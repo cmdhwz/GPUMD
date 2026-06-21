@@ -631,6 +631,50 @@ void Force::compute(
   }
 }
 
+bool Force::compute_qnep_non_electro(
+  Box& box,
+  GPU_Vector<double>& position_per_atom,
+  GPU_Vector<int>& type,
+  std::vector<Group>& group,
+  GPU_Vector<double>& potential_per_atom,
+  GPU_Vector<double>& force_per_atom,
+  GPU_Vector<double>& virial_per_atom)
+{
+  (void)group;
+  if (potentials.size() != 1 || multiple_potentials_mode_.compare("observe") != 0) {
+    return false;
+  }
+
+  auto* qnep = dynamic_cast<NEP_Charge*>(potentials[0].get());
+  if (qnep == nullptr) {
+    return false;
+  }
+
+  box.set_is_orthogonal();
+  const int number_of_atoms = type.size();
+  if (!is_fcp) {
+    gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      box,
+      position_per_atom.data(),
+      position_per_atom.data() + number_of_atoms,
+      position_per_atom.data() + number_of_atoms * 2);
+  }
+
+  initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    number_of_atoms,
+    force_per_atom.data(),
+    force_per_atom.data() + number_of_atoms,
+    force_per_atom.data() + number_of_atoms * 2,
+    potential_per_atom.data(),
+    virial_per_atom.data());
+  GPU_CHECK_KERNEL
+
+  qnep->compute_non_electro(
+    box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
+  return true;
+}
+
 static __global__ void gpu_find_per_atom_tensor(
   int N,
   double* g_mass,
