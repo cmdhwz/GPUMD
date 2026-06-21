@@ -42,6 +42,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/dump_observer.cuh"
 #include "measure/dump_polarizability.cuh"
 #include "measure/dump_position.cuh"
+#include "measure/dump_pimd_restart.cuh"
 #include "measure/dump_restart.cuh"
 #include "measure/dump_shock_nemd.cuh"
 #include "measure/dump_thermo.cuh"
@@ -67,6 +68,7 @@ Run simulation according to the inputs in the run.in file.
 #include "minimize/minimize.cuh"
 #include "model/box.cuh"
 #include "model/read_xyz.cuh"
+#include "model/read_pimd_restart.cuh"
 #include "phonon/hessian.cuh"
 #include "replicate.cuh"
 #include "run.cuh"
@@ -385,6 +387,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_velocity(param, num_param);
   } else if (strcmp(param[0], "ensemble") == 0) {
     integrate.parse_ensemble(param, num_param, time_step, atom, box, group, thermo);
+  } else if (strcmp(param[0], "read_pimd_restart") == 0) {
+    parse_read_pimd_restart(param, num_param);
   } else if (strcmp(param[0], "time_step") == 0) {
     parse_time_step(param, num_param);
   } else if (strcmp(param[0], "correct_velocity") == 0) {
@@ -416,6 +420,10 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
   } else if (strcmp(param[0], "dump_restart") == 0) {
     std::unique_ptr<Property> property;
     property.reset(new Dump_Restart(param, num_param));
+    measure.properties.emplace_back(std::move(property));
+  } else if (strcmp(param[0], "dump_pimd_restart") == 0) {
+    std::unique_ptr<Property> property;
+    property.reset(new Dump_PIMD_Restart(param, num_param));
     measure.properties.emplace_back(std::move(property));
   } else if (strcmp(param[0], "dump_velocity") == 0) {
     std::unique_ptr<Property> property;
@@ -605,6 +613,22 @@ void Run::parse_velocity(const char** param, int num_param)
   if (!has_velocity_in_xyz) {
     printf("Initialized velocities with input T = %g K.\n", initial_temperature);
   }
+}
+
+void Run::parse_read_pimd_restart(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("read_pimd_restart should have 1 parameter.\n");
+  }
+  if (integrate.type < 31 || integrate.number_of_beads < 2) {
+    PRINT_INPUT_ERROR("read_pimd_restart should be used after a PIMD-related ensemble keyword.\n");
+  }
+
+  read_pimd_restart(param[1], integrate.number_of_beads, box, atom);
+  has_velocity_in_xyz = 1;
+
+  printf("Read PIMD restart data from %s.\n", param[1]);
+  printf("    number of beads = %d.\n", atom.number_of_beads);
 }
 
 void Run::parse_correct_velocity(const char** param, int num_param, const std::vector<Group>& group)
