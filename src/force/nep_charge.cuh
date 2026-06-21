@@ -136,6 +136,13 @@ public:
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial);
+  void compute_non_electro(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    GPU_Vector<double>& potential,
+    GPU_Vector<double>& force,
+    GPU_Vector<double>& virial);
 
   const GPU_Vector<int>& get_NN_radial_ptr();
 
@@ -164,7 +171,8 @@ private:
     const GPU_Vector<double>& position,
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
-    GPU_Vector<double>& virial);
+    GPU_Vector<double>& virial,
+    const bool include_electro = true);
 
   void compute_large_box(
     Box& box,
@@ -172,7 +180,8 @@ private:
     const GPU_Vector<double>& position,
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
-    GPU_Vector<double>& virial);
+    GPU_Vector<double>& virial,
+    const bool include_electro = true);
 
   void find_k_and_G(const double* box);
 
