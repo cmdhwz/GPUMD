@@ -317,6 +317,14 @@ void Integrate::compute1(
       temperature1 + (temperature2 - temperature1) * step_over_number_of_steps;
   }
 
+  if (type == 33 && num_target_pressure_components > 0) {
+    for (int i = 0; i < num_target_pressure_components; ++i) {
+      ensemble->target_pressure[i] = target_pressure1[i] +
+                                     (target_pressure2[i] - target_pressure1[i]) *
+                                       step_over_number_of_steps;
+    }
+  }
+
   if (atom.unwrapped_position.size() > 0) {
     gpu_copy_position<<<(atom.number_of_atoms - 1) / 128 + 1, 128>>>(
       atom.number_of_atoms,
@@ -366,6 +374,14 @@ void Integrate::compute2(
     return;
   }
 
+  if (type == 33 && num_target_pressure_components > 0) {
+    for (int i = 0; i < num_target_pressure_components; ++i) {
+      ensemble->target_pressure[i] = target_pressure1[i] +
+                                     (target_pressure2[i] - target_pressure1[i]) *
+                                       step_over_number_of_steps;
+    }
+  }
+
   ensemble->compute2(time_step, group, box, atom, thermo);
 }
 
@@ -387,6 +403,10 @@ void Integrate::parse_ensemble(
 {
   qtb_f_max = 200.0;
   qtb_n_f = 100;
+  for (int i = 0; i < 6; ++i) {
+    target_pressure1[i] = 0.0;
+    target_pressure2[i] = 0.0;
+  }
 
   // 1. Determine the integration method
   if (strcmp(param[1], "nve") == 0) {
@@ -490,8 +510,11 @@ void Integrate::parse_ensemble(
     }
   } else if (strcmp(param[1], "pimd") == 0) {
     type = 33;
-    if (num_param != 6 && num_param != 9 && num_param != 13 && num_param != 19) {
-      PRINT_INPUT_ERROR("ensemble pimd should have 4 or 7 or 11 or 17 parameters.");
+    if (
+      num_param != 6 && num_param != 9 && num_param != 10 && num_param != 13 &&
+      num_param != 16 && num_param != 19 && num_param != 25) {
+      PRINT_INPUT_ERROR(
+        "ensemble pimd should have 4, 7, 8, 11, 14, 17, or 23 parameters.");
     }
   } else if (strcmp(param[1], "msst") == 0) {
     type = -1;
@@ -786,32 +809,22 @@ void Integrate::parse_ensemble(
 
       // pressures:
       if (num_param >= 9) {
-        if (num_param == 13) {
-          for (int i = 0; i < 3; i++) {
-            if (!is_valid_real(param[6 + i], &target_pressure[i])) {
-              PRINT_INPUT_ERROR("Pressure should be a number.");
-            }
+        if (num_param == 9 || num_param == 10) { // isotropic, fixed or ramped
+          if (!is_valid_real(param[6], &target_pressure1[0])) {
+            PRINT_INPUT_ERROR("Initial pressure should be a number.");
           }
-          for (int i = 0; i < 3; i++) {
-            if (!is_valid_real(param[9 + i], &elastic_modulus[i])) {
+          if (num_param == 10) {
+            if (!is_valid_real(param[7], &target_pressure2[0])) {
+              PRINT_INPUT_ERROR("Final pressure should be a number.");
+            }
+            if (!is_valid_real(param[8], &elastic_modulus[0])) {
               PRINT_INPUT_ERROR("elastic modulus should be a number.");
             }
-            if (elastic_modulus[i] <= 0) {
-              PRINT_INPUT_ERROR("elastic modulus should > 0.");
+          } else {
+            target_pressure2[0] = target_pressure1[0];
+            if (!is_valid_real(param[7], &elastic_modulus[0])) {
+              PRINT_INPUT_ERROR("elastic modulus should be a number.");
             }
-          }
-          num_target_pressure_components = 3;
-          if (
-            box.cpu_h[1] != 0 || box.cpu_h[2] != 0 || box.cpu_h[3] != 0 || box.cpu_h[5] != 0 ||
-            box.cpu_h[6] != 0 || box.cpu_h[7] != 0) {
-            PRINT_INPUT_ERROR("Cannot use triclinic box with only 3 target pressure components.");
-          }
-        } else if (num_param == 9) { // isotropic
-          if (!is_valid_real(param[6], &target_pressure[0])) {
-            PRINT_INPUT_ERROR("Pressure should be a number.");
-          }
-          if (!is_valid_real(param[7], &elastic_modulus[0])) {
-            PRINT_INPUT_ERROR("elastic modulus should be a number.");
           }
           if (elastic_modulus[0] <= 0) {
             PRINT_INPUT_ERROR("elastic modulus should > 0.");
@@ -826,16 +839,72 @@ void Integrate::parse_ensemble(
             PRINT_INPUT_ERROR(
               "Cannot use isotropic pressure with non-periodic boundary in any direction.");
           }
-        } else { // then must be triclinic box
+        } else if (num_param == 13 || num_param == 16) { // orthogonal, fixed or ramped
+          for (int i = 0; i < 3; i++) {
+            if (!is_valid_real(param[6 + i], &target_pressure1[i])) {
+              PRINT_INPUT_ERROR("Initial pressure should be a number.");
+            }
+          }
+          if (num_param == 16) {
+            for (int i = 0; i < 3; i++) {
+              if (!is_valid_real(param[9 + i], &target_pressure2[i])) {
+                PRINT_INPUT_ERROR("Final pressure should be a number.");
+              }
+            }
+            for (int i = 0; i < 3; i++) {
+              if (!is_valid_real(param[12 + i], &elastic_modulus[i])) {
+                PRINT_INPUT_ERROR("elastic modulus should be a number.");
+              }
+            }
+          } else {
+            for (int i = 0; i < 3; i++) {
+              target_pressure2[i] = target_pressure1[i];
+            }
+            for (int i = 0; i < 3; i++) {
+              if (!is_valid_real(param[9 + i], &elastic_modulus[i])) {
+                PRINT_INPUT_ERROR("elastic modulus should be a number.");
+              }
+            }
+          }
+          for (int i = 0; i < 3; i++) {
+            if (elastic_modulus[i] <= 0) {
+              PRINT_INPUT_ERROR("elastic modulus should > 0.");
+            }
+          }
+          num_target_pressure_components = 3;
+          if (
+            box.cpu_h[1] != 0 || box.cpu_h[2] != 0 || box.cpu_h[3] != 0 || box.cpu_h[5] != 0 ||
+            box.cpu_h[6] != 0 || box.cpu_h[7] != 0) {
+            PRINT_INPUT_ERROR("Cannot use triclinic box with only 3 target pressure components.");
+          }
+        } else if (num_param == 19 || num_param == 25) { // triclinic, fixed or ramped
           for (int i = 0; i < 6; i++) {
-            if (!is_valid_real(param[6 + i], &target_pressure[i])) {
-              PRINT_INPUT_ERROR("Pressure should be a number.");
+            if (!is_valid_real(param[6 + i], &target_pressure1[i])) {
+              PRINT_INPUT_ERROR("Initial pressure should be a number.");
+            }
+          }
+          if (num_param == 25) {
+            for (int i = 0; i < 6; i++) {
+              if (!is_valid_real(param[12 + i], &target_pressure2[i])) {
+                PRINT_INPUT_ERROR("Final pressure should be a number.");
+              }
+            }
+            for (int i = 0; i < 6; i++) {
+              if (!is_valid_real(param[18 + i], &elastic_modulus[i])) {
+                PRINT_INPUT_ERROR("elastic modulus should be a number.");
+              }
+            }
+          } else {
+            for (int i = 0; i < 6; i++) {
+              target_pressure2[i] = target_pressure1[i];
+            }
+            for (int i = 0; i < 6; i++) {
+              if (!is_valid_real(param[12 + i], &elastic_modulus[i])) {
+                PRINT_INPUT_ERROR("elastic modulus should be a number.");
+              }
             }
           }
           for (int i = 0; i < 6; i++) {
-            if (!is_valid_real(param[12 + i], &elastic_modulus[i])) {
-              PRINT_INPUT_ERROR("elastic modulus should be a number.");
-            }
             if (elastic_modulus[i] <= 0) {
               PRINT_INPUT_ERROR("elastic modulus should > 0.");
             }
@@ -845,10 +914,20 @@ void Integrate::parse_ensemble(
             PRINT_INPUT_ERROR(
               "Cannot use 6 pressure components with non-periodic boundary in any direction.");
           }
+        } else {
+          PRINT_INPUT_ERROR(
+            "For PIMD NPT, use 9/10 parameters for isotropic, 13/16 for orthogonal, or 19/25 for triclinic pressure control.");
+        }
+
+        for (int i = 0; i < num_target_pressure_components; ++i) {
+          target_pressure[i] = target_pressure1[i];
         }
 
         // pressure_coupling:
-        int index_pressure_coupling = num_target_pressure_components * 2 + 6;
+        int index_pressure_coupling = 6 + num_target_pressure_components;
+        if (num_param == 10 || num_param == 16 || num_param == 25) {
+          index_pressure_coupling += num_target_pressure_components;
+        }
         if (!is_valid_real(param[index_pressure_coupling], &tau_p)) {
           PRINT_INPUT_ERROR("Pressure coupling should be a number.");
         }
@@ -1089,22 +1168,32 @@ void Integrate::parse_ensemble(
       printf("    tau_T is %g time_step.\n", temperature_coupling);
       if (num_param >= 9) {
         if (num_target_pressure_components == 1) {
-          printf("    isotropic pressure is %g GPa.\n", target_pressure[0]);
+          printf("    initial isotropic pressure is %g GPa.\n", target_pressure1[0]);
+          printf("    final isotropic pressure is %g GPa.\n", target_pressure2[0]);
           printf("    bulk modulus is %g GPa.\n", elastic_modulus[0]);
         } else if (num_target_pressure_components == 3) {
-          printf("    pressure_xx is %g GPa.\n", target_pressure[0]);
-          printf("    pressure_yy is %g GPa.\n", target_pressure[1]);
-          printf("    pressure_zz is %g GPa.\n", target_pressure[2]);
+          printf("    initial pressure_xx is %g GPa.\n", target_pressure1[0]);
+          printf("    initial pressure_yy is %g GPa.\n", target_pressure1[1]);
+          printf("    initial pressure_zz is %g GPa.\n", target_pressure1[2]);
+          printf("    final pressure_xx is %g GPa.\n", target_pressure2[0]);
+          printf("    final pressure_yy is %g GPa.\n", target_pressure2[1]);
+          printf("    final pressure_zz is %g GPa.\n", target_pressure2[2]);
           printf("    modulus_xx is %g GPa.\n", elastic_modulus[0]);
           printf("    modulus_yy is %g GPa.\n", elastic_modulus[1]);
           printf("    modulus_zz is %g GPa.\n", elastic_modulus[2]);
         } else if (num_target_pressure_components == 6) {
-          printf("    pressure_xx is %g GPa.\n", target_pressure[0]);
-          printf("    pressure_yy is %g GPa.\n", target_pressure[1]);
-          printf("    pressure_zz is %g GPa.\n", target_pressure[2]);
-          printf("    pressure_yz is %g GPa.\n", target_pressure[3]);
-          printf("    pressure_xz is %g GPa.\n", target_pressure[4]);
-          printf("    pressure_xy is %g GPa.\n", target_pressure[5]);
+          printf("    initial pressure_xx is %g GPa.\n", target_pressure1[0]);
+          printf("    initial pressure_yy is %g GPa.\n", target_pressure1[1]);
+          printf("    initial pressure_zz is %g GPa.\n", target_pressure1[2]);
+          printf("    initial pressure_yz is %g GPa.\n", target_pressure1[3]);
+          printf("    initial pressure_xz is %g GPa.\n", target_pressure1[4]);
+          printf("    initial pressure_xy is %g GPa.\n", target_pressure1[5]);
+          printf("    final pressure_xx is %g GPa.\n", target_pressure2[0]);
+          printf("    final pressure_yy is %g GPa.\n", target_pressure2[1]);
+          printf("    final pressure_zz is %g GPa.\n", target_pressure2[2]);
+          printf("    final pressure_yz is %g GPa.\n", target_pressure2[3]);
+          printf("    final pressure_xz is %g GPa.\n", target_pressure2[4]);
+          printf("    final pressure_xy is %g GPa.\n", target_pressure2[5]);
           printf("    modulus_xx is %g GPa.\n", elastic_modulus[0]);
           printf("    modulus_yy is %g GPa.\n", elastic_modulus[1]);
           printf("    modulus_zz is %g GPa.\n", elastic_modulus[2]);
@@ -1116,7 +1205,9 @@ void Integrate::parse_ensemble(
 
         // Change the units of pressure form GPa to that used in the code
         for (int i = 0; i < 6; i++) {
-          target_pressure[i] /= PRESSURE_UNIT_CONVERSION;
+          target_pressure1[i] /= PRESSURE_UNIT_CONVERSION;
+          target_pressure2[i] /= PRESSURE_UNIT_CONVERSION;
+          target_pressure[i] = target_pressure1[i];
           pressure_coupling[i] *= PRESSURE_UNIT_CONVERSION;
         }
       }

@@ -84,6 +84,8 @@ public:
   double temperature2; // target final temperature for a run
   double delta_temperature;
   double target_pressure[6];
+  double target_pressure1[6];
+  double target_pressure2[6];
   int num_target_pressure_components;
   double temperature_coupling;
   double qtb_f_max = 200.0; // in ps^-1
