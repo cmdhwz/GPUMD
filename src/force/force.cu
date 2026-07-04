@@ -48,6 +48,16 @@ The driver class calculating force and related quantities.
 
 #define BLOCK_SIZE 128
 
+static __global__ void initialize_properties(
+  int number_of_atoms,
+  double* force_x,
+  double* force_y,
+  double* force_z,
+  double* potential,
+  double* virial);
+
+static __global__ void gpu_apply_pbc(int N, Box box, double* g_x, double* g_y, double* g_z);
+
 Force::Force(void)
 {
   is_fcp = false;
