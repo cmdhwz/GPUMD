@@ -225,7 +225,18 @@ void Run::perform_a_run()
   measure.initialize(number_of_steps, time_step, integrate, group, atom, box, force);
 
   // compute force for the first integrate step
-  if (integrate.type >= 31) { // PIMD
+  if (integrate.type == 33) { // thermostatted PIMD
+    force.compute_pimd_beads(
+      box,
+      atom.type,
+      group,
+      atom.position_beads,
+      atom.potential_beads,
+      atom.force_beads,
+      atom.virial_beads,
+      atom.velocity_beads,
+      atom.mass);
+  } else if (integrate.type >= 31) { // RPMD/TRPMD
     for (int k = 0; k < integrate.number_of_beads; ++k) {
       force.compute(
         box,
@@ -273,7 +284,18 @@ void Run::perform_a_run()
     integrate.current_step = step;
     integrate.compute1(time_step, double(step) / number_of_steps, group, box, atom, thermo);
 
-    if (integrate.type >= 31) { // PIMD
+    if (integrate.type == 33) { // thermostatted PIMD
+      force.compute_pimd_beads(
+        box,
+        atom.type,
+        group,
+        atom.position_beads,
+        atom.potential_beads,
+        atom.force_beads,
+        atom.virial_beads,
+        atom.velocity_beads,
+        atom.mass);
+    } else if (integrate.type >= 31) { // RPMD/TRPMD
       for (int k = 0; k < integrate.number_of_beads; ++k) {
         force.compute(
           box,
@@ -371,7 +393,18 @@ void Run::mdi_set_positions(const double* positions)
 
 void Run::mdi_compute_forces()
 {
-  if (integrate.type >= 31) { // PIMD
+  if (integrate.type == 33) { // thermostatted PIMD
+    force.compute_pimd_beads(
+      box,
+      atom.type,
+      group,
+      atom.position_beads,
+      atom.potential_beads,
+      atom.force_beads,
+      atom.virial_beads,
+      atom.velocity_beads,
+      atom.mass);
+  } else if (integrate.type >= 31) { // RPMD/TRPMD
     for (int k = 0; k < integrate.number_of_beads; ++k) {
       force.compute(
         box,
@@ -629,6 +662,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_velocity(param, num_param);
   } else if (strcmp(param[0], "ensemble") == 0) {
     integrate.parse_ensemble(param, num_param, time_step, atom, box, group, thermo);
+  } else if (strcmp(param[0], "pimd_bead_gpu_parallel") == 0) {
+    parse_pimd_bead_gpu_parallel(param, num_param);
   } else if (strcmp(param[0], "read_pimd_restart") == 0) {
     parse_read_pimd_restart(param, num_param);
   } else if (strcmp(param[0], "time_step") == 0) {
@@ -862,6 +897,27 @@ void Run::parse_read_pimd_restart(const char** param, int num_param)
 
   printf("Read PIMD restart data from %s.\n", param[1]);
   printf("    number of beads = %d.\n", atom.number_of_beads);
+}
+
+void Run::parse_pimd_bead_gpu_parallel(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_bead_gpu_parallel should have 1 parameter.\n");
+  }
+  int num_devices = 0;
+  if (!is_valid_int(param[1], &num_devices)) {
+    PRINT_INPUT_ERROR("number of GPUs for PIMD bead parallel should be an integer.\n");
+  }
+  if (num_devices < 1) {
+    PRINT_INPUT_ERROR("number of GPUs for PIMD bead parallel should >= 1.\n");
+  }
+  force.set_pimd_bead_gpu_parallel(num_devices);
+  if (num_devices == 1) {
+    printf("Disabled PIMD bead-to-GPU parallel force evaluation.\n");
+  } else {
+    printf("Requested PIMD bead-to-GPU parallel force evaluation on %d GPUs.\n", num_devices);
+    printf("    only the thermostatted PIMD path will use this scheduling rule.\n");
+  }
 }
 
 void Run::parse_correct_velocity(const char** param, int num_param, const std::vector<Group>& group)

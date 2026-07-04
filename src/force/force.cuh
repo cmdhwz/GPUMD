@@ -26,6 +26,17 @@
 class Force
 {
 public:
+  struct PIMD_Bead_GPU_Worker
+  {
+    int device_id = 0;
+    std::unique_ptr<Potential> potential;
+    GPU_Vector<int> type;
+    GPU_Vector<double> position;
+    GPU_Vector<double> potential_per_atom;
+    GPU_Vector<double> force_per_atom;
+    GPU_Vector<double> virial_per_atom;
+  };
+
   Force(void);
 
   void
@@ -51,6 +62,17 @@ public:
     GPU_Vector<double>& velocity_per_atom,
     GPU_Vector<double>& mass_per_atom);
 
+  void compute_pimd_beads(
+    Box& box,
+    GPU_Vector<int>& type,
+    std::vector<Group>& group,
+    std::vector<GPU_Vector<double>>& position_beads,
+    std::vector<GPU_Vector<double>>& potential_beads,
+    std::vector<GPU_Vector<double>>& force_beads,
+    std::vector<GPU_Vector<double>>& virial_beads,
+    std::vector<GPU_Vector<double>>& velocity_beads,
+    GPU_Vector<double>& mass_per_atom);
+
   void finalize();
 
   int get_number_of_types(FILE* fid_potential);
@@ -65,6 +87,7 @@ public:
     const std::vector<int>& type_size,
     const double T);
   void set_multiple_potentials_mode(std::string mode);
+  void set_pimd_bead_gpu_parallel(const int num_devices);
 
   bool compute_hnemd_ = false;
   int compute_hnemdec_ = -1;
@@ -79,7 +102,12 @@ private:
   bool is_fcp = false;
   bool has_non_nep = false;
   std::string multiple_potentials_mode_ = "observe"; // "observe" or "average"
+  int pimd_bead_gpu_parallel_devices_ = 1;
+  std::string primary_nep_model_path_;
   std::string atom_types[NUM_ELEMENTS];
+  std::vector<std::unique_ptr<PIMD_Bead_GPU_Worker>> pimd_bead_gpu_workers_;
 
   void check_types(const char* file_potential);
+  bool can_use_pimd_bead_gpu_parallel_() const;
+  void refresh_pimd_bead_gpu_workers_();
 };

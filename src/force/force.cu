@@ -41,6 +41,7 @@ The driver class calculating force and related quantities.
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -123,6 +124,7 @@ void Force::parse_potential(
     strcmp(potential_name, "nep4_zbl_charge3") == 0) {
     potential.reset(new NEP_Charge(param[1], number_of_atoms));
     is_nep = true;
+    primary_nep_model_path_.clear();
     check_types(param[1]);
   } else if (
     strcmp(potential_name, "nep5") == 0 || strcmp(potential_name, "nep5_zbl") == 0 ||
@@ -159,6 +161,7 @@ void Force::parse_potential(
       potential.reset(new NEP_MULTIGPU(num_gpus, param[1], number_of_atoms, partition_direction));
     }
     is_nep = true;
+    primary_nep_model_path_ = param[1];
     // Check if the types for this potential are compatible with the possibly other potentials
     check_types(param[1]);
 #ifdef USE_DEEPMD
@@ -215,6 +218,7 @@ void Force::parse_potential(
   if (potentials.size() > 1 && has_non_nep) {
     PRINT_INPUT_ERROR("Multiple potentials may only be used with NEP potentials.\n");
   }
+  refresh_pimd_bead_gpu_workers_();
 }
 
 int Force::get_number_of_types(FILE* fid_potential)
@@ -223,6 +227,73 @@ int Force::get_number_of_types(FILE* fid_potential)
   int count = fscanf(fid_potential, "%d", &num_of_types);
   PRINT_SCANF_ERROR(count, 1, "Reading error for number of types.");
   return num_of_types;
+}
+
+void Force::set_pimd_bead_gpu_parallel(const int num_devices)
+{
+  pimd_bead_gpu_parallel_devices_ = num_devices;
+  refresh_pimd_bead_gpu_workers_();
+}
+
+bool Force::can_use_pimd_bead_gpu_parallel_() const
+{
+  if (pimd_bead_gpu_parallel_devices_ <= 1 || pimd_bead_gpu_workers_.size() <= 1) {
+    return false;
+  }
+  if (potentials.size() != 1 || multiple_potentials_mode_.compare("observe") != 0) {
+    return false;
+  }
+  if (is_fcp || compute_hnemd_ || compute_hnemdec_ != -1 || primary_nep_model_path_.empty()) {
+    return false;
+  }
+  Potential* primary = potentials[0].get();
+  return !primary->need_B_projection &&
+         (dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary));
+}
+
+void Force::refresh_pimd_bead_gpu_workers_()
+{
+  pimd_bead_gpu_workers_.clear();
+  if (pimd_bead_gpu_parallel_devices_ <= 1 || primary_nep_model_path_.empty() ||
+      number_of_atoms_ <= 0) {
+    return;
+  }
+  if (potentials.size() != 1 || multiple_potentials_mode_.compare("observe") != 0) {
+    return;
+  }
+  if (is_fcp || compute_hnemd_ || compute_hnemdec_ != -1) {
+    return;
+  }
+  Potential* primary = potentials[0].get();
+  if (!(dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary))) {
+    return;
+  }
+  if (primary->need_B_projection) {
+    return;
+  }
+
+  int available_devices = 0;
+  CHECK(gpuGetDeviceCount(&available_devices));
+  const int num_workers = std::min(pimd_bead_gpu_parallel_devices_, available_devices);
+  if (num_workers <= 1) {
+    return;
+  }
+
+  for (int device_id = 0; device_id < num_workers; ++device_id) {
+    CHECK(gpuSetDevice(device_id));
+    std::unique_ptr<Force::PIMD_Bead_GPU_Worker> worker(new Force::PIMD_Bead_GPU_Worker());
+    worker->device_id = device_id;
+    worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
+    worker->potential->N1 = 0;
+    worker->potential->N2 = number_of_atoms_;
+    worker->type.resize(number_of_atoms_);
+    worker->position.resize(number_of_atoms_ * 3);
+    worker->potential_per_atom.resize(number_of_atoms_);
+    worker->force_per_atom.resize(number_of_atoms_ * 3);
+    worker->virial_per_atom.resize(number_of_atoms_ * 9);
+    pimd_bead_gpu_workers_.push_back(std::move(worker));
+  }
+  CHECK(gpuSetDevice(0));
 }
 
 static __global__ void gpu_add_driving_force(
@@ -249,6 +320,137 @@ static __global__ void gpu_add_driving_force(
     g_fy[i] += fe_x * g_sxy[i] + fe_y * g_syy[i] + fe_z * g_szy[i];
     g_fz[i] += fe_x * g_sxz[i] + fe_y * g_syz[i] + fe_z * g_szz[i];
   }
+}
+
+void Force::compute_pimd_beads(
+  Box& box,
+  GPU_Vector<int>& type,
+  std::vector<Group>& group,
+  std::vector<GPU_Vector<double>>& position_beads,
+  std::vector<GPU_Vector<double>>& potential_beads,
+  std::vector<GPU_Vector<double>>& force_beads,
+  std::vector<GPU_Vector<double>>& virial_beads,
+  std::vector<GPU_Vector<double>>& velocity_beads,
+  GPU_Vector<double>& mass_per_atom)
+{
+  if (!can_use_pimd_bead_gpu_parallel_()) {
+    static bool warned_once = false;
+    if (pimd_bead_gpu_parallel_devices_ > 1 && !warned_once) {
+      printf("Warning: falling back to serial PIMD bead force evaluation.\n");
+      printf(
+        "    bead-to-GPU mode currently requires a single-potential NEP run without HNEMD/FCP.\n");
+      warned_once = true;
+    }
+    for (int k = 0; k < position_beads.size(); ++k) {
+      compute(
+        box,
+        position_beads[k],
+        type,
+        group,
+        potential_beads[k],
+        force_beads[k],
+        virial_beads[k],
+        velocity_beads[k],
+        mass_per_atom);
+    }
+    return;
+  }
+
+  (void)group;
+  (void)velocity_beads;
+  (void)mass_per_atom;
+
+  box.set_is_orthogonal();
+  const int number_of_atoms = type.size();
+  const size_t type_bytes = sizeof(int) * number_of_atoms;
+  const size_t position_bytes = sizeof(double) * number_of_atoms * 3;
+  const size_t potential_bytes = sizeof(double) * number_of_atoms;
+  const size_t force_bytes = sizeof(double) * number_of_atoms * 3;
+  const size_t virial_bytes = sizeof(double) * number_of_atoms * 9;
+
+  for (auto& worker_ptr : pimd_bead_gpu_workers_) {
+    CHECK(gpuSetDevice(worker_ptr->device_id));
+    CHECK(gpuMemcpy(worker_ptr->type.data(), type.data(), type_bytes, gpuMemcpyDeviceToDevice));
+  }
+
+  for (int bead_begin = 0; bead_begin < int(position_beads.size());
+       bead_begin += int(pimd_bead_gpu_workers_.size())) {
+    const int batch_size =
+      std::min(int(pimd_bead_gpu_workers_.size()), int(position_beads.size()) - bead_begin);
+    for (int worker_id = 0; worker_id < batch_size; ++worker_id) {
+      const int bead_id = bead_begin + worker_id;
+      auto& worker = *pimd_bead_gpu_workers_[worker_id];
+      CHECK(gpuSetDevice(worker.device_id));
+      CHECK(gpuMemcpy(
+        worker.position.data(),
+        position_beads[bead_id].data(),
+        position_bytes,
+        gpuMemcpyDeviceToDevice));
+      gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+        number_of_atoms,
+        box,
+        worker.position.data(),
+        worker.position.data() + number_of_atoms,
+        worker.position.data() + number_of_atoms * 2);
+      initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+        number_of_atoms,
+        worker.force_per_atom.data(),
+        worker.force_per_atom.data() + number_of_atoms,
+        worker.force_per_atom.data() + number_of_atoms * 2,
+        worker.potential_per_atom.data(),
+        worker.virial_per_atom.data());
+      GPU_CHECK_KERNEL
+
+      temperature += delta_T;
+      if (3 == worker.potential->nep_model_type) {
+        worker.potential->compute(
+          temperature,
+          box,
+          worker.type,
+          worker.position,
+          worker.potential_per_atom,
+          worker.force_per_atom,
+          worker.virial_per_atom);
+      } else {
+        worker.potential->compute(
+          box,
+          worker.type,
+          worker.position,
+          worker.potential_per_atom,
+          worker.force_per_atom,
+          worker.virial_per_atom);
+      }
+    }
+
+    for (int worker_id = 0; worker_id < batch_size; ++worker_id) {
+      const int bead_id = bead_begin + worker_id;
+      auto& worker = *pimd_bead_gpu_workers_[worker_id];
+      CHECK(gpuSetDevice(worker.device_id));
+      CHECK(gpuDeviceSynchronize());
+      CHECK(gpuMemcpy(
+        position_beads[bead_id].data(),
+        worker.position.data(),
+        position_bytes,
+        gpuMemcpyDeviceToDevice));
+      CHECK(gpuMemcpy(
+        potential_beads[bead_id].data(),
+        worker.potential_per_atom.data(),
+        potential_bytes,
+        gpuMemcpyDeviceToDevice));
+      CHECK(gpuMemcpy(
+        force_beads[bead_id].data(),
+        worker.force_per_atom.data(),
+        force_bytes,
+        gpuMemcpyDeviceToDevice));
+      CHECK(gpuMemcpy(
+        virial_beads[bead_id].data(),
+        worker.virial_per_atom.data(),
+        virial_bytes,
+        gpuMemcpyDeviceToDevice));
+    }
+  }
+
+  CHECK(gpuSetDevice(0));
 }
 
 // get the total force
@@ -336,6 +538,7 @@ void Force::finalize()
 {
   compute_hnemd_ = false;
   compute_hnemdec_ = -1;
+  refresh_pimd_bead_gpu_workers_();
 }
 
 void Force::set_hnemd_parameters(
@@ -348,6 +551,7 @@ void Force::set_hnemd_parameters(
   hnemd_fe_[0] = hnemd_fe_x;
   hnemd_fe_[1] = hnemd_fe_y;
   hnemd_fe_[2] = hnemd_fe_z;
+  refresh_pimd_bead_gpu_workers_();
 }
 
 void Force::set_hnemdec_parameters(
@@ -419,6 +623,7 @@ void Force::set_hnemdec_parameters(
   hnemd_fe_[0] = hnemd_fe_x;
   hnemd_fe_[1] = hnemd_fe_y;
   hnemd_fe_[2] = hnemd_fe_z;
+  refresh_pimd_bead_gpu_workers_();
 }
 
 static __global__ void gpu_apply_pbc(int N, Box box, double* g_x, double* g_y, double* g_z)
@@ -479,7 +684,11 @@ static __global__ void gpu_average_properties(
   }
 }
 
-void Force::set_multiple_potentials_mode(std::string mode) { multiple_potentials_mode_ = mode; }
+void Force::set_multiple_potentials_mode(std::string mode)
+{
+  multiple_potentials_mode_ = mode;
+  refresh_pimd_bead_gpu_workers_();
+}
 
 void Force::compute(
   Box& box,
