@@ -87,6 +87,8 @@ public:
     return dummy_bec;
   }
 
+  virtual void set_neighbor_rebuild(const bool /* value */) {}
+
 protected:
   void find_properties_many_body(
     Box& box,

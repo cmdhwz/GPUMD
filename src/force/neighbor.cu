@@ -773,7 +773,7 @@ void Neighbor::find_neighbor_global(
     z0.resize(N);
   }
 
-  if (is_first_time || check_atom_distance(box, x, y, z)) {
+  if (always_rebuild || is_first_time || check_atom_distance(box, x, y, z)) {
     find_neighbor(
       0,
       N,

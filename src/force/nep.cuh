@@ -133,6 +133,8 @@ public:
 
   const GPU_Vector<int>& get_NL_radial_ptr();
 
+  virtual void set_neighbor_rebuild(const bool value) { neighbor.set_always_rebuild(value); }
+
 private:
   ParaMB paramb;
   ANN annmb;

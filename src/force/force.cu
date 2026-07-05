@@ -279,6 +279,9 @@ Potential* Force::get_pimd_bead_potential_(const int device_id) const
 void Force::refresh_pimd_bead_gpu_workers_()
 {
   pimd_bead_gpu_workers_.clear();
+  if (potentials.size() == 1 && potentials[0]) {
+    potentials[0]->set_neighbor_rebuild(false);
+  }
   if (pimd_bead_gpu_parallel_devices_ <= 1 || primary_nep_model_path_.empty() ||
       number_of_atoms_ <= 0) {
     return;
@@ -306,6 +309,8 @@ void Force::refresh_pimd_bead_gpu_workers_()
     return;
   }
 
+  primary->set_neighbor_rebuild(true);
+
   for (int device_id = 0; device_id < num_workers; ++device_id) {
     CHECK(gpuSetDevice(device_id));
     std::unique_ptr<Force::PIMD_Bead_GPU_Worker> worker(new Force::PIMD_Bead_GPU_Worker());
@@ -315,6 +320,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
     } else {
       worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
     }
+    worker->potential->set_neighbor_rebuild(true);
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;
     worker->type.resize(number_of_atoms_);

@@ -145,6 +145,8 @@ public:
 
   GPU_Vector<float>& get_bec_reference();
 
+  virtual void set_neighbor_rebuild(const bool value) { neighbor.set_always_rebuild(value); }
+
 private:
   ParaMB paramb;
   ANN annmb;

@@ -196,6 +196,7 @@ class Neighbor
 public:
   GPU_Vector<int> NN, NL; // global neighbor list
   void initialize(const double rc, const int num_atoms, const int num_neighbors);
+  void set_always_rebuild(const bool value) { always_rebuild = value; }
   void find_neighbor_global(
     const double rc,
     Box& box, 
@@ -210,6 +211,7 @@ public:
 
 private:
   double skin = 1.0;              // skin distance
+  bool always_rebuild = false;
   GPU_Vector<int> cell_count;     // for cell list
   GPU_Vector<int> cell_count_sum; // for cell list
   GPU_Vector<int> cell_contents;  // for cell list
