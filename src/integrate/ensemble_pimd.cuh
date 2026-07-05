@@ -106,7 +106,7 @@ protected:
   void apply_pressure_local_orthogonal_(Atom& atom, double scale_factor[3]);
   void apply_pressure_local_isotropic_(Atom& atom, double scale_factor);
   void apply_pressure_local_triclinic_(Atom& atom, double mu[9]);
-  void clone_atom_to_current_device_(const Atom& source, Atom& destination);
+  void clone_atom_to_current_device_(const Atom& source, Atom& destination, int source_device, int destination_device);
   std::mt19937 rng;
   void initialize_rng();
   bool distributed_enabled_ = false;

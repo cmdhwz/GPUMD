@@ -31,6 +31,45 @@ References for implementation:
 #include <cstdlib>
 #include <cstring>
 
+namespace
+{
+
+template <typename T>
+void copy_gpu_buffer_between_devices_(
+  const int destination_device,
+  T* destination,
+  const int source_device,
+  const T* source,
+  const size_t count)
+{
+  if (count == 0) {
+    return;
+  }
+  const size_t bytes = sizeof(T) * count;
+  if (destination_device == source_device) {
+    CHECK(gpuSetDevice(destination_device));
+    CHECK(gpuMemcpy(destination, source, bytes, gpuMemcpyDeviceToDevice));
+    return;
+  }
+  CHECK(gpuMemcpyPeer(destination, destination_device, source, source_device, bytes));
+}
+
+template <typename T>
+void copy_gpu_vector_between_devices_(
+  const int destination_device,
+  GPU_Vector<T>& destination,
+  const int source_device,
+  const GPU_Vector<T>& source)
+{
+  if (destination.size() != source.size()) {
+    PRINT_INPUT_ERROR("Cannot copy between GPU vectors with inconsistent sizes.\n");
+  }
+  copy_gpu_buffer_between_devices_(
+    destination_device, destination.data(), source_device, source.data(), destination.size());
+}
+
+} // namespace
+
 void Ensemble_PIMD::initialize_rng()
 {
 #ifdef DEBUG
@@ -182,7 +221,8 @@ Ensemble_PIMD::~Ensemble_PIMD(void)
   // nothing
 }
 
-void Ensemble_PIMD::clone_atom_to_current_device_(const Atom& source, Atom& destination)
+void Ensemble_PIMD::clone_atom_to_current_device_(
+  const Atom& source, Atom& destination, const int source_device, const int destination_device)
 {
   destination.number_of_atoms = source.number_of_atoms;
   destination.number_of_beads = source.number_of_beads;
@@ -194,14 +234,35 @@ void Ensemble_PIMD::clone_atom_to_current_device_(const Atom& source, Atom& dest
   destination.force_per_atom.resize(source.force_per_atom.size());
   destination.potential_per_atom.resize(source.potential_per_atom.size());
   destination.virial_per_atom.resize(source.virial_per_atom.size());
-  destination.type.copy_from_device(source.type.data());
-  destination.mass.copy_from_device(source.mass.data());
-  destination.charge.copy_from_device(source.charge.data());
-  destination.position_per_atom.copy_from_device(source.position_per_atom.data());
-  destination.velocity_per_atom.copy_from_device(source.velocity_per_atom.data());
-  destination.force_per_atom.copy_from_device(source.force_per_atom.data());
-  destination.potential_per_atom.copy_from_device(source.potential_per_atom.data());
-  destination.virial_per_atom.copy_from_device(source.virial_per_atom.data());
+  copy_gpu_vector_between_devices_(destination_device, destination.type, source_device, source.type);
+  copy_gpu_vector_between_devices_(destination_device, destination.mass, source_device, source.mass);
+  copy_gpu_vector_between_devices_(
+    destination_device, destination.charge, source_device, source.charge);
+  copy_gpu_vector_between_devices_(
+    destination_device,
+    destination.position_per_atom,
+    source_device,
+    source.position_per_atom);
+  copy_gpu_vector_between_devices_(
+    destination_device,
+    destination.velocity_per_atom,
+    source_device,
+    source.velocity_per_atom);
+  copy_gpu_vector_between_devices_(
+    destination_device,
+    destination.force_per_atom,
+    source_device,
+    source.force_per_atom);
+  copy_gpu_vector_between_devices_(
+    destination_device,
+    destination.potential_per_atom,
+    source_device,
+    source.potential_per_atom);
+  copy_gpu_vector_between_devices_(
+    destination_device,
+    destination.virial_per_atom,
+    source_device,
+    source.virial_per_atom);
 
   destination.position_beads.resize(source.number_of_beads);
   destination.velocity_beads.resize(source.number_of_beads);
@@ -214,11 +275,19 @@ void Ensemble_PIMD::clone_atom_to_current_device_(const Atom& source, Atom& dest
     destination.force_beads[k].resize(source.force_beads[k].size());
     destination.potential_beads[k].resize(source.potential_beads[k].size());
     destination.virial_beads[k].resize(source.virial_beads[k].size());
-    destination.position_beads[k].copy_from_device(source.position_beads[k].data());
-    destination.velocity_beads[k].copy_from_device(source.velocity_beads[k].data());
-    destination.force_beads[k].copy_from_device(source.force_beads[k].data());
-    destination.potential_beads[k].copy_from_device(source.potential_beads[k].data());
-    destination.virial_beads[k].copy_from_device(source.virial_beads[k].data());
+    copy_gpu_vector_between_devices_(
+      destination_device, destination.position_beads[k], source_device, source.position_beads[k]);
+    copy_gpu_vector_between_devices_(
+      destination_device, destination.velocity_beads[k], source_device, source.velocity_beads[k]);
+    copy_gpu_vector_between_devices_(
+      destination_device, destination.force_beads[k], source_device, source.force_beads[k]);
+    copy_gpu_vector_between_devices_(
+      destination_device,
+      destination.potential_beads[k],
+      source_device,
+      source.potential_beads[k]);
+    copy_gpu_vector_between_devices_(
+      destination_device, destination.virial_beads[k], source_device, source.virial_beads[k]);
   }
 }
 
@@ -235,9 +304,9 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
     replica->device_id = device_id;
     replica->bead_begin = device_id * number_of_beads / num_devices;
     replica->bead_end = (device_id + 1) * number_of_beads / num_devices;
-    clone_atom_to_current_device_(atom, replica->atom);
+    clone_atom_to_current_device_(atom, replica->atom, 0, device_id);
     replica->thermo.resize(thermo.size());
-    replica->thermo.copy_from_device(thermo.data());
+    copy_gpu_vector_between_devices_(device_id, replica->thermo, 0, thermo);
     if (num_target_pressure_components == 0) {
       replica->ensemble.reset(
         new Ensemble_PIMD(number_of_atoms, number_of_beads, temperature_coupling, replica->atom));
@@ -252,7 +321,8 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
         replica->atom));
     }
     replica->ensemble->temperature = temperature;
-    replica->ensemble->curand_states.copy_from_device(curand_states.data());
+    copy_gpu_vector_between_devices_(
+      device_id, replica->ensemble->curand_states, 0, curand_states);
     distributed_replicas_.push_back(std::move(replica));
   }
   CHECK(gpuSetDevice(0));
@@ -1112,10 +1182,6 @@ void Ensemble_PIMD::compute_force_distributed(
   const int owner0_begin = 0;
   const int owner0_end = number_of_beads / num_devices;
   const double initial_temperature = force.temperature;
-  const size_t position_bytes = sizeof(double) * number_of_atoms * 3;
-  const size_t potential_bytes = sizeof(double) * number_of_atoms;
-  const size_t force_bytes = sizeof(double) * number_of_atoms * 3;
-  const size_t virial_bytes = sizeof(double) * number_of_atoms * 9;
 
   force.compute_pimd_bead_range_on_device(
     0,
@@ -1158,35 +1224,40 @@ void Ensemble_PIMD::compute_force_distributed(
   }
 
   auto sync_bead =
-    [&](const int device_id, const std::vector<GPU_Vector<double>>& src_position_beads,
+    [&](const int destination_device,
+        const int source_device,
+        const std::vector<GPU_Vector<double>>& src_position_beads,
         const std::vector<GPU_Vector<double>>& src_potential_beads,
         const std::vector<GPU_Vector<double>>& src_force_beads,
         const std::vector<GPU_Vector<double>>& src_virial_beads,
         Atom& destination,
         const int bead_begin,
         const int bead_end) {
-      CHECK(gpuSetDevice(device_id));
       for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
-        CHECK(gpuMemcpy(
+        copy_gpu_buffer_between_devices_(
+          destination_device,
           destination.position_beads[bead_id].data(),
+          source_device,
           src_position_beads[bead_id].data(),
-          position_bytes,
-          gpuMemcpyDeviceToDevice));
-        CHECK(gpuMemcpy(
+          number_of_atoms * 3);
+        copy_gpu_buffer_between_devices_(
+          destination_device,
           destination.potential_beads[bead_id].data(),
+          source_device,
           src_potential_beads[bead_id].data(),
-          potential_bytes,
-          gpuMemcpyDeviceToDevice));
-        CHECK(gpuMemcpy(
+          number_of_atoms);
+        copy_gpu_buffer_between_devices_(
+          destination_device,
           destination.force_beads[bead_id].data(),
+          source_device,
           src_force_beads[bead_id].data(),
-          force_bytes,
-          gpuMemcpyDeviceToDevice));
-        CHECK(gpuMemcpy(
+          number_of_atoms * 3);
+        copy_gpu_buffer_between_devices_(
+          destination_device,
           destination.virial_beads[bead_id].data(),
+          source_device,
           src_virial_beads[bead_id].data(),
-          virial_bytes,
-          gpuMemcpyDeviceToDevice));
+          number_of_atoms * 9);
       }
     };
 
@@ -1194,6 +1265,7 @@ void Ensemble_PIMD::compute_force_distributed(
     auto& replica = *replica_ptr;
     sync_bead(
       0,
+      replica.device_id,
       replica.atom.position_beads,
       replica.atom.potential_beads,
       replica.atom.force_beads,
@@ -1207,6 +1279,7 @@ void Ensemble_PIMD::compute_force_distributed(
     auto& replica = *replica_ptr;
     sync_bead(
       replica.device_id,
+      0,
       atom.position_beads,
       atom.potential_beads,
       atom.force_beads,
@@ -1221,6 +1294,7 @@ void Ensemble_PIMD::compute_force_distributed(
       }
       sync_bead(
         replica.device_id,
+        other.device_id,
         other.atom.position_beads,
         other.atom.potential_beads,
         other.atom.force_beads,
