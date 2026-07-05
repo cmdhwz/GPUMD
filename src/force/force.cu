@@ -134,7 +134,7 @@ void Force::parse_potential(
     strcmp(potential_name, "nep4_zbl_charge3") == 0) {
     potential.reset(new NEP_Charge(param[1], number_of_atoms));
     is_nep = true;
-    primary_nep_model_path_.clear();
+    primary_nep_model_path_ = param[1];
     check_types(param[1]);
   } else if (
     strcmp(potential_name, "nep5") == 0 || strcmp(potential_name, "nep5_zbl") == 0 ||
@@ -258,7 +258,8 @@ bool Force::can_use_pimd_bead_gpu_parallel_() const
   }
   Potential* primary = potentials[0].get();
   return !primary->need_B_projection &&
-         (dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary));
+         (dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary) ||
+          dynamic_cast<NEP_Charge*>(primary));
 }
 
 void Force::refresh_pimd_bead_gpu_workers_()
@@ -275,7 +276,9 @@ void Force::refresh_pimd_bead_gpu_workers_()
     return;
   }
   Potential* primary = potentials[0].get();
-  if (!(dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary))) {
+  const bool is_nep_worker = dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary);
+  const bool is_qnep_worker = dynamic_cast<NEP_Charge*>(primary);
+  if (!(is_nep_worker || is_qnep_worker)) {
     return;
   }
   if (primary->need_B_projection) {
@@ -293,7 +296,11 @@ void Force::refresh_pimd_bead_gpu_workers_()
     CHECK(gpuSetDevice(device_id));
     std::unique_ptr<Force::PIMD_Bead_GPU_Worker> worker(new Force::PIMD_Bead_GPU_Worker());
     worker->device_id = device_id;
-    worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
+    if (is_qnep_worker) {
+      worker->potential.reset(new NEP_Charge(primary_nep_model_path_.c_str(), number_of_atoms_));
+    } else {
+      worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
+    }
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;
     worker->type.resize(number_of_atoms_);
@@ -348,7 +355,7 @@ void Force::compute_pimd_beads(
     if (pimd_bead_gpu_parallel_devices_ > 1 && !warned_once) {
       printf("Warning: falling back to serial PIMD bead force evaluation.\n");
       printf(
-        "    bead-to-GPU mode currently requires a single-potential NEP run without HNEMD/FCP.\n");
+        "    bead-to-GPU mode currently requires a single-potential NEP/qNEP run without HNEMD/FCP.\n");
       warned_once = true;
     }
     for (int k = 0; k < position_beads.size(); ++k) {
