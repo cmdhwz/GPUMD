@@ -379,25 +379,26 @@ void Force::compute_pimd_beads(
 
   box.set_is_orthogonal();
   const int number_of_atoms = type.size();
+  const int number_of_beads = int(position_beads.size());
+  const int number_of_workers = int(pimd_bead_gpu_workers_.size());
   const size_t type_bytes = sizeof(int) * number_of_atoms;
   const size_t position_bytes = sizeof(double) * number_of_atoms * 3;
   const size_t potential_bytes = sizeof(double) * number_of_atoms;
   const size_t force_bytes = sizeof(double) * number_of_atoms * 3;
   const size_t virial_bytes = sizeof(double) * number_of_atoms * 9;
+  const double initial_temperature = temperature;
 
   for (auto& worker_ptr : pimd_bead_gpu_workers_) {
     CHECK(gpuSetDevice(worker_ptr->device_id));
     CHECK(gpuMemcpy(worker_ptr->type.data(), type.data(), type_bytes, gpuMemcpyDeviceToDevice));
   }
 
-  for (int bead_begin = 0; bead_begin < int(position_beads.size());
-       bead_begin += int(pimd_bead_gpu_workers_.size())) {
-    const int batch_size =
-      std::min(int(pimd_bead_gpu_workers_.size()), int(position_beads.size()) - bead_begin);
-    for (int worker_id = 0; worker_id < batch_size; ++worker_id) {
-      const int bead_id = bead_begin + worker_id;
-      auto& worker = *pimd_bead_gpu_workers_[worker_id];
-      CHECK(gpuSetDevice(worker.device_id));
+  for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
+    const int bead_begin = worker_id * number_of_beads / number_of_workers;
+    const int bead_end = (worker_id + 1) * number_of_beads / number_of_workers;
+    auto& worker = *pimd_bead_gpu_workers_[worker_id];
+    CHECK(gpuSetDevice(worker.device_id));
+    for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
       CHECK(gpuMemcpy(
         worker.position.data(),
         position_beads[bead_id].data(),
@@ -418,10 +419,10 @@ void Force::compute_pimd_beads(
         worker.virial_per_atom.data());
       GPU_CHECK_KERNEL
 
-      temperature += delta_T;
+      const double bead_temperature = initial_temperature + (bead_id + 1) * delta_T;
       if (3 == worker.potential->nep_model_type) {
         worker.potential->compute(
-          temperature,
+          bead_temperature,
           box,
           worker.type,
           worker.position,
@@ -437,13 +438,7 @@ void Force::compute_pimd_beads(
           worker.force_per_atom,
           worker.virial_per_atom);
       }
-    }
 
-    for (int worker_id = 0; worker_id < batch_size; ++worker_id) {
-      const int bead_id = bead_begin + worker_id;
-      auto& worker = *pimd_bead_gpu_workers_[worker_id];
-      CHECK(gpuSetDevice(worker.device_id));
-      CHECK(gpuDeviceSynchronize());
       CHECK(gpuMemcpy(
         position_beads[bead_id].data(),
         worker.position.data(),
@@ -467,6 +462,11 @@ void Force::compute_pimd_beads(
     }
   }
 
+  for (auto& worker_ptr : pimd_bead_gpu_workers_) {
+    CHECK(gpuSetDevice(worker_ptr->device_id));
+    CHECK(gpuDeviceSynchronize());
+  }
+  temperature = initial_temperature + number_of_beads * delta_T;
   CHECK(gpuSetDevice(0));
 }
 
