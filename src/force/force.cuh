@@ -72,6 +72,20 @@ public:
     std::vector<GPU_Vector<double>>& virial_beads,
     std::vector<GPU_Vector<double>>& velocity_beads,
     GPU_Vector<double>& mass_per_atom);
+  void compute_pimd_bead_range_on_device(
+    int device_id,
+    Box& box,
+    GPU_Vector<int>& type,
+    std::vector<Group>& group,
+    std::vector<GPU_Vector<double>>& position_beads,
+    std::vector<GPU_Vector<double>>& potential_beads,
+    std::vector<GPU_Vector<double>>& force_beads,
+    std::vector<GPU_Vector<double>>& virial_beads,
+    std::vector<GPU_Vector<double>>& velocity_beads,
+    GPU_Vector<double>& mass_per_atom,
+    int bead_begin,
+    int bead_end,
+    double initial_temperature);
 
   void finalize();
 
@@ -88,6 +102,9 @@ public:
     const double T);
   void set_multiple_potentials_mode(std::string mode);
   void set_pimd_bead_gpu_parallel(const int num_devices);
+  int get_pimd_bead_gpu_parallel_devices() const { return pimd_bead_gpu_parallel_devices_; }
+  int get_pimd_bead_gpu_worker_count() const { return int(pimd_bead_gpu_workers_.size()); }
+  bool pimd_bead_gpu_parallel_available() const { return can_use_pimd_bead_gpu_parallel_(); }
 
   bool compute_hnemd_ = false;
   int compute_hnemdec_ = -1;
@@ -109,5 +126,6 @@ private:
 
   void check_types(const char* file_potential);
   bool can_use_pimd_bead_gpu_parallel_() const;
+  Potential* get_pimd_bead_potential_(int device_id) const;
   void refresh_pimd_bead_gpu_workers_();
 };

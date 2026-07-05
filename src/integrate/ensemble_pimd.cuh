@@ -21,12 +21,23 @@
 #else
   #include <curand_kernel.h>
 #endif
+#include <memory>
 #include <random>
 #include <vector>
 
 class Ensemble_PIMD : public Ensemble
 {
 public:
+  struct DistributedReplica
+  {
+    int device_id = 0;
+    int bead_begin = 0;
+    int bead_end = 0;
+    Atom atom;
+    GPU_Vector<double> thermo;
+    std::unique_ptr<Ensemble_PIMD> ensemble;
+  };
+
   Ensemble_PIMD(
     int number_of_atoms_input, int number_of_beads_input, bool thermostat_internal, Atom& atom);
 
@@ -57,6 +68,9 @@ public:
     Box& box,
     Atom& atom,
     GPU_Vector<double>& thermo);
+  void enable_distributed(int num_devices, Atom& atom, GPU_Vector<double>& thermo);
+  bool distributed_enabled() const { return distributed_enabled_; }
+  void compute_force_distributed(Force& force, Box& box, std::vector<Group>& group, Atom& atom);
 
 protected:
   int number_of_atoms = 0;
@@ -77,6 +91,24 @@ protected:
 
   void initialize(Atom& atom);
   void langevin(const double time_step, Atom& atom);
+  void compute1_local_(
+    const double time_step,
+    const std::vector<Group>& group,
+    Box& box,
+    Atom& atom,
+    GPU_Vector<double>& thermo);
+  void compute2_local_pre_pressure_(
+    const double time_step,
+    const std::vector<Group>& group,
+    Box& box,
+    Atom& atom,
+    GPU_Vector<double>& thermo);
+  void apply_pressure_local_orthogonal_(Atom& atom, double scale_factor[3]);
+  void apply_pressure_local_isotropic_(Atom& atom, double scale_factor);
+  void apply_pressure_local_triclinic_(Atom& atom, double mu[9]);
+  void clone_atom_to_current_device_(const Atom& source, Atom& destination);
   std::mt19937 rng;
   void initialize_rng();
+  bool distributed_enabled_ = false;
+  std::vector<std::unique_ptr<DistributedReplica>> distributed_replicas_;
 };

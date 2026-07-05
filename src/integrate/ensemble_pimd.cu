@@ -182,6 +182,83 @@ Ensemble_PIMD::~Ensemble_PIMD(void)
   // nothing
 }
 
+void Ensemble_PIMD::clone_atom_to_current_device_(const Atom& source, Atom& destination)
+{
+  destination.number_of_atoms = source.number_of_atoms;
+  destination.number_of_beads = source.number_of_beads;
+  destination.type.resize(source.type.size());
+  destination.mass.resize(source.mass.size());
+  destination.charge.resize(source.charge.size());
+  destination.position_per_atom.resize(source.position_per_atom.size());
+  destination.velocity_per_atom.resize(source.velocity_per_atom.size());
+  destination.force_per_atom.resize(source.force_per_atom.size());
+  destination.potential_per_atom.resize(source.potential_per_atom.size());
+  destination.virial_per_atom.resize(source.virial_per_atom.size());
+  destination.type.copy_from_device(source.type.data());
+  destination.mass.copy_from_device(source.mass.data());
+  destination.charge.copy_from_device(source.charge.data());
+  destination.position_per_atom.copy_from_device(source.position_per_atom.data());
+  destination.velocity_per_atom.copy_from_device(source.velocity_per_atom.data());
+  destination.force_per_atom.copy_from_device(source.force_per_atom.data());
+  destination.potential_per_atom.copy_from_device(source.potential_per_atom.data());
+  destination.virial_per_atom.copy_from_device(source.virial_per_atom.data());
+
+  destination.position_beads.resize(source.number_of_beads);
+  destination.velocity_beads.resize(source.number_of_beads);
+  destination.force_beads.resize(source.number_of_beads);
+  destination.potential_beads.resize(source.number_of_beads);
+  destination.virial_beads.resize(source.number_of_beads);
+  for (int k = 0; k < source.number_of_beads; ++k) {
+    destination.position_beads[k].resize(source.position_beads[k].size());
+    destination.velocity_beads[k].resize(source.velocity_beads[k].size());
+    destination.force_beads[k].resize(source.force_beads[k].size());
+    destination.potential_beads[k].resize(source.potential_beads[k].size());
+    destination.virial_beads[k].resize(source.virial_beads[k].size());
+    destination.position_beads[k].copy_from_device(source.position_beads[k].data());
+    destination.velocity_beads[k].copy_from_device(source.velocity_beads[k].data());
+    destination.force_beads[k].copy_from_device(source.force_beads[k].data());
+    destination.potential_beads[k].copy_from_device(source.potential_beads[k].data());
+    destination.virial_beads[k].copy_from_device(source.virial_beads[k].data());
+  }
+}
+
+void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<double>& thermo)
+{
+  if (distributed_enabled_ || num_devices <= 1) {
+    return;
+  }
+
+  distributed_replicas_.clear();
+  for (int device_id = 1; device_id < num_devices; ++device_id) {
+    CHECK(gpuSetDevice(device_id));
+    std::unique_ptr<DistributedReplica> replica(new DistributedReplica());
+    replica->device_id = device_id;
+    replica->bead_begin = device_id * number_of_beads / num_devices;
+    replica->bead_end = (device_id + 1) * number_of_beads / num_devices;
+    clone_atom_to_current_device_(atom, replica->atom);
+    replica->thermo.resize(thermo.size());
+    replica->thermo.copy_from_device(thermo.data());
+    if (num_target_pressure_components == 0) {
+      replica->ensemble.reset(
+        new Ensemble_PIMD(number_of_atoms, number_of_beads, temperature_coupling, replica->atom));
+    } else {
+      replica->ensemble.reset(new Ensemble_PIMD(
+        number_of_atoms,
+        number_of_beads,
+        temperature_coupling,
+        num_target_pressure_components,
+        target_pressure,
+        pressure_coupling,
+        replica->atom));
+    }
+    replica->ensemble->temperature = temperature;
+    replica->ensemble->curand_states.copy_from_device(curand_states.data());
+    distributed_replicas_.push_back(std::move(replica));
+  }
+  CHECK(gpuSetDevice(0));
+  distributed_enabled_ = !distributed_replicas_.empty();
+}
+
 static __global__ void gpu_nve_1(
   const int number_of_atoms,
   const int number_of_beads,
@@ -791,7 +868,7 @@ void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
   }
 }
 
-void Ensemble_PIMD::compute1(
+void Ensemble_PIMD::compute1_local_(
   const double time_step,
   const std::vector<Group>& group,
   Box& box,
@@ -819,7 +896,7 @@ void Ensemble_PIMD::compute1(
   GPU_CHECK_KERNEL
 }
 
-void Ensemble_PIMD::compute2(
+void Ensemble_PIMD::compute2_local_pre_pressure_(
   const double time_step,
   const std::vector<Group>& group,
   Box& box,
@@ -880,47 +957,280 @@ void Ensemble_PIMD::compute2(
   gpu_find_thermo<<<8, 1024>>>(
     box.get_volume(), number_of_atoms * K_B * temperature, sum_1024.data(), thermo.data());
   GPU_CHECK_KERNEL
+}
+
+void Ensemble_PIMD::apply_pressure_local_isotropic_(Atom& atom, const double scale_factor)
+{
+  gpu_pressure_isotropic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    number_of_atoms,
+    number_of_beads,
+    scale_factor,
+    position_beads.data(),
+    atom.position_per_atom.data());
+  GPU_CHECK_KERNEL
+}
+
+void Ensemble_PIMD::apply_pressure_local_orthogonal_(Atom& atom, double scale_factor[3])
+{
+  gpu_pressure_orthogonal<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    number_of_atoms,
+    number_of_beads,
+    scale_factor[0],
+    scale_factor[1],
+    scale_factor[2],
+    position_beads.data(),
+    atom.position_per_atom.data());
+  GPU_CHECK_KERNEL
+}
+
+void Ensemble_PIMD::apply_pressure_local_triclinic_(Atom& atom, double mu[9])
+{
+  gpu_pressure_triclinic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    number_of_atoms,
+    number_of_beads,
+    mu[0],
+    mu[1],
+    mu[2],
+    mu[3],
+    mu[4],
+    mu[5],
+    mu[6],
+    mu[7],
+    mu[8],
+    position_beads.data(),
+    atom.position_per_atom.data());
+  GPU_CHECK_KERNEL
+}
+
+void Ensemble_PIMD::compute1(
+  const double time_step,
+  const std::vector<Group>& group,
+  Box& box,
+  Atom& atom,
+  GPU_Vector<double>& thermo)
+{
+  compute1_local_(time_step, group, box, atom, thermo);
+  if (!distributed_enabled_) {
+    return;
+  }
+  for (auto& replica_ptr : distributed_replicas_) {
+    auto& replica = *replica_ptr;
+    CHECK(gpuSetDevice(replica.device_id));
+    replica.ensemble->temperature = temperature;
+    replica.ensemble->compute1_local_(time_step, group, box, replica.atom, replica.thermo);
+  }
+  CHECK(gpuSetDevice(0));
+}
+
+void Ensemble_PIMD::compute2(
+  const double time_step,
+  const std::vector<Group>& group,
+  Box& box,
+  Atom& atom,
+  GPU_Vector<double>& thermo)
+{
+  if (!distributed_enabled_) {
+    compute2_local_pre_pressure_(time_step, group, box, atom, thermo);
+    if (num_target_pressure_components == 1) {
+      double scale_factor;
+      cpu_pressure_isotropic(
+        rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
+      apply_pressure_local_isotropic_(atom, scale_factor);
+    } else if (num_target_pressure_components == 3) {
+      double scale_factor[3];
+      cpu_pressure_orthogonal(
+        rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
+      apply_pressure_local_orthogonal_(atom, scale_factor);
+    } else if (num_target_pressure_components == 6) {
+      double mu[9];
+      cpu_pressure_triclinic(
+        rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), mu);
+      apply_pressure_local_triclinic_(atom, mu);
+    }
+    return;
+  }
+
+  Box box_before = box;
+  compute2_local_pre_pressure_(time_step, group, box_before, atom, thermo);
+  for (auto& replica_ptr : distributed_replicas_) {
+    auto& replica = *replica_ptr;
+    CHECK(gpuSetDevice(replica.device_id));
+    replica.ensemble->temperature = temperature;
+    replica.ensemble->compute2_local_pre_pressure_(
+      time_step, group, box_before, replica.atom, replica.thermo);
+  }
 
   if (num_target_pressure_components == 1) {
     double scale_factor;
     cpu_pressure_isotropic(
       rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
-    gpu_pressure_isotropic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-      number_of_atoms,
-      number_of_beads,
-      scale_factor,
-      position_beads.data(),
-      atom.position_per_atom.data());
+    apply_pressure_local_isotropic_(atom, scale_factor);
+    for (auto& replica_ptr : distributed_replicas_) {
+      CHECK(gpuSetDevice(replica_ptr->device_id));
+      replica_ptr->ensemble->apply_pressure_local_isotropic_(replica_ptr->atom, scale_factor);
+    }
   } else if (num_target_pressure_components == 3) {
     double scale_factor[3];
     cpu_pressure_orthogonal(
       rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
-    gpu_pressure_orthogonal<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-      number_of_atoms,
-      number_of_beads,
-      scale_factor[0],
-      scale_factor[1],
-      scale_factor[2],
-      position_beads.data(),
-      atom.position_per_atom.data());
-    GPU_CHECK_KERNEL
+    apply_pressure_local_orthogonal_(atom, scale_factor);
+    for (auto& replica_ptr : distributed_replicas_) {
+      CHECK(gpuSetDevice(replica_ptr->device_id));
+      replica_ptr->ensemble->apply_pressure_local_orthogonal_(replica_ptr->atom, scale_factor);
+    }
   } else if (num_target_pressure_components == 6) {
     double mu[9];
     cpu_pressure_triclinic(
       rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), mu);
-    gpu_pressure_triclinic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-      number_of_atoms,
-      number_of_beads,
-      mu[0],
-      mu[1],
-      mu[2],
-      mu[3],
-      mu[4],
-      mu[5],
-      mu[6],
-      mu[7],
-      mu[8],
-      position_beads.data(),
-      atom.position_per_atom.data());
+    apply_pressure_local_triclinic_(atom, mu);
+    for (auto& replica_ptr : distributed_replicas_) {
+      CHECK(gpuSetDevice(replica_ptr->device_id));
+      replica_ptr->ensemble->apply_pressure_local_triclinic_(replica_ptr->atom, mu);
+    }
   }
+  CHECK(gpuSetDevice(0));
+}
+
+void Ensemble_PIMD::compute_force_distributed(
+  Force& force, Box& box, std::vector<Group>& group, Atom& atom)
+{
+  if (!distributed_enabled_) {
+    force.compute_pimd_beads(
+      box,
+      atom.type,
+      group,
+      atom.position_beads,
+      atom.potential_beads,
+      atom.force_beads,
+      atom.virial_beads,
+      atom.velocity_beads,
+      atom.mass);
+    return;
+  }
+
+  const int num_devices = int(distributed_replicas_.size()) + 1;
+  const int owner0_begin = 0;
+  const int owner0_end = number_of_beads / num_devices;
+  const double initial_temperature = force.temperature;
+  const size_t position_bytes = sizeof(double) * number_of_atoms * 3;
+  const size_t potential_bytes = sizeof(double) * number_of_atoms;
+  const size_t force_bytes = sizeof(double) * number_of_atoms * 3;
+  const size_t virial_bytes = sizeof(double) * number_of_atoms * 9;
+
+  force.compute_pimd_bead_range_on_device(
+    0,
+    box,
+    atom.type,
+    group,
+    atom.position_beads,
+    atom.potential_beads,
+    atom.force_beads,
+    atom.virial_beads,
+    atom.velocity_beads,
+    atom.mass,
+    owner0_begin,
+    owner0_end,
+    initial_temperature);
+
+  for (auto& replica_ptr : distributed_replicas_) {
+    auto& replica = *replica_ptr;
+    force.compute_pimd_bead_range_on_device(
+      replica.device_id,
+      box,
+      replica.atom.type,
+      group,
+      replica.atom.position_beads,
+      replica.atom.potential_beads,
+      replica.atom.force_beads,
+      replica.atom.virial_beads,
+      replica.atom.velocity_beads,
+      replica.atom.mass,
+      replica.bead_begin,
+      replica.bead_end,
+      initial_temperature);
+  }
+
+  CHECK(gpuSetDevice(0));
+  CHECK(gpuDeviceSynchronize());
+  for (auto& replica_ptr : distributed_replicas_) {
+    CHECK(gpuSetDevice(replica_ptr->device_id));
+    CHECK(gpuDeviceSynchronize());
+  }
+
+  auto sync_bead =
+    [&](const int device_id, const std::vector<GPU_Vector<double>>& src_position_beads,
+        const std::vector<GPU_Vector<double>>& src_potential_beads,
+        const std::vector<GPU_Vector<double>>& src_force_beads,
+        const std::vector<GPU_Vector<double>>& src_virial_beads,
+        Atom& destination,
+        const int bead_begin,
+        const int bead_end) {
+      CHECK(gpuSetDevice(device_id));
+      for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
+        CHECK(gpuMemcpy(
+          destination.position_beads[bead_id].data(),
+          src_position_beads[bead_id].data(),
+          position_bytes,
+          gpuMemcpyDeviceToDevice));
+        CHECK(gpuMemcpy(
+          destination.potential_beads[bead_id].data(),
+          src_potential_beads[bead_id].data(),
+          potential_bytes,
+          gpuMemcpyDeviceToDevice));
+        CHECK(gpuMemcpy(
+          destination.force_beads[bead_id].data(),
+          src_force_beads[bead_id].data(),
+          force_bytes,
+          gpuMemcpyDeviceToDevice));
+        CHECK(gpuMemcpy(
+          destination.virial_beads[bead_id].data(),
+          src_virial_beads[bead_id].data(),
+          virial_bytes,
+          gpuMemcpyDeviceToDevice));
+      }
+    };
+
+  for (auto& replica_ptr : distributed_replicas_) {
+    auto& replica = *replica_ptr;
+    sync_bead(
+      0,
+      replica.atom.position_beads,
+      replica.atom.potential_beads,
+      replica.atom.force_beads,
+      replica.atom.virial_beads,
+      atom,
+      replica.bead_begin,
+      replica.bead_end);
+  }
+
+  for (auto& replica_ptr : distributed_replicas_) {
+    auto& replica = *replica_ptr;
+    sync_bead(
+      replica.device_id,
+      atom.position_beads,
+      atom.potential_beads,
+      atom.force_beads,
+      atom.virial_beads,
+      replica.atom,
+      owner0_begin,
+      owner0_end);
+    for (auto& other_ptr : distributed_replicas_) {
+      auto& other = *other_ptr;
+      if (other.device_id == replica.device_id) {
+        continue;
+      }
+      sync_bead(
+        replica.device_id,
+        other.atom.position_beads,
+        other.atom.potential_beads,
+        other.atom.force_beads,
+        other.atom.virial_beads,
+        replica.atom,
+        other.bead_begin,
+        other.bead_end);
+    }
+  }
+
+  force.temperature = initial_temperature + number_of_beads * force.delta_T;
+  CHECK(gpuSetDevice(0));
 }

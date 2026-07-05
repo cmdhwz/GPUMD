@@ -262,6 +262,20 @@ bool Force::can_use_pimd_bead_gpu_parallel_() const
           dynamic_cast<NEP_Charge*>(primary));
 }
 
+Potential* Force::get_pimd_bead_potential_(const int device_id) const
+{
+  if (device_id == 0) {
+    return potentials[0].get();
+  }
+  for (const auto& worker_ptr : pimd_bead_gpu_workers_) {
+    if (worker_ptr->device_id == device_id) {
+      return worker_ptr->potential.get();
+    }
+  }
+  PRINT_INPUT_ERROR("Cannot find the requested GPU worker for PIMD bead parallel.\n");
+  return nullptr;
+}
+
 void Force::refresh_pimd_bead_gpu_workers_()
 {
   pimd_bead_gpu_workers_.clear();
@@ -468,6 +482,75 @@ void Force::compute_pimd_beads(
   }
   temperature = initial_temperature + number_of_beads * delta_T;
   CHECK(gpuSetDevice(0));
+}
+
+void Force::compute_pimd_bead_range_on_device(
+  const int device_id,
+  Box& box,
+  GPU_Vector<int>& type,
+  std::vector<Group>& group,
+  std::vector<GPU_Vector<double>>& position_beads,
+  std::vector<GPU_Vector<double>>& potential_beads,
+  std::vector<GPU_Vector<double>>& force_beads,
+  std::vector<GPU_Vector<double>>& virial_beads,
+  std::vector<GPU_Vector<double>>& velocity_beads,
+  GPU_Vector<double>& mass_per_atom,
+  const int bead_begin,
+  const int bead_end,
+  const double initial_temperature)
+{
+  (void)group;
+  (void)velocity_beads;
+  (void)mass_per_atom;
+
+  if (bead_begin >= bead_end) {
+    return;
+  }
+
+  CHECK(gpuSetDevice(device_id));
+  box.set_is_orthogonal();
+
+  Potential* potential = get_pimd_bead_potential_(device_id);
+  const int number_of_atoms = type.size();
+  for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
+    if (!is_fcp) {
+      gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+        number_of_atoms,
+        box,
+        position_beads[bead_id].data(),
+        position_beads[bead_id].data() + number_of_atoms,
+        position_beads[bead_id].data() + number_of_atoms * 2);
+    }
+
+    initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      force_beads[bead_id].data(),
+      force_beads[bead_id].data() + number_of_atoms,
+      force_beads[bead_id].data() + number_of_atoms * 2,
+      potential_beads[bead_id].data(),
+      virial_beads[bead_id].data());
+    GPU_CHECK_KERNEL
+
+    const double bead_temperature = initial_temperature + (bead_id + 1) * delta_T;
+    if (3 == potential->nep_model_type) {
+      potential->compute(
+        bead_temperature,
+        box,
+        type,
+        position_beads[bead_id],
+        potential_beads[bead_id],
+        force_beads[bead_id],
+        virial_beads[bead_id]);
+    } else {
+      potential->compute(
+        box,
+        type,
+        position_beads[bead_id],
+        potential_beads[bead_id],
+        force_beads[bead_id],
+        virial_beads[bead_id]);
+    }
+  }
 }
 
 // get the total force
