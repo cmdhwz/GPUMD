@@ -25,7 +25,6 @@ Run simulation according to the inputs in the run.in file.
 #include "electron_stop.cuh"
 #include "force/force.cuh"
 #include "integrate/ensemble.cuh"
-#include "integrate/ensemble_pimd.cuh"
 #include "integrate/integrate.cuh"
 #include "measure/active.cuh"
 #include "measure/adf.cuh"
@@ -218,32 +217,21 @@ void Run::execute_run_in()
 void Run::perform_a_run()
 {
   integrate.initialize(time_step, atom, box, group, thermo, number_of_steps);
-  Ensemble_PIMD* distributed_pimd = nullptr;
-  if (integrate.type == 33 && force.pimd_bead_gpu_parallel_available()) {
-    distributed_pimd = dynamic_cast<Ensemble_PIMD*>(integrate.ensemble.get());
-    if (distributed_pimd != nullptr) {
-      distributed_pimd->enable_distributed(force.get_pimd_bead_gpu_worker_count(), atom, thermo);
-    }
-  }
   mc.initialize();
   measure.initialize(number_of_steps, time_step, integrate, group, atom, box, force);
 
   // compute force for the first integrate step
   if (integrate.type == 33) { // thermostatted PIMD
-    if (distributed_pimd != nullptr && distributed_pimd->distributed_enabled()) {
-      distributed_pimd->compute_force_distributed(force, box, group, atom);
-    } else {
-      force.compute_pimd_beads(
-        box,
-        atom.type,
-        group,
-        atom.position_beads,
-        atom.potential_beads,
-        atom.force_beads,
-        atom.virial_beads,
-        atom.velocity_beads,
-        atom.mass);
-    }
+    force.compute_pimd_beads(
+      box,
+      atom.type,
+      group,
+      atom.position_beads,
+      atom.potential_beads,
+      atom.force_beads,
+      atom.virial_beads,
+      atom.velocity_beads,
+      atom.mass);
   } else if (integrate.type >= 31) { // RPMD/TRPMD
     for (int k = 0; k < integrate.number_of_beads; ++k) {
       force.compute(
@@ -286,20 +274,16 @@ void Run::perform_a_run()
     integrate.compute1(time_step, double(step) / number_of_steps, group, box, atom, thermo);
 
     if (integrate.type == 33) { // thermostatted PIMD
-      if (distributed_pimd != nullptr && distributed_pimd->distributed_enabled()) {
-        distributed_pimd->compute_force_distributed(force, box, group, atom);
-      } else {
-        force.compute_pimd_beads(
-          box,
-          atom.type,
-          group,
-          atom.position_beads,
-          atom.potential_beads,
-          atom.force_beads,
-          atom.virial_beads,
-          atom.velocity_beads,
-          atom.mass);
-      }
+      force.compute_pimd_beads(
+        box,
+        atom.type,
+        group,
+        atom.position_beads,
+        atom.potential_beads,
+        atom.force_beads,
+        atom.virial_beads,
+        atom.velocity_beads,
+        atom.mass);
     } else if (integrate.type >= 31) { // RPMD/TRPMD
       for (int k = 0; k < integrate.number_of_beads; ++k) {
         force.compute(

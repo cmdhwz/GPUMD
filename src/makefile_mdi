@@ -31,6 +31,9 @@ endif
 INC = -I. -Imain_gpumd
 LDFLAGS =
 LIBS = -lcublas -lcusolver -lcufft
+ifndef OS
+LIBS += -lpthread
+endif
 
 # MDI library linking
 ifdef MDI_LIB
