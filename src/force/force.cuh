@@ -114,9 +114,11 @@ public:
   void set_multiple_potentials_mode(std::string mode);
   void set_pimd_bead_gpu_parallel(const int num_devices);
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
+  void set_pimd_bead_profile(const bool enabled) { pimd_bead_profile_enabled_ = enabled; }
   int get_pimd_bead_gpu_parallel_devices() const { return pimd_bead_gpu_parallel_devices_; }
   int get_pimd_bead_gpu_worker_count() const { return int(pimd_bead_gpu_workers_.size()); }
   bool pimd_bead_gpu_parallel_available() const { return can_use_pimd_bead_gpu_parallel_(); }
+  bool pimd_bead_profile_enabled() const { return pimd_bead_profile_enabled_; }
   void reset_pimd_bead_timing();
   const PIMD_Bead_Timing& get_pimd_bead_timing() const { return pimd_bead_timing_; }
 
@@ -135,6 +137,7 @@ private:
   std::string multiple_potentials_mode_ = "observe"; // "observe" or "average"
   int pimd_bead_gpu_parallel_devices_ = 1;
   bool pimd_bead_neighbor_always_rebuild_ = true;
+  bool pimd_bead_profile_enabled_ = false;
   std::string primary_nep_model_path_;
   std::string atom_types[NUM_ELEMENTS];
   std::vector<std::unique_ptr<PIMD_Bead_GPU_Worker>> pimd_bead_gpu_workers_;
