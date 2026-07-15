@@ -50,7 +50,6 @@ private:
   void parse_neighbor(const char** param, int num_param);
   void parse_pimd_bead_gpu_parallel(const char** param, int num_param);
   void parse_pimd_bead_neighbor_rebuild(const char** param, int num_param);
-  void parse_pimd_bead_profile(const char** param, int num_param);
   void parse_velocity(const char** param, int num_param);
   void parse_change_box(const char** param, int num_param);
   void parse_read_pimd_restart(const char** param, int num_param);

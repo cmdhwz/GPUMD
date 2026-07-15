@@ -456,16 +456,10 @@ void Force::compute_pimd_beads(
   const int number_of_workers = int(pimd_bead_gpu_workers_.size());
   const double initial_temperature = temperature;
   using Clock = std::chrono::high_resolution_clock;
-  Clock::time_point total_begin;
-  if (pimd_bead_profile_enabled_) {
-    total_begin = Clock::now();
-  }
+  const auto total_begin = Clock::now();
 
   // Keep the authoritative coordinates on GPU 0 wrapped before staging remote beads.
-  Clock::time_point wrap_begin;
-  if (pimd_bead_profile_enabled_) {
-    wrap_begin = Clock::now();
-  }
+  const auto wrap_begin = Clock::now();
   CHECK(gpuSetDevice(0));
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -477,17 +471,12 @@ void Force::compute_pimd_beads(
   }
   GPU_CHECK_KERNEL
   CHECK(gpuDeviceSynchronize());
-  if (pimd_bead_profile_enabled_) {
-    pimd_bead_timing_.wrap_positions +=
-      std::chrono::duration<double>(Clock::now() - wrap_begin).count();
-  }
+  pimd_bead_timing_.wrap_positions +=
+    std::chrono::duration<double>(Clock::now() - wrap_begin).count();
 
   // Stage all remote coordinates first. Each remote bead then has dedicated buffers,
   // so force kernels can be queued without synchronizing and reusing one scratch output.
-  Clock::time_point stage_begin;
-  if (pimd_bead_profile_enabled_) {
-    stage_begin = Clock::now();
-  }
+  const auto stage_begin = Clock::now();
   for (int worker_id = 1; worker_id < number_of_workers; ++worker_id) {
     const int bead_begin = worker_id * number_of_beads / number_of_workers;
     const int bead_end = (worker_id + 1) * number_of_beads / number_of_workers;
@@ -507,25 +496,16 @@ void Force::compute_pimd_beads(
         size_t(number_of_atoms) * 3);
     }
   }
-  if (pimd_bead_profile_enabled_) {
-    pimd_bead_timing_.stage_remote +=
-      std::chrono::duration<double>(Clock::now() - stage_begin).count();
-  }
+  pimd_bead_timing_.stage_remote +=
+    std::chrono::duration<double>(Clock::now() - stage_begin).count();
 
-  Clock::time_point compute_begin;
-  std::vector<double> worker_compute;
-  if (pimd_bead_profile_enabled_) {
-    compute_begin = Clock::now();
-    worker_compute.resize(number_of_workers, 0.0);
-  }
+  const auto compute_begin = Clock::now();
+  std::vector<double> worker_compute(number_of_workers, 0.0);
   std::vector<std::thread> workers;
   workers.reserve(number_of_workers);
   for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
     workers.emplace_back([&, worker_id]() {
-      Clock::time_point worker_begin;
-      if (pimd_bead_profile_enabled_) {
-        worker_begin = Clock::now();
-      }
+      const auto worker_begin = Clock::now();
       const int bead_begin = worker_id * number_of_beads / number_of_workers;
       const int bead_end = (worker_id + 1) * number_of_beads / number_of_workers;
       auto& worker = *pimd_bead_gpu_workers_[worker_id];
@@ -575,32 +555,25 @@ void Force::compute_pimd_beads(
         }
       }
       CHECK(gpuDeviceSynchronize());
-      if (pimd_bead_profile_enabled_) {
-        worker_compute[worker_id] =
-          std::chrono::duration<double>(Clock::now() - worker_begin).count();
-      }
+      worker_compute[worker_id] =
+        std::chrono::duration<double>(Clock::now() - worker_begin).count();
     });
   }
   for (auto& worker : workers) {
     worker.join();
   }
-  if (pimd_bead_profile_enabled_) {
-    pimd_bead_timing_.compute_workers +=
-      std::chrono::duration<double>(Clock::now() - compute_begin).count();
-    if (pimd_bead_timing_.worker_compute.size() != size_t(number_of_workers)) {
-      pimd_bead_timing_.worker_compute.assign(number_of_workers, 0.0);
-    }
-    for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
-      pimd_bead_timing_.worker_compute[worker_id] += worker_compute[worker_id];
-    }
+  pimd_bead_timing_.compute_workers +=
+    std::chrono::duration<double>(Clock::now() - compute_begin).count();
+  if (pimd_bead_timing_.worker_compute.size() != size_t(number_of_workers)) {
+    pimd_bead_timing_.worker_compute.assign(number_of_workers, 0.0);
+  }
+  for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
+    pimd_bead_timing_.worker_compute[worker_id] += worker_compute[worker_id];
   }
 
   // PIMD integration and restart state stay authoritative on GPU 0. Coordinates
   // were wrapped before staging, so only force-related outputs need to return.
-  Clock::time_point gather_begin;
-  if (pimd_bead_profile_enabled_) {
-    gather_begin = Clock::now();
-  }
+  const auto gather_begin = Clock::now();
   for (int worker_id = 1; worker_id < number_of_workers; ++worker_id) {
     const int bead_begin = worker_id * number_of_beads / number_of_workers;
     const int bead_end = (worker_id + 1) * number_of_beads / number_of_workers;
@@ -628,18 +601,14 @@ void Force::compute_pimd_beads(
         size_t(number_of_atoms) * 9);
     }
   }
-  if (pimd_bead_profile_enabled_) {
-    pimd_bead_timing_.gather_remote +=
-      std::chrono::duration<double>(Clock::now() - gather_begin).count();
-  }
+  pimd_bead_timing_.gather_remote +=
+    std::chrono::duration<double>(Clock::now() - gather_begin).count();
 
   temperature = initial_temperature + number_of_beads * delta_T;
   CHECK(gpuSetDevice(0));
-  if (pimd_bead_profile_enabled_) {
-    pimd_bead_timing_.total +=
-      std::chrono::duration<double>(Clock::now() - total_begin).count();
-    ++pimd_bead_timing_.calls;
-  }
+  pimd_bead_timing_.total +=
+    std::chrono::duration<double>(Clock::now() - total_begin).count();
+  ++pimd_bead_timing_.calls;
 }
 
 void Force::compute_pimd_bead_range_on_device(

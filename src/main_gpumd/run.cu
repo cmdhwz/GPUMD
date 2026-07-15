@@ -261,8 +261,7 @@ void Run::perform_a_run()
 
   double initial_time_step = time_step;
   const bool profile_pimd_bead_parallel =
-    integrate.type == 33 && force.pimd_bead_gpu_parallel_available() &&
-    force.pimd_bead_profile_enabled();
+    integrate.type == 33 && force.pimd_bead_gpu_parallel_available();
   double pimd_compute1_time = 0.0;
   double pimd_compute2_time = 0.0;
   if (profile_pimd_bead_parallel) {
@@ -463,8 +462,6 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_bead_gpu_parallel(param, num_param);
   } else if (strcmp(param[0], "pimd_bead_neighbor_rebuild") == 0) {
     parse_pimd_bead_neighbor_rebuild(param, num_param);
-  } else if (strcmp(param[0], "pimd_bead_profile") == 0) {
-    parse_pimd_bead_profile(param, num_param);
   } else if (strcmp(param[0], "read_pimd_restart") == 0) {
     parse_read_pimd_restart(param, num_param);
   } else if (strcmp(param[0], "time_step") == 0) {
@@ -743,22 +740,6 @@ void Run::parse_pimd_bead_neighbor_rebuild(const char** param, int num_param)
     printf("PIMD bead GPU workers will rebuild neighbor lists for every bead.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_bead_neighbor_rebuild should be auto or always.\n");
-  }
-}
-
-void Run::parse_pimd_bead_profile(const char** param, int num_param)
-{
-  if (num_param != 2) {
-    PRINT_INPUT_ERROR("pimd_bead_profile should have 1 parameter.\n");
-  }
-  if (strcmp(param[1], "on") == 0) {
-    force.set_pimd_bead_profile(true);
-    printf("Enabled PIMD bead-parallel phase profiling.\n");
-  } else if (strcmp(param[1], "off") == 0) {
-    force.set_pimd_bead_profile(false);
-    printf("Disabled PIMD bead-parallel phase profiling.\n");
-  } else {
-    PRINT_INPUT_ERROR("pimd_bead_profile should be on or off.\n");
   }
 }
 
