@@ -76,6 +76,7 @@ Run simulation according to the inputs in the run.in file.
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
 #include "velocity.cuh"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -259,6 +260,13 @@ void Run::perform_a_run()
   }
 
   double initial_time_step = time_step;
+  const bool profile_pimd_bead_parallel =
+    integrate.type == 33 && force.pimd_bead_gpu_parallel_available();
+  double pimd_compute1_time = 0.0;
+  double pimd_compute2_time = 0.0;
+  if (profile_pimd_bead_parallel) {
+    force.reset_pimd_bead_timing();
+  }
 
   const auto time_begin = std::chrono::high_resolution_clock::now();
 
@@ -271,7 +279,18 @@ void Run::perform_a_run()
     global_time += time_step;
 
     integrate.current_step = step;
+    std::chrono::high_resolution_clock::time_point compute1_begin;
+    if (profile_pimd_bead_parallel) {
+      compute1_begin = std::chrono::high_resolution_clock::now();
+    }
     integrate.compute1(time_step, double(step) / number_of_steps, group, box, atom, thermo);
+    if (profile_pimd_bead_parallel) {
+      CHECK(gpuSetDevice(0));
+      CHECK(gpuDeviceSynchronize());
+      pimd_compute1_time += std::chrono::duration<double>(
+                              std::chrono::high_resolution_clock::now() - compute1_begin)
+                              .count();
+    }
 
     if (integrate.type == 33) { // thermostatted PIMD
       force.compute_pimd_beads(
@@ -316,7 +335,18 @@ void Run::perform_a_run()
     add_random_force.compute(step, atom);
     add_efield.compute(step, group, atom, force);
 
+    std::chrono::high_resolution_clock::time_point compute2_begin;
+    if (profile_pimd_bead_parallel) {
+      compute2_begin = std::chrono::high_resolution_clock::now();
+    }
     integrate.compute2(time_step, double(step) / number_of_steps, group, box, atom, thermo, force);
+    if (profile_pimd_bead_parallel) {
+      CHECK(gpuSetDevice(0));
+      CHECK(gpuDeviceSynchronize());
+      pimd_compute2_time += std::chrono::duration<double>(
+                              std::chrono::high_resolution_clock::now() - compute2_begin)
+                              .count();
+    }
 
     mc.compute(step, number_of_steps, atom, box, group);
 
@@ -348,6 +378,25 @@ void Run::perform_a_run()
   printf("Time used for this run = %g second.\n", time_used.count());
   double run_speed = atom.number_of_atoms * (number_of_steps * 1.0 / time_used.count());
   printf("Speed of this run = %g atom*step/second.\n", run_speed);
+  if (profile_pimd_bead_parallel) {
+    const auto& timing = force.get_pimd_bead_timing();
+    const double measured = pimd_compute1_time + timing.total + pimd_compute2_time;
+    const double other = std::max(0.0, time_used.count() - measured);
+    const auto percentage = [&](const double seconds) {
+      return time_used.count() > 0.0 ? seconds * 100.0 / time_used.count() : 0.0;
+    };
+    printf("PIMD bead-parallel timing (%lld force calls):\n", timing.calls);
+    printf("    compute1/integrator = %g s (%g%%).\n", pimd_compute1_time, percentage(pimd_compute1_time));
+    printf("    force/wrap positions = %g s (%g%%).\n", timing.wrap_positions, percentage(timing.wrap_positions));
+    printf("    force/stage remote = %g s (%g%%).\n", timing.stage_remote, percentage(timing.stage_remote));
+    printf("    force/worker wall = %g s (%g%%).\n", timing.compute_workers, percentage(timing.compute_workers));
+    for (size_t worker_id = 0; worker_id < timing.worker_compute.size(); ++worker_id) {
+      printf("        GPU %zu worker compute = %g s.\n", worker_id, timing.worker_compute[worker_id]);
+    }
+    printf("    force/gather remote = %g s (%g%%).\n", timing.gather_remote, percentage(timing.gather_remote));
+    printf("    compute2/integrator = %g s (%g%%).\n", pimd_compute2_time, percentage(pimd_compute2_time));
+    printf("    other run work = %g s (%g%%).\n", other, percentage(other));
+  }
   print_line_2();
 
   measure.finalize(atom, box, integrate, number_of_steps, time_step, integrate.temperature2);

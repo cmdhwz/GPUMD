@@ -26,6 +26,17 @@
 class Force
 {
 public:
+  struct PIMD_Bead_Timing
+  {
+    double total = 0.0;
+    double wrap_positions = 0.0;
+    double stage_remote = 0.0;
+    double compute_workers = 0.0;
+    double gather_remote = 0.0;
+    long long calls = 0;
+    std::vector<double> worker_compute;
+  };
+
   struct PIMD_Bead_GPU_Worker
   {
     int device_id = 0;
@@ -105,6 +116,8 @@ public:
   int get_pimd_bead_gpu_parallel_devices() const { return pimd_bead_gpu_parallel_devices_; }
   int get_pimd_bead_gpu_worker_count() const { return int(pimd_bead_gpu_workers_.size()); }
   bool pimd_bead_gpu_parallel_available() const { return can_use_pimd_bead_gpu_parallel_(); }
+  void reset_pimd_bead_timing();
+  const PIMD_Bead_Timing& get_pimd_bead_timing() const { return pimd_bead_timing_; }
 
   bool compute_hnemd_ = false;
   int compute_hnemdec_ = -1;
@@ -123,6 +136,7 @@ private:
   std::string primary_nep_model_path_;
   std::string atom_types[NUM_ELEMENTS];
   std::vector<std::unique_ptr<PIMD_Bead_GPU_Worker>> pimd_bead_gpu_workers_;
+  PIMD_Bead_Timing pimd_bead_timing_;
 
   void check_types(const char* file_potential);
   bool can_use_pimd_bead_gpu_parallel_() const;
