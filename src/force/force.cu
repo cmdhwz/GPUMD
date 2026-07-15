@@ -60,6 +60,22 @@ static __global__ void initialize_properties(
 
 static __global__ void gpu_apply_pbc(int N, Box box, double* g_x, double* g_y, double* g_z);
 
+template <typename T>
+static void copy_gpu_buffer_between_devices(
+  const int dst_device, T* dst, const int src_device, const T* src, const size_t count)
+{
+  if (count == 0) {
+    return;
+  }
+  const size_t bytes = sizeof(T) * count;
+  if (dst_device == src_device) {
+    CHECK(gpuSetDevice(dst_device));
+    CHECK(gpuMemcpy(dst, src, bytes, gpuMemcpyDeviceToDevice));
+  } else {
+    CHECK(gpuMemcpyPeer(dst, dst_device, src, src_device, bytes));
+  }
+}
+
 static void ensure_pimd_worker_bead_buffers(
   Force::PIMD_Bead_GPU_Worker& worker, const int number_of_beads, const int number_of_atoms)
 {
@@ -86,105 +102,6 @@ Force::Force(void)
 {
   is_fcp = false;
   has_non_nep = false;
-}
-
-Force::~Force(void)
-{
-  stop_pimd_bead_worker_threads_();
-  clear_pimd_bead_gpu_workers_();
-}
-
-void Force::clear_pimd_bead_gpu_workers_()
-{
-  for (auto& worker : pimd_bead_gpu_workers_) {
-    CHECK(gpuSetDevice(worker->device_id));
-    if (worker->copy_stream != nullptr) {
-      CHECK(gpuStreamDestroy(worker->copy_stream));
-      worker->copy_stream = nullptr;
-    }
-    worker.reset();
-  }
-  pimd_bead_gpu_workers_.clear();
-  CHECK(gpuSetDevice(0));
-}
-
-void Force::start_pimd_bead_worker_threads_()
-{
-  if (pimd_bead_gpu_workers_.size() <= 1 || !pimd_bead_worker_threads_.empty()) {
-    return;
-  }
-  pimd_bead_workers_stop_ = false;
-  pimd_bead_worker_generation_ = 0;
-  pimd_bead_workers_completed_ = 0;
-  pimd_bead_worker_threads_.reserve(pimd_bead_gpu_workers_.size());
-  for (int worker_id = 0; worker_id < int(pimd_bead_gpu_workers_.size()); ++worker_id) {
-    pimd_bead_worker_threads_.emplace_back([this, worker_id]() {
-      CHECK(gpuSetDevice(pimd_bead_gpu_workers_[worker_id]->device_id));
-      size_t observed_generation = 0;
-      while (true) {
-        std::function<void(int)> task;
-        {
-          std::unique_lock<std::mutex> lock(pimd_bead_worker_mutex_);
-          pimd_bead_worker_start_.wait(lock, [&]() {
-            return pimd_bead_workers_stop_ ||
-                   pimd_bead_worker_generation_ != observed_generation;
-          });
-          if (pimd_bead_workers_stop_) {
-            return;
-          }
-          observed_generation = pimd_bead_worker_generation_;
-          task = pimd_bead_worker_task_;
-        }
-
-        task(worker_id);
-
-        {
-          std::lock_guard<std::mutex> lock(pimd_bead_worker_mutex_);
-          ++pimd_bead_workers_completed_;
-          if (pimd_bead_workers_completed_ == int(pimd_bead_worker_threads_.size())) {
-            pimd_bead_worker_done_.notify_one();
-          }
-        }
-      }
-    });
-  }
-}
-
-void Force::stop_pimd_bead_worker_threads_()
-{
-  if (pimd_bead_worker_threads_.empty()) {
-    return;
-  }
-  {
-    std::lock_guard<std::mutex> lock(pimd_bead_worker_mutex_);
-    pimd_bead_workers_stop_ = true;
-  }
-  pimd_bead_worker_start_.notify_all();
-  for (auto& thread : pimd_bead_worker_threads_) {
-    thread.join();
-  }
-  pimd_bead_worker_threads_.clear();
-  pimd_bead_worker_task_ = nullptr;
-  pimd_bead_workers_stop_ = false;
-  pimd_bead_worker_generation_ = 0;
-  pimd_bead_workers_completed_ = 0;
-}
-
-void Force::run_pimd_bead_worker_task_(std::function<void(int)> task)
-{
-  {
-    std::lock_guard<std::mutex> lock(pimd_bead_worker_mutex_);
-    pimd_bead_worker_task_ = std::move(task);
-    pimd_bead_workers_completed_ = 0;
-    ++pimd_bead_worker_generation_;
-  }
-  pimd_bead_worker_start_.notify_all();
-
-  std::unique_lock<std::mutex> lock(pimd_bead_worker_mutex_);
-  pimd_bead_worker_done_.wait(lock, [&]() {
-    return pimd_bead_workers_completed_ == int(pimd_bead_worker_threads_.size());
-  });
-  pimd_bead_worker_task_ = nullptr;
 }
 
 void Force::check_types(const char* file_potential)
@@ -418,8 +335,7 @@ Potential* Force::get_pimd_bead_potential_(const int device_id) const
 
 void Force::refresh_pimd_bead_gpu_workers_()
 {
-  stop_pimd_bead_worker_threads_();
-  clear_pimd_bead_gpu_workers_();
+  pimd_bead_gpu_workers_.clear();
   if (potentials.size() == 1 && potentials[0]) {
     potentials[0]->set_neighbor_rebuild(false);
   }
@@ -465,13 +381,9 @@ void Force::refresh_pimd_bead_gpu_workers_()
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;
     worker->type.resize(number_of_atoms_);
-    if (device_id > 0) {
-      CHECK(gpuStreamCreate(&worker->copy_stream));
-    }
     pimd_bead_gpu_workers_.push_back(std::move(worker));
   }
   CHECK(gpuSetDevice(0));
-  start_pimd_bead_worker_threads_();
 }
 
 static __global__ void gpu_add_driving_force(
@@ -546,7 +458,7 @@ void Force::compute_pimd_beads(
   using Clock = std::chrono::high_resolution_clock;
   const auto total_begin = Clock::now();
 
-  // Wrap the coordinates after compute1 advances the ring polymer positions.
+  // Keep the authoritative coordinates on GPU 0 wrapped before staging remote beads.
   const auto wrap_begin = Clock::now();
   CHECK(gpuSetDevice(0));
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
@@ -572,40 +484,33 @@ void Force::compute_pimd_beads(
     auto& worker = *pimd_bead_gpu_workers_[worker_id];
     CHECK(gpuSetDevice(worker.device_id));
     ensure_pimd_worker_bead_buffers(worker, local_beads, number_of_atoms);
-    CHECK(gpuMemcpyPeerAsync(
-      worker.type.data(),
-      worker.device_id,
-      type.data(),
-      0,
-      sizeof(int) * size_t(number_of_atoms),
-      worker.copy_stream));
+    copy_gpu_buffer_between_devices(
+      worker.device_id, worker.type.data(), 0, type.data(), number_of_atoms);
     for (int local_bead = 0; local_bead < local_beads; ++local_bead) {
       const int bead_id = bead_begin + local_bead;
-      CHECK(gpuMemcpyPeerAsync(
-        worker.position_beads[local_bead].data(),
+      copy_gpu_buffer_between_devices(
         worker.device_id,
-        position_beads[bead_id].data(),
+        worker.position_beads[local_bead].data(),
         0,
-        sizeof(double) * size_t(number_of_atoms) * 3,
-        worker.copy_stream));
+        position_beads[bead_id].data(),
+        size_t(number_of_atoms) * 3);
     }
-  }
-  for (int worker_id = 1; worker_id < number_of_workers; ++worker_id) {
-    auto& worker = *pimd_bead_gpu_workers_[worker_id];
-    CHECK(gpuSetDevice(worker.device_id));
-    CHECK(gpuStreamSynchronize(worker.copy_stream));
   }
   pimd_bead_timing_.stage_remote +=
     std::chrono::duration<double>(Clock::now() - stage_begin).count();
 
   const auto compute_begin = Clock::now();
   std::vector<double> worker_compute(number_of_workers, 0.0);
-  run_pimd_bead_worker_task_([&](const int worker_id) {
+  std::vector<std::thread> workers;
+  workers.reserve(number_of_workers);
+  for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
+    workers.emplace_back([&, worker_id]() {
       const auto worker_begin = Clock::now();
       const int bead_begin = worker_id * number_of_beads / number_of_workers;
       const int bead_end = (worker_id + 1) * number_of_beads / number_of_workers;
       auto& worker = *pimd_bead_gpu_workers_[worker_id];
       const int device_id = worker.device_id;
+      CHECK(gpuSetDevice(device_id));
       Box worker_box = box;
 
       for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
@@ -653,6 +558,10 @@ void Force::compute_pimd_beads(
       worker_compute[worker_id] =
         std::chrono::duration<double>(Clock::now() - worker_begin).count();
     });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
   pimd_bead_timing_.compute_workers +=
     std::chrono::duration<double>(Clock::now() - compute_begin).count();
   if (pimd_bead_timing_.worker_compute.size() != size_t(number_of_workers)) {
@@ -672,33 +581,25 @@ void Force::compute_pimd_beads(
     CHECK(gpuSetDevice(worker.device_id));
     for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
       const int local_bead = bead_id - bead_begin;
-      CHECK(gpuMemcpyPeerAsync(
+      copy_gpu_buffer_between_devices(
+        0,
         potential_beads[bead_id].data(),
-        0,
+        worker.device_id,
         worker.potential_beads[local_bead].data(),
-        worker.device_id,
-        sizeof(double) * size_t(number_of_atoms),
-        worker.copy_stream));
-      CHECK(gpuMemcpyPeerAsync(
+        number_of_atoms);
+      copy_gpu_buffer_between_devices(
+        0,
         force_beads[bead_id].data(),
-        0,
+        worker.device_id,
         worker.force_beads[local_bead].data(),
-        worker.device_id,
-        sizeof(double) * size_t(number_of_atoms) * 3,
-        worker.copy_stream));
-      CHECK(gpuMemcpyPeerAsync(
-        virial_beads[bead_id].data(),
+        size_t(number_of_atoms) * 3);
+      copy_gpu_buffer_between_devices(
         0,
-        worker.virial_beads[local_bead].data(),
+        virial_beads[bead_id].data(),
         worker.device_id,
-        sizeof(double) * size_t(number_of_atoms) * 9,
-        worker.copy_stream));
+        worker.virial_beads[local_bead].data(),
+        size_t(number_of_atoms) * 9);
     }
-  }
-  for (int worker_id = 1; worker_id < number_of_workers; ++worker_id) {
-    auto& worker = *pimd_bead_gpu_workers_[worker_id];
-    CHECK(gpuSetDevice(worker.device_id));
-    CHECK(gpuStreamSynchronize(worker.copy_stream));
   }
   pimd_bead_timing_.gather_remote +=
     std::chrono::duration<double>(Clock::now() - gather_begin).count();
