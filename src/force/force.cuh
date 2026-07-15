@@ -31,10 +31,10 @@ public:
     int device_id = 0;
     std::unique_ptr<Potential> potential;
     GPU_Vector<int> type;
-    GPU_Vector<double> position;
-    GPU_Vector<double> potential_per_atom;
-    GPU_Vector<double> force_per_atom;
-    GPU_Vector<double> virial_per_atom;
+    std::vector<GPU_Vector<double>> position_beads;
+    std::vector<GPU_Vector<double>> potential_beads;
+    std::vector<GPU_Vector<double>> force_beads;
+    std::vector<GPU_Vector<double>> virial_beads;
   };
 
   Force(void);

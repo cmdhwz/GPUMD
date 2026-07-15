@@ -75,6 +75,28 @@ static void copy_gpu_buffer_between_devices(
   }
 }
 
+static void ensure_pimd_worker_bead_buffers(
+  Force::PIMD_Bead_GPU_Worker& worker, const int number_of_beads, const int number_of_atoms)
+{
+  if (!worker.position_beads.empty()) {
+    if (int(worker.position_beads.size()) != number_of_beads) {
+      PRINT_INPUT_ERROR("Cannot change the number of PIMD beads between runs.\n");
+    }
+    return;
+  }
+
+  worker.position_beads.resize(number_of_beads);
+  worker.potential_beads.resize(number_of_beads);
+  worker.force_beads.resize(number_of_beads);
+  worker.virial_beads.resize(number_of_beads);
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    worker.position_beads[bead].resize(number_of_atoms * 3);
+    worker.potential_beads[bead].resize(number_of_atoms);
+    worker.force_beads[bead].resize(number_of_atoms * 3);
+    worker.virial_beads[bead].resize(number_of_atoms * 9);
+  }
+}
+
 Force::Force(void)
 {
   is_fcp = false;
@@ -341,10 +363,6 @@ void Force::refresh_pimd_bead_gpu_workers_()
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;
     worker->type.resize(number_of_atoms_);
-    worker->position.resize(number_of_atoms_ * 3);
-    worker->potential_per_atom.resize(number_of_atoms_);
-    worker->force_per_atom.resize(number_of_atoms_ * 3);
-    worker->virial_per_atom.resize(number_of_atoms_ * 9);
     pimd_bead_gpu_workers_.push_back(std::move(worker));
   }
   CHECK(gpuSetDevice(0));
@@ -419,6 +437,42 @@ void Force::compute_pimd_beads(
   const int number_of_beads = int(position_beads.size());
   const int number_of_workers = int(pimd_bead_gpu_workers_.size());
   const double initial_temperature = temperature;
+
+  // Keep the authoritative coordinates on GPU 0 wrapped before staging remote beads.
+  CHECK(gpuSetDevice(0));
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      box,
+      position_beads[bead_id].data(),
+      position_beads[bead_id].data() + number_of_atoms,
+      position_beads[bead_id].data() + number_of_atoms * 2);
+  }
+  GPU_CHECK_KERNEL
+  CHECK(gpuDeviceSynchronize());
+
+  // Stage all remote coordinates first. Each remote bead then has dedicated buffers,
+  // so force kernels can be queued without synchronizing and reusing one scratch output.
+  for (int worker_id = 1; worker_id < number_of_workers; ++worker_id) {
+    const int bead_begin = worker_id * number_of_beads / number_of_workers;
+    const int bead_end = (worker_id + 1) * number_of_beads / number_of_workers;
+    const int local_beads = bead_end - bead_begin;
+    auto& worker = *pimd_bead_gpu_workers_[worker_id];
+    CHECK(gpuSetDevice(worker.device_id));
+    ensure_pimd_worker_bead_buffers(worker, local_beads, number_of_atoms);
+    copy_gpu_buffer_between_devices(
+      worker.device_id, worker.type.data(), 0, type.data(), number_of_atoms);
+    for (int local_bead = 0; local_bead < local_beads; ++local_bead) {
+      const int bead_id = bead_begin + local_bead;
+      copy_gpu_buffer_between_devices(
+        worker.device_id,
+        worker.position_beads[local_bead].data(),
+        0,
+        position_beads[bead_id].data(),
+        size_t(number_of_atoms) * 3);
+    }
+  }
+
   std::vector<std::thread> workers;
   workers.reserve(number_of_workers);
   for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
@@ -428,76 +482,48 @@ void Force::compute_pimd_beads(
       auto& worker = *pimd_bead_gpu_workers_[worker_id];
       const int device_id = worker.device_id;
       CHECK(gpuSetDevice(device_id));
-      copy_gpu_buffer_between_devices(device_id, worker.type.data(), 0, type.data(), number_of_atoms);
+      Box worker_box = box;
 
       for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
-        copy_gpu_buffer_between_devices(
-          device_id,
-          worker.position.data(),
-          0,
-          position_beads[bead_id].data(),
-          size_t(number_of_atoms) * 3);
+        const int local_bead = bead_id - bead_begin;
+        GPU_Vector<int>& worker_type = device_id == 0 ? type : worker.type;
+        GPU_Vector<double>& worker_position =
+          device_id == 0 ? position_beads[bead_id] : worker.position_beads[local_bead];
+        GPU_Vector<double>& worker_potential =
+          device_id == 0 ? potential_beads[bead_id] : worker.potential_beads[local_bead];
+        GPU_Vector<double>& worker_force =
+          device_id == 0 ? force_beads[bead_id] : worker.force_beads[local_bead];
+        GPU_Vector<double>& worker_virial =
+          device_id == 0 ? virial_beads[bead_id] : worker.virial_beads[local_bead];
 
-        gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-          number_of_atoms,
-          box,
-          worker.position.data(),
-          worker.position.data() + number_of_atoms,
-          worker.position.data() + number_of_atoms * 2);
         initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
           number_of_atoms,
-          worker.force_per_atom.data(),
-          worker.force_per_atom.data() + number_of_atoms,
-          worker.force_per_atom.data() + number_of_atoms * 2,
-          worker.potential_per_atom.data(),
-          worker.virial_per_atom.data());
+          worker_force.data(),
+          worker_force.data() + number_of_atoms,
+          worker_force.data() + number_of_atoms * 2,
+          worker_potential.data(),
+          worker_virial.data());
         GPU_CHECK_KERNEL
 
         const double bead_temperature = initial_temperature + (bead_id + 1) * delta_T;
         if (3 == worker.potential->nep_model_type) {
           worker.potential->compute(
             bead_temperature,
-            box,
-            worker.type,
-            worker.position,
-            worker.potential_per_atom,
-            worker.force_per_atom,
-            worker.virial_per_atom);
+            worker_box,
+            worker_type,
+            worker_position,
+            worker_potential,
+            worker_force,
+            worker_virial);
         } else {
           worker.potential->compute(
-            box,
-            worker.type,
-            worker.position,
-            worker.potential_per_atom,
-            worker.force_per_atom,
-            worker.virial_per_atom);
+            worker_box,
+            worker_type,
+            worker_position,
+            worker_potential,
+            worker_force,
+            worker_virial);
         }
-        CHECK(gpuDeviceSynchronize());
-
-        copy_gpu_buffer_between_devices(
-          0,
-          position_beads[bead_id].data(),
-          device_id,
-          worker.position.data(),
-          size_t(number_of_atoms) * 3);
-        copy_gpu_buffer_between_devices(
-          0,
-          potential_beads[bead_id].data(),
-          device_id,
-          worker.potential_per_atom.data(),
-          number_of_atoms);
-        copy_gpu_buffer_between_devices(
-          0,
-          force_beads[bead_id].data(),
-          device_id,
-          worker.force_per_atom.data(),
-          size_t(number_of_atoms) * 3);
-        copy_gpu_buffer_between_devices(
-          0,
-          virial_beads[bead_id].data(),
-          device_id,
-          worker.virial_per_atom.data(),
-          size_t(number_of_atoms) * 9);
       }
       CHECK(gpuDeviceSynchronize());
     });
@@ -505,6 +531,37 @@ void Force::compute_pimd_beads(
   for (auto& worker : workers) {
     worker.join();
   }
+
+  // PIMD integration and restart state stay authoritative on GPU 0. Coordinates
+  // were wrapped before staging, so only force-related outputs need to return.
+  for (int worker_id = 1; worker_id < number_of_workers; ++worker_id) {
+    const int bead_begin = worker_id * number_of_beads / number_of_workers;
+    const int bead_end = (worker_id + 1) * number_of_beads / number_of_workers;
+    auto& worker = *pimd_bead_gpu_workers_[worker_id];
+    CHECK(gpuSetDevice(worker.device_id));
+    for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
+      const int local_bead = bead_id - bead_begin;
+      copy_gpu_buffer_between_devices(
+        0,
+        potential_beads[bead_id].data(),
+        worker.device_id,
+        worker.potential_beads[local_bead].data(),
+        number_of_atoms);
+      copy_gpu_buffer_between_devices(
+        0,
+        force_beads[bead_id].data(),
+        worker.device_id,
+        worker.force_beads[local_bead].data(),
+        size_t(number_of_atoms) * 3);
+      copy_gpu_buffer_between_devices(
+        0,
+        virial_beads[bead_id].data(),
+        worker.device_id,
+        worker.virial_beads[local_bead].data(),
+        size_t(number_of_atoms) * 9);
+    }
+  }
+
   temperature = initial_temperature + number_of_beads * delta_T;
   CHECK(gpuSetDevice(0));
 }
