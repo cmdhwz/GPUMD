@@ -21,6 +21,7 @@
 #include "utilities/gpu_vector.cuh"
 #include "ewald.cuh"
 #include "pppm.cuh"
+#include <memory>
 
 struct NEP_Charge_Data {
   GPU_Vector<float> f12x; // 3-body or manybody partial forces
@@ -137,6 +138,14 @@ public:
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial);
 
+  bool compute_pimd_batch(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const std::vector<GPU_Vector<double>*>& position_beads,
+    const std::vector<GPU_Vector<double>*>& potential_beads,
+    const std::vector<GPU_Vector<double>*>& force_beads,
+    const std::vector<GPU_Vector<double>*>& virial_beads);
+
   const GPU_Vector<int>& get_NN_radial_ptr();
 
   const GPU_Vector<int>& get_NL_radial_ptr();
@@ -145,7 +154,8 @@ public:
 
   GPU_Vector<float>& get_bec_reference();
 
-  virtual void set_neighbor_rebuild(const bool value) { neighbor.set_always_rebuild(value); }
+  virtual void set_neighbor_rebuild(const bool value);
+  void set_neighbor_diagnostics(const bool enabled) { neighbor_diagnostics_enabled_ = enabled; }
 
 private:
   ParaMB paramb;
@@ -157,6 +167,49 @@ private:
   Ewald ewald;
   PPPM pppm;
   Neighbor neighbor;
+
+  struct PIMD_Bead_Data
+  {
+    std::unique_ptr<Neighbor> neighbor;
+    GPU_Vector<float> charge;
+    GPU_Vector<float> D_real;
+    GPU_Vector<float> bec;
+  };
+
+  struct PIMD_Batch_Data
+  {
+    int number_of_atoms = 0;
+    int number_of_beads = 0;
+    std::vector<std::unique_ptr<PIMD_Bead_Data>> beads;
+    std::vector<double*> position_ptrs_host;
+    std::vector<double*> potential_ptrs_host;
+    std::vector<double*> force_ptrs_host;
+    std::vector<double*> virial_ptrs_host;
+    GPU_Vector<double*> position_ptrs;
+    GPU_Vector<double*> potential_ptrs;
+    GPU_Vector<double*> force_ptrs;
+    GPU_Vector<double*> virial_ptrs;
+    GPU_Vector<int*> NN_global_ptrs;
+    GPU_Vector<int*> NL_global_ptrs;
+    GPU_Vector<float*> charge_ptrs;
+    GPU_Vector<float*> D_real_ptrs;
+    GPU_Vector<int> NN_radial;
+    GPU_Vector<int> NL_radial;
+    GPU_Vector<int> NN_angular;
+    GPU_Vector<int> NL_angular;
+    GPU_Vector<float> Fp;
+    GPU_Vector<float> charge_derivative;
+    GPU_Vector<float> sum_fxyz;
+    GPU_Vector<float> f12x;
+    GPU_Vector<float> f12y;
+    GPU_Vector<float> f12z;
+  };
+
+  std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
+  bool neighbor_always_rebuild_ = false;
+  bool neighbor_diagnostics_enabled_ = true;
+  long long neighbor_large_box_calls_ = 0;
+  long long neighbor_small_box_calls_ = 0;
 
   void update_potential(float* parameters, ANN& ann);
 
@@ -181,5 +234,11 @@ private:
   bool use_pppm = true; // use PPPM by default
   void check_ewald_pppm();
   bool has_dftd3 = false;
+  void initialize_pimd_batch_(
+    int number_of_atoms,
+    const std::vector<GPU_Vector<double>*>& position_beads,
+    const std::vector<GPU_Vector<double>*>& potential_beads,
+    const std::vector<GPU_Vector<double>*>& force_beads,
+    const std::vector<GPU_Vector<double>*>& virial_beads);
   void initialize_dftd3();
 };

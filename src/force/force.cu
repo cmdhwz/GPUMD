@@ -374,6 +374,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
     worker->device_id = device_id;
     if (is_qnep_worker) {
       worker->potential.reset(new NEP_Charge(primary_nep_model_path_.c_str(), number_of_atoms_));
+      dynamic_cast<NEP_Charge*>(worker->potential.get())->set_neighbor_diagnostics(false);
     } else {
       worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
     }
@@ -513,7 +514,40 @@ void Force::compute_pimd_beads(
       CHECK(gpuSetDevice(device_id));
       Box worker_box = box;
 
-      for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
+      bool used_pimd_batch = false;
+      if (pimd_qnep_bead_batch_enabled_) {
+        NEP_Charge* qnep = dynamic_cast<NEP_Charge*>(worker.potential.get());
+        if (qnep) {
+          std::vector<GPU_Vector<double>*> worker_positions;
+          std::vector<GPU_Vector<double>*> worker_potentials;
+          std::vector<GPU_Vector<double>*> worker_forces;
+          std::vector<GPU_Vector<double>*> worker_virials;
+          worker_positions.reserve(bead_end - bead_begin);
+          worker_potentials.reserve(bead_end - bead_begin);
+          worker_forces.reserve(bead_end - bead_begin);
+          worker_virials.reserve(bead_end - bead_begin);
+          for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
+            const int local_bead = bead_id - bead_begin;
+            worker_positions.push_back(
+              device_id == 0 ? &position_beads[bead_id] : &worker.position_beads[local_bead]);
+            worker_potentials.push_back(
+              device_id == 0 ? &potential_beads[bead_id] : &worker.potential_beads[local_bead]);
+            worker_forces.push_back(
+              device_id == 0 ? &force_beads[bead_id] : &worker.force_beads[local_bead]);
+            worker_virials.push_back(
+              device_id == 0 ? &virial_beads[bead_id] : &worker.virial_beads[local_bead]);
+          }
+          used_pimd_batch = qnep->compute_pimd_batch(
+            worker_box,
+            device_id == 0 ? type : worker.type,
+            worker_positions,
+            worker_potentials,
+            worker_forces,
+            worker_virials);
+        }
+      }
+
+      for (int bead_id = bead_begin; !used_pimd_batch && bead_id < bead_end; ++bead_id) {
         const int local_bead = bead_id - bead_begin;
         GPU_Vector<int>& worker_type = device_id == 0 ? type : worker.type;
         GPU_Vector<double>& worker_position =

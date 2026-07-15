@@ -462,6 +462,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_bead_gpu_parallel(param, num_param);
   } else if (strcmp(param[0], "pimd_bead_neighbor_rebuild") == 0) {
     parse_pimd_bead_neighbor_rebuild(param, num_param);
+  } else if (strcmp(param[0], "pimd_qnep_bead_batch") == 0) {
+    parse_pimd_qnep_bead_batch(param, num_param);
   } else if (strcmp(param[0], "read_pimd_restart") == 0) {
     parse_read_pimd_restart(param, num_param);
   } else if (strcmp(param[0], "time_step") == 0) {
@@ -740,6 +742,22 @@ void Run::parse_pimd_bead_neighbor_rebuild(const char** param, int num_param)
     printf("PIMD bead GPU workers will rebuild neighbor lists for every bead.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_bead_neighbor_rebuild should be auto or always.\n");
+  }
+}
+
+void Run::parse_pimd_qnep_bead_batch(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_qnep_bead_batch should have 1 parameter.\n");
+  }
+  if (strcmp(param[1], "on") == 0) {
+    force.set_pimd_qnep_bead_batch(true);
+    printf("Requested qNEP PIMD bead-batched local kernels.\n");
+  } else if (strcmp(param[1], "off") == 0) {
+    force.set_pimd_qnep_bead_batch(false);
+    printf("Disabled qNEP PIMD bead-batched local kernels.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_qnep_bead_batch should be on or off.\n");
   }
 }
 
