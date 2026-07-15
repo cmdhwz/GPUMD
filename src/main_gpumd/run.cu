@@ -460,6 +460,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     integrate.parse_ensemble(param, num_param, time_step, atom, box, group, thermo);
   } else if (strcmp(param[0], "pimd_bead_gpu_parallel") == 0) {
     parse_pimd_bead_gpu_parallel(param, num_param);
+  } else if (strcmp(param[0], "pimd_bead_neighbor_rebuild") == 0) {
+    parse_pimd_bead_neighbor_rebuild(param, num_param);
   } else if (strcmp(param[0], "read_pimd_restart") == 0) {
     parse_read_pimd_restart(param, num_param);
   } else if (strcmp(param[0], "time_step") == 0) {
@@ -722,6 +724,22 @@ void Run::parse_pimd_bead_gpu_parallel(const char** param, int num_param)
   } else {
     printf("Requested PIMD bead-to-GPU parallel force evaluation on %d GPUs.\n", num_devices);
     printf("    only the thermostatted PIMD path will use this scheduling rule.\n");
+  }
+}
+
+void Run::parse_pimd_bead_neighbor_rebuild(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_bead_neighbor_rebuild should have 1 parameter.\n");
+  }
+  if (strcmp(param[1], "auto") == 0) {
+    force.set_pimd_bead_neighbor_rebuild(false);
+    printf("PIMD bead GPU workers will rebuild neighbor lists based on the skin distance.\n");
+  } else if (strcmp(param[1], "always") == 0) {
+    force.set_pimd_bead_neighbor_rebuild(true);
+    printf("PIMD bead GPU workers will rebuild neighbor lists for every bead.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_bead_neighbor_rebuild should be auto or always.\n");
   }
 }
 

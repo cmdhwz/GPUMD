@@ -291,6 +291,17 @@ void Force::set_pimd_bead_gpu_parallel(const int num_devices)
   refresh_pimd_bead_gpu_workers_();
 }
 
+void Force::set_pimd_bead_neighbor_rebuild(const bool always_rebuild)
+{
+  pimd_bead_neighbor_always_rebuild_ = always_rebuild;
+  if (potentials.size() == 1 && potentials[0] && pimd_bead_gpu_parallel_devices_ > 1) {
+    potentials[0]->set_neighbor_rebuild(always_rebuild);
+  }
+  for (auto& worker : pimd_bead_gpu_workers_) {
+    worker->potential->set_neighbor_rebuild(always_rebuild);
+  }
+}
+
 bool Force::can_use_pimd_bead_gpu_parallel_() const
 {
   if (pimd_bead_gpu_parallel_devices_ <= 1 || pimd_bead_gpu_workers_.size() <= 1) {
@@ -355,7 +366,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
     return;
   }
 
-  primary->set_neighbor_rebuild(true);
+  primary->set_neighbor_rebuild(pimd_bead_neighbor_always_rebuild_);
 
   for (int device_id = 0; device_id < num_workers; ++device_id) {
     CHECK(gpuSetDevice(device_id));
@@ -366,7 +377,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
     } else {
       worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
     }
-    worker->potential->set_neighbor_rebuild(true);
+    worker->potential->set_neighbor_rebuild(pimd_bead_neighbor_always_rebuild_);
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;
     worker->type.resize(number_of_atoms_);
