@@ -32,6 +32,7 @@
 #define gpuMemcpyHostToHost hipMemcpyHostToHost
 #define gpuMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define gpuMemcpyPeer hipMemcpyPeer
+#define gpuMemcpyPeerAsync hipMemcpyPeerAsync
 #define gpuMemset hipMemset
 
 // error handling
@@ -53,6 +54,7 @@
 #define gpuStream_t hipStream_t
 #define gpuStreamCreate hipStreamCreate
 #define gpuStreamDestroy hipStreamDestroy
+#define gpuStreamSynchronize hipStreamSynchronize
 
 // random numbers
 #define gpurandState hiprandState
@@ -121,6 +123,7 @@
 #define gpuMemcpyHostToHost cudaMemcpyHostToHost
 #define gpuMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
 #define gpuMemcpyPeer cudaMemcpyPeer
+#define gpuMemcpyPeerAsync cudaMemcpyPeerAsync
 #define gpuMemset cudaMemset
 
 // error handling
@@ -142,6 +145,7 @@
 #define gpuStream_t cudaStream_t
 #define gpuStreamCreate cudaStreamCreate
 #define gpuStreamDestroy cudaStreamDestroy
+#define gpuStreamSynchronize cudaStreamSynchronize
 
 // random numbers
 #define gpurandState curandState

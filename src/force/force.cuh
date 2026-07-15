@@ -19,8 +19,12 @@
 #include "model/group.cuh"
 #include "potential.cuh"
 #include "utilities/common.cuh"
+#include <condition_variable>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdio.h>
+#include <thread>
 #include <vector>
 
 class Force
@@ -46,9 +50,11 @@ public:
     std::vector<GPU_Vector<double>> potential_beads;
     std::vector<GPU_Vector<double>> force_beads;
     std::vector<GPU_Vector<double>> virial_beads;
+    gpuStream_t copy_stream = nullptr;
   };
 
   Force(void);
+  ~Force(void);
 
   void
   parse_potential(const char** param, int num_param, const Box& box, const int number_of_atoms);
@@ -139,9 +145,21 @@ private:
   std::string atom_types[NUM_ELEMENTS];
   std::vector<std::unique_ptr<PIMD_Bead_GPU_Worker>> pimd_bead_gpu_workers_;
   PIMD_Bead_Timing pimd_bead_timing_;
+  std::vector<std::thread> pimd_bead_worker_threads_;
+  std::mutex pimd_bead_worker_mutex_;
+  std::condition_variable pimd_bead_worker_start_;
+  std::condition_variable pimd_bead_worker_done_;
+  std::function<void(int)> pimd_bead_worker_task_;
+  size_t pimd_bead_worker_generation_ = 0;
+  int pimd_bead_workers_completed_ = 0;
+  bool pimd_bead_workers_stop_ = false;
 
   void check_types(const char* file_potential);
   bool can_use_pimd_bead_gpu_parallel_() const;
   Potential* get_pimd_bead_potential_(int device_id) const;
+  void clear_pimd_bead_gpu_workers_();
+  void start_pimd_bead_worker_threads_();
+  void stop_pimd_bead_worker_threads_();
+  void run_pimd_bead_worker_task_(std::function<void(int)> task);
   void refresh_pimd_bead_gpu_workers_();
 };
