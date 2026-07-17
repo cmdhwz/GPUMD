@@ -114,7 +114,7 @@ public:
   void set_multiple_potentials_mode(std::string mode);
   void set_pimd_bead_gpu_parallel(const int num_devices);
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
-  void set_pimd_qnep_bead_batch(const bool enabled) { pimd_qnep_bead_batch_enabled_ = enabled; }
+  void set_pimd_qnep_bead_batch(const bool enabled);
   int get_pimd_bead_gpu_parallel_devices() const { return pimd_bead_gpu_parallel_devices_; }
   int get_pimd_bead_gpu_worker_count() const { return int(pimd_bead_gpu_workers_.size()); }
   bool pimd_bead_gpu_parallel_available() const { return can_use_pimd_bead_gpu_parallel_(); }
@@ -144,6 +144,14 @@ private:
 
   void check_types(const char* file_potential);
   bool can_use_pimd_bead_gpu_parallel_() const;
+  bool can_use_pimd_qnep_batch_() const;
+  bool try_compute_pimd_qnep_batch_(
+    Box& box,
+    GPU_Vector<int>& type,
+    std::vector<GPU_Vector<double>>& position_beads,
+    std::vector<GPU_Vector<double>>& potential_beads,
+    std::vector<GPU_Vector<double>>& force_beads,
+    std::vector<GPU_Vector<double>>& virial_beads);
   Potential* get_pimd_bead_potential_(int device_id) const;
   void refresh_pimd_bead_gpu_workers_();
 };
