@@ -115,6 +115,7 @@ public:
   void set_pimd_bead_gpu_parallel(const int num_devices);
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
   void set_pimd_qnep_bead_batch(const bool enabled);
+  void set_pimd_nep_bead_batch(const bool enabled);
   int get_pimd_bead_gpu_parallel_devices() const { return pimd_bead_gpu_parallel_devices_; }
   int get_pimd_bead_gpu_worker_count() const { return int(pimd_bead_gpu_workers_.size()); }
   bool pimd_bead_gpu_parallel_available() const { return can_use_pimd_bead_gpu_parallel_(); }
@@ -137,15 +138,25 @@ private:
   int pimd_bead_gpu_parallel_devices_ = 1;
   bool pimd_bead_neighbor_always_rebuild_ = true;
   bool pimd_qnep_bead_batch_enabled_ = false;
+  bool pimd_nep_bead_batch_enabled_ = false;
   std::string primary_nep_model_path_;
   std::string atom_types[NUM_ELEMENTS];
+  std::unique_ptr<Potential> pimd_nep_single_gpu_batch_potential_;
   std::vector<std::unique_ptr<PIMD_Bead_GPU_Worker>> pimd_bead_gpu_workers_;
   PIMD_Bead_Timing pimd_bead_timing_;
 
   void check_types(const char* file_potential);
   bool can_use_pimd_bead_gpu_parallel_() const;
   bool can_use_pimd_qnep_batch_() const;
+  bool can_use_pimd_nep_batch_() const;
   bool try_compute_pimd_qnep_batch_(
+    Box& box,
+    GPU_Vector<int>& type,
+    std::vector<GPU_Vector<double>>& position_beads,
+    std::vector<GPU_Vector<double>>& potential_beads,
+    std::vector<GPU_Vector<double>>& force_beads,
+    std::vector<GPU_Vector<double>>& virial_beads);
+  bool try_compute_pimd_nep_batch_(
     Box& box,
     GPU_Vector<int>& type,
     std::vector<GPU_Vector<double>>& position_beads,

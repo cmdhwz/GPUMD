@@ -222,7 +222,7 @@ void Run::perform_a_run()
   measure.initialize(number_of_steps, time_step, integrate, group, atom, box, force);
 
   // compute force for the first integrate step
-  if (integrate.type == 33) { // thermostatted PIMD
+  if (integrate.type >= 31 && integrate.type <= 33) { // RPMD/TRPMD/PIMD
     force.compute_pimd_beads(
       box,
       atom.type,
@@ -233,19 +233,6 @@ void Run::perform_a_run()
       atom.virial_beads,
       atom.velocity_beads,
       atom.mass);
-  } else if (integrate.type >= 31) { // RPMD/TRPMD
-    for (int k = 0; k < integrate.number_of_beads; ++k) {
-      force.compute(
-        box,
-        atom.position_beads[k],
-        atom.type,
-        group,
-        atom.potential_beads[k],
-        atom.force_beads[k],
-        atom.virial_beads[k],
-        atom.velocity_beads[k],
-        atom.mass);
-    }
   } else {
     force.compute(
       box,
@@ -261,7 +248,8 @@ void Run::perform_a_run()
 
   double initial_time_step = time_step;
   const bool profile_pimd_bead_parallel =
-    integrate.type == 33 && force.pimd_bead_gpu_parallel_available();
+    integrate.type >= 31 && integrate.type <= 33 &&
+    force.pimd_bead_gpu_parallel_available();
   double pimd_compute1_time = 0.0;
   double pimd_compute2_time = 0.0;
   if (profile_pimd_bead_parallel) {
@@ -292,7 +280,7 @@ void Run::perform_a_run()
                               .count();
     }
 
-    if (integrate.type == 33) { // thermostatted PIMD
+    if (integrate.type >= 31 && integrate.type <= 33) { // RPMD/TRPMD/PIMD
       force.compute_pimd_beads(
         box,
         atom.type,
@@ -303,19 +291,6 @@ void Run::perform_a_run()
         atom.virial_beads,
         atom.velocity_beads,
         atom.mass);
-    } else if (integrate.type >= 31) { // RPMD/TRPMD
-      for (int k = 0; k < integrate.number_of_beads; ++k) {
-        force.compute(
-          box,
-          atom.position_beads[k],
-          atom.type,
-          group,
-          atom.potential_beads[k],
-          atom.force_beads[k],
-          atom.virial_beads[k],
-          atom.velocity_beads[k],
-          atom.mass);
-      }
     } else {
       force.compute(
         box,
@@ -385,7 +360,7 @@ void Run::perform_a_run()
     const auto percentage = [&](const double seconds) {
       return time_used.count() > 0.0 ? seconds * 100.0 / time_used.count() : 0.0;
     };
-    printf("PIMD bead-parallel timing (%lld force calls):\n", timing.calls);
+    printf("Ring-polymer bead-parallel timing (%lld force calls):\n", timing.calls);
     printf("    compute1/integrator = %g s (%g%%).\n", pimd_compute1_time, percentage(pimd_compute1_time));
     printf("    force/wrap positions = %g s (%g%%).\n", timing.wrap_positions, percentage(timing.wrap_positions));
     printf("    force/stage remote = %g s (%g%%).\n", timing.stage_remote, percentage(timing.stage_remote));
@@ -464,6 +439,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_bead_neighbor_rebuild(param, num_param);
   } else if (strcmp(param[0], "pimd_qnep_bead_batch") == 0) {
     parse_pimd_qnep_bead_batch(param, num_param);
+  } else if (strcmp(param[0], "pimd_nep_bead_batch") == 0) {
+    parse_pimd_nep_bead_batch(param, num_param);
   } else if (strcmp(param[0], "read_pimd_restart") == 0) {
     parse_read_pimd_restart(param, num_param);
   } else if (strcmp(param[0], "time_step") == 0) {
@@ -725,7 +702,7 @@ void Run::parse_pimd_bead_gpu_parallel(const char** param, int num_param)
     printf("Disabled PIMD bead-to-GPU parallel force evaluation.\n");
   } else {
     printf("Requested PIMD bead-to-GPU parallel force evaluation on %d GPUs.\n", num_devices);
-    printf("    only the thermostatted PIMD path will use this scheduling rule.\n");
+    printf("    PIMD, RPMD, and TRPMD will use this scheduling rule.\n");
   }
 }
 
@@ -752,12 +729,28 @@ void Run::parse_pimd_qnep_bead_batch(const char** param, int num_param)
   }
   if (strcmp(param[1], "on") == 0) {
     force.set_pimd_qnep_bead_batch(true);
-    printf("Requested qNEP PIMD bead-batched local kernels.\n");
+    printf("Requested qNEP ring-polymer bead-batched local kernels.\n");
   } else if (strcmp(param[1], "off") == 0) {
     force.set_pimd_qnep_bead_batch(false);
-    printf("Disabled qNEP PIMD bead-batched local kernels.\n");
+    printf("Disabled qNEP ring-polymer bead-batched local kernels.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_qnep_bead_batch should be on or off.\n");
+  }
+}
+
+void Run::parse_pimd_nep_bead_batch(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_nep_bead_batch should have 1 parameter.\n");
+  }
+  if (strcmp(param[1], "on") == 0) {
+    force.set_pimd_nep_bead_batch(true);
+    printf("Requested NEP ring-polymer bead-batched kernels.\n");
+  } else if (strcmp(param[1], "off") == 0) {
+    force.set_pimd_nep_bead_batch(false);
+    printf("Disabled NEP ring-polymer bead-batched kernels.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_nep_bead_batch should be on or off.\n");
   }
 }
 

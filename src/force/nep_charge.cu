@@ -458,7 +458,7 @@ void NEP_Charge::initialize_pimd_batch_(
     batch.charge_ptrs.copy_from_host(charge_ptrs.data());
     batch.D_real_ptrs.copy_from_host(D_real_ptrs.data());
     printf(
-      "Using qNEP PIMD bead-batched local kernels for %d beads on one GPU.\n",
+      "Using qNEP ring-polymer bead-batched local kernels for %d beads on one GPU.\n",
       number_of_beads);
     fflush(stdout);
   }

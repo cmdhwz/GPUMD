@@ -120,6 +120,14 @@ public:
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial);
 
+  bool compute_pimd_batch(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const std::vector<GPU_Vector<double>*>& position_beads,
+    const std::vector<GPU_Vector<double>*>& potential_beads,
+    const std::vector<GPU_Vector<double>*>& force_beads,
+    const std::vector<GPU_Vector<double>*>& virial_beads);
+
   virtual void compute(
     const float temperature,
     Box& box,
@@ -133,7 +141,7 @@ public:
 
   const GPU_Vector<int>& get_NL_radial_ptr();
 
-  virtual void set_neighbor_rebuild(const bool value) { neighbor.set_always_rebuild(value); }
+  virtual void set_neighbor_rebuild(const bool value);
 
 private:
   ParaMB paramb;
@@ -142,6 +150,47 @@ private:
   ExpandedBox ebox;
   DFTD3 dftd3;
   Neighbor neighbor;
+
+  struct PIMD_Bead_Data
+  {
+    std::unique_ptr<Neighbor> neighbor;
+  };
+
+  struct PIMD_Batch_Data
+  {
+    int number_of_atoms = 0;
+    int number_of_beads = 0;
+    std::vector<std::unique_ptr<PIMD_Bead_Data>> beads;
+    std::vector<double*> position_ptrs_host;
+    std::vector<double*> potential_ptrs_host;
+    std::vector<double*> force_ptrs_host;
+    std::vector<double*> virial_ptrs_host;
+    GPU_Vector<double*> position_ptrs;
+    GPU_Vector<double*> potential_ptrs;
+    GPU_Vector<double*> force_ptrs;
+    GPU_Vector<double*> virial_ptrs;
+    GPU_Vector<int*> NN_global_ptrs;
+    GPU_Vector<int*> NL_global_ptrs;
+    GPU_Vector<int> NN_radial;
+    GPU_Vector<int> NL_radial;
+    GPU_Vector<int> NN_angular;
+    GPU_Vector<int> NL_angular;
+    GPU_Vector<float> Fp;
+    GPU_Vector<float> sum_fxyz;
+    GPU_Vector<float> f12x;
+    GPU_Vector<float> f12y;
+    GPU_Vector<float> f12z;
+  };
+
+  std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
+  bool neighbor_always_rebuild_ = false;
+
+  void initialize_pimd_batch_(
+    int number_of_atoms,
+    const std::vector<GPU_Vector<double>*>& position_beads,
+    const std::vector<GPU_Vector<double>*>& potential_beads,
+    const std::vector<GPU_Vector<double>*>& force_beads,
+    const std::vector<GPU_Vector<double>*>& virial_beads);
 
   void update_potential(float* parameters, ANN& ann);
 

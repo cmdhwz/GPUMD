@@ -296,11 +296,15 @@ void Force::set_pimd_bead_neighbor_rebuild(const bool always_rebuild)
   pimd_bead_neighbor_always_rebuild_ = always_rebuild;
   if (
     potentials.size() == 1 && potentials[0] &&
-    (pimd_bead_gpu_parallel_devices_ > 1 || pimd_qnep_bead_batch_enabled_)) {
+    (pimd_bead_gpu_parallel_devices_ > 1 || pimd_qnep_bead_batch_enabled_ ||
+     pimd_nep_bead_batch_enabled_)) {
     potentials[0]->set_neighbor_rebuild(always_rebuild);
   }
   for (auto& worker : pimd_bead_gpu_workers_) {
     worker->potential->set_neighbor_rebuild(always_rebuild);
+  }
+  if (pimd_nep_single_gpu_batch_potential_) {
+    pimd_nep_single_gpu_batch_potential_->set_neighbor_rebuild(always_rebuild);
   }
 }
 
@@ -309,6 +313,15 @@ void Force::set_pimd_qnep_bead_batch(const bool enabled)
   pimd_qnep_bead_batch_enabled_ = enabled;
   if (potentials.size() == 1 && dynamic_cast<NEP_Charge*>(potentials[0].get())) {
     potentials[0]->set_neighbor_rebuild(enabled ? pimd_bead_neighbor_always_rebuild_ : false);
+  }
+}
+
+void Force::set_pimd_nep_bead_batch(const bool enabled)
+{
+  pimd_nep_bead_batch_enabled_ = enabled;
+  if (potentials.size() == 1 && dynamic_cast<NEP*>(potentials[0].get())) {
+    potentials[0]->set_neighbor_rebuild(
+      enabled ? pimd_bead_neighbor_always_rebuild_ : false);
   }
 }
 
@@ -340,6 +353,21 @@ bool Force::can_use_pimd_qnep_batch_() const
   }
   Potential* primary = potentials[0].get();
   return primary && !primary->need_B_projection && dynamic_cast<NEP_Charge*>(primary);
+}
+
+bool Force::can_use_pimd_nep_batch_() const
+{
+  if (!pimd_nep_bead_batch_enabled_ || potentials.size() != 1 ||
+      multiple_potentials_mode_.compare("observe") != 0) {
+    return false;
+  }
+  if (is_fcp || compute_hnemd_ || compute_hnemdec_ != -1) {
+    return false;
+  }
+  Potential* primary = potentials[0].get();
+  return primary && !primary->need_B_projection &&
+         (dynamic_cast<NEP*>(primary) ||
+          (dynamic_cast<NEP_MULTIGPU*>(primary) && !primary_nep_model_path_.empty()));
 }
 
 bool Force::try_compute_pimd_qnep_batch_(
@@ -398,6 +426,73 @@ bool Force::try_compute_pimd_qnep_batch_(
   return used_batch;
 }
 
+bool Force::try_compute_pimd_nep_batch_(
+  Box& box,
+  GPU_Vector<int>& type,
+  std::vector<GPU_Vector<double>>& position_beads,
+  std::vector<GPU_Vector<double>>& potential_beads,
+  std::vector<GPU_Vector<double>>& force_beads,
+  std::vector<GPU_Vector<double>>& virial_beads)
+{
+  if (!can_use_pimd_nep_batch_()) {
+    return false;
+  }
+
+  CHECK(gpuSetDevice(0));
+  box.set_is_orthogonal();
+  const int number_of_atoms = type.size();
+  const int number_of_beads = int(position_beads.size());
+  if (
+    number_of_beads < 2 || potential_beads.size() != position_beads.size() ||
+    force_beads.size() != position_beads.size() ||
+    virial_beads.size() != position_beads.size()) {
+    return false;
+  }
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      box,
+      position_beads[bead_id].data(),
+      position_beads[bead_id].data() + number_of_atoms,
+      position_beads[bead_id].data() + number_of_atoms * 2);
+  }
+  GPU_CHECK_KERNEL
+
+  std::vector<GPU_Vector<double>*> positions;
+  std::vector<GPU_Vector<double>*> potentials_per_bead;
+  std::vector<GPU_Vector<double>*> forces;
+  std::vector<GPU_Vector<double>*> virials;
+  positions.reserve(number_of_beads);
+  potentials_per_bead.reserve(number_of_beads);
+  forces.reserve(number_of_beads);
+  virials.reserve(number_of_beads);
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    positions.push_back(&position_beads[bead_id]);
+    potentials_per_bead.push_back(&potential_beads[bead_id]);
+    forces.push_back(&force_beads[bead_id]);
+    virials.push_back(&virial_beads[bead_id]);
+  }
+
+  NEP* nep = dynamic_cast<NEP*>(potentials[0].get());
+  if (!nep) {
+    if (!pimd_nep_single_gpu_batch_potential_) {
+      pimd_nep_single_gpu_batch_potential_.reset(
+        new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
+      pimd_nep_single_gpu_batch_potential_->N1 = 0;
+      pimd_nep_single_gpu_batch_potential_->N2 = number_of_atoms_;
+      pimd_nep_single_gpu_batch_potential_->set_neighbor_rebuild(
+        pimd_bead_neighbor_always_rebuild_);
+    }
+    nep = dynamic_cast<NEP*>(pimd_nep_single_gpu_batch_potential_.get());
+  }
+  const bool used_batch = nep->compute_pimd_batch(
+    box, type, positions, potentials_per_bead, forces, virials);
+  if (used_batch) {
+    temperature += number_of_beads * delta_T;
+  }
+  return used_batch;
+}
+
 Potential* Force::get_pimd_bead_potential_(const int device_id) const
 {
   if (device_id == 0) {
@@ -417,7 +512,8 @@ void Force::refresh_pimd_bead_gpu_workers_()
   pimd_bead_gpu_workers_.clear();
   if (potentials.size() == 1 && potentials[0]) {
     const bool use_primary_batch_neighbor_setting =
-      pimd_qnep_bead_batch_enabled_ && dynamic_cast<NEP_Charge*>(potentials[0].get());
+      (pimd_qnep_bead_batch_enabled_ && dynamic_cast<NEP_Charge*>(potentials[0].get())) ||
+      (pimd_nep_bead_batch_enabled_ && dynamic_cast<NEP*>(potentials[0].get()));
     potentials[0]->set_neighbor_rebuild(
       use_primary_batch_neighbor_setting ? pimd_bead_neighbor_always_rebuild_ : false);
   }
@@ -507,27 +603,31 @@ void Force::compute_pimd_beads(
   GPU_Vector<double>& mass_per_atom)
 {
   if (!can_use_pimd_bead_gpu_parallel_()) {
-    if (try_compute_pimd_qnep_batch_(
-          box,
-          type,
-          position_beads,
-          potential_beads,
-          force_beads,
-          virial_beads)) {
+    if (
+      try_compute_pimd_qnep_batch_(
+        box, type, position_beads, potential_beads, force_beads, virial_beads) ||
+      try_compute_pimd_nep_batch_(
+        box, type, position_beads, potential_beads, force_beads, virial_beads)) {
       return;
     }
     static bool warned_once = false;
     if (pimd_bead_gpu_parallel_devices_ > 1 && !warned_once) {
-      printf("Warning: falling back to serial PIMD bead force evaluation.\n");
+      printf("Warning: falling back to serial ring-polymer bead force evaluation.\n");
       printf(
         "    bead-to-GPU mode currently requires a single-potential NEP/qNEP run without HNEMD/FCP.\n");
       warned_once = true;
     }
     static bool warned_qnep_batch_once = false;
     if (pimd_qnep_bead_batch_enabled_ && !warned_qnep_batch_once) {
-      printf("Warning: qNEP PIMD bead batching is unavailable; using serial bead forces.\n");
+      printf("Warning: qNEP ring-polymer bead batching is unavailable; using serial bead forces.\n");
       printf("    batching requires at least two beads, qNEP, and the large-box path.\n");
       warned_qnep_batch_once = true;
+    }
+    static bool warned_nep_batch_once = false;
+    if (pimd_nep_bead_batch_enabled_ && !warned_nep_batch_once) {
+      printf("Warning: NEP ring-polymer bead batching is unavailable; using serial bead forces.\n");
+      printf("    batching requires at least two beads, a standard NEP energy model, and the large-box path.\n");
+      warned_nep_batch_once = true;
     }
     for (int k = 0; k < position_beads.size(); ++k) {
       compute(
@@ -612,9 +712,12 @@ void Force::compute_pimd_beads(
       Box worker_box = box;
 
       bool used_pimd_batch = false;
-      if (pimd_qnep_bead_batch_enabled_) {
+      if (pimd_qnep_bead_batch_enabled_ || pimd_nep_bead_batch_enabled_) {
         NEP_Charge* qnep = dynamic_cast<NEP_Charge*>(worker.potential.get());
-        if (qnep) {
+        NEP* nep = dynamic_cast<NEP*>(worker.potential.get());
+        if (
+          (pimd_qnep_bead_batch_enabled_ && qnep) ||
+          (pimd_nep_bead_batch_enabled_ && nep)) {
           std::vector<GPU_Vector<double>*> worker_positions;
           std::vector<GPU_Vector<double>*> worker_potentials;
           std::vector<GPU_Vector<double>*> worker_forces;
@@ -634,13 +737,23 @@ void Force::compute_pimd_beads(
             worker_virials.push_back(
               device_id == 0 ? &virial_beads[bead_id] : &worker.virial_beads[local_bead]);
           }
-          used_pimd_batch = qnep->compute_pimd_batch(
-            worker_box,
-            device_id == 0 ? type : worker.type,
-            worker_positions,
-            worker_potentials,
-            worker_forces,
-            worker_virials);
+          if (qnep) {
+            used_pimd_batch = qnep->compute_pimd_batch(
+              worker_box,
+              device_id == 0 ? type : worker.type,
+              worker_positions,
+              worker_potentials,
+              worker_forces,
+              worker_virials);
+          } else {
+            used_pimd_batch = nep->compute_pimd_batch(
+              worker_box,
+              device_id == 0 ? type : worker.type,
+              worker_positions,
+              worker_potentials,
+              worker_forces,
+              worker_virials);
+          }
         }
       }
 
