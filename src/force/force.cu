@@ -551,8 +551,10 @@ void Force::refresh_pimd_bead_gpu_workers_()
     std::unique_ptr<Force::PIMD_Bead_GPU_Worker> worker(new Force::PIMD_Bead_GPU_Worker());
     worker->device_id = device_id;
     if (is_qnep_worker) {
-      worker->potential.reset(new NEP_Charge(primary_nep_model_path_.c_str(), number_of_atoms_));
-      dynamic_cast<NEP_Charge*>(worker->potential.get())->set_neighbor_diagnostics(false);
+      std::unique_ptr<NEP_Charge> qnep_worker(
+        new NEP_Charge(primary_nep_model_path_.c_str(), number_of_atoms_));
+      qnep_worker->set_neighbor_diagnostics(false);
+      worker->potential = std::move(qnep_worker);
     } else {
       worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
     }
