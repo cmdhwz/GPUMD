@@ -72,6 +72,14 @@ public:
     GPU_Vector<double>& virial_per_atom,
     GPU_Vector<double>& velocity_per_atom,
     GPU_Vector<double>& mass_per_atom);
+  bool compute_qnep_non_electro(
+    Box& box,
+    GPU_Vector<double>& position_per_atom,
+    GPU_Vector<int>& type,
+    std::vector<Group>& group,
+    GPU_Vector<double>& potential_per_atom,
+    GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& virial_per_atom);
 
   void compute_pimd_beads(
     Box& box,

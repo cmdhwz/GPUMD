@@ -62,4 +62,17 @@ public:
 
 private:
   GPU_Vector<double> heat_all;
+  GPU_Vector<double> heat_all_by_type_;
+  GPU_Vector<double> heat_all_by_type_electro_;
+  GPU_Vector<double> centroid_potential_per_atom_;
+  GPU_Vector<double> centroid_force_per_atom_;
+  GPU_Vector<double> centroid_virial_per_atom_;
+  GPU_Vector<double> non_electro_potential_per_atom_;
+  GPU_Vector<double> non_electro_force_per_atom_;
+  GPU_Vector<double> non_electro_virial_per_atom_;
+  GPU_Vector<double> electro_potential_per_atom_;
+  GPU_Vector<double> electro_virial_per_atom_;
+  GPU_Vector<double> electro_heat_per_atom_;
+  int use_centroid_heat_flux_ = 0;
+  int split_qnep_heat_by_type_ = 0;
 };
