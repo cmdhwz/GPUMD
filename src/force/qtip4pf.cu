@@ -724,7 +724,10 @@ void QTIP4PF::initialize_topology(const GPU_Vector<int>& type)
     cpu_site_charge[n] = para_.charge[cpu_type[n]];
     total_charge += cpu_site_charge[n];
   }
-  total_charge += number_of_waters_ * para_.charge[4];
+  // Cast before multiplying: int * float is otherwise rounded in single
+  // precision and can spuriously exceed the neutrality tolerance for large
+  // water systems even though qM == -2*qH exactly in float representation.
+  total_charge += double(number_of_waters_) * double(para_.charge[4]);
   if (fabs(total_charge) > 1.0e-4) {
     PRINT_INPUT_ERROR("qtip4pf Ewald/PPPM currently requires a charge-neutral system.\n");
   }
