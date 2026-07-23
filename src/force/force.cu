@@ -34,6 +34,7 @@ The driver class calculating force and related quantities.
 #include "nep_multigpu.cuh"
 #include "nep_charge.cuh"
 #include "potential.cuh"
+#include "qtip4pf.cuh"
 #include "tersoff1988.cuh"
 #include "tersoff1989.cuh"
 #include "tersoff_mini.cuh"
@@ -232,6 +233,8 @@ void Force::parse_potential(
 #endif
   } else if (strcmp(potential_name, "lj") == 0) {
     potential.reset(new LJ(fid_potential, num_types, number_of_atoms));
+  } else if (strcmp(potential_name, "qtip4pf") == 0) {
+    potential.reset(new QTIP4PF(fid_potential, num_types, number_of_atoms));
   } else if (strcmp(potential_name, "nep_ilp") == 0) {
     if (num_param != 3) {
       PRINT_INPUT_ERROR("potential should contain an ILP potential file and a NEP map file.\n");

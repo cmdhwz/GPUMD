@@ -1,0 +1,6 @@
+potential ../../potentials/qtip4pf_nacl.txt
+
+ensemble nve
+time_step 0
+dump_force 1
+run 1
