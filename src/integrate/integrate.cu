@@ -924,7 +924,7 @@ void Integrate::parse_ensemble(
         }
 
         // pressure_coupling:
-        int index_pressure_coupling = 6 + num_target_pressure_components;
+        int index_pressure_coupling = 6 + num_target_pressure_components * 2;
         if (num_param == 10 || num_param == 16 || num_param == 25) {
           index_pressure_coupling += num_target_pressure_components;
         }
