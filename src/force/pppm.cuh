@@ -39,6 +39,18 @@ public:
     GPU_Vector<double>& force_per_atom,
     GPU_Vector<double>& virial_per_atom,
     GPU_Vector<double>& potential_per_atom);
+  void find_force_batch(
+    const int N,
+    const int N1,
+    const int N2,
+    const Box& box,
+    const GPU_Vector<float*>& charge,
+    const GPU_Vector<double*>& position_per_atom,
+    const GPU_Vector<float*>& D_real,
+    const GPU_Vector<double*>& force_per_atom,
+    const GPU_Vector<double*>& virial_per_atom,
+    const GPU_Vector<double*>& potential_per_atom,
+    const int number_of_beads);
   struct Para {
     int K0K1K2;             // total number of mesh points
     int K0K1;               // K[0] * K[1]
@@ -62,12 +74,22 @@ private:
   GPU_Vector<gpufftComplex> mesh_x;
   GPU_Vector<gpufftComplex> mesh_y;
   GPU_Vector<gpufftComplex> mesh_z;
-  gpufftHandle plan;
+  gpufftHandle plan = 0;
+  GPU_Vector<gpufftComplex> mesh_batch;
+  GPU_Vector<gpufftComplex> mesh_G_batch;
+  GPU_Vector<gpufftComplex> mesh_x_batch;
+  GPU_Vector<gpufftComplex> mesh_y_batch;
+  GPU_Vector<gpufftComplex> mesh_z_batch;
+  gpufftHandle plan_batch = 0;
+  int batch_capacity = 0;
   void allocate_memory();
+  void allocate_batch_memory(const int number_of_beads);
   void find_para(const int N, const Box& box);
   void find_k_and_G(const double* box);
 
   bool need_peratom_virial = false;
   GPU_Vector<gpufftComplex> mesh_virial;
-  gpufftHandle plan_virial;
+  gpufftHandle plan_virial = 0;
+  GPU_Vector<gpufftComplex> mesh_virial_batch;
+  gpufftHandle plan_virial_batch = 0;
 };

@@ -200,6 +200,11 @@ private:
     GPU_Vector<int*> NL_global_ptrs;
     GPU_Vector<float*> charge_ptrs;
     GPU_Vector<float*> D_real_ptrs;
+    GPU_Vector<float*> bec_ptrs;
+    GPU_Vector<double*> x0_ptrs;
+    GPU_Vector<double*> y0_ptrs;
+    GPU_Vector<double*> z0_ptrs;
+    GPU_Vector<int> rebuild_flags;
     GPU_Vector<int> NN_radial;
     GPU_Vector<int> NL_radial;
     GPU_Vector<int> NN_angular;

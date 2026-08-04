@@ -683,6 +683,31 @@ __global__ void gpu_check_atom_distance(
   }
 }
 
+__global__ void gpu_check_atom_distance_batch(
+  const Box box,
+  const int N,
+  const double d2,
+  double* const* x_old_batch,
+  double* const* y_old_batch,
+  double* const* z_old_batch,
+  double* const* position_batch,
+  int* rebuild_flags)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= N) {
+    return;
+  }
+  const double* position = position_batch[bead];
+  float dx = position[n] - x_old_batch[bead][n];
+  float dy = position[n + N] - y_old_batch[bead][n];
+  float dz = position[n + N * 2] - z_old_batch[bead][n];
+  apply_mic(box, dx, dy, dz);
+  if ((dx * dx + dy * dy + dz * dz) > d2) {
+    atomicExch(&rebuild_flags[bead], 1);
+  }
+}
+
 __device__ int static_s2[1];
 
 __global__ void
@@ -795,6 +820,96 @@ void Neighbor::find_neighbor_global(
       x0.data(), 
       y0.data(), 
       z0.data());
+    GPU_CHECK_KERNEL
+  }
+}
+
+void Neighbor::find_neighbor_global_batch(
+  const double rc,
+  Box& box,
+  const GPU_Vector<int>& type,
+  const std::vector<GPU_Vector<double>*>& position_beads,
+  const std::vector<Neighbor*>& neighbors,
+  const GPU_Vector<double*>& position_ptrs,
+  GPU_Vector<double*>& x0_batch,
+  GPU_Vector<double*>& y0_batch,
+  GPU_Vector<double*>& z0_batch,
+  GPU_Vector<int>& rebuild_flags)
+{
+  const int number_of_beads = static_cast<int>(neighbors.size());
+  const int N = type.size();
+  if (
+    number_of_beads == 0 || position_beads.size() != neighbors.size() ||
+    position_ptrs.size() != static_cast<size_t>(number_of_beads) ||
+    x0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    y0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    z0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    rebuild_flags.size() != static_cast<size_t>(number_of_beads)) {
+    return;
+  }
+
+  std::vector<double*> x0_ptrs(number_of_beads);
+  std::vector<double*> y0_ptrs(number_of_beads);
+  std::vector<double*> z0_ptrs(number_of_beads);
+  std::vector<int> initial_flags(number_of_beads, 0);
+  bool need_distance_check = false;
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    Neighbor* neighbor = neighbors[bead_id];
+    const bool first = neighbor->prepare_reference_positions(N);
+    x0_ptrs[bead_id] = neighbor->reference_x_data();
+    y0_ptrs[bead_id] = neighbor->reference_y_data();
+    z0_ptrs[bead_id] = neighbor->reference_z_data();
+    if (first || neighbor->always_rebuild) {
+      initial_flags[bead_id] = 1;
+    } else {
+      need_distance_check = true;
+    }
+  }
+  x0_batch.copy_from_host(x0_ptrs.data());
+  y0_batch.copy_from_host(y0_ptrs.data());
+  z0_batch.copy_from_host(z0_ptrs.data());
+  rebuild_flags.copy_from_host(initial_flags.data());
+  if (need_distance_check) {
+    gpu_check_atom_distance_batch<<<
+      dim3((N - 1) / 128 + 1, number_of_beads), 128>>>(
+      box,
+      N,
+      neighbors[0]->skin * neighbors[0]->skin * 0.25,
+      x0_batch.data(),
+      y0_batch.data(),
+      z0_batch.data(),
+      position_ptrs.data(),
+      rebuild_flags.data());
+    GPU_CHECK_KERNEL
+  }
+  std::vector<int> host_flags(number_of_beads, 0);
+  rebuild_flags.copy_to_host(host_flags.data());
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    if (host_flags[bead_id] == 0) {
+      continue;
+    }
+    Neighbor* neighbor = neighbors[bead_id];
+    find_neighbor(
+      0,
+      N,
+      rc + neighbor->skin,
+      box,
+      type,
+      *position_beads[bead_id],
+      neighbor->cell_count,
+      neighbor->cell_count_sum,
+      neighbor->cell_contents,
+      neighbor->NN,
+      neighbor->NL);
+    const double* position = position_beads[bead_id]->data();
+    gpu_update_xyz0<<<(N - 1) / 128 + 1, 128>>>(
+      N,
+      position,
+      position + N,
+      position + N * 2,
+      neighbor->x0.data(),
+      neighbor->y0.data(),
+      neighbor->z0.data());
     GPU_CHECK_KERNEL
   }
 }

@@ -17,6 +17,7 @@
 #include "model/box.cuh"
 #include "model/group.cuh"
 #include "utilities/gpu_vector.cuh"
+#include <vector>
 
 void find_cell_list(
   const double rc,
@@ -202,6 +203,30 @@ public:
     Box& box, 
     const GPU_Vector<int>& type, 
     const GPU_Vector<double>& position_per_atom);
+  static void find_neighbor_global_batch(
+    const double rc,
+    Box& box,
+    const GPU_Vector<int>& type,
+    const std::vector<GPU_Vector<double>*>& position_beads,
+    const std::vector<Neighbor*>& neighbors,
+    const GPU_Vector<double*>& position_ptrs,
+    GPU_Vector<double*>& x0_batch,
+    GPU_Vector<double*>& y0_batch,
+    GPU_Vector<double*>& z0_batch,
+    GPU_Vector<int>& rebuild_flags);
+  bool prepare_reference_positions(const int num_atoms)
+  {
+    const bool first = x0.size() == 0;
+    if (first) {
+      x0.resize(num_atoms);
+      y0.resize(num_atoms);
+      z0.resize(num_atoms);
+    }
+    return first;
+  }
+  double* reference_x_data() { return x0.data(); }
+  double* reference_y_data() { return y0.data(); }
+  double* reference_z_data() { return z0.data(); }
   void find_local_neighbor_from_global(
     const double rc,
     Box& box, 

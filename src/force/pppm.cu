@@ -534,6 +534,402 @@ void __global__ find_potential_and_virial(
   }
 }
 
+void __global__ set_mesh_to_zero_batch(
+  const PPPM::Para para,
+  const int number_of_beads,
+  gpufftComplex* g_mesh)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bead < number_of_beads && n < para.K0K1K2) {
+    g_mesh[static_cast<size_t>(bead) * para.K0K1K2 + n] = {0.0f, 0.0f};
+  }
+}
+
+__global__ void find_mesh_batch(
+  const int N,
+  const int N1,
+  const int N2,
+  const PPPM::Para para,
+  const Box box,
+  float* const* g_charge,
+  double* const* g_position,
+  gpufftComplex* g_mesh)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= gridDim.y || n >= N2) {
+    return;
+  }
+  const double* position = g_position[bead];
+  const float* charge = g_charge[bead];
+  const double x = position[n];
+  const double y = position[n + N];
+  const double z = position[n + N * 2];
+  const float q = charge[n];
+  const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+  const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+  const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+  const int ix = int(sx + 0.5f);
+  const int iy = int(sy + 0.5f);
+  const int iz = int(sz + 0.5f);
+  const float dx = sx - ix;
+  const float dy = sy - iy;
+  const float dz = sz - iz;
+  float Wx[5] = {0.0f};
+  float Wy[5] = {0.0f};
+  float Wz[5] = {0.0f};
+  for (int d = 0; d < 5; ++d) {
+    Wx[d] = (((W_coeff[d][4] * dx + W_coeff[d][3]) * dx + W_coeff[d][2]) * dx + W_coeff[d][1]) * dx + W_coeff[d][0];
+    Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy + W_coeff[d][1]) * dy + W_coeff[d][0];
+    Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz + W_coeff[d][1]) * dz + W_coeff[d][0];
+  }
+  gpufftComplex* mesh = g_mesh + static_cast<size_t>(bead) * para.K0K1K2;
+  for (int n0 = -2; n0 <= 2; ++n0) {
+    const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);
+    for (int n1 = -2; n1 <= 2; ++n1) {
+      const int neighbor1 = get_index_within_mesh(para.K[1], iy + n1);
+      for (int n2 = -2; n2 <= 2; ++n2) {
+        const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);
+        const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
+        atomicAdd(&mesh[neighbor012].x, q * Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2]);
+      }
+    }
+  }
+}
+
+void __global__ ik_times_mesh_times_G_batch(
+  const PPPM::Para para,
+  const int number_of_beads,
+  const float* g_kx,
+  const float* g_ky,
+  const float* g_kz,
+  const float* g_G,
+  const gpufftComplex* g_mesh_fft,
+  gpufftComplex* g_mesh_fft_x,
+  gpufftComplex* g_mesh_fft_y,
+  gpufftComplex* g_mesh_fft_z)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bead < number_of_beads && n < para.K0K1K2) {
+    const size_t offset = static_cast<size_t>(bead) * para.K0K1K2 + n;
+    const float kx = g_kx[n];
+    const float ky = g_ky[n];
+    const float kz = g_kz[n];
+    const float G = g_G[n];
+    const gpufftComplex mesh_fft = g_mesh_fft[offset];
+    g_mesh_fft_x[offset] = {mesh_fft.y * kx * G, -mesh_fft.x * kx * G};
+    g_mesh_fft_y[offset] = {mesh_fft.y * ky * G, -mesh_fft.x * ky * G};
+    g_mesh_fft_z[offset] = {mesh_fft.y * kz * G, -mesh_fft.x * kz * G};
+  }
+}
+
+void __global__ find_mesh_G_batch(
+  const PPPM::Para para,
+  const int number_of_beads,
+  const float* g_G,
+  const gpufftComplex* g_mesh,
+  gpufftComplex* g_mesh_G)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bead < number_of_beads && n < para.K0K1K2) {
+    const size_t offset = static_cast<size_t>(bead) * para.K0K1K2 + n;
+    const float G = g_G[n];
+    const gpufftComplex mesh = g_mesh[offset];
+    g_mesh_G[offset] = {mesh.x * G, mesh.y * G};
+  }
+}
+
+void __global__ find_mesh_virial_batch(
+  const PPPM::Para para,
+  const int number_of_beads,
+  const float* g_kx,
+  const float* g_ky,
+  const float* g_kz,
+  const float* g_G,
+  const gpufftComplex* g_S,
+  gpufftComplex* g_mesh_virial)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bead < number_of_beads && n < para.K0K1K2) {
+    const size_t mesh_offset = static_cast<size_t>(bead) * para.K0K1K2;
+    const size_t offset = static_cast<size_t>(bead) * 6 * para.K0K1K2 + n;
+    const float kx = g_kx[n];
+    const float ky = g_ky[n];
+    const float kz = g_kz[n];
+    const float ksq = kx * kx + ky * ky + kz * kz;
+    if (ksq == 0.0f) {
+      for (int component = 0; component < 6; ++component) {
+        g_mesh_virial[offset + static_cast<size_t>(component) * para.K0K1K2] = {0.0f, 0.0f};
+      }
+      return;
+    }
+    const float alpha_k_factor = 2.0f * para.alpha_factor + 2.0f / ksq;
+    const float G = g_G[n];
+    const gpufftComplex S = g_S[mesh_offset + n];
+    const float GSx = G * S.x;
+    const float GSy = G * S.y;
+    float B = 1.0f - alpha_k_factor * kx * kx;
+    g_mesh_virial[offset + static_cast<size_t>(0) * para.K0K1K2] = {B * GSx, B * GSy};
+    B = 1.0f - alpha_k_factor * ky * ky;
+    g_mesh_virial[offset + static_cast<size_t>(1) * para.K0K1K2] = {B * GSx, B * GSy};
+    B = 1.0f - alpha_k_factor * kz * kz;
+    g_mesh_virial[offset + static_cast<size_t>(2) * para.K0K1K2] = {B * GSx, B * GSy};
+    B = -alpha_k_factor * kx * ky;
+    g_mesh_virial[offset + static_cast<size_t>(3) * para.K0K1K2] = {B * GSx, B * GSy};
+    B = -alpha_k_factor * ky * kz;
+    g_mesh_virial[offset + static_cast<size_t>(4) * para.K0K1K2] = {B * GSx, B * GSy};
+    B = -alpha_k_factor * kz * kx;
+    g_mesh_virial[offset + static_cast<size_t>(5) * para.K0K1K2] = {B * GSx, B * GSy};
+  }
+}
+
+__global__ void find_force_from_field_batch(
+  const int N,
+  const int N1,
+  const int N2,
+  const PPPM::Para para,
+  const Box box,
+  float* const* g_charge,
+  double* const* g_position,
+  const gpufftComplex* g_mesh_G,
+  const gpufftComplex* g_mesh_fft_x_ifft,
+  const gpufftComplex* g_mesh_fft_y_ifft,
+  const gpufftComplex* g_mesh_fft_z_ifft,
+  float* const* g_D_real,
+  double* const* g_force,
+  const int number_of_beads)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads || n >= N2) {
+    return;
+  }
+  const double* position = g_position[bead];
+  double* force = g_force[bead];
+  const float* charge = g_charge[bead];
+  const size_t mesh_offset = static_cast<size_t>(bead) * para.K0K1K2;
+  const double x = position[n];
+  const double y = position[n + N];
+  const double z = position[n + N * 2];
+  const float q = K_C_SP * charge[n] * 2.0f;
+  const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+  const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+  const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+  const int ix = int(sx + 0.5f);
+  const int iy = int(sy + 0.5f);
+  const int iz = int(sz + 0.5f);
+  const float dx = sx - ix;
+  const float dy = sy - iy;
+  const float dz = sz - iz;
+  float Wx[5] = {0.0f};
+  float Wy[5] = {0.0f};
+  float Wz[5] = {0.0f};
+  for (int d = 0; d < 5; ++d) {
+    Wx[d] = (((W_coeff[d][4] * dx + W_coeff[d][3]) * dx + W_coeff[d][2]) * dx + W_coeff[d][1]) * dx + W_coeff[d][0];
+    Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy + W_coeff[d][1]) * dy + W_coeff[d][0];
+    Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz + W_coeff[d][1]) * dz + W_coeff[d][0];
+  }
+  float D_real = 0.0f;
+  float E[3] = {0.0f, 0.0f, 0.0f};
+  for (int n0 = -2; n0 <= 2; ++n0) {
+    const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);
+    for (int n1 = -2; n1 <= 2; ++n1) {
+      const int neighbor1 = get_index_within_mesh(para.K[1], iy + n1);
+      for (int n2 = -2; n2 <= 2; ++n2) {
+        const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);
+        const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
+        const float W = Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2];
+        const size_t mesh_index = mesh_offset + neighbor012;
+        D_real += W * g_mesh_G[mesh_index].x;
+        E[0] += W * g_mesh_fft_x_ifft[mesh_index].x;
+        E[1] += W * g_mesh_fft_y_ifft[mesh_index].x;
+        E[2] += W * g_mesh_fft_z_ifft[mesh_index].x;
+      }
+    }
+  }
+  g_D_real[bead][n] = 2.0f * K_C_SP * D_real;
+  force[ n] += q * E[0];
+  force[n + N] += q * E[1];
+  force[n + N * 2] += q * E[2];
+}
+
+__global__ void find_force_virial_potential_from_field_batch(
+  const int N,
+  const int N1,
+  const int N2,
+  const PPPM::Para para,
+  const Box box,
+  float* const* g_charge,
+  double* const* g_position,
+  const gpufftComplex* g_mesh_G,
+  const gpufftComplex* g_mesh_fft_x_ifft,
+  const gpufftComplex* g_mesh_fft_y_ifft,
+  const gpufftComplex* g_mesh_fft_z_ifft,
+  const gpufftComplex* g_mesh_virial,
+  float* const* g_D_real,
+  double* const* g_force,
+  double* const* g_virial,
+  double* const* g_pe,
+  const int number_of_beads)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads || n >= N2) {
+    return;
+  }
+  const double* position = g_position[bead];
+  double* force = g_force[bead];
+  double* virial = g_virial[bead];
+  double* pe = g_pe[bead];
+  const float* charge = g_charge[bead];
+  const size_t mesh_offset = static_cast<size_t>(bead) * para.K0K1K2;
+  const size_t virial_offset = static_cast<size_t>(bead) * 6 * para.K0K1K2;
+  const double x = position[n];
+  const double y = position[n + N];
+  const double z = position[n + N * 2];
+  const float q = K_C_SP * charge[n];
+  const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+  const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+  const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+  const int ix = int(sx + 0.5f);
+  const int iy = int(sy + 0.5f);
+  const int iz = int(sz + 0.5f);
+  const float dx = sx - ix;
+  const float dy = sy - iy;
+  const float dz = sz - iz;
+  float Wx[5] = {0.0f};
+  float Wy[5] = {0.0f};
+  float Wz[5] = {0.0f};
+  for (int d = 0; d < 5; ++d) {
+    Wx[d] = (((W_coeff[d][4] * dx + W_coeff[d][3]) * dx + W_coeff[d][2]) * dx + W_coeff[d][1]) * dx + W_coeff[d][0];
+    Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy + W_coeff[d][1]) * dy + W_coeff[d][0];
+    Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz + W_coeff[d][1]) * dz + W_coeff[d][0];
+  }
+  float D_real = 0.0f;
+  float E[3] = {0.0f, 0.0f, 0.0f};
+  float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  for (int n0 = -2; n0 <= 2; ++n0) {
+    const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);
+    for (int n1 = -2; n1 <= 2; ++n1) {
+      const int neighbor1 = get_index_within_mesh(para.K[1], iy + n1);
+      for (int n2 = -2; n2 <= 2; ++n2) {
+        const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);
+        const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
+        const float W = Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2];
+        const size_t mesh_index = mesh_offset + neighbor012;
+        D_real += W * g_mesh_G[mesh_index].x;
+        E[0] += W * g_mesh_fft_x_ifft[mesh_index].x;
+        E[1] += W * g_mesh_fft_y_ifft[mesh_index].x;
+        E[2] += W * g_mesh_fft_z_ifft[mesh_index].x;
+        V[0] += W * g_mesh_virial[virial_offset + neighbor012].x;
+        V[1] += W * g_mesh_virial[virial_offset + para.K0K1K2 + neighbor012].x;
+        V[2] += W * g_mesh_virial[virial_offset + 2 * para.K0K1K2 + neighbor012].x;
+        V[3] += W * g_mesh_virial[virial_offset + 3 * para.K0K1K2 + neighbor012].x;
+        V[4] += W * g_mesh_virial[virial_offset + 4 * para.K0K1K2 + neighbor012].x;
+        V[5] += W * g_mesh_virial[virial_offset + 5 * para.K0K1K2 + neighbor012].x;
+      }
+    }
+  }
+  g_D_real[bead][n] = 2.0f * K_C_SP * D_real;
+  force[n] += 2.0f * q * E[0];
+  force[n + N] += 2.0f * q * E[1];
+  force[n + N * 2] += 2.0f * q * E[2];
+  virial[n + 0 * N] += q * V[0];
+  virial[n + 1 * N] += q * V[1];
+  virial[n + 2 * N] += q * V[2];
+  virial[n + 3 * N] += q * V[3];
+  virial[n + 6 * N] += q * V[3];
+  virial[n + 5 * N] += q * V[4];
+  virial[n + 8 * N] += q * V[4];
+  virial[n + 4 * N] += q * V[5];
+  virial[n + 7 * N] += q * V[5];
+  pe[n] += q * D_real;
+}
+
+void __global__ find_potential_and_virial_batch(
+  const int N,
+  const PPPM::Para para,
+  const int number_of_beads,
+  const gpufftComplex* g_S,
+  const float* g_kx,
+  const float* g_ky,
+  const float* g_kz,
+  const float* g_G,
+  double* const* g_virial,
+  double* const* g_pe)
+{
+  const int bead = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (bead >= number_of_beads) {
+    return;
+  }
+  const size_t mesh_offset = static_cast<size_t>(bead) * para.K0K1K2;
+  int number_of_batches = (para.K0K1K2 - 1) / 1024 + 1;
+  __shared__ float s_data[1024];
+  float data = 0.0f;
+  for (int batch = 0; batch < number_of_batches; ++batch) {
+    const int n = tid + batch * 1024;
+    if (n < para.K0K1K2) {
+      const gpufftComplex S = g_S[mesh_offset + n];
+      const float GSS = g_G[n] * (S.x * S.x + S.y * S.y);
+      const float kx = g_kx[n];
+      const float ky = g_ky[n];
+      const float kz = g_kz[n];
+      const float ksq = kx * kx + ky * ky + kz * kz;
+      if (ksq != 0.0f) {
+        const float alpha_k_factor = 2.0f * para.alpha_factor + 2.0f / ksq;
+        switch (blockIdx.x) {
+          case 0: data += GSS * (1.0f - alpha_k_factor * kx * kx); break;
+          case 1: data += GSS * (1.0f - alpha_k_factor * ky * ky); break;
+          case 2: data += GSS * (1.0f - alpha_k_factor * kz * kz); break;
+          case 3: data -= GSS * (alpha_k_factor * kx * ky); break;
+          case 4: data -= GSS * (alpha_k_factor * ky * kz); break;
+          case 5: data -= GSS * (alpha_k_factor * kz * kx); break;
+          case 6: data += GSS; break;
+        }
+      }
+    }
+  }
+  s_data[tid] = data;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_data[tid] += s_data[tid + offset];
+    }
+    __syncthreads();
+  }
+  number_of_batches = (N - 1) / 1024 + 1;
+  double* virial = g_virial[bead];
+  double* pe = g_pe[bead];
+  for (int batch = 0; batch < number_of_batches; ++batch) {
+    const int n = tid + batch * 1024;
+    if (n < N) {
+      switch (blockIdx.x) {
+        case 0: virial[n + 0 * N] += s_data[0] * para.potential_factor; break;
+        case 1: virial[n + 1 * N] += s_data[0] * para.potential_factor; break;
+        case 2: virial[n + 2 * N] += s_data[0] * para.potential_factor; break;
+        case 3:
+          virial[n + 3 * N] += s_data[0] * para.potential_factor;
+          virial[n + 6 * N] += s_data[0] * para.potential_factor;
+          break;
+        case 4:
+          virial[n + 5 * N] += s_data[0] * para.potential_factor;
+          virial[n + 8 * N] += s_data[0] * para.potential_factor;
+          break;
+        case 5:
+          virial[n + 4 * N] += s_data[0] * para.potential_factor;
+          virial[n + 7 * N] += s_data[0] * para.potential_factor;
+          break;
+        case 6: pe[n] += s_data[0] * para.potential_factor; break;
+      }
+    }
+  }
+}
+
 }
 
 PPPM::PPPM()
@@ -543,14 +939,39 @@ PPPM::PPPM()
 
 PPPM::~PPPM()
 {
-  gpufftDestroy(plan);
-  if (need_peratom_virial) {
+  if (plan != 0) {
+    gpufftDestroy(plan);
+  }
+  if (plan_batch != 0) {
+    gpufftDestroy(plan_batch);
+  }
+  if (need_peratom_virial && plan_virial != 0) {
     gpufftDestroy(plan_virial);
+  }
+  if (need_peratom_virial && plan_virial_batch != 0) {
+    gpufftDestroy(plan_virial_batch);
   }
 }
 
 void PPPM::allocate_memory()
 {
+  if (plan != 0) {
+    gpufftDestroy(plan);
+    plan = 0;
+  }
+  if (plan_virial != 0) {
+    gpufftDestroy(plan_virial);
+    plan_virial = 0;
+  }
+  if (plan_batch != 0) {
+    gpufftDestroy(plan_batch);
+    plan_batch = 0;
+  }
+  if (plan_virial_batch != 0) {
+    gpufftDestroy(plan_virial_batch);
+    plan_virial_batch = 0;
+  }
+  batch_capacity = 0;
   kx.resize(para.K0K1K2);
   ky.resize(para.K0K1K2);
   kz.resize(para.K0K1K2);
@@ -571,6 +992,62 @@ void PPPM::allocate_memory()
     int n[3] = {para.K[2], para.K[1], para.K[0]};
     if (gpufftPlanMany(&plan_virial, 3, n, NULL, 1, para.K0K1K2, NULL, 1, para.K0K1K2, GPUFFT_C2C, 6) != GPUFFT_SUCCESS) {
       std::cout << "GPUFFT error: plan_virial creation failed" << std::endl;
+      exit(1);
+    }
+  }
+}
+
+void PPPM::allocate_batch_memory(const int number_of_beads)
+{
+  if (number_of_beads == batch_capacity) {
+    return;
+  }
+  if (plan_batch != 0) {
+    gpufftDestroy(plan_batch);
+    plan_batch = 0;
+  }
+  if (plan_virial_batch != 0) {
+    gpufftDestroy(plan_virial_batch);
+    plan_virial_batch = 0;
+  }
+  batch_capacity = number_of_beads;
+  const size_t batch_mesh_size = static_cast<size_t>(number_of_beads) * para.K0K1K2;
+  mesh_batch.resize(batch_mesh_size);
+  mesh_G_batch.resize(batch_mesh_size);
+  mesh_x_batch.resize(batch_mesh_size);
+  mesh_y_batch.resize(batch_mesh_size);
+  mesh_z_batch.resize(batch_mesh_size);
+  int n[3] = {para.K[2], para.K[1], para.K[0]};
+  if (gpufftPlanMany(
+        &plan_batch,
+        3,
+        n,
+        NULL,
+        1,
+        para.K0K1K2,
+        NULL,
+        1,
+        para.K0K1K2,
+        GPUFFT_C2C,
+        number_of_beads) != GPUFFT_SUCCESS) {
+    std::cout << "GPUFFT error: plan_batch creation failed" << std::endl;
+    exit(1);
+  }
+  if (need_peratom_virial) {
+    mesh_virial_batch.resize(static_cast<size_t>(number_of_beads) * 6 * para.K0K1K2);
+    if (gpufftPlanMany(
+          &plan_virial_batch,
+          3,
+          n,
+          NULL,
+          1,
+          para.K0K1K2,
+          NULL,
+          1,
+          para.K0K1K2,
+          GPUFFT_C2C,
+          number_of_beads * 6) != GPUFFT_SUCCESS) {
+      std::cout << "GPUFFT error: plan_virial_batch creation failed" << std::endl;
       exit(1);
     }
   }
@@ -776,6 +1253,139 @@ void PPPM::find_force(
       N,
       para,
       mesh.data(),
+      kx.data(),
+      ky.data(),
+      kz.data(),
+      G.data(),
+      virial_per_atom.data(),
+      potential_per_atom.data());
+    GPU_CHECK_KERNEL
+  }
+}
+
+void PPPM::find_force_batch(
+  const int N,
+  const int N1,
+  const int N2,
+  const Box& box,
+  const GPU_Vector<float*>& charge,
+  const GPU_Vector<double*>& position_per_atom,
+  const GPU_Vector<float*>& D_real,
+  const GPU_Vector<double*>& force_per_atom,
+  const GPU_Vector<double*>& virial_per_atom,
+  const GPU_Vector<double*>& potential_per_atom,
+  const int number_of_beads)
+{
+  if (number_of_beads <= 0) {
+    return;
+  }
+  find_para(N, box);
+  allocate_batch_memory(number_of_beads);
+  const int mesh_grid = (para.K0K1K2 - 1) / 64 + 1;
+  const dim3 mesh_grid_batch(mesh_grid, number_of_beads);
+  find_k_and_G_opt<<<mesh_grid, 64>>>(para, kx.data(), ky.data(), kz.data(), G.data());
+  GPU_CHECK_KERNEL
+  set_mesh_to_zero_batch<<<mesh_grid_batch, 64>>>(para, number_of_beads, mesh_batch.data());
+  GPU_CHECK_KERNEL
+  find_mesh_batch<<<dim3((N2 - N1 - 1) / 64 + 1, number_of_beads), 64>>>(
+    N,
+    N1,
+    N2,
+    para,
+    box,
+    charge.data(),
+    position_per_atom.data(),
+    mesh_batch.data());
+  GPU_CHECK_KERNEL
+  if (gpufftExecC2C(plan_batch, mesh_batch.data(), mesh_batch.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
+    std::cout << "GPUFFT error: batched forward failed" << std::endl;
+    exit(1);
+  }
+  ik_times_mesh_times_G_batch<<<mesh_grid_batch, 64>>>(
+    para,
+    number_of_beads,
+    kx.data(),
+    ky.data(),
+    kz.data(),
+    G.data(),
+    mesh_batch.data(),
+    mesh_x_batch.data(),
+    mesh_y_batch.data(),
+    mesh_z_batch.data());
+  GPU_CHECK_KERNEL
+  find_mesh_G_batch<<<mesh_grid_batch, 64>>>(
+    para, number_of_beads, G.data(), mesh_batch.data(), mesh_G_batch.data());
+  GPU_CHECK_KERNEL
+  if (need_peratom_virial) {
+    find_mesh_virial_batch<<<mesh_grid_batch, 64>>>(
+      para,
+      number_of_beads,
+      kx.data(),
+      ky.data(),
+      kz.data(),
+      G.data(),
+      mesh_batch.data(),
+      mesh_virial_batch.data());
+    GPU_CHECK_KERNEL
+  }
+  if (gpufftExecC2C(plan_batch, mesh_G_batch.data(), mesh_G_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS ||
+      gpufftExecC2C(plan_batch, mesh_x_batch.data(), mesh_x_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS ||
+      gpufftExecC2C(plan_batch, mesh_y_batch.data(), mesh_y_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS ||
+      gpufftExecC2C(plan_batch, mesh_z_batch.data(), mesh_z_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cout << "GPUFFT error: batched inverse failed" << std::endl;
+    exit(1);
+  }
+  if (need_peratom_virial) {
+    if (gpufftExecC2C(
+          plan_virial_batch,
+          mesh_virial_batch.data(),
+          mesh_virial_batch.data(),
+          GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+      std::cout << "GPUFFT error: batched virial inverse failed" << std::endl;
+      exit(1);
+    }
+    find_force_virial_potential_from_field_batch<<<
+      dim3((N2 - N1 - 1) / 64 + 1, number_of_beads), 64>>>(
+      N,
+      N1,
+      N2,
+      para,
+      box,
+      charge.data(),
+      position_per_atom.data(),
+      mesh_G_batch.data(),
+      mesh_x_batch.data(),
+      mesh_y_batch.data(),
+      mesh_z_batch.data(),
+      mesh_virial_batch.data(),
+      D_real.data(),
+      force_per_atom.data(),
+      virial_per_atom.data(),
+      potential_per_atom.data(),
+      number_of_beads);
+    GPU_CHECK_KERNEL
+  } else {
+    find_force_from_field_batch<<<dim3((N2 - N1 - 1) / 64 + 1, number_of_beads), 64>>>(
+      N,
+      N1,
+      N2,
+      para,
+      box,
+      charge.data(),
+      position_per_atom.data(),
+      mesh_G_batch.data(),
+      mesh_x_batch.data(),
+      mesh_y_batch.data(),
+      mesh_z_batch.data(),
+      D_real.data(),
+      force_per_atom.data(),
+      number_of_beads);
+    GPU_CHECK_KERNEL
+    find_potential_and_virial_batch<<<dim3(7, number_of_beads), 1024>>>(
+      N,
+      para,
+      number_of_beads,
+      mesh_batch.data(),
       kx.data(),
       ky.data(),
       kz.data(),

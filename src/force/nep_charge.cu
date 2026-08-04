@@ -414,6 +414,10 @@ void NEP_Charge::initialize_pimd_batch_(
     batch.NL_global_ptrs.resize(number_of_beads);
     batch.charge_ptrs.resize(number_of_beads);
     batch.D_real_ptrs.resize(number_of_beads);
+    batch.x0_ptrs.resize(number_of_beads);
+    batch.y0_ptrs.resize(number_of_beads);
+    batch.z0_ptrs.resize(number_of_beads);
+    batch.rebuild_flags.resize(number_of_beads);
     batch.NN_radial.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
     batch.NL_radial.resize(
       static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_radial);
@@ -438,6 +442,7 @@ void NEP_Charge::initialize_pimd_batch_(
     std::vector<int*> NL_global_ptrs(number_of_beads);
     std::vector<float*> charge_ptrs(number_of_beads);
     std::vector<float*> D_real_ptrs(number_of_beads);
+    std::vector<float*> bec_ptrs(number_of_beads);
     batch.beads.reserve(number_of_beads);
     for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
       std::unique_ptr<PIMD_Bead_Data> bead(new PIMD_Bead_Data());
@@ -451,12 +456,15 @@ void NEP_Charge::initialize_pimd_batch_(
       NL_global_ptrs[bead_id] = bead->neighbor->NL.data();
       charge_ptrs[bead_id] = bead->charge.data();
       D_real_ptrs[bead_id] = bead->D_real.data();
+      bec_ptrs[bead_id] = bead->bec.data();
       batch.beads.push_back(std::move(bead));
     }
     batch.NN_global_ptrs.copy_from_host(NN_global_ptrs.data());
     batch.NL_global_ptrs.copy_from_host(NL_global_ptrs.data());
     batch.charge_ptrs.copy_from_host(charge_ptrs.data());
     batch.D_real_ptrs.copy_from_host(D_real_ptrs.data());
+    batch.bec_ptrs.resize(number_of_beads);
+    batch.bec_ptrs.copy_from_host(bec_ptrs.data());
     printf(
       "Using qNEP ring-polymer bead-batched local kernels for %d beads on one GPU.\n",
       number_of_beads);
@@ -1955,6 +1963,102 @@ static __global__ void find_force_charge_real_space(
   }
 }
 
+static __global__ void find_force_charge_real_space_pimd_batch(
+  const int N,
+  const int MN_radial,
+  const NEP_Charge::Charge_Para charge_para,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const Box box,
+  const int* g_NN_batch,
+  const int* g_NL_batch,
+  float* const* g_charge,
+  double* const* g_position,
+  double* const* g_force,
+  double* const* g_virial,
+  double* const* g_pe,
+  float* const* g_D_real)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads || n1 >= N2) {
+    return;
+  }
+  const double* position = g_position[bead];
+  double* force = g_force[bead];
+  double* virial = g_virial[bead];
+  double* pe = g_pe[bead];
+  float* D_real_out = g_D_real[bead];
+  const float* charge = g_charge[bead];
+  const int* g_NN = g_NN_batch + static_cast<size_t>(bead) * N;
+  const int* g_NL = g_NL_batch + static_cast<size_t>(bead) * N * MN_radial;
+  float s_fx = 0.0f;
+  float s_fy = 0.0f;
+  float s_fz = 0.0f;
+  float s_sxx = 0.0f;
+  float s_sxy = 0.0f;
+  float s_sxz = 0.0f;
+  float s_syx = 0.0f;
+  float s_syy = 0.0f;
+  float s_syz = 0.0f;
+  float s_szx = 0.0f;
+  float s_szy = 0.0f;
+  float s_szz = 0.0f;
+  const double x1 = position[n1];
+  const double y1 = position[n1 + N];
+  const double z1 = position[n1 + N * 2];
+  const float q1 = charge[n1];
+  float s_pe = -charge_para.two_alpha_over_sqrt_pi * 0.5f * q1 * q1;
+  float D_real = -q1 * charge_para.two_alpha_over_sqrt_pi;
+  for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
+    const int n2 = g_NL[n1 + N * i1];
+    const float q2 = charge[n2];
+    const float qq = q1 * q2;
+    float x12 = position[n2] - x1;
+    float y12 = position[n2 + N] - y1;
+    float z12 = position[n2 + N * 2] - z1;
+    apply_mic(box, x12, y12, z12);
+    const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+    const float d12inv = 1.0f / d12;
+    const float erfc_r = erfc(charge_para.alpha * d12) * d12inv;
+    D_real += q2 * erfc_r;
+    s_pe += 0.5f * qq * erfc_r;
+    float f2 = erfc_r + charge_para.two_alpha_over_sqrt_pi * exp(
+      -charge_para.alpha * charge_para.alpha * d12 * d12);
+    f2 *= -0.5f * K_C_SP * qq * d12inv * d12inv;
+    const float fx = x12 * f2;
+    const float fy = y12 * f2;
+    const float fz = z12 * f2;
+    s_fx += 2.0f * fx;
+    s_fy += 2.0f * fy;
+    s_fz += 2.0f * fz;
+    s_sxx -= x12 * fx;
+    s_sxy -= x12 * fy;
+    s_sxz -= x12 * fz;
+    s_syx -= y12 * fx;
+    s_syy -= y12 * fy;
+    s_syz -= y12 * fz;
+    s_szx -= z12 * fx;
+    s_szy -= z12 * fy;
+    s_szz -= z12 * fz;
+  }
+  force[n1] += s_fx;
+  force[n1 + N] += s_fy;
+  force[n1 + N * 2] += s_fz;
+  virial[n1 + 0 * N] += s_sxx;
+  virial[n1 + 1 * N] += s_syy;
+  virial[n1 + 2 * N] += s_szz;
+  virial[n1 + 3 * N] += s_sxy;
+  virial[n1 + 4 * N] += s_sxz;
+  virial[n1 + 5 * N] += s_syz;
+  virial[n1 + 6 * N] += s_syx;
+  virial[n1 + 7 * N] += s_szx;
+  virial[n1 + 8 * N] += s_szy;
+  D_real_out[n1] += K_C_SP * D_real;
+  pe[n1] += K_C_SP * s_pe;
+}
+
 // large box fo MD applications
 void NEP_Charge::compute_large_box(
   Box& box,
@@ -2585,6 +2689,54 @@ void NEP_Charge::compute(
   }
 }
 
+static __global__ void zero_total_charge_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  float* const* g_charge);
+static __global__ void zero_mean_D_real_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  float* const* g_D_real);
+static __global__ void find_bec_diagonal_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  float* const* g_charge,
+  float* const* g_bec);
+static __global__ void find_bec_radial_pimd_batch(
+  const NEP_Charge::ParaMB paramb,
+  const NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const Box box,
+  const int* g_NN_batch,
+  const int* g_NL_batch,
+  const int* g_type,
+  double* const* g_position,
+  const float* g_charge_derivative_batch,
+  float* const* g_bec);
+static __global__ void find_bec_angular_pimd_batch(
+  const NEP_Charge::ParaMB paramb,
+  const NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const Box box,
+  const int* g_NN_batch,
+  const int* g_NL_batch,
+  const int* g_type,
+  double* const* g_position,
+  const float* g_charge_derivative_batch,
+  const float* g_sum_fxyz_batch,
+  float* const* g_bec);
+static __global__ void scale_bec_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  const float* sqrt_epsilon_inf,
+  float* const* g_bec);
+
 bool NEP_Charge::compute_pimd_batch(
   Box& box,
   const GPU_Vector<int>& type,
@@ -2618,10 +2770,22 @@ bool NEP_Charge::compute_pimd_batch(
   initialize_pimd_batch_(
     N, position_beads, potential_beads, force_beads, virial_beads);
   auto& batch = *pimd_batch_data_;
-  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
-    batch.beads[bead_id]->neighbor->find_neighbor_global(
-      rc, box, type, *position_beads[bead_id]);
+  std::vector<Neighbor*> neighbor_ptrs;
+  neighbor_ptrs.reserve(number_of_beads);
+  for (auto& bead : batch.beads) {
+    neighbor_ptrs.push_back(bead->neighbor.get());
   }
+  Neighbor::find_neighbor_global_batch(
+    rc,
+    box,
+    type,
+    position_beads,
+    neighbor_ptrs,
+    batch.position_ptrs,
+    batch.x0_ptrs,
+    batch.y0_ptrs,
+    batch.z0_ptrs,
+    batch.rebuild_flags);
 
   const int block_size = 64;
   const int grid_size = (N2 - N1 - 1) / block_size + 1;
@@ -2668,71 +2832,64 @@ bool NEP_Charge::compute_pimd_batch(
     batch.sum_fxyz.data());
   GPU_CHECK_KERNEL
 
-  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
-    auto& bead = *batch.beads[bead_id];
-    const size_t radial_offset =
-      static_cast<size_t>(bead_id) * N * paramb.MN_radial;
-    const size_t angular_offset =
-      static_cast<size_t>(bead_id) * N * paramb.MN_angular;
-    const size_t atom_offset = static_cast<size_t>(bead_id) * N;
-    const size_t descriptor_offset = atom_offset * annmb.dim;
-    const int sum_components =
-      (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
-    const size_t sum_offset = atom_offset * sum_components;
+  const dim3 bead_grid(grid_size, number_of_beads);
+  zero_total_charge_pimd_batch<<<number_of_beads, 1024>>>(
+    N, number_of_beads, batch.charge_ptrs.data());
+  GPU_CHECK_KERNEL
+  find_bec_diagonal_pimd_batch<<<bead_grid, block_size>>>(
+    N, number_of_beads, batch.charge_ptrs.data(), batch.bec_ptrs.data());
+  GPU_CHECK_KERNEL
+  find_bec_radial_pimd_batch<<<bead_grid, block_size>>>(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    number_of_beads,
+    box,
+    batch.NN_radial.data(),
+    batch.NL_radial.data(),
+    type.data(),
+    batch.position_ptrs.data(),
+    batch.charge_derivative.data(),
+    batch.bec_ptrs.data());
+  GPU_CHECK_KERNEL
+  find_bec_angular_pimd_batch<<<bead_grid, block_size>>>(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    number_of_beads,
+    box,
+    batch.NN_angular.data(),
+    batch.NL_angular.data(),
+    type.data(),
+    batch.position_ptrs.data(),
+    batch.charge_derivative.data(),
+    batch.sum_fxyz.data(),
+    batch.bec_ptrs.data());
+  GPU_CHECK_KERNEL
+  scale_bec_pimd_batch<<<bead_grid, block_size>>>(
+    N, number_of_beads, annmb.sqrt_epsilon_inf, batch.bec_ptrs.data());
+  GPU_CHECK_KERNEL
 
-    zero_total_charge<<<1, 1024>>>(N, bead.charge.data());
-    GPU_CHECK_KERNEL
-    find_bec_diagonal<<<grid_size, block_size>>>(N, bead.charge.data(), bead.bec.data());
-    GPU_CHECK_KERNEL
-    find_bec_radial<<<grid_size, block_size>>>(
-      paramb,
-      annmb,
+  if (use_pppm) {
+    pppm.find_force_batch(
       N,
       N1,
       N2,
       box,
-      batch.NN_radial.data() + atom_offset,
-      batch.NL_radial.data() + radial_offset,
-      type.data(),
-      position_beads[bead_id]->data(),
-      position_beads[bead_id]->data() + N,
-      position_beads[bead_id]->data() + N * 2,
-      batch.charge_derivative.data() + descriptor_offset,
-      bead.bec.data());
-    GPU_CHECK_KERNEL
-    find_bec_angular<<<grid_size, block_size>>>(
-      paramb,
-      annmb,
-      N,
-      N1,
-      N2,
-      box,
-      batch.NN_angular.data() + atom_offset,
-      batch.NL_angular.data() + angular_offset,
-      type.data(),
-      position_beads[bead_id]->data(),
-      position_beads[bead_id]->data() + N,
-      position_beads[bead_id]->data() + N * 2,
-      batch.charge_derivative.data() + descriptor_offset,
-      batch.sum_fxyz.data() + sum_offset,
-      bead.bec.data());
-    GPU_CHECK_KERNEL
-    scale_bec<<<grid_size, block_size>>>(N, annmb.sqrt_epsilon_inf, bead.bec.data());
-    GPU_CHECK_KERNEL
-
-    if (use_pppm) {
-      pppm.find_force(
-        N,
-        N1,
-        N2,
-        box,
-        bead.charge,
-        *position_beads[bead_id],
-        bead.D_real,
-        *force_beads[bead_id],
-        *virial_beads[bead_id],
-        *potential_beads[bead_id]);
-    } else {
+      batch.charge_ptrs,
+      batch.position_ptrs,
+      batch.D_real_ptrs,
+      batch.force_ptrs,
+      batch.virial_ptrs,
+      batch.potential_ptrs,
+      number_of_beads);
+  } else {
+    for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+      auto& bead = *batch.beads[bead_id];
       ewald.find_force(
         N,
         N1,
@@ -2745,30 +2902,29 @@ bool NEP_Charge::compute_pimd_batch(
         *virial_beads[bead_id],
         *potential_beads[bead_id]);
     }
-    if (paramb.charge_mode == 1) {
-      find_force_charge_real_space<<<grid_size, block_size>>>(
-        N,
-        charge_para,
-        N1,
-        N2,
-        box,
-        batch.NN_radial.data() + atom_offset,
-        batch.NL_radial.data() + radial_offset,
-        bead.charge.data(),
-        position_beads[bead_id]->data(),
-        position_beads[bead_id]->data() + N,
-        position_beads[bead_id]->data() + N * 2,
-        force_beads[bead_id]->data(),
-        force_beads[bead_id]->data() + N,
-        force_beads[bead_id]->data() + N * 2,
-        virial_beads[bead_id]->data(),
-        potential_beads[bead_id]->data(),
-        bead.D_real.data());
-      GPU_CHECK_KERNEL
-    }
-    zero_mean_D_real<<<1, 1024>>>(N, bead.D_real.data());
+  }
+  if (paramb.charge_mode == 1) {
+    find_force_charge_real_space_pimd_batch<<<bead_grid, block_size>>>(
+      N,
+      paramb.MN_radial,
+      charge_para,
+      N1,
+      N2,
+      number_of_beads,
+      box,
+      batch.NN_radial.data(),
+      batch.NL_radial.data(),
+      batch.charge_ptrs.data(),
+      batch.position_ptrs.data(),
+      batch.force_ptrs.data(),
+      batch.virial_ptrs.data(),
+      batch.potential_ptrs.data(),
+      batch.D_real_ptrs.data());
     GPU_CHECK_KERNEL
   }
+  zero_mean_D_real_pimd_batch<<<number_of_beads, 1024>>>(
+    N, number_of_beads, batch.D_real_ptrs.data());
+  GPU_CHECK_KERNEL
 
   find_force_radial_pimd_batch<<<grid, block_size>>>(
     paramb,
@@ -2857,6 +3013,288 @@ bool NEP_Charge::compute_pimd_batch(
     }
   }
   return true;
+}
+
+static __global__ void zero_total_charge_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  float* const* g_charge)
+{
+  const int bead = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (bead >= number_of_beads) {
+    return;
+  }
+  __shared__ float s_charge[1024];
+  float charge = 0.0f;
+  const int number_of_batches = (N - 1) / 1024 + 1;
+  for (int batch = 0; batch < number_of_batches; ++batch) {
+    const int n = tid + batch * 1024;
+    if (n < N) {
+      charge += g_charge[bead][n];
+    }
+  }
+  s_charge[tid] = charge;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_charge[tid] += s_charge[tid + offset];
+    }
+    __syncthreads();
+  }
+  for (int batch = 0; batch < number_of_batches; ++batch) {
+    const int n = tid + batch * 1024;
+    if (n < N) {
+      g_charge[bead][n] -= s_charge[0] / N;
+    }
+  }
+}
+
+static __global__ void zero_mean_D_real_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  float* const* g_D_real)
+{
+  const int bead = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (bead >= number_of_beads) {
+    return;
+  }
+  __shared__ double s_sum[1024];
+  double sum = 0.0;
+  const int number_of_batches = (N - 1) / 1024 + 1;
+  for (int batch = 0; batch < number_of_batches; ++batch) {
+    const int n = tid + batch * 1024;
+    if (n < N) {
+      sum += static_cast<double>(g_D_real[bead][n]);
+    }
+  }
+  s_sum[tid] = sum;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_sum[tid] += s_sum[tid + offset];
+    }
+    __syncthreads();
+  }
+  const float mean_D = static_cast<float>(s_sum[0] / N);
+  for (int batch = 0; batch < number_of_batches; ++batch) {
+    const int n = tid + batch * 1024;
+    if (n < N) {
+      g_D_real[bead][n] -= mean_D;
+    }
+  }
+}
+
+static __global__ void find_bec_diagonal_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  float* const* g_charge,
+  float* const* g_bec)
+{
+  const int bead = blockIdx.y;
+  const int n1 = threadIdx.x + blockIdx.x * blockDim.x;
+  if (bead < number_of_beads && n1 < N) {
+    const float q = g_charge[bead][n1];
+    float* bec = g_bec[bead];
+    bec[n1 + N * 0] = q;
+    bec[n1 + N * 1] = 0.0f;
+    bec[n1 + N * 2] = 0.0f;
+    bec[n1 + N * 3] = 0.0f;
+    bec[n1 + N * 4] = q;
+    bec[n1 + N * 5] = 0.0f;
+    bec[n1 + N * 6] = 0.0f;
+    bec[n1 + N * 7] = 0.0f;
+    bec[n1 + N * 8] = q;
+  }
+}
+
+static __global__ void find_bec_radial_pimd_batch(
+  const NEP_Charge::ParaMB paramb,
+  const NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const Box box,
+  const int* g_NN_batch,
+  const int* g_NL_batch,
+  const int* g_type,
+  double* const* g_position,
+  const float* g_charge_derivative_batch,
+  float* const* g_bec)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads || n1 >= N2) {
+    return;
+  }
+  const double* position = g_position[bead];
+  const double* g_x = position;
+  const double* g_y = position + N;
+  const double* g_z = position + N * 2;
+  const int* g_NN = g_NN_batch + static_cast<size_t>(bead) * N;
+  const int* g_NL = g_NL_batch + static_cast<size_t>(bead) * N * paramb.MN_radial;
+  const float* g_charge_derivative =
+    g_charge_derivative_batch + static_cast<size_t>(bead) * N * annmb.dim;
+  float* bec = g_bec[bead];
+  const int t1 = g_type[n1];
+  const double x1 = g_x[n1];
+  const double y1 = g_y[n1];
+  const double z1 = g_z[n1];
+  for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
+    const int n2 = g_NL[n1 + N * i1];
+    const int t2 = g_type[n2];
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
+    const float r12[3] = {x12, y12, z12};
+    const float d12 = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
+    const float d12inv = 1.0f / d12;
+    float fc12, fcp12;
+    find_fc_and_fcp(paramb.rc_radial, paramb.rcinv_radial, d12, fc12, fcp12);
+    float fn12[MAX_NUM_N];
+    float fnp12[MAX_NUM_N];
+    find_fn_and_fnp(paramb.basis_size_radial, paramb.rcinv_radial, d12, fc12, fcp12, fn12, fnp12);
+    float f12[3] = {0.0f};
+    for (int n = 0; n <= paramb.n_max_radial; ++n) {
+      float gnp12 = 0.0f;
+      for (int k = 0; k <= paramb.basis_size_radial; ++k) {
+        const int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
+        gnp12 += fnp12[k] * annmb.c[c_index + t1 * paramb.num_types + t2];
+      }
+      const float tmp12 = g_charge_derivative[n1 + n * N] * gnp12 * d12inv;
+      f12[0] += tmp12 * r12[0];
+      f12[1] += tmp12 * r12[1];
+      f12[2] += tmp12 * r12[2];
+    }
+    const float bec_values[9] = {
+      0.5f * r12[0] * f12[0], 0.5f * r12[0] * f12[1], 0.5f * r12[0] * f12[2],
+      0.5f * r12[1] * f12[0], 0.5f * r12[1] * f12[1], 0.5f * r12[1] * f12[2],
+      0.5f * r12[2] * f12[0], 0.5f * r12[2] * f12[1], 0.5f * r12[2] * f12[2]};
+    for (int component = 0; component < 9; ++component) {
+      atomicAdd(&bec[n1 + component * N], bec_values[component]);
+      atomicAdd(&bec[n2 + component * N], -bec_values[component]);
+    }
+  }
+}
+
+static __global__ void find_bec_angular_pimd_batch(
+  const NEP_Charge::ParaMB paramb,
+  const NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const Box box,
+  const int* g_NN_batch,
+  const int* g_NL_batch,
+  const int* g_type,
+  double* const* g_position,
+  const float* g_charge_derivative_batch,
+  const float* g_sum_fxyz_batch,
+  float* const* g_bec)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads || n1 >= N2) {
+    return;
+  }
+  const double* position = g_position[bead];
+  const double* g_x = position;
+  const double* g_y = position + N;
+  const double* g_z = position + N * 2;
+  const int* g_NN = g_NN_batch + static_cast<size_t>(bead) * N;
+  const int* g_NL = g_NL_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
+  const float* g_charge_derivative =
+    g_charge_derivative_batch + static_cast<size_t>(bead) * N * annmb.dim;
+  const int sum_components =
+    (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
+  const float* g_sum_fxyz = g_sum_fxyz_batch + static_cast<size_t>(bead) * N * sum_components;
+  float* bec = g_bec[bead];
+  float Fp[MAX_DIM_ANGULAR] = {0.0f};
+  float sum_fxyz[NUM_OF_ABC * MAX_NUM_N];
+  for (int d = 0; d < paramb.dim_angular; ++d) {
+    Fp[d] = g_charge_derivative[(paramb.n_max_radial + 1 + d) * N + n1];
+  }
+  for (int n = 0; n <= paramb.n_max_angular; ++n) {
+    for (int abc = 0; abc < (paramb.L_max + 1) * (paramb.L_max + 1) - 1; ++abc) {
+      sum_fxyz[n * NUM_OF_ABC + abc] =
+        g_sum_fxyz[(n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) * N + n1];
+    }
+  }
+  const int t1 = g_type[n1];
+  const double x1 = g_x[n1];
+  const double y1 = g_y[n1];
+  const double z1 = g_z[n1];
+  for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
+    const int n2 = g_NL[n1 + N * i1];
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
+    const float r12[3] = {x12, y12, z12};
+    const float d12 = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
+    float fc12, fcp12;
+    find_fc_and_fcp(paramb.rc_angular, paramb.rcinv_angular, d12, fc12, fcp12);
+    float fn12[MAX_NUM_N];
+    float fnp12[MAX_NUM_N];
+    find_fn_and_fnp(paramb.basis_size_angular, paramb.rcinv_angular, d12, fc12, fcp12, fn12, fnp12);
+    float f12[3] = {0.0f};
+    const int t2 = g_type[n2];
+    for (int n = 0; n <= paramb.n_max_angular; ++n) {
+      float gn12 = 0.0f;
+      float gnp12 = 0.0f;
+      for (int k = 0; k <= paramb.basis_size_angular; ++k) {
+        const int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
+        gn12 += fn12[k] * annmb.c[c_index + t1 * paramb.num_types + t2 + paramb.num_c_radial];
+        gnp12 += fnp12[k] * annmb.c[c_index + t1 * paramb.num_types + t2 + paramb.num_c_radial];
+      }
+      accumulate_f12(
+        paramb.L_max,
+        paramb.has_q_222,
+        paramb.has_q_1111,
+        paramb.has_q_112,
+        paramb.has_q_123,
+        paramb.has_q_233,
+        paramb.has_q_134,
+        paramb.num_L,
+        n,
+        paramb.n_max_angular + 1,
+        d12,
+        r12,
+        gn12,
+        gnp12,
+        Fp,
+        sum_fxyz,
+        f12);
+    }
+    const float bec_values[9] = {
+      0.5f * r12[0] * f12[0], 0.5f * r12[0] * f12[1], 0.5f * r12[0] * f12[2],
+      0.5f * r12[1] * f12[0], 0.5f * r12[1] * f12[1], 0.5f * r12[1] * f12[2],
+      0.5f * r12[2] * f12[0], 0.5f * r12[2] * f12[1], 0.5f * r12[2] * f12[2]};
+    for (int component = 0; component < 9; ++component) {
+      atomicAdd(&bec[n1 + component * N], bec_values[component]);
+      atomicAdd(&bec[n2 + component * N], -bec_values[component]);
+    }
+  }
+}
+
+static __global__ void scale_bec_pimd_batch(
+  const int N,
+  const int number_of_beads,
+  const float* sqrt_epsilon_inf,
+  float* const* g_bec)
+{
+  const int bead = blockIdx.y;
+  const int n1 = threadIdx.x + blockIdx.x * blockDim.x;
+  if (bead < number_of_beads && n1 < N) {
+    float* bec = g_bec[bead];
+    for (int d = 0; d < 9; ++d) {
+      bec[n1 + N * d] *= sqrt_epsilon_inf[0];
+    }
+  }
 }
 
 void NEP_Charge::compute_non_electro(
