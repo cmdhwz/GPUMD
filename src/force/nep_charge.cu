@@ -2752,9 +2752,6 @@ bool NEP_Charge::compute_pimd_batch(
     virial_beads.size() != position_beads.size()) {
     return false;
   }
-  if (get_expanded_box(paramb.rc_radial, box, ebox)) {
-    return false;
-  }
 
   const int N = type.size();
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
@@ -2765,6 +2762,50 @@ bool NEP_Charge::compute_pimd_batch(
       virial_beads[bead_id]->size() != static_cast<size_t>(N) * 9) {
       return false;
     }
+  }
+
+  if (get_expanded_box(paramb.rc_radial, box, ebox)) {
+    // The small-box kernels use explicit periodic images and do not share the
+    // large-box global-neighbor layout. Keep this path correct while the
+    // large-box electrostatics use the fully batched implementation below.
+    initialize_pimd_batch_(
+      N, position_beads, potential_beads, force_beads, virial_beads);
+    auto& batch = *pimd_batch_data_;
+    if (small_box_data.NN_radial.size() != static_cast<size_t>(N)) {
+      const int big_neighbor_size = 2000;
+      const int size_x12 = N * big_neighbor_size;
+      small_box_data.NN_radial.resize(N);
+      small_box_data.NL_radial.resize(size_x12);
+      small_box_data.NN_angular.resize(N);
+      small_box_data.NL_angular.resize(size_x12);
+      small_box_data.r12.resize(size_x12 * 6);
+    }
+    initialize_pimd_batch_properties<<<
+      dim3((N - 1) / 128 + 1, number_of_beads), 128>>>(
+      N,
+      batch.potential_ptrs.data(),
+      batch.force_ptrs.data(),
+      batch.virial_ptrs.data());
+    GPU_CHECK_KERNEL
+    for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+      compute_small_box(
+        box,
+        type,
+        *position_beads[bead_id],
+        *potential_beads[bead_id],
+        *force_beads[bead_id],
+        *virial_beads[bead_id]);
+      if (has_dftd3) {
+        dftd3.compute(
+          box,
+          type,
+          *position_beads[bead_id],
+          *potential_beads[bead_id],
+          *force_beads[bead_id],
+          *virial_beads[bead_id]);
+      }
+    }
+    return true;
   }
 
   initialize_pimd_batch_(
