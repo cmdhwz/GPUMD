@@ -133,7 +133,7 @@ void Dump_PIMD_Restart::process(
   for (int n = 0; n < number_of_atoms; ++n) {
     fprintf(
       fid,
-      "%s %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+      "%s %.17g %.17g %.17g %.8f %.17g %.17g %.17g\n",
       atom.cpu_atom_symbol[n].c_str(),
       cpu_position_[n],
       cpu_position_[n + number_of_atoms],
@@ -152,7 +152,7 @@ void Dump_PIMD_Restart::process(
     for (int n = 0; n < number_of_atoms; ++n) {
       fprintf(
         fid,
-        "%s %.17g %.17g %.17g %.17g %.17g %.17g\n",
+        "%s %.17g %.17g %.17g %.8f %.17g %.17g %.17g\n",
         atom.cpu_atom_symbol[n].c_str(),
         cpu_position_[n],
         cpu_position_[n + number_of_atoms],
