@@ -18,6 +18,8 @@ Dump a single-file restart container for centroid and all beads in PIMD-related 
 --------------------------------------------------------------------------------------------------*/
 
 #include "dump_pimd_restart.cuh"
+#include "integrate/ensemble.cuh"
+#include "integrate/integrate.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "utilities/common.cuh"
@@ -65,21 +67,23 @@ void Dump_PIMD_Restart::preprocess(
   cpu_velocity_.resize(atom.number_of_atoms * 3);
 }
 
-void Dump_PIMD_Restart::output_line_2(FILE* fid, const Box& box, int number_of_beads, int bead_index)
+void Dump_PIMD_Restart::output_line_2(
+  FILE* fid, const Box& box, int number_of_beads, int bead_index, double temperature)
 {
   fprintf(
     fid,
-    "pimd_restart=1 num_beads=%d bead=%d role=%s ",
+    "pimd_restart=1 num_beads=%d bead=%d role=%s temperature=%.17g ",
     number_of_beads,
     bead_index,
-    bead_index < 0 ? "centroid" : "bead");
+    bead_index < 0 ? "centroid" : "bead",
+    temperature);
 
   fprintf(
     fid, "pbc=\"%c %c %c\" ", box.pbc_x ? 'T' : 'F', box.pbc_y ? 'T' : 'F', box.pbc_z ? 'T' : 'F');
 
   fprintf(
     fid,
-    "Lattice=\"%.8f %.8f %.8f %.8f %.8f %.8f %.8f %.8f %.8f\" ",
+    "Lattice=\"%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\" ",
     box.cpu_h[0],
     box.cpu_h[3],
     box.cpu_h[6],
@@ -118,16 +122,18 @@ void Dump_PIMD_Restart::process(
   const int number_of_atoms = atom.number_of_atoms;
   const int number_of_beads = atom.number_of_beads;
   const double natural_to_A_per_fs = 1.0 / TIME_UNIT_CONVERSION;
+  const double restart_temperature =
+    integrate.ensemble != nullptr ? integrate.ensemble->temperature : temperature;
 
   // The centroid frame is written first so restart readers can reuse the averaged state directly.
   atom.position_per_atom.copy_to_host(cpu_position_.data());
   atom.velocity_per_atom.copy_to_host(cpu_velocity_.data());
   fprintf(fid, "%d\n", number_of_atoms);
-  output_line_2(fid, box, number_of_beads, -1);
+  output_line_2(fid, box, number_of_beads, -1, restart_temperature);
   for (int n = 0; n < number_of_atoms; ++n) {
     fprintf(
       fid,
-      "%s %.8f %.8f %.8f %.8f %.8f %.8f %.8f\n",
+      "%s %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
       atom.cpu_atom_symbol[n].c_str(),
       cpu_position_[n],
       cpu_position_[n + number_of_atoms],
@@ -142,11 +148,11 @@ void Dump_PIMD_Restart::process(
     atom.position_beads[k].copy_to_host(cpu_position_.data());
     atom.velocity_beads[k].copy_to_host(cpu_velocity_.data());
     fprintf(fid, "%d\n", number_of_atoms);
-    output_line_2(fid, box, number_of_beads, k);
+    output_line_2(fid, box, number_of_beads, k, restart_temperature);
     for (int n = 0; n < number_of_atoms; ++n) {
       fprintf(
         fid,
-        "%s %.8f %.8f %.8f %.8f %.8f %.8f %.8f\n",
+        "%s %.17g %.17g %.17g %.17g %.17g %.17g\n",
         atom.cpu_atom_symbol[n].c_str(),
         cpu_position_[n],
         cpu_position_[n + number_of_atoms],

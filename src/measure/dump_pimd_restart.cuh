@@ -47,5 +47,6 @@ private:
   std::vector<double> cpu_position_;
   std::vector<double> cpu_velocity_;
 
-  void output_line_2(FILE* fid, const Box& box, int number_of_beads, int bead_index);
+  void output_line_2(
+    FILE* fid, const Box& box, int number_of_beads, int bead_index, double temperature);
 };

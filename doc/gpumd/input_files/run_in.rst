@@ -81,6 +81,10 @@ Simulation setup
      - Specify the integration time step
      - No
      - Yes
+   * - :ref:`read_pimd_restart <kw_read_pimd_restart>`
+     - Read a centroid and bead-resolved PIMD restart state
+     - Yes
+     - N/A
 
 Actions
 ^^^^^^^
@@ -169,6 +173,10 @@ Output
      - No
    * - :ref:`dump_exyz <kw_dump_exyz>`
      - Write positions and other quantities in `extended XYZ format <https://github.com/libAtoms/extxyz>`_
+     - No
+     - No
+   * - :ref:`dump_pimd_restart <kw_dump_pimd_restart>`
+     - Write a centroid and bead-resolved PIMD restart state
      - No
      - No
    * - :ref:`dump_observer <kw_dump_observer>`

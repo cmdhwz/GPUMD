@@ -78,7 +78,9 @@ void read_pimd_restart_line_2(
   int& bead_index,
   std::string& role,
   int& num_columns,
-  int* property_offset)
+  int* property_offset,
+  double& frame_temperature,
+  bool& frame_has_temperature)
 {
   std::vector<std::string> tokens = get_tokens_without_unwanted_spaces(input);
   for (auto& token : tokens) {
@@ -92,6 +94,8 @@ void read_pimd_restart_line_2(
   bool has_role = false;
   bool has_lattice = false;
   bool has_properties = false;
+  frame_temperature = 0.0;
+  frame_has_temperature = false;
   num_columns = 0;
   property_offset[0] = 0;
   property_offset[1] = 0;
@@ -163,6 +167,13 @@ void read_pimd_restart_line_2(
         }
       }
       has_lattice = true;
+    } else if (tokens[n].substr(0, 12) == "temperature=") {
+      frame_temperature =
+        get_double_from_token(tokens[n].substr(12, tokens[n].length() - 12), __FILE__, __LINE__);
+      if (frame_temperature <= 0.0) {
+        PRINT_INPUT_ERROR("temperature in restart_beads.xyz should > 0.");
+      }
+      frame_has_temperature = true;
     } else if (tokens[n].substr(0, 11) == "properties=") {
       std::string line = tokens[n].substr(11, tokens[n].length() - 11);
       for (auto& letter : line) {
@@ -207,7 +218,12 @@ void read_pimd_restart_line_2(
 }
 } // namespace
 
-void read_pimd_restart(const char* filename, int expected_number_of_beads, Box& box, Atom& atom)
+void read_pimd_restart(
+  const char* filename,
+  int expected_number_of_beads,
+  Box& box,
+  Atom& atom,
+  PIMD_Restart_Metadata* metadata)
 {
   std::ifstream input(filename);
   if (!input.is_open()) {
@@ -223,6 +239,7 @@ void read_pimd_restart(const char* filename, int expected_number_of_beads, Box& 
   std::vector<int> bead_frame_seen(expected_number_of_beads, 0);
   bool read_box = false;
   bool centroid_frame_seen = false;
+  PIMD_Restart_Metadata restart_metadata;
 
   atom.position_beads.resize(expected_number_of_beads);
   atom.velocity_beads.resize(expected_number_of_beads);
@@ -255,6 +272,8 @@ void read_pimd_restart(const char* filename, int expected_number_of_beads, Box& 
     std::string role;
     int property_offset[4] = {0, 0, 0, 0};
     int num_columns = 0;
+    double frame_temperature = 0.0;
+    bool frame_has_temperature = false;
     read_pimd_restart_line_2(
       input,
       expected_number_of_beads,
@@ -263,7 +282,9 @@ void read_pimd_restart(const char* filename, int expected_number_of_beads, Box& 
       bead_index,
       role,
       num_columns,
-      property_offset);
+      property_offset,
+      frame_temperature,
+      frame_has_temperature);
     read_frame_atom_data(
       input,
       number_of_atoms,
@@ -273,6 +294,19 @@ void read_pimd_restart(const char* filename, int expected_number_of_beads, Box& 
       atom.cpu_mass,
       position,
       velocity);
+
+    if (frame_has_temperature) {
+      if (!restart_metadata.has_temperature) {
+        restart_metadata.has_temperature = true;
+        restart_metadata.temperature = frame_temperature;
+      } else {
+        const double temperature_tolerance =
+          1.0e-8 * std::max(1.0, std::abs(restart_metadata.temperature));
+        if (std::abs(frame_temperature - restart_metadata.temperature) > temperature_tolerance) {
+          PRINT_INPUT_ERROR("temperature values in restart_beads.xyz are inconsistent.\n");
+        }
+      }
+    }
 
     if (role == "centroid") {
       if (bead_index != -1) {
@@ -315,4 +349,29 @@ void read_pimd_restart(const char* filename, int expected_number_of_beads, Box& 
   atom.position_per_atom.copy_from_host(atom.cpu_position_per_atom.data());
   atom.velocity_per_atom.copy_from_host(atom.cpu_velocity_per_atom.data());
   atom.number_of_beads = expected_number_of_beads;
+
+  // The centroid frame is stored for readability, but the bead frames are the
+  // authoritative phase-space state.  Recompute the centroid from the loaded
+  // beads so rounding cannot leave an inconsistent starting state.
+  std::fill(atom.cpu_position_per_atom.begin(), atom.cpu_position_per_atom.end(), 0.0);
+  std::fill(atom.cpu_velocity_per_atom.begin(), atom.cpu_velocity_per_atom.end(), 0.0);
+  for (int k = 0; k < expected_number_of_beads; ++k) {
+    atom.position_beads[k].copy_to_host(position.data());
+    atom.velocity_beads[k].copy_to_host(velocity.data());
+    for (int i = 0; i < number_of_atoms * 3; ++i) {
+      atom.cpu_position_per_atom[i] += position[i];
+      atom.cpu_velocity_per_atom[i] += velocity[i];
+    }
+  }
+  const double inverse_number_of_beads = 1.0 / expected_number_of_beads;
+  for (int i = 0; i < number_of_atoms * 3; ++i) {
+    atom.cpu_position_per_atom[i] *= inverse_number_of_beads;
+    atom.cpu_velocity_per_atom[i] *= inverse_number_of_beads;
+  }
+  atom.position_per_atom.copy_from_host(atom.cpu_position_per_atom.data());
+  atom.velocity_per_atom.copy_from_host(atom.cpu_velocity_per_atom.data());
+
+  if (metadata != nullptr) {
+    *metadata = restart_metadata;
+  }
 }

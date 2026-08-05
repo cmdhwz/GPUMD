@@ -30,9 +30,12 @@ If the first parameter is :attr:`rpmd`, it means that the current run will use r
 
 It can be used as follows::
 
-    ensemble rpmd <num_beads> 
+    ensemble rpmd <num_beads> {<temperature>}
 
 This can be understood as the NVE version of :term:`PIMD`, where no thermostat is applied.
+The optional temperature is used to set the ring-polymer frequency when RPMD is started in a
+fresh run. If it is omitted, a temperature must have been supplied by a preceding PIMD
+declaration or restored from :attr:`read_pimd_restart`.
 
 :attr:`trpmd`
 ^^^^^^^^^^^^^
@@ -40,6 +43,7 @@ If the first parameter is :attr:`trpmd`, it means that the current run will use 
 
 It can be used as follows::
 
-    ensemble trpmd <num_beads> 
+    ensemble trpmd <num_beads> {<temperature>}
 
 This is similar to :term:`RPMD`, but the Langevin thermosat is applied to the internal modes.
+The optional temperature follows the same rule as for :attr:`rpmd`.

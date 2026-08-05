@@ -71,6 +71,12 @@ void Integrate::initialize(
     }
   }
 
+  if ((type == 31 || type == 32) && !ring_polymer_temperature_is_set) {
+    PRINT_INPUT_ERROR(
+      "RPMD/TRPMD temperature is not set. Use ensemble rpmd/trpmd <beads> <temperature>, "
+      "or read a restart file containing temperature metadata.");
+  }
+
   // determine the integrator
   switch (type) {
     case 0: // NVE
@@ -500,13 +506,13 @@ void Integrate::parse_ensemble(
     }
   } else if (strcmp(param[1], "rpmd") == 0) {
     type = 31;
-    if (num_param != 3) {
-      PRINT_INPUT_ERROR("ensemble rpmd should have 1 parameter.");
+    if (num_param != 3 && num_param != 4) {
+      PRINT_INPUT_ERROR("ensemble rpmd should have 1 or 2 parameters.");
     }
   } else if (strcmp(param[1], "trpmd") == 0) {
     type = 32;
-    if (num_param != 3) {
-      PRINT_INPUT_ERROR("ensemble trpmd should have 1 parameter.");
+    if (num_param != 3 && num_param != 4) {
+      PRINT_INPUT_ERROR("ensemble trpmd should have 1 or 2 parameters.");
     }
   } else if (strcmp(param[1], "pimd") == 0) {
     type = 33;
@@ -805,6 +811,9 @@ void Integrate::parse_ensemble(
         PRINT_INPUT_ERROR("Temperature coupling should >= 1.");
       }
 
+      ring_polymer_temperature_is_set = true;
+      ring_polymer_temperature_is_explicit = false;
+
       num_target_pressure_components = 0;
 
       // pressures:
@@ -942,6 +951,22 @@ void Integrate::parse_ensemble(
         }
       }
     }
+  }
+
+  // RPMD/TRPMD normally inherit the temperature from a preceding PIMD
+  // declaration.  Allow an explicit temperature so a restart can be opened
+  // in a fresh process without relying on uninitialized Integrate state.
+  if ((type == 31 || type == 32) && num_param == 4) {
+    if (!is_valid_real(param[3], &temperature)) {
+      PRINT_INPUT_ERROR("RPMD temperature should be a number.");
+    }
+    if (temperature <= 0.0) {
+      PRINT_INPUT_ERROR("RPMD temperature should > 0.");
+    }
+    temperature1 = temperature;
+    temperature2 = temperature;
+    ring_polymer_temperature_is_set = true;
+    ring_polymer_temperature_is_explicit = true;
   }
 
   switch (type) {
@@ -1151,10 +1176,12 @@ void Integrate::parse_ensemble(
     case 31:
       printf("Use ring-polymer MD (RPMD) for this run.\n");
       printf("    number of beads is %d.\n", number_of_beads);
+      printf("    ring-polymer temperature is %g K.\n", temperature2);
       break;
     case 32:
       printf("Use thermostatted ring-polyer MD (TRPMD) for this run.\n");
       printf("    number of beads is %d.\n", number_of_beads);
+      printf("    ring-polymer temperature is %g K.\n", temperature2);
       break;
     case 33:
       if (num_param >= 9) {

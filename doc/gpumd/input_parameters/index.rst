@@ -35,6 +35,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    ensemble_shock_nemd
    ensemble_msst
    ensemble_nphug
+   read_pimd_restart
    add_force
    add_efield
    add_spring
@@ -80,6 +81,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    
    active
    dump_exyz
+   dump_pimd_restart
    dump_xyz
    dump_beads
    dump_observer

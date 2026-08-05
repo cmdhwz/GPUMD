@@ -70,7 +70,7 @@ public:
   void parse_move(const char**, int, std::vector<Group>& group);
 
   // these data will be used to initialize ensemble
-  int type; // ensemble type in a specific run
+  int type = 0; // ensemble type in a specific run
   int source;
   int sink;
   int fixed_group = -1; // ID of the group in which the atoms will be fixed
@@ -79,9 +79,9 @@ public:
   int move_grouping_method = 0;
   double move_velocity[3];
 
-  double temperature;  // target temperature at a specific time
-  double temperature1; // target initial temperature for a run
-  double temperature2; // target final temperature for a run
+  double temperature = 0.0;  // target temperature at a specific time
+  double temperature1 = 0.0; // target initial temperature for a run
+  double temperature2 = 0.0; // target final temperature for a run
   double delta_temperature;
   double target_pressure[6];
   double target_pressure1[6];
@@ -99,7 +99,11 @@ public:
   double deform_rate[3];
 
   // PIMD
-  int number_of_beads;
+  int number_of_beads = 0;
+  // True when a valid temperature for a ring-polymer run was supplied by the
+  // input or restored from a PIMD restart file.
+  bool ring_polymer_temperature_is_set = false;
+  bool ring_polymer_temperature_is_explicit = false;
 
   // TTM parameters
   TTM_Parameters ttm_parameters;

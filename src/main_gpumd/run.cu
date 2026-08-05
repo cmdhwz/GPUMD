@@ -78,6 +78,7 @@ Run simulation according to the inputs in the run.in file.
 #include "velocity.cuh"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
 static __global__ void gpu_find_largest_v2(
@@ -678,7 +679,26 @@ void Run::parse_read_pimd_restart(const char** param, int num_param)
     PRINT_INPUT_ERROR("read_pimd_restart should be used after a PIMD-related ensemble keyword.\n");
   }
 
-  read_pimd_restart(param[1], integrate.number_of_beads, box, atom);
+  PIMD_Restart_Metadata restart_metadata;
+  read_pimd_restart(param[1], integrate.number_of_beads, box, atom, &restart_metadata);
+  if (restart_metadata.has_temperature) {
+    if (integrate.ring_polymer_temperature_is_explicit) {
+      const double temperature_tolerance =
+        1.0e-8 * std::max(1.0, std::abs(integrate.temperature2));
+      if (std::abs(integrate.temperature2 - restart_metadata.temperature) > temperature_tolerance) {
+        PRINT_INPUT_ERROR(
+          "The explicit RPMD temperature does not match restart_beads.xyz temperature.");
+      }
+    }
+    integrate.temperature = restart_metadata.temperature;
+    integrate.temperature1 = restart_metadata.temperature;
+    integrate.temperature2 = restart_metadata.temperature;
+    integrate.ring_polymer_temperature_is_set = true;
+  } else if (!integrate.ring_polymer_temperature_is_set) {
+    PRINT_INPUT_ERROR(
+      "restart_beads.xyz has no temperature. Use ensemble rpmd/trpmd <beads> <temperature>, "
+      "or precede read_pimd_restart with an ensemble pimd declaration.");
+  }
   has_velocity_in_xyz = 1;
 
   printf("Read PIMD restart data from %s.\n", param[1]);
