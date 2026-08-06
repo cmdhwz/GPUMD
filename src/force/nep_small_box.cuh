@@ -1150,26 +1150,26 @@ static __global__ void find_neighbor_list_small_box_pimd_batch(
     for (int i1 = 0; i1 < g_NN_radial[n1]; ++i1) {
       const int index = i1 * N + n1;
       const int n2 = g_NL_radial[index];
-      x12_radial_batch[neighbor_offset + i1 * N + n1] =
+      g_x12_radial[neighbor_offset + i1 * N + n1] =
         static_cast<float>(g_x[n2] - x1) + box.float_h[0] * g_image_x_radial[index] +
         box.float_h[1] * g_image_y_radial[index] + box.float_h[2] * g_image_z_radial[index];
-      y12_radial_batch[neighbor_offset + i1 * N + n1] =
+      g_y12_radial[neighbor_offset + i1 * N + n1] =
         static_cast<float>(g_y[n2] - y1) + box.float_h[3] * g_image_x_radial[index] +
         box.float_h[4] * g_image_y_radial[index] + box.float_h[5] * g_image_z_radial[index];
-      z12_radial_batch[neighbor_offset + i1 * N + n1] =
+      g_z12_radial[neighbor_offset + i1 * N + n1] =
         static_cast<float>(g_z[n2] - z1) + box.float_h[6] * g_image_x_radial[index] +
         box.float_h[7] * g_image_y_radial[index] + box.float_h[8] * g_image_z_radial[index];
     }
     for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
       const int index = i1 * N + n1;
       const int n2 = g_NL_angular[index];
-      x12_angular_batch[neighbor_offset + i1 * N + n1] =
+      g_x12_angular[neighbor_offset + i1 * N + n1] =
         static_cast<float>(g_x[n2] - x1) + box.float_h[0] * g_image_x_angular[index] +
         box.float_h[1] * g_image_y_angular[index] + box.float_h[2] * g_image_z_angular[index];
-      y12_angular_batch[neighbor_offset + i1 * N + n1] =
+      g_y12_angular[neighbor_offset + i1 * N + n1] =
         static_cast<float>(g_y[n2] - y1) + box.float_h[3] * g_image_x_angular[index] +
         box.float_h[4] * g_image_y_angular[index] + box.float_h[5] * g_image_z_angular[index];
-      z12_angular_batch[neighbor_offset + i1 * N + n1] =
+      g_z12_angular[neighbor_offset + i1 * N + n1] =
         static_cast<float>(g_z[n2] - z1) + box.float_h[6] * g_image_x_angular[index] +
         box.float_h[7] * g_image_y_angular[index] + box.float_h[8] * g_image_z_angular[index];
     }
