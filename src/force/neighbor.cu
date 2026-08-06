@@ -702,6 +702,15 @@ __global__ void gpu_check_atom_distance_batch(
   float dx = position[n] - x_old_batch[bead][n];
   float dy = position[n + N] - y_old_batch[bead][n];
   float dz = position[n + N * 2] - z_old_batch[bead][n];
+  const float sdx = box.float_h[9] * dx + box.float_h[10] * dy + box.float_h[11] * dz;
+  const float sdy = box.float_h[12] * dx + box.float_h[13] * dy + box.float_h[14] * dz;
+  const float sdz = box.float_h[15] * dx + box.float_h[16] * dy + box.float_h[17] * dz;
+  if (
+    (box.pbc_x == 1 && fabsf(sdx) > 0.5f) || (box.pbc_y == 1 && fabsf(sdy) > 0.5f) ||
+    (box.pbc_z == 1 && fabsf(sdz) > 0.5f)) {
+    atomicExch(&rebuild_flags[bead], 1);
+    return;
+  }
   apply_mic(box, dx, dy, dz);
   if ((dx * dx + dy * dy + dz * dz) > d2) {
     atomicExch(&rebuild_flags[bead], 1);
@@ -719,6 +728,25 @@ gpu_update_xyz0(int N, const double* x, const double* y, const double* z, double
     y0[n] = y[n];
     z0[n] = z[n];
   }
+}
+
+__global__ void gpu_update_xyz0_batch_if_rebuild(
+  const int N,
+  double* const* position_batch,
+  double* const* x0_batch,
+  double* const* y0_batch,
+  double* const* z0_batch,
+  const int* rebuild_flags)
+{
+  const int bead = blockIdx.y;
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= N || rebuild_flags[bead] == 0) {
+    return;
+  }
+  const double* position = position_batch[bead];
+  x0_batch[bead][n] = position[n];
+  y0_batch[bead][n] = position[n + N];
+  z0_batch[bead][n] = position[n + N * 2];
 }
 
 __global__ void gpu_find_local_neighbor_from_global(
@@ -912,6 +940,64 @@ void Neighbor::find_neighbor_global_batch(
       neighbor->z0.data());
     GPU_CHECK_KERNEL
   }
+}
+
+void Neighbor::check_atom_distance_batch(
+  const Box& box,
+  const int number_of_atoms,
+  const double skin,
+  const GPU_Vector<double*>& x0_batch,
+  const GPU_Vector<double*>& y0_batch,
+  const GPU_Vector<double*>& z0_batch,
+  const GPU_Vector<double*>& position_batch,
+  GPU_Vector<int>& rebuild_flags)
+{
+  const int number_of_beads = static_cast<int>(position_batch.size());
+  if (
+    number_of_beads == 0 || x0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    y0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    z0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    rebuild_flags.size() != static_cast<size_t>(number_of_beads)) {
+    return;
+  }
+  gpu_check_atom_distance_batch<<<
+    dim3((number_of_atoms - 1) / 128 + 1, number_of_beads), 128>>>(
+    box,
+    number_of_atoms,
+    skin * skin * 0.25,
+    x0_batch.data(),
+    y0_batch.data(),
+    z0_batch.data(),
+    position_batch.data(),
+    rebuild_flags.data());
+  GPU_CHECK_KERNEL
+}
+
+void Neighbor::update_reference_positions_batch(
+  const int number_of_atoms,
+  const GPU_Vector<double*>& position_batch,
+  const GPU_Vector<double*>& x0_batch,
+  const GPU_Vector<double*>& y0_batch,
+  const GPU_Vector<double*>& z0_batch,
+  const GPU_Vector<int>& rebuild_flags)
+{
+  const int number_of_beads = static_cast<int>(position_batch.size());
+  if (
+    number_of_beads == 0 || x0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    y0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    z0_batch.size() != static_cast<size_t>(number_of_beads) ||
+    rebuild_flags.size() != static_cast<size_t>(number_of_beads)) {
+    return;
+  }
+  gpu_update_xyz0_batch_if_rebuild<<<
+    dim3((number_of_atoms - 1) / 128 + 1, number_of_beads), 128>>>(
+    number_of_atoms,
+    position_batch.data(),
+    x0_batch.data(),
+    y0_batch.data(),
+    z0_batch.data(),
+    rebuild_flags.data());
+  GPU_CHECK_KERNEL
 }
 
 void Neighbor::find_local_neighbor_from_global(

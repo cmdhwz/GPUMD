@@ -155,6 +155,9 @@ private:
   struct PIMD_Bead_Data
   {
     std::unique_ptr<Neighbor> neighbor;
+    GPU_Vector<double> small_box_x0;
+    GPU_Vector<double> small_box_y0;
+    GPU_Vector<double> small_box_z0;
   };
 
   struct PIMD_Batch_Data
@@ -172,15 +175,37 @@ private:
     GPU_Vector<double*> virial_ptrs;
     GPU_Vector<int*> NN_global_ptrs;
     GPU_Vector<int*> NL_global_ptrs;
+    GPU_Vector<double*> small_box_x0_ptrs;
+    GPU_Vector<double*> small_box_y0_ptrs;
+    GPU_Vector<double*> small_box_z0_ptrs;
+    GPU_Vector<int> small_box_rebuild_flags;
     GPU_Vector<int> NN_radial;
     GPU_Vector<int> NL_radial;
     GPU_Vector<int> NN_angular;
     GPU_Vector<int> NL_angular;
+    GPU_Vector<int> small_NN_radial;
+    GPU_Vector<int> small_NL_radial;
+    GPU_Vector<int> small_NN_angular;
+    GPU_Vector<int> small_NL_angular;
+    GPU_Vector<float> small_x12_radial;
+    GPU_Vector<float> small_y12_radial;
+    GPU_Vector<float> small_z12_radial;
+    GPU_Vector<float> small_x12_angular;
+    GPU_Vector<float> small_y12_angular;
+    GPU_Vector<float> small_z12_angular;
+    GPU_Vector<int> small_image_x_radial;
+    GPU_Vector<int> small_image_y_radial;
+    GPU_Vector<int> small_image_z_radial;
+    GPU_Vector<int> small_image_x_angular;
+    GPU_Vector<int> small_image_y_angular;
+    GPU_Vector<int> small_image_z_angular;
     GPU_Vector<float> Fp;
     GPU_Vector<float> sum_fxyz;
     GPU_Vector<float> f12x;
     GPU_Vector<float> f12y;
     GPU_Vector<float> f12z;
+    bool small_box_initialized = false;
+    double small_box_h[9] = {0.0};
   };
 
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;

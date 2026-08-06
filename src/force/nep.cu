@@ -28,6 +28,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include "utilities/gpu_macro.cuh"
 #include "utilities/nep_utilities.cuh"
 #include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <cstddef>
@@ -393,6 +394,7 @@ void NEP::initialize_pimd_batch_(
   if (needs_allocation) {
     pimd_batch_data_.reset(new PIMD_Batch_Data());
     auto& batch = *pimd_batch_data_;
+    const int small_box_neighbor_size = 2000;
     batch.number_of_atoms = number_of_atoms;
     batch.number_of_beads = number_of_beads;
     batch.position_ptrs.resize(number_of_beads);
@@ -401,12 +403,46 @@ void NEP::initialize_pimd_batch_(
     batch.virial_ptrs.resize(number_of_beads);
     batch.NN_global_ptrs.resize(number_of_beads);
     batch.NL_global_ptrs.resize(number_of_beads);
+    batch.small_box_x0_ptrs.resize(number_of_beads);
+    batch.small_box_y0_ptrs.resize(number_of_beads);
+    batch.small_box_z0_ptrs.resize(number_of_beads);
+    batch.small_box_rebuild_flags.resize(number_of_beads);
     batch.NN_radial.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
     batch.NL_radial.resize(
       static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_radial);
     batch.NN_angular.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
     batch.NL_angular.resize(
       static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_angular);
+    batch.small_NN_radial.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
+    batch.small_NL_radial.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_NN_angular.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
+    batch.small_NL_angular.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_x12_radial.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_y12_radial.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_z12_radial.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_x12_angular.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_y12_angular.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_z12_angular.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_image_x_radial.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_image_y_radial.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_image_z_radial.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_image_x_angular.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_image_y_angular.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
+    batch.small_image_z_angular.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
     batch.Fp.resize(
       static_cast<size_t>(number_of_beads) * number_of_atoms * annmb.dim);
     const int sum_components =
@@ -421,18 +457,30 @@ void NEP::initialize_pimd_batch_(
 
     std::vector<int*> NN_global_ptrs(number_of_beads);
     std::vector<int*> NL_global_ptrs(number_of_beads);
+    std::vector<double*> small_box_x0_ptrs(number_of_beads);
+    std::vector<double*> small_box_y0_ptrs(number_of_beads);
+    std::vector<double*> small_box_z0_ptrs(number_of_beads);
     batch.beads.reserve(number_of_beads);
     for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
       std::unique_ptr<PIMD_Bead_Data> bead(new PIMD_Bead_Data());
       bead->neighbor.reset(new Neighbor());
       bead->neighbor->initialize(rc, number_of_atoms, paramb.MN_radial);
       bead->neighbor->set_always_rebuild(neighbor_always_rebuild_);
+      bead->small_box_x0.resize(number_of_atoms);
+      bead->small_box_y0.resize(number_of_atoms);
+      bead->small_box_z0.resize(number_of_atoms);
       NN_global_ptrs[bead_id] = bead->neighbor->NN.data();
       NL_global_ptrs[bead_id] = bead->neighbor->NL.data();
+      small_box_x0_ptrs[bead_id] = bead->small_box_x0.data();
+      small_box_y0_ptrs[bead_id] = bead->small_box_y0.data();
+      small_box_z0_ptrs[bead_id] = bead->small_box_z0.data();
       batch.beads.push_back(std::move(bead));
     }
     batch.NN_global_ptrs.copy_from_host(NN_global_ptrs.data());
     batch.NL_global_ptrs.copy_from_host(NL_global_ptrs.data());
+    batch.small_box_x0_ptrs.copy_from_host(small_box_x0_ptrs.data());
+    batch.small_box_y0_ptrs.copy_from_host(small_box_y0_ptrs.data());
+    batch.small_box_z0_ptrs.copy_from_host(small_box_z0_ptrs.data());
     printf(
       "Using NEP ring-polymer bead-batched kernels for %d beads on one GPU.\n",
       number_of_beads);
@@ -2033,9 +2081,7 @@ bool NEP::compute_pimd_batch(
     virial_beads.size() != position_beads.size()) {
     return false;
   }
-  if (get_expanded_box(paramb.rc_radial_max, box, ebox)) {
-    return false;
-  }
+  const bool is_small_box = get_expanded_box(paramb.rc_radial_max, box, ebox);
 
   const int N = type.size();
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
@@ -2051,6 +2097,192 @@ bool NEP::compute_pimd_batch(
   initialize_pimd_batch_(
     N, position_beads, potential_beads, force_beads, virial_beads);
   auto& batch = *pimd_batch_data_;
+
+  if (is_small_box) {
+    // The cached list includes the skin, so explicit images must cover it too.
+    get_expanded_box(paramb.rc_radial_max + 1.0, box, ebox);
+    const int small_box_neighbor_size = 2000;
+    std::vector<int> initial_flags(number_of_beads, 0);
+    bool box_changed = !batch.small_box_initialized;
+    for (int component = 0; component < 9 && !box_changed; ++component) {
+      if (batch.small_box_h[component] != box.cpu_h[component]) {
+        box_changed = true;
+      }
+    }
+    if (box_changed || neighbor_always_rebuild_) {
+      std::fill(initial_flags.begin(), initial_flags.end(), 1);
+    }
+    batch.small_box_rebuild_flags.copy_from_host(initial_flags.data());
+    if (!box_changed && !neighbor_always_rebuild_) {
+      Neighbor::check_atom_distance_batch(
+        box,
+        N,
+        1.0,
+        batch.small_box_x0_ptrs,
+        batch.small_box_y0_ptrs,
+        batch.small_box_z0_ptrs,
+        batch.position_ptrs,
+        batch.small_box_rebuild_flags);
+    }
+
+    const int block_size = 64;
+    const int grid_size = (N2 - N1 - 1) / block_size + 1;
+    const dim3 grid(grid_size, number_of_beads);
+    initialize_nep_pimd_batch_properties<<<
+      dim3((N - 1) / 128 + 1, number_of_beads), 128>>>(
+      N,
+      batch.potential_ptrs.data(),
+      batch.force_ptrs.data(),
+      batch.virial_ptrs.data());
+    GPU_CHECK_KERNEL
+
+    find_neighbor_list_small_box_pimd_batch<<<grid, block_size>>>(
+      paramb,
+      N,
+      N1,
+      N2,
+      number_of_beads,
+      small_box_neighbor_size,
+      1.0f,
+      box,
+      ebox,
+      type.data(),
+      batch.position_ptrs.data(),
+      batch.small_box_rebuild_flags.data(),
+      batch.small_NN_radial.data(),
+      batch.small_NL_radial.data(),
+      batch.small_NN_angular.data(),
+      batch.small_NL_angular.data(),
+      batch.small_x12_radial.data(),
+      batch.small_y12_radial.data(),
+      batch.small_z12_radial.data(),
+      batch.small_x12_angular.data(),
+      batch.small_y12_angular.data(),
+      batch.small_z12_angular.data(),
+      batch.small_image_x_radial.data(),
+      batch.small_image_y_radial.data(),
+      batch.small_image_z_radial.data(),
+      batch.small_image_x_angular.data(),
+      batch.small_image_y_angular.data(),
+      batch.small_image_z_angular.data());
+    GPU_CHECK_KERNEL
+    Neighbor::update_reference_positions_batch(
+      N,
+      batch.position_ptrs,
+      batch.small_box_x0_ptrs,
+      batch.small_box_y0_ptrs,
+      batch.small_box_z0_ptrs,
+      batch.small_box_rebuild_flags);
+
+    const dim3 bead_grid(grid_size, number_of_beads);
+    find_descriptor_small_box_pimd_batch<<<bead_grid, block_size>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      number_of_beads,
+      small_box_neighbor_size,
+      batch.small_NN_radial.data(),
+      batch.small_NL_radial.data(),
+      batch.small_NN_angular.data(),
+      batch.small_NL_angular.data(),
+      type.data(),
+      batch.small_x12_radial.data(),
+      batch.small_y12_radial.data(),
+      batch.small_z12_radial.data(),
+      batch.small_x12_angular.data(),
+      batch.small_y12_angular.data(),
+      batch.small_z12_angular.data(),
+      batch.potential_ptrs.data(),
+      batch.Fp.data(),
+      batch.virial_ptrs.data(),
+      batch.sum_fxyz.data());
+    GPU_CHECK_KERNEL
+
+    find_force_radial_small_box_pimd_batch<<<bead_grid, block_size>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      number_of_beads,
+      small_box_neighbor_size,
+      batch.small_NN_radial.data(),
+      batch.small_NL_radial.data(),
+      type.data(),
+      batch.small_x12_radial.data(),
+      batch.small_y12_radial.data(),
+      batch.small_z12_radial.data(),
+      batch.Fp.data(),
+      batch.force_ptrs.data(),
+      batch.virial_ptrs.data());
+    GPU_CHECK_KERNEL
+
+    find_force_angular_small_box_pimd_batch<<<bead_grid, block_size>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      number_of_beads,
+      small_box_neighbor_size,
+      batch.small_NN_angular.data(),
+      batch.small_NL_angular.data(),
+      type.data(),
+      batch.small_x12_angular.data(),
+      batch.small_y12_angular.data(),
+      batch.small_z12_angular.data(),
+      batch.Fp.data(),
+      batch.sum_fxyz.data(),
+      batch.force_ptrs.data(),
+      batch.virial_ptrs.data());
+    GPU_CHECK_KERNEL
+
+    for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+      const size_t atom_offset = static_cast<size_t>(bead_id) * N;
+      const size_t neighbor_offset = atom_offset * small_box_neighbor_size;
+      if (zbl.enabled) {
+        find_force_ZBL_small_box<<<grid_size, block_size>>>(
+          paramb,
+          N,
+          zbl,
+          N1,
+          N2,
+          batch.small_NN_angular.data() + atom_offset,
+          batch.small_NL_angular.data() + neighbor_offset,
+          type.data(),
+          batch.small_x12_angular.data() + neighbor_offset,
+          batch.small_y12_angular.data() + neighbor_offset,
+          batch.small_z12_angular.data() + neighbor_offset,
+          position_beads[bead_id]->data(),
+          position_beads[bead_id]->data() + N,
+          position_beads[bead_id]->data() + N * 2,
+          force_beads[bead_id]->data(),
+          force_beads[bead_id]->data() + N,
+          force_beads[bead_id]->data() + N * 2,
+          virial_beads[bead_id]->data(),
+          potential_beads[bead_id]->data());
+        GPU_CHECK_KERNEL
+      }
+      if (has_dftd3) {
+        dftd3.compute(
+          box,
+          type,
+          *position_beads[bead_id],
+          *potential_beads[bead_id],
+          *force_beads[bead_id],
+          *virial_beads[bead_id]);
+      }
+    }
+    batch.small_box_initialized = true;
+    for (int component = 0; component < 9; ++component) {
+      batch.small_box_h[component] = box.cpu_h[component];
+    }
+    return true;
+  }
+
+  batch.small_box_initialized = false;
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     batch.beads[bead_id]->neighbor->find_neighbor_global(
       rc, box, type, *position_beads[bead_id]);

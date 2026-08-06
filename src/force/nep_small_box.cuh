@@ -131,7 +131,7 @@ static __global__ void find_neighbor_list_small_box(
   }
 }
 
-static __global__ void find_descriptor_small_box(
+static __device__ void find_descriptor_small_box_impl(
   NEP::ParaMB paramb,
   NEP::ANN annmb,
   const int N,
@@ -155,9 +155,9 @@ static __global__ void find_descriptor_small_box(
   float* g_sum_fxyz,
   bool need_B_projection,
   double* B_projection,
-  int B_projection_size)
+  int B_projection_size,
+  const int n1)
 {
-  int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
     int t1 = g_type[n1];
     float q[MAX_DIM] = {0.0f};
@@ -292,6 +292,122 @@ static __global__ void find_descriptor_small_box(
 }
 
 static __global__ void find_descriptor_small_box(
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int* g_NN_radial,
+  const int* g_NL_radial,
+  const int* g_NN_angular,
+  const int* g_NL_angular,
+  const int* __restrict__ g_type,
+  const float* __restrict__ g_x12_radial,
+  const float* __restrict__ g_y12_radial,
+  const float* __restrict__ g_z12_radial,
+  const float* __restrict__ g_x12_angular,
+  const float* __restrict__ g_y12_angular,
+  const float* __restrict__ g_z12_angular,
+  const bool is_polarizability,
+  double* g_pe,
+  float* g_Fp,
+  double* g_virial,
+  float* g_sum_fxyz,
+  bool need_B_projection,
+  double* B_projection,
+  int B_projection_size)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  find_descriptor_small_box_impl(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    g_NN_radial,
+    g_NL_radial,
+    g_NN_angular,
+    g_NL_angular,
+    g_type,
+    g_x12_radial,
+    g_y12_radial,
+    g_z12_radial,
+    g_x12_angular,
+    g_y12_angular,
+    g_z12_angular,
+    is_polarizability,
+    g_pe,
+    g_Fp,
+    g_virial,
+    g_sum_fxyz,
+    need_B_projection,
+    B_projection,
+    B_projection_size,
+    n1);
+}
+
+static __global__ void find_descriptor_small_box_pimd_batch(
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const int small_neighbor_size,
+  const int* g_NN_radial_batch,
+  const int* g_NL_radial_batch,
+  const int* g_NN_angular_batch,
+  const int* g_NL_angular_batch,
+  const int* __restrict__ g_type,
+  const float* __restrict__ g_x12_radial_batch,
+  const float* __restrict__ g_y12_radial_batch,
+  const float* __restrict__ g_z12_radial_batch,
+  const float* __restrict__ g_x12_angular_batch,
+  const float* __restrict__ g_y12_angular_batch,
+  const float* __restrict__ g_z12_angular_batch,
+  double* const* g_pe,
+  float* g_Fp_batch,
+  double* const* g_virial,
+  float* g_sum_fxyz_batch)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads) {
+    return;
+  }
+  const size_t atom_offset = static_cast<size_t>(bead) * N;
+  const size_t neighbor_offset = atom_offset * small_neighbor_size;
+  const int sum_components =
+    (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
+  find_descriptor_small_box_impl(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    g_NN_radial_batch + atom_offset,
+    g_NL_radial_batch + neighbor_offset,
+    g_NN_angular_batch + atom_offset,
+    g_NL_angular_batch + neighbor_offset,
+    g_type,
+    g_x12_radial_batch + neighbor_offset,
+    g_y12_radial_batch + neighbor_offset,
+    g_z12_radial_batch + neighbor_offset,
+    g_x12_angular_batch + neighbor_offset,
+    g_y12_angular_batch + neighbor_offset,
+    g_z12_angular_batch + neighbor_offset,
+    false,
+    g_pe[bead],
+    g_Fp_batch + static_cast<size_t>(bead) * N * annmb.dim,
+    g_virial[bead],
+    g_sum_fxyz_batch + static_cast<size_t>(bead) * N * sum_components,
+    false,
+    nullptr,
+    0,
+    n1);
+}
+
+static __global__ void find_descriptor_small_box(
   const float temperature,
   NEP::ParaMB paramb,
   NEP::ANN annmb,
@@ -393,7 +509,7 @@ static __global__ void find_descriptor_small_box(
   }
 }
 
-static __global__ void find_force_radial_small_box(
+static __device__ void find_force_radial_small_box_impl(
   NEP::ParaMB paramb,
   NEP::ANN annmb,
   const int N,
@@ -410,9 +526,9 @@ static __global__ void find_force_radial_small_box(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial,
+  const int n1)
 {
-  int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
     int t1 = g_type[n1];
     for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
@@ -491,7 +607,95 @@ static __global__ void find_force_radial_small_box(
   }
 }
 
-static __global__ void find_force_angular_small_box(
+static __global__ void find_force_radial_small_box(
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int* g_NN,
+  const int* g_NL,
+  const int* __restrict__ g_type,
+  const float* __restrict__ g_x12,
+  const float* __restrict__ g_y12,
+  const float* __restrict__ g_z12,
+  const float* __restrict__ g_Fp,
+  const bool is_dipole,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  find_force_radial_small_box_impl(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    g_NN,
+    g_NL,
+    g_type,
+    g_x12,
+    g_y12,
+    g_z12,
+    g_Fp,
+    is_dipole,
+    g_fx,
+    g_fy,
+    g_fz,
+    g_virial,
+    n1);
+}
+
+static __global__ void find_force_radial_small_box_pimd_batch(
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const int small_neighbor_size,
+  const int* g_NN_batch,
+  const int* g_NL_batch,
+  const int* __restrict__ g_type,
+  const float* __restrict__ g_x12_batch,
+  const float* __restrict__ g_y12_batch,
+  const float* __restrict__ g_z12_batch,
+  const float* g_Fp_batch,
+  double* const* g_force,
+  double* const* g_virial)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads) {
+    return;
+  }
+  const size_t atom_offset = static_cast<size_t>(bead) * N;
+  const size_t neighbor_offset = atom_offset * small_neighbor_size;
+  double* force = g_force[bead];
+  find_force_radial_small_box_impl(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    g_NN_batch + atom_offset,
+    g_NL_batch + neighbor_offset,
+    g_type,
+    g_x12_batch + neighbor_offset,
+    g_y12_batch + neighbor_offset,
+    g_z12_batch + neighbor_offset,
+    g_Fp_batch + static_cast<size_t>(bead) * N * annmb.dim,
+    false,
+    force,
+    force + N,
+    force + N * 2,
+    g_virial[bead],
+    n1);
+}
+
+static __device__ void find_force_angular_small_box_impl(
   NEP::ParaMB paramb,
   NEP::ANN annmb,
   const int N,
@@ -509,9 +713,9 @@ static __global__ void find_force_angular_small_box(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial,
+  const int n1)
 {
-  int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
 
     float Fp[MAX_DIM_ANGULAR] = {0.0f};
@@ -614,6 +818,100 @@ static __global__ void find_force_angular_small_box(
   }
 }
 
+static __global__ void find_force_angular_small_box(
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int* g_NN_angular,
+  const int* g_NL_angular,
+  const int* __restrict__ g_type,
+  const float* __restrict__ g_x12,
+  const float* __restrict__ g_y12,
+  const float* __restrict__ g_z12,
+  const float* __restrict__ g_Fp,
+  const float* __restrict__ g_sum_fxyz,
+  const bool is_dipole,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  find_force_angular_small_box_impl(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    g_NN_angular,
+    g_NL_angular,
+    g_type,
+    g_x12,
+    g_y12,
+    g_z12,
+    g_Fp,
+    g_sum_fxyz,
+    is_dipole,
+    g_fx,
+    g_fy,
+    g_fz,
+    g_virial,
+    n1);
+}
+
+static __global__ void find_force_angular_small_box_pimd_batch(
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const int small_neighbor_size,
+  const int* g_NN_batch,
+  const int* g_NL_batch,
+  const int* __restrict__ g_type,
+  const float* __restrict__ g_x12_batch,
+  const float* __restrict__ g_y12_batch,
+  const float* __restrict__ g_z12_batch,
+  const float* __restrict__ g_Fp_batch,
+  const float* __restrict__ g_sum_fxyz_batch,
+  double* const* g_force,
+  double* const* g_virial)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads) {
+    return;
+  }
+  const size_t atom_offset = static_cast<size_t>(bead) * N;
+  const size_t neighbor_offset = atom_offset * small_neighbor_size;
+  const int sum_components =
+    (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
+  double* force = g_force[bead];
+  find_force_angular_small_box_impl(
+    paramb,
+    annmb,
+    N,
+    N1,
+    N2,
+    g_NN_batch + atom_offset,
+    g_NL_batch + neighbor_offset,
+    g_type,
+    g_x12_batch + neighbor_offset,
+    g_y12_batch + neighbor_offset,
+    g_z12_batch + neighbor_offset,
+    g_Fp_batch + static_cast<size_t>(bead) * N * annmb.dim,
+    g_sum_fxyz_batch + static_cast<size_t>(bead) * N * sum_components,
+    false,
+    force,
+    force + N,
+    force + N * 2,
+    g_virial[bead],
+    n1);
+}
+
 static __global__ void find_force_ZBL_small_box(
   NEP::ParaMB paramb,
   const int N,
@@ -696,5 +994,184 @@ static __global__ void find_force_ZBL_small_box(
       s_pe += f * 0.5f;
     }
     g_pe[n1] += s_pe;
+  }
+}
+
+static __device__ void apply_mic_small_box_with_image(
+  const Box& box,
+  const NEP::ExpandedBox& ebox,
+  const int ia,
+  const int ib,
+  const int ic,
+  float& x12,
+  float& y12,
+  float& z12,
+  int& image_x,
+  int& image_y,
+  int& image_z)
+{
+  float sx12 = ebox.h[9] * x12 + ebox.h[10] * y12 + ebox.h[11] * z12;
+  float sy12 = ebox.h[12] * x12 + ebox.h[13] * y12 + ebox.h[14] * z12;
+  float sz12 = ebox.h[15] * x12 + ebox.h[16] * y12 + ebox.h[17] * z12;
+  const int shift_x = box.pbc_x == 1 ? static_cast<int>(nearbyint(sx12)) : 0;
+  const int shift_y = box.pbc_y == 1 ? static_cast<int>(nearbyint(sy12)) : 0;
+  const int shift_z = box.pbc_z == 1 ? static_cast<int>(nearbyint(sz12)) : 0;
+  sx12 -= shift_x;
+  sy12 -= shift_y;
+  sz12 -= shift_z;
+  x12 = ebox.h[0] * sx12 + ebox.h[1] * sy12 + ebox.h[2] * sz12;
+  y12 = ebox.h[3] * sx12 + ebox.h[4] * sy12 + ebox.h[5] * sz12;
+  z12 = ebox.h[6] * sx12 + ebox.h[7] * sy12 + ebox.h[8] * sz12;
+  image_x = ia - ebox.num_cells[0] * shift_x;
+  image_y = ib - ebox.num_cells[1] * shift_y;
+  image_z = ic - ebox.num_cells[2] * shift_z;
+}
+
+static __global__ void find_neighbor_list_small_box_pimd_batch(
+  NEP::ParaMB paramb,
+  const int N,
+  const int N1,
+  const int N2,
+  const int number_of_beads,
+  const int small_neighbor_size,
+  const float skin,
+  const Box box,
+  const NEP::ExpandedBox ebox,
+  const int* g_type,
+  double* const* g_position,
+  const int* rebuild_flags,
+  int* g_NN_radial_batch,
+  int* g_NL_radial_batch,
+  int* g_NN_angular_batch,
+  int* g_NL_angular_batch,
+  float* g_x12_radial_batch,
+  float* g_y12_radial_batch,
+  float* g_z12_radial_batch,
+  float* g_x12_angular_batch,
+  float* g_y12_angular_batch,
+  float* g_z12_angular_batch,
+  int* g_image_x_radial_batch,
+  int* g_image_y_radial_batch,
+  int* g_image_z_radial_batch,
+  int* g_image_x_angular_batch,
+  int* g_image_y_angular_batch,
+  int* g_image_z_angular_batch)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (bead >= number_of_beads || n1 >= N2) {
+    return;
+  }
+  const size_t atom_offset = static_cast<size_t>(bead) * N;
+  const size_t neighbor_offset = atom_offset * small_neighbor_size;
+  double* position = g_position[bead];
+  const double* g_x = position;
+  const double* g_y = position + N;
+  const double* g_z = position + N * 2;
+  int* g_NN_radial = g_NN_radial_batch + atom_offset;
+  int* g_NL_radial = g_NL_radial_batch + neighbor_offset;
+  int* g_NN_angular = g_NN_angular_batch + atom_offset;
+  int* g_NL_angular = g_NL_angular_batch + neighbor_offset;
+  float* g_x12_radial = g_x12_radial_batch + neighbor_offset;
+  float* g_y12_radial = g_y12_radial_batch + neighbor_offset;
+  float* g_z12_radial = g_z12_radial_batch + neighbor_offset;
+  float* g_x12_angular = g_x12_angular_batch + neighbor_offset;
+  float* g_y12_angular = g_y12_angular_batch + neighbor_offset;
+  float* g_z12_angular = g_z12_angular_batch + neighbor_offset;
+  int* g_image_x_radial = g_image_x_radial_batch + neighbor_offset;
+  int* g_image_y_radial = g_image_y_radial_batch + neighbor_offset;
+  int* g_image_z_radial = g_image_z_radial_batch + neighbor_offset;
+  int* g_image_x_angular = g_image_x_angular_batch + neighbor_offset;
+  int* g_image_y_angular = g_image_y_angular_batch + neighbor_offset;
+  int* g_image_z_angular = g_image_z_angular_batch + neighbor_offset;
+
+  const float x1 = g_x[n1];
+  const float y1 = g_y[n1];
+  const float z1 = g_z[n1];
+  int count_radial = 0;
+  int count_angular = 0;
+  if (rebuild_flags[bead] != 0) {
+    const int t1 = g_type[n1];
+    for (int n2 = N1; n2 < N2; ++n2) {
+      for (int ia = 0; ia < ebox.num_cells[0]; ++ia) {
+        for (int ib = 0; ib < ebox.num_cells[1]; ++ib) {
+          for (int ic = 0; ic < ebox.num_cells[2]; ++ic) {
+            if (ia == 0 && ib == 0 && ic == 0 && n1 == n2) {
+              continue;
+            }
+            float x12 = static_cast<float>(g_x[n2] - x1);
+            float y12 = static_cast<float>(g_y[n2] - y1);
+            float z12 = static_cast<float>(g_z[n2] - z1);
+            x12 += box.float_h[0] * ia + box.float_h[1] * ib + box.float_h[2] * ic;
+            y12 += box.float_h[3] * ia + box.float_h[4] * ib + box.float_h[5] * ic;
+            z12 += box.float_h[6] * ia + box.float_h[7] * ib + box.float_h[8] * ic;
+            int image_x, image_y, image_z;
+            apply_mic_small_box_with_image(
+              box, ebox, ia, ib, ic, x12, y12, z12, image_x, image_y, image_z);
+            const float distance_square = x12 * x12 + y12 * y12 + z12 * z12;
+            const int t2 = g_type[n2];
+            const float rc_radial =
+              (paramb.rc_radial[t1] + paramb.rc_radial[t2]) * 0.5f + skin;
+            const float rc_angular =
+              (paramb.rc_angular[t1] + paramb.rc_angular[t2]) * 0.5f + skin;
+            if (distance_square < rc_radial * rc_radial) {
+              if (count_radial < small_neighbor_size) {
+                const int index = count_radial * N + n1;
+                g_NL_radial[index] = n2;
+                g_x12_radial[index] = x12;
+                g_y12_radial[index] = y12;
+                g_z12_radial[index] = z12;
+                g_image_x_radial[index] = image_x;
+                g_image_y_radial[index] = image_y;
+                g_image_z_radial[index] = image_z;
+              }
+              ++count_radial;
+            }
+            if (distance_square < rc_angular * rc_angular) {
+              if (count_angular < small_neighbor_size) {
+                const int index = count_angular * N + n1;
+                g_NL_angular[index] = n2;
+                g_x12_angular[index] = x12;
+                g_y12_angular[index] = y12;
+                g_z12_angular[index] = z12;
+                g_image_x_angular[index] = image_x;
+                g_image_y_angular[index] = image_y;
+                g_image_z_angular[index] = image_z;
+              }
+              ++count_angular;
+            }
+          }
+        }
+      }
+    }
+    g_NN_radial[n1] = min(count_radial, small_neighbor_size);
+    g_NN_angular[n1] = min(count_angular, small_neighbor_size);
+  } else {
+    for (int i1 = 0; i1 < g_NN_radial[n1]; ++i1) {
+      const int index = i1 * N + n1;
+      const int n2 = g_NL_radial[index];
+      x12_radial_batch[neighbor_offset + i1 * N + n1] =
+        static_cast<float>(g_x[n2] - x1) + box.float_h[0] * g_image_x_radial[index] +
+        box.float_h[1] * g_image_y_radial[index] + box.float_h[2] * g_image_z_radial[index];
+      y12_radial_batch[neighbor_offset + i1 * N + n1] =
+        static_cast<float>(g_y[n2] - y1) + box.float_h[3] * g_image_x_radial[index] +
+        box.float_h[4] * g_image_y_radial[index] + box.float_h[5] * g_image_z_radial[index];
+      z12_radial_batch[neighbor_offset + i1 * N + n1] =
+        static_cast<float>(g_z[n2] - z1) + box.float_h[6] * g_image_x_radial[index] +
+        box.float_h[7] * g_image_y_radial[index] + box.float_h[8] * g_image_z_radial[index];
+    }
+    for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
+      const int index = i1 * N + n1;
+      const int n2 = g_NL_angular[index];
+      x12_angular_batch[neighbor_offset + i1 * N + n1] =
+        static_cast<float>(g_x[n2] - x1) + box.float_h[0] * g_image_x_angular[index] +
+        box.float_h[1] * g_image_y_angular[index] + box.float_h[2] * g_image_z_angular[index];
+      y12_angular_batch[neighbor_offset + i1 * N + n1] =
+        static_cast<float>(g_y[n2] - y1) + box.float_h[3] * g_image_x_angular[index] +
+        box.float_h[4] * g_image_y_angular[index] + box.float_h[5] * g_image_z_angular[index];
+      z12_angular_batch[neighbor_offset + i1 * N + n1] =
+        static_cast<float>(g_z[n2] - z1) + box.float_h[6] * g_image_x_angular[index] +
+        box.float_h[7] * g_image_y_angular[index] + box.float_h[8] * g_image_z_angular[index];
+    }
   }
 }

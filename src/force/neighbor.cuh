@@ -214,6 +214,22 @@ public:
     GPU_Vector<double*>& y0_batch,
     GPU_Vector<double*>& z0_batch,
     GPU_Vector<int>& rebuild_flags);
+  static void check_atom_distance_batch(
+    const Box& box,
+    const int number_of_atoms,
+    const double skin,
+    const GPU_Vector<double*>& x0_batch,
+    const GPU_Vector<double*>& y0_batch,
+    const GPU_Vector<double*>& z0_batch,
+    const GPU_Vector<double*>& position_batch,
+    GPU_Vector<int>& rebuild_flags);
+  static void update_reference_positions_batch(
+    const int number_of_atoms,
+    const GPU_Vector<double*>& position_batch,
+    const GPU_Vector<double*>& x0_batch,
+    const GPU_Vector<double*>& y0_batch,
+    const GPU_Vector<double*>& z0_batch,
+    const GPU_Vector<int>& rebuild_flags);
   bool prepare_reference_positions(const int num_atoms)
   {
     const bool first = x0.size() == 0;
