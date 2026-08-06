@@ -15,6 +15,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    velocity
    correct_velocity
    potential
+   md_nep_fine_parallel
    compute_extrapolation
    dftd3
    change_box

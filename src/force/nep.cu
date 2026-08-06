@@ -384,6 +384,7 @@ NEP::NEP(const char* file_potential, const int num_atoms)
   nep_data.NL_radial.resize(static_cast<size_t>(num_atoms) * paramb.MN_radial);
   nep_data.NN_angular.resize(num_atoms);
   nep_data.NL_angular.resize(num_atoms * paramb.MN_angular);
+  nep_data.reverse_edge.resize(num_atoms * paramb.MN_angular);
   nep_data.Fp.resize(static_cast<size_t>(num_atoms) * annmb.dim);
   nep_data.sum_fxyz.resize(
     static_cast<size_t>(num_atoms) * (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1));
@@ -397,6 +398,11 @@ NEP::NEP(const char* file_potential, const int num_atoms)
 NEP::~NEP(void)
 {
   // nothing
+}
+
+void NEP::set_md_nep_fine_parallel(const bool enabled)
+{
+  md_nep_fine_parallel_ = enabled;
 }
 
 void NEP::update_potential(float* parameters, ANN& ann)
@@ -1011,6 +1017,16 @@ void NEP::compute_large_box(
     nep_data.NL_angular.data());
   GPU_CHECK_KERNEL
 
+  if (md_nep_fine_parallel_) {
+    build_reverse_edge(
+      N,
+      N1,
+      N2,
+      nep_data.NN_angular,
+      nep_data.NL_angular,
+      nep_data.reverse_edge);
+  }
+
   static int num_calls = 0;
   if (num_calls++ % 1000 == 0) {
     nep_data.NN_radial.copy_to_host(nep_data.cpu_NN_radial.data());
@@ -1111,7 +1127,8 @@ void NEP::compute_large_box(
     is_dipole,
     position_per_atom,
     force_per_atom,
-    virial_per_atom);
+    virial_per_atom,
+    md_nep_fine_parallel_ ? nep_data.reverse_edge.data() : nullptr);
   GPU_CHECK_KERNEL
 
   if (zbl.enabled) {
@@ -1363,6 +1380,13 @@ void NEP::compute(
 {
   const bool is_small_box = get_expanded_box(paramb.rc_radial_max, box, ebox);
   if (is_small_box) {
+    if (md_nep_fine_parallel_) {
+      static bool warned_small_box = false;
+      if (!warned_small_box) {
+        printf("Warning: md_nep_fine_parallel uses the original small-box NEP path.\n");
+        warned_small_box = true;
+      }
+    }
     // update small_box_data
     const int current_num_atoms = type.size();
     if (small_box_data.NN_radial.size() != current_num_atoms) {

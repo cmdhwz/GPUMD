@@ -63,6 +63,9 @@ public:
     GPU_Vector<double>& /* virial */,
     std::vector<Group>& /* group */){}
 
+  // Enable the opt-in fine-grained NEP path. Non-NEP potentials ignore it.
+  virtual void set_md_nep_fine_parallel(bool /* enabled */) {}
+
   virtual const GPU_Vector<int>& get_NN_radial_ptr()
   {
     static GPU_Vector<int> dummy_NN;
@@ -97,7 +100,8 @@ protected:
     const double* f12z,
     const GPU_Vector<double>& position_per_atom,
     GPU_Vector<double>& force_per_atom,
-    GPU_Vector<double>& virial_per_atom);
+    GPU_Vector<double>& virial_per_atom,
+    const int* reverse_edge = nullptr);
 
   void find_properties_many_body(
     Box& box,
@@ -109,5 +113,14 @@ protected:
     const bool is_dipole,
     const GPU_Vector<double>& position_per_atom,
     GPU_Vector<double>& force_per_atom,
-    GPU_Vector<double>& virial_per_atom);
+    GPU_Vector<double>& virial_per_atom,
+    const int* reverse_edge = nullptr);
+
+  void build_reverse_edge(
+    const int N,
+    const int N1,
+    const int N2,
+    const GPU_Vector<int>& neighbor_number,
+    const GPU_Vector<int>& neighbor_list,
+    GPU_Vector<int>& reverse_edge);
 };

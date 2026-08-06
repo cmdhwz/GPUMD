@@ -207,6 +207,7 @@ void Force::parse_potential(
 
   potential->N1 = 0;
   potential->N2 = number_of_atoms;
+  potential->set_md_nep_fine_parallel(md_nep_fine_parallel_);
 
   // Move the pointer into the list of potentials
   potentials.push_back(std::move(potential));
@@ -480,6 +481,17 @@ static __global__ void gpu_average_properties(
 }
 
 void Force::set_multiple_potentials_mode(std::string mode) { multiple_potentials_mode_ = mode; }
+
+void Force::set_md_nep_fine_parallel(const bool enabled)
+{
+  md_nep_fine_parallel_ = enabled;
+  for (auto& potential : potentials) {
+    potential->set_md_nep_fine_parallel(enabled);
+  }
+  printf(
+    "%s md_nep_fine_parallel for supported single-GPU NEP/qNEP potentials.\n",
+    enabled ? "Enabled" : "Disabled");
+}
 
 void Force::compute(
   Box& box,

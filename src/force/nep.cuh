@@ -31,6 +31,7 @@ struct NEP_Data {
   GPU_Vector<int> NL_radial;    // radial neighbor list
   GPU_Vector<int> NN_angular;   // angular neighbor list
   GPU_Vector<int> NL_angular;   // angular neighbor list
+  GPU_Vector<int> reverse_edge;  // reverse edge for the opt-in large-box path
   GPU_Vector<float> parameters; // parameters to be optimized
   std::vector<int> cpu_NN_radial;
   std::vector<int> cpu_NN_angular;
@@ -122,6 +123,8 @@ public:
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial);
 
+  void set_md_nep_fine_parallel(bool enabled) override;
+
   virtual void compute(
     const float temperature,
     Box& box,
@@ -180,5 +183,6 @@ private:
     GPU_Vector<double>& virial);
 
   bool has_dftd3 = false;
+  bool md_nep_fine_parallel_ = false;
   void initialize_dftd3();
 };

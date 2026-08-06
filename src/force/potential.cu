@@ -32,6 +32,57 @@ Potential::~Potential(void)
   // nothing
 }
 
+static __global__ void gpu_build_reverse_edge(
+  const int N,
+  const int N1,
+  const int N2,
+  const int max_neighbors,
+  const int* g_neighbor_number,
+  const int* g_neighbor_list,
+  int* g_reverse_edge)
+{
+  const int local_edge = blockIdx.x * blockDim.x + threadIdx.x;
+  const int atom_count = N2 - N1;
+  const int edge_count = atom_count * max_neighbors;
+  if (local_edge >= edge_count || atom_count <= 0) {
+    return;
+  }
+
+  const int n1 = N1 + local_edge % atom_count;
+  const int i1 = local_edge / atom_count;
+  const size_t edge_index = static_cast<size_t>(i1) * N + n1;
+  if (i1 >= g_neighbor_number[n1]) {
+    g_reverse_edge[edge_index] = -1;
+    return;
+  }
+
+  const int n2 = g_neighbor_list[edge_index];
+  const int neighbor_number_2 = g_neighbor_number[n2];
+
+  // Large-box NEP neighbor lists are sorted by atom index. This search is
+  // performed during the list-update stage, not during every force sum.
+  int left = 0;
+  int right = neighbor_number_2;
+  while (left < right) {
+    const int middle = (left + right) >> 1;
+    const int value = g_neighbor_list[static_cast<size_t>(middle) * N + n2];
+    if (value < n1) {
+      left = middle + 1;
+    } else {
+      right = middle;
+    }
+  }
+
+  if (left < neighbor_number_2 &&
+      g_neighbor_list[static_cast<size_t>(left) * N + n2] == n1) {
+    g_reverse_edge[edge_index] = left * N + n2;
+  } else {
+    // The force kernel retains a compatibility fallback for an asymmetric
+    // neighbor list, so a missing reverse edge cannot silently corrupt force.
+    g_reverse_edge[edge_index] = -1;
+  }
+}
+
 static __global__ void gpu_find_force_many_body(
   const int number_of_particles,
   const int N1,
@@ -39,6 +90,7 @@ static __global__ void gpu_find_force_many_body(
   const Box box,
   const int* g_neighbor_number,
   const int* g_neighbor_list,
+  const int* g_reverse_edge,
   const double* __restrict__ g_f12x,
   const double* __restrict__ g_f12y,
   const double* __restrict__ g_f12z,
@@ -71,9 +123,8 @@ static __global__ void gpu_find_force_many_body(
     double z1 = g_z[n1];
 
     for (int i1 = 0; i1 < neighbor_number; ++i1) {
-      int index = i1 * number_of_particles + n1;
+      const int index = i1 * number_of_particles + n1;
       int n2 = g_neighbor_list[index];
-      int neighbor_number_2 = g_neighbor_number[n2];
 
       double x12 = g_x[n2] - x1;
       double y12 = g_y[n2] - y1;
@@ -83,17 +134,22 @@ static __global__ void gpu_find_force_many_body(
       double f12x = g_f12x[index];
       double f12y = g_f12y[index];
       double f12z = g_f12z[index];
-      int offset = 0;
-      for (int k = 0; k < neighbor_number_2; ++k) {
-        if (n1 == g_neighbor_list[n2 + number_of_particles * k]) {
-          offset = k;
-          break;
+      int reverse_index = g_reverse_edge == nullptr ? -1 : g_reverse_edge[index];
+      if (reverse_index < 0) {
+        const int neighbor_number_2 = g_neighbor_number[n2];
+        for (int k = 0; k < neighbor_number_2; ++k) {
+          if (n1 == g_neighbor_list[n2 + number_of_particles * k]) {
+            reverse_index = k * number_of_particles + n2;
+            break;
+          }
         }
       }
-      index = offset * number_of_particles + n2;
-      double f21x = g_f12x[index];
-      double f21y = g_f12y[index];
-      double f21z = g_f12z[index];
+      if (reverse_index < 0) {
+        continue;
+      }
+      double f21x = g_f12x[reverse_index];
+      double f21y = g_f12y[reverse_index];
+      double f21z = g_f12z[reverse_index];
 
       // per atom force
       s_fx += f12x - f21x;
@@ -142,7 +198,8 @@ void Potential::find_properties_many_body(
   const double* f12z,
   const GPU_Vector<double>& position_per_atom,
   GPU_Vector<double>& force_per_atom,
-  GPU_Vector<double>& virial_per_atom)
+  GPU_Vector<double>& virial_per_atom,
+  const int* reverse_edge)
 {
   const int number_of_atoms = position_per_atom.size() / 3;
   int grid_size = (N2 - N1 - 1) / BLOCK_SIZE_FORCE + 1;
@@ -154,6 +211,7 @@ void Potential::find_properties_many_body(
     box,
     NN,
     NL,
+    reverse_edge,
     f12x,
     f12y,
     f12z,
@@ -175,6 +233,7 @@ static __global__ void gpu_find_force_many_body(
   const Box box,
   const int* g_neighbor_number,
   const int* g_neighbor_list,
+  const int* g_reverse_edge,
   const float* __restrict__ g_f12x,
   const float* __restrict__ g_f12y,
   const float* __restrict__ g_f12z,
@@ -207,7 +266,7 @@ static __global__ void gpu_find_force_many_body(
     double z1 = g_z[n1];
 
     for (int i1 = 0; i1 < neighbor_number; ++i1) {
-      int index = i1 * number_of_particles + n1;
+      const int index = i1 * number_of_particles + n1;
       int n2 = g_neighbor_list[index];
 
       double x12double = g_x[n2] - x1;
@@ -221,33 +280,30 @@ static __global__ void gpu_find_force_many_body(
       float f12x = g_f12x[index];
       float f12y = g_f12y[index];
       float f12z = g_f12z[index];
-      // int offset = 0;
-
-      int l = 0;
-      int r = g_neighbor_number[n2];
-      int m = 0;
-      int tmp_value = 0;
-      while (l < r) {
-        m = (l + r) >> 1;
-        tmp_value = g_neighbor_list[n2 + number_of_particles * m];
-        if (tmp_value < n1) {
-          l = m + 1;
-        } else if (tmp_value > n1) {
-          r = m - 1;
-        } else {
-          break;
+      int reverse_index = g_reverse_edge == nullptr ? -1 : g_reverse_edge[index];
+      if (reverse_index < 0) {
+        int left = 0;
+        int right = g_neighbor_number[n2];
+        while (left < right) {
+          const int middle = (left + right) >> 1;
+          const int value = g_neighbor_list[n2 + number_of_particles * middle];
+          if (value < n1) {
+            left = middle + 1;
+          } else {
+            right = middle;
+          }
+        }
+        if (left < g_neighbor_number[n2] &&
+            g_neighbor_list[n2 + number_of_particles * left] == n1) {
+          reverse_index = left * number_of_particles + n2;
         }
       }
-      // for (int k = 0; k < neighbor_number_2; ++k) {
-      //   if (n1 == g_neighbor_list[n2 + number_of_particles * k]) {
-      //     offset = k;
-      //     break;
-      //   }
-      // }
-      index = ((l + r) >> 1) * number_of_particles + n2;
-      float f21x = g_f12x[index];
-      float f21y = g_f12y[index];
-      float f21z = g_f12z[index];
+      if (reverse_index < 0) {
+        continue;
+      }
+      float f21x = g_f12x[reverse_index];
+      float f21y = g_f12y[reverse_index];
+      float f21z = g_f12z[reverse_index];
 
       // per atom force
       s_fx += f12x - f21x;
@@ -306,7 +362,8 @@ void Potential::find_properties_many_body(
   const bool is_dipole,
   const GPU_Vector<double>& position_per_atom,
   GPU_Vector<double>& force_per_atom,
-  GPU_Vector<double>& virial_per_atom)
+  GPU_Vector<double>& virial_per_atom,
+  const int* reverse_edge)
 {
   const int number_of_atoms = position_per_atom.size() / 3;
   int grid_size = (N2 - N1 - 1) / BLOCK_SIZE_FORCE + 1;
@@ -319,6 +376,7 @@ void Potential::find_properties_many_body(
     box,
     NN,
     NL,
+    reverse_edge,
     f12x,
     f12y,
     f12z,
@@ -329,5 +387,38 @@ void Potential::find_properties_many_body(
     force_per_atom.data() + number_of_atoms,
     force_per_atom.data() + 2 * number_of_atoms,
     virial_per_atom.data());
+  GPU_CHECK_KERNEL
+}
+
+void Potential::build_reverse_edge(
+  const int N,
+  const int N1,
+  const int N2,
+  const GPU_Vector<int>& neighbor_number,
+  const GPU_Vector<int>& neighbor_list,
+  GPU_Vector<int>& reverse_edge)
+{
+  if (N <= 0 || N2 <= N1 || neighbor_number.size() == 0 || neighbor_list.size() == 0) {
+    return;
+  }
+
+  const int max_neighbors = static_cast<int>(neighbor_list.size() / neighbor_number.size());
+  if (max_neighbors <= 0) {
+    return;
+  }
+  if (reverse_edge.size() != neighbor_list.size()) {
+    reverse_edge.resize(neighbor_list.size());
+  }
+
+  const size_t edge_count = static_cast<size_t>(N2 - N1) * max_neighbors;
+  const int grid_size = static_cast<int>((edge_count - 1) / 128 + 1);
+  gpu_build_reverse_edge<<<grid_size, 128>>>(
+    N,
+    N1,
+    N2,
+    max_neighbors,
+    neighbor_number.data(),
+    neighbor_list.data(),
+    reverse_edge.data());
   GPU_CHECK_KERNEL
 }
