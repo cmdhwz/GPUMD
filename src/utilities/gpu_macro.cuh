@@ -52,6 +52,15 @@
 #define gpuStream_t hipStream_t
 #define gpuStreamCreate hipStreamCreate
 #define gpuStreamDestroy hipStreamDestroy
+#define gpuStreamSynchronize hipStreamSynchronize
+
+// event timing
+#define gpuEvent_t hipEvent_t
+#define gpuEventCreate hipEventCreate
+#define gpuEventDestroy hipEventDestroy
+#define gpuEventRecord hipEventRecord
+#define gpuEventSynchronize hipEventSynchronize
+#define gpuEventElapsedTime hipEventElapsedTime
 
 // random numbers
 #define gpurandState hiprandState
@@ -97,6 +106,7 @@
 #define gpufftHandle hipfftHandle
 #define gpufftComplex hipfftComplex
 #define gpufftExecC2C hipfftExecC2C
+#define gpufftSetStream hipfftSetStream
 #define gpufftPlan3d hipfftPlan3d 
 #define gpufftPlanMany hipfftPlanMany
 #define gpufftDestroy hipfftDestroy
@@ -140,6 +150,15 @@
 #define gpuStream_t cudaStream_t
 #define gpuStreamCreate cudaStreamCreate
 #define gpuStreamDestroy cudaStreamDestroy
+#define gpuStreamSynchronize cudaStreamSynchronize
+
+// event timing
+#define gpuEvent_t cudaEvent_t
+#define gpuEventCreate cudaEventCreate
+#define gpuEventDestroy cudaEventDestroy
+#define gpuEventRecord cudaEventRecord
+#define gpuEventSynchronize cudaEventSynchronize
+#define gpuEventElapsedTime cudaEventElapsedTime
 
 // random numbers
 #define gpurandState curandState
@@ -188,6 +207,7 @@
 #define gpufftHandle cufftHandle
 #define gpufftComplex cufftComplex
 #define gpufftExecC2C cufftExecC2C
+#define gpufftSetStream cufftSetStream
 #define gpufftPlan3d cufftPlan3d 
 #define gpufftPlanMany cufftPlanMany
 #define gpufftDestroy cufftDestroy

@@ -182,6 +182,58 @@ __global__ void find_mesh(
   }
 }
 
+__global__ void find_mesh_edge(
+  const int N1,
+  const int N2,
+  const PPPM::Para para,
+  const Box box,
+  const float* g_charge,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  gpufftComplex* g_mesh)
+{
+  const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+  const int atom_count = N2 - N1;
+  const int edge_count = atom_count * 125;
+  if (edge >= edge_count) {
+    return;
+  }
+
+  const int n = N1 + edge / 125;
+  const int stencil = edge % 125;
+  const int n0 = stencil / 25 - 2;
+  const int n1 = (stencil / 5) % 5 - 2;
+  const int n2 = stencil % 5 - 2;
+  const double x = g_x[n];
+  const double y = g_y[n];
+  const double z = g_z[n];
+  const float q = g_charge[n];
+  const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+  const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+  const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+  const int ix = int(sx + 0.5f);
+  const int iy = int(sy + 0.5f);
+  const int iz = int(sz + 0.5f);
+  const float dx = sx - ix;
+  const float dy = sy - iy;
+  const float dz = sz - iz;
+  const float Wx = (((W_coeff[n0 + 2][4] * dx + W_coeff[n0 + 2][3]) * dx +
+                      W_coeff[n0 + 2][2]) * dx + W_coeff[n0 + 2][1]) * dx +
+                    W_coeff[n0 + 2][0];
+  const float Wy = (((W_coeff[n1 + 2][4] * dy + W_coeff[n1 + 2][3]) * dy +
+                      W_coeff[n1 + 2][2]) * dy + W_coeff[n1 + 2][1]) * dy +
+                    W_coeff[n1 + 2][0];
+  const float Wz = (((W_coeff[n2 + 2][4] * dz + W_coeff[n2 + 2][3]) * dz +
+                      W_coeff[n2 + 2][2]) * dz + W_coeff[n2 + 2][1]) * dz +
+                    W_coeff[n2 + 2][0];
+  const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);
+  const int neighbor1 = get_index_within_mesh(para.K[1], iy + n1);
+  const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);
+  const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
+  atomicAdd(&g_mesh[neighbor012].x, q * Wx * Wy * Wz);
+}
+
 void __global__ ik_times_mesh_times_G(
   const PPPM::Para para,
   const float* g_kx,
@@ -433,6 +485,220 @@ __global__ void find_force_virial_potential_from_field(
   } 
 }
 
+__global__ void find_force_from_field_block(
+  const int N,
+  const int N1,
+  const int N2,
+  const PPPM::Para para,
+  const Box box,
+  const float* g_charge,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  const gpufftComplex* g_mesh_G,
+  const gpufftComplex* g_mesh_fft_x_ifft,
+  const gpufftComplex* g_mesh_fft_y_ifft,
+  const gpufftComplex* g_mesh_fft_z_ifft,
+  float* g_D_real,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz)
+{
+  const int n = blockIdx.x + N1;
+  if (n < N1 || n >= N2) {
+    return;
+  }
+
+  __shared__ float s_D[128];
+  __shared__ float s_fx[128];
+  __shared__ float s_fy[128];
+  __shared__ float s_fz[128];
+  float D_real = 0.0f;
+  float E[3] = {0.0f, 0.0f, 0.0f};
+  if (threadIdx.x < 125) {
+    const int stencil = threadIdx.x;
+    const int n0 = stencil / 25 - 2;
+    const int n1 = (stencil / 5) % 5 - 2;
+    const int n2 = stencil % 5 - 2;
+    const double x = g_x[n];
+    const double y = g_y[n];
+    const double z = g_z[n];
+    const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+    const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+    const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+    const int ix = int(sx + 0.5f);
+    const int iy = int(sy + 0.5f);
+    const int iz = int(sz + 0.5f);
+    const float dx = sx - ix;
+    const float dy = sy - iy;
+    const float dz = sz - iz;
+    float Wx[5] = {0.0f};
+    float Wy[5] = {0.0f};
+    float Wz[5] = {0.0f};
+    for (int d = 0; d < 5; ++d) {
+      Wx[d] = (((W_coeff[d][4] * dx + W_coeff[d][3]) * dx + W_coeff[d][2]) * dx +
+                W_coeff[d][1]) * dx + W_coeff[d][0];
+      Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy +
+                W_coeff[d][1]) * dy + W_coeff[d][0];
+      Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz +
+                W_coeff[d][1]) * dz + W_coeff[d][0];
+    }
+    const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);
+    const int neighbor1 = get_index_within_mesh(para.K[1], iy + n1);
+    const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);
+    const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
+    const float W = Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2];
+    D_real = W * g_mesh_G[neighbor012].x;
+    E[0] = W * g_mesh_fft_x_ifft[neighbor012].x;
+    E[1] = W * g_mesh_fft_y_ifft[neighbor012].x;
+    E[2] = W * g_mesh_fft_z_ifft[neighbor012].x;
+  }
+  s_D[threadIdx.x] = D_real;
+  s_fx[threadIdx.x] = E[0];
+  s_fy[threadIdx.x] = E[1];
+  s_fz[threadIdx.x] = E[2];
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      s_D[threadIdx.x] += s_D[threadIdx.x + offset];
+      s_fx[threadIdx.x] += s_fx[threadIdx.x + offset];
+      s_fy[threadIdx.x] += s_fy[threadIdx.x + offset];
+      s_fz[threadIdx.x] += s_fz[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float q = K_C_SP * g_charge[n];
+    g_D_real[n] = 2.0f * K_C_SP * s_D[0];
+    g_fx[n] += 2.0f * q * s_fx[0];
+    g_fy[n] += 2.0f * q * s_fy[0];
+    g_fz[n] += 2.0f * q * s_fz[0];
+  }
+}
+
+__global__ void find_force_virial_potential_from_field_block(
+  const int N,
+  const int N1,
+  const int N2,
+  const PPPM::Para para,
+  const Box box,
+  const float* g_charge,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  const gpufftComplex* g_mesh_G,
+  const gpufftComplex* g_mesh_fft_x_ifft,
+  const gpufftComplex* g_mesh_fft_y_ifft,
+  const gpufftComplex* g_mesh_fft_z_ifft,
+  const gpufftComplex* g_mesh_virial_xx,
+  const gpufftComplex* g_mesh_virial_yy,
+  const gpufftComplex* g_mesh_virial_zz,
+  const gpufftComplex* g_mesh_virial_xy,
+  const gpufftComplex* g_mesh_virial_yz,
+  const gpufftComplex* g_mesh_virial_zx,
+  float* g_D_real,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial,
+  double* g_pe)
+{
+  const int n = blockIdx.x + N1;
+  if (n < N1 || n >= N2) {
+    return;
+  }
+
+  __shared__ float s_D[128];
+  __shared__ float s_fx[128];
+  __shared__ float s_fy[128];
+  __shared__ float s_fz[128];
+  __shared__ float s_v[6][128];
+  float D_real = 0.0f;
+  float E[3] = {0.0f, 0.0f, 0.0f};
+  float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  if (threadIdx.x < 125) {
+    const int stencil = threadIdx.x;
+    const int n0 = stencil / 25 - 2;
+    const int n1 = (stencil / 5) % 5 - 2;
+    const int n2 = stencil % 5 - 2;
+    const double x = g_x[n];
+    const double y = g_y[n];
+    const double z = g_z[n];
+    const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+    const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+    const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+    const int ix = int(sx + 0.5f);
+    const int iy = int(sy + 0.5f);
+    const int iz = int(sz + 0.5f);
+    const float dx = sx - ix;
+    const float dy = sy - iy;
+    const float dz = sz - iz;
+    float Wx[5] = {0.0f};
+    float Wy[5] = {0.0f};
+    float Wz[5] = {0.0f};
+    for (int d = 0; d < 5; ++d) {
+      Wx[d] = (((W_coeff[d][4] * dx + W_coeff[d][3]) * dx + W_coeff[d][2]) * dx +
+                W_coeff[d][1]) * dx + W_coeff[d][0];
+      Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy +
+                W_coeff[d][1]) * dy + W_coeff[d][0];
+      Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz +
+                W_coeff[d][1]) * dz + W_coeff[d][0];
+    }
+    const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);
+    const int neighbor1 = get_index_within_mesh(para.K[1], iy + n1);
+    const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);
+    const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
+    const float W = Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2];
+    D_real = W * g_mesh_G[neighbor012].x;
+    E[0] = W * g_mesh_fft_x_ifft[neighbor012].x;
+    E[1] = W * g_mesh_fft_y_ifft[neighbor012].x;
+    E[2] = W * g_mesh_fft_z_ifft[neighbor012].x;
+    V[0] = W * g_mesh_virial_xx[neighbor012].x;
+    V[1] = W * g_mesh_virial_yy[neighbor012].x;
+    V[2] = W * g_mesh_virial_zz[neighbor012].x;
+    V[3] = W * g_mesh_virial_xy[neighbor012].x;
+    V[4] = W * g_mesh_virial_yz[neighbor012].x;
+    V[5] = W * g_mesh_virial_zx[neighbor012].x;
+  }
+  s_D[threadIdx.x] = D_real;
+  s_fx[threadIdx.x] = E[0];
+  s_fy[threadIdx.x] = E[1];
+  s_fz[threadIdx.x] = E[2];
+  for (int c = 0; c < 6; ++c) {
+    s_v[c][threadIdx.x] = V[c];
+  }
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      s_D[threadIdx.x] += s_D[threadIdx.x + offset];
+      s_fx[threadIdx.x] += s_fx[threadIdx.x + offset];
+      s_fy[threadIdx.x] += s_fy[threadIdx.x + offset];
+      s_fz[threadIdx.x] += s_fz[threadIdx.x + offset];
+      for (int c = 0; c < 6; ++c) {
+        s_v[c][threadIdx.x] += s_v[c][threadIdx.x + offset];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float q = K_C_SP * g_charge[n];
+    g_D_real[n] = 2.0f * K_C_SP * s_D[0];
+    g_fx[n] += 2.0f * q * s_fx[0];
+    g_fy[n] += 2.0f * q * s_fy[0];
+    g_fz[n] += 2.0f * q * s_fz[0];
+    g_virial[n + 0 * N] += q * s_v[0][0];
+    g_virial[n + 1 * N] += q * s_v[1][0];
+    g_virial[n + 2 * N] += q * s_v[2][0];
+    g_virial[n + 3 * N] += q * s_v[3][0];
+    g_virial[n + 6 * N] += q * s_v[3][0];
+    g_virial[n + 5 * N] += q * s_v[4][0];
+    g_virial[n + 8 * N] += q * s_v[4][0];
+    g_virial[n + 4 * N] += q * s_v[5][0];
+    g_virial[n + 7 * N] += q * s_v[5][0];
+    g_pe[n] += q * s_D[0];
+  }
+}
+
 void __global__ find_potential_and_virial(
   const int N,
   const PPPM::Para para,
@@ -628,11 +894,26 @@ void PPPM::find_force(
   GPU_Vector<float>& D_real,
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom,
-  GPU_Vector<double>& potential_per_atom)
+  GPU_Vector<double>& potential_per_atom,
+  const bool fine_parallel,
+  const gpuStream_t stream,
+  const bool synchronize_stream)
 {
   find_para(N, box);
 
-  find_k_and_G_opt<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
+  const gpuStream_t execution_stream = fine_parallel ? stream : nullptr;
+  if (gpufftSetStream(plan, execution_stream) != GPUFFT_SUCCESS) {
+    std::cout << "GPUFFT error: SetStream failed" << std::endl;
+    exit(1);
+  }
+  if (need_peratom_virial) {
+    if (gpufftSetStream(plan_virial, execution_stream) != GPUFFT_SUCCESS) {
+      std::cout << "GPUFFT error: SetStream failed" << std::endl;
+      exit(1);
+    }
+  }
+
+  find_k_and_G_opt<<<(para.K0K1K2 - 1) / 64 + 1, 64, 0, execution_stream>>>(
     para, 
     kx.data(), 
     ky.data(), 
@@ -640,19 +921,33 @@ void PPPM::find_force(
     G.data());
   GPU_CHECK_KERNEL
 
-  set_mesh_to_zero<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(para, mesh.data());
+  set_mesh_to_zero<<<(para.K0K1K2 - 1) / 64 + 1, 64, 0, execution_stream>>>(para, mesh.data());
   GPU_CHECK_KERNEL
 
-  find_mesh<<<(N - 1) / 64 + 1, 64>>>(
-    N1,
-    N2,
-    para,
-    box,
-    charge.data(),
-    position_per_atom.data(),
-    position_per_atom.data() + N,
-    position_per_atom.data() + N * 2,
-    mesh.data());
+  if (fine_parallel) {
+    const int edge_count = (N2 - N1) * 125;
+    find_mesh_edge<<<(edge_count - 1) / 64 + 1, 64, 0, execution_stream>>>(
+      N1,
+      N2,
+      para,
+      box,
+      charge.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      mesh.data());
+  } else {
+    find_mesh<<<(N - 1) / 64 + 1, 64, 0, execution_stream>>>(
+      N1,
+      N2,
+      para,
+      box,
+      charge.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      mesh.data());
+  }
   GPU_CHECK_KERNEL
 
   if (gpufftExecC2C(plan, mesh.data(), mesh.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
@@ -660,7 +955,7 @@ void PPPM::find_force(
     exit(1);
   }
 
-  ik_times_mesh_times_G<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
+  ik_times_mesh_times_G<<<(para.K0K1K2 - 1) / 64 + 1, 64, 0, execution_stream>>>(
     para,
     kx.data(),
     ky.data(),
@@ -672,7 +967,7 @@ void PPPM::find_force(
     mesh_z.data());
   GPU_CHECK_KERNEL
 
-  find_mesh_G<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
+  find_mesh_G<<<(para.K0K1K2 - 1) / 64 + 1, 64, 0, execution_stream>>>(
     para,
     G.data(),
     mesh.data(),
@@ -680,7 +975,7 @@ void PPPM::find_force(
   GPU_CHECK_KERNEL
 
   if (need_peratom_virial) {
-    find_mesh_virial<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
+    find_mesh_virial<<<(para.K0K1K2 - 1) / 64 + 1, 64, 0, execution_stream>>>(
       para,
       kx.data(),
       ky.data(),
@@ -722,57 +1017,107 @@ void PPPM::find_force(
       exit(1);
     }
 
-    // get force, virial, and potential in single kernel
-    find_force_virial_potential_from_field<<<(N - 1) / 64 + 1, 64>>>(
-      N,
-      N1,
-      N2,
-      para,
-      box,
-      charge.data(),
-      position_per_atom.data(),
-      position_per_atom.data() + N,
-      position_per_atom.data() + N * 2,
-      mesh_G.data(),
-      mesh_x.data(),
-      mesh_y.data(),
-      mesh_z.data(),
-      mesh_virial.data() + para.K0K1K2 * 0,
-      mesh_virial.data() + para.K0K1K2 * 1,
-      mesh_virial.data() + para.K0K1K2 * 2,
-      mesh_virial.data() + para.K0K1K2 * 3,
-      mesh_virial.data() + para.K0K1K2 * 4,
-      mesh_virial.data() + para.K0K1K2 * 5,
-      D_real.data(),
-      force_per_atom.data(),
-      force_per_atom.data() + N,
-      force_per_atom.data() + N * 2,
-      virial_per_atom.data(),
-      potential_per_atom.data());
+    if (fine_parallel) {
+      find_force_virial_potential_from_field_block<<<N2 - N1, 128, 0, execution_stream>>>(
+        N,
+        N1,
+        N2,
+        para,
+        box,
+        charge.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        mesh_G.data(),
+        mesh_x.data(),
+        mesh_y.data(),
+        mesh_z.data(),
+        mesh_virial.data() + para.K0K1K2 * 0,
+        mesh_virial.data() + para.K0K1K2 * 1,
+        mesh_virial.data() + para.K0K1K2 * 2,
+        mesh_virial.data() + para.K0K1K2 * 3,
+        mesh_virial.data() + para.K0K1K2 * 4,
+        mesh_virial.data() + para.K0K1K2 * 5,
+        D_real.data(),
+        force_per_atom.data(),
+        force_per_atom.data() + N,
+        force_per_atom.data() + N * 2,
+        virial_per_atom.data(),
+        potential_per_atom.data());
+    } else {
+      // get force, virial, and potential in single kernel
+      find_force_virial_potential_from_field<<<(N - 1) / 64 + 1, 64, 0, execution_stream>>>(
+        N,
+        N1,
+        N2,
+        para,
+        box,
+        charge.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        mesh_G.data(),
+        mesh_x.data(),
+        mesh_y.data(),
+        mesh_z.data(),
+        mesh_virial.data() + para.K0K1K2 * 0,
+        mesh_virial.data() + para.K0K1K2 * 1,
+        mesh_virial.data() + para.K0K1K2 * 2,
+        mesh_virial.data() + para.K0K1K2 * 3,
+        mesh_virial.data() + para.K0K1K2 * 4,
+        mesh_virial.data() + para.K0K1K2 * 5,
+        D_real.data(),
+        force_per_atom.data(),
+        force_per_atom.data() + N,
+        force_per_atom.data() + N * 2,
+        virial_per_atom.data(),
+        potential_per_atom.data());
+    }
     GPU_CHECK_KERNEL
   } else {
     // get force only
-    find_force_from_field<<<(N - 1) / 64 + 1, 64>>>(
-      N1,
-      N2,
-      para,
-      box,
-      charge.data(),
-      position_per_atom.data(),
-      position_per_atom.data() + N,
-      position_per_atom.data() + N * 2,
-      mesh_G.data(),
-      mesh_x.data(),
-      mesh_y.data(),
-      mesh_z.data(),
-      D_real.data(),
-      force_per_atom.data(),
-      force_per_atom.data() + N,
-      force_per_atom.data() + N * 2);
+    if (fine_parallel) {
+      find_force_from_field_block<<<N2 - N1, 128, 0, execution_stream>>>(
+        N,
+        N1,
+        N2,
+        para,
+        box,
+        charge.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        mesh_G.data(),
+        mesh_x.data(),
+        mesh_y.data(),
+        mesh_z.data(),
+        D_real.data(),
+        force_per_atom.data(),
+        force_per_atom.data() + N,
+        force_per_atom.data() + N * 2);
+    } else {
+      find_force_from_field<<<(N - 1) / 64 + 1, 64, 0, execution_stream>>>(
+        N1,
+        N2,
+        para,
+        box,
+        charge.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        mesh_G.data(),
+        mesh_x.data(),
+        mesh_y.data(),
+        mesh_z.data(),
+        D_real.data(),
+        force_per_atom.data(),
+        force_per_atom.data() + N,
+        force_per_atom.data() + N * 2);
+    }
     GPU_CHECK_KERNEL
 
     // then get average potential and virial
-    find_potential_and_virial<<<7, 1024>>>(
+    find_potential_and_virial<<<7, 1024, 0, execution_stream>>>(
       N,
       para,
       mesh.data(),
@@ -783,5 +1128,8 @@ void PPPM::find_force(
       virial_per_atom.data(),
       potential_per_atom.data());
     GPU_CHECK_KERNEL
+  }
+  if (execution_stream != nullptr && synchronize_stream) {
+    CHECK(gpuStreamSynchronize(execution_stream));
   }
 }

@@ -208,6 +208,7 @@ void Force::parse_potential(
   potential->N1 = 0;
   potential->N2 = number_of_atoms;
   potential->set_md_nep_fine_parallel(md_nep_fine_parallel_);
+  potential->set_md_nep_timing(md_nep_timing_);
 
   // Move the pointer into the list of potentials
   potentials.push_back(std::move(potential));
@@ -490,6 +491,17 @@ void Force::set_md_nep_fine_parallel(const bool enabled)
   }
   printf(
     "%s md_nep_fine_parallel for supported single-GPU NEP/qNEP potentials.\n",
+    enabled ? "Enabled" : "Disabled");
+}
+
+void Force::set_md_nep_timing(const bool enabled)
+{
+  md_nep_timing_ = enabled;
+  for (auto& potential : potentials) {
+    potential->set_md_nep_timing(enabled);
+  }
+  printf(
+    "%s md_nep_timing for supported single-GPU NEP/qNEP potentials.\n",
     enabled ? "Enabled" : "Disabled");
 }
 

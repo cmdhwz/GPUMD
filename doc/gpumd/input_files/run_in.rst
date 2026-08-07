@@ -61,6 +61,10 @@ Simulation setup
      - Enable the experimental fine-grained NEP/qNEP force path
      - Yes
      - N/A
+   * - :ref:`md_nep_timing <kw_md_nep_timing>`
+     - Measure NEP/qNEP GPU force stages
+     - Yes
+     - N/A
    * - :ref:`dftd3 <kw_dftd3>`
      - Add the DFT-D3 dispersion correction to the NEP model
      - Yes

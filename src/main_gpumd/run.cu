@@ -364,6 +364,17 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     } else {
       PRINT_INPUT_ERROR("md_nep_fine_parallel must be on or off.\n");
     }
+  } else if (strcmp(param[0], "md_nep_timing") == 0) {
+    if (num_param != 2) {
+      PRINT_INPUT_ERROR("md_nep_timing should have 1 parameter: on or off.\n");
+    }
+    if (strcmp(param[1], "on") == 0) {
+      force.set_md_nep_timing(true);
+    } else if (strcmp(param[1], "off") == 0) {
+      force.set_md_nep_timing(false);
+    } else {
+      PRINT_INPUT_ERROR("md_nep_timing must be on or off.\n");
+    }
   } else if (strcmp(param[0], "replicate") == 0) {
     Replicate(param, num_param, box, atom, group);
     allocate_memory_gpu(group, atom, thermo);

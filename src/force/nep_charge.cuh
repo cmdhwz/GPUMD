@@ -28,6 +28,8 @@ struct NEP_Charge_Data {
   GPU_Vector<float> f12z; // 3-body or manybody partial forces
   GPU_Vector<float> Fp;
   GPU_Vector<float> sum_fxyz;
+  // Per-edge radial force/virial contributions for the opt-in fine path.
+  GPU_Vector<float> radial_edge_contribution;
   GPU_Vector<int> NN_radial;    // radial neighbor list
   GPU_Vector<int> NL_radial;    // radial neighbor list
   GPU_Vector<int> NN_angular;   // angular neighbor list
@@ -43,6 +45,12 @@ struct NEP_Charge_Data {
   GPU_Vector<float> S_real;
   GPU_Vector<float> S_imag;
   GPU_Vector<float> D_real;
+  GPU_Vector<float> real_space_D_real;
+  GPU_Vector<double> real_space_force;
+  GPU_Vector<double> real_space_virial;
+  GPU_Vector<double> real_space_potential;
+  GPU_Vector<double> D_real_partial;
+  GPU_Vector<double> D_real_mean;
   GPU_Vector<float> charge;
   GPU_Vector<float> charge_derivative;
   GPU_Vector<float> bec;               // BEC
@@ -139,6 +147,7 @@ public:
     GPU_Vector<double>& virial);
 
   void set_md_nep_fine_parallel(bool enabled) override;
+  void set_md_nep_timing(bool enabled) override;
 
   const GPU_Vector<int>& get_NN_radial_ptr();
 
@@ -183,5 +192,9 @@ private:
   void check_ewald_pppm();
   bool has_dftd3 = false;
   bool md_nep_fine_parallel_ = false;
+  gpuStream_t md_nep_bec_stream_ = nullptr;
+  gpuStream_t md_nep_pppm_stream_ = nullptr;
+  gpuStream_t md_nep_real_stream_ = nullptr;
+  bool md_nep_streams_initialized_ = false;
   void initialize_dftd3();
 };

@@ -26,6 +26,9 @@ struct NEP_Data {
   GPU_Vector<float> f12z; // 3-body or manybody partial forces
   GPU_Vector<float> Fp;
   GPU_Vector<float> sum_fxyz;
+  // Per-edge radial force/virial contributions for the opt-in fine path.
+  // The 12 components are stored as 3 force + 9 virial planes.
+  GPU_Vector<float> radial_edge_contribution;
   GPU_Vector<float> descriptor_parameters_type_pair;
   GPU_Vector<int> NN_radial;    // radial neighbor list
   GPU_Vector<int> NL_radial;    // radial neighbor list
@@ -124,6 +127,7 @@ public:
     GPU_Vector<double>& virial);
 
   void set_md_nep_fine_parallel(bool enabled) override;
+  void set_md_nep_timing(bool enabled) override;
 
   virtual void compute(
     const float temperature,

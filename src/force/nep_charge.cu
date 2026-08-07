@@ -353,6 +353,10 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
   charge_para.A += charge_para.two_alpha_over_sqrt_pi * exp(-float(PI * PI)) / paramb.rc_radial;
   charge_para.B = - erfc(float(PI)) / paramb.rc_radial - charge_para.A * paramb.rc_radial;
   nep_data.D_real.resize(num_atoms);
+  nep_data.real_space_D_real.resize(num_atoms);
+  nep_data.real_space_force.resize(num_atoms * 3);
+  nep_data.real_space_virial.resize(num_atoms * 9);
+  nep_data.real_space_potential.resize(num_atoms);
   nep_data.charge.resize(num_atoms);
   nep_data.charge_derivative.resize(num_atoms * annmb.dim);
   nep_data.bec.resize(num_atoms * 9);
@@ -377,12 +381,21 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
 
 NEP_Charge::~NEP_Charge(void)
 {
-  // nothing
+  if (md_nep_streams_initialized_) {
+    CHECK(gpuStreamDestroy(md_nep_bec_stream_));
+    CHECK(gpuStreamDestroy(md_nep_pppm_stream_));
+    CHECK(gpuStreamDestroy(md_nep_real_stream_));
+  }
 }
 
 void NEP_Charge::set_md_nep_fine_parallel(const bool enabled)
 {
   md_nep_fine_parallel_ = enabled;
+}
+
+void NEP_Charge::set_md_nep_timing(const bool enabled)
+{
+  configure_md_nep_timing(enabled);
 }
 
 void NEP_Charge::update_potential(float* parameters, ANN& ann)
@@ -577,6 +590,176 @@ static __global__ void find_descriptor(
   }
 }
 
+static __global__ void find_descriptor_block(
+  NEP_Charge::ParaMB paramb,
+  NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN,
+  const int* g_NL,
+  const int* g_NN_angular,
+  const int* g_NL_angular,
+  const int* __restrict__ g_type,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  double* g_pe,
+  float* g_Fp,
+  float* g_charge,
+  float* g_charge_derivative,
+  double* g_virial,
+  float* g_sum_fxyz)
+{
+  const int n1 = blockIdx.x + N1;
+  if (n1 < N1 || n1 >= N2) {
+    return;
+  }
+
+  __shared__ float q_shared[MAX_DIM];
+  __shared__ float s_shared[MAX_NUM_N][NUM_OF_ABC];
+  __shared__ float ann_energy_shared;
+  __shared__ float ann_charge_shared;
+  __shared__ float ann_energy_derivative_shared[MAX_DIM];
+  __shared__ float ann_charge_derivative_shared[MAX_DIM];
+  for (int i = threadIdx.x; i < MAX_DIM; i += blockDim.x) {
+    q_shared[i] = 0.0f;
+  }
+  for (int i = threadIdx.x; i < MAX_NUM_N * NUM_OF_ABC; i += blockDim.x) {
+    s_shared[i / NUM_OF_ABC][i % NUM_OF_ABC] = 0.0f;
+  }
+  __syncthreads();
+
+  const int t1 = g_type[n1];
+  const double x1 = g_x[n1];
+  const double y1 = g_y[n1];
+  const double z1 = g_z[n1];
+
+  for (int i1 = threadIdx.x; i1 < g_NN[n1]; i1 += blockDim.x) {
+    const int n2 = g_NL[static_cast<size_t>(N) * i1 + n1];
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
+    const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+    const int t2 = g_type[n2];
+    const float rcinv = paramb.rcinv_radial;
+    float fc12;
+    find_fc(paramb.rc_radial, rcinv, d12, fc12);
+    float fn12[MAX_NUM_N];
+    find_fn(paramb.basis_size_radial, rcinv, d12, fc12, fn12);
+    for (int n = 0; n <= paramb.n_max_radial; ++n) {
+      float gn12 = 0.0f;
+      for (int k = 0; k <= paramb.basis_size_radial; ++k) {
+        const int c_index =
+          (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
+        gn12 += fn12[k] * annmb.c[c_index + t1 * paramb.num_types + t2];
+      }
+      atomicAdd(&q_shared[n], gn12);
+    }
+  }
+
+  for (int i1 = threadIdx.x; i1 < g_NN_angular[n1]; i1 += blockDim.x) {
+    const int n2 = g_NL_angular[static_cast<size_t>(N) * i1 + n1];
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
+    const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+    const int t2 = g_type[n2];
+    const float rcinv = paramb.rcinv_angular;
+    float fc12;
+    find_fc(paramb.rc_angular, rcinv, d12, fc12);
+    float fn12[MAX_NUM_N];
+    find_fn(paramb.basis_size_angular, rcinv, d12, fc12, fn12);
+    for (int n = 0; n <= paramb.n_max_angular; ++n) {
+      float gn12 = 0.0f;
+      for (int k = 0; k <= paramb.basis_size_angular; ++k) {
+        int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
+        c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
+        gn12 += fn12[k] * annmb.c[c_index];
+      }
+      float s_local[NUM_OF_ABC] = {0.0f};
+      accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s_local);
+      const int angular_components = (paramb.L_max + 1) * (paramb.L_max + 1) - 1;
+      for (int abc = 0; abc < angular_components; ++abc) {
+        atomicAdd(&s_shared[n][abc], s_local[abc]);
+      }
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    for (int n = 0; n <= paramb.n_max_angular; ++n) {
+      find_q(
+        paramb.L_max,
+        paramb.has_q_222,
+        paramb.has_q_1111,
+        paramb.has_q_112,
+        paramb.has_q_123,
+        paramb.has_q_233,
+        paramb.has_q_134,
+        paramb.n_max_angular + 1,
+        n,
+        s_shared[n],
+        q_shared + (paramb.n_max_radial + 1));
+      const int angular_components = (paramb.L_max + 1) * (paramb.L_max + 1) - 1;
+      for (int abc = 0; abc < angular_components; ++abc) {
+        g_sum_fxyz[
+          static_cast<size_t>(N) *
+            (n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) +
+          n1] = s_shared[n][abc];
+      }
+    }
+    for (int d = 0; d < annmb.dim; ++d) {
+      q_shared[d] *= annmb.q_scaler[d];
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    ann_energy_shared = 0.0f;
+    ann_charge_shared = 0.0f;
+    for (int d = 0; d < MAX_DIM; ++d) {
+      ann_energy_derivative_shared[d] = 0.0f;
+      ann_charge_derivative_shared[d] = 0.0f;
+    }
+  }
+  __syncthreads();
+
+  for (int neuron = threadIdx.x; neuron < annmb.num_neurons1; neuron += blockDim.x) {
+    float w0_times_q = 0.0f;
+    for (int d = 0; d < annmb.dim; ++d) {
+      w0_times_q += annmb.w0[t1][neuron * annmb.dim + d] * q_shared[d];
+    }
+    const float x_hidden = tanh(w0_times_q - annmb.b0[t1][neuron]);
+    const float tanh_der = 1.0f - x_hidden * x_hidden;
+    atomicAdd(&ann_energy_shared, annmb.w1[t1][neuron] * x_hidden);
+    atomicAdd(&ann_charge_shared, annmb.w1[t1][neuron + annmb.num_neurons1] * x_hidden);
+    for (int d = 0; d < annmb.dim; ++d) {
+      const float projection = tanh_der * annmb.w0[t1][neuron * annmb.dim + d];
+      atomicAdd(
+        &ann_energy_derivative_shared[d],
+        annmb.w1[t1][neuron] * projection);
+      atomicAdd(
+        &ann_charge_derivative_shared[d],
+        annmb.w1[t1][neuron + annmb.num_neurons1] * projection);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    g_pe[n1] += ann_energy_shared - annmb.b1[0];
+    g_charge[n1] = ann_charge_shared;
+    for (int d = 0; d < annmb.dim; ++d) {
+      g_Fp[d * N + n1] = ann_energy_derivative_shared[d] * annmb.q_scaler[d];
+      g_charge_derivative[d * N + n1] =
+        ann_charge_derivative_shared[d] * annmb.q_scaler[d];
+    }
+  }
+}
+
 static __global__ void zero_total_charge(const int N, float* g_charge)
 {
   int tid = threadIdx.x;
@@ -639,6 +822,18 @@ static __global__ void zero_mean_D_real(const int N, float* g_D_real)
     if (n < N) {
       g_D_real[n] -= mean_D;
     }
+  }
+}
+
+static __device__ inline void add_bec_contribution(
+  const int N,
+  const int n,
+  const float sign,
+  const float* bec,
+  float* g_bec)
+{
+  for (int d = 0; d < 9; ++d) {
+    atomicAdd(&g_bec[n + N * d], sign * bec[d]);
   }
 }
 
@@ -743,6 +938,76 @@ static __global__ void find_bec_radial(
       atomicAdd(&g_bec[n2 + N * 8], -bec_zz);
     }
   }
+}
+
+static __global__ void find_bec_radial_edge(
+  const NEP_Charge::ParaMB paramb,
+  const NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN,
+  const int* g_NL,
+  const int* g_type,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  const float* g_charge_derivative,
+  const int max_neighbors,
+  float* g_bec)
+{
+  const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= N * max_neighbors) {
+    return;
+  }
+  const int n1 = edge % N;
+  const int i1 = edge / N;
+  if (n1 < N1 || n1 >= N2 || i1 >= g_NN[n1]) {
+    return;
+  }
+
+  const int n2 = g_NL[edge];
+  const int t1 = g_type[n1];
+  const int t2 = g_type[n2];
+  float x12 = g_x[n2] - g_x[n1];
+  float y12 = g_y[n2] - g_y[n1];
+  float z12 = g_z[n2] - g_z[n1];
+  apply_mic(box, x12, y12, z12);
+  const float r12[3] = {x12, y12, z12};
+  const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+  const float d12inv = 1.0f / d12;
+  float fc12, fcp12;
+  find_fc_and_fcp(paramb.rc_radial, paramb.rcinv_radial, d12, fc12, fcp12);
+  float fn12[MAX_NUM_N];
+  float fnp12[MAX_NUM_N];
+  find_fn_and_fnp(paramb.basis_size_radial, paramb.rcinv_radial, d12, fc12, fcp12, fn12, fnp12);
+
+  float f12[3] = {0.0f};
+  for (int n = 0; n <= paramb.n_max_radial; ++n) {
+    float gnp12 = 0.0f;
+    for (int k = 0; k <= paramb.basis_size_radial; ++k) {
+      const int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
+      gnp12 += fnp12[k] * annmb.c[c_index + t1 * paramb.num_types + t2];
+    }
+    const float tmp12 = g_charge_derivative[n1 + n * N] * gnp12 * d12inv;
+    for (int d = 0; d < 3; ++d) {
+      f12[d] += tmp12 * r12[d];
+    }
+  }
+
+  const float bec[9] = {
+    0.5f * r12[0] * f12[0],
+    0.5f * r12[0] * f12[1],
+    0.5f * r12[0] * f12[2],
+    0.5f * r12[1] * f12[0],
+    0.5f * r12[1] * f12[1],
+    0.5f * r12[1] * f12[2],
+    0.5f * r12[2] * f12[0],
+    0.5f * r12[2] * f12[1],
+    0.5f * r12[2] * f12[2]};
+  add_bec_contribution(N, n1, 1.0f, bec, g_bec);
+  add_bec_contribution(N, n2, -1.0f, bec, g_bec);
 }
 
 static __global__ void find_bec_angular(
@@ -853,6 +1118,112 @@ static __global__ void find_bec_angular(
       atomicAdd(&g_bec[n2 + N * 8], -bec_zz);
     }
   }
+}
+
+static __global__ void find_bec_angular_edge(
+  NEP_Charge::ParaMB paramb,
+  NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN_angular,
+  const int* g_NL_angular,
+  const int* g_type,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  const float* g_charge_derivative,
+  const float* g_sum_fxyz,
+  const int max_neighbors,
+  float* g_bec)
+{
+  const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= N * max_neighbors) {
+    return;
+  }
+  const int n1 = edge % N;
+  const int i1 = edge / N;
+  if (n1 < N1 || n1 >= N2 || i1 >= g_NN_angular[n1]) {
+    return;
+  }
+
+  float Fp[MAX_DIM_ANGULAR] = {0.0f};
+  float sum_fxyz[NUM_OF_ABC * MAX_NUM_N] = {0.0f};
+  for (int d = 0; d < paramb.dim_angular; ++d) {
+    Fp[d] = g_charge_derivative[(paramb.n_max_radial + 1 + d) * N + n1];
+  }
+  for (int n = 0; n <= paramb.n_max_angular; ++n) {
+    for (int abc = 0; abc < (paramb.L_max + 1) * (paramb.L_max + 1) - 1; ++abc) {
+      sum_fxyz[n * NUM_OF_ABC + abc] =
+        g_sum_fxyz[(n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) * N + n1];
+    }
+  }
+
+  const int n2 = g_NL_angular[edge];
+  const int t1 = g_type[n1];
+  const int t2 = g_type[n2];
+  float x12 = g_x[n2] - g_x[n1];
+  float y12 = g_y[n2] - g_y[n1];
+  float z12 = g_z[n2] - g_z[n1];
+  apply_mic(box, x12, y12, z12);
+  const float r12[3] = {x12, y12, z12};
+  const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+  float f12[3] = {0.0f};
+  float fc12, fcp12;
+  find_fc_and_fcp(paramb.rc_angular, paramb.rcinv_angular, d12, fc12, fcp12);
+  float fn12[MAX_NUM_N];
+  float fnp12[MAX_NUM_N];
+  find_fn_and_fnp(
+    paramb.basis_size_angular,
+    paramb.rcinv_angular,
+    d12,
+    fc12,
+    fcp12,
+    fn12,
+    fnp12);
+  for (int n = 0; n <= paramb.n_max_angular; ++n) {
+    float gn12 = 0.0f;
+    float gnp12 = 0.0f;
+    for (int k = 0; k <= paramb.basis_size_angular; ++k) {
+      const int c_index =
+        (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq +
+        t1 * paramb.num_types + t2 + paramb.num_c_radial;
+      gn12 += fn12[k] * annmb.c[c_index];
+      gnp12 += fnp12[k] * annmb.c[c_index];
+    }
+    accumulate_f12(
+      paramb.L_max,
+      paramb.has_q_222,
+      paramb.has_q_1111,
+      paramb.has_q_112,
+      paramb.has_q_123,
+      paramb.has_q_233,
+      paramb.has_q_134,
+      paramb.num_L,
+      n,
+      paramb.n_max_angular + 1,
+      d12,
+      r12,
+      gn12,
+      gnp12,
+      Fp,
+      sum_fxyz,
+      f12);
+  }
+
+  const float bec[9] = {
+    0.5f * r12[0] * f12[0],
+    0.5f * r12[0] * f12[1],
+    0.5f * r12[0] * f12[2],
+    0.5f * r12[1] * f12[0],
+    0.5f * r12[1] * f12[1],
+    0.5f * r12[1] * f12[2],
+    0.5f * r12[2] * f12[0],
+    0.5f * r12[2] * f12[1],
+    0.5f * r12[2] * f12[2]};
+  add_bec_contribution(N, n1, 1.0f, bec, g_bec);
+  add_bec_contribution(N, n2, -1.0f, bec, g_bec);
 }
 
 static __global__ void scale_bec(const int N, const float* sqrt_epsilon_inf, float* g_bec)
@@ -972,6 +1343,289 @@ static __global__ void find_force_radial(
   }
 }
 
+static __global__ void find_force_radial_edge(
+  NEP_Charge::ParaMB paramb,
+  NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN,
+  const int* g_NL,
+  const int* __restrict__ g_type,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  const float* __restrict__ g_Fp,
+  const float* g_charge_derivative,
+  const float* g_D_real,
+  const int max_neighbors,
+  float* g_edge_contribution)
+{
+  const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+  const int edge_count = N * max_neighbors;
+  if (edge >= edge_count) {
+    return;
+  }
+  const int n1 = edge % N;
+  const int i1 = edge / N;
+  if (n1 < N1 || n1 >= N2 || i1 >= g_NN[n1]) {
+    return;
+  }
+
+  const int t1 = g_type[n1];
+  const int n2 = g_NL[edge];
+  const int t2 = g_type[n2];
+  float x12 = g_x[n2] - g_x[n1];
+  float y12 = g_y[n2] - g_y[n1];
+  float z12 = g_z[n2] - g_z[n1];
+  apply_mic(box, x12, y12, z12);
+  const float r12[3] = {x12, y12, z12};
+  const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+  const float d12inv = 1.0f / d12;
+  float f12[3] = {0.0f};
+  float f21[3] = {0.0f};
+  float fc12, fcp12;
+  const float rcinv = paramb.rcinv_radial;
+  find_fc_and_fcp(paramb.rc_radial, rcinv, d12, fc12, fcp12);
+  float fn12[MAX_NUM_N];
+  float fnp12[MAX_NUM_N];
+  find_fn_and_fnp(paramb.basis_size_radial, rcinv, d12, fc12, fcp12, fn12, fnp12);
+  for (int n = 0; n <= paramb.n_max_radial; ++n) {
+    float gnp12 = 0.0f;
+    float gnp21 = 0.0f;
+    for (int k = 0; k <= paramb.basis_size_radial; ++k) {
+      const int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
+      gnp12 += fnp12[k] * annmb.c[c_index + t1 * paramb.num_types + t2];
+      gnp21 += fnp12[k] * annmb.c[c_index + t2 * paramb.num_types + t1];
+    }
+    const float tmp12 =
+      (g_Fp[n1 + n * N] + g_charge_derivative[n1 + n * N] * g_D_real[n1]) *
+      gnp12 * d12inv;
+    const float tmp21 =
+      (g_Fp[n2 + n * N] + g_charge_derivative[n2 + n * N] * g_D_real[n2]) *
+      gnp21 * d12inv;
+    for (int d = 0; d < 3; ++d) {
+      f12[d] += tmp12 * r12[d];
+      f21[d] -= tmp21 * r12[d];
+    }
+  }
+
+  g_edge_contribution[edge] = f12[0] - f21[0];
+  g_edge_contribution[edge_count + edge] = f12[1] - f21[1];
+  g_edge_contribution[2 * edge_count + edge] = f12[2] - f21[2];
+  g_edge_contribution[3 * edge_count + edge] = r12[0] * f21[0];
+  g_edge_contribution[4 * edge_count + edge] = r12[1] * f21[1];
+  g_edge_contribution[5 * edge_count + edge] = r12[2] * f21[2];
+  g_edge_contribution[6 * edge_count + edge] = r12[0] * f21[1];
+  g_edge_contribution[7 * edge_count + edge] = r12[0] * f21[2];
+  g_edge_contribution[8 * edge_count + edge] = r12[1] * f21[0];
+  g_edge_contribution[9 * edge_count + edge] = r12[1] * f21[2];
+  g_edge_contribution[10 * edge_count + edge] = r12[2] * f21[0];
+  g_edge_contribution[11 * edge_count + edge] = r12[2] * f21[1];
+}
+
+static __global__ void reduce_radial_edge_contribution(
+  const int N,
+  const int N1,
+  const int N2,
+  const int max_neighbors,
+  const int* g_NN,
+  const float* g_edge_contribution,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial)
+{
+  const int n1 = blockIdx.x;
+  if (n1 < N1 || n1 >= N2) {
+    return;
+  }
+  const int edge_count = N * max_neighbors;
+  __shared__ float s[12][128];
+  float sum[12] = {0.0f};
+  for (int i1 = threadIdx.x; i1 < g_NN[n1]; i1 += blockDim.x) {
+    const int edge = i1 * N + n1;
+    for (int c = 0; c < 12; ++c) {
+      sum[c] += g_edge_contribution[c * edge_count + edge];
+    }
+  }
+  for (int c = 0; c < 12; ++c) {
+    s[c][threadIdx.x] = sum[c];
+  }
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      for (int c = 0; c < 12; ++c) {
+        s[c][threadIdx.x] += s[c][threadIdx.x + offset];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    g_fx[n1] += s[0][0];
+    g_fy[n1] += s[1][0];
+    g_fz[n1] += s[2][0];
+    for (int c = 0; c < 9; ++c) {
+      g_virial[n1 + c * N] += s[c + 3][0];
+    }
+  }
+}
+
+static __global__ void sum_D_real_partial(
+  const int N,
+  const float* g_D_real,
+  double* g_partial)
+{
+  __shared__ double s_sum[256];
+  const int tid = threadIdx.x;
+  const int n = blockIdx.x * blockDim.x + tid;
+  s_sum[tid] = n < N ? static_cast<double>(g_D_real[n]) : 0.0;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_sum[tid] += s_sum[tid + offset];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    g_partial[blockIdx.x] = s_sum[0];
+  }
+}
+
+static __global__ void find_mean_D_real(
+  const int number_of_partials,
+  const int N,
+  const double* g_partial,
+  double* g_mean)
+{
+  __shared__ double s_sum[256];
+  const int tid = threadIdx.x;
+  double sum = 0.0;
+  for (int i = tid; i < number_of_partials; i += blockDim.x) {
+    sum += g_partial[i];
+  }
+  s_sum[tid] = sum;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_sum[tid] += s_sum[tid + offset];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    g_mean[0] = s_sum[0] / static_cast<double>(N);
+  }
+}
+
+static __global__ void subtract_mean_D_real(const int N, const double* g_mean, float* g_D_real)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < N) {
+    g_D_real[n] -= static_cast<float>(g_mean[0]);
+  }
+}
+
+static __global__ void find_partial_force_angular_edge(
+  NEP_Charge::ParaMB paramb,
+  NEP_Charge::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN_angular,
+  const int* g_NL_angular,
+  const int* __restrict__ g_type,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  const float* __restrict__ g_Fp,
+  const float* g_charge_derivative,
+  const float* g_D_real,
+  const float* __restrict__ g_sum_fxyz,
+  const int max_neighbors,
+  float* g_f12x,
+  float* g_f12y,
+  float* g_f12z)
+{
+  const int edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= N * max_neighbors) {
+    return;
+  }
+  const int n1 = edge % N;
+  const int i1 = edge / N;
+  if (n1 < N1 || n1 >= N2 || i1 >= g_NN_angular[n1]) {
+    return;
+  }
+
+  float Fp[MAX_DIM_ANGULAR] = {0.0f};
+  float sum_fxyz[NUM_OF_ABC * MAX_NUM_N];
+  for (int d = 0; d < paramb.dim_angular; ++d) {
+    Fp[d] = g_Fp[(paramb.n_max_radial + 1 + d) * N + n1] +
+            g_charge_derivative[(paramb.n_max_radial + 1 + d) * N + n1] * g_D_real[n1];
+  }
+  for (int n = 0; n <= paramb.n_max_angular; ++n) {
+    for (int abc = 0; abc < (paramb.L_max + 1) * (paramb.L_max + 1) - 1; ++abc) {
+      sum_fxyz[n * NUM_OF_ABC + abc] =
+        g_sum_fxyz[(n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) * N + n1];
+    }
+  }
+
+  const int n2 = g_NL_angular[edge];
+  const int t1 = g_type[n1];
+  const int t2 = g_type[n2];
+  float x12 = g_x[n2] - g_x[n1];
+  float y12 = g_y[n2] - g_y[n1];
+  float z12 = g_z[n2] - g_z[n1];
+  apply_mic(box, x12, y12, z12);
+  const float r12[3] = {x12, y12, z12};
+  const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+  float f12[3] = {0.0f};
+  float fc12, fcp12;
+  find_fc_and_fcp(paramb.rc_angular, paramb.rcinv_angular, d12, fc12, fcp12);
+  float fn12[MAX_NUM_N];
+  float fnp12[MAX_NUM_N];
+  find_fn_and_fnp(
+    paramb.basis_size_angular,
+    paramb.rcinv_angular,
+    d12,
+    fc12,
+    fcp12,
+    fn12,
+    fnp12);
+  for (int n = 0; n <= paramb.n_max_angular; ++n) {
+    float gn12 = 0.0f;
+    float gnp12 = 0.0f;
+    for (int k = 0; k <= paramb.basis_size_angular; ++k) {
+      int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
+      c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
+      gn12 += fn12[k] * annmb.c[c_index];
+      gnp12 += fnp12[k] * annmb.c[c_index];
+    }
+    accumulate_f12(
+      paramb.L_max,
+      paramb.has_q_222,
+      paramb.has_q_1111,
+      paramb.has_q_112,
+      paramb.has_q_123,
+      paramb.has_q_233,
+      paramb.has_q_134,
+      paramb.num_L,
+      n,
+      paramb.n_max_angular + 1,
+      d12,
+      r12,
+      gn12,
+      gnp12,
+      Fp,
+      sum_fxyz,
+      f12);
+  }
+  g_f12x[edge] = f12[0];
+  g_f12y[edge] = f12[1];
+  g_f12z[edge] = f12[2];
+}
+
 static __global__ void find_partial_force_angular(
   NEP_Charge::ParaMB paramb,
   NEP_Charge::ANN annmb,
@@ -1061,6 +1715,133 @@ static __global__ void find_partial_force_angular(
       g_f12z[index] = f12[2];
     }
   }
+}
+
+static __global__ void find_force_charge_real_space_segmented(
+  const int N,
+  const NEP_Charge::Charge_Para charge_para,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN,
+  const int* g_NL,
+  const float* g_charge,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial,
+  double* g_pe,
+  float* g_D_real)
+{
+  const int n1 = blockIdx.x;
+  if (n1 < N1 || n1 >= N2) {
+    return;
+  }
+  __shared__ float s[12][128];
+  __shared__ float s_D[128];
+  __shared__ float s_pe[128];
+  float sum[12] = {0.0f};
+  float D_real = threadIdx.x == 0 ? -g_charge[n1] * charge_para.two_alpha_over_sqrt_pi : 0.0f;
+  float pe = threadIdx.x == 0
+               ? -charge_para.two_alpha_over_sqrt_pi * 0.5f * g_charge[n1] * g_charge[n1]
+               : 0.0f;
+  const double x1 = g_x[n1];
+  const double y1 = g_y[n1];
+  const double z1 = g_z[n1];
+  const float q1 = g_charge[n1];
+
+  for (int i1 = threadIdx.x; i1 < g_NN[n1]; i1 += blockDim.x) {
+    const int n2 = g_NL[n1 + N * i1];
+    const float q2 = g_charge[n2];
+    const float qq = q1 * q2;
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
+    const float r12[3] = {x12, y12, z12};
+    const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+    const float d12inv = 1.0f / d12;
+    const float erfc_r = erfc(charge_para.alpha * d12) * d12inv;
+    D_real += q2 * erfc_r;
+    pe += 0.5f * qq * erfc_r;
+    float f2 = erfc_r + charge_para.two_alpha_over_sqrt_pi *
+                             exp(-charge_para.alpha * charge_para.alpha * d12 * d12);
+    f2 *= -0.5f * K_C_SP * qq * d12inv * d12inv;
+    const float f12[3] = {r12[0] * f2, r12[1] * f2, r12[2] * f2};
+    const float f21[3] = {-f12[0], -f12[1], -f12[2]};
+    sum[0] += f12[0] - f21[0];
+    sum[1] += f12[1] - f21[1];
+    sum[2] += f12[2] - f21[2];
+    sum[3] -= r12[0] * f12[0];
+    sum[4] -= r12[0] * f12[1];
+    sum[5] -= r12[0] * f12[2];
+    sum[6] -= r12[1] * f12[0];
+    sum[7] -= r12[1] * f12[1];
+    sum[8] -= r12[1] * f12[2];
+    sum[9] -= r12[2] * f12[0];
+    sum[10] -= r12[2] * f12[1];
+    sum[11] -= r12[2] * f12[2];
+  }
+  for (int c = 0; c < 12; ++c) {
+    s[c][threadIdx.x] = sum[c];
+  }
+  s_D[threadIdx.x] = D_real;
+  s_pe[threadIdx.x] = pe;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      for (int c = 0; c < 12; ++c) {
+        s[c][threadIdx.x] += s[c][threadIdx.x + offset];
+      }
+      s_D[threadIdx.x] += s_D[threadIdx.x + offset];
+      s_pe[threadIdx.x] += s_pe[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    g_fx[n1] = s[0][0];
+    g_fy[n1] = s[1][0];
+    g_fz[n1] = s[2][0];
+    for (int c = 0; c < 9; ++c) {
+      g_virial[n1 + c * N] = s[c + 3][0];
+    }
+    g_D_real[n1] = K_C_SP * s_D[0];
+    g_pe[n1] = K_C_SP * s_pe[0];
+  }
+}
+
+static __global__ void combine_real_space_charge(
+  const int N,
+  const int N1,
+  const int N2,
+  const float* g_real_D_real,
+  const double* g_real_fx,
+  const double* g_real_fy,
+  const double* g_real_fz,
+  const double* g_real_virial,
+  const double* g_real_pe,
+  float* g_D_real,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial,
+  double* g_pe)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (n >= N2) {
+    return;
+  }
+  g_D_real[n] += g_real_D_real[n];
+  g_fx[n] += g_real_fx[n];
+  g_fy[n] += g_real_fy[n];
+  g_fz[n] += g_real_fz[n];
+  for (int c = 0; c < 9; ++c) {
+    g_virial[n + c * N] += g_real_virial[n + c * N];
+  }
+  g_pe[n] += g_real_pe[n];
 }
 
 static __global__ void find_force_ZBL(
@@ -1280,6 +2061,17 @@ void NEP_Charge::compute_large_box(
   const int N = type.size();
   const int grid_size = (N2 - N1 - 1) / BLOCK_SIZE + 1;
 
+  if (md_nep_fine_parallel_ && !md_nep_streams_initialized_) {
+    CHECK(gpuStreamCreate(&md_nep_bec_stream_));
+    CHECK(gpuStreamCreate(&md_nep_pppm_stream_));
+    CHECK(gpuStreamCreate(&md_nep_real_stream_));
+    md_nep_streams_initialized_ = true;
+  }
+  const gpuStream_t bec_stream = md_nep_fine_parallel_ ? md_nep_bec_stream_ : nullptr;
+  const gpuStream_t pppm_stream = md_nep_fine_parallel_ ? md_nep_pppm_stream_ : nullptr;
+  const gpuStream_t real_stream = md_nep_fine_parallel_ ? md_nep_real_stream_ : nullptr;
+
+  md_nep_timing_begin("qnep.large.neighbor");
   neighbor.find_neighbor_global(
     rc,
     box, 
@@ -1303,8 +2095,10 @@ void NEP_Charge::compute_large_box(
     nep_data.NN_angular.data(),
     nep_data.NL_angular.data());
   GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.large.neighbor");
 
   if (md_nep_fine_parallel_) {
+    md_nep_timing_begin("qnep.large.reverse_edge");
     build_reverse_edge(
       N,
       N1,
@@ -1312,6 +2106,7 @@ void NEP_Charge::compute_large_box(
       nep_data.NN_angular,
       nep_data.NL_angular,
       nep_data.reverse_edge);
+    md_nep_timing_end("qnep.large.reverse_edge");
   }
 
   static int num_calls = 0;
@@ -1336,43 +2131,9 @@ void NEP_Charge::compute_large_box(
     output_file.close();
   }
 
-  find_descriptor<<<grid_size, BLOCK_SIZE>>>(
-    paramb,
-    annmb,
-    N,
-    N1,
-    N2,
-    box,
-    nep_data.NN_radial.data(),
-    nep_data.NL_radial.data(),
-    nep_data.NN_angular.data(),
-    nep_data.NL_angular.data(),
-    type.data(),
-    position_per_atom.data(),
-    position_per_atom.data() + N,
-    position_per_atom.data() + N * 2,
-    potential_per_atom.data(),
-    nep_data.Fp.data(),
-    nep_data.charge.data(),
-    nep_data.charge_derivative.data(),
-    virial_per_atom.data(),
-    nep_data.sum_fxyz.data());
-  GPU_CHECK_KERNEL
-
-  // enforce charge neutrality
-  zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
-  GPU_CHECK_KERNEL
-
-  if (true) { // TODO
-    // get BEC (the diagonal part)
-    find_bec_diagonal<<<grid_size, BLOCK_SIZE>>>(
-      N,
-      nep_data.charge.data(),
-      nep_data.bec.data());
-    GPU_CHECK_KERNEL
-
-    // get BEC (radial descriptor part)
-    find_bec_radial<<<grid_size, BLOCK_SIZE>>>(
+  md_nep_timing_begin("qnep.large.descriptor");
+  if (md_nep_fine_parallel_) {
+    find_descriptor_block<<<N2 - N1, 128>>>(
       paramb,
       annmb,
       N,
@@ -1381,41 +2142,173 @@ void NEP_Charge::compute_large_box(
       box,
       nep_data.NN_radial.data(),
       nep_data.NL_radial.data(),
-      type.data(),
-      position_per_atom.data(),
-      position_per_atom.data() + N,
-      position_per_atom.data() + N * 2,
-      nep_data.charge_derivative.data(),
-      nep_data.bec.data());
-    GPU_CHECK_KERNEL
-
-    // get BEC (angular descriptor part)
-    find_bec_angular<<<grid_size, BLOCK_SIZE>>>(
-      paramb,
-      annmb,
-      N,
-      N1,
-      N2,
-      box,
       nep_data.NN_angular.data(),
       nep_data.NL_angular.data(),
       type.data(),
       position_per_atom.data(),
       position_per_atom.data() + N,
       position_per_atom.data() + N * 2,
+      potential_per_atom.data(),
+      nep_data.Fp.data(),
+      nep_data.charge.data(),
       nep_data.charge_derivative.data(),
-      nep_data.sum_fxyz.data(),
+      virial_per_atom.data(),
+      nep_data.sum_fxyz.data());
+  } else {
+    find_descriptor<<<grid_size, BLOCK_SIZE>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      nep_data.NN_radial.data(),
+      nep_data.NL_radial.data(),
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      type.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      potential_per_atom.data(),
+      nep_data.Fp.data(),
+      nep_data.charge.data(),
+      nep_data.charge_derivative.data(),
+      virial_per_atom.data(),
+      nep_data.sum_fxyz.data());
+  }
+  GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.large.descriptor");
+
+  // enforce charge neutrality
+  md_nep_timing_begin("qnep.large.charge_neutrality");
+  zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
+  GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.large.charge_neutrality");
+  if (md_nep_fine_parallel_) {
+    CHECK(gpuDeviceSynchronize());
+  }
+
+  if (true) { // TODO
+    md_nep_timing_begin("qnep.large.bec");
+    // get BEC (the diagonal part)
+    find_bec_diagonal<<<grid_size, BLOCK_SIZE, 0, bec_stream>>>(
+      N,
+      nep_data.charge.data(),
       nep_data.bec.data());
     GPU_CHECK_KERNEL
 
+    if (md_nep_fine_parallel_) {
+      const int max_radial_neighbors = static_cast<int>(nep_data.NL_radial.size() / N);
+      const int radial_edge_count = N * max_radial_neighbors;
+      md_nep_timing_begin("qnep.large.bec_radial_edge");
+      find_bec_radial_edge<<<
+        (radial_edge_count - 1) / BLOCK_SIZE + 1,
+        BLOCK_SIZE,
+        0,
+        bec_stream>>>(
+        paramb,
+        annmb,
+        N,
+        N1,
+        N2,
+        box,
+        nep_data.NN_radial.data(),
+        nep_data.NL_radial.data(),
+        type.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        nep_data.charge_derivative.data(),
+        max_radial_neighbors,
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
+      if (md_nep_timing_enabled()) {
+        CHECK(gpuStreamSynchronize(bec_stream));
+      }
+      md_nep_timing_end("qnep.large.bec_radial_edge");
+
+      const int max_angular_neighbors = static_cast<int>(nep_data.NL_angular.size() / N);
+      const int angular_edge_count = N * max_angular_neighbors;
+      md_nep_timing_begin("qnep.large.bec_angular_edge");
+      find_bec_angular_edge<<<
+        (angular_edge_count - 1) / BLOCK_SIZE + 1,
+        BLOCK_SIZE,
+        0,
+        bec_stream>>>(
+        paramb,
+        annmb,
+        N,
+        N1,
+        N2,
+        box,
+        nep_data.NN_angular.data(),
+        nep_data.NL_angular.data(),
+        type.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        nep_data.charge_derivative.data(),
+        nep_data.sum_fxyz.data(),
+        max_angular_neighbors,
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
+      if (md_nep_timing_enabled()) {
+        CHECK(gpuStreamSynchronize(bec_stream));
+      }
+      md_nep_timing_end("qnep.large.bec_angular_edge");
+    } else {
+      // get BEC (radial descriptor part)
+      find_bec_radial<<<grid_size, BLOCK_SIZE, 0, bec_stream>>>(
+        paramb,
+        annmb,
+        N,
+        N1,
+        N2,
+        box,
+        nep_data.NN_radial.data(),
+        nep_data.NL_radial.data(),
+        type.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        nep_data.charge_derivative.data(),
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
+
+      // get BEC (angular descriptor part)
+      find_bec_angular<<<grid_size, BLOCK_SIZE, 0, bec_stream>>>(
+        paramb,
+        annmb,
+        N,
+        N1,
+        N2,
+        box,
+        nep_data.NN_angular.data(),
+        nep_data.NL_angular.data(),
+        type.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        nep_data.charge_derivative.data(),
+        nep_data.sum_fxyz.data(),
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
+    }
+
     // scale q to q * sqrt(epsilon_inf)
-    scale_bec<<<grid_size, BLOCK_SIZE>>>(
+    scale_bec<<<grid_size, BLOCK_SIZE, 0, bec_stream>>>(
       N,
       annmb.sqrt_epsilon_inf,
       nep_data.bec.data());
     GPU_CHECK_KERNEL
+    if (md_nep_fine_parallel_ && md_nep_timing_enabled()) {
+      CHECK(gpuStreamSynchronize(bec_stream));
+    }
+    md_nep_timing_end("qnep.large.bec");
   }
 
+  md_nep_timing_begin("qnep.large.long_range");
   if (use_pppm) {
     pppm.find_force(
       N,
@@ -1427,7 +2320,10 @@ void NEP_Charge::compute_large_box(
       nep_data.D_real,
       force_per_atom,
       virial_per_atom,
-      potential_per_atom);
+      potential_per_atom,
+      md_nep_fine_parallel_,
+      pppm_stream,
+      !md_nep_fine_parallel_);
   } else {
     ewald.find_force(
       N,
@@ -1441,9 +2337,8 @@ void NEP_Charge::compute_large_box(
       virial_per_atom,
       potential_per_atom);
   }
-
-  if (paramb.charge_mode == 1) {
-    find_force_charge_real_space<<<grid_size, BLOCK_SIZE>>>(
+  if (md_nep_fine_parallel_ && paramb.charge_mode == 1) {
+    find_force_charge_real_space_segmented<<<N2 - N1, 128, 0, real_stream>>>(
       N,
       charge_para,
       N1,
@@ -1455,78 +2350,258 @@ void NEP_Charge::compute_large_box(
       position_per_atom.data(),
       position_per_atom.data() + N,
       position_per_atom.data() + N * 2,
-      force_per_atom.data(),
-      force_per_atom.data() + N,
-      force_per_atom.data() + N * 2,
-      virial_per_atom.data(),
-      potential_per_atom.data(),
-      nep_data.D_real.data());
+      nep_data.real_space_force.data(),
+      nep_data.real_space_force.data() + N,
+      nep_data.real_space_force.data() + N * 2,
+      nep_data.real_space_virial.data(),
+      nep_data.real_space_potential.data(),
+      nep_data.real_space_D_real.data());
     GPU_CHECK_KERNEL
+  }
+  if (md_nep_fine_parallel_) {
+    CHECK(gpuStreamSynchronize(pppm_stream));
+    CHECK(gpuStreamSynchronize(bec_stream));
+    if (paramb.charge_mode == 1) {
+      CHECK(gpuStreamSynchronize(real_stream));
+    }
+  }
+  md_nep_timing_end("qnep.large.long_range");
+
+  if (paramb.charge_mode == 1) {
+    if (md_nep_fine_parallel_) {
+      md_nep_timing_begin("qnep.large.real_space_charge_combine");
+      combine_real_space_charge<<<(N2 - N1 - 1) / BLOCK_SIZE + 1, BLOCK_SIZE>>>(
+        N,
+        N1,
+        N2,
+        nep_data.real_space_D_real.data(),
+        nep_data.real_space_force.data(),
+        nep_data.real_space_force.data() + N,
+        nep_data.real_space_force.data() + N * 2,
+        nep_data.real_space_virial.data(),
+        nep_data.real_space_potential.data(),
+        nep_data.D_real.data(),
+        force_per_atom.data(),
+        force_per_atom.data() + N,
+        force_per_atom.data() + N * 2,
+        virial_per_atom.data(),
+        potential_per_atom.data());
+      GPU_CHECK_KERNEL
+      md_nep_timing_end("qnep.large.real_space_charge_combine");
+    } else {
+      md_nep_timing_begin("qnep.large.real_space_charge");
+      find_force_charge_real_space<<<grid_size, BLOCK_SIZE>>>(
+        N,
+        charge_para,
+        N1,
+        N2,
+        box,
+        nep_data.NN_radial.data(),
+        nep_data.NL_radial.data(),
+        nep_data.charge.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        force_per_atom.data(),
+        force_per_atom.data() + N,
+        force_per_atom.data() + N * 2,
+        virial_per_atom.data(),
+        potential_per_atom.data(),
+        nep_data.D_real.data());
+      GPU_CHECK_KERNEL
+      md_nep_timing_end("qnep.large.real_space_charge");
+    }
   }
 
   // Chain rule correction: D_real -= mean(D_real)
-  zero_mean_D_real<<<1, 1024>>>(N, nep_data.D_real.data());
-  GPU_CHECK_KERNEL
+  if (md_nep_fine_parallel_) {
+    md_nep_timing_begin("qnep.large.zero_mean_D_real_parallel");
+    const int partial_count = (N - 1) / 256 + 1;
+    if (nep_data.D_real_partial.size() != partial_count) {
+      nep_data.D_real_partial.resize(partial_count);
+    }
+    if (nep_data.D_real_mean.size() != 1) {
+      nep_data.D_real_mean.resize(1);
+    }
+    sum_D_real_partial<<<partial_count, 256>>>(
+      N, nep_data.D_real.data(), nep_data.D_real_partial.data());
+    GPU_CHECK_KERNEL
+    find_mean_D_real<<<1, 256>>>(
+      partial_count,
+      N,
+      nep_data.D_real_partial.data(),
+      nep_data.D_real_mean.data());
+    GPU_CHECK_KERNEL
+    subtract_mean_D_real<<<partial_count, 256>>>(
+      N, nep_data.D_real_mean.data(), nep_data.D_real.data());
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.zero_mean_D_real_parallel");
+  } else {
+    md_nep_timing_begin("qnep.large.zero_mean_D_real");
+    zero_mean_D_real<<<1, 1024>>>(N, nep_data.D_real.data());
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.zero_mean_D_real");
+  }
 
-  find_force_radial<<<grid_size, BLOCK_SIZE>>>(
-    paramb,
-    annmb,
-    N,
-    N1,
-    N2,
-    box,
-    nep_data.NN_radial.data(),
-    nep_data.NL_radial.data(),
-    type.data(),
-    position_per_atom.data(),
-    position_per_atom.data() + N,
-    position_per_atom.data() + N * 2,
-    nep_data.Fp.data(),
-    nep_data.charge_derivative.data(),
-    nep_data.D_real.data(),
-    force_per_atom.data(),
-    force_per_atom.data() + N,
-    force_per_atom.data() + N * 2,
-    virial_per_atom.data());
-  GPU_CHECK_KERNEL
+  if (md_nep_fine_parallel_) {
+    const int max_radial_neighbors = static_cast<int>(nep_data.NL_radial.size() / N);
+    const int radial_edge_count = N * max_radial_neighbors;
+    if (nep_data.radial_edge_contribution.size() !=
+        static_cast<size_t>(12) * radial_edge_count) {
+      nep_data.radial_edge_contribution.resize(static_cast<size_t>(12) * radial_edge_count);
+    }
+    md_nep_timing_begin("qnep.large.radial_force_edge");
+    find_force_radial_edge<<<(radial_edge_count - 1) / BLOCK_SIZE + 1, BLOCK_SIZE>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      nep_data.NN_radial.data(),
+      nep_data.NL_radial.data(),
+      type.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      nep_data.Fp.data(),
+      nep_data.charge_derivative.data(),
+      nep_data.D_real.data(),
+      max_radial_neighbors,
+      nep_data.radial_edge_contribution.data());
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.radial_force_edge");
 
-  find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
-    paramb,
-    annmb,
-    N,
-    N1,
-    N2,
-    box,
-    nep_data.NN_angular.data(),
-    nep_data.NL_angular.data(),
-    type.data(),
-    position_per_atom.data(),
-    position_per_atom.data() + N,
-    position_per_atom.data() + N * 2,
-    nep_data.Fp.data(),
-    nep_data.charge_derivative.data(),
-    nep_data.D_real.data(),
-    nep_data.sum_fxyz.data(),
-    nep_data.f12x.data(),
-    nep_data.f12y.data(),
-    nep_data.f12z.data());
-  GPU_CHECK_KERNEL
+    md_nep_timing_begin("qnep.large.radial_force_reduce");
+    reduce_radial_edge_contribution<<<N, 128>>>(
+      N,
+      N1,
+      N2,
+      max_radial_neighbors,
+      nep_data.NN_radial.data(),
+      nep_data.radial_edge_contribution.data(),
+      force_per_atom.data(),
+      force_per_atom.data() + N,
+      force_per_atom.data() + N * 2,
+      virial_per_atom.data());
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.radial_force_reduce");
+  } else {
+    md_nep_timing_begin("qnep.large.radial_force");
+    find_force_radial<<<grid_size, BLOCK_SIZE>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      nep_data.NN_radial.data(),
+      nep_data.NL_radial.data(),
+      type.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      nep_data.Fp.data(),
+      nep_data.charge_derivative.data(),
+      nep_data.D_real.data(),
+      force_per_atom.data(),
+      force_per_atom.data() + N,
+      force_per_atom.data() + N * 2,
+      virial_per_atom.data());
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.radial_force");
+  }
 
-  find_properties_many_body(
-    box,
-    nep_data.NN_angular.data(),
-    nep_data.NL_angular.data(),
-    nep_data.f12x.data(),
-    nep_data.f12y.data(),
-    nep_data.f12z.data(),
-    false,
-    position_per_atom,
-    force_per_atom,
-    virial_per_atom,
-    md_nep_fine_parallel_ ? nep_data.reverse_edge.data() : nullptr);
-  GPU_CHECK_KERNEL
+  if (md_nep_fine_parallel_) {
+    const int max_angular_neighbors = static_cast<int>(nep_data.NL_angular.size() / N);
+    const int angular_edge_count = N * max_angular_neighbors;
+    md_nep_timing_begin("qnep.large.angular_force_edge");
+    find_partial_force_angular_edge<<<
+      (angular_edge_count - 1) / BLOCK_SIZE + 1,
+      BLOCK_SIZE>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      type.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      nep_data.Fp.data(),
+      nep_data.charge_derivative.data(),
+      nep_data.D_real.data(),
+      nep_data.sum_fxyz.data(),
+      max_angular_neighbors,
+      nep_data.f12x.data(),
+      nep_data.f12y.data(),
+      nep_data.f12z.data());
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.angular_force_edge");
+  } else {
+    md_nep_timing_begin("qnep.large.angular_force");
+    find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      type.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      nep_data.Fp.data(),
+      nep_data.charge_derivative.data(),
+      nep_data.D_real.data(),
+      nep_data.sum_fxyz.data(),
+      nep_data.f12x.data(),
+      nep_data.f12y.data(),
+      nep_data.f12z.data());
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.angular_force");
+  }
+
+  if (md_nep_fine_parallel_) {
+    md_nep_timing_begin("qnep.large.many_body_segmented");
+    find_properties_many_body_segmented(
+      box,
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      nep_data.f12x.data(),
+      nep_data.f12y.data(),
+      nep_data.f12z.data(),
+      false,
+      position_per_atom,
+      force_per_atom,
+      virial_per_atom,
+      nep_data.reverse_edge.data());
+    md_nep_timing_end("qnep.large.many_body_segmented");
+  } else {
+    md_nep_timing_begin("qnep.large.many_body");
+    find_properties_many_body(
+      box,
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      nep_data.f12x.data(),
+      nep_data.f12y.data(),
+      nep_data.f12z.data(),
+      false,
+      position_per_atom,
+      force_per_atom,
+      virial_per_atom,
+      nullptr);
+    GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.many_body");
+  }
 
   if (zbl.enabled) {
+    md_nep_timing_begin("qnep.large.zbl");
     find_force_ZBL<<<grid_size, BLOCK_SIZE>>>(
       paramb,
       N,
@@ -1546,6 +2621,7 @@ void NEP_Charge::compute_large_box(
       virial_per_atom.data(),
       potential_per_atom.data());
     GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.large.zbl");
   }
 }
 
@@ -1565,6 +2641,7 @@ void NEP_Charge::compute_small_box(
   const int big_neighbor_size = 2000;
   const int size_x12 = type.size() * big_neighbor_size;
 
+  md_nep_timing_begin("qnep.small.neighbor");
   find_neighbor_list_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
     N,
@@ -1587,6 +2664,7 @@ void NEP_Charge::compute_small_box(
     small_box_data.r12.data() + size_x12 * 4,
     small_box_data.r12.data() + size_x12 * 5);
   GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.small.neighbor");
 
   static int num_calls = 0;
   if (num_calls++ % 1000 == 0) {
@@ -1612,6 +2690,7 @@ void NEP_Charge::compute_small_box(
     output_file.close();
   }
 
+  md_nep_timing_begin("qnep.small.descriptor");
   find_descriptor_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
     annmb,
@@ -1636,12 +2715,16 @@ void NEP_Charge::compute_small_box(
     virial_per_atom.data(),
     nep_data.sum_fxyz.data());
   GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.small.descriptor");
 
   // enforce charge neutrality
+  md_nep_timing_begin("qnep.small.charge_neutrality");
   zero_total_charge<<<N, 1024>>>(N, nep_data.charge.data());
   GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.small.charge_neutrality");
 
   if (true) { // TODO
+    md_nep_timing_begin("qnep.small.bec");
     // get BEC (the diagonal part)
     find_bec_diagonal<<<grid_size, BLOCK_SIZE>>>(
       N,
@@ -1690,8 +2773,10 @@ void NEP_Charge::compute_small_box(
       annmb.sqrt_epsilon_inf,
       nep_data.bec.data());
     GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.small.bec");
   }
 
+  md_nep_timing_begin("qnep.small.long_range");
   if (use_pppm) {
     pppm.find_force(
       N,
@@ -1717,8 +2802,10 @@ void NEP_Charge::compute_small_box(
       virial_per_atom,
       potential_per_atom);
   }
+  md_nep_timing_end("qnep.small.long_range");
 
   if (paramb.charge_mode == 1) {
+    md_nep_timing_begin("qnep.small.real_space_charge");
     find_force_charge_real_space_small_box<<<grid_size, BLOCK_SIZE>>>(
       N,
       charge_para,
@@ -1738,12 +2825,16 @@ void NEP_Charge::compute_small_box(
       potential_per_atom.data(),
       nep_data.D_real.data());
     GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.small.real_space_charge");
   }
 
   // Chain rule correction: D_real -= mean(D_real)
+  md_nep_timing_begin("qnep.small.zero_mean_D_real");
   zero_mean_D_real<<<1, 1024>>>(N, nep_data.D_real.data());
   GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.small.zero_mean_D_real");
 
+  md_nep_timing_begin("qnep.small.radial_force");
   find_force_radial_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
     annmb,
@@ -1764,7 +2855,9 @@ void NEP_Charge::compute_small_box(
     force_per_atom.data() + N * 2,
     virial_per_atom.data());
   GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.small.radial_force");
 
+  md_nep_timing_begin("qnep.small.angular_force");
   find_force_angular_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
     annmb,
@@ -1786,8 +2879,10 @@ void NEP_Charge::compute_small_box(
     force_per_atom.data() + N * 2,
     virial_per_atom.data());
   GPU_CHECK_KERNEL
+  md_nep_timing_end("qnep.small.angular_force");
 
   if (zbl.enabled) {
+    md_nep_timing_begin("qnep.small.zbl");
     find_force_ZBL_small_box<<<grid_size, BLOCK_SIZE>>>(
       paramb,
       N,
@@ -1806,6 +2901,7 @@ void NEP_Charge::compute_small_box(
       virial_per_atom.data(),
       potential_per_atom.data());
     GPU_CHECK_KERNEL
+    md_nep_timing_end("qnep.small.zbl");
   }
 }
 
@@ -1878,6 +2974,7 @@ void NEP_Charge::compute(
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom)
 {
+  md_nep_timing_begin_step();
   if (!box.pbc_x || !box.pbc_y || !box.pbc_z) {
     PRINT_INPUT_ERROR("Cannot use non-periodic boundaries for qNEP models.");
   }
@@ -1913,6 +3010,7 @@ void NEP_Charge::compute(
     dftd3.compute(
       box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
   }
+  md_nep_timing_end_step();
 }
 
 const GPU_Vector<int>& NEP_Charge::get_NN_radial_ptr() { return nep_data.NN_radial; }

@@ -38,7 +38,10 @@ public:
     GPU_Vector<float>& D_real,
     GPU_Vector<double>& force_per_atom,
     GPU_Vector<double>& virial_per_atom,
-    GPU_Vector<double>& potential_per_atom);
+    GPU_Vector<double>& potential_per_atom,
+    const bool fine_parallel = false,
+    const gpuStream_t stream = nullptr,
+    const bool synchronize_stream = true);
   struct Para {
     int K0K1K2;             // total number of mesh points
     int K0K1;               // K[0] * K[1]

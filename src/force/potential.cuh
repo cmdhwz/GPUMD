@@ -16,7 +16,11 @@
 #pragma once
 #include "model/box.cuh"
 #include "model/group.cuh"
+#include "utilities/gpu_macro.cuh"
 #include "utilities/gpu_vector.cuh"
+#include <cstddef>
+#include <map>
+#include <string>
 
 class Potential
 {
@@ -66,6 +70,9 @@ public:
   // Enable the opt-in fine-grained NEP path. Non-NEP potentials ignore it.
   virtual void set_md_nep_fine_parallel(bool /* enabled */) {}
 
+  // Enable optional NEP/qNEP kernel timing. Non-NEP potentials ignore it.
+  virtual void set_md_nep_timing(bool /* enabled */) {}
+
   virtual const GPU_Vector<int>& get_NN_radial_ptr()
   {
     static GPU_Vector<int> dummy_NN;
@@ -103,6 +110,31 @@ protected:
     GPU_Vector<double>& virial_per_atom,
     const int* reverse_edge = nullptr);
 
+  void find_properties_many_body_segmented(
+    Box& box,
+    const int* NN,
+    const int* NL,
+    const float* f12x,
+    const float* f12y,
+    const float* f12z,
+    const bool is_dipole,
+    const GPU_Vector<double>& position_per_atom,
+    GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& virial_per_atom,
+    const int* reverse_edge = nullptr);
+
+  void find_properties_many_body_segmented(
+    Box& box,
+    const int* NN,
+    const int* NL,
+    const double* f12x,
+    const double* f12y,
+    const double* f12z,
+    const GPU_Vector<double>& position_per_atom,
+    GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& virial_per_atom,
+    const int* reverse_edge = nullptr);
+
   void find_properties_many_body(
     Box& box,
     const int* NN,
@@ -123,4 +155,22 @@ protected:
     const GPU_Vector<int>& neighbor_number,
     const GPU_Vector<int>& neighbor_list,
     GPU_Vector<int>& reverse_edge);
+
+  void configure_md_nep_timing(bool enabled);
+  void md_nep_timing_begin(const char* label);
+  void md_nep_timing_end(const char* label);
+  void md_nep_timing_begin_step();
+  void md_nep_timing_end_step();
+  bool md_nep_timing_enabled() const { return md_nep_timing_enabled_; }
+
+private:
+  void flush_md_nep_timing();
+
+  bool md_nep_timing_enabled_ = false;
+  bool md_nep_timing_events_ready_ = false;
+  gpuEvent_t md_nep_timing_start_ = nullptr;
+  gpuEvent_t md_nep_timing_stop_ = nullptr;
+  size_t md_nep_timing_steps_ = 0;
+  std::map<std::string, double> md_nep_timing_total_ms_;
+  std::map<std::string, size_t> md_nep_timing_counts_;
 };

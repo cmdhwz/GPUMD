@@ -66,6 +66,7 @@ public:
     const double T);
   void set_multiple_potentials_mode(std::string mode);
   void set_md_nep_fine_parallel(bool enabled);
+  void set_md_nep_timing(bool enabled);
 
   bool compute_hnemd_ = false;
   int compute_hnemdec_ = -1;
@@ -80,6 +81,7 @@ private:
   bool is_fcp = false;
   bool has_non_nep = false;
   bool md_nep_fine_parallel_ = false;
+  bool md_nep_timing_ = false;
   std::string multiple_potentials_mode_ = "observe"; // "observe" or "average"
   std::string atom_types[NUM_ELEMENTS];
 

@@ -24,12 +24,103 @@ The abstract base class (ABC) for the potential classes.
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+
+#define BLOCK_SIZE_SEGMENTED 128
 
 Potential::Potential(void) { rc = 0.0; }
 
 Potential::~Potential(void)
 {
-  // nothing
+  configure_md_nep_timing(false);
+}
+
+void Potential::configure_md_nep_timing(const bool enabled)
+{
+  if (enabled == md_nep_timing_enabled_ && (!enabled || md_nep_timing_events_ready_)) {
+    return;
+  }
+
+  if (!enabled) {
+    if (md_nep_timing_enabled_) {
+      flush_md_nep_timing();
+    }
+    if (md_nep_timing_events_ready_) {
+      CHECK(gpuEventDestroy(md_nep_timing_start_));
+      CHECK(gpuEventDestroy(md_nep_timing_stop_));
+      md_nep_timing_start_ = nullptr;
+      md_nep_timing_stop_ = nullptr;
+      md_nep_timing_events_ready_ = false;
+    }
+    md_nep_timing_enabled_ = false;
+    return;
+  }
+
+  CHECK(gpuEventCreate(&md_nep_timing_start_));
+  CHECK(gpuEventCreate(&md_nep_timing_stop_));
+  md_nep_timing_events_ready_ = true;
+  md_nep_timing_enabled_ = true;
+  md_nep_timing_steps_ = 0;
+  md_nep_timing_total_ms_.clear();
+  md_nep_timing_counts_.clear();
+  printf("Enabled md_nep_timing; reports are appended to md_nep_timing.out.\n");
+}
+
+void Potential::md_nep_timing_begin(const char* /* label */)
+{
+  if (!md_nep_timing_enabled_) {
+    return;
+  }
+  CHECK(gpuEventRecord(md_nep_timing_start_, 0));
+}
+
+void Potential::md_nep_timing_end(const char* label)
+{
+  if (!md_nep_timing_enabled_) {
+    return;
+  }
+  CHECK(gpuEventRecord(md_nep_timing_stop_, 0));
+  CHECK(gpuEventSynchronize(md_nep_timing_stop_));
+  float elapsed_ms = 0.0f;
+  CHECK(gpuEventElapsedTime(&elapsed_ms, md_nep_timing_start_, md_nep_timing_stop_));
+  md_nep_timing_total_ms_[label] += elapsed_ms;
+  md_nep_timing_counts_[label] += 1;
+}
+
+void Potential::md_nep_timing_begin_step()
+{
+  if (md_nep_timing_enabled_) {
+    ++md_nep_timing_steps_;
+  }
+}
+
+void Potential::md_nep_timing_end_step()
+{
+  if (md_nep_timing_enabled_ && md_nep_timing_steps_ % 100 == 0) {
+    flush_md_nep_timing();
+  }
+}
+
+void Potential::flush_md_nep_timing()
+{
+  if (md_nep_timing_counts_.empty()) {
+    return;
+  }
+
+  std::ofstream output_file("md_nep_timing.out", std::ios_base::app);
+  output_file << std::fixed << std::setprecision(6);
+  output_file << "Timing report after " << md_nep_timing_steps_ << " force evaluations\n";
+  output_file << "label count total_ms average_ms\n";
+  for (const auto& item : md_nep_timing_total_ms_) {
+    const size_t count = md_nep_timing_counts_[item.first];
+    output_file << item.first << " " << count << " " << item.second << " "
+                << item.second / static_cast<double>(count) << "\n";
+  }
+  output_file << "\n";
+  output_file.close();
+  md_nep_timing_total_ms_.clear();
+  md_nep_timing_counts_.clear();
 }
 
 static __global__ void gpu_build_reverse_edge(
@@ -189,6 +280,150 @@ static __global__ void gpu_find_force_many_body(
   }
 }
 
+static __global__ void gpu_find_force_many_body_segmented(
+  const int number_of_particles,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_neighbor_number,
+  const int* g_neighbor_list,
+  const int* g_reverse_edge,
+  const double* __restrict__ g_f12x,
+  const double* __restrict__ g_f12y,
+  const double* __restrict__ g_f12z,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial)
+{
+  const int n1 = blockIdx.x;
+  if (n1 < N1 || n1 >= N2) {
+    return;
+  }
+
+  __shared__ double s_fx[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_fy[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_fz[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_sxx[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_sxy[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_sxz[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_syx[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_syy[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_syz[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_szx[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_szy[BLOCK_SIZE_SEGMENTED];
+  __shared__ double s_szz[BLOCK_SIZE_SEGMENTED];
+
+  double fx = 0.0;
+  double fy = 0.0;
+  double fz = 0.0;
+  double sxx = 0.0;
+  double sxy = 0.0;
+  double sxz = 0.0;
+  double syx = 0.0;
+  double syy = 0.0;
+  double syz = 0.0;
+  double szx = 0.0;
+  double szy = 0.0;
+  double szz = 0.0;
+  const int neighbor_number = g_neighbor_number[n1];
+  const double x1 = g_x[n1];
+  const double y1 = g_y[n1];
+  const double z1 = g_z[n1];
+
+  for (int i1 = threadIdx.x; i1 < neighbor_number; i1 += blockDim.x) {
+    const int index = i1 * number_of_particles + n1;
+    const int n2 = g_neighbor_list[index];
+    double x12 = g_x[n2] - x1;
+    double y12 = g_y[n2] - y1;
+    double z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
+
+    int reverse_index = g_reverse_edge == nullptr ? -1 : g_reverse_edge[index];
+    if (reverse_index < 0) {
+      const int neighbor_number_2 = g_neighbor_number[n2];
+      for (int k = 0; k < neighbor_number_2; ++k) {
+        if (n1 == g_neighbor_list[n2 + number_of_particles * k]) {
+          reverse_index = k * number_of_particles + n2;
+          break;
+        }
+      }
+    }
+    if (reverse_index < 0) {
+      continue;
+    }
+
+    const double f12x = g_f12x[index];
+    const double f12y = g_f12y[index];
+    const double f12z = g_f12z[index];
+    const double f21x = g_f12x[reverse_index];
+    const double f21y = g_f12y[reverse_index];
+    const double f21z = g_f12z[reverse_index];
+    fx += f12x - f21x;
+    fy += f12y - f21y;
+    fz += f12z - f21z;
+    sxx += x12 * f21x;
+    sxy += x12 * f21y;
+    sxz += x12 * f21z;
+    syx += y12 * f21x;
+    syy += y12 * f21y;
+    syz += y12 * f21z;
+    szx += z12 * f21x;
+    szy += z12 * f21y;
+    szz += z12 * f21z;
+  }
+
+  s_fx[threadIdx.x] = fx;
+  s_fy[threadIdx.x] = fy;
+  s_fz[threadIdx.x] = fz;
+  s_sxx[threadIdx.x] = sxx;
+  s_sxy[threadIdx.x] = sxy;
+  s_sxz[threadIdx.x] = sxz;
+  s_syx[threadIdx.x] = syx;
+  s_syy[threadIdx.x] = syy;
+  s_syz[threadIdx.x] = syz;
+  s_szx[threadIdx.x] = szx;
+  s_szy[threadIdx.x] = szy;
+  s_szz[threadIdx.x] = szz;
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      s_fx[threadIdx.x] += s_fx[threadIdx.x + offset];
+      s_fy[threadIdx.x] += s_fy[threadIdx.x + offset];
+      s_fz[threadIdx.x] += s_fz[threadIdx.x + offset];
+      s_sxx[threadIdx.x] += s_sxx[threadIdx.x + offset];
+      s_sxy[threadIdx.x] += s_sxy[threadIdx.x + offset];
+      s_sxz[threadIdx.x] += s_sxz[threadIdx.x + offset];
+      s_syx[threadIdx.x] += s_syx[threadIdx.x + offset];
+      s_syy[threadIdx.x] += s_syy[threadIdx.x + offset];
+      s_syz[threadIdx.x] += s_syz[threadIdx.x + offset];
+      s_szx[threadIdx.x] += s_szx[threadIdx.x + offset];
+      s_szy[threadIdx.x] += s_szy[threadIdx.x + offset];
+      s_szz[threadIdx.x] += s_szz[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    g_fx[n1] += s_fx[0];
+    g_fy[n1] += s_fy[0];
+    g_fz[n1] += s_fz[0];
+    g_virial[n1 + 0 * number_of_particles] += s_sxx[0];
+    g_virial[n1 + 1 * number_of_particles] += s_syy[0];
+    g_virial[n1 + 2 * number_of_particles] += s_szz[0];
+    g_virial[n1 + 3 * number_of_particles] += s_sxy[0];
+    g_virial[n1 + 4 * number_of_particles] += s_sxz[0];
+    g_virial[n1 + 5 * number_of_particles] += s_syz[0];
+    g_virial[n1 + 6 * number_of_particles] += s_syx[0];
+    g_virial[n1 + 7 * number_of_particles] += s_szx[0];
+    g_virial[n1 + 8 * number_of_particles] += s_szy[0];
+  }
+}
+
 void Potential::find_properties_many_body(
   Box& box,
   const int* NN,
@@ -205,6 +440,43 @@ void Potential::find_properties_many_body(
   int grid_size = (N2 - N1 - 1) / BLOCK_SIZE_FORCE + 1;
 
   gpu_find_force_many_body<<<grid_size, BLOCK_SIZE_FORCE>>>(
+    number_of_atoms,
+    N1,
+    N2,
+    box,
+    NN,
+    NL,
+    reverse_edge,
+    f12x,
+    f12y,
+    f12z,
+    position_per_atom.data(),
+    position_per_atom.data() + number_of_atoms,
+    position_per_atom.data() + number_of_atoms * 2,
+    force_per_atom.data(),
+    force_per_atom.data() + number_of_atoms,
+    force_per_atom.data() + 2 * number_of_atoms,
+    virial_per_atom.data());
+  GPU_CHECK_KERNEL
+}
+
+void Potential::find_properties_many_body_segmented(
+  Box& box,
+  const int* NN,
+  const int* NL,
+  const double* f12x,
+  const double* f12y,
+  const double* f12z,
+  const GPU_Vector<double>& position_per_atom,
+  GPU_Vector<double>& force_per_atom,
+  GPU_Vector<double>& virial_per_atom,
+  const int* reverse_edge)
+{
+  const int number_of_atoms = position_per_atom.size() / 3;
+  if (number_of_atoms <= 0) {
+    return;
+  }
+  gpu_find_force_many_body_segmented<<<number_of_atoms, BLOCK_SIZE_SEGMENTED>>>(
     number_of_atoms,
     N1,
     N2,
@@ -352,6 +624,169 @@ static __global__ void gpu_find_force_many_body(
   }
 }
 
+static __global__ void gpu_find_force_many_body_segmented(
+  const bool is_dipole,
+  const int number_of_particles,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_neighbor_number,
+  const int* g_neighbor_list,
+  const int* g_reverse_edge,
+  const float* __restrict__ g_f12x,
+  const float* __restrict__ g_f12y,
+  const float* __restrict__ g_f12z,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial)
+{
+  const int n1 = blockIdx.x;
+  if (n1 < N1 || n1 >= N2) {
+    return;
+  }
+
+  __shared__ float s_fx[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_fy[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_fz[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_sxx[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_sxy[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_sxz[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_syx[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_syy[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_syz[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_szx[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_szy[BLOCK_SIZE_SEGMENTED];
+  __shared__ float s_szz[BLOCK_SIZE_SEGMENTED];
+
+  float fx = 0.0f;
+  float fy = 0.0f;
+  float fz = 0.0f;
+  float sxx = 0.0f;
+  float sxy = 0.0f;
+  float sxz = 0.0f;
+  float syx = 0.0f;
+  float syy = 0.0f;
+  float syz = 0.0f;
+  float szx = 0.0f;
+  float szy = 0.0f;
+  float szz = 0.0f;
+  const int neighbor_number = g_neighbor_number[n1];
+  const double x1 = g_x[n1];
+  const double y1 = g_y[n1];
+  const double z1 = g_z[n1];
+
+  for (int i1 = threadIdx.x; i1 < neighbor_number; i1 += blockDim.x) {
+    const int index = i1 * number_of_particles + n1;
+    const int n2 = g_neighbor_list[index];
+    double x12double = g_x[n2] - x1;
+    double y12double = g_y[n2] - y1;
+    double z12double = g_z[n2] - z1;
+    apply_mic(box, x12double, y12double, z12double);
+    const float x12 = float(x12double);
+    const float y12 = float(y12double);
+    const float z12 = float(z12double);
+
+    int reverse_index = g_reverse_edge == nullptr ? -1 : g_reverse_edge[index];
+    if (reverse_index < 0) {
+      int left = 0;
+      int right = g_neighbor_number[n2];
+      while (left < right) {
+        const int middle = (left + right) >> 1;
+        const int value = g_neighbor_list[n2 + number_of_particles * middle];
+        if (value < n1) {
+          left = middle + 1;
+        } else {
+          right = middle;
+        }
+      }
+      if (left < g_neighbor_number[n2] &&
+          g_neighbor_list[n2 + number_of_particles * left] == n1) {
+        reverse_index = left * number_of_particles + n2;
+      }
+    }
+    if (reverse_index < 0) {
+      continue;
+    }
+
+    const float f12x = g_f12x[index];
+    const float f12y = g_f12y[index];
+    const float f12z = g_f12z[index];
+    const float f21x = g_f12x[reverse_index];
+    const float f21y = g_f12y[reverse_index];
+    const float f21z = g_f12z[reverse_index];
+    fx += f12x - f21x;
+    fy += f12y - f21y;
+    fz += f12z - f21z;
+    if (is_dipole) {
+      const float r12_square = x12 * x12 + y12 * y12 + z12 * z12;
+      sxx -= r12_square * f21x;
+      syy -= r12_square * f21y;
+      szz -= r12_square * f21z;
+    } else {
+      sxx += x12 * f21x;
+      syy += y12 * f21y;
+      szz += z12 * f21z;
+    }
+    sxy += x12 * f21y;
+    sxz += x12 * f21z;
+    syx += y12 * f21x;
+    syz += y12 * f21z;
+    szx += z12 * f21x;
+    szy += z12 * f21y;
+  }
+
+  s_fx[threadIdx.x] = fx;
+  s_fy[threadIdx.x] = fy;
+  s_fz[threadIdx.x] = fz;
+  s_sxx[threadIdx.x] = sxx;
+  s_sxy[threadIdx.x] = sxy;
+  s_sxz[threadIdx.x] = sxz;
+  s_syx[threadIdx.x] = syx;
+  s_syy[threadIdx.x] = syy;
+  s_syz[threadIdx.x] = syz;
+  s_szx[threadIdx.x] = szx;
+  s_szy[threadIdx.x] = szy;
+  s_szz[threadIdx.x] = szz;
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      s_fx[threadIdx.x] += s_fx[threadIdx.x + offset];
+      s_fy[threadIdx.x] += s_fy[threadIdx.x + offset];
+      s_fz[threadIdx.x] += s_fz[threadIdx.x + offset];
+      s_sxx[threadIdx.x] += s_sxx[threadIdx.x + offset];
+      s_sxy[threadIdx.x] += s_sxy[threadIdx.x + offset];
+      s_sxz[threadIdx.x] += s_sxz[threadIdx.x + offset];
+      s_syx[threadIdx.x] += s_syx[threadIdx.x + offset];
+      s_syy[threadIdx.x] += s_syy[threadIdx.x + offset];
+      s_syz[threadIdx.x] += s_syz[threadIdx.x + offset];
+      s_szx[threadIdx.x] += s_szx[threadIdx.x + offset];
+      s_szy[threadIdx.x] += s_szy[threadIdx.x + offset];
+      s_szz[threadIdx.x] += s_szz[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    g_fx[n1] += s_fx[0];
+    g_fy[n1] += s_fy[0];
+    g_fz[n1] += s_fz[0];
+    g_virial[n1 + 0 * number_of_particles] += s_sxx[0];
+    g_virial[n1 + 1 * number_of_particles] += s_syy[0];
+    g_virial[n1 + 2 * number_of_particles] += s_szz[0];
+    g_virial[n1 + 3 * number_of_particles] += s_sxy[0];
+    g_virial[n1 + 4 * number_of_particles] += s_sxz[0];
+    g_virial[n1 + 5 * number_of_particles] += s_syz[0];
+    g_virial[n1 + 6 * number_of_particles] += s_syx[0];
+    g_virial[n1 + 7 * number_of_particles] += s_szx[0];
+    g_virial[n1 + 8 * number_of_particles] += s_szy[0];
+  }
+}
+
 void Potential::find_properties_many_body(
   Box& box,
   const int* NN,
@@ -369,6 +804,45 @@ void Potential::find_properties_many_body(
   int grid_size = (N2 - N1 - 1) / BLOCK_SIZE_FORCE + 1;
 
   gpu_find_force_many_body<<<grid_size, BLOCK_SIZE_FORCE>>>(
+    is_dipole,
+    number_of_atoms,
+    N1,
+    N2,
+    box,
+    NN,
+    NL,
+    reverse_edge,
+    f12x,
+    f12y,
+    f12z,
+    position_per_atom.data(),
+    position_per_atom.data() + number_of_atoms,
+    position_per_atom.data() + number_of_atoms * 2,
+    force_per_atom.data(),
+    force_per_atom.data() + number_of_atoms,
+    force_per_atom.data() + 2 * number_of_atoms,
+    virial_per_atom.data());
+  GPU_CHECK_KERNEL
+}
+
+void Potential::find_properties_many_body_segmented(
+  Box& box,
+  const int* NN,
+  const int* NL,
+  const float* f12x,
+  const float* f12y,
+  const float* f12z,
+  const bool is_dipole,
+  const GPU_Vector<double>& position_per_atom,
+  GPU_Vector<double>& force_per_atom,
+  GPU_Vector<double>& virial_per_atom,
+  const int* reverse_edge)
+{
+  const int number_of_atoms = position_per_atom.size() / 3;
+  if (number_of_atoms <= 0) {
+    return;
+  }
+  gpu_find_force_many_body_segmented<<<number_of_atoms, BLOCK_SIZE_SEGMENTED>>>(
     is_dipole,
     number_of_atoms,
     N1,
