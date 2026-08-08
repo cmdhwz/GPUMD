@@ -124,6 +124,10 @@ public:
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
   void set_pimd_qnep_bead_batch(const bool enabled);
   void set_pimd_nep_bead_batch(const bool enabled);
+  void set_pimd_nep_batch_profile(const bool enabled);
+  void reset_pimd_nep_batch_profile();
+  void print_pimd_nep_batch_profile() const;
+  bool pimd_nep_batch_profile_enabled() const { return pimd_nep_batch_profile_enabled_; }
   int get_pimd_bead_gpu_parallel_devices() const { return pimd_bead_gpu_parallel_devices_; }
   int get_pimd_bead_gpu_worker_count() const { return int(pimd_bead_gpu_workers_.size()); }
   bool pimd_bead_gpu_parallel_available() const { return can_use_pimd_bead_gpu_parallel_(); }
@@ -147,6 +151,7 @@ private:
   bool pimd_bead_neighbor_always_rebuild_ = true;
   bool pimd_qnep_bead_batch_enabled_ = false;
   bool pimd_nep_bead_batch_enabled_ = false;
+  bool pimd_nep_batch_profile_enabled_ = false;
   std::string primary_nep_model_path_;
   std::string atom_types[NUM_ELEMENTS];
   std::unique_ptr<Potential> pimd_nep_single_gpu_batch_potential_;

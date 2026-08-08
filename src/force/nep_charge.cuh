@@ -163,6 +163,10 @@ public:
 
   virtual void set_neighbor_rebuild(const bool value);
   void set_neighbor_diagnostics(const bool enabled) { neighbor_diagnostics_enabled_ = enabled; }
+  void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }
+  bool pimd_batch_profile_enabled() const override { return pimd_batch_profile_enabled_; }
+  const PIMD_Batch_Timing& get_pimd_batch_timing() const override { return pimd_batch_timing_; }
+  void reset_pimd_batch_timing() override { pimd_batch_timing_ = PIMD_Batch_Timing(); }
 
 private:
   ParaMB paramb;
@@ -245,6 +249,8 @@ private:
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
   bool neighbor_always_rebuild_ = false;
   bool neighbor_diagnostics_enabled_ = true;
+  bool pimd_batch_profile_enabled_ = false;
+  PIMD_Batch_Timing pimd_batch_timing_;
   long long neighbor_large_box_calls_ = 0;
   long long neighbor_small_box_calls_ = 0;
 

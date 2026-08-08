@@ -325,6 +325,75 @@ void Force::set_pimd_nep_bead_batch(const bool enabled)
   }
 }
 
+void Force::set_pimd_nep_batch_profile(const bool enabled)
+{
+  pimd_nep_batch_profile_enabled_ = enabled;
+  for (auto& potential : potentials) {
+    potential->set_pimd_batch_profile(enabled);
+  }
+  for (auto& worker : pimd_bead_gpu_workers_) {
+    worker->potential->set_pimd_batch_profile(enabled);
+  }
+  if (pimd_nep_single_gpu_batch_potential_) {
+    pimd_nep_single_gpu_batch_potential_->set_pimd_batch_profile(enabled);
+  }
+}
+
+void Force::reset_pimd_nep_batch_profile()
+{
+  for (auto& potential : potentials) {
+    potential->reset_pimd_batch_timing();
+  }
+  for (auto& worker : pimd_bead_gpu_workers_) {
+    worker->potential->reset_pimd_batch_timing();
+  }
+  if (pimd_nep_single_gpu_batch_potential_) {
+    pimd_nep_single_gpu_batch_potential_->reset_pimd_batch_timing();
+  }
+}
+
+void Force::print_pimd_nep_batch_profile() const
+{
+  if (!pimd_nep_batch_profile_enabled_) {
+    return;
+  }
+
+  auto print_timing = [](const char* label, const PIMD_Batch_Timing& timing) {
+    if (timing.calls == 0) {
+      return;
+    }
+    printf("    %s (%lld force calls):\n", label, timing.calls);
+    printf("        setup = %g s.\n", timing.setup);
+    printf("        neighbor = %g s.\n", timing.neighbor);
+    printf("        initialize = %g s.\n", timing.initialize);
+    printf("        descriptor/ANN = %g s.\n", timing.descriptor);
+    printf("        BEC = %g s.\n", timing.bec);
+    printf("        electrostatics = %g s.\n", timing.electrostatics);
+    printf("        radial force = %g s.\n", timing.radial);
+    printf("        angular force = %g s.\n", timing.angular);
+    printf("        many-body force = %g s.\n", timing.many_body);
+    printf("        ZBL/DFTD3 = %g s.\n", timing.corrections);
+    printf("        total batch potential = %g s.\n", timing.total);
+  };
+
+  printf("PIMD NEP/qNEP batch stage timing:\n");
+  for (size_t potential_id = 0; potential_id < potentials.size(); ++potential_id) {
+    char label[64];
+    snprintf(label, sizeof(label), "GPU 0 potential %zu", potential_id);
+    print_timing(label, potentials[potential_id]->get_pimd_batch_timing());
+  }
+  for (const auto& worker : pimd_bead_gpu_workers_) {
+    char label[64];
+    snprintf(label, sizeof(label), "GPU %d worker", worker->device_id);
+    print_timing(label, worker->potential->get_pimd_batch_timing());
+  }
+  if (pimd_nep_single_gpu_batch_potential_) {
+    print_timing(
+      "single-GPU fallback potential",
+      pimd_nep_single_gpu_batch_potential_->get_pimd_batch_timing());
+  }
+}
+
 bool Force::can_use_pimd_bead_gpu_parallel_() const
 {
   if (pimd_bead_gpu_parallel_devices_ <= 1 || pimd_bead_gpu_workers_.size() <= 1) {
@@ -482,6 +551,8 @@ bool Force::try_compute_pimd_nep_batch_(
       pimd_nep_single_gpu_batch_potential_->N2 = number_of_atoms_;
       pimd_nep_single_gpu_batch_potential_->set_neighbor_rebuild(
         pimd_bead_neighbor_always_rebuild_);
+      pimd_nep_single_gpu_batch_potential_->set_pimd_batch_profile(
+        pimd_nep_batch_profile_enabled_);
     }
     nep = dynamic_cast<NEP*>(pimd_nep_single_gpu_batch_potential_.get());
   }
@@ -516,6 +587,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
       (pimd_nep_bead_batch_enabled_ && dynamic_cast<NEP*>(potentials[0].get()));
     potentials[0]->set_neighbor_rebuild(
       use_primary_batch_neighbor_setting ? pimd_bead_neighbor_always_rebuild_ : false);
+    potentials[0]->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
   }
   if (pimd_bead_gpu_parallel_devices_ <= 1 || primary_nep_model_path_.empty() ||
       number_of_atoms_ <= 0) {
@@ -558,6 +630,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
     } else {
       worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
     }
+    worker->potential->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
     worker->potential->set_neighbor_rebuild(pimd_bead_neighbor_always_rebuild_);
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;

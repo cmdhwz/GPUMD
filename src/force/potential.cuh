@@ -18,6 +18,22 @@
 #include "model/group.cuh"
 #include "utilities/gpu_vector.cuh"
 
+struct PIMD_Batch_Timing
+{
+  double setup = 0.0;
+  double neighbor = 0.0;
+  double initialize = 0.0;
+  double descriptor = 0.0;
+  double bec = 0.0;
+  double electrostatics = 0.0;
+  double radial = 0.0;
+  double angular = 0.0;
+  double many_body = 0.0;
+  double corrections = 0.0;
+  double total = 0.0;
+  long long calls = 0;
+};
+
 class Potential
 {
 public:
@@ -88,6 +104,15 @@ public:
   }
 
   virtual void set_neighbor_rebuild(const bool /* value */) {}
+
+  virtual void set_pimd_batch_profile(const bool /* enabled */) {}
+  virtual bool pimd_batch_profile_enabled() const { return false; }
+  virtual const PIMD_Batch_Timing& get_pimd_batch_timing() const
+  {
+    static const PIMD_Batch_Timing dummy;
+    return dummy;
+  }
+  virtual void reset_pimd_batch_timing() {}
 
 protected:
   void find_properties_many_body(

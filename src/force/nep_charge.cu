@@ -2814,12 +2814,21 @@ bool NEP_Charge::compute_pimd_batch(
   }
 
   const bool is_small_box = get_expanded_box(paramb.rc_radial, box, ebox);
+  const bool profile = pimd_batch_profile_enabled_;
+  const auto total_begin = std::chrono::high_resolution_clock::now();
+  const auto setup_begin = std::chrono::high_resolution_clock::now();
   initialize_pimd_batch_(
     N, position_beads, potential_beads, force_beads, virial_beads);
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.setup += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - setup_begin).count();
+  }
   auto& batch = *pimd_batch_data_;
 
   if (is_small_box) {
     // The cached list includes the skin, so explicit images must cover it too.
+    const auto neighbor_begin = std::chrono::high_resolution_clock::now();
     get_expanded_box(paramb.rc_radial + 1.0, box, ebox);
     const int small_box_neighbor_size = 2000;
     std::vector<int> initial_flags(number_of_beads, 0);
@@ -2919,7 +2928,13 @@ bool NEP_Charge::compute_pimd_batch(
       batch.small_box_y0_ptrs,
       batch.small_box_z0_ptrs,
       batch.small_box_rebuild_flags);
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.neighbor += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - neighbor_begin).count();
+    }
 
+    const auto descriptor_begin = std::chrono::high_resolution_clock::now();
     find_descriptor_small_box_pimd_batch<<<bead_grid, block_size>>>(
       paramb,
       annmb,
@@ -2946,7 +2961,13 @@ bool NEP_Charge::compute_pimd_batch(
       batch.virial_ptrs.data(),
       batch.sum_fxyz.data());
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.descriptor += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - descriptor_begin).count();
+    }
 
+    const auto bec_begin = std::chrono::high_resolution_clock::now();
     zero_total_charge_pimd_batch<<<number_of_beads, 1024>>>(
       N, number_of_beads, batch.charge_ptrs.data());
     GPU_CHECK_KERNEL
@@ -2991,7 +3012,13 @@ bool NEP_Charge::compute_pimd_batch(
     scale_bec_pimd_batch<<<bead_grid, block_size>>>(
       N, number_of_beads, annmb.sqrt_epsilon_inf, batch.bec_ptrs.data());
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.bec += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - bec_begin).count();
+    }
 
+    const auto electrostatics_begin = std::chrono::high_resolution_clock::now();
     if (use_pppm) {
       pppm.find_force_batch(
         N,
@@ -3046,7 +3073,13 @@ bool NEP_Charge::compute_pimd_batch(
     zero_mean_D_real_pimd_batch<<<number_of_beads, 1024>>>(
       N, number_of_beads, batch.D_real_ptrs.data());
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.electrostatics += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - electrostatics_begin).count();
+    }
 
+    const auto radial_begin = std::chrono::high_resolution_clock::now();
     find_force_radial_small_box_pimd_batch<<<bead_grid, block_size>>>(
       paramb,
       annmb,
@@ -3067,6 +3100,12 @@ bool NEP_Charge::compute_pimd_batch(
       batch.force_ptrs.data(),
       batch.virial_ptrs.data());
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.radial += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - radial_begin).count();
+    }
+    const auto angular_begin = std::chrono::high_resolution_clock::now();
     find_force_angular_small_box_pimd_batch<<<bead_grid, block_size>>>(
       paramb,
       annmb,
@@ -3088,7 +3127,13 @@ bool NEP_Charge::compute_pimd_batch(
       batch.force_ptrs.data(),
       batch.virial_ptrs.data());
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.angular += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - angular_begin).count();
+    }
 
+    const auto corrections_begin = std::chrono::high_resolution_clock::now();
     for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
       const size_t atom_offset = static_cast<size_t>(bead_id) * N;
       const size_t neighbor_offset = atom_offset * small_box_neighbor_size;
@@ -3122,13 +3167,25 @@ bool NEP_Charge::compute_pimd_batch(
           *virial_beads[bead_id]);
       }
     }
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.corrections += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - corrections_begin).count();
+    }
     batch.small_box_initialized = true;
     for (int component = 0; component < 9; ++component) {
       batch.small_box_h[component] = box.cpu_h[component];
     }
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.total += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - total_begin).count();
+      ++pimd_batch_timing_.calls;
+    }
     return true;
   }
 
+  const auto neighbor_begin = std::chrono::high_resolution_clock::now();
   batch.small_box_initialized = false;
   std::vector<Neighbor*> neighbor_ptrs;
   neighbor_ptrs.reserve(number_of_beads);
@@ -3146,17 +3203,29 @@ bool NEP_Charge::compute_pimd_batch(
     batch.y0_ptrs,
     batch.z0_ptrs,
     batch.rebuild_flags);
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.neighbor += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - neighbor_begin).count();
+  }
 
   const int block_size = 64;
   const int grid_size = (N2 - N1 - 1) / block_size + 1;
   const dim3 grid(grid_size, number_of_beads);
+  const auto initialize_begin = std::chrono::high_resolution_clock::now();
   initialize_pimd_batch_properties<<<dim3((N - 1) / 128 + 1, number_of_beads), 128>>>(
     N,
     batch.potential_ptrs.data(),
     batch.force_ptrs.data(),
     batch.virial_ptrs.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.initialize += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - initialize_begin).count();
+  }
 
+  const auto neighbor_filter_begin = std::chrono::high_resolution_clock::now();
   find_neighbor_list_large_box_pimd_batch<<<grid, block_size>>>(
     paramb,
     N,
@@ -3171,7 +3240,13 @@ bool NEP_Charge::compute_pimd_batch(
     batch.NN_angular.data(),
     batch.NL_angular.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.neighbor += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - neighbor_filter_begin).count();
+  }
 
+  const auto descriptor_begin = std::chrono::high_resolution_clock::now();
   find_descriptor_pimd_batch<<<grid, block_size>>>(
     paramb,
     annmb,
@@ -3191,8 +3266,14 @@ bool NEP_Charge::compute_pimd_batch(
     batch.charge_derivative.data(),
     batch.sum_fxyz.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.descriptor += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - descriptor_begin).count();
+  }
 
   const dim3 bead_grid(grid_size, number_of_beads);
+  const auto bec_begin = std::chrono::high_resolution_clock::now();
   zero_total_charge_pimd_batch<<<number_of_beads, 1024>>>(
     N, number_of_beads, batch.charge_ptrs.data());
   GPU_CHECK_KERNEL
@@ -3233,7 +3314,13 @@ bool NEP_Charge::compute_pimd_batch(
   scale_bec_pimd_batch<<<bead_grid, block_size>>>(
     N, number_of_beads, annmb.sqrt_epsilon_inf, batch.bec_ptrs.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.bec += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - bec_begin).count();
+  }
 
+  const auto electrostatics_begin = std::chrono::high_resolution_clock::now();
   if (use_pppm) {
     pppm.find_force_batch(
       N,
@@ -3285,7 +3372,13 @@ bool NEP_Charge::compute_pimd_batch(
   zero_mean_D_real_pimd_batch<<<number_of_beads, 1024>>>(
     N, number_of_beads, batch.D_real_ptrs.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.electrostatics += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - electrostatics_begin).count();
+  }
 
+  const auto radial_begin = std::chrono::high_resolution_clock::now();
   find_force_radial_pimd_batch<<<grid, block_size>>>(
     paramb,
     annmb,
@@ -3303,6 +3396,12 @@ bool NEP_Charge::compute_pimd_batch(
     batch.force_ptrs.data(),
     batch.virial_ptrs.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.radial += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - radial_begin).count();
+  }
+  const auto angular_begin = std::chrono::high_resolution_clock::now();
   find_partial_force_angular_pimd_batch<<<grid, block_size>>>(
     paramb,
     annmb,
@@ -3322,6 +3421,12 @@ bool NEP_Charge::compute_pimd_batch(
     batch.f12y.data(),
     batch.f12z.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.angular += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - angular_begin).count();
+  }
+  const auto many_body_begin = std::chrono::high_resolution_clock::now();
   find_force_many_body_pimd_batch<<<grid, block_size>>>(
     paramb,
     N,
@@ -3337,7 +3442,13 @@ bool NEP_Charge::compute_pimd_batch(
     batch.force_ptrs.data(),
     batch.virial_ptrs.data());
   GPU_CHECK_KERNEL
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.many_body += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - many_body_begin).count();
+  }
 
+  const auto corrections_begin = std::chrono::high_resolution_clock::now();
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     const size_t atom_offset = static_cast<size_t>(bead_id) * N;
     const size_t angular_offset = atom_offset * paramb.MN_angular;
@@ -3371,6 +3482,14 @@ bool NEP_Charge::compute_pimd_batch(
         *force_beads[bead_id],
         *virial_beads[bead_id]);
     }
+  }
+  if (profile) {
+    CHECK(gpuDeviceSynchronize());
+    pimd_batch_timing_.corrections += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - corrections_begin).count();
+    pimd_batch_timing_.total += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - total_begin).count();
+    ++pimd_batch_timing_.calls;
   }
   return true;
 }
