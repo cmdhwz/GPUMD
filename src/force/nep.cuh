@@ -144,9 +144,9 @@ public:
 
   virtual void set_neighbor_rebuild(const bool value);
   void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }
-  void set_pimd_batch_global_neighbor(const bool enabled) override
+  void set_pimd_batch_geometry_cache(const bool enabled) override
   {
-    pimd_batch_global_neighbor_enabled_ = enabled;
+    pimd_batch_geometry_cache_enabled_ = enabled;
   }
   bool pimd_batch_profile_enabled() const override { return pimd_batch_profile_enabled_; }
   const PIMD_Batch_Timing& get_pimd_batch_timing() const override { return pimd_batch_timing_; }
@@ -195,6 +195,12 @@ private:
     GPU_Vector<int> NL_radial;
     GPU_Vector<int> NN_angular;
     GPU_Vector<int> NL_angular;
+    GPU_Vector<float> x12_radial;
+    GPU_Vector<float> y12_radial;
+    GPU_Vector<float> z12_radial;
+    GPU_Vector<float> x12_angular;
+    GPU_Vector<float> y12_angular;
+    GPU_Vector<float> z12_angular;
     GPU_Vector<int> small_NN_radial;
     GPU_Vector<int> small_NL_radial;
     GPU_Vector<int> small_NN_angular;
@@ -217,6 +223,7 @@ private:
     GPU_Vector<float> f12y;
     GPU_Vector<float> f12z;
     std::vector<Neighbor*> neighbor_ptrs;
+    bool large_box_geometry_data_allocated = false;
     bool small_box_data_allocated = false;
     bool small_box_initialized = false;
     double small_box_h[9] = {0.0};
@@ -225,7 +232,7 @@ private:
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
   bool neighbor_always_rebuild_ = false;
   bool pimd_batch_profile_enabled_ = false;
-  bool pimd_batch_global_neighbor_enabled_ = false;
+  bool pimd_batch_geometry_cache_enabled_ = false;
   PIMD_Batch_Timing pimd_batch_timing_;
 
   void initialize_pimd_batch_(

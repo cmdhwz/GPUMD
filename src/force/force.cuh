@@ -125,7 +125,7 @@ public:
   void set_pimd_qnep_bead_batch(const bool enabled);
   void set_pimd_nep_bead_batch(const bool enabled);
   void set_pimd_nep_batch_profile(const bool enabled);
-  void set_pimd_nep_batch_global_neighbor(const bool enabled);
+  void set_pimd_nep_batch_geometry_cache(const bool enabled);
   void reset_pimd_nep_batch_profile();
   void print_pimd_nep_batch_profile() const;
   bool pimd_nep_batch_profile_enabled() const { return pimd_nep_batch_profile_enabled_; }
@@ -153,7 +153,7 @@ private:
   bool pimd_qnep_bead_batch_enabled_ = false;
   bool pimd_nep_bead_batch_enabled_ = false;
   bool pimd_nep_batch_profile_enabled_ = false;
-  bool pimd_nep_batch_global_neighbor_enabled_ = false;
+  bool pimd_nep_batch_geometry_cache_enabled_ = false;
   std::string primary_nep_model_path_;
   std::string atom_types[NUM_ELEMENTS];
   std::unique_ptr<Potential> pimd_nep_single_gpu_batch_potential_;

@@ -22,6 +22,8 @@ struct PIMD_Batch_Timing
 {
   double setup = 0.0;
   double neighbor = 0.0;
+  double neighbor_global = 0.0;
+  double neighbor_filter = 0.0;
   double initialize = 0.0;
   double descriptor = 0.0;
   double bec = 0.0;
@@ -106,7 +108,7 @@ public:
   virtual void set_neighbor_rebuild(const bool /* value */) {}
 
   virtual void set_pimd_batch_profile(const bool /* enabled */) {}
-  virtual void set_pimd_batch_global_neighbor(const bool /* enabled */) {}
+  virtual void set_pimd_batch_geometry_cache(const bool /* enabled */) {}
   virtual bool pimd_batch_profile_enabled() const { return false; }
   virtual const PIMD_Batch_Timing& get_pimd_batch_timing() const
   {

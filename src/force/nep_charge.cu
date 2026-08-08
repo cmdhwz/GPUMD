@@ -2871,6 +2871,7 @@ bool NEP_Charge::compute_pimd_batch(
       batch.virial_ptrs.data());
     GPU_CHECK_KERNEL
 
+    const auto neighbor_filter_begin = std::chrono::high_resolution_clock::now();
     find_neighbor_list_small_box_pimd_batch<<<bead_grid, block_size>>>(
       paramb,
       N,
@@ -2901,6 +2902,11 @@ bool NEP_Charge::compute_pimd_batch(
       batch.small_image_y_angular.data(),
       batch.small_image_z_angular.data());
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.neighbor_filter += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - neighbor_filter_begin).count();
+    }
 
     long long& num_calls = neighbor_small_box_calls_;
     if (neighbor_diagnostics_enabled_ && num_calls++ % 1000 == 0) {
@@ -3212,8 +3218,10 @@ bool NEP_Charge::compute_pimd_batch(
     batch.rebuild_flags);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
-    pimd_batch_timing_.neighbor += std::chrono::duration<double>(
+    const double neighbor_time = std::chrono::duration<double>(
       std::chrono::high_resolution_clock::now() - neighbor_begin).count();
+    pimd_batch_timing_.neighbor += neighbor_time;
+    pimd_batch_timing_.neighbor_global += neighbor_time;
   }
 
   const int block_size = 64;
@@ -3249,8 +3257,10 @@ bool NEP_Charge::compute_pimd_batch(
   GPU_CHECK_KERNEL
   if (profile) {
     CHECK(gpuDeviceSynchronize());
-    pimd_batch_timing_.neighbor += std::chrono::duration<double>(
+    const double neighbor_filter_time = std::chrono::duration<double>(
       std::chrono::high_resolution_clock::now() - neighbor_filter_begin).count();
+    pimd_batch_timing_.neighbor += neighbor_filter_time;
+    pimd_batch_timing_.neighbor_filter += neighbor_filter_time;
   }
 
   const auto descriptor_begin = std::chrono::high_resolution_clock::now();
