@@ -34,6 +34,8 @@ public:
 
   std::string property_name = "";
 
+  virtual bool requires_bec() const { return false; }
+
   virtual void preprocess(
     const int number_of_steps,
     const double time_step,

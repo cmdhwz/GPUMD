@@ -51,6 +51,7 @@ private:
   void parse_pimd_bead_gpu_parallel(const char** param, int num_param);
   void parse_pimd_bead_neighbor_rebuild(const char** param, int num_param);
   void parse_pimd_qnep_bead_batch(const char** param, int num_param);
+  void parse_pimd_qnep_batch_bec(const char** param, int num_param);
   void parse_pimd_nep_bead_batch(const char** param, int num_param);
   void parse_pimd_nep_batch_profile(const char** param, int num_param);
   void parse_pimd_nep_batch_geometry_cache(const char** param, int num_param);

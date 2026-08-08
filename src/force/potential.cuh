@@ -24,6 +24,10 @@ struct PIMD_Batch_Timing
   double neighbor = 0.0;
   double neighbor_global = 0.0;
   double neighbor_filter = 0.0;
+  double neighbor_pointer = 0.0;
+  double neighbor_check = 0.0;
+  double neighbor_flags = 0.0;
+  double neighbor_rebuild = 0.0;
   double initialize = 0.0;
   double descriptor = 0.0;
   double bec = 0.0;
@@ -34,6 +38,7 @@ struct PIMD_Batch_Timing
   double corrections = 0.0;
   double total = 0.0;
   long long calls = 0;
+  long long neighbor_rebuild_beads = 0;
 };
 
 class Potential
@@ -108,6 +113,7 @@ public:
   virtual void set_neighbor_rebuild(const bool /* value */) {}
 
   virtual void set_pimd_batch_profile(const bool /* enabled */) {}
+  virtual void set_pimd_batch_bec(const bool /* enabled */) {}
   virtual bool pimd_batch_profile_enabled() const { return false; }
   virtual const PIMD_Batch_Timing& get_pimd_batch_timing() const
   {

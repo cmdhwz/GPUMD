@@ -21,6 +21,7 @@ class Compute_dpdt : public Property
 {
 public:
   Compute_dpdt(const char**, int);
+  bool requires_bec() const override { return true; }
 
   int sample_interval;
 

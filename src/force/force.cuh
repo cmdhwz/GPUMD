@@ -123,6 +123,8 @@ public:
   void set_pimd_bead_gpu_parallel(const int num_devices);
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
   void set_pimd_qnep_bead_batch(const bool enabled);
+  void set_pimd_qnep_batch_bec_mode(const int mode);
+  void set_pimd_qnep_batch_bec_required(const bool required);
   void set_pimd_nep_bead_batch(const bool enabled);
   void set_pimd_nep_batch_profile(const bool enabled);
   void reset_pimd_nep_batch_profile();
@@ -150,6 +152,8 @@ private:
   int pimd_bead_gpu_parallel_devices_ = 1;
   bool pimd_bead_neighbor_always_rebuild_ = true;
   bool pimd_qnep_bead_batch_enabled_ = false;
+  int pimd_qnep_batch_bec_mode_ = 0; // 0: auto, 1: on, 2: off
+  bool pimd_qnep_batch_bec_required_ = false;
   bool pimd_nep_bead_batch_enabled_ = false;
   bool pimd_nep_batch_profile_enabled_ = false;
   std::string primary_nep_model_path_;
@@ -162,6 +166,7 @@ private:
   bool can_use_pimd_bead_gpu_parallel_() const;
   bool can_use_pimd_qnep_batch_() const;
   bool can_use_pimd_nep_batch_() const;
+  void apply_pimd_qnep_batch_bec_setting_();
   bool try_compute_pimd_qnep_batch_(
     Box& box,
     GPU_Vector<int>& type,
@@ -178,4 +183,9 @@ private:
     std::vector<GPU_Vector<double>>& virial_beads);
   Potential* get_pimd_bead_potential_(int device_id) const;
   void refresh_pimd_bead_gpu_workers_();
+  bool pimd_qnep_batch_bec_enabled_() const
+  {
+    return pimd_qnep_batch_bec_mode_ == 1 ||
+           (pimd_qnep_batch_bec_mode_ == 0 && pimd_qnep_batch_bec_required_);
+  }
 };

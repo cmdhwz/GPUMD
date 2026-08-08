@@ -26,6 +26,7 @@ class Dump_XYZ : public Property
 {
 public:
   Dump_XYZ(const char** param, int num_param, const std::vector<Group>& groups, Atom& atom);
+  bool requires_bec() const override { return quantities.has_bec_; }
   void parse(const char** param, int num_param, const std::vector<Group>& groups);
   virtual void preprocess(
     const int number_of_steps,

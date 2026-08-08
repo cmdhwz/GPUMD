@@ -27,6 +27,7 @@ public:
   void parse(const char** param, int num_param, const std::vector<Group>& group);
   void compute(const int step, const std::vector<Group>& groups, Atom& atom, Force& force);
   void finalize();
+  bool requires_bec() const;
 
 private:
   int num_calls_ = 0;
@@ -35,5 +36,5 @@ private:
   int grouping_method_[10];
   int group_id_[10];
   bool is_nep_charge = false;
-  bool use_bec_[10];
+  bool use_bec_[10] = {};
 };

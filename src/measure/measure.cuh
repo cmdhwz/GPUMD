@@ -60,4 +60,14 @@ public:
     Force& force);
 
   std::vector<std::unique_ptr<Property>> properties;
+
+  bool requires_bec() const
+  {
+    for (const auto& property : properties) {
+      if (property->requires_bec()) {
+        return true;
+      }
+    }
+    return false;
+  }
 };

@@ -162,6 +162,7 @@ public:
   GPU_Vector<float>& get_bec_reference();
 
   virtual void set_neighbor_rebuild(const bool value);
+  void set_pimd_batch_bec(const bool enabled) override { pimd_batch_bec_enabled_ = enabled; }
   void set_neighbor_diagnostics(const bool enabled) { neighbor_diagnostics_enabled_ = enabled; }
   void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }
   bool pimd_batch_profile_enabled() const override { return pimd_batch_profile_enabled_; }
@@ -212,6 +213,11 @@ private:
     GPU_Vector<double*> y0_ptrs;
     GPU_Vector<double*> z0_ptrs;
     GPU_Vector<int> rebuild_flags;
+    GPU_Vector<int> any_rebuild;
+    std::vector<double*> x0_ptrs_host;
+    std::vector<double*> y0_ptrs_host;
+    std::vector<double*> z0_ptrs_host;
+    bool pointer_arrays_initialized = false;
     GPU_Vector<double*> small_box_x0_ptrs;
     GPU_Vector<double*> small_box_y0_ptrs;
     GPU_Vector<double*> small_box_z0_ptrs;
@@ -242,6 +248,7 @@ private:
     GPU_Vector<float> f12x;
     GPU_Vector<float> f12y;
     GPU_Vector<float> f12z;
+    std::vector<Neighbor*> neighbor_ptrs;
     bool small_box_data_allocated = false;
     bool small_box_initialized = false;
     double small_box_h[9] = {0.0};
@@ -250,6 +257,7 @@ private:
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
   bool neighbor_always_rebuild_ = false;
   bool neighbor_diagnostics_enabled_ = true;
+  bool pimd_batch_bec_enabled_ = true;
   bool pimd_batch_profile_enabled_ = false;
   PIMD_Batch_Timing pimd_batch_timing_;
   long long neighbor_large_box_calls_ = 0;

@@ -22,6 +22,7 @@ neighbor list.
 #include "utilities/gpu_macro.cuh"
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
+#include <chrono>
 #include <cstring>
 
 static __device__ void find_cell_id(
@@ -691,7 +692,8 @@ __global__ void gpu_check_atom_distance_batch(
   double* const* y_old_batch,
   double* const* z_old_batch,
   double* const* position_batch,
-  int* rebuild_flags)
+  int* rebuild_flags,
+  int* any_rebuild)
 {
   const int bead = blockIdx.y;
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -715,6 +717,9 @@ __global__ void gpu_check_atom_distance_batch(
   __syncthreads();
   if (threadIdx.x == 0 && rebuild_block != 0) {
     atomicExch(&rebuild_flags[bead], 1);
+    if (any_rebuild != nullptr) {
+      atomicExch(any_rebuild, 1);
+    }
   }
 }
 
@@ -863,7 +868,13 @@ void Neighbor::find_neighbor_global_batch(
   GPU_Vector<double*>& x0_batch,
   GPU_Vector<double*>& y0_batch,
   GPU_Vector<double*>& z0_batch,
-  GPU_Vector<int>& rebuild_flags)
+  GPU_Vector<int>& rebuild_flags,
+  GPU_Vector<int>& any_rebuild,
+  std::vector<double*>& x0_ptrs_host,
+  std::vector<double*>& y0_ptrs_host,
+  std::vector<double*>& z0_ptrs_host,
+  bool& pointer_arrays_initialized,
+  Neighbor_Batch_Timing* timing)
 {
   const int number_of_beads = static_cast<int>(neighbors.size());
   const int N = type.size();
@@ -873,32 +884,64 @@ void Neighbor::find_neighbor_global_batch(
     x0_batch.size() != static_cast<size_t>(number_of_beads) ||
     y0_batch.size() != static_cast<size_t>(number_of_beads) ||
     z0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    rebuild_flags.size() != static_cast<size_t>(number_of_beads)) {
+    rebuild_flags.size() != static_cast<size_t>(number_of_beads) ||
+    any_rebuild.size() != 1 ||
+    x0_ptrs_host.size() != static_cast<size_t>(number_of_beads) ||
+    y0_ptrs_host.size() != static_cast<size_t>(number_of_beads) ||
+    z0_ptrs_host.size() != static_cast<size_t>(number_of_beads)) {
     return;
   }
 
-  std::vector<double*> x0_ptrs(number_of_beads);
-  std::vector<double*> y0_ptrs(number_of_beads);
-  std::vector<double*> z0_ptrs(number_of_beads);
+  using Clock = std::chrono::high_resolution_clock;
+  const auto pointer_begin = Clock::now();
   std::vector<int> initial_flags(number_of_beads, 0);
   bool need_distance_check = false;
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     Neighbor* neighbor = neighbors[bead_id];
     const bool first = neighbor->prepare_reference_positions(N);
-    x0_ptrs[bead_id] = neighbor->reference_x_data();
-    y0_ptrs[bead_id] = neighbor->reference_y_data();
-    z0_ptrs[bead_id] = neighbor->reference_z_data();
+    x0_ptrs_host[bead_id] = neighbor->reference_x_data();
+    y0_ptrs_host[bead_id] = neighbor->reference_y_data();
+    z0_ptrs_host[bead_id] = neighbor->reference_z_data();
     if (first || neighbor->always_rebuild) {
       initial_flags[bead_id] = 1;
     } else {
       need_distance_check = true;
     }
   }
-  x0_batch.copy_from_host(x0_ptrs.data());
-  y0_batch.copy_from_host(y0_ptrs.data());
-  z0_batch.copy_from_host(z0_ptrs.data());
-  rebuild_flags.copy_from_host(initial_flags.data());
-  if (need_distance_check) {
+  if (!pointer_arrays_initialized) {
+    x0_batch.copy_from_host(x0_ptrs_host.data());
+    y0_batch.copy_from_host(y0_ptrs_host.data());
+    z0_batch.copy_from_host(z0_ptrs_host.data());
+    pointer_arrays_initialized = true;
+  }
+  if (timing) {
+    CHECK(gpuDeviceSynchronize());
+    timing->pointer_setup += std::chrono::duration<double>(Clock::now() - pointer_begin).count();
+  }
+
+  const auto flags_begin = Clock::now();
+  bool any_rebuild_host = false;
+  for (const int flag : initial_flags) {
+    if (flag != 0) {
+      any_rebuild_host = true;
+      break;
+    }
+  }
+  if (any_rebuild_host) {
+    rebuild_flags.copy_from_host(initial_flags.data());
+    int any_rebuild_value = 1;
+    any_rebuild.copy_from_host(&any_rebuild_value);
+  } else {
+    rebuild_flags.fill(0);
+    any_rebuild.fill(0);
+  }
+  if (timing) {
+    CHECK(gpuDeviceSynchronize());
+    timing->flag_transfer += std::chrono::duration<double>(Clock::now() - flags_begin).count();
+  }
+
+  const auto distance_begin = Clock::now();
+  if (need_distance_check && !any_rebuild_host) {
     gpu_check_atom_distance_batch<<<
       dim3((N - 1) / 128 + 1, number_of_beads), 128>>>(
       box,
@@ -908,11 +951,34 @@ void Neighbor::find_neighbor_global_batch(
       y0_batch.data(),
       z0_batch.data(),
       position_ptrs.data(),
-      rebuild_flags.data());
+      rebuild_flags.data(),
+      any_rebuild.data());
     GPU_CHECK_KERNEL
   }
+  if (timing && need_distance_check && !any_rebuild_host) {
+    CHECK(gpuDeviceSynchronize());
+    timing->distance_check += std::chrono::duration<double>(Clock::now() - distance_begin).count();
+  }
+
+  int any_rebuild_value = any_rebuild_host ? 1 : 0;
+  if (!any_rebuild_host && need_distance_check) {
+    const auto any_flag_begin = Clock::now();
+    any_rebuild.copy_to_host(&any_rebuild_value);
+    if (timing) {
+      timing->flag_transfer += std::chrono::duration<double>(Clock::now() - any_flag_begin).count();
+    }
+  }
+  if (any_rebuild_value == 0) {
+    return;
+  }
+
   std::vector<int> host_flags(number_of_beads, 0);
+  const auto flag_copy_begin = Clock::now();
   rebuild_flags.copy_to_host(host_flags.data());
+  if (timing) {
+    timing->flag_transfer += std::chrono::duration<double>(Clock::now() - flag_copy_begin).count();
+  }
+  const auto rebuild_begin = Clock::now();
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     if (host_flags[bead_id] == 0) {
       continue;
@@ -940,6 +1006,13 @@ void Neighbor::find_neighbor_global_batch(
       neighbor->y0.data(),
       neighbor->z0.data());
     GPU_CHECK_KERNEL
+    if (timing) {
+      CHECK(gpuDeviceSynchronize());
+      ++timing->rebuild_beads;
+    }
+  }
+  if (timing) {
+    timing->rebuild += std::chrono::duration<double>(Clock::now() - rebuild_begin).count();
   }
 }
 
@@ -970,7 +1043,8 @@ void Neighbor::check_atom_distance_batch(
     y0_batch.data(),
     z0_batch.data(),
     position_batch.data(),
-    rebuild_flags.data());
+    rebuild_flags.data(),
+    nullptr);
   GPU_CHECK_KERNEL
 }
 

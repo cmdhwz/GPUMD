@@ -138,6 +138,16 @@ void Add_Efield::compute(const int step, const std::vector<Group>& groups, Atom&
   }
 }
 
+bool Add_Efield::requires_bec() const
+{
+  for (int call = 0; call < num_calls_; ++call) {
+    if (use_bec_[call]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Add_Efield::parse(const char** param, int num_param, const std::vector<Group>& group)
 {
   printf("Add electric field.\n");

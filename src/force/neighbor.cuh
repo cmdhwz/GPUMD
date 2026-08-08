@@ -41,6 +41,15 @@ void find_neighbor(
   GPU_Vector<int>& NN,
   GPU_Vector<int>& NL);
 
+struct Neighbor_Batch_Timing
+{
+  double pointer_setup = 0.0;
+  double distance_check = 0.0;
+  double flag_transfer = 0.0;
+  double rebuild = 0.0;
+  int rebuild_beads = 0;
+};
+
 // For ILP
 void find_neighbor_ilp(
   const int N1,
@@ -213,7 +222,13 @@ public:
     GPU_Vector<double*>& x0_batch,
     GPU_Vector<double*>& y0_batch,
     GPU_Vector<double*>& z0_batch,
-    GPU_Vector<int>& rebuild_flags);
+    GPU_Vector<int>& rebuild_flags,
+    GPU_Vector<int>& any_rebuild,
+    std::vector<double*>& x0_ptrs_host,
+    std::vector<double*>& y0_ptrs_host,
+    std::vector<double*>& z0_ptrs_host,
+    bool& pointer_arrays_initialized,
+    Neighbor_Batch_Timing* timing = nullptr);
   static void check_atom_distance_batch(
     const Box& box,
     const int number_of_atoms,

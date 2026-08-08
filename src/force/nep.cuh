@@ -183,6 +183,11 @@ private:
     GPU_Vector<double*> y0_ptrs;
     GPU_Vector<double*> z0_ptrs;
     GPU_Vector<int> rebuild_flags;
+    GPU_Vector<int> any_rebuild;
+    std::vector<double*> x0_ptrs_host;
+    std::vector<double*> y0_ptrs_host;
+    std::vector<double*> z0_ptrs_host;
+    bool pointer_arrays_initialized = false;
     GPU_Vector<double*> small_box_x0_ptrs;
     GPU_Vector<double*> small_box_y0_ptrs;
     GPU_Vector<double*> small_box_z0_ptrs;

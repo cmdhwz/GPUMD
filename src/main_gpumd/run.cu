@@ -221,6 +221,7 @@ void Run::perform_a_run()
   integrate.initialize(time_step, atom, box, group, thermo, number_of_steps);
   mc.initialize();
   measure.initialize(number_of_steps, time_step, integrate, group, atom, box, force);
+  force.set_pimd_qnep_batch_bec_required(measure.requires_bec() || add_efield.requires_bec());
 
   // compute force for the first integrate step
   if (integrate.type >= 31 && integrate.type <= 33) { // RPMD/TRPMD/PIMD
@@ -447,6 +448,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_bead_neighbor_rebuild(param, num_param);
   } else if (strcmp(param[0], "pimd_qnep_bead_batch") == 0) {
     parse_pimd_qnep_bead_batch(param, num_param);
+  } else if (strcmp(param[0], "pimd_qnep_batch_bec") == 0) {
+    parse_pimd_qnep_batch_bec(param, num_param);
   } else if (strcmp(param[0], "pimd_nep_bead_batch") == 0) {
     parse_pimd_nep_bead_batch(param, num_param);
   } else if (strcmp(param[0], "pimd_nep_batch_profile") == 0) {
@@ -782,6 +785,25 @@ void Run::parse_pimd_nep_bead_batch(const char** param, int num_param)
     printf("Disabled NEP ring-polymer bead-batched kernels.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_nep_bead_batch should be on or off.\n");
+  }
+}
+
+void Run::parse_pimd_qnep_batch_bec(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_qnep_batch_bec should have 1 parameter.\n");
+  }
+  if (strcmp(param[1], "auto") == 0) {
+    force.set_pimd_qnep_batch_bec_mode(0);
+    printf("qNEP PIMD batch BEC mode is auto.\n");
+  } else if (strcmp(param[1], "on") == 0) {
+    force.set_pimd_qnep_batch_bec_mode(1);
+    printf("qNEP PIMD batch BEC evaluation is on.\n");
+  } else if (strcmp(param[1], "off") == 0) {
+    force.set_pimd_qnep_batch_bec_mode(2);
+    printf("qNEP PIMD batch BEC evaluation is off.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_qnep_batch_bec should be auto, on or off.\n");
   }
 }
 

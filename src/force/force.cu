@@ -314,6 +314,49 @@ void Force::set_pimd_qnep_bead_batch(const bool enabled)
   if (potentials.size() == 1 && dynamic_cast<NEP_Charge*>(potentials[0].get())) {
     potentials[0]->set_neighbor_rebuild(enabled ? pimd_bead_neighbor_always_rebuild_ : false);
   }
+  apply_pimd_qnep_batch_bec_setting_();
+}
+
+void Force::apply_pimd_qnep_batch_bec_setting_()
+{
+  const bool enabled = pimd_qnep_batch_bec_enabled_();
+  for (auto& potential : potentials) {
+    potential->set_pimd_batch_bec(enabled);
+  }
+  for (auto& worker : pimd_bead_gpu_workers_) {
+    worker->potential->set_pimd_batch_bec(enabled);
+  }
+  if (pimd_nep_single_gpu_batch_potential_) {
+    pimd_nep_single_gpu_batch_potential_->set_pimd_batch_bec(enabled);
+  }
+}
+
+void Force::set_pimd_qnep_batch_bec_mode(const int mode)
+{
+  if (mode < 0 || mode > 2) {
+    PRINT_INPUT_ERROR("Invalid qNEP PIMD batch BEC mode.\n");
+  }
+  pimd_qnep_batch_bec_mode_ = mode;
+  if (mode == 2 && pimd_qnep_batch_bec_required_ && pimd_qnep_bead_batch_enabled_) {
+    PRINT_INPUT_ERROR(
+      "pimd_qnep_batch_bec off cannot be used with a BEC-dependent command.\n");
+  }
+  apply_pimd_qnep_batch_bec_setting_();
+}
+
+void Force::set_pimd_qnep_batch_bec_required(const bool required)
+{
+  if (required && pimd_qnep_batch_bec_mode_ == 2 && pimd_qnep_bead_batch_enabled_) {
+    PRINT_INPUT_ERROR(
+      "pimd_qnep_batch_bec off cannot be used with a BEC-dependent command.\n");
+  }
+  pimd_qnep_batch_bec_required_ = required;
+  apply_pimd_qnep_batch_bec_setting_();
+  if (pimd_qnep_bead_batch_enabled_) {
+    printf(
+      "PIMD qNEP batch BEC evaluation = %s.\n",
+      pimd_qnep_batch_bec_enabled_() ? "on" : "off");
+  }
 }
 
 void Force::set_pimd_nep_bead_batch(const bool enabled)
@@ -366,6 +409,13 @@ void Force::print_pimd_nep_batch_profile() const
     printf("        setup = %g s.\n", timing.setup);
     printf("        neighbor = %g s.\n", timing.neighbor);
     printf("            global check/rebuild = %g s.\n", timing.neighbor_global);
+    printf("                pointer setup = %g s.\n", timing.neighbor_pointer);
+    printf("                distance check = %g s.\n", timing.neighbor_check);
+    printf("                flag transfer = %g s.\n", timing.neighbor_flags);
+    printf(
+      "                rebuild/update = %g s (%lld bead rebuilds).\n",
+      timing.neighbor_rebuild,
+      timing.neighbor_rebuild_beads);
     printf("            compact filter/geometry = %g s.\n", timing.neighbor_filter);
     printf("        initialize = %g s.\n", timing.initialize);
     printf("        descriptor/ANN = %g s.\n", timing.descriptor);
@@ -633,12 +683,14 @@ void Force::refresh_pimd_bead_gpu_workers_()
       worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
     }
     worker->potential->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
+    worker->potential->set_pimd_batch_bec(pimd_qnep_batch_bec_enabled_());
     worker->potential->set_neighbor_rebuild(pimd_bead_neighbor_always_rebuild_);
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;
     worker->type.resize(number_of_atoms_);
     pimd_bead_gpu_workers_.push_back(std::move(worker));
   }
+  apply_pimd_qnep_batch_bec_setting_();
   CHECK(gpuSetDevice(0));
 }
 

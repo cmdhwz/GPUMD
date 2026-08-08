@@ -409,6 +409,10 @@ void NEP::initialize_pimd_batch_(
     batch.y0_ptrs.resize(number_of_beads);
     batch.z0_ptrs.resize(number_of_beads);
     batch.rebuild_flags.resize(number_of_beads);
+    batch.any_rebuild.resize(1);
+    batch.x0_ptrs_host.resize(number_of_beads);
+    batch.y0_ptrs_host.resize(number_of_beads);
+    batch.z0_ptrs_host.resize(number_of_beads);
     batch.small_box_x0_ptrs.resize(number_of_beads);
     batch.small_box_y0_ptrs.resize(number_of_beads);
     batch.small_box_z0_ptrs.resize(number_of_beads);
@@ -2345,6 +2349,7 @@ bool NEP::compute_pimd_batch(
 
   const auto neighbor_begin = std::chrono::high_resolution_clock::now();
   batch.small_box_initialized = false;
+  Neighbor_Batch_Timing neighbor_timing;
   Neighbor::find_neighbor_global_batch(
     rc,
     box,
@@ -2355,13 +2360,24 @@ bool NEP::compute_pimd_batch(
     batch.x0_ptrs,
     batch.y0_ptrs,
     batch.z0_ptrs,
-    batch.rebuild_flags);
+    batch.rebuild_flags,
+    batch.any_rebuild,
+    batch.x0_ptrs_host,
+    batch.y0_ptrs_host,
+    batch.z0_ptrs_host,
+    batch.pointer_arrays_initialized,
+    profile ? &neighbor_timing : nullptr);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
     const double neighbor_time = std::chrono::duration<double>(
       std::chrono::high_resolution_clock::now() - neighbor_begin).count();
     pimd_batch_timing_.neighbor += neighbor_time;
     pimd_batch_timing_.neighbor_global += neighbor_time;
+    pimd_batch_timing_.neighbor_pointer += neighbor_timing.pointer_setup;
+    pimd_batch_timing_.neighbor_check += neighbor_timing.distance_check;
+    pimd_batch_timing_.neighbor_flags += neighbor_timing.flag_transfer;
+    pimd_batch_timing_.neighbor_rebuild += neighbor_timing.rebuild;
+    pimd_batch_timing_.neighbor_rebuild_beads += neighbor_timing.rebuild_beads;
   }
 
   const int block_size = 64;
