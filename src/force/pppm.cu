@@ -598,47 +598,30 @@ __global__ void find_mesh_batch(
   }
 }
 
-void __global__ ik_times_mesh_times_G_batch(
+void __global__ prepare_inverse_fields_batch(
   const PPPM::Para para,
   const int number_of_beads,
   const float* g_kx,
   const float* g_ky,
   const float* g_kz,
   const float* g_G,
-  const gpufftComplex* g_mesh_fft,
-  gpufftComplex* g_mesh_fft_x,
-  gpufftComplex* g_mesh_fft_y,
-  gpufftComplex* g_mesh_fft_z)
+  const gpufftComplex* g_mesh,
+  gpufftComplex* g_mesh_inverse)
 {
   const int bead = blockIdx.y;
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (bead < number_of_beads && n < para.K0K1K2) {
     const size_t offset = static_cast<size_t>(bead) * para.K0K1K2 + n;
+    const size_t field_stride = static_cast<size_t>(number_of_beads) * para.K0K1K2;
     const float kx = g_kx[n];
     const float ky = g_ky[n];
     const float kz = g_kz[n];
     const float G = g_G[n];
-    const gpufftComplex mesh_fft = g_mesh_fft[offset];
-    g_mesh_fft_x[offset] = {mesh_fft.y * kx * G, -mesh_fft.x * kx * G};
-    g_mesh_fft_y[offset] = {mesh_fft.y * ky * G, -mesh_fft.x * ky * G};
-    g_mesh_fft_z[offset] = {mesh_fft.y * kz * G, -mesh_fft.x * kz * G};
-  }
-}
-
-void __global__ find_mesh_G_batch(
-  const PPPM::Para para,
-  const int number_of_beads,
-  const float* g_G,
-  const gpufftComplex* g_mesh,
-  gpufftComplex* g_mesh_G)
-{
-  const int bead = blockIdx.y;
-  const int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (bead < number_of_beads && n < para.K0K1K2) {
-    const size_t offset = static_cast<size_t>(bead) * para.K0K1K2 + n;
-    const float G = g_G[n];
     const gpufftComplex mesh = g_mesh[offset];
-    g_mesh_G[offset] = {mesh.x * G, mesh.y * G};
+    g_mesh_inverse[offset] = {mesh.x * G, mesh.y * G};
+    g_mesh_inverse[field_stride + offset] = {mesh.y * kx * G, -mesh.x * kx * G};
+    g_mesh_inverse[2 * field_stride + offset] = {mesh.y * ky * G, -mesh.x * ky * G};
+    g_mesh_inverse[3 * field_stride + offset] = {mesh.y * kz * G, -mesh.x * kz * G};
   }
 }
 
@@ -945,6 +928,9 @@ PPPM::~PPPM()
   if (plan_batch != 0) {
     gpufftDestroy(plan_batch);
   }
+  if (plan_inverse_batch != 0) {
+    gpufftDestroy(plan_inverse_batch);
+  }
   if (need_peratom_virial && plan_virial != 0) {
     gpufftDestroy(plan_virial);
   }
@@ -966,6 +952,10 @@ void PPPM::allocate_memory()
   if (plan_batch != 0) {
     gpufftDestroy(plan_batch);
     plan_batch = 0;
+  }
+  if (plan_inverse_batch != 0) {
+    gpufftDestroy(plan_inverse_batch);
+    plan_inverse_batch = 0;
   }
   if (plan_virial_batch != 0) {
     gpufftDestroy(plan_virial_batch);
@@ -1010,13 +1000,14 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
     gpufftDestroy(plan_virial_batch);
     plan_virial_batch = 0;
   }
+  if (plan_inverse_batch != 0) {
+    gpufftDestroy(plan_inverse_batch);
+    plan_inverse_batch = 0;
+  }
   batch_capacity = number_of_beads;
   const size_t batch_mesh_size = static_cast<size_t>(number_of_beads) * para.K0K1K2;
   mesh_batch.resize(batch_mesh_size);
-  mesh_G_batch.resize(batch_mesh_size);
-  mesh_x_batch.resize(batch_mesh_size);
-  mesh_y_batch.resize(batch_mesh_size);
-  mesh_z_batch.resize(batch_mesh_size);
+  mesh_inverse_batch.resize(batch_mesh_size * 4);
   int n[3] = {para.K[2], para.K[1], para.K[0]};
   if (gpufftPlanMany(
         &plan_batch,
@@ -1031,6 +1022,21 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
         GPUFFT_C2C,
         number_of_beads) != GPUFFT_SUCCESS) {
     std::cout << "GPUFFT error: plan_batch creation failed" << std::endl;
+    exit(1);
+  }
+  if (gpufftPlanMany(
+        &plan_inverse_batch,
+        3,
+        n,
+        NULL,
+        1,
+        para.K0K1K2,
+        NULL,
+        1,
+        para.K0K1K2,
+        GPUFFT_C2C,
+        number_of_beads * 4) != GPUFFT_SUCCESS) {
+    std::cout << "GPUFFT error: plan_inverse_batch creation failed" << std::endl;
     exit(1);
   }
   if (need_peratom_virial) {
@@ -1301,7 +1307,9 @@ void PPPM::find_force_batch(
     std::cout << "GPUFFT error: batched forward failed" << std::endl;
     exit(1);
   }
-  ik_times_mesh_times_G_batch<<<mesh_grid_batch, 64>>>(
+  const size_t inverse_field_stride =
+    static_cast<size_t>(number_of_beads) * para.K0K1K2;
+  prepare_inverse_fields_batch<<<mesh_grid_batch, 64>>>(
     para,
     number_of_beads,
     kx.data(),
@@ -1309,12 +1317,7 @@ void PPPM::find_force_batch(
     kz.data(),
     G.data(),
     mesh_batch.data(),
-    mesh_x_batch.data(),
-    mesh_y_batch.data(),
-    mesh_z_batch.data());
-  GPU_CHECK_KERNEL
-  find_mesh_G_batch<<<mesh_grid_batch, 64>>>(
-    para, number_of_beads, G.data(), mesh_batch.data(), mesh_G_batch.data());
+    mesh_inverse_batch.data());
   GPU_CHECK_KERNEL
   if (need_peratom_virial) {
     find_mesh_virial_batch<<<mesh_grid_batch, 64>>>(
@@ -1328,10 +1331,11 @@ void PPPM::find_force_batch(
       mesh_virial_batch.data());
     GPU_CHECK_KERNEL
   }
-  if (gpufftExecC2C(plan_batch, mesh_G_batch.data(), mesh_G_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS ||
-      gpufftExecC2C(plan_batch, mesh_x_batch.data(), mesh_x_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS ||
-      gpufftExecC2C(plan_batch, mesh_y_batch.data(), mesh_y_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS ||
-      gpufftExecC2C(plan_batch, mesh_z_batch.data(), mesh_z_batch.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+  if (gpufftExecC2C(
+        plan_inverse_batch,
+        mesh_inverse_batch.data(),
+        mesh_inverse_batch.data(),
+        GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     std::cout << "GPUFFT error: batched inverse failed" << std::endl;
     exit(1);
   }
@@ -1353,10 +1357,10 @@ void PPPM::find_force_batch(
       box,
       charge.data(),
       position_per_atom.data(),
-      mesh_G_batch.data(),
-      mesh_x_batch.data(),
-      mesh_y_batch.data(),
-      mesh_z_batch.data(),
+      mesh_inverse_batch.data(),
+      mesh_inverse_batch.data() + inverse_field_stride,
+      mesh_inverse_batch.data() + 2 * inverse_field_stride,
+      mesh_inverse_batch.data() + 3 * inverse_field_stride,
       mesh_virial_batch.data(),
       D_real.data(),
       force_per_atom.data(),
@@ -1373,10 +1377,10 @@ void PPPM::find_force_batch(
       box,
       charge.data(),
       position_per_atom.data(),
-      mesh_G_batch.data(),
-      mesh_x_batch.data(),
-      mesh_y_batch.data(),
-      mesh_z_batch.data(),
+      mesh_inverse_batch.data(),
+      mesh_inverse_batch.data() + inverse_field_stride,
+      mesh_inverse_batch.data() + 2 * inverse_field_stride,
+      mesh_inverse_batch.data() + 3 * inverse_field_stride,
       D_real.data(),
       force_per_atom.data(),
       number_of_beads);

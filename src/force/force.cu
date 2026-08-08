@@ -339,20 +339,6 @@ void Force::set_pimd_nep_batch_profile(const bool enabled)
   }
 }
 
-void Force::set_pimd_nep_batch_geometry_cache(const bool enabled)
-{
-  pimd_nep_batch_geometry_cache_enabled_ = enabled;
-  for (auto& potential : potentials) {
-    potential->set_pimd_batch_geometry_cache(enabled);
-  }
-  for (auto& worker : pimd_bead_gpu_workers_) {
-    worker->potential->set_pimd_batch_geometry_cache(enabled);
-  }
-  if (pimd_nep_single_gpu_batch_potential_) {
-    pimd_nep_single_gpu_batch_potential_->set_pimd_batch_geometry_cache(enabled);
-  }
-}
-
 void Force::reset_pimd_nep_batch_profile()
 {
   for (auto& potential : potentials) {
@@ -569,8 +555,6 @@ bool Force::try_compute_pimd_nep_batch_(
         pimd_bead_neighbor_always_rebuild_);
       pimd_nep_single_gpu_batch_potential_->set_pimd_batch_profile(
         pimd_nep_batch_profile_enabled_);
-      pimd_nep_single_gpu_batch_potential_->set_pimd_batch_geometry_cache(
-        pimd_nep_batch_geometry_cache_enabled_);
     }
     nep = dynamic_cast<NEP*>(pimd_nep_single_gpu_batch_potential_.get());
   }
@@ -606,8 +590,6 @@ void Force::refresh_pimd_bead_gpu_workers_()
     potentials[0]->set_neighbor_rebuild(
       use_primary_batch_neighbor_setting ? pimd_bead_neighbor_always_rebuild_ : false);
     potentials[0]->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
-    potentials[0]->set_pimd_batch_geometry_cache(
-      pimd_nep_batch_geometry_cache_enabled_);
   }
   if (pimd_bead_gpu_parallel_devices_ <= 1 || primary_nep_model_path_.empty() ||
       number_of_atoms_ <= 0) {
@@ -651,8 +633,6 @@ void Force::refresh_pimd_bead_gpu_workers_()
       worker->potential.reset(new NEP(primary_nep_model_path_.c_str(), number_of_atoms_));
     }
     worker->potential->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
-    worker->potential->set_pimd_batch_geometry_cache(
-      pimd_nep_batch_geometry_cache_enabled_);
     worker->potential->set_neighbor_rebuild(pimd_bead_neighbor_always_rebuild_);
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;

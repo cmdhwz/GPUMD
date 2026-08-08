@@ -801,22 +801,6 @@ void Run::parse_pimd_nep_batch_profile(const char** param, int num_param)
   }
 }
 
-void Run::parse_pimd_nep_batch_geometry_cache(const char** param, int num_param)
-{
-  if (num_param != 2) {
-    PRINT_INPUT_ERROR("pimd_nep_batch_geometry_cache should have 1 parameter.\n");
-  }
-  if (strcmp(param[1], "on") == 0) {
-    force.set_pimd_nep_batch_geometry_cache(true);
-    printf("Enabled compact-neighbor geometry caching for NEP batch.\n");
-  } else if (strcmp(param[1], "off") == 0) {
-    force.set_pimd_nep_batch_geometry_cache(false);
-    printf("Disabled compact-neighbor geometry caching for NEP batch.\n");
-  } else {
-    PRINT_INPUT_ERROR("pimd_nep_batch_geometry_cache should be on or off.\n");
-  }
-}
-
 void Run::parse_correct_velocity(const char** param, int num_param, const std::vector<Group>& group)
 {
   printf("Correct linear and angular momenta.\n");
@@ -1028,4 +1012,16 @@ void Run::parse_change_box(const char** param, int num_param)
     }
     printf("\n");
   }
+}
+
+void Run::parse_pimd_nep_batch_geometry_cache(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_nep_batch_geometry_cache should have 1 parameter.\n");
+  }
+  if (strcmp(param[1], "on") != 0 && strcmp(param[1], "off") != 0) {
+    PRINT_INPUT_ERROR("pimd_nep_batch_geometry_cache should be on or off.\n");
+  }
+  printf(
+    "Ignored pimd_nep_batch_geometry_cache; using the baseline compact-neighbor path.\n");
 }

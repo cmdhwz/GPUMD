@@ -76,11 +76,9 @@ private:
   GPU_Vector<gpufftComplex> mesh_z;
   gpufftHandle plan = 0;
   GPU_Vector<gpufftComplex> mesh_batch;
-  GPU_Vector<gpufftComplex> mesh_G_batch;
-  GPU_Vector<gpufftComplex> mesh_x_batch;
-  GPU_Vector<gpufftComplex> mesh_y_batch;
-  GPU_Vector<gpufftComplex> mesh_z_batch;
+  GPU_Vector<gpufftComplex> mesh_inverse_batch;
   gpufftHandle plan_batch = 0;
+  gpufftHandle plan_inverse_batch = 0;
   int batch_capacity = 0;
   void allocate_memory();
   void allocate_batch_memory(const int number_of_beads);

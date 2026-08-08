@@ -454,22 +454,6 @@ void NEP::initialize_pimd_batch_(
   }
 
   auto& batch = *pimd_batch_data_;
-  if (!is_small_box && pimd_batch_geometry_cache_enabled_ &&
-      !batch.large_box_geometry_data_allocated) {
-    batch.x12_radial.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_radial);
-    batch.y12_radial.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_radial);
-    batch.z12_radial.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_radial);
-    batch.x12_angular.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_angular);
-    batch.y12_angular.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_angular);
-    batch.z12_angular.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_angular);
-    batch.large_box_geometry_data_allocated = true;
-  }
   if (is_small_box && !batch.small_box_data_allocated) {
     batch.small_NN_radial.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
     batch.small_NL_radial.resize(
@@ -1037,14 +1021,7 @@ static __global__ void find_neighbor_list_large_box_nep_pimd_batch(
   int* g_NN_radial_batch,
   int* g_NL_radial_batch,
   int* g_NN_angular_batch,
-  int* g_NL_angular_batch,
-  float* g_x12_radial_batch,
-  float* g_y12_radial_batch,
-  float* g_z12_radial_batch,
-  float* g_x12_angular_batch,
-  float* g_y12_angular_batch,
-  float* g_z12_angular_batch,
-  const bool cache_geometry)
+  int* g_NL_angular_batch)
 {
   const int bead = blockIdx.y;
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
@@ -1063,24 +1040,6 @@ static __global__ void find_neighbor_list_large_box_nep_pimd_batch(
   int* g_NN_angular = g_NN_angular_batch + static_cast<size_t>(bead) * N;
   int* g_NL_angular =
     g_NL_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
-  float* g_x12_radial = cache_geometry
-    ? g_x12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  float* g_y12_radial = cache_geometry
-    ? g_y12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  float* g_z12_radial = cache_geometry
-    ? g_z12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  float* g_x12_angular = cache_geometry
-    ? g_x12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  float* g_y12_angular = cache_geometry
-    ? g_y12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  float* g_z12_angular = cache_geometry
-    ? g_z12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
   const int t1 = g_type[n1];
   const double x1 = g_x[n1];
   const double y1 = g_y[n1];
@@ -1100,21 +1059,9 @@ static __global__ void find_neighbor_list_large_box_nep_pimd_batch(
     if (d12_square >= rc_radial * rc_radial) {
       continue;
     }
-    const int radial_index = count_radial++ * N + n1;
-    g_NL_radial[radial_index] = n2;
-    if (cache_geometry) {
-      g_x12_radial[radial_index] = x12;
-      g_y12_radial[radial_index] = y12;
-      g_z12_radial[radial_index] = z12;
-    }
+    g_NL_radial[count_radial++ * N + n1] = n2;
     if (d12_square < rc_angular * rc_angular) {
-      const int angular_index = count_angular++ * N + n1;
-      g_NL_angular[angular_index] = n2;
-      if (cache_geometry) {
-        g_x12_angular[angular_index] = x12;
-        g_y12_angular[angular_index] = y12;
-        g_z12_angular[angular_index] = z12;
-      }
+      g_NL_angular[count_angular++ * N + n1] = n2;
     }
   }
   g_NN_radial[n1] = count_radial;
@@ -1132,13 +1079,6 @@ static __global__ void find_descriptor_nep_pimd_batch(
   int* g_NL_radial_batch,
   int* g_NN_angular_batch,
   int* g_NL_angular_batch,
-  const float* g_x12_radial_batch,
-  const float* g_y12_radial_batch,
-  const float* g_z12_radial_batch,
-  const float* g_x12_angular_batch,
-  const float* g_y12_angular_batch,
-  const float* g_z12_angular_batch,
-  const bool use_geometry_cache,
   const int* __restrict__ g_type,
   double* const* g_position,
   double* const* g_potential,
@@ -1161,24 +1101,6 @@ static __global__ void find_descriptor_nep_pimd_batch(
   const int* g_NN_angular = g_NN_angular_batch + static_cast<size_t>(bead) * N;
   const int* g_NL_angular =
     g_NL_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
-  const float* g_x12_radial = use_geometry_cache
-    ? g_x12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  const float* g_y12_radial = use_geometry_cache
-    ? g_y12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  const float* g_z12_radial = use_geometry_cache
-    ? g_z12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  const float* g_x12_angular = use_geometry_cache
-    ? g_x12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  const float* g_y12_angular = use_geometry_cache
-    ? g_y12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  const float* g_z12_angular = use_geometry_cache
-    ? g_z12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
   float* g_Fp = g_Fp_batch + static_cast<size_t>(bead) * N * annmb.dim;
   const int sum_components =
     (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
@@ -1192,20 +1114,10 @@ static __global__ void find_descriptor_nep_pimd_batch(
   float q[MAX_DIM] = {0.0f};
   for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
     const int n2 = g_NL[n1 + N * i1];
-    float x12;
-    float y12;
-    float z12;
-    if (use_geometry_cache) {
-      const int index = i1 * N + n1;
-      x12 = g_x12_radial[index];
-      y12 = g_y12_radial[index];
-      z12 = g_z12_radial[index];
-    } else {
-      x12 = g_x[n2] - x1;
-      y12 = g_y[n2] - y1;
-      z12 = g_z[n2] - z1;
-      apply_mic(box, x12, y12, z12);
-    }
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
     const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
     const int t2 = g_type[n2];
     const float rc = (paramb.rc_radial[t1] + paramb.rc_radial[t2]) * 0.5f;
@@ -1229,20 +1141,10 @@ static __global__ void find_descriptor_nep_pimd_batch(
     float s[NUM_OF_ABC] = {0.0f};
     for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
       const int n2 = g_NL_angular[n1 + N * i1];
-      float x12;
-      float y12;
-      float z12;
-      if (use_geometry_cache) {
-        const int index = i1 * N + n1;
-        x12 = g_x12_angular[index];
-        y12 = g_y12_angular[index];
-        z12 = g_z12_angular[index];
-      } else {
-        x12 = g_x[n2] - x1;
-        y12 = g_y[n2] - y1;
-        z12 = g_z[n2] - z1;
-        apply_mic(box, x12, y12, z12);
-      }
+      float x12 = g_x[n2] - x1;
+      float y12 = g_y[n2] - y1;
+      float z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
       const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
       const int t2 = g_type[n2];
       const float rc = (paramb.rc_angular[t1] + paramb.rc_angular[t2]) * 0.5f;
@@ -1320,10 +1222,6 @@ static __global__ void find_force_radial_nep_pimd_batch(
   const Box box,
   const int* g_NN_radial_batch,
   const int* g_NL_radial_batch,
-  const float* g_x12_radial_batch,
-  const float* g_y12_radial_batch,
-  const float* g_z12_radial_batch,
-  const bool use_geometry_cache,
   const int* __restrict__ g_type,
   double* const* g_position,
   const float* g_Fp_batch,
@@ -1347,15 +1245,6 @@ static __global__ void find_force_radial_nep_pimd_batch(
   const int* g_NN = g_NN_radial_batch + static_cast<size_t>(bead) * N;
   const int* g_NL =
     g_NL_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial;
-  const float* g_x12_radial = use_geometry_cache
-    ? g_x12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  const float* g_y12_radial = use_geometry_cache
-    ? g_y12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
-  const float* g_z12_radial = use_geometry_cache
-    ? g_z12_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial
-    : nullptr;
   const float* g_Fp = g_Fp_batch + static_cast<size_t>(bead) * N * annmb.dim;
 
   const int t1 = g_type[n1];
@@ -1377,20 +1266,10 @@ static __global__ void find_force_radial_nep_pimd_batch(
   for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
     const int n2 = g_NL[n1 + N * i1];
     const int t2 = g_type[n2];
-    float x12;
-    float y12;
-    float z12;
-    if (use_geometry_cache) {
-      const int index = i1 * N + n1;
-      x12 = g_x12_radial[index];
-      y12 = g_y12_radial[index];
-      z12 = g_z12_radial[index];
-    } else {
-      x12 = g_x[n2] - x1;
-      y12 = g_y[n2] - y1;
-      z12 = g_z[n2] - z1;
-      apply_mic(box, x12, y12, z12);
-    }
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
     const float r12[3] = {x12, y12, z12};
     const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
     const float d12inv = 1.0f / d12;
@@ -1457,10 +1336,6 @@ static __global__ void find_partial_force_angular_nep_pimd_batch(
   const Box box,
   const int* g_NN_angular_batch,
   const int* g_NL_angular_batch,
-  const float* g_x12_angular_batch,
-  const float* g_y12_angular_batch,
-  const float* g_z12_angular_batch,
-  const bool use_geometry_cache,
   const int* __restrict__ g_type,
   double* const* g_position,
   const float* g_Fp_batch,
@@ -1481,15 +1356,6 @@ static __global__ void find_partial_force_angular_nep_pimd_batch(
   const int* g_NN_angular = g_NN_angular_batch + static_cast<size_t>(bead) * N;
   const int* g_NL_angular =
     g_NL_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
-  const float* g_x12_angular = use_geometry_cache
-    ? g_x12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  const float* g_y12_angular = use_geometry_cache
-    ? g_y12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  const float* g_z12_angular = use_geometry_cache
-    ? g_z12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
   const float* g_Fp = g_Fp_batch + static_cast<size_t>(bead) * N * annmb.dim;
   const int sum_components =
     (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
@@ -1521,19 +1387,10 @@ static __global__ void find_partial_force_angular_nep_pimd_batch(
   for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
     const int index = i1 * N + n1;
     const int n2 = g_NL_angular[index];
-    float x12;
-    float y12;
-    float z12;
-    if (use_geometry_cache) {
-      x12 = g_x12_angular[index];
-      y12 = g_y12_angular[index];
-      z12 = g_z12_angular[index];
-    } else {
-      x12 = g_x[n2] - x1;
-      y12 = g_y[n2] - y1;
-      z12 = g_z[n2] - z1;
-      apply_mic(box, x12, y12, z12);
-    }
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
     const float r12[3] = {x12, y12, z12};
     const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
     const int t2 = g_type[n2];
@@ -1590,10 +1447,6 @@ static __global__ void find_force_many_body_nep_pimd_batch(
   const Box box,
   const int* g_NN_angular_batch,
   const int* g_NL_angular_batch,
-  const float* g_x12_angular_batch,
-  const float* g_y12_angular_batch,
-  const float* g_z12_angular_batch,
-  const bool use_geometry_cache,
   const float* g_f12x_batch,
   const float* g_f12y_batch,
   const float* g_f12z_batch,
@@ -1609,15 +1462,6 @@ static __global__ void find_force_many_body_nep_pimd_batch(
   const int* g_NN = g_NN_angular_batch + static_cast<size_t>(bead) * N;
   const int* g_NL =
     g_NL_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
-  const float* g_x12_angular = use_geometry_cache
-    ? g_x12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  const float* g_y12_angular = use_geometry_cache
-    ? g_y12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
-  const float* g_z12_angular = use_geometry_cache
-    ? g_z12_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular
-    : nullptr;
   const float* g_f12x =
     g_f12x_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
   const float* g_f12y =
@@ -1652,22 +1496,13 @@ static __global__ void find_force_many_body_nep_pimd_batch(
   for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
     int index = i1 * N + n1;
     const int n2 = g_NL[index];
-    float x12;
-    float y12;
-    float z12;
-    if (use_geometry_cache) {
-      x12 = g_x12_angular[index];
-      y12 = g_y12_angular[index];
-      z12 = g_z12_angular[index];
-    } else {
-      double x12_double = g_x[n2] - x1;
-      double y12_double = g_y[n2] - y1;
-      double z12_double = g_z[n2] - z1;
-      apply_mic(box, x12_double, y12_double, z12_double);
-      x12 = float(x12_double);
-      y12 = float(y12_double);
-      z12 = float(z12_double);
-    }
+    double x12_double = g_x[n2] - x1;
+    double y12_double = g_y[n2] - y1;
+    double z12_double = g_z[n2] - z1;
+    apply_mic(box, x12_double, y12_double, z12_double);
+    const float x12 = float(x12_double);
+    const float y12 = float(y12_double);
+    const float z12 = float(z12_double);
     const float f12x = g_f12x[index];
     const float f12y = g_f12y[index];
     const float f12z = g_f12z[index];
@@ -2274,7 +2109,6 @@ bool NEP::compute_pimd_batch(
   }
 
   const bool profile = pimd_batch_profile_enabled_;
-  const bool use_geometry_cache = pimd_batch_geometry_cache_enabled_ && !is_small_box;
   const auto total_begin = std::chrono::high_resolution_clock::now();
   const auto setup_begin = std::chrono::high_resolution_clock::now();
   initialize_pimd_batch_(
@@ -2561,14 +2395,7 @@ bool NEP::compute_pimd_batch(
     batch.NN_radial.data(),
     batch.NL_radial.data(),
     batch.NN_angular.data(),
-    batch.NL_angular.data(),
-    use_geometry_cache ? batch.x12_radial.data() : nullptr,
-    use_geometry_cache ? batch.y12_radial.data() : nullptr,
-    use_geometry_cache ? batch.z12_radial.data() : nullptr,
-    use_geometry_cache ? batch.x12_angular.data() : nullptr,
-    use_geometry_cache ? batch.y12_angular.data() : nullptr,
-    use_geometry_cache ? batch.z12_angular.data() : nullptr,
-    use_geometry_cache);
+    batch.NL_angular.data());
   GPU_CHECK_KERNEL
   if (profile) {
     CHECK(gpuDeviceSynchronize());
@@ -2588,13 +2415,6 @@ bool NEP::compute_pimd_batch(
     batch.NL_radial.data(),
     batch.NN_angular.data(),
     batch.NL_angular.data(),
-    use_geometry_cache ? batch.x12_radial.data() : nullptr,
-    use_geometry_cache ? batch.y12_radial.data() : nullptr,
-    use_geometry_cache ? batch.z12_radial.data() : nullptr,
-    use_geometry_cache ? batch.x12_angular.data() : nullptr,
-    use_geometry_cache ? batch.y12_angular.data() : nullptr,
-    use_geometry_cache ? batch.z12_angular.data() : nullptr,
-    use_geometry_cache,
     type.data(),
     batch.position_ptrs.data(),
     batch.potential_ptrs.data(),
@@ -2617,10 +2437,6 @@ bool NEP::compute_pimd_batch(
     box,
     batch.NN_radial.data(),
     batch.NL_radial.data(),
-    use_geometry_cache ? batch.x12_radial.data() : nullptr,
-    use_geometry_cache ? batch.y12_radial.data() : nullptr,
-    use_geometry_cache ? batch.z12_radial.data() : nullptr,
-    use_geometry_cache,
     type.data(),
     batch.position_ptrs.data(),
     batch.Fp.data(),
@@ -2643,10 +2459,6 @@ bool NEP::compute_pimd_batch(
     box,
     batch.NN_angular.data(),
     batch.NL_angular.data(),
-    use_geometry_cache ? batch.x12_angular.data() : nullptr,
-    use_geometry_cache ? batch.y12_angular.data() : nullptr,
-    use_geometry_cache ? batch.z12_angular.data() : nullptr,
-    use_geometry_cache,
     type.data(),
     batch.position_ptrs.data(),
     batch.Fp.data(),
@@ -2670,10 +2482,6 @@ bool NEP::compute_pimd_batch(
     box,
     batch.NN_angular.data(),
     batch.NL_angular.data(),
-    use_geometry_cache ? batch.x12_angular.data() : nullptr,
-    use_geometry_cache ? batch.y12_angular.data() : nullptr,
-    use_geometry_cache ? batch.z12_angular.data() : nullptr,
-    use_geometry_cache,
     batch.f12x.data(),
     batch.f12y.data(),
     batch.f12z.data(),
