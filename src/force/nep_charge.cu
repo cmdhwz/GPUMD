@@ -377,7 +377,11 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
 
 NEP_Charge::~NEP_Charge(void)
 {
-  // nothing
+  if (pimd_batch_data_) {
+    for (gpuStream_t stream : pimd_batch_data_->rebuild_streams) {
+      CHECK(gpuStreamDestroy(stream));
+    }
+  }
 }
 
 void NEP_Charge::set_neighbor_rebuild(const bool value)
@@ -405,6 +409,11 @@ void NEP_Charge::initialize_pimd_batch_(
     !pimd_batch_data_ || pimd_batch_data_->number_of_atoms != number_of_atoms ||
     pimd_batch_data_->number_of_beads != number_of_beads;
   if (needs_allocation) {
+    if (pimd_batch_data_) {
+      for (gpuStream_t stream : pimd_batch_data_->rebuild_streams) {
+        CHECK(gpuStreamDestroy(stream));
+      }
+    }
     pimd_batch_data_.reset(new PIMD_Batch_Data());
     auto& batch = *pimd_batch_data_;
     batch.number_of_atoms = number_of_atoms;
@@ -478,6 +487,11 @@ void NEP_Charge::initialize_pimd_batch_(
     batch.D_real_ptrs.copy_from_host(D_real_ptrs.data());
     batch.bec_ptrs.resize(number_of_beads);
     batch.bec_ptrs.copy_from_host(bec_ptrs.data());
+    const int rebuild_stream_count = number_of_beads < 4 ? number_of_beads : 4;
+    batch.rebuild_streams.resize(rebuild_stream_count);
+    for (gpuStream_t& stream : batch.rebuild_streams) {
+      CHECK(gpuStreamCreate(&stream));
+    }
     printf(
       "Using qNEP ring-polymer bead-batched local kernels for %d beads on one GPU.\n",
       number_of_beads);
@@ -2986,11 +3000,12 @@ bool NEP_Charge::compute_pimd_batch(
         std::chrono::high_resolution_clock::now() - descriptor_begin).count();
     }
 
+    // Charge neutrality is required by PPPM/Ewald and is independent of BEC output.
+    zero_total_charge_pimd_batch<<<number_of_beads, 1024>>>(
+      N, number_of_beads, batch.charge_ptrs.data());
+    GPU_CHECK_KERNEL
     if (pimd_batch_bec_enabled_) {
       const auto bec_begin = std::chrono::high_resolution_clock::now();
-      zero_total_charge_pimd_batch<<<number_of_beads, 1024>>>(
-        N, number_of_beads, batch.charge_ptrs.data());
-      GPU_CHECK_KERNEL
       find_bec_diagonal_pimd_batch<<<bead_grid, block_size>>>(
         N, number_of_beads, batch.charge_ptrs.data(), batch.bec_ptrs.data());
       GPU_CHECK_KERNEL
@@ -3225,6 +3240,7 @@ bool NEP_Charge::compute_pimd_batch(
     batch.y0_ptrs_host,
     batch.z0_ptrs_host,
     batch.pointer_arrays_initialized,
+    batch.rebuild_streams,
     profile ? &neighbor_timing : nullptr);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
@@ -3305,11 +3321,12 @@ bool NEP_Charge::compute_pimd_batch(
   }
 
   const dim3 bead_grid(grid_size, number_of_beads);
+  // Charge neutrality is required by PPPM/Ewald and is independent of BEC output.
+  zero_total_charge_pimd_batch<<<number_of_beads, 1024>>>(
+    N, number_of_beads, batch.charge_ptrs.data());
+  GPU_CHECK_KERNEL
   if (pimd_batch_bec_enabled_) {
     const auto bec_begin = std::chrono::high_resolution_clock::now();
-    zero_total_charge_pimd_batch<<<number_of_beads, 1024>>>(
-      N, number_of_beads, batch.charge_ptrs.data());
-    GPU_CHECK_KERNEL
     find_bec_diagonal_pimd_batch<<<bead_grid, block_size>>>(
       N, number_of_beads, batch.charge_ptrs.data(), batch.bec_ptrs.data());
     GPU_CHECK_KERNEL

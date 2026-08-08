@@ -218,6 +218,7 @@ private:
     GPU_Vector<float> f12y;
     GPU_Vector<float> f12z;
     std::vector<Neighbor*> neighbor_ptrs;
+    std::vector<gpuStream_t> rebuild_streams;
     bool small_box_data_allocated = false;
     bool small_box_initialized = false;
     double small_box_h[9] = {0.0};

@@ -349,6 +349,69 @@ void find_neighbor(
   GPU_CHECK_KERNEL
 }
 
+void find_neighbor(
+  gpuStream_t& stream,
+  const int N1,
+  const int N2,
+  double rc,
+  Box& box,
+  const GPU_Vector<int>& type,
+  const GPU_Vector<double>& position_per_atom,
+  GPU_Vector<int>& cell_count,
+  GPU_Vector<int>& cell_count_sum,
+  GPU_Vector<int>& cell_contents,
+  GPU_Vector<int>& NN,
+  GPU_Vector<int>& NL)
+{
+  const int N = NN.size();
+  const int block_size = 256;
+  const int grid_size = (N2 - N1 - 1) / block_size + 1;
+  const double* x = position_per_atom.data();
+  const double* y = position_per_atom.data() + N;
+  const double* z = position_per_atom.data() + N * 2;
+  const double rc_cell_list = 0.5 * rc;
+  const double rc_inv_cell_list = 2.0 / rc;
+
+  int num_bins[3];
+  box.get_num_bins(rc_cell_list, num_bins);
+
+  find_cell_list(
+    stream,
+    rc_cell_list,
+    num_bins,
+    box,
+    N,
+    position_per_atom,
+    cell_count,
+    cell_count_sum,
+    cell_contents);
+
+  gpu_find_neighbor_ON1<<<grid_size, block_size, 0, stream>>>(
+    box,
+    N,
+    N1,
+    N2,
+    type.data(),
+    cell_count.data(),
+    cell_count_sum.data(),
+    cell_contents.data(),
+    NN.data(),
+    NL.data(),
+    x,
+    y,
+    z,
+    num_bins[0],
+    num_bins[1],
+    num_bins[2],
+    rc_inv_cell_list,
+    rc * rc);
+  GPU_CHECK_KERNEL
+
+  const int MN = NL.size() / NN.size();
+  gpu_sort_neighbor_list<<<N, MN, MN * sizeof(int), stream>>>(N, NN.data(), NL.data());
+  GPU_CHECK_KERNEL
+}
+
 // For ILP, the neighbor could not contain atoms in the same layer
 static __global__ void gpu_find_neighbor_ON1_ilp(
   const Box box,
@@ -874,6 +937,7 @@ void Neighbor::find_neighbor_global_batch(
   std::vector<double*>& y0_ptrs_host,
   std::vector<double*>& z0_ptrs_host,
   bool& pointer_arrays_initialized,
+  std::vector<gpuStream_t>& rebuild_streams,
   Neighbor_Batch_Timing* timing)
 {
   const int number_of_beads = static_cast<int>(neighbors.size());
@@ -979,12 +1043,69 @@ void Neighbor::find_neighbor_global_batch(
     timing->flag_transfer += std::chrono::duration<double>(Clock::now() - flag_copy_begin).count();
   }
   const auto rebuild_begin = Clock::now();
+  int rebuild_beads = 0;
+  if (rebuild_streams.empty()) {
+    for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+      if (host_flags[bead_id] == 0) {
+        continue;
+      }
+      Neighbor* neighbor = neighbors[bead_id];
+      find_neighbor(
+        0,
+        N,
+        rc + neighbor->skin,
+        box,
+        type,
+        *position_beads[bead_id],
+        neighbor->cell_count,
+        neighbor->cell_count_sum,
+        neighbor->cell_contents,
+        neighbor->NN,
+        neighbor->NL);
+      const double* position = position_beads[bead_id]->data();
+      gpu_update_xyz0<<<(N - 1) / 128 + 1, 128>>>(
+        N,
+        position,
+        position + N,
+        position + N * 2,
+        neighbor->x0.data(),
+        neighbor->y0.data(),
+        neighbor->z0.data());
+      GPU_CHECK_KERNEL
+      ++rebuild_beads;
+    }
+    if (rebuild_beads > 0) {
+      CHECK(gpuDeviceSynchronize());
+    }
+    if (timing) {
+      timing->rebuild_beads += rebuild_beads;
+      timing->rebuild += std::chrono::duration<double>(Clock::now() - rebuild_begin).count();
+    }
+    return;
+  }
+  // Ensure all per-bead cell-list buffers are sized before any stream starts.
+  // Resizing device buffers from concurrent streams would invalidate pointers.
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     if (host_flags[bead_id] == 0) {
       continue;
     }
     Neighbor* neighbor = neighbors[bead_id];
+    int num_bins[3];
+    box.get_num_bins(0.5 * (rc + neighbor->skin), num_bins);
+    const int number_of_cells = num_bins[0] * num_bins[1] * num_bins[2];
+    if (number_of_cells > static_cast<int>(neighbor->cell_count.size())) {
+      neighbor->cell_count.resize(number_of_cells);
+      neighbor->cell_count_sum.resize(number_of_cells);
+    }
+  }
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    if (host_flags[bead_id] == 0) {
+      continue;
+    }
+    Neighbor* neighbor = neighbors[bead_id];
+    gpuStream_t& stream = rebuild_streams[rebuild_beads % rebuild_streams.size()];
     find_neighbor(
+      stream,
       0,
       N,
       rc + neighbor->skin,
@@ -997,7 +1118,7 @@ void Neighbor::find_neighbor_global_batch(
       neighbor->NN,
       neighbor->NL);
     const double* position = position_beads[bead_id]->data();
-    gpu_update_xyz0<<<(N - 1) / 128 + 1, 128>>>(
+    gpu_update_xyz0<<<(N - 1) / 128 + 1, 128, 0, stream>>>(
       N,
       position,
       position + N,
@@ -1006,12 +1127,13 @@ void Neighbor::find_neighbor_global_batch(
       neighbor->y0.data(),
       neighbor->z0.data());
     GPU_CHECK_KERNEL
-    if (timing) {
-      CHECK(gpuDeviceSynchronize());
-      ++timing->rebuild_beads;
-    }
+    ++rebuild_beads;
+  }
+  if (rebuild_beads > 0) {
+    CHECK(gpuDeviceSynchronize());
   }
   if (timing) {
+    timing->rebuild_beads += rebuild_beads;
     timing->rebuild += std::chrono::duration<double>(Clock::now() - rebuild_begin).count();
   }
 }
