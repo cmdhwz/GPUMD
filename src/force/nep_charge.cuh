@@ -151,8 +151,7 @@ public:
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
-    const std::vector<GPU_Vector<double>*>& virial_beads,
-    bool is_small_box);
+    const std::vector<GPU_Vector<double>*>& virial_beads);
 
   const GPU_Vector<int>& get_NN_radial_ptr();
 
@@ -286,6 +285,7 @@ private:
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
-    const std::vector<GPU_Vector<double>*>& virial_beads);
+    const std::vector<GPU_Vector<double>*>& virial_beads,
+    bool is_small_box);
   void initialize_dftd3();
 };

@@ -127,8 +127,7 @@ public:
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
-    const std::vector<GPU_Vector<double>*>& virial_beads,
-    bool is_small_box);
+    const std::vector<GPU_Vector<double>*>& virial_beads);
 
   virtual void compute(
     const float temperature,
@@ -224,7 +223,8 @@ private:
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
-    const std::vector<GPU_Vector<double>*>& virial_beads);
+    const std::vector<GPU_Vector<double>*>& virial_beads,
+    bool is_small_box);
 
   void update_potential(float* parameters, ANN& ann);
 
