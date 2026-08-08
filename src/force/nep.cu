@@ -405,6 +405,10 @@ void NEP::initialize_pimd_batch_(
     batch.virial_ptrs.resize(number_of_beads);
     batch.NN_global_ptrs.resize(number_of_beads);
     batch.NL_global_ptrs.resize(number_of_beads);
+    batch.x0_ptrs.resize(number_of_beads);
+    batch.y0_ptrs.resize(number_of_beads);
+    batch.z0_ptrs.resize(number_of_beads);
+    batch.rebuild_flags.resize(number_of_beads);
     batch.small_box_x0_ptrs.resize(number_of_beads);
     batch.small_box_y0_ptrs.resize(number_of_beads);
     batch.small_box_z0_ptrs.resize(number_of_beads);
@@ -430,6 +434,7 @@ void NEP::initialize_pimd_batch_(
     std::vector<int*> NN_global_ptrs(number_of_beads);
     std::vector<int*> NL_global_ptrs(number_of_beads);
     batch.beads.reserve(number_of_beads);
+    batch.neighbor_ptrs.reserve(number_of_beads);
     for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
       std::unique_ptr<PIMD_Bead_Data> bead(new PIMD_Bead_Data());
       bead->neighbor.reset(new Neighbor());
@@ -437,6 +442,7 @@ void NEP::initialize_pimd_batch_(
       bead->neighbor->set_always_rebuild(neighbor_always_rebuild_);
       NN_global_ptrs[bead_id] = bead->neighbor->NN.data();
       NL_global_ptrs[bead_id] = bead->neighbor->NL.data();
+      batch.neighbor_ptrs.push_back(bead->neighbor.get());
       batch.beads.push_back(std::move(bead));
     }
     batch.NN_global_ptrs.copy_from_host(NN_global_ptrs.data());
@@ -2333,10 +2339,17 @@ bool NEP::compute_pimd_batch(
 
   const auto neighbor_begin = std::chrono::high_resolution_clock::now();
   batch.small_box_initialized = false;
-  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
-    batch.beads[bead_id]->neighbor->find_neighbor_global(
-      rc, box, type, *position_beads[bead_id]);
-  }
+  Neighbor::find_neighbor_global_batch(
+    rc,
+    box,
+    type,
+    position_beads,
+    batch.neighbor_ptrs,
+    batch.position_ptrs,
+    batch.x0_ptrs,
+    batch.y0_ptrs,
+    batch.z0_ptrs,
+    batch.rebuild_flags);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
     pimd_batch_timing_.neighbor += std::chrono::duration<double>(

@@ -179,6 +179,10 @@ private:
     GPU_Vector<double*> virial_ptrs;
     GPU_Vector<int*> NN_global_ptrs;
     GPU_Vector<int*> NL_global_ptrs;
+    GPU_Vector<double*> x0_ptrs;
+    GPU_Vector<double*> y0_ptrs;
+    GPU_Vector<double*> z0_ptrs;
+    GPU_Vector<int> rebuild_flags;
     GPU_Vector<double*> small_box_x0_ptrs;
     GPU_Vector<double*> small_box_y0_ptrs;
     GPU_Vector<double*> small_box_z0_ptrs;
@@ -208,6 +212,7 @@ private:
     GPU_Vector<float> f12x;
     GPU_Vector<float> f12y;
     GPU_Vector<float> f12z;
+    std::vector<Neighbor*> neighbor_ptrs;
     bool small_box_data_allocated = false;
     bool small_box_initialized = false;
     double small_box_h[9] = {0.0};
