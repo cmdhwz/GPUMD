@@ -151,7 +151,8 @@ public:
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
-    const std::vector<GPU_Vector<double>*>& virial_beads);
+    const std::vector<GPU_Vector<double>*>& virial_beads,
+    bool is_small_box);
 
   const GPU_Vector<int>& get_NN_radial_ptr();
 
@@ -242,6 +243,7 @@ private:
     GPU_Vector<float> f12x;
     GPU_Vector<float> f12y;
     GPU_Vector<float> f12z;
+    bool small_box_data_allocated = false;
     bool small_box_initialized = false;
     double small_box_h[9] = {0.0};
   };

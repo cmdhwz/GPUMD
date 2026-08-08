@@ -396,16 +396,17 @@ void NEP_Charge::initialize_pimd_batch_(
   const std::vector<GPU_Vector<double>*>& position_beads,
   const std::vector<GPU_Vector<double>*>& potential_beads,
   const std::vector<GPU_Vector<double>*>& force_beads,
-  const std::vector<GPU_Vector<double>*>& virial_beads)
+  const std::vector<GPU_Vector<double>*>& virial_beads,
+  const bool is_small_box)
 {
   const int number_of_beads = int(position_beads.size());
+  const int small_box_neighbor_size = 2000;
   const bool needs_allocation =
     !pimd_batch_data_ || pimd_batch_data_->number_of_atoms != number_of_atoms ||
     pimd_batch_data_->number_of_beads != number_of_beads;
   if (needs_allocation) {
     pimd_batch_data_.reset(new PIMD_Batch_Data());
     auto& batch = *pimd_batch_data_;
-    const int small_box_neighbor_size = 2000;
     batch.number_of_atoms = number_of_atoms;
     batch.number_of_beads = number_of_beads;
     batch.position_ptrs.resize(number_of_beads);
@@ -430,6 +431,55 @@ void NEP_Charge::initialize_pimd_batch_(
     batch.NN_angular.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
     batch.NL_angular.resize(
       static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_angular);
+    batch.Fp.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * annmb.dim);
+    batch.charge_derivative.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * annmb.dim);
+    const int sum_components =
+      (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
+    batch.sum_fxyz.resize(
+      static_cast<size_t>(number_of_beads) * number_of_atoms * sum_components);
+    const size_t partial_force_size =
+      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_angular;
+    batch.f12x.resize(partial_force_size);
+    batch.f12y.resize(partial_force_size);
+    batch.f12z.resize(partial_force_size);
+
+    std::vector<int*> NN_global_ptrs(number_of_beads);
+    std::vector<int*> NL_global_ptrs(number_of_beads);
+    std::vector<float*> charge_ptrs(number_of_beads);
+    std::vector<float*> D_real_ptrs(number_of_beads);
+    std::vector<float*> bec_ptrs(number_of_beads);
+    batch.beads.reserve(number_of_beads);
+    for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+      std::unique_ptr<PIMD_Bead_Data> bead(new PIMD_Bead_Data());
+      bead->neighbor.reset(new Neighbor());
+      bead->neighbor->initialize(rc, number_of_atoms, paramb.MN_radial);
+      bead->neighbor->set_always_rebuild(neighbor_always_rebuild_);
+      bead->charge.resize(number_of_atoms);
+      bead->D_real.resize(number_of_atoms);
+      bead->bec.resize(static_cast<size_t>(number_of_atoms) * 9);
+      NN_global_ptrs[bead_id] = bead->neighbor->NN.data();
+      NL_global_ptrs[bead_id] = bead->neighbor->NL.data();
+      charge_ptrs[bead_id] = bead->charge.data();
+      D_real_ptrs[bead_id] = bead->D_real.data();
+      bec_ptrs[bead_id] = bead->bec.data();
+      batch.beads.push_back(std::move(bead));
+    }
+    batch.NN_global_ptrs.copy_from_host(NN_global_ptrs.data());
+    batch.NL_global_ptrs.copy_from_host(NL_global_ptrs.data());
+    batch.charge_ptrs.copy_from_host(charge_ptrs.data());
+    batch.D_real_ptrs.copy_from_host(D_real_ptrs.data());
+    batch.bec_ptrs.resize(number_of_beads);
+    batch.bec_ptrs.copy_from_host(bec_ptrs.data());
+    printf(
+      "Using qNEP ring-polymer bead-batched local kernels for %d beads on one GPU.\n",
+      number_of_beads);
+    fflush(stdout);
+  }
+
+  auto& batch = *pimd_batch_data_;
+  if (is_small_box && !batch.small_box_data_allocated) {
     batch.small_NN_radial.resize(static_cast<size_t>(number_of_beads) * number_of_atoms);
     batch.small_NL_radial.resize(
       static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
@@ -460,66 +510,23 @@ void NEP_Charge::initialize_pimd_batch_(
       static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
     batch.small_image_z_angular.resize(
       static_cast<size_t>(number_of_beads) * number_of_atoms * small_box_neighbor_size);
-    batch.Fp.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * annmb.dim);
-    batch.charge_derivative.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * annmb.dim);
-    const int sum_components =
-      (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1);
-    batch.sum_fxyz.resize(
-      static_cast<size_t>(number_of_beads) * number_of_atoms * sum_components);
-    const size_t partial_force_size =
-      static_cast<size_t>(number_of_beads) * number_of_atoms * paramb.MN_angular;
-    batch.f12x.resize(partial_force_size);
-    batch.f12y.resize(partial_force_size);
-    batch.f12z.resize(partial_force_size);
 
-    std::vector<int*> NN_global_ptrs(number_of_beads);
-    std::vector<int*> NL_global_ptrs(number_of_beads);
     std::vector<double*> small_box_x0_ptrs(number_of_beads);
     std::vector<double*> small_box_y0_ptrs(number_of_beads);
     std::vector<double*> small_box_z0_ptrs(number_of_beads);
-    std::vector<float*> charge_ptrs(number_of_beads);
-    std::vector<float*> D_real_ptrs(number_of_beads);
-    std::vector<float*> bec_ptrs(number_of_beads);
-    batch.beads.reserve(number_of_beads);
     for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
-      std::unique_ptr<PIMD_Bead_Data> bead(new PIMD_Bead_Data());
-      bead->neighbor.reset(new Neighbor());
-      bead->neighbor->initialize(rc, number_of_atoms, paramb.MN_radial);
-      bead->neighbor->set_always_rebuild(neighbor_always_rebuild_);
-      bead->charge.resize(number_of_atoms);
-      bead->D_real.resize(number_of_atoms);
-      bead->bec.resize(static_cast<size_t>(number_of_atoms) * 9);
-      bead->small_box_x0.resize(number_of_atoms);
-      bead->small_box_y0.resize(number_of_atoms);
-      bead->small_box_z0.resize(number_of_atoms);
-      NN_global_ptrs[bead_id] = bead->neighbor->NN.data();
-      NL_global_ptrs[bead_id] = bead->neighbor->NL.data();
-      charge_ptrs[bead_id] = bead->charge.data();
-      D_real_ptrs[bead_id] = bead->D_real.data();
-      bec_ptrs[bead_id] = bead->bec.data();
-      small_box_x0_ptrs[bead_id] = bead->small_box_x0.data();
-      small_box_y0_ptrs[bead_id] = bead->small_box_y0.data();
-      small_box_z0_ptrs[bead_id] = bead->small_box_z0.data();
-      batch.beads.push_back(std::move(bead));
+      batch.beads[bead_id]->small_box_x0.resize(number_of_atoms);
+      batch.beads[bead_id]->small_box_y0.resize(number_of_atoms);
+      batch.beads[bead_id]->small_box_z0.resize(number_of_atoms);
+      small_box_x0_ptrs[bead_id] = batch.beads[bead_id]->small_box_x0.data();
+      small_box_y0_ptrs[bead_id] = batch.beads[bead_id]->small_box_y0.data();
+      small_box_z0_ptrs[bead_id] = batch.beads[bead_id]->small_box_z0.data();
     }
-    batch.NN_global_ptrs.copy_from_host(NN_global_ptrs.data());
-    batch.NL_global_ptrs.copy_from_host(NL_global_ptrs.data());
-    batch.charge_ptrs.copy_from_host(charge_ptrs.data());
-    batch.D_real_ptrs.copy_from_host(D_real_ptrs.data());
-    batch.bec_ptrs.resize(number_of_beads);
-    batch.bec_ptrs.copy_from_host(bec_ptrs.data());
     batch.small_box_x0_ptrs.copy_from_host(small_box_x0_ptrs.data());
     batch.small_box_y0_ptrs.copy_from_host(small_box_y0_ptrs.data());
     batch.small_box_z0_ptrs.copy_from_host(small_box_z0_ptrs.data());
-    printf(
-      "Using qNEP ring-polymer bead-batched local kernels for %d beads on one GPU.\n",
-      number_of_beads);
-    fflush(stdout);
+    batch.small_box_data_allocated = true;
   }
-
-  auto& batch = *pimd_batch_data_;
   std::vector<double*> position_ptrs(number_of_beads);
   std::vector<double*> potential_ptrs(number_of_beads);
   std::vector<double*> force_ptrs(number_of_beads);
@@ -2818,7 +2825,7 @@ bool NEP_Charge::compute_pimd_batch(
   const auto total_begin = std::chrono::high_resolution_clock::now();
   const auto setup_begin = std::chrono::high_resolution_clock::now();
   initialize_pimd_batch_(
-    N, position_beads, potential_beads, force_beads, virial_beads);
+    N, position_beads, potential_beads, force_beads, virial_beads, is_small_box);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
     pimd_batch_timing_.setup += std::chrono::duration<double>(
