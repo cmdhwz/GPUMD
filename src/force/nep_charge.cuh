@@ -214,6 +214,12 @@ private:
     GPU_Vector<double*> z0_ptrs;
     GPU_Vector<int> rebuild_flags;
     GPU_Vector<int> any_rebuild;
+    GPU_Vector<int> active_bead_ids;
+    GPU_Vector<int> cell_count_batch;
+    GPU_Vector<int> cell_count_sum_batch;
+    GPU_Vector<int> cell_contents_batch;
+    GPU_Vector<int> cell_keys_batch;
+    int cell_stride = 0;
     std::vector<double*> x0_ptrs_host;
     std::vector<double*> y0_ptrs_host;
     std::vector<double*> z0_ptrs_host;
@@ -249,7 +255,6 @@ private:
     GPU_Vector<float> f12y;
     GPU_Vector<float> f12z;
     std::vector<Neighbor*> neighbor_ptrs;
-    std::vector<gpuStream_t> rebuild_streams;
     bool small_box_data_allocated = false;
     bool small_box_initialized = false;
     double small_box_h[9] = {0.0};

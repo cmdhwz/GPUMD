@@ -28,32 +28,7 @@ void find_cell_list(
   GPU_Vector<int>& cell_count_sum,
   GPU_Vector<int>& cell_contents);
 
-void find_cell_list(
-  gpuStream_t& stream,
-  const double rc,
-  const int* num_bins,
-  Box& box,
-  const int N,
-  const GPU_Vector<double>& position_per_atom,
-  GPU_Vector<int>& cell_count,
-  GPU_Vector<int>& cell_count_sum,
-  GPU_Vector<int>& cell_contents);
-
 void find_neighbor(
-  const int N1,
-  const int N2,
-  double rc,
-  Box& box,
-  const GPU_Vector<int>& type,
-  const GPU_Vector<double>& position_per_atom,
-  GPU_Vector<int>& cell_count,
-  GPU_Vector<int>& cell_count_sum,
-  GPU_Vector<int>& cell_contents,
-  GPU_Vector<int>& NN,
-  GPU_Vector<int>& NL);
-
-void find_neighbor(
-  gpuStream_t& stream,
   const int N1,
   const int N2,
   double rc,
@@ -244,6 +219,8 @@ public:
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<Neighbor*>& neighbors,
     const GPU_Vector<double*>& position_ptrs,
+    const GPU_Vector<int*>& NN_global_ptrs,
+    const GPU_Vector<int*>& NL_global_ptrs,
     GPU_Vector<double*>& x0_batch,
     GPU_Vector<double*>& y0_batch,
     GPU_Vector<double*>& z0_batch,
@@ -253,7 +230,12 @@ public:
     std::vector<double*>& y0_ptrs_host,
     std::vector<double*>& z0_ptrs_host,
     bool& pointer_arrays_initialized,
-    std::vector<gpuStream_t>& rebuild_streams,
+    GPU_Vector<int>& active_bead_ids,
+    GPU_Vector<int>& cell_count_batch,
+    GPU_Vector<int>& cell_count_sum_batch,
+    GPU_Vector<int>& cell_contents_batch,
+    GPU_Vector<int>& cell_keys_batch,
+    int& cell_stride,
     Neighbor_Batch_Timing* timing = nullptr);
   static void check_atom_distance_batch(
     const Box& box,

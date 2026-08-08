@@ -377,11 +377,7 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
 
 NEP_Charge::~NEP_Charge(void)
 {
-  if (pimd_batch_data_) {
-    for (gpuStream_t stream : pimd_batch_data_->rebuild_streams) {
-      CHECK(gpuStreamDestroy(stream));
-    }
-  }
+  // GPU_Vector members release the batch buffers.
 }
 
 void NEP_Charge::set_neighbor_rebuild(const bool value)
@@ -409,11 +405,6 @@ void NEP_Charge::initialize_pimd_batch_(
     !pimd_batch_data_ || pimd_batch_data_->number_of_atoms != number_of_atoms ||
     pimd_batch_data_->number_of_beads != number_of_beads;
   if (needs_allocation) {
-    if (pimd_batch_data_) {
-      for (gpuStream_t stream : pimd_batch_data_->rebuild_streams) {
-        CHECK(gpuStreamDestroy(stream));
-      }
-    }
     pimd_batch_data_.reset(new PIMD_Batch_Data());
     auto& batch = *pimd_batch_data_;
     batch.number_of_atoms = number_of_atoms;
@@ -431,6 +422,7 @@ void NEP_Charge::initialize_pimd_batch_(
     batch.z0_ptrs.resize(number_of_beads);
     batch.rebuild_flags.resize(number_of_beads);
     batch.any_rebuild.resize(1);
+    batch.active_bead_ids.resize(number_of_beads);
     batch.x0_ptrs_host.resize(number_of_beads);
     batch.y0_ptrs_host.resize(number_of_beads);
     batch.z0_ptrs_host.resize(number_of_beads);
@@ -487,11 +479,6 @@ void NEP_Charge::initialize_pimd_batch_(
     batch.D_real_ptrs.copy_from_host(D_real_ptrs.data());
     batch.bec_ptrs.resize(number_of_beads);
     batch.bec_ptrs.copy_from_host(bec_ptrs.data());
-    const int rebuild_stream_count = number_of_beads < 4 ? number_of_beads : 4;
-    batch.rebuild_streams.resize(rebuild_stream_count);
-    for (gpuStream_t& stream : batch.rebuild_streams) {
-      CHECK(gpuStreamCreate(&stream));
-    }
     printf(
       "Using qNEP ring-polymer bead-batched local kernels for %d beads on one GPU.\n",
       number_of_beads);
@@ -2495,7 +2482,7 @@ void NEP_Charge::compute_small_box(
   GPU_CHECK_KERNEL
 
   if (include_electro) {
-    zero_total_charge<<<N, 1024>>>(N, nep_data.charge.data());
+    zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
     GPU_CHECK_KERNEL
 
     // get BEC (the diagonal part)
@@ -3231,6 +3218,8 @@ bool NEP_Charge::compute_pimd_batch(
     position_beads,
     batch.neighbor_ptrs,
     batch.position_ptrs,
+    batch.NN_global_ptrs,
+    batch.NL_global_ptrs,
     batch.x0_ptrs,
     batch.y0_ptrs,
     batch.z0_ptrs,
@@ -3240,7 +3229,12 @@ bool NEP_Charge::compute_pimd_batch(
     batch.y0_ptrs_host,
     batch.z0_ptrs_host,
     batch.pointer_arrays_initialized,
-    batch.rebuild_streams,
+    batch.active_bead_ids,
+    batch.cell_count_batch,
+    batch.cell_count_sum_batch,
+    batch.cell_contents_batch,
+    batch.cell_keys_batch,
+    batch.cell_stride,
     profile ? &neighbor_timing : nullptr);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
