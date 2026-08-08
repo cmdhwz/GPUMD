@@ -53,6 +53,7 @@ private:
   void parse_pimd_qnep_bead_batch(const char** param, int num_param);
   void parse_pimd_nep_bead_batch(const char** param, int num_param);
   void parse_pimd_nep_batch_profile(const char** param, int num_param);
+  void parse_pimd_nep_batch_global_neighbor(const char** param, int num_param);
   void parse_velocity(const char** param, int num_param);
   void parse_change_box(const char** param, int num_param);
   void parse_read_pimd_restart(const char** param, int num_param);

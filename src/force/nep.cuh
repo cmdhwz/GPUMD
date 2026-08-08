@@ -144,6 +144,10 @@ public:
 
   virtual void set_neighbor_rebuild(const bool value);
   void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }
+  void set_pimd_batch_global_neighbor(const bool enabled) override
+  {
+    pimd_batch_global_neighbor_enabled_ = enabled;
+  }
   bool pimd_batch_profile_enabled() const override { return pimd_batch_profile_enabled_; }
   const PIMD_Batch_Timing& get_pimd_batch_timing() const override { return pimd_batch_timing_; }
   void reset_pimd_batch_timing() override { pimd_batch_timing_ = PIMD_Batch_Timing(); }
@@ -221,6 +225,7 @@ private:
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
   bool neighbor_always_rebuild_ = false;
   bool pimd_batch_profile_enabled_ = false;
+  bool pimd_batch_global_neighbor_enabled_ = false;
   PIMD_Batch_Timing pimd_batch_timing_;
 
   void initialize_pimd_batch_(

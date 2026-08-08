@@ -451,6 +451,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_nep_bead_batch(param, num_param);
   } else if (strcmp(param[0], "pimd_nep_batch_profile") == 0) {
     parse_pimd_nep_batch_profile(param, num_param);
+  } else if (strcmp(param[0], "pimd_nep_batch_global_neighbor") == 0) {
+    parse_pimd_nep_batch_global_neighbor(param, num_param);
   } else if (strcmp(param[0], "read_pimd_restart") == 0) {
     parse_read_pimd_restart(param, num_param);
   } else if (strcmp(param[0], "time_step") == 0) {
@@ -796,6 +798,22 @@ void Run::parse_pimd_nep_batch_profile(const char** param, int num_param)
     printf("Disabled PIMD NEP/qNEP batch stage profiling.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_nep_batch_profile should be on or off.\n");
+  }
+}
+
+void Run::parse_pimd_nep_batch_global_neighbor(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_nep_batch_global_neighbor should have 1 parameter.\n");
+  }
+  if (strcmp(param[1], "on") == 0) {
+    force.set_pimd_nep_batch_global_neighbor(true);
+    printf("Enabled fused global-neighbor descriptor path for NEP batch.\n");
+  } else if (strcmp(param[1], "off") == 0) {
+    force.set_pimd_nep_batch_global_neighbor(false);
+    printf("Disabled fused global-neighbor descriptor path for NEP batch.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_nep_batch_global_neighbor should be on or off.\n");
   }
 }
 

@@ -1075,10 +1075,13 @@ static __global__ void find_descriptor_nep_pimd_batch(
   const int N1,
   const int N2,
   const Box box,
-  const int* g_NN_radial_batch,
-  const int* g_NL_radial_batch,
-  const int* g_NN_angular_batch,
-  const int* g_NL_angular_batch,
+  int* g_NN_radial_batch,
+  int* g_NL_radial_batch,
+  int* g_NN_angular_batch,
+  int* g_NL_angular_batch,
+  int* const* g_NN_global_batch,
+  int* const* g_NL_global_batch,
+  const bool use_global_neighbor,
   const int* __restrict__ g_type,
   double* const* g_position,
   double* const* g_potential,
@@ -1095,11 +1098,21 @@ static __global__ void find_descriptor_nep_pimd_batch(
   const double* g_y = position + N;
   const double* g_z = position + N * 2;
   double* g_pe = g_potential[bead];
-  const int* g_NN = g_NN_radial_batch + static_cast<size_t>(bead) * N;
-  const int* g_NL =
+  const int* g_NN = use_global_neighbor
+    ? g_NN_global_batch[bead]
+    : g_NN_radial_batch + static_cast<size_t>(bead) * N;
+  const int* g_NL = use_global_neighbor
+    ? g_NL_global_batch[bead]
+    : g_NL_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial;
+  const int* g_NN_angular = use_global_neighbor
+    ? g_NN_global_batch[bead]
+    : g_NN_angular_batch + static_cast<size_t>(bead) * N;
+  const int* g_NL_angular = use_global_neighbor
+    ? g_NL_global_batch[bead]
+    : g_NL_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
+  int* g_NL_radial_output =
     g_NL_radial_batch + static_cast<size_t>(bead) * N * paramb.MN_radial;
-  const int* g_NN_angular = g_NN_angular_batch + static_cast<size_t>(bead) * N;
-  const int* g_NL_angular =
+  int* g_NL_angular_output =
     g_NL_angular_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
   float* g_Fp = g_Fp_batch + static_cast<size_t>(bead) * N * annmb.dim;
   const int sum_components =
@@ -1112,15 +1125,24 @@ static __global__ void find_descriptor_nep_pimd_batch(
   const double y1 = g_y[n1];
   const double z1 = g_z[n1];
   float q[MAX_DIM] = {0.0f};
+  int count_radial = 0;
+  int count_angular = 0;
   for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
     const int n2 = g_NL[n1 + N * i1];
     float x12 = g_x[n2] - x1;
     float y12 = g_y[n2] - y1;
     float z12 = g_z[n2] - z1;
     apply_mic(box, x12, y12, z12);
-    const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+    const float d12_square = x12 * x12 + y12 * y12 + z12 * z12;
     const int t2 = g_type[n2];
     const float rc = (paramb.rc_radial[t1] + paramb.rc_radial[t2]) * 0.5f;
+    if (use_global_neighbor && d12_square >= rc * rc) {
+      continue;
+    }
+    if (use_global_neighbor) {
+      g_NL_radial_output[count_radial++ * N + n1] = n2;
+    }
+    const float d12 = sqrt(d12_square);
     const float rcinv = 1.0f / rc;
     float fc12;
     find_fc(rc, rcinv, d12, fc12);
@@ -1137,17 +1159,27 @@ static __global__ void find_descriptor_nep_pimd_batch(
       q[n] += gn12;
     }
   }
+  const int angular_neighbor_count = g_NN_angular[n1];
   for (int n = 0; n <= paramb.n_max_angular; ++n) {
     float s[NUM_OF_ABC] = {0.0f};
-    for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
+    for (int i1 = 0; i1 < angular_neighbor_count; ++i1) {
       const int n2 = g_NL_angular[n1 + N * i1];
       float x12 = g_x[n2] - x1;
       float y12 = g_y[n2] - y1;
       float z12 = g_z[n2] - z1;
       apply_mic(box, x12, y12, z12);
-      const float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+      const float d12_square = x12 * x12 + y12 * y12 + z12 * z12;
       const int t2 = g_type[n2];
+      const float rc_radial = (paramb.rc_radial[t1] + paramb.rc_radial[t2]) * 0.5f;
       const float rc = (paramb.rc_angular[t1] + paramb.rc_angular[t2]) * 0.5f;
+      if (use_global_neighbor &&
+          (d12_square >= rc_radial * rc_radial || d12_square >= rc * rc)) {
+        continue;
+      }
+      if (use_global_neighbor && n == 0) {
+        g_NL_angular_output[count_angular++ * N + n1] = n2;
+      }
+      const float d12 = sqrt(d12_square);
       const float rcinv = 1.0f / rc;
       float fc12;
       find_fc(rc, rcinv, d12, fc12);
@@ -1178,6 +1210,10 @@ static __global__ void find_descriptor_nep_pimd_batch(
     for (int abc = 0; abc < num_abc; ++abc) {
       g_sum_fxyz[(n * num_abc + abc) * N + n1] = s[abc];
     }
+  }
+  if (use_global_neighbor) {
+    g_NN_radial_batch[static_cast<size_t>(bead) * N + n1] = count_radial;
+    g_NN_angular_batch[static_cast<size_t>(bead) * N + n1] = count_angular;
   }
   for (int d = 0; d < annmb.dim; ++d) {
     q[d] *= annmb.q_scaler[d];
@@ -2109,6 +2145,7 @@ bool NEP::compute_pimd_batch(
   }
 
   const bool profile = pimd_batch_profile_enabled_;
+  const bool use_global_neighbor = pimd_batch_global_neighbor_enabled_;
   const auto total_begin = std::chrono::high_resolution_clock::now();
   const auto setup_begin = std::chrono::high_resolution_clock::now();
   initialize_pimd_batch_(
@@ -2373,26 +2410,28 @@ bool NEP::compute_pimd_batch(
       std::chrono::high_resolution_clock::now() - initialize_begin).count();
   }
 
-  const auto neighbor_filter_begin = std::chrono::high_resolution_clock::now();
-  find_neighbor_list_large_box_nep_pimd_batch<<<grid, block_size>>>(
-    paramb,
-    N,
-    N1,
-    N2,
-    box,
-    type.data(),
-    batch.position_ptrs.data(),
-    batch.NN_global_ptrs.data(),
-    batch.NL_global_ptrs.data(),
-    batch.NN_radial.data(),
-    batch.NL_radial.data(),
-    batch.NN_angular.data(),
-    batch.NL_angular.data());
-  GPU_CHECK_KERNEL
-  if (profile) {
-    CHECK(gpuDeviceSynchronize());
-    pimd_batch_timing_.neighbor += std::chrono::duration<double>(
-      std::chrono::high_resolution_clock::now() - neighbor_filter_begin).count();
+  if (!use_global_neighbor) {
+    const auto neighbor_filter_begin = std::chrono::high_resolution_clock::now();
+    find_neighbor_list_large_box_nep_pimd_batch<<<grid, block_size>>>(
+      paramb,
+      N,
+      N1,
+      N2,
+      box,
+      type.data(),
+      batch.position_ptrs.data(),
+      batch.NN_global_ptrs.data(),
+      batch.NL_global_ptrs.data(),
+      batch.NN_radial.data(),
+      batch.NL_radial.data(),
+      batch.NN_angular.data(),
+      batch.NL_angular.data());
+    GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      pimd_batch_timing_.neighbor += std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - neighbor_filter_begin).count();
+    }
   }
 
   const auto descriptor_begin = std::chrono::high_resolution_clock::now();
@@ -2407,6 +2446,9 @@ bool NEP::compute_pimd_batch(
     batch.NL_radial.data(),
     batch.NN_angular.data(),
     batch.NL_angular.data(),
+    batch.NN_global_ptrs.data(),
+    batch.NL_global_ptrs.data(),
+    use_global_neighbor,
     type.data(),
     batch.position_ptrs.data(),
     batch.potential_ptrs.data(),
