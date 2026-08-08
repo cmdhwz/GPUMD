@@ -2355,6 +2355,8 @@ bool NEP::compute_pimd_batch(
     rc,
     box,
     type,
+    N1,
+    N2,
     position_beads,
     batch.neighbor_ptrs,
     batch.position_ptrs,

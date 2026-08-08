@@ -216,6 +216,8 @@ public:
     const double rc,
     Box& box,
     const GPU_Vector<int>& type,
+    const int N1,
+    const int N2,
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<Neighbor*>& neighbors,
     const GPU_Vector<double*>& position_ptrs,
