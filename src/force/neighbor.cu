@@ -695,24 +695,25 @@ __global__ void gpu_check_atom_distance_batch(
 {
   const int bead = blockIdx.y;
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n >= N) {
-    return;
+  __shared__ int rebuild_block;
+  if (threadIdx.x == 0) {
+    rebuild_block = 0;
   }
-  const double* position = position_batch[bead];
-  float dx = position[n] - x_old_batch[bead][n];
-  float dy = position[n + N] - y_old_batch[bead][n];
-  float dz = position[n + N * 2] - z_old_batch[bead][n];
-  const float sdx = box.float_h[9] * dx + box.float_h[10] * dy + box.float_h[11] * dz;
-  const float sdy = box.float_h[12] * dx + box.float_h[13] * dy + box.float_h[14] * dz;
-  const float sdz = box.float_h[15] * dx + box.float_h[16] * dy + box.float_h[17] * dz;
-  if (
-    (box.pbc_x == 1 && fabsf(sdx) > 0.5f) || (box.pbc_y == 1 && fabsf(sdy) > 0.5f) ||
-    (box.pbc_z == 1 && fabsf(sdz) > 0.5f)) {
-    atomicExch(&rebuild_flags[bead], 1);
-    return;
+  __syncthreads();
+
+  if (n < N) {
+    const double* position = position_batch[bead];
+    float dx = position[n] - x_old_batch[bead][n];
+    float dy = position[n + N] - y_old_batch[bead][n];
+    float dz = position[n + N * 2] - z_old_batch[bead][n];
+    apply_mic(box, dx, dy, dz);
+    if ((dx * dx + dy * dy + dz * dz) > d2) {
+      atomicExch(&rebuild_block, 1);
+    }
   }
-  apply_mic(box, dx, dy, dz);
-  if ((dx * dx + dy * dy + dz * dz) > d2) {
+
+  __syncthreads();
+  if (threadIdx.x == 0 && rebuild_block != 0) {
     atomicExch(&rebuild_flags[bead], 1);
   }
 }
