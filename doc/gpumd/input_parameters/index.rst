@@ -42,6 +42,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    electron_stop
    fix
    kspace
+   pppm_mesh_spacing
    move
    mc
    plumed

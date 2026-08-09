@@ -162,6 +162,7 @@ public:
   GPU_Vector<float>& get_bec_reference();
 
   virtual void set_neighbor_rebuild(const bool value);
+  void set_pppm_mesh_spacing(const double value) override { pppm.set_mesh_spacing(value); }
   void set_pimd_batch_bec(const bool enabled) override { pimd_batch_bec_enabled_ = enabled; }
   void set_neighbor_diagnostics(const bool enabled) { neighbor_diagnostics_enabled_ = enabled; }
   void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }

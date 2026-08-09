@@ -638,6 +638,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     mc.parse_mc(param, num_param, group, atom);
   } else if (strcmp(param[0], "kspace") == 0) {
     // nothing here; will be handled elsewhere
+  } else if (strcmp(param[0], "pppm_mesh_spacing") == 0) {
+    parse_pppm_mesh_spacing(param, num_param);
   } else if (strcmp(param[0], "dftd3") == 0) {
     // nothing here; will be handled elsewhere
   } else if (strcmp(param[0], "compute_lsqt") == 0) {
@@ -1046,4 +1048,17 @@ void Run::parse_pimd_nep_batch_geometry_cache(const char** param, int num_param)
   }
   printf(
     "Ignored pimd_nep_batch_geometry_cache; using the baseline compact-neighbor path.\n");
+}
+
+void Run::parse_pppm_mesh_spacing(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pppm_mesh_spacing should have 1 parameter.\n");
+  }
+  const double spacing = get_double_from_token(param[1], __FILE__, __LINE__);
+  if (!(spacing > 0.0)) {
+    PRINT_INPUT_ERROR("pppm_mesh_spacing should be greater than zero.\n");
+  }
+  force.set_pppm_mesh_spacing(spacing);
+  printf("PPPM mesh spacing = %g Angstrom.\n", spacing);
 }
