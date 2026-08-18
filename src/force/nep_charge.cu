@@ -2129,7 +2129,8 @@ void NEP_Charge::compute_large_box(
   GPU_Vector<double>& potential_per_atom,
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom,
-  const bool include_electro)
+  const bool include_electro,
+  const bool include_bec)
 {
   const int BLOCK_SIZE = 64;
   const int N = type.size();
@@ -2208,56 +2209,58 @@ void NEP_Charge::compute_large_box(
     zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
     GPU_CHECK_KERNEL
 
-    // get BEC (the diagonal part)
-    find_bec_diagonal<<<grid_size, BLOCK_SIZE>>>(
-      N,
-      nep_data.charge.data(),
-      nep_data.bec.data());
-    GPU_CHECK_KERNEL
+    if (include_bec) {
+      // get BEC (the diagonal part)
+      find_bec_diagonal<<<grid_size, BLOCK_SIZE>>>(
+        N,
+        nep_data.charge.data(),
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
 
-    // get BEC (radial descriptor part)
-    find_bec_radial<<<grid_size, BLOCK_SIZE>>>(
-      paramb,
-      annmb,
-      N,
-      N1,
-      N2,
-      box,
-      nep_data.NN_radial.data(),
-      nep_data.NL_radial.data(),
-      type.data(),
-      position_per_atom.data(),
-      position_per_atom.data() + N,
-      position_per_atom.data() + N * 2,
-      nep_data.charge_derivative.data(),
-      nep_data.bec.data());
-    GPU_CHECK_KERNEL
+      // get BEC (radial descriptor part)
+      find_bec_radial<<<grid_size, BLOCK_SIZE>>>(
+        paramb,
+        annmb,
+        N,
+        N1,
+        N2,
+        box,
+        nep_data.NN_radial.data(),
+        nep_data.NL_radial.data(),
+        type.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        nep_data.charge_derivative.data(),
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
 
-    // get BEC (angular descriptor part)
-    find_bec_angular<<<grid_size, BLOCK_SIZE>>>(
-      paramb,
-      annmb,
-      N,
-      N1,
-      N2,
-      box,
-      nep_data.NN_angular.data(),
-      nep_data.NL_angular.data(),
-      type.data(),
-      position_per_atom.data(),
-      position_per_atom.data() + N,
-      position_per_atom.data() + N * 2,
-      nep_data.charge_derivative.data(),
-      nep_data.sum_fxyz.data(),
-      nep_data.bec.data());
-    GPU_CHECK_KERNEL
+      // get BEC (angular descriptor part)
+      find_bec_angular<<<grid_size, BLOCK_SIZE>>>(
+        paramb,
+        annmb,
+        N,
+        N1,
+        N2,
+        box,
+        nep_data.NN_angular.data(),
+        nep_data.NL_angular.data(),
+        type.data(),
+        position_per_atom.data(),
+        position_per_atom.data() + N,
+        position_per_atom.data() + N * 2,
+        nep_data.charge_derivative.data(),
+        nep_data.sum_fxyz.data(),
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
 
-    // scale q to q * sqrt(epsilon_inf)
-    scale_bec<<<grid_size, BLOCK_SIZE>>>(
-      N,
-      annmb.sqrt_epsilon_inf,
-      nep_data.bec.data());
-    GPU_CHECK_KERNEL
+      // scale q to q * sqrt(epsilon_inf)
+      scale_bec<<<grid_size, BLOCK_SIZE>>>(
+        N,
+        annmb.sqrt_epsilon_inf,
+        nep_data.bec.data());
+      GPU_CHECK_KERNEL
+    }
     if (use_pppm) {
       pppm.find_force(
         N,
@@ -2400,7 +2403,8 @@ void NEP_Charge::compute_small_box(
   GPU_Vector<double>& potential_per_atom,
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom,
-  const bool include_electro)
+  const bool include_electro,
+  const bool include_bec)
 {
   const int BLOCK_SIZE = 64;
   const int N = type.size();
@@ -2485,6 +2489,7 @@ void NEP_Charge::compute_small_box(
     zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
     GPU_CHECK_KERNEL
 
+    if (include_bec) {
     // get BEC (the diagonal part)
     find_bec_diagonal<<<grid_size, BLOCK_SIZE>>>(
       N,
@@ -2533,6 +2538,7 @@ void NEP_Charge::compute_small_box(
       annmb.sqrt_epsilon_inf,
       nep_data.bec.data());
     GPU_CHECK_KERNEL
+    }
     if (use_pppm) {
       pppm.find_force(
         N,
@@ -2741,10 +2747,24 @@ void NEP_Charge::compute(
       small_box_data.r12.resize(size_x12 * 6);
     }
     compute_small_box(
-      box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
+      box,
+      type,
+      position_per_atom,
+      potential_per_atom,
+      force_per_atom,
+      virial_per_atom,
+      true,
+      md_qnep_bec_enabled_);
   } else {
     compute_large_box(
-      box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
+      box,
+      type,
+      position_per_atom,
+      potential_per_atom,
+      force_per_atom,
+      virial_per_atom,
+      true,
+      md_qnep_bec_enabled_);
   }
   if (has_dftd3) {
     dftd3.compute(
@@ -3849,10 +3869,24 @@ void NEP_Charge::compute_non_electro(
       small_box_data.r12.resize(size_x12 * 6);
     }
     compute_small_box(
-      box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom, false);
+      box,
+      type,
+      position_per_atom,
+      potential_per_atom,
+      force_per_atom,
+      virial_per_atom,
+      false,
+      false);
   } else {
     compute_large_box(
-      box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom, false);
+      box,
+      type,
+      position_per_atom,
+      potential_per_atom,
+      force_per_atom,
+      virial_per_atom,
+      false,
+      false);
   }
   if (has_dftd3) {
     dftd3.compute(

@@ -221,6 +221,9 @@ void Run::perform_a_run()
   integrate.initialize(time_step, atom, box, group, thermo, number_of_steps);
   mc.initialize();
   measure.initialize(number_of_steps, time_step, integrate, group, atom, box, force);
+  const bool classical_md = integrate.type < 31;
+  force.set_md_qnep_bec_required(
+    classical_md && (measure.requires_bec() || add_efield.requires_bec()));
   force.set_pimd_qnep_batch_bec_required(measure.requires_bec() || add_efield.requires_bec());
 
   // compute force for the first integrate step
@@ -452,6 +455,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_bead_gpu_parallel(param, num_param);
   } else if (strcmp(param[0], "pimd_bead_neighbor_rebuild") == 0) {
     parse_pimd_bead_neighbor_rebuild(param, num_param);
+  } else if (strcmp(param[0], "md_qnep_bec") == 0) {
+    parse_md_qnep_bec(param, num_param);
   } else if (strcmp(param[0], "pimd_qnep_bead_batch") == 0) {
     parse_pimd_qnep_bead_batch(param, num_param);
   } else if (strcmp(param[0], "pimd_qnep_batch_bec") == 0) {
@@ -809,6 +814,25 @@ void Run::parse_pimd_bead_neighbor_rebuild(const char** param, int num_param)
     printf("PIMD bead GPU workers will rebuild neighbor lists for every bead.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_bead_neighbor_rebuild should be auto or always.\n");
+  }
+}
+
+void Run::parse_md_qnep_bec(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("md_qnep_bec should have 1 parameter.\n");
+  }
+  if (strcmp(param[1], "auto") == 0) {
+    force.set_md_qnep_bec_mode(0);
+    printf("qNEP classical MD BEC mode is auto.\n");
+  } else if (strcmp(param[1], "on") == 0) {
+    force.set_md_qnep_bec_mode(1);
+    printf("qNEP classical MD BEC evaluation is on.\n");
+  } else if (strcmp(param[1], "off") == 0) {
+    force.set_md_qnep_bec_mode(2);
+    printf("qNEP classical MD BEC evaluation is off.\n");
+  } else {
+    PRINT_INPUT_ERROR("md_qnep_bec should be auto, on or off.\n");
   }
 }
 

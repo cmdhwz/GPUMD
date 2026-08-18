@@ -261,6 +261,7 @@ void Force::parse_potential(
   potential->N1 = 0;
   potential->N2 = number_of_atoms;
   potential->set_pppm_mesh_spacing(pppm_mesh_spacing_);
+  potential->set_md_qnep_bec(md_qnep_bec_mode_ == 1);
 
   // Move the pointer into the list of potentials
   potentials.push_back(std::move(potential));
@@ -320,6 +321,46 @@ void Force::set_pppm_mesh_spacing(const double spacing)
   }
   if (pimd_nep_single_gpu_batch_potential_) {
     pimd_nep_single_gpu_batch_potential_->set_pppm_mesh_spacing(spacing);
+  }
+}
+
+void Force::apply_md_qnep_bec_setting_()
+{
+  const bool enabled =
+    md_qnep_bec_mode_ == 1 || (md_qnep_bec_mode_ == 0 && md_qnep_bec_required_);
+  for (auto& potential : potentials) {
+    potential->set_md_qnep_bec(enabled);
+  }
+}
+
+void Force::set_md_qnep_bec_mode(const int mode)
+{
+  if (mode < 0 || mode > 2) {
+    PRINT_INPUT_ERROR("Invalid classical MD qNEP BEC mode.\n");
+  }
+  md_qnep_bec_mode_ = mode;
+  apply_md_qnep_bec_setting_();
+}
+
+void Force::set_md_qnep_bec_required(const bool required)
+{
+  bool has_qnep = false;
+  for (const auto& potential : potentials) {
+    if (dynamic_cast<NEP_Charge*>(potential.get())) {
+      has_qnep = true;
+      break;
+    }
+  }
+  if (required && md_qnep_bec_mode_ == 2 && has_qnep) {
+    PRINT_INPUT_ERROR(
+      "md_qnep_bec off cannot be used with a BEC-dependent command.\n");
+  }
+  md_qnep_bec_required_ = required;
+  apply_md_qnep_bec_setting_();
+  if (has_qnep) {
+    const bool enabled =
+      md_qnep_bec_mode_ == 1 || (md_qnep_bec_mode_ == 0 && required);
+    printf("qNEP classical MD BEC evaluation = %s.\n", enabled ? "on" : "off");
   }
 }
 

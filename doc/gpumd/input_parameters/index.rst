@@ -44,6 +44,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    fix
    kspace
    pppm_mesh_spacing
+   md_qnep_bec
    move
    mc
    plumed

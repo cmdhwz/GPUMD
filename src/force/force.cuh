@@ -123,6 +123,8 @@ public:
   void set_pimd_bead_gpu_parallel(const int num_devices);
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
   void set_pppm_mesh_spacing(const double spacing);
+  void set_md_qnep_bec_mode(const int mode);
+  void set_md_qnep_bec_required(const bool required);
   void set_pimd_qnep_bead_batch(const bool enabled);
   void set_pimd_qnep_batch_bec_mode(const int mode);
   void set_pimd_qnep_batch_bec_required(const bool required);
@@ -153,6 +155,8 @@ private:
   int pimd_bead_gpu_parallel_devices_ = 1;
   bool pimd_bead_neighbor_always_rebuild_ = true;
   double pppm_mesh_spacing_ = 1.0;
+  int md_qnep_bec_mode_ = 0; // 0: auto, 1: on, 2: off
+  bool md_qnep_bec_required_ = false;
   bool pimd_qnep_bead_batch_enabled_ = false;
   int pimd_qnep_batch_bec_mode_ = 0; // 0: auto, 1: on, 2: off
   bool pimd_qnep_batch_bec_required_ = false;
@@ -165,6 +169,7 @@ private:
   PIMD_Bead_Timing pimd_bead_timing_;
 
   void check_types(const char* file_potential);
+  void apply_md_qnep_bec_setting_();
   bool can_use_pimd_bead_gpu_parallel_() const;
   bool can_use_pimd_qnep_batch_() const;
   bool can_use_pimd_nep_batch_() const;

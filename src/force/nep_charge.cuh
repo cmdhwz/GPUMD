@@ -163,6 +163,7 @@ public:
 
   virtual void set_neighbor_rebuild(const bool value);
   void set_pppm_mesh_spacing(const double value) override { pppm.set_mesh_spacing(value); }
+  void set_md_qnep_bec(const bool enabled) override { md_qnep_bec_enabled_ = enabled; }
   void set_pimd_batch_bec(const bool enabled) override { pimd_batch_bec_enabled_ = enabled; }
   void set_neighbor_diagnostics(const bool enabled) { neighbor_diagnostics_enabled_ = enabled; }
   void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }
@@ -264,6 +265,7 @@ private:
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
   bool neighbor_always_rebuild_ = false;
   bool neighbor_diagnostics_enabled_ = true;
+  bool md_qnep_bec_enabled_ = true;
   bool pimd_batch_bec_enabled_ = true;
   bool pimd_batch_profile_enabled_ = false;
   PIMD_Batch_Timing pimd_batch_timing_;
@@ -279,7 +281,8 @@ private:
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial,
-    const bool include_electro = true);
+    const bool include_electro = true,
+    const bool include_bec = true);
 
   void compute_large_box(
     Box& box,
@@ -288,7 +291,8 @@ private:
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial,
-    const bool include_electro = true);
+    const bool include_electro = true,
+    const bool include_bec = true);
 
   void find_k_and_G(const double* box);
 
