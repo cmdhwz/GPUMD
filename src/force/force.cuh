@@ -122,6 +122,7 @@ public:
   void set_multiple_potentials_mode(std::string mode);
   void set_pimd_bead_gpu_parallel(const int num_devices);
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
+  void set_pppm_mesh_spacing(const double spacing);
   void set_pimd_qnep_bead_batch(const bool enabled);
   void set_pimd_qnep_batch_bec_mode(const int mode);
   void set_pimd_qnep_batch_bec_required(const bool required);
@@ -151,6 +152,7 @@ private:
   std::string multiple_potentials_mode_ = "observe"; // "observe" or "average"
   int pimd_bead_gpu_parallel_devices_ = 1;
   bool pimd_bead_neighbor_always_rebuild_ = true;
+  double pppm_mesh_spacing_ = 1.0;
   bool pimd_qnep_bead_batch_enabled_ = false;
   int pimd_qnep_batch_bec_mode_ = 0; // 0: auto, 1: on, 2: off
   bool pimd_qnep_batch_bec_required_ = false;

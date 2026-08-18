@@ -1074,7 +1074,6 @@ void PPPM::initialize(const float alpha_input)
 void PPPM::find_para(const int N, const Box& box)
 {
   const float two_pi = 6.2831853f;
-  const double mesh_spacing = 1.0; // Is this good enough?
   const double volume = box.get_volume();
   para.two_pi_over_V = two_pi / volume;
   int K[3] = {0};

@@ -28,6 +28,7 @@ public:
   PPPM();
   ~PPPM();
   void initialize(const float alpha_input);
+  void set_mesh_spacing(const double value) { mesh_spacing = value; }
   void find_force(
     const int N,
     const int N1,
@@ -64,6 +65,7 @@ public:
     float two_pi_over_K[3]; // 2 * pi ./ K
   };
 private:
+  double mesh_spacing = 1.0;
   Para para;
   GPU_Vector<float> kx;
   GPU_Vector<float> ky;

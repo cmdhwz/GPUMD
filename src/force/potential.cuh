@@ -111,6 +111,7 @@ public:
   }
 
   virtual void set_neighbor_rebuild(const bool /* value */) {}
+  virtual void set_pppm_mesh_spacing(const double /* value */) {}
 
   virtual void set_pimd_batch_profile(const bool /* enabled */) {}
   virtual void set_pimd_batch_bec(const bool /* enabled */) {}

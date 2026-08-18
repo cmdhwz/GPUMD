@@ -1237,6 +1237,15 @@ void Neighbor::find_neighbor_global_batch(
     MN,
     MN * sizeof(int)>>>(N, active_bead_ids.data(), NN_global_ptrs.data(), NL_global_ptrs.data());
   GPU_CHECK_KERNEL
+
+  // Reset the skin-distance reference only for beads rebuilt in this batch.
+  update_reference_positions_batch(
+    N,
+    position_ptrs,
+    x0_batch,
+    y0_batch,
+    z0_batch,
+    rebuild_flags);
   if (timing) {
     CHECK(gpuDeviceSynchronize());
   }

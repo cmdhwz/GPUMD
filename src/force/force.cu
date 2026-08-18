@@ -260,6 +260,7 @@ void Force::parse_potential(
 
   potential->N1 = 0;
   potential->N2 = number_of_atoms;
+  potential->set_pppm_mesh_spacing(pppm_mesh_spacing_);
 
   // Move the pointer into the list of potentials
   potentials.push_back(std::move(potential));
@@ -305,6 +306,20 @@ void Force::set_pimd_bead_neighbor_rebuild(const bool always_rebuild)
   }
   if (pimd_nep_single_gpu_batch_potential_) {
     pimd_nep_single_gpu_batch_potential_->set_neighbor_rebuild(always_rebuild);
+  }
+}
+
+void Force::set_pppm_mesh_spacing(const double spacing)
+{
+  pppm_mesh_spacing_ = spacing;
+  for (auto& potential : potentials) {
+    potential->set_pppm_mesh_spacing(spacing);
+  }
+  for (auto& worker : pimd_bead_gpu_workers_) {
+    worker->potential->set_pppm_mesh_spacing(spacing);
+  }
+  if (pimd_nep_single_gpu_batch_potential_) {
+    pimd_nep_single_gpu_batch_potential_->set_pppm_mesh_spacing(spacing);
   }
 }
 
@@ -639,6 +654,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
       (pimd_nep_bead_batch_enabled_ && dynamic_cast<NEP*>(potentials[0].get()));
     potentials[0]->set_neighbor_rebuild(
       use_primary_batch_neighbor_setting ? pimd_bead_neighbor_always_rebuild_ : false);
+    potentials[0]->set_pppm_mesh_spacing(pppm_mesh_spacing_);
     potentials[0]->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
   }
   if (pimd_bead_gpu_parallel_devices_ <= 1 || primary_nep_model_path_.empty() ||
@@ -685,6 +701,7 @@ void Force::refresh_pimd_bead_gpu_workers_()
     worker->potential->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
     worker->potential->set_pimd_batch_bec(pimd_qnep_batch_bec_enabled_());
     worker->potential->set_neighbor_rebuild(pimd_bead_neighbor_always_rebuild_);
+    worker->potential->set_pppm_mesh_spacing(pppm_mesh_spacing_);
     worker->potential->N1 = 0;
     worker->potential->N2 = number_of_atoms_;
     worker->type.resize(number_of_atoms_);
