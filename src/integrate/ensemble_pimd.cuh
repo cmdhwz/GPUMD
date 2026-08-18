@@ -39,10 +39,22 @@ public:
   };
 
   Ensemble_PIMD(
-    int number_of_atoms_input, int number_of_beads_input, bool thermostat_internal, Atom& atom);
+    int number_of_atoms_input,
+    int number_of_beads_input,
+    bool thermostat_internal,
+    Atom& atom,
+    bool use_exact_propagator,
+    double pile_scale,
+    bool fix_com);
 
   Ensemble_PIMD(
-    int number_of_atoms_input, int number_of_beads_input, double temperature_coupling, Atom& atom);
+    int number_of_atoms_input,
+    int number_of_beads_input,
+    double temperature_coupling,
+    Atom& atom,
+    bool use_exact_propagator,
+    double pile_scale,
+    bool fix_com);
 
   Ensemble_PIMD(
     int number_of_atoms_input,
@@ -51,7 +63,10 @@ public:
     int num_target_pressure_components,
     double target_pressure[6],
     double pressure_coupling[6],
-    Atom& atom);
+    Atom& atom,
+    bool use_exact_propagator,
+    double pile_scale,
+    bool fix_com);
 
   virtual ~Ensemble_PIMD(void);
 
@@ -77,6 +92,9 @@ protected:
   int number_of_beads = 0;
   bool thermostat_internal = false;
   bool thermostat_centroid = false;
+  bool use_exact_propagator_ = true;
+  double pile_scale_ = 2.0;
+  bool fix_com_ = true;
   double omega_n;
   GPU_Vector<gpurandState> curand_states;
   GPU_Vector<double*> position_beads;
@@ -85,11 +103,18 @@ protected:
   GPU_Vector<double*> force_beads;
   GPU_Vector<double*> virial_beads;
   GPU_Vector<double> transformation_matrix;
+  GPU_Vector<double> free_ring_polymer_frequency;
+  GPU_Vector<double> free_ring_polymer_cosine;
+  GPU_Vector<double> free_ring_polymer_sine;
+  bool free_ring_polymer_propagator_initialized_ = false;
+  double free_ring_polymer_cached_omega_n_ = 0.0;
+  double free_ring_polymer_cached_time_step_ = 0.0;
   GPU_Vector<double> kinetic_energy_virial_part;
 
   GPU_Vector<double> sum_1024; // for intermidiate summation
 
   void initialize(Atom& atom);
+  void update_free_ring_polymer_propagator_(const double time_step);
   void langevin(const double time_step, Atom& atom);
   void compute1_local_(
     const double time_step,

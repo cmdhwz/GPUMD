@@ -442,6 +442,12 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_velocity(param, num_param);
   } else if (strcmp(param[0], "ensemble") == 0) {
     integrate.parse_ensemble(param, num_param, time_step, atom, box, group, thermo);
+  } else if (strcmp(param[0], "pimd_propagator") == 0) {
+    parse_pimd_propagator(param, num_param);
+  } else if (strcmp(param[0], "pimd_pile_scale") == 0) {
+    parse_pimd_pile_scale(param, num_param);
+  } else if (strcmp(param[0], "pimd_fix_com") == 0) {
+    parse_pimd_fix_com(param, num_param);
   } else if (strcmp(param[0], "pimd_bead_gpu_parallel") == 0) {
     parse_pimd_bead_gpu_parallel(param, num_param);
   } else if (strcmp(param[0], "pimd_bead_neighbor_rebuild") == 0) {
@@ -739,6 +745,54 @@ void Run::parse_pimd_bead_gpu_parallel(const char** param, int num_param)
   } else {
     printf("Requested PIMD bead-to-GPU parallel force evaluation on %d GPUs.\n", num_devices);
     printf("    PIMD, RPMD, and TRPMD will use this scheduling rule.\n");
+  }
+}
+
+void Run::parse_pimd_propagator(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_propagator should have 1 parameter.");
+  }
+  if (strcmp(param[1], "exact") == 0) {
+    integrate.pimd_use_exact_propagator = true;
+    printf("PIMD free ring-polymer propagator is exact.\n");
+  } else if (strcmp(param[1], "cayley") == 0) {
+    integrate.pimd_use_exact_propagator = false;
+    printf("PIMD free ring-polymer propagator is Cayley.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_propagator should be exact or cayley.");
+  }
+}
+
+void Run::parse_pimd_pile_scale(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_pile_scale should have 1 parameter.");
+  }
+  double pile_scale = 0.0;
+  if (!is_valid_real(param[1], &pile_scale)) {
+    PRINT_INPUT_ERROR("pimd_pile_scale should be a number.");
+  }
+  if (pile_scale <= 0.0) {
+    PRINT_INPUT_ERROR("pimd_pile_scale should be > 0.");
+  }
+  integrate.pimd_pile_scale = pile_scale;
+  printf("PIMD internal-mode Langevin scale is %g.\n", pile_scale);
+}
+
+void Run::parse_pimd_fix_com(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_fix_com should have 1 parameter.");
+  }
+  if (strcmp(param[1], "on") == 0) {
+    integrate.pimd_fix_com = true;
+    printf("PIMD global ring-polymer center-of-mass momentum correction is on.\n");
+  } else if (strcmp(param[1], "off") == 0) {
+    integrate.pimd_fix_com = false;
+    printf("PIMD global ring-polymer center-of-mass momentum correction is off.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_fix_com should be on or off.");
   }
 }
 

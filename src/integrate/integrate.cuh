@@ -100,6 +100,15 @@ public:
 
   // PIMD
   int number_of_beads = 0;
+  // The exact normal-mode propagator is the default, matching i-PI.  Cayley
+  // remains available for runs that need its larger-step stability.
+  bool pimd_use_exact_propagator = true;
+  // Internal-mode Langevin damping multiplier.  A value of 2.0 gives the
+  // standard PILE-L friction gamma_k = 2*omega_k; the historical GPUMD
+  // coefficient corresponds to 1.0.
+  double pimd_pile_scale = 2.0;
+  // Remove only the global ring-polymer COM momentum when enabled.
+  bool pimd_fix_com = true;
   // True when a valid temperature for a ring-polymer run was supplied by the
   // input or restored from a PIMD restart file.
   bool ring_polymer_temperature_is_set = false;

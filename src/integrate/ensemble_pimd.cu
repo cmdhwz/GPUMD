@@ -80,13 +80,22 @@ void Ensemble_PIMD::initialize_rng()
 };
 
 Ensemble_PIMD::Ensemble_PIMD(
-  int number_of_atoms_input, int number_of_beads_input, bool thermostat_internal_input, Atom& atom)
+  int number_of_atoms_input,
+  int number_of_beads_input,
+  bool thermostat_internal_input,
+  Atom& atom,
+  bool use_exact_propagator_input,
+  double pile_scale_input,
+  bool fix_com_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
   num_target_pressure_components = 0;
   thermostat_internal = thermostat_internal_input;
   thermostat_centroid = false;
+  use_exact_propagator_ = use_exact_propagator_input;
+  pile_scale_ = pile_scale_input;
+  fix_com_ = fix_com_input;
   initialize(atom);
 }
 
@@ -94,7 +103,10 @@ Ensemble_PIMD::Ensemble_PIMD(
   int number_of_atoms_input,
   int number_of_beads_input,
   double temperature_coupling_input,
-  Atom& atom)
+  Atom& atom,
+  bool use_exact_propagator_input,
+  double pile_scale_input,
+  bool fix_com_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -102,6 +114,9 @@ Ensemble_PIMD::Ensemble_PIMD(
   temperature_coupling = temperature_coupling_input;
   thermostat_internal = true;
   thermostat_centroid = true;
+  use_exact_propagator_ = use_exact_propagator_input;
+  pile_scale_ = pile_scale_input;
+  fix_com_ = fix_com_input;
   initialize(atom);
 }
 
@@ -112,7 +127,10 @@ Ensemble_PIMD::Ensemble_PIMD(
   int num_target_pressure_components_input,
   double target_pressure_input[6],
   double pressure_coupling_input[6],
-  Atom& atom)
+  Atom& atom,
+  bool use_exact_propagator_input,
+  double pile_scale_input,
+  bool fix_com_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -124,6 +142,9 @@ Ensemble_PIMD::Ensemble_PIMD(
   }
   thermostat_internal = true;
   thermostat_centroid = true;
+  use_exact_propagator_ = use_exact_propagator_input;
+  pile_scale_ = pile_scale_input;
+  fix_com_ = fix_com_input;
   initialize(atom);
   initialize_rng();
 }
@@ -210,10 +231,44 @@ void Ensemble_PIMD::initialize(Atom& atom)
   }
   transformation_matrix.copy_from_host(transformation_matrix_cpu.data());
 
+  free_ring_polymer_frequency.resize(number_of_beads);
+  free_ring_polymer_cosine.resize(number_of_beads);
+  free_ring_polymer_sine.resize(number_of_beads);
+
   curand_states.resize(number_of_atoms);
   int grid_size = (number_of_atoms - 1) / 128 + 1;
   initialize_curand_states<<<grid_size, 128>>>(curand_states.data(), number_of_atoms, rand());
   GPU_CHECK_KERNEL
+}
+
+void Ensemble_PIMD::update_free_ring_polymer_propagator_(const double time_step)
+{
+  if (
+    free_ring_polymer_propagator_initialized_ &&
+    free_ring_polymer_cached_omega_n_ == omega_n &&
+    free_ring_polymer_cached_time_step_ == time_step) {
+    return;
+  }
+
+  std::vector<double> frequency(number_of_beads, 0.0);
+  std::vector<double> cosine(number_of_beads, 1.0);
+  std::vector<double> sine(number_of_beads, 0.0);
+  for (int k = 1; k < number_of_beads; ++k) {
+    const double omega_k = 2.0 * omega_n * sin(k * PI / number_of_beads);
+    frequency[k] = omega_k;
+    if (use_exact_propagator_) {
+      cosine[k] = cos(omega_k * time_step);
+      sine[k] = sin(omega_k * time_step);
+    }
+  }
+  free_ring_polymer_frequency.copy_from_host(frequency.data());
+  if (use_exact_propagator_) {
+    free_ring_polymer_cosine.copy_from_host(cosine.data());
+    free_ring_polymer_sine.copy_from_host(sine.data());
+  }
+  free_ring_polymer_cached_omega_n_ = omega_n;
+  free_ring_polymer_cached_time_step_ = time_step;
+  free_ring_polymer_propagator_initialized_ = true;
 }
 
 Ensemble_PIMD::~Ensemble_PIMD(void)
@@ -308,8 +363,14 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
     replica->thermo.resize(thermo.size());
     copy_gpu_vector_between_devices_(device_id, replica->thermo, 0, thermo);
     if (num_target_pressure_components == 0) {
-      replica->ensemble.reset(
-        new Ensemble_PIMD(number_of_atoms, number_of_beads, temperature_coupling, replica->atom));
+      replica->ensemble.reset(new Ensemble_PIMD(
+        number_of_atoms,
+        number_of_beads,
+        temperature_coupling,
+        replica->atom,
+        use_exact_propagator_,
+        pile_scale_,
+        fix_com_));
     } else {
       replica->ensemble.reset(new Ensemble_PIMD(
         number_of_atoms,
@@ -318,7 +379,10 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
         num_target_pressure_components,
         target_pressure,
         pressure_coupling,
-        replica->atom));
+        replica->atom,
+        use_exact_propagator_,
+        pile_scale_,
+        fix_com_));
     }
     replica->ensemble->temperature = temperature;
     copy_gpu_vector_between_devices_(
@@ -332,9 +396,12 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
 static __global__ void gpu_nve_1(
   const int number_of_atoms,
   const int number_of_beads,
-  const double omega_n,
   const double time_step,
+  const bool use_exact_propagator,
   const double* transformation_matrix,
+  const double* free_ring_polymer_frequency,
+  const double* free_ring_polymer_cosine,
+  const double* free_ring_polymer_sine,
   const double* g_mass,
   double** force,
   double** position,
@@ -374,14 +441,19 @@ static __global__ void gpu_nve_1(
     }
 
     for (int k = 1; k < number_of_beads; ++k) {
-      double omega_k = 2.0 * omega_n * sin(k * PI / number_of_beads);
-      // The exact solution is actaully not very stable:
-      // double cos_factor = cos(omega_k * time_step);
-      // double sin_factor = sin(omega_k * time_step);
-      // The approximate solution based on Cayley is more stable:
-      double cayley = 1.0 / (1 + (omega_k * half_time_step) * (omega_k * half_time_step));
-      double cos_factor = cayley * (1 - (omega_k * half_time_step) * (omega_k * half_time_step));
-      double sin_factor = cayley * omega_k * time_step;
+      double omega_k = free_ring_polymer_frequency[k];
+      double cos_factor;
+      double sin_factor;
+      if (use_exact_propagator) {
+        cos_factor = free_ring_polymer_cosine[k];
+        sin_factor = free_ring_polymer_sine[k];
+      } else {
+        // Cayley is a stable rational approximation to the exact rotation.
+        double cayley = 1.0 / (1 + (omega_k * half_time_step) * (omega_k * half_time_step));
+        cos_factor =
+          cayley * (1 - (omega_k * half_time_step) * (omega_k * half_time_step));
+        sin_factor = cayley * omega_k * time_step;
+      }
       double sin_factor_times_omega = sin_factor * omega_k;
       double sin_factor_over_omega = sin_factor / omega_k;
       for (int d = 0; d < 3; ++d) {
@@ -439,8 +511,9 @@ static __global__ void gpu_langevin(
   gpurandState* g_state,
   const double temperature,
   const double temperature_coupling,
-  const double omega_n,
   const double time_step,
+  const double pile_scale,
+  const double* free_ring_polymer_frequency,
   const double* transformation_matrix,
   const double* g_mass,
   double** velocity)
@@ -468,8 +541,12 @@ static __global__ void gpu_langevin(
       if (k == 0 && !thermostat_centroid) {
         continue;
       }
+      // This kernel is called twice per MD step.  Each call is one Langevin
+      // half step, so pile_scale=2 gives gamma_k=2*omega_k (PILE-L).
       double c1 = (k == 0) ? exp(-0.5 / temperature_coupling)
-                           : exp(-time_step * omega_n * sin(k * PI / number_of_beads));
+                           : exp(
+                               -0.5 * pile_scale * time_step *
+                               free_ring_polymer_frequency[k]);
       double c2 = sqrt((1 - c1 * c1) * K_B * temperature * number_of_beads / g_mass[n]);
       for (int d = 0; d < 3; ++d) {
         int index_kd = k * 3 + d;
@@ -540,11 +617,18 @@ static __global__ void gpu_correct_momentum_beads(
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < number_of_atoms) {
-    double inverse_of_total_mass = 1.0 / device_momentum_beads[0][3];
+    double total_momentum[3] = {0.0};
+    for (int k = 0; k < number_of_beads; ++k) {
+      for (int d = 0; d < 3; ++d) {
+        total_momentum[d] += device_momentum_beads[k][d];
+      }
+    }
+    const double inverse_of_ring_polymer_mass =
+      1.0 / (device_momentum_beads[0][3] * number_of_beads);
     for (int k = 0; k < number_of_beads; ++k) {
       for (int d = 0; d < 3; ++d) {
         g_velocity[k][i + d * number_of_atoms] -=
-          device_momentum_beads[k][d] * inverse_of_total_mass;
+          total_momentum[d] * inverse_of_ring_polymer_mass;
       }
     }
   }
@@ -555,23 +639,31 @@ static __global__ void gpu_apply_pbc(
 {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (n < number_of_atoms) {
-    float pos_temp[3][MAX_NUM_BEADS] = {0.0};
+    // Keep bead coordinates in double precision.  This kernel is called every
+    // half step, so a float round trip can accumulate noticeable noise in
+    // small boxes and in long RPMD trajectories.
+    double position_reference[3] = {0.0};
     for (int k = 0; k < number_of_beads; ++k) {
+      double position_current[3];
       for (int d = 0; d < 3; ++d) {
-        pos_temp[d][k] = position[k][d * number_of_atoms + n];
+        position_current[d] = position[k][d * number_of_atoms + n];
       }
-      if (k > 0) {
+      if (k == 0) {
+        for (int d = 0; d < 3; ++d) {
+          position_reference[d] = position_current[d];
+        }
+      } else {
         double pos_diff[3] = {0.0};
         for (int d = 0; d < 3; ++d) {
-          pos_diff[d] = pos_temp[d][k] - pos_temp[d][0];
+          pos_diff[d] = position_current[d] - position_reference[d];
         }
         apply_mic(box, pos_diff[0], pos_diff[1], pos_diff[2]);
         for (int d = 0; d < 3; ++d) {
-          pos_temp[d][k] = pos_temp[d][0] + pos_diff[d];
+          position_current[d] = position_reference[d] + pos_diff[d];
         }
       }
       for (int d = 0; d < 3; ++d) {
-        position[k][d * number_of_atoms + n] = pos_temp[d][k];
+        position[k][d * number_of_atoms + n] = position_current[d];
       }
     }
   }
@@ -921,20 +1013,23 @@ void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
       curand_states.data(),
       temperature,
       temperature_coupling,
-      omega_n,
       time_step,
+      pile_scale_,
+      free_ring_polymer_frequency.data(),
       transformation_matrix.data(),
       atom.mass.data(),
       velocity_beads.data());
     GPU_CHECK_KERNEL
 
-    gpu_find_momentum_beads<<<number_of_beads, 1024>>>(
-      number_of_atoms, atom.mass.data(), velocity_beads.data());
-    GPU_CHECK_KERNEL
+    if (fix_com_) {
+      gpu_find_momentum_beads<<<number_of_beads, 1024>>>(
+        number_of_atoms, atom.mass.data(), velocity_beads.data());
+      GPU_CHECK_KERNEL
 
-    gpu_correct_momentum_beads<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
-      number_of_atoms, number_of_beads, velocity_beads.data());
-    GPU_CHECK_KERNEL
+      gpu_correct_momentum_beads<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
+        number_of_atoms, number_of_beads, velocity_beads.data());
+      GPU_CHECK_KERNEL
+    }
   }
 }
 
@@ -946,6 +1041,7 @@ void Ensemble_PIMD::compute1_local_(
   GPU_Vector<double>& thermo)
 {
   omega_n = number_of_beads * K_B * temperature / HBAR;
+  update_free_ring_polymer_propagator_(time_step);
 
   langevin(time_step, atom);
 
@@ -956,9 +1052,12 @@ void Ensemble_PIMD::compute1_local_(
   gpu_nve_1<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
     number_of_atoms,
     number_of_beads,
-    omega_n,
     time_step,
+    use_exact_propagator_,
     transformation_matrix.data(),
+    free_ring_polymer_frequency.data(),
+    free_ring_polymer_cosine.data(),
+    free_ring_polymer_sine.data(),
     atom.mass.data(),
     force_beads.data(),
     position_beads.data(),
@@ -974,6 +1073,7 @@ void Ensemble_PIMD::compute2_local_pre_pressure_(
   GPU_Vector<double>& thermo)
 {
   omega_n = number_of_beads * K_B * temperature / HBAR;
+  update_free_ring_polymer_propagator_(time_step);
 
   gpu_nve_2<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
     number_of_atoms,

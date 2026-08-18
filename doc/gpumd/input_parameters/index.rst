@@ -35,6 +35,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    ensemble_shock_nemd
    ensemble_msst
    ensemble_nphug
+   pimd_controls
    read_pimd_restart
    add_force
    add_efield

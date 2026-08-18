@@ -55,6 +55,9 @@ private:
   void parse_pimd_nep_bead_batch(const char** param, int num_param);
   void parse_pimd_nep_batch_profile(const char** param, int num_param);
   void parse_pimd_nep_batch_geometry_cache(const char** param, int num_param);
+  void parse_pimd_propagator(const char** param, int num_param);
+  void parse_pimd_pile_scale(const char** param, int num_param);
+  void parse_pimd_fix_com(const char** param, int num_param);
   void parse_pppm_mesh_spacing(const char** param, int num_param);
   void parse_velocity(const char** param, int num_param);
   void parse_change_box(const char** param, int num_param);

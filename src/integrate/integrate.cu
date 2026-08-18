@@ -223,15 +223,36 @@ void Integrate::initialize(
         box));
       break;
     case 31: // RPMD
-      ensemble.reset(new Ensemble_PIMD(number_of_atoms, number_of_beads, false, atom));
+      ensemble.reset(new Ensemble_PIMD(
+        number_of_atoms,
+        number_of_beads,
+        false,
+        atom,
+        pimd_use_exact_propagator,
+        pimd_pile_scale,
+        pimd_fix_com));
       break;
     case 32: // TRPMD
-      ensemble.reset(new Ensemble_PIMD(number_of_atoms, number_of_beads, true, atom));
+      ensemble.reset(new Ensemble_PIMD(
+        number_of_atoms,
+        number_of_beads,
+        true,
+        atom,
+        pimd_use_exact_propagator,
+        pimd_pile_scale,
+        pimd_fix_com));
       break;
     case 33: // PIMD
       if (num_target_pressure_components == 0) {
         ensemble.reset(
-          new Ensemble_PIMD(number_of_atoms, number_of_beads, temperature_coupling, atom));
+          new Ensemble_PIMD(
+            number_of_atoms,
+            number_of_beads,
+            temperature_coupling,
+            atom,
+            pimd_use_exact_propagator,
+            pimd_pile_scale,
+            pimd_fix_com));
       } else {
         ensemble.reset(new Ensemble_PIMD(
           number_of_atoms,
@@ -240,7 +261,10 @@ void Integrate::initialize(
           num_target_pressure_components,
           target_pressure,
           pressure_coupling,
-          atom));
+          atom,
+          pimd_use_exact_propagator,
+          pimd_pile_scale,
+          pimd_fix_com));
       }
       break;
     default:
@@ -1177,11 +1201,17 @@ void Integrate::parse_ensemble(
       printf("Use ring-polymer MD (RPMD) for this run.\n");
       printf("    number of beads is %d.\n", number_of_beads);
       printf("    ring-polymer temperature is %g K.\n", temperature2);
+      printf("    free ring-polymer propagator is %s.\n",
+             pimd_use_exact_propagator ? "exact" : "Cayley");
       break;
     case 32:
       printf("Use thermostatted ring-polyer MD (TRPMD) for this run.\n");
       printf("    number of beads is %d.\n", number_of_beads);
       printf("    ring-polymer temperature is %g K.\n", temperature2);
+      printf("    free ring-polymer propagator is %s.\n",
+             pimd_use_exact_propagator ? "exact" : "Cayley");
+      printf("    internal-mode Langevin scale is %g.\n", pimd_pile_scale);
+      printf("    global ring-polymer COM correction is %s.\n", pimd_fix_com ? "on" : "off");
       break;
     case 33:
       if (num_param >= 9) {
@@ -1193,6 +1223,10 @@ void Integrate::parse_ensemble(
       printf("    initial temperature is %g K.\n", temperature1);
       printf("    final temperature is %g K.\n", temperature2);
       printf("    tau_T is %g time_step.\n", temperature_coupling);
+      printf("    free ring-polymer propagator is %s.\n",
+             pimd_use_exact_propagator ? "exact" : "Cayley");
+      printf("    internal-mode Langevin scale is %g.\n", pimd_pile_scale);
+      printf("    global ring-polymer COM correction is %s.\n", pimd_fix_com ? "on" : "off");
       if (num_param >= 9) {
         if (num_target_pressure_components == 1) {
           printf("    initial isotropic pressure is %g GPa.\n", target_pressure1[0]);
