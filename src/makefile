@@ -16,6 +16,11 @@
 ###########################################################
 CC = nvcc
 CUDA_ARCH=-arch=sm_60
+# Enable dump_netcdf for Linux builds. Set NETCDF_ROOT when NetCDF is
+# installed outside the compiler's default include/library search paths.
+USE_NETCDF ?= 1
+NETCDF_ROOT ?=
+NETCDF_LIBS ?= -lnetcdf
 WARN_FLAGS = -Wall -Wextra
 WARN_FLAGS += -Wno-sign-compare -Wno-unused-parameter
 WARN_FLAGS += -Wnull-dereference -Wstringop-overflow -Wstringop-truncation -Wrestrict
@@ -33,6 +38,14 @@ LDFLAGS =
 LIBS = -lcublas -lcusolver -lcufft
 ifndef OS
 LIBS += -lpthread
+ifeq ($(USE_NETCDF),1)
+CFLAGS += -DUSE_NETCDF
+ifneq ($(strip $(NETCDF_ROOT)),)
+INC += -I$(NETCDF_ROOT)/include
+LDFLAGS += -L$(NETCDF_ROOT)/lib
+endif
+LIBS += $(NETCDF_LIBS)
+endif
 endif
 
 
