@@ -71,7 +71,8 @@ public:
     GPU_Vector<double>& force_per_atom,
     GPU_Vector<double>& virial_per_atom,
     GPU_Vector<double>& velocity_per_atom,
-    GPU_Vector<double>& mass_per_atom);
+    GPU_Vector<double>& mass_per_atom,
+    int* position_image = nullptr);
   bool compute_qnep_non_electro(
     Box& box,
     GPU_Vector<double>& position_per_atom,
@@ -125,10 +126,9 @@ public:
   void set_pppm_mesh_spacing(const double spacing);
   void set_md_qnep_bec_mode(const int mode);
   void set_md_qnep_bec_required(const bool required);
-  void set_pimd_qnep_bead_batch(const bool enabled);
+  void set_pimd_bead_batch(const bool enabled);
   void set_pimd_qnep_batch_bec_mode(const int mode);
   void set_pimd_qnep_batch_bec_required(const bool required);
-  void set_pimd_nep_bead_batch(const bool enabled);
   void set_pimd_nep_batch_profile(const bool enabled);
   void reset_pimd_nep_batch_profile();
   void print_pimd_nep_batch_profile() const;
@@ -157,10 +157,9 @@ private:
   double pppm_mesh_spacing_ = 1.0;
   int md_qnep_bec_mode_ = 0; // 0: auto, 1: on, 2: off
   bool md_qnep_bec_required_ = false;
-  bool pimd_qnep_bead_batch_enabled_ = false;
+  bool pimd_bead_batch_enabled_ = false;
   int pimd_qnep_batch_bec_mode_ = 0; // 0: auto, 1: on, 2: off
   bool pimd_qnep_batch_bec_required_ = false;
-  bool pimd_nep_bead_batch_enabled_ = false;
   bool pimd_nep_batch_profile_enabled_ = false;
   std::string primary_nep_model_path_;
   std::string atom_types[NUM_ELEMENTS];
@@ -174,6 +173,7 @@ private:
   bool can_use_pimd_qnep_batch_() const;
   bool can_use_pimd_nep_batch_() const;
   void apply_pimd_qnep_batch_bec_setting_();
+  bool pimd_qnep_bead_batch_active_() const;
   bool try_compute_pimd_qnep_batch_(
     Box& box,
     GPU_Vector<int>& type,

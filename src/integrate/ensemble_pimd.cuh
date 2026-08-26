@@ -66,7 +66,8 @@ public:
     Atom& atom,
     bool use_exact_propagator,
     double pile_scale,
-    bool fix_com);
+    bool fix_com,
+    bool use_scr_barostat);
 
   virtual ~Ensemble_PIMD(void);
 
@@ -95,6 +96,7 @@ protected:
   bool use_exact_propagator_ = true;
   double pile_scale_ = 2.0;
   bool fix_com_ = true;
+  bool use_scr_barostat_ = false;
   double omega_n;
   GPU_Vector<gpurandState> curand_states;
   GPU_Vector<double*> position_beads;

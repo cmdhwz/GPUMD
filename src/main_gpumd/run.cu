@@ -457,6 +457,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_bead_neighbor_rebuild(param, num_param);
   } else if (strcmp(param[0], "md_qnep_bec") == 0) {
     parse_md_qnep_bec(param, num_param);
+  } else if (strcmp(param[0], "pimd_bead_batch") == 0) {
+    parse_pimd_bead_batch(param, num_param);
   } else if (strcmp(param[0], "pimd_qnep_bead_batch") == 0) {
     parse_pimd_qnep_bead_batch(param, num_param);
   } else if (strcmp(param[0], "pimd_qnep_batch_bec") == 0) {
@@ -836,36 +838,32 @@ void Run::parse_md_qnep_bec(const char** param, int num_param)
   }
 }
 
-void Run::parse_pimd_qnep_bead_batch(const char** param, int num_param)
+void Run::parse_pimd_bead_batch(const char** param, int num_param)
 {
   if (num_param != 2) {
-    PRINT_INPUT_ERROR("pimd_qnep_bead_batch should have 1 parameter.\n");
+    PRINT_INPUT_ERROR("pimd_bead_batch should have 1 parameter.\n");
   }
   if (strcmp(param[1], "on") == 0) {
-    force.set_pimd_qnep_bead_batch(true);
-    printf("Requested qNEP ring-polymer bead-batched local kernels.\n");
+    force.set_pimd_bead_batch(true);
+    printf("Requested automatic NEP/qNEP ring-polymer bead-batched kernels.\n");
   } else if (strcmp(param[1], "off") == 0) {
-    force.set_pimd_qnep_bead_batch(false);
-    printf("Disabled qNEP ring-polymer bead-batched local kernels.\n");
+    force.set_pimd_bead_batch(false);
+    printf("Disabled automatic NEP/qNEP ring-polymer bead-batched kernels.\n");
   } else {
-    PRINT_INPUT_ERROR("pimd_qnep_bead_batch should be on or off.\n");
+    PRINT_INPUT_ERROR("pimd_bead_batch should be on or off.\n");
   }
+}
+
+void Run::parse_pimd_qnep_bead_batch(const char** param, int num_param)
+{
+  parse_pimd_bead_batch(param, num_param);
+  printf("Warning: pimd_qnep_bead_batch is deprecated; use pimd_bead_batch instead.\n");
 }
 
 void Run::parse_pimd_nep_bead_batch(const char** param, int num_param)
 {
-  if (num_param != 2) {
-    PRINT_INPUT_ERROR("pimd_nep_bead_batch should have 1 parameter.\n");
-  }
-  if (strcmp(param[1], "on") == 0) {
-    force.set_pimd_nep_bead_batch(true);
-    printf("Requested NEP ring-polymer bead-batched kernels.\n");
-  } else if (strcmp(param[1], "off") == 0) {
-    force.set_pimd_nep_bead_batch(false);
-    printf("Disabled NEP ring-polymer bead-batched kernels.\n");
-  } else {
-    PRINT_INPUT_ERROR("pimd_nep_bead_batch should be on or off.\n");
-  }
+  parse_pimd_bead_batch(param, num_param);
+  printf("Warning: pimd_nep_bead_batch is deprecated; use pimd_bead_batch instead.\n");
 }
 
 void Run::parse_pimd_qnep_batch_bec(const char** param, int num_param)

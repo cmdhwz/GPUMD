@@ -59,6 +59,11 @@ public:
     Atom& atom,
     Force& force);
 
+  void process_dynamics(
+    const int md_step,
+    Box& box,
+    Atom& atom);
+
   std::vector<std::unique_ptr<Property>> properties;
 
   bool requires_bec() const

@@ -25,6 +25,7 @@ References for implementation:
 
 #include "ensemble_pimd.cuh"
 #include "langevin_utilities.cuh"
+#include "svr_utilities.cuh"
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <chrono>
@@ -130,7 +131,8 @@ Ensemble_PIMD::Ensemble_PIMD(
   Atom& atom,
   bool use_exact_propagator_input,
   double pile_scale_input,
-  bool fix_com_input)
+  bool fix_com_input,
+  bool use_scr_barostat_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -145,6 +147,7 @@ Ensemble_PIMD::Ensemble_PIMD(
   use_exact_propagator_ = use_exact_propagator_input;
   pile_scale_ = pile_scale_input;
   fix_com_ = fix_com_input;
+  use_scr_barostat_ = use_scr_barostat_input;
   initialize(atom);
   initialize_rng();
 }
@@ -382,7 +385,8 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
         replica->atom,
         use_exact_propagator_,
         pile_scale_,
-        fix_com_));
+        fix_com_,
+        use_scr_barostat_));
     }
     replica->ensemble->temperature = temperature;
     copy_gpu_vector_between_devices_(
@@ -823,7 +827,8 @@ gpu_find_thermo(const double volume, const double NkBT, const double* g_sum_1024
 }
 
 static void cpu_pressure_orthogonal(
-  std::mt19937 rng,
+  std::mt19937& rng,
+  const bool use_scr_barostat,
   Box& box,
   double target_temperature,
   double* p0,
@@ -833,10 +838,16 @@ static void cpu_pressure_orthogonal(
 {
   double p[3];
   CHECK(gpuMemcpy(p, thermo + 2, sizeof(double) * 3, gpuMemcpyDeviceToHost));
+  const double volume = box.get_volume();
 
   if (box.pbc_x == 1) {
     const double scale_factor_Berendsen = 1.0 - p_coupling[0] * (p0[0] - p[0]);
     scale_factor[0] = scale_factor_Berendsen;
+    if (use_scr_barostat) {
+      const double scale_factor_stochastic =
+        sqrt(2.0 * p_coupling[0] * K_B * target_temperature / volume) * gasdev(rng);
+      scale_factor[0] += scale_factor_stochastic;
+    }
     box.cpu_h[0] *= scale_factor[0];
   } else {
     scale_factor[0] = 1.0;
@@ -845,6 +856,11 @@ static void cpu_pressure_orthogonal(
   if (box.pbc_y == 1) {
     const double scale_factor_Berendsen = 1.0 - p_coupling[1] * (p0[1] - p[1]);
     scale_factor[1] = scale_factor_Berendsen;
+    if (use_scr_barostat) {
+      const double scale_factor_stochastic =
+        sqrt(2.0 * p_coupling[1] * K_B * target_temperature / volume) * gasdev(rng);
+      scale_factor[1] += scale_factor_stochastic;
+    }
     box.cpu_h[4] *= scale_factor[1];
   } else {
     scale_factor[1] = 1.0;
@@ -853,6 +869,11 @@ static void cpu_pressure_orthogonal(
   if (box.pbc_z == 1) {
     const double scale_factor_Berendsen = 1.0 - p_coupling[2] * (p0[2] - p[2]);
     scale_factor[2] = scale_factor_Berendsen;
+    if (use_scr_barostat) {
+      const double scale_factor_stochastic =
+        sqrt(2.0 * p_coupling[2] * K_B * target_temperature / volume) * gasdev(rng);
+      scale_factor[2] += scale_factor_stochastic;
+    }
     box.cpu_h[8] *= scale_factor[2];
   } else {
     scale_factor[2] = 1.0;
@@ -861,7 +882,8 @@ static void cpu_pressure_orthogonal(
 }
 
 static void cpu_pressure_isotropic(
-  std::mt19937 rng,
+  std::mt19937& rng,
+  const bool use_scr_barostat,
   Box& box,
   double target_temperature,
   double* target_pressure,
@@ -875,6 +897,12 @@ static void cpu_pressure_isotropic(
   const double scale_factor_Berendsen =
     1.0 - p_coupling[0] * (target_pressure[0] - pressure_instant);
   scale_factor = scale_factor_Berendsen;
+  if (use_scr_barostat) {
+    const double scale_factor_stochastic =
+      sqrt(0.666666666666667 * p_coupling[0] * K_B * target_temperature / box.get_volume()) *
+      gasdev(rng);
+    scale_factor += scale_factor_stochastic;
+  }
   box.cpu_h[0] *= scale_factor;
   box.cpu_h[4] *= scale_factor;
   box.cpu_h[8] *= scale_factor;
@@ -882,7 +910,8 @@ static void cpu_pressure_isotropic(
 }
 
 static void cpu_pressure_triclinic(
-  std::mt19937 rng,
+  std::mt19937& rng,
+  const bool use_scr_barostat,
   Box& box,
   double target_temperature,
   double* p0,
@@ -899,19 +928,24 @@ static void cpu_pressure_triclinic(
   mu[3] = mu[1] = -p_coupling[5] * (p0[5] - p[3]); // xy
   mu[6] = mu[2] = -p_coupling[4] * (p0[4] - p[4]); // xz
   mu[7] = mu[5] = -p_coupling[3] * (p0[3] - p[5]); // yz
-  /*
-  double p_coupling_3by3[3][3] = {
-    {p_coupling[0], p_coupling[3], p_coupling[4]},
-    {p_coupling[3], p_coupling[1], p_coupling[5]},
-    {p_coupling[4], p_coupling[5], p_coupling[2]}};
-  const double volume = box.get_volume();
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) {
-      mu[r * 3 + c] +=
-        sqrt(2.0 * p_coupling_3by3[r][c] * K_B * target_temperature / volume) * gasdev(rng);
-    }
+  if (use_scr_barostat) {
+    const double volume = box.get_volume();
+    mu[0] += sqrt(2.0 * p_coupling[0] * K_B * target_temperature / volume) * gasdev(rng);
+    mu[4] += sqrt(2.0 * p_coupling[1] * K_B * target_temperature / volume) * gasdev(rng);
+    mu[8] += sqrt(2.0 * p_coupling[2] * K_B * target_temperature / volume) * gasdev(rng);
+    const double noise_yz =
+      sqrt(p_coupling[3] * K_B * target_temperature / volume) * gasdev(rng);
+    const double noise_xz =
+      sqrt(p_coupling[4] * K_B * target_temperature / volume) * gasdev(rng);
+    const double noise_xy =
+      sqrt(p_coupling[5] * K_B * target_temperature / volume) * gasdev(rng);
+    mu[5] += noise_yz;
+    mu[7] += noise_yz;
+    mu[2] += noise_xz;
+    mu[6] += noise_xz;
+    mu[1] += noise_xy;
+    mu[3] += noise_xy;
   }
-  */
   double h_old[9];
   for (int i = 0; i < 9; ++i) {
     h_old[i] = box.cpu_h[i];
@@ -1204,17 +1238,38 @@ void Ensemble_PIMD::compute2(
     if (num_target_pressure_components == 1) {
       double scale_factor;
       cpu_pressure_isotropic(
-        rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
+        rng,
+        use_scr_barostat_,
+        box,
+        temperature,
+        target_pressure,
+        pressure_coupling,
+        thermo.data(),
+        scale_factor);
       apply_pressure_local_isotropic_(atom, scale_factor);
     } else if (num_target_pressure_components == 3) {
       double scale_factor[3];
       cpu_pressure_orthogonal(
-        rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
+        rng,
+        use_scr_barostat_,
+        box,
+        temperature,
+        target_pressure,
+        pressure_coupling,
+        thermo.data(),
+        scale_factor);
       apply_pressure_local_orthogonal_(atom, scale_factor);
     } else if (num_target_pressure_components == 6) {
       double mu[9];
       cpu_pressure_triclinic(
-        rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), mu);
+        rng,
+        use_scr_barostat_,
+        box,
+        temperature,
+        target_pressure,
+        pressure_coupling,
+        thermo.data(),
+        mu);
       apply_pressure_local_triclinic_(atom, mu);
     }
     return;
@@ -1233,7 +1288,14 @@ void Ensemble_PIMD::compute2(
   if (num_target_pressure_components == 1) {
     double scale_factor;
     cpu_pressure_isotropic(
-      rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
+      rng,
+      use_scr_barostat_,
+      box,
+      temperature,
+      target_pressure,
+      pressure_coupling,
+      thermo.data(),
+      scale_factor);
     apply_pressure_local_isotropic_(atom, scale_factor);
     for (auto& replica_ptr : distributed_replicas_) {
       CHECK(gpuSetDevice(replica_ptr->device_id));
@@ -1242,7 +1304,14 @@ void Ensemble_PIMD::compute2(
   } else if (num_target_pressure_components == 3) {
     double scale_factor[3];
     cpu_pressure_orthogonal(
-      rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), scale_factor);
+      rng,
+      use_scr_barostat_,
+      box,
+      temperature,
+      target_pressure,
+      pressure_coupling,
+      thermo.data(),
+      scale_factor);
     apply_pressure_local_orthogonal_(atom, scale_factor);
     for (auto& replica_ptr : distributed_replicas_) {
       CHECK(gpuSetDevice(replica_ptr->device_id));
@@ -1251,7 +1320,14 @@ void Ensemble_PIMD::compute2(
   } else if (num_target_pressure_components == 6) {
     double mu[9];
     cpu_pressure_triclinic(
-      rng, box, temperature, target_pressure, pressure_coupling, thermo.data(), mu);
+      rng,
+      use_scr_barostat_,
+      box,
+      temperature,
+      target_pressure,
+      pressure_coupling,
+      thermo.data(),
+      mu);
     apply_pressure_local_triclinic_(atom, mu);
     for (auto& replica_ptr : distributed_replicas_) {
       CHECK(gpuSetDevice(replica_ptr->device_id));

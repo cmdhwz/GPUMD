@@ -63,6 +63,24 @@ In the current implementation the COM correction is coupled to the Langevin
 step, so this parameter has no effect in a pure :attr:`rpmd` run.
 
 
+PIMD bead batching
+------------------
+
+Syntax::
+
+    pimd_bead_batch on|off
+
+This enables or disables the batched force kernels for PIMD, RPMD, and TRPMD
+runs. The active potential is detected automatically: standard NEP models use
+the NEP bead-batch path, while qNEP models use the qNEP bead-batch path. The
+default is ``off``. The command must appear before the corresponding ``run``.
+
+The older ``pimd_nep_bead_batch`` and ``pimd_qnep_bead_batch`` keywords remain
+accepted as compatibility aliases, but new input files should use
+``pimd_bead_batch``. The qNEP-only BEC control
+``pimd_qnep_batch_bec`` remains separate.
+
+
 Centroid heat flux
 ------------------
 
