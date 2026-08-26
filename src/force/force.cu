@@ -58,7 +58,8 @@ static __global__ void initialize_properties(
   double* potential,
   double* virial);
 
-static __global__ void gpu_apply_pbc(int N, Box box, double* g_x, double* g_y, double* g_z);
+static __global__ void gpu_apply_pbc(
+  int N, Box box, double* g_x, double* g_y, double* g_z, int* g_position_image);
 
 template <typename T>
 static void copy_gpu_buffer_between_devices(
@@ -577,7 +578,8 @@ bool Force::try_compute_pimd_qnep_batch_(
       box,
       position_beads[bead_id].data(),
       position_beads[bead_id].data() + number_of_atoms,
-      position_beads[bead_id].data() + number_of_atoms * 2);
+      position_beads[bead_id].data() + number_of_atoms * 2,
+      nullptr);
   }
   GPU_CHECK_KERNEL
 
@@ -633,7 +635,8 @@ bool Force::try_compute_pimd_nep_batch_(
       box,
       position_beads[bead_id].data(),
       position_beads[bead_id].data() + number_of_atoms,
-      position_beads[bead_id].data() + number_of_atoms * 2);
+      position_beads[bead_id].data() + number_of_atoms * 2,
+      nullptr);
   }
   GPU_CHECK_KERNEL
 
@@ -862,7 +865,8 @@ void Force::compute_pimd_beads(
       box,
       position_beads[bead_id].data(),
       position_beads[bead_id].data() + number_of_atoms,
-      position_beads[bead_id].data() + number_of_atoms * 2);
+      position_beads[bead_id].data() + number_of_atoms * 2,
+      nullptr);
   }
   GPU_CHECK_KERNEL
   CHECK(gpuDeviceSynchronize());
@@ -1086,7 +1090,8 @@ void Force::compute_pimd_bead_range_on_device(
         box,
         position_beads[bead_id].data(),
         position_beads[bead_id].data() + number_of_atoms,
-        position_beads[bead_id].data() + number_of_atoms * 2);
+        position_beads[bead_id].data() + number_of_atoms * 2,
+        nullptr);
     }
 
     initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -1548,7 +1553,8 @@ bool Force::compute_qnep_non_electro(
       box,
       position_per_atom.data(),
       position_per_atom.data() + number_of_atoms,
-      position_per_atom.data() + number_of_atoms * 2);
+      position_per_atom.data() + number_of_atoms * 2,
+      nullptr);
   }
 
   initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
