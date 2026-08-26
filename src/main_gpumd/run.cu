@@ -248,8 +248,12 @@ void Run::perform_a_run()
       atom.force_per_atom,
       atom.virial_per_atom,
       atom.velocity_per_atom,
-      atom.mass);
+      atom.mass,
+      atom.position_image.size() > 0 ? atom.position_image.data() : nullptr);
   }
+
+  atom.update_unwrapped_position(box);
+  measure.process_dynamics(0, box, atom);
 
   double initial_time_step = time_step;
   const bool profile_pimd_bead_parallel =
@@ -310,20 +314,25 @@ void Run::perform_a_run()
         atom.force_per_atom,
         atom.virial_per_atom,
         atom.velocity_per_atom,
-        atom.mass);
+        atom.mass,
+        atom.position_image.size() > 0 ? atom.position_image.data() : nullptr);
     }
 
+    atom.update_unwrapped_position(box);
     electron_stop.compute(time_step, atom);
     add_force.compute(step, group, atom);
     add_spring.compute(step, group, atom);
     add_random_force.compute(step, atom);
     add_efield.compute(step, group, atom, force);
 
+    measure.process_dynamics(step + 1, box, atom);
+
     std::chrono::high_resolution_clock::time_point compute2_begin;
     if (profile_pimd_bead_parallel) {
       compute2_begin = std::chrono::high_resolution_clock::now();
     }
     integrate.compute2(time_step, double(step) / number_of_steps, group, box, atom, thermo, force);
+    atom.update_unwrapped_position(box);
     if (profile_pimd_bead_parallel) {
       CHECK(gpuSetDevice(0));
       CHECK(gpuDeviceSynchronize());
