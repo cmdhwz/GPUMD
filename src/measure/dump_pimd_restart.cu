@@ -37,12 +37,25 @@ Dump a single-file restart container for centroid and all beads in PIMD-related 
 
 namespace
 {
-bool make_restart_backup_directory()
+bool is_valid_backup_directory_name(const char* directory)
+{
+  if (directory[0] == '\0' || strcmp(directory, ".") == 0 || strcmp(directory, "..") == 0) {
+    return false;
+  }
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(directory); *p != '\0'; ++p) {
+    if (*p < 32 || *p == '/' || *p == '\\' || *p == ':') {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool make_restart_backup_directory(const std::string& directory)
 {
 #ifdef _WIN32
-  return _mkdir("restart_backups") == 0 || errno == EEXIST;
+  return _mkdir(directory.c_str()) == 0 || errno == EEXIST;
 #else
-  return mkdir("restart_backups", 0777) == 0 || errno == EEXIST;
+  return mkdir(directory.c_str(), 0777) == 0 || errno == EEXIST;
 #endif
 }
 
@@ -78,16 +91,18 @@ void Dump_PIMD_Restart::parse(const char** param, int num_param)
     PRINT_INPUT_ERROR("PIMD restart dump interval should > 0.");
   }
   if (num_param == 3) {
-    if (strcmp(param[2], "backup") != 0) {
-      PRINT_INPUT_ERROR("The optional second parameter of dump_pimd_restart should be backup.");
+    if (!is_valid_backup_directory_name(param[2])) {
+      PRINT_INPUT_ERROR(
+        "The optional backup directory name should be a single directory name without '/', '\\\\', or ':'.");
     }
     backup_ = true;
+    backup_directory_ = param[2];
   }
   dump_ = true;
-  printf(
-    "Dump PIMD restart every %d steps%s.\n",
-    dump_interval_,
-    backup_ ? " with backups in restart_backups" : "");
+  printf("Dump PIMD restart every %d steps.\n", dump_interval_);
+  if (backup_) {
+    printf("    Save backup files in %s.\n", backup_directory_.c_str());
+  }
 }
 
 void Dump_PIMD_Restart::preprocess(
@@ -105,8 +120,8 @@ void Dump_PIMD_Restart::preprocess(
   if (atom.number_of_beads == 0) {
     PRINT_INPUT_ERROR("Cannot use dump_pimd_restart for non-PIMD-related runs.");
   }
-  if (backup_ && !make_restart_backup_directory()) {
-    PRINT_INPUT_ERROR("Failed to create the restart_backups directory.");
+  if (backup_ && !make_restart_backup_directory(backup_directory_)) {
+    PRINT_INPUT_ERROR("Failed to create the PIMD restart backup directory.");
   }
   cpu_position_.resize(atom.number_of_atoms * 3);
   cpu_velocity_.resize(atom.number_of_atoms * 3);
@@ -166,7 +181,7 @@ void Dump_PIMD_Restart::process(
   std::string filename = "restart_beads.xyz";
   if (backup_) {
     std::ostringstream backup_filename;
-    backup_filename << "restart_backups/restart_beads_step_" << std::setw(10)
+    backup_filename << backup_directory_ << "/restart_beads_step_" << std::setw(10)
                     << std::setfill('0') << (step + 1) << ".xyz";
     filename = backup_filename.str();
   }
