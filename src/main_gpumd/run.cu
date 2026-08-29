@@ -61,6 +61,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/orientorder.cuh"
 #include "measure/plumed.cuh"
 #include "measure/property.cuh"
+#include "measure/proton_tunneling.cuh"
 #include "measure/rdf.cuh"
 #include "measure/sdc.cuh"
 #include "measure/shc.cuh"
@@ -607,6 +608,10 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
   } else if (strcmp(param[0], "compute_hac") == 0) {
     std::unique_ptr<Property> property;
     property.reset(new HAC(param, num_param));
+    measure.properties.emplace_back(std::move(property));
+  } else if (strcmp(param[0], "compute_proton_tunneling") == 0) {
+    std::unique_ptr<Property> property;
+    property.reset(new Proton_Tunneling(param, num_param, atom));
     measure.properties.emplace_back(std::move(property));
   } else if (strcmp(param[0], "compute_viscosity") == 0) {
     std::unique_ptr<Property> property;
