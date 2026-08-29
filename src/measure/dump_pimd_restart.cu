@@ -25,7 +25,40 @@ Dump a single-file restart container for centroid and all beads in PIMD-related 
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/read_file.cuh"
+#include <cerrno>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
+
+namespace
+{
+bool make_restart_backup_directory()
+{
+#ifdef _WIN32
+  return _mkdir("restart_backups") == 0 || errno == EEXIST;
+#else
+  return mkdir("restart_backups", 0777) == 0 || errno == EEXIST;
+#endif
+}
+
+void copy_restart_file(const std::string& source, const std::string& destination)
+{
+  std::ifstream input(source, std::ios::binary);
+  std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+  if (!input || !output) {
+    PRINT_INPUT_ERROR("Failed to copy the PIMD restart backup to restart_beads.xyz.");
+  }
+  output << input.rdbuf();
+  if (!output) {
+    PRINT_INPUT_ERROR("Failed while copying the PIMD restart backup.");
+  }
+}
+} // namespace
 
 Dump_PIMD_Restart::Dump_PIMD_Restart(const char** param, int num_param)
 {
@@ -35,8 +68,8 @@ Dump_PIMD_Restart::Dump_PIMD_Restart(const char** param, int num_param)
 
 void Dump_PIMD_Restart::parse(const char** param, int num_param)
 {
-  if (num_param != 2) {
-    PRINT_INPUT_ERROR("dump_pimd_restart should have 1 parameter.");
+  if (num_param != 2 && num_param != 3) {
+    PRINT_INPUT_ERROR("dump_pimd_restart should have 1 or 2 parameters.");
   }
   if (!is_valid_int(param[1], &dump_interval_)) {
     PRINT_INPUT_ERROR("PIMD restart dump interval should be an integer.");
@@ -44,8 +77,17 @@ void Dump_PIMD_Restart::parse(const char** param, int num_param)
   if (dump_interval_ <= 0) {
     PRINT_INPUT_ERROR("PIMD restart dump interval should > 0.");
   }
+  if (num_param == 3) {
+    if (strcmp(param[2], "backup") != 0) {
+      PRINT_INPUT_ERROR("The optional second parameter of dump_pimd_restart should be backup.");
+    }
+    backup_ = true;
+  }
   dump_ = true;
-  printf("Dump PIMD restart every %d steps.\n", dump_interval_);
+  printf(
+    "Dump PIMD restart every %d steps%s.\n",
+    dump_interval_,
+    backup_ ? " with backups in restart_backups" : "");
 }
 
 void Dump_PIMD_Restart::preprocess(
@@ -62,6 +104,9 @@ void Dump_PIMD_Restart::preprocess(
   }
   if (atom.number_of_beads == 0) {
     PRINT_INPUT_ERROR("Cannot use dump_pimd_restart for non-PIMD-related runs.");
+  }
+  if (backup_ && !make_restart_backup_directory()) {
+    PRINT_INPUT_ERROR("Failed to create the restart_backups directory.");
   }
   cpu_position_.resize(atom.number_of_atoms * 3);
   cpu_velocity_.resize(atom.number_of_atoms * 3);
@@ -118,7 +163,15 @@ void Dump_PIMD_Restart::process(
     return;
   }
 
-  FILE* fid = my_fopen("restart_beads.xyz", "w");
+  std::string filename = "restart_beads.xyz";
+  if (backup_) {
+    std::ostringstream backup_filename;
+    backup_filename << "restart_backups/restart_beads_step_" << std::setw(10)
+                    << std::setfill('0') << (step + 1) << ".xyz";
+    filename = backup_filename.str();
+  }
+
+  FILE* fid = my_fopen(filename.c_str(), "w");
   const int number_of_atoms = atom.number_of_atoms;
   const int number_of_beads = atom.number_of_beads;
   const double natural_to_A_per_fs = 1.0 / TIME_UNIT_CONVERSION;
@@ -166,6 +219,10 @@ void Dump_PIMD_Restart::process(
 
   fflush(fid);
   fclose(fid);
+
+  if (backup_) {
+    copy_restart_file(filename, "restart_beads.xyz");
+  }
 }
 
 void Dump_PIMD_Restart::postprocess(

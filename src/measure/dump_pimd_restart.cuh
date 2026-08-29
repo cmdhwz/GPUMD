@@ -43,6 +43,7 @@ public:
 
 private:
   bool dump_ = false;
+  bool backup_ = false;
   int dump_interval_ = 1;
   std::vector<double> cpu_position_;
   std::vector<double> cpu_velocity_;
