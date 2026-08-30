@@ -57,13 +57,43 @@ public:
     const double temperature) override;
 
 private:
+  enum class AttemptOutcome
+  {
+    success,
+    return_to_state,
+    geometry_lost,
+    run_end
+  };
+
+  struct GeometryResult
+  {
+    bool valid = false;
+    int nearest_oxygen = -1;
+    int oxygen_low = -1;
+    int oxygen_high = -1;
+    double delta = 0.0;
+    double dOO = 0.0;
+    double rperp = 0.0;
+    double low_to_high_dx = 0.0;
+    double low_to_high_dy = 0.0;
+    double low_to_high_dz = 0.0;
+  };
+
   struct BondStats
   {
     long long geometry_samples = 0;
     long long n_plus = 0;
     long long n_minus = 0;
+    long long n_deadband = 0;
     long long transitions = 0;
+    long long attempts = 0;
+    long long successes = 0;
+    long long returns = 0;
+    long long geometry_lost = 0;
     double sum_abs_delta = 0.0;
+    double sum_delta = 0.0;
+    double sum_dOO = 0.0;
+    double sum_rperp = 0.0;
   };
 
   struct HydrogenState
@@ -74,25 +104,41 @@ private:
     int pending_state = 0;
     int pending_count = 0;
     double last_delta = 0.0;
+    bool attempt_active = false;
+    int attempt_from_state = 0;
+    long long attempt_id = 0;
+    double attempt_start_time_fs = 0.0;
+    double attempt_delta_start = 0.0;
+    double attempt_min_abs_delta = 0.0;
+    double pending_start_time_fs = 0.0;
   };
 
   void parse(const char** param, const int num_param, const Atom& atom);
   bool find_geometry(
     const int hydrogen,
     const Box& box,
-    int& nearest_oxygen,
-    int& oxygen_low,
-    int& oxygen_high,
-    double& delta) const;
+    GeometryResult& geometry) const;
   int classify_delta(const double delta) const;
   void record_bond(
     std::unordered_map<unsigned long long, BondStats>& bond_stats,
-    const int oxygen_low,
-    const int oxygen_high,
-    const double delta,
+    const GeometryResult& geometry,
     const int state);
+  void start_attempt(
+    HydrogenState& hydrogen_state,
+    const int stable_state,
+    const double time_fs,
+    const double delta);
+  void finish_attempt(
+    const int hydrogen,
+    HydrogenState& hydrogen_state,
+    const AttemptOutcome outcome,
+    const double time_fs,
+    const double delta_end,
+    const GeometryResult* geometry);
+  const char* outcome_name(const AttemptOutcome outcome) const;
   void observe_frame(const double time_fs, const Box& box, Atom& atom);
   void write_window(const double time_fs);
+  void write_edge_window(const double time_start_fs, const double time_end_fs);
   void write_final_bonds();
 
   int sample_interval_ = 1;
@@ -100,6 +146,8 @@ private:
   int hold_samples_ = 2;
   int window_sample_count_ = 0;
   int number_of_atoms_ = 0;
+  long long window_id_ = 0;
+  long long next_attempt_id_ = 1;
   long long window_flip_count_ = 0;
   long long window_valid_pair_count_ = 0;
   long long window_positive_defect_sum_ = 0;
@@ -109,6 +157,7 @@ private:
   double dOO_max_ = 2.60;
   double rperp_max_ = 0.80;
   double time_step_ = 0.0;
+  double window_start_time_fs_ = 0.0;
   double last_time_fs_ = 0.0;
   bool initialized_ = false;
 
@@ -117,11 +166,14 @@ private:
   std::vector<int> oxygen_indices_;
   std::vector<int> hydrogen_indices_;
   std::vector<double> cpu_position_;
+  std::vector<int> hydrogen_count_;
   std::vector<HydrogenState> hydrogen_states_;
 
   std::unordered_map<unsigned long long, BondStats> window_bonds_;
   std::unordered_map<unsigned long long, BondStats> total_bonds_;
   FILE* bias_file_ = nullptr;
   FILE* transfer_file_ = nullptr;
+  FILE* attempt_file_ = nullptr;
+  FILE* edge_window_file_ = nullptr;
   FILE* bond_file_ = nullptr;
 };

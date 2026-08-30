@@ -135,10 +135,13 @@ void Proton_Tunneling::preprocess(
   number_of_atoms_ = atom.number_of_atoms;
   time_step_ = time_step;
   cpu_position_.resize(number_of_atoms_ * 3);
+  hydrogen_count_.resize(number_of_atoms_, 0);
   hydrogen_states_.resize(hydrogen_indices_.size());
 
   bias_file_ = my_fopen("proton_bias.out", "a");
   transfer_file_ = my_fopen("proton_transfer.out", "a");
+  attempt_file_ = my_fopen("proton_attempt.out", "a");
+  edge_window_file_ = my_fopen("proton_edge_window.out", "a");
   bond_file_ = my_fopen("proton_bond.out", "a");
 
   fprintf(bias_file_,
@@ -150,14 +153,23 @@ void Proton_Tunneling::preprocess(
     "flip_rate_per_ps active_bonds positive_defects negative_defects valid_pairs_per_frame\n");
 
   fprintf(transfer_file_,
-    "# columns time_fs H_id O_from O_to O_pair_low O_pair_high delta_before delta_after "
-    "nH_from nH_to\n");
+    "# columns event_id time_start_fs time_confirm_fs H_id O_from O_to O_pair_low O_pair_high "
+    "dx dy dz delta_start delta_confirm nH_from nH_to\n");
+  fprintf(attempt_file_,
+    "# columns attempt_id time_start_fs time_end_fs H_id O_low O_high O_from O_target outcome "
+    "delta_start min_abs_delta delta_end\n");
+  fprintf(edge_window_file_,
+    "# columns window_id time_start_fs time_end_fs O_low O_high geometry_occupancy "
+    "n_plus n_minus n_deadband A abs_A DeltaF_over_kBT attempts successes returns geometry_lost "
+    "success_probability mean_delta mean_abs_delta mean_dOO mean_rperp\n");
   fprintf(bond_file_,
     "# columns O_pair_low O_pair_high geometry_samples n_plus n_minus transitions "
     "A abs_A mean_abs_delta\n");
 
   fflush(bias_file_);
   fflush(transfer_file_);
+  fflush(attempt_file_);
+  fflush(edge_window_file_);
   fflush(bond_file_);
   initialized_ = true;
 }
@@ -165,15 +177,9 @@ void Proton_Tunneling::preprocess(
 bool Proton_Tunneling::find_geometry(
   const int hydrogen,
   const Box& box,
-  int& nearest_oxygen,
-  int& oxygen_low,
-  int& oxygen_high,
-  double& delta) const
+  GeometryResult& geometry) const
 {
-  nearest_oxygen = -1;
-  oxygen_low = -1;
-  oxygen_high = -1;
-  delta = 0.0;
+  geometry = GeometryResult();
 
   int first_oxygen = -1;
   int second_oxygen = -1;
@@ -204,47 +210,52 @@ bool Proton_Tunneling::find_geometry(
   if (first_oxygen < 0 || second_oxygen < 0)
     return false;
 
-  nearest_oxygen = first_oxygen;
-  oxygen_low = std::min(first_oxygen, second_oxygen);
-  oxygen_high = std::max(first_oxygen, second_oxygen);
-  const double low_oxygen_distance = (oxygen_low == first_oxygen)
+  geometry.nearest_oxygen = first_oxygen;
+  geometry.oxygen_low = std::min(first_oxygen, second_oxygen);
+  geometry.oxygen_high = std::max(first_oxygen, second_oxygen);
+  const double low_oxygen_distance = (geometry.oxygen_low == first_oxygen)
     ? std::sqrt(first_distance_square)
     : std::sqrt(second_distance_square);
-  const double high_oxygen_distance = (oxygen_high == first_oxygen)
+  const double high_oxygen_distance = (geometry.oxygen_high == first_oxygen)
     ? std::sqrt(first_distance_square)
     : std::sqrt(second_distance_square);
-  delta = low_oxygen_distance - high_oxygen_distance;
+  geometry.delta = low_oxygen_distance - high_oxygen_distance;
 
-  double ox = cpu_position_[oxygen_high] - cpu_position_[oxygen_low];
-  double oy = cpu_position_[oxygen_high + number_of_atoms_] -
-    cpu_position_[oxygen_low + number_of_atoms_];
-  double oz = cpu_position_[oxygen_high + 2 * number_of_atoms_] -
-    cpu_position_[oxygen_low + 2 * number_of_atoms_];
+  double ox = cpu_position_[geometry.oxygen_high] - cpu_position_[geometry.oxygen_low];
+  double oy = cpu_position_[geometry.oxygen_high + number_of_atoms_] -
+    cpu_position_[geometry.oxygen_low + number_of_atoms_];
+  double oz = cpu_position_[geometry.oxygen_high + 2 * number_of_atoms_] -
+    cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
   apply_mic(box, ox, oy, oz);
   const double dOO_square = ox * ox + oy * oy + oz * oz;
   if (dOO_square < dOO_min_ * dOO_min_ || dOO_square > dOO_max_ * dOO_max_)
     return false;
+  geometry.dOO = std::sqrt(dOO_square);
+  geometry.low_to_high_dx = ox;
+  geometry.low_to_high_dy = oy;
+  geometry.low_to_high_dz = oz;
 
-  double hx_from_low = hx - cpu_position_[oxygen_low];
-  double hy_from_low = hy - cpu_position_[oxygen_low + number_of_atoms_];
-  double hz_from_low = hz - cpu_position_[oxygen_low + 2 * number_of_atoms_];
+  double hx_from_low = hx - cpu_position_[geometry.oxygen_low];
+  double hy_from_low = hy - cpu_position_[geometry.oxygen_low + number_of_atoms_];
+  double hz_from_low = hz - cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
   apply_mic(box, hx_from_low, hy_from_low, hz_from_low);
   const double projection = (hx_from_low * ox + hy_from_low * oy + hz_from_low * oz) /
     dOO_square;
   const double px = hx_from_low - projection * ox;
   const double py = hy_from_low - projection * oy;
   const double pz = hz_from_low - projection * oz;
-  if (px * px + py * py + pz * pz > rperp_max_ * rperp_max_)
+  geometry.rperp = std::sqrt(px * px + py * py + pz * pz);
+  if (geometry.rperp > rperp_max_)
     return false;
 
   // The two nearest O atoms must form a hydrogen-bond-like O-H-O geometry. This rejects
   // most accidental pairs from the other interpenetrating ice-VII network.
-  double low_x = cpu_position_[oxygen_low] - hx;
-  double low_y = cpu_position_[oxygen_low + number_of_atoms_] - hy;
-  double low_z = cpu_position_[oxygen_low + 2 * number_of_atoms_] - hz;
-  double high_x = cpu_position_[oxygen_high] - hx;
-  double high_y = cpu_position_[oxygen_high + number_of_atoms_] - hy;
-  double high_z = cpu_position_[oxygen_high + 2 * number_of_atoms_] - hz;
+  double low_x = cpu_position_[geometry.oxygen_low] - hx;
+  double low_y = cpu_position_[geometry.oxygen_low + number_of_atoms_] - hy;
+  double low_z = cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_] - hz;
+  double high_x = cpu_position_[geometry.oxygen_high] - hx;
+  double high_y = cpu_position_[geometry.oxygen_high + number_of_atoms_] - hy;
+  double high_z = cpu_position_[geometry.oxygen_high + 2 * number_of_atoms_] - hz;
   apply_mic(box, low_x, low_y, low_z);
   apply_mic(box, high_x, high_y, high_z);
   const double low_distance = low_oxygen_distance;
@@ -257,6 +268,7 @@ bool Proton_Tunneling::find_geometry(
   if (angle_cosine > -0.5)
     return false;
 
+  geometry.valid = true;
   return true;
 }
 
@@ -271,18 +283,151 @@ int Proton_Tunneling::classify_delta(const double delta) const
 
 void Proton_Tunneling::record_bond(
   std::unordered_map<unsigned long long, BondStats>& bond_stats,
-  const int oxygen_low,
-  const int oxygen_high,
-  const double delta,
+  const GeometryResult& geometry,
   const int state)
 {
-  BondStats& stats = bond_stats[make_bond_key(oxygen_low, oxygen_high)];
+  BondStats& stats = bond_stats[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)];
   ++stats.geometry_samples;
-  stats.sum_abs_delta += std::abs(delta);
+  stats.sum_abs_delta += std::abs(geometry.delta);
+  stats.sum_delta += geometry.delta;
+  stats.sum_dOO += geometry.dOO;
+  stats.sum_rperp += geometry.rperp;
   if (state > 0)
     ++stats.n_plus;
   else if (state < 0)
     ++stats.n_minus;
+  else
+    ++stats.n_deadband;
+}
+
+void Proton_Tunneling::start_attempt(
+  HydrogenState& hydrogen_state,
+  const int stable_state,
+  const double time_fs,
+  const double delta)
+{
+  hydrogen_state.attempt_active = true;
+  hydrogen_state.attempt_from_state = stable_state;
+  hydrogen_state.attempt_id = next_attempt_id_++;
+  hydrogen_state.attempt_start_time_fs = time_fs;
+  hydrogen_state.attempt_delta_start = delta;
+  hydrogen_state.attempt_min_abs_delta = std::abs(delta);
+  hydrogen_state.pending_state = 0;
+  hydrogen_state.pending_count = 0;
+  hydrogen_state.pending_start_time_fs = 0.0;
+}
+
+const char* Proton_Tunneling::outcome_name(const AttemptOutcome outcome) const
+{
+  switch (outcome) {
+  case AttemptOutcome::success:
+    return "success";
+  case AttemptOutcome::return_to_state:
+    return "return";
+  case AttemptOutcome::geometry_lost:
+    return "geometry_lost";
+  case AttemptOutcome::run_end:
+    return "run_end";
+  }
+  return "unknown";
+}
+
+void Proton_Tunneling::finish_attempt(
+  const int hydrogen,
+  HydrogenState& hydrogen_state,
+  const AttemptOutcome outcome,
+  const double time_fs,
+  const double delta_end,
+  const GeometryResult* geometry)
+{
+  if (!hydrogen_state.attempt_active)
+    return;
+
+  const int oxygen_low = hydrogen_state.oxygen_low;
+  const int oxygen_high = hydrogen_state.oxygen_high;
+  const int oxygen_from = (hydrogen_state.attempt_from_state < 0)
+    ? oxygen_low
+    : oxygen_high;
+  const int oxygen_target = (hydrogen_state.attempt_from_state < 0)
+    ? oxygen_high
+    : oxygen_low;
+  const unsigned long long key = make_bond_key(oxygen_low, oxygen_high);
+  BondStats& total_stats = total_bonds_[key];
+  BondStats& window_stats = window_bonds_[key];
+  ++total_stats.attempts;
+  ++window_stats.attempts;
+  if (outcome == AttemptOutcome::success) {
+    ++total_stats.successes;
+    ++window_stats.successes;
+    ++total_stats.transitions;
+    ++window_stats.transitions;
+    ++window_flip_count_;
+  } else if (outcome == AttemptOutcome::return_to_state) {
+    ++total_stats.returns;
+    ++window_stats.returns;
+  } else if (outcome == AttemptOutcome::geometry_lost) {
+    ++total_stats.geometry_lost;
+    ++window_stats.geometry_lost;
+  }
+
+  fprintf(
+    attempt_file_,
+    "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e\n",
+    hydrogen_state.attempt_id,
+    hydrogen_state.attempt_start_time_fs,
+    time_fs,
+    hydrogen,
+    oxygen_low,
+    oxygen_high,
+    oxygen_from,
+    oxygen_target,
+    outcome_name(outcome),
+    hydrogen_state.attempt_delta_start,
+    hydrogen_state.attempt_min_abs_delta,
+    delta_end);
+
+  if (outcome == AttemptOutcome::success && geometry != nullptr) {
+    double dx = geometry->low_to_high_dx;
+    double dy = geometry->low_to_high_dy;
+    double dz = geometry->low_to_high_dz;
+    if (oxygen_from != geometry->oxygen_low) {
+      dx = -dx;
+      dy = -dy;
+      dz = -dz;
+    }
+    fprintf(
+      transfer_file_,
+      "%lld %.10e %.10e %d %d %d %d %d %.10e %.10e %.10e %.10e %.10e %d %d\n",
+      hydrogen_state.attempt_id,
+      hydrogen_state.attempt_start_time_fs,
+      time_fs,
+      hydrogen,
+      oxygen_from,
+      oxygen_target,
+      oxygen_low,
+      oxygen_high,
+      dx,
+      dy,
+      dz,
+      hydrogen_state.attempt_delta_start,
+      delta_end,
+      hydrogen_count_[oxygen_from],
+      hydrogen_count_[oxygen_target]);
+  }
+
+  if (outcome == AttemptOutcome::success)
+    hydrogen_state.stable_state = -hydrogen_state.attempt_from_state;
+  else if (outcome == AttemptOutcome::geometry_lost || outcome == AttemptOutcome::run_end)
+    hydrogen_state.stable_state = 0;
+  hydrogen_state.attempt_active = false;
+  hydrogen_state.attempt_from_state = 0;
+  hydrogen_state.attempt_id = 0;
+  hydrogen_state.attempt_start_time_fs = 0.0;
+  hydrogen_state.attempt_delta_start = 0.0;
+  hydrogen_state.attempt_min_abs_delta = 0.0;
+  hydrogen_state.pending_state = 0;
+  hydrogen_state.pending_count = 0;
+  hydrogen_state.pending_start_time_fs = 0.0;
 }
 
 void Proton_Tunneling::observe_frame(
@@ -291,102 +436,123 @@ void Proton_Tunneling::observe_frame(
   Atom& atom)
 {
   atom.position_per_atom.copy_to_host(cpu_position_.data());
+  if (window_sample_count_ == 0)
+    window_start_time_fs_ = time_fs;
 
-  std::vector<int> hydrogen_count(number_of_atoms_, 0);
+  std::fill(hydrogen_count_.begin(), hydrogen_count_.end(), 0);
   for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
     const int hydrogen = hydrogen_indices_[h_index];
-    int nearest_oxygen;
-    int oxygen_low;
-    int oxygen_high;
-    double delta;
-    const bool valid_geometry = find_geometry(
-      hydrogen, box, nearest_oxygen, oxygen_low, oxygen_high, delta);
-    if (nearest_oxygen >= 0)
-      ++hydrogen_count[nearest_oxygen];
+    GeometryResult geometry;
+    const bool valid_geometry = find_geometry(hydrogen, box, geometry);
+    if (geometry.nearest_oxygen >= 0)
+      ++hydrogen_count_[geometry.nearest_oxygen];
 
     HydrogenState& hydrogen_state = hydrogen_states_[h_index];
     if (!valid_geometry) {
+      if (hydrogen_state.attempt_active) {
+        finish_attempt(
+          hydrogen,
+          hydrogen_state,
+          AttemptOutcome::geometry_lost,
+          time_fs,
+          hydrogen_state.last_delta,
+          nullptr);
+      }
       hydrogen_state = HydrogenState();
       continue;
     }
 
     ++window_valid_pair_count_;
-    const int state = classify_delta(delta);
-    record_bond(window_bonds_, oxygen_low, oxygen_high, delta, state);
-    record_bond(total_bonds_, oxygen_low, oxygen_high, delta, state);
+    const int state = classify_delta(geometry.delta);
 
-    if (hydrogen_state.oxygen_low != oxygen_low || hydrogen_state.oxygen_high != oxygen_high) {
-      hydrogen_state.oxygen_low = oxygen_low;
-      hydrogen_state.oxygen_high = oxygen_high;
-      hydrogen_state.stable_state = 0;
-      hydrogen_state.pending_state = 0;
-      hydrogen_state.pending_count = 0;
-      hydrogen_state.last_delta = delta;
+    if (hydrogen_state.oxygen_low != geometry.oxygen_low ||
+        hydrogen_state.oxygen_high != geometry.oxygen_high) {
+      if (hydrogen_state.attempt_active) {
+        finish_attempt(
+          hydrogen,
+          hydrogen_state,
+          AttemptOutcome::geometry_lost,
+          time_fs,
+          hydrogen_state.last_delta,
+          nullptr);
+      }
+      hydrogen_state = HydrogenState();
+      hydrogen_state.oxygen_low = geometry.oxygen_low;
+      hydrogen_state.oxygen_high = geometry.oxygen_high;
     }
 
-    if (state == 0) {
-      hydrogen_state.pending_state = 0;
-      hydrogen_state.pending_count = 0;
-      hydrogen_state.last_delta = delta;
-      continue;
-    }
+    record_bond(window_bonds_, geometry, state);
+    record_bond(total_bonds_, geometry, state);
 
     if (hydrogen_state.stable_state == 0) {
-      if (hydrogen_state.pending_state == state) {
-        ++hydrogen_state.pending_count;
-      } else {
-        hydrogen_state.pending_state = state;
-        hydrogen_state.pending_count = 1;
-      }
-      if (hydrogen_state.pending_count >= hold_samples_) {
-        hydrogen_state.stable_state = state;
+      if (state == 0) {
         hydrogen_state.pending_state = 0;
         hydrogen_state.pending_count = 0;
+      } else {
+        if (hydrogen_state.pending_state == state) {
+          ++hydrogen_state.pending_count;
+        } else {
+          hydrogen_state.pending_state = state;
+          hydrogen_state.pending_count = 1;
+        }
+        if (hydrogen_state.pending_count >= hold_samples_) {
+          hydrogen_state.stable_state = state;
+          hydrogen_state.pending_state = 0;
+          hydrogen_state.pending_count = 0;
+        }
       }
-    } else if (state == hydrogen_state.stable_state) {
-      hydrogen_state.pending_state = 0;
-      hydrogen_state.pending_count = 0;
     } else {
-      if (hydrogen_state.pending_state == state) {
-        ++hydrogen_state.pending_count;
-      } else {
-        hydrogen_state.pending_state = state;
-        hydrogen_state.pending_count = 1;
+      if (!hydrogen_state.attempt_active && state != hydrogen_state.stable_state) {
+        // If sampling jumps across the dead band, retain the event rather than silently
+        // losing it. With a sufficiently small sample interval, normal attempts start in state 0.
+        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry.delta);
       }
-      if (hydrogen_state.pending_count >= hold_samples_) {
-        const int old_state = hydrogen_state.stable_state;
-        const int oxygen_from = (old_state < 0) ? oxygen_low : oxygen_high;
-        const int oxygen_to = (old_state < 0) ? oxygen_high : oxygen_low;
-        BondStats& total_stats = total_bonds_[make_bond_key(oxygen_low, oxygen_high)];
-        BondStats& window_stats = window_bonds_[make_bond_key(oxygen_low, oxygen_high)];
-        ++total_stats.transitions;
-        ++window_stats.transitions;
-        ++window_flip_count_;
-        fprintf(
-          transfer_file_,
-          "%.10e %d %d %d %d %d %.10e %.10e %d %d\n",
-          time_fs,
-          hydrogen,
-          oxygen_from,
-          oxygen_to,
-          oxygen_low,
-          oxygen_high,
-          hydrogen_state.last_delta,
-          delta,
-          hydrogen_count[oxygen_from],
-          hydrogen_count[oxygen_to]);
-        hydrogen_state.stable_state = state;
-        hydrogen_state.pending_state = 0;
-        hydrogen_state.pending_count = 0;
+
+      if (hydrogen_state.attempt_active) {
+        hydrogen_state.attempt_min_abs_delta = std::min(
+          hydrogen_state.attempt_min_abs_delta,
+          std::abs(geometry.delta));
+        if (state == hydrogen_state.stable_state) {
+          finish_attempt(
+            hydrogen,
+            hydrogen_state,
+            AttemptOutcome::return_to_state,
+            time_fs,
+            geometry.delta,
+            nullptr);
+        } else if (state == -hydrogen_state.attempt_from_state) {
+          if (hydrogen_state.pending_state == state) {
+            ++hydrogen_state.pending_count;
+          } else {
+            hydrogen_state.pending_state = state;
+            hydrogen_state.pending_count = 1;
+            hydrogen_state.pending_start_time_fs = time_fs;
+          }
+          if (hydrogen_state.pending_count >= hold_samples_) {
+            finish_attempt(
+              hydrogen,
+              hydrogen_state,
+              AttemptOutcome::success,
+              time_fs,
+              geometry.delta,
+              &geometry);
+          }
+        } else {
+          hydrogen_state.pending_state = 0;
+          hydrogen_state.pending_count = 0;
+          hydrogen_state.pending_start_time_fs = 0.0;
+        }
+      } else if (state == 0) {
+        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry.delta);
       }
     }
-    hydrogen_state.last_delta = delta;
+    hydrogen_state.last_delta = geometry.delta;
   }
 
   for (const int oxygen : oxygen_indices_) {
-    if (hydrogen_count[oxygen] > 2)
+    if (hydrogen_count_[oxygen] > 2)
       ++window_positive_defect_sum_;
-    else if (hydrogen_count[oxygen] < 2)
+    else if (hydrogen_count_[oxygen] < 2)
       ++window_negative_defect_sum_;
   }
 
@@ -491,12 +657,84 @@ void Proton_Tunneling::write_window(const double time_fs)
     valid_pairs_per_frame);
   fflush(bias_file_);
 
+  write_edge_window(window_start_time_fs_, time_fs);
+
   window_bonds_.clear();
   window_sample_count_ = 0;
+  window_start_time_fs_ = 0.0;
   window_flip_count_ = 0;
   window_valid_pair_count_ = 0;
   window_positive_defect_sum_ = 0;
   window_negative_defect_sum_ = 0;
+}
+
+void Proton_Tunneling::write_edge_window(
+  const double time_start_fs,
+  const double time_end_fs)
+{
+  BondStats empty_stats;
+  for (const auto& item : total_bonds_) {
+    int oxygen_low;
+    int oxygen_high;
+    decode_bond_key(item.first, oxygen_low, oxygen_high);
+    const auto window_item = window_bonds_.find(item.first);
+    const BondStats& stats = (window_item == window_bonds_.end())
+      ? empty_stats
+      : window_item->second;
+    const long long biased_samples = stats.n_plus + stats.n_minus;
+    const long long completed_attempts = stats.successes + stats.returns;
+    const double geometry_occupancy = static_cast<double>(stats.geometry_samples) /
+      window_sample_count_;
+    const double asymmetry = (biased_samples > 0)
+      ? static_cast<double>(stats.n_plus - stats.n_minus) / static_cast<double>(biased_samples)
+      : std::numeric_limits<double>::quiet_NaN();
+    const double delta_f = (stats.n_plus > 0 && stats.n_minus > 0)
+      ? std::abs(std::log(static_cast<double>(stats.n_plus) /
+                          static_cast<double>(stats.n_minus)))
+      : std::numeric_limits<double>::quiet_NaN();
+    const double success_probability = (completed_attempts > 0)
+      ? static_cast<double>(stats.successes) / static_cast<double>(completed_attempts)
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_delta = (stats.geometry_samples > 0)
+      ? stats.sum_delta / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_abs_delta = (stats.geometry_samples > 0)
+      ? stats.sum_abs_delta / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_dOO = (stats.geometry_samples > 0)
+      ? stats.sum_dOO / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_rperp = (stats.geometry_samples > 0)
+      ? stats.sum_rperp / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    fprintf(
+      edge_window_file_,
+      "%lld %.10e %.10e %d %d %.10e %lld %lld %lld %.10e %.10e %.10e "
+      "%lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e\n",
+      window_id_,
+      time_start_fs,
+      time_end_fs,
+      oxygen_low,
+      oxygen_high,
+      geometry_occupancy,
+      stats.n_plus,
+      stats.n_minus,
+      stats.n_deadband,
+      asymmetry,
+      std::abs(asymmetry),
+      delta_f,
+      stats.attempts,
+      stats.successes,
+      stats.returns,
+      stats.geometry_lost,
+      success_probability,
+      mean_delta,
+      mean_abs_delta,
+      mean_dOO,
+      mean_rperp);
+  }
+  fflush(edge_window_file_);
+  ++window_id_;
 }
 
 void Proton_Tunneling::write_final_bonds()
@@ -546,14 +784,30 @@ void Proton_Tunneling::postprocess(
   if (!initialized_)
     return;
 
+  for (size_t h_index = 0; h_index < hydrogen_states_.size(); ++h_index) {
+    HydrogenState& hydrogen_state = hydrogen_states_[h_index];
+    if (hydrogen_state.attempt_active) {
+      finish_attempt(
+        hydrogen_indices_[h_index],
+        hydrogen_state,
+        AttemptOutcome::run_end,
+        last_time_fs_,
+        hydrogen_state.last_delta,
+        nullptr);
+    }
+  }
   if (window_sample_count_ > 0)
     write_window(last_time_fs_);
   write_final_bonds();
   fclose(bias_file_);
   fclose(transfer_file_);
+  fclose(attempt_file_);
+  fclose(edge_window_file_);
   fclose(bond_file_);
   bias_file_ = nullptr;
   transfer_file_ = nullptr;
+  attempt_file_ = nullptr;
+  edge_window_file_ = nullptr;
   bond_file_ = nullptr;
   initialized_ = false;
 }
