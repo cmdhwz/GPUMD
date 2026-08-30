@@ -54,6 +54,13 @@
 #define gpuStreamCreate hipStreamCreate
 #define gpuStreamDestroy hipStreamDestroy
 
+// events
+#define gpuEvent_t hipEvent_t
+#define gpuEventCreate hipEventCreate
+#define gpuEventDestroy hipEventDestroy
+#define gpuEventRecord hipEventRecord
+#define gpuEventElapsedTime hipEventElapsedTime
+
 // random numbers
 #define gpurandState hiprandState
 #define gpurand_normal_double hiprand_normal_double
@@ -142,6 +149,13 @@
 #define gpuStream_t cudaStream_t
 #define gpuStreamCreate cudaStreamCreate
 #define gpuStreamDestroy cudaStreamDestroy
+
+// events
+#define gpuEvent_t cudaEvent_t
+#define gpuEventCreate cudaEventCreate
+#define gpuEventDestroy cudaEventDestroy
+#define gpuEventRecord cudaEventRecord
+#define gpuEventElapsedTime cudaEventElapsedTime
 
 // random numbers
 #define gpurandState curandState

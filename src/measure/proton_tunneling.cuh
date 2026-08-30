@@ -20,6 +20,32 @@
 #include <unordered_map>
 #include <vector>
 
+struct GeometryResultGPU
+{
+  int valid;
+  int assignment_ambiguous;
+  int pair_conflict;
+  int nearest_oxygen;
+  int oxygen_low;
+  int oxygen_high;
+  int candidate_count;
+  double delta;
+  double dOO;
+  double rperp;
+  double path_excess;
+  double assignment_score;
+  double second_assignment_score;
+  double assignment_score_gap;
+  double low_to_high_dx;
+  double low_to_high_dy;
+  double low_to_high_dz;
+  double E_ion_nominal_parallel;
+  int nearest_ion_id;
+  double nearest_ion_distance;
+  double nearest_ion1_distance;
+  double nearest_ion2_distance;
+};
+
 class Proton_Tunneling : public Property
 {
 public:
@@ -256,6 +282,9 @@ private:
 
   void parse(const char** param, const int num_param, const Atom& atom);
   void build_oxygen_shell(const Box& box);
+  void initialize_geometry_gpu();
+  void compute_geometry_gpu(const Box& box, Atom& atom);
+  void release_geometry_timing_events();
   void compute_ion_field(const Box& box, GeometryResult& geometry) const;
   bool ensure_bead_positions(Atom& atom);
   bool evaluate_bead_diagnostic(
@@ -338,8 +367,19 @@ private:
   std::vector<int> ion2_indices_;
   std::vector<int> oxygen_local_index_;
   std::vector<std::vector<int>> oxygen_shell_neighbors_;
+  std::vector<int> oxygen_shell_offsets_cpu_;
+  std::vector<int> oxygen_shell_neighbors_cpu_;
+  GPU_Vector<int> oxygen_indices_gpu_;
+  GPU_Vector<int> hydrogen_indices_gpu_;
+  GPU_Vector<int> oxygen_local_index_gpu_;
+  GPU_Vector<int> oxygen_shell_offsets_gpu_;
+  GPU_Vector<int> oxygen_shell_neighbors_gpu_;
+  GPU_Vector<int> ion1_indices_gpu_;
+  GPU_Vector<int> ion2_indices_gpu_;
+  GPU_Vector<GeometryResultGPU> frame_geometries_gpu_;
   std::vector<double> cpu_position_;
   std::vector<double> cpu_position_beads_;
+  std::vector<GeometryResultGPU> cpu_geometry_gpu_;
   std::vector<double*> bead_position_ptrs_cpu_;
   GPU_Vector<double*> bead_position_ptrs_gpu_;
   GPU_Vector<double> bead_position_staging_gpu_;
@@ -352,6 +392,11 @@ private:
   double bead_copy_wall_time_ = 0.0;
   double bead_analysis_wall_time_ = 0.0;
   double total_observer_wall_time_ = 0.0;
+  double geometry_kernel_wall_time_ = 0.0;
+  double geometry_D2H_wall_time_ = 0.0;
+  double state_machine_wall_time_ = 0.0;
+  gpuEvent_t geometry_kernel_start_event_ = nullptr;
+  gpuEvent_t geometry_kernel_end_event_ = nullptr;
   std::vector<int> hydrogen_count_;
   std::vector<int> previous_hydrogen_count_;
   std::vector<int> event_hydrogen_count_;

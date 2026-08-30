@@ -66,6 +66,298 @@ __global__ void pack_bead_positions(
     packed_positions[static_cast<size_t>(bead) * position_size + component] =
       position_beads[bead][component];
 }
+
+__device__ bool geometry_candidate_is_better(
+  const GeometryResultGPU& first,
+  const GeometryResultGPU& second)
+{
+  if (first.assignment_score != second.assignment_score)
+    return first.assignment_score < second.assignment_score;
+  return first.rperp < second.rperp;
+}
+
+__device__ void compute_ion_field_gpu(
+  const double* position,
+  const int number_of_atoms,
+  const Box& box,
+  const GeometryResultGPU& base_geometry,
+  const int* ion1_indices,
+  const int ion1_count,
+  const double ion1_charge,
+  const int* ion2_indices,
+  const int ion2_count,
+  const double ion2_charge,
+  const double ion_field_cutoff,
+  GeometryResultGPU& geometry)
+{
+  geometry.E_ion_nominal_parallel = 0.0;
+  geometry.nearest_ion_id = -1;
+  geometry.nearest_ion_distance = 1.0e300;
+  geometry.nearest_ion1_distance = 1.0e300;
+  geometry.nearest_ion2_distance = 1.0e300;
+  const double inverse_dOO = 1.0 / base_geometry.dOO;
+  const double ex = base_geometry.low_to_high_dx * inverse_dOO;
+  const double ey = base_geometry.low_to_high_dy * inverse_dOO;
+  const double ez = base_geometry.low_to_high_dz * inverse_dOO;
+
+  for (int species = 0; species < 2; ++species) {
+    const int* ions = (species == 0) ? ion1_indices : ion2_indices;
+    const int ion_count = (species == 0) ? ion1_count : ion2_count;
+    const double charge = (species == 0) ? ion1_charge : ion2_charge;
+    double& nearest_species_distance = (species == 0)
+      ? geometry.nearest_ion1_distance
+      : geometry.nearest_ion2_distance;
+    for (int i = 0; i < ion_count; ++i) {
+      const int ion = ions[i];
+      double ion_dx = position[ion] - position[base_geometry.oxygen_low];
+      double ion_dy = position[ion + number_of_atoms] -
+        position[base_geometry.oxygen_low + number_of_atoms];
+      double ion_dz = position[ion + 2 * number_of_atoms] -
+        position[base_geometry.oxygen_low + 2 * number_of_atoms];
+      apply_mic(box, ion_dx, ion_dy, ion_dz);
+      double midpoint_to_ion_x = 0.5 * base_geometry.low_to_high_dx - ion_dx;
+      double midpoint_to_ion_y = 0.5 * base_geometry.low_to_high_dy - ion_dy;
+      double midpoint_to_ion_z = 0.5 * base_geometry.low_to_high_dz - ion_dz;
+      apply_mic(box, midpoint_to_ion_x, midpoint_to_ion_y, midpoint_to_ion_z);
+      const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
+        midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
+      const double distance = sqrt(distance_square);
+      if (distance < nearest_species_distance)
+        nearest_species_distance = distance;
+      if (distance < geometry.nearest_ion_distance) {
+        geometry.nearest_ion_distance = distance;
+        geometry.nearest_ion_id = ion;
+      }
+      if (distance <= ion_field_cutoff && distance > 1.0e-12) {
+        geometry.E_ion_nominal_parallel += K_C * charge *
+          (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
+          (distance_square * distance);
+      }
+    }
+  }
+}
+
+__global__ void gpu_find_proton_geometry(
+  const double* position,
+  const int number_of_atoms,
+  const int* oxygen_indices,
+  const int number_of_oxygen,
+  const int* hydrogen_indices,
+  const int* oxygen_local_index,
+  const int* shell_offsets,
+  const int* shell_neighbors,
+  const int* ion1_indices,
+  const int ion1_count,
+  const double ion1_charge,
+  const int* ion2_indices,
+  const int ion2_count,
+  const double ion2_charge,
+  const Box box,
+  const double dOO_min,
+  const double dOO_max,
+  const double rperp_max,
+  const double angle_cosine_limit,
+  const double assignment_path_excess_weight,
+  const double assignment_score_gap_min,
+  const int ion_field_enabled,
+  const double ion_field_cutoff,
+  GeometryResultGPU* output)
+{
+  const int hydrogen_index = blockIdx.x;
+  const int hydrogen = hydrogen_indices[hydrogen_index];
+  const int thread = threadIdx.x;
+  __shared__ double nearest_distance_square[128];
+  __shared__ int nearest_oxygen[128];
+  __shared__ GeometryResultGPU candidate_results[8];
+  __shared__ int candidate_valid[8];
+
+  double local_distance_square = 1.0e300;
+  int local_oxygen = -1;
+  const double hx = position[hydrogen];
+  const double hy = position[hydrogen + number_of_atoms];
+  const double hz = position[hydrogen + 2 * number_of_atoms];
+  for (int i = thread; i < number_of_oxygen; i += blockDim.x) {
+    const int oxygen = oxygen_indices[i];
+    double dx = position[oxygen] - hx;
+    double dy = position[oxygen + number_of_atoms] - hy;
+    double dz = position[oxygen + 2 * number_of_atoms] - hz;
+    apply_mic(box, dx, dy, dz);
+    const double distance_square = dx * dx + dy * dy + dz * dz;
+    if (distance_square < local_distance_square ||
+        (distance_square == local_distance_square && oxygen < local_oxygen)) {
+      local_distance_square = distance_square;
+      local_oxygen = oxygen;
+    }
+  }
+  nearest_distance_square[thread] = local_distance_square;
+  nearest_oxygen[thread] = local_oxygen;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (thread < stride) {
+      const double other_distance_square = nearest_distance_square[thread + stride];
+      const int other_oxygen = nearest_oxygen[thread + stride];
+      if (other_distance_square < nearest_distance_square[thread] ||
+          (other_distance_square == nearest_distance_square[thread] &&
+           other_oxygen >= 0 &&
+           (nearest_oxygen[thread] < 0 || other_oxygen < nearest_oxygen[thread]))) {
+        nearest_distance_square[thread] = other_distance_square;
+        nearest_oxygen[thread] = other_oxygen;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (thread == 0) {
+    GeometryResultGPU empty_geometry = {};
+    empty_geometry.nearest_oxygen = nearest_oxygen[0];
+    empty_geometry.nearest_ion_id = -1;
+    output[hydrogen_index] = empty_geometry;
+  }
+  __syncthreads();
+  const int first_oxygen = nearest_oxygen[0];
+  if (first_oxygen < 0)
+    return;
+
+  const int anchor_local = (first_oxygen < number_of_atoms)
+    ? oxygen_local_index[first_oxygen]
+    : -1;
+  const int shell_begin = (anchor_local >= 0) ? shell_offsets[anchor_local] : 0;
+  const int shell_end = (anchor_local >= 0) ? shell_offsets[anchor_local + 1] : 0;
+  const int shell_size = (shell_end - shell_begin < 8)
+    ? (shell_end - shell_begin)
+    : 8;
+  if (thread < 8) {
+    candidate_results[thread] = {};
+    candidate_valid[thread] = 0;
+  }
+  __syncthreads();
+
+  if (thread < shell_size) {
+    const int second_oxygen = shell_neighbors[shell_begin + thread];
+    const int second_local = (second_oxygen < number_of_atoms)
+      ? oxygen_local_index[second_oxygen]
+      : -1;
+    bool mutual_neighbor = false;
+    if (second_local >= 0) {
+      for (int i = shell_offsets[second_local]; i < shell_offsets[second_local + 1]; ++i) {
+        if (shell_neighbors[i] == first_oxygen) {
+          mutual_neighbor = true;
+          break;
+        }
+      }
+    }
+    if (mutual_neighbor) {
+      GeometryResultGPU candidate = {};
+      candidate.nearest_oxygen = first_oxygen;
+      candidate.nearest_ion_id = -1;
+      candidate.oxygen_low = (first_oxygen < second_oxygen) ? first_oxygen : second_oxygen;
+      candidate.oxygen_high = (first_oxygen < second_oxygen) ? second_oxygen : first_oxygen;
+      double ox = position[candidate.oxygen_high] - position[candidate.oxygen_low];
+      double oy = position[candidate.oxygen_high + number_of_atoms] -
+        position[candidate.oxygen_low + number_of_atoms];
+      double oz = position[candidate.oxygen_high + 2 * number_of_atoms] -
+        position[candidate.oxygen_low + 2 * number_of_atoms];
+      apply_mic(box, ox, oy, oz);
+      const double dOO_square = ox * ox + oy * oy + oz * oz;
+      if (dOO_square >= dOO_min * dOO_min && dOO_square <= dOO_max * dOO_max) {
+        candidate.dOO = sqrt(dOO_square);
+        candidate.low_to_high_dx = ox;
+        candidate.low_to_high_dy = oy;
+        candidate.low_to_high_dz = oz;
+
+        double hx_from_low = hx - position[candidate.oxygen_low];
+        double hy_from_low = hy - position[candidate.oxygen_low + number_of_atoms];
+        double hz_from_low = hz - position[candidate.oxygen_low + 2 * number_of_atoms];
+        apply_mic(box, hx_from_low, hy_from_low, hz_from_low);
+        const double projection = (hx_from_low * ox + hy_from_low * oy + hz_from_low * oz) /
+          dOO_square;
+        if (projection >= -1.0e-10 && projection <= 1.0 + 1.0e-10) {
+          const double px = hx_from_low - projection * ox;
+          const double py = hy_from_low - projection * oy;
+          const double pz = hz_from_low - projection * oz;
+          candidate.rperp = sqrt(fmax(0.0, px * px + py * py + pz * pz));
+          if (candidate.rperp <= rperp_max) {
+            double low_x = position[candidate.oxygen_low] - hx;
+            double low_y = position[candidate.oxygen_low + number_of_atoms] - hy;
+            double low_z = position[candidate.oxygen_low + 2 * number_of_atoms] - hz;
+            double high_x = position[candidate.oxygen_high] - hx;
+            double high_y = position[candidate.oxygen_high + number_of_atoms] - hy;
+            double high_z = position[candidate.oxygen_high + 2 * number_of_atoms] - hz;
+            apply_mic(box, low_x, low_y, low_z);
+            apply_mic(box, high_x, high_y, high_z);
+            const double low_distance = sqrt(low_x * low_x + low_y * low_y + low_z * low_z);
+            const double high_distance = sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
+            if (low_distance > 0.0 && high_distance > 0.0 &&
+                low_distance <= 1.60 && high_distance <= 1.60) {
+              const double angle_cosine = (low_x * high_x + low_y * high_y + low_z * high_z) /
+                (low_distance * high_distance);
+              if (angle_cosine <= angle_cosine_limit) {
+                candidate.delta = low_distance - high_distance;
+                candidate.path_excess = fmax(0.0,
+                  low_distance + high_distance - candidate.dOO);
+                candidate.assignment_score = candidate.rperp +
+                  assignment_path_excess_weight * candidate.path_excess;
+                if (ion_field_enabled != 0) {
+                  compute_ion_field_gpu(
+                    position,
+                    number_of_atoms,
+                    box,
+                    candidate,
+                    ion1_indices,
+                    ion1_count,
+                    ion1_charge,
+                    ion2_indices,
+                    ion2_count,
+                    ion2_charge,
+                    ion_field_cutoff,
+                    candidate);
+                }
+                candidate.valid = 1;
+                candidate_valid[thread] = 1;
+                candidate_results[thread] = candidate;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (thread == 0) {
+    int best_candidate = -1;
+    int second_candidate = -1;
+    int candidate_count = 0;
+    for (int i = 0; i < shell_size; ++i) {
+      if (candidate_valid[i] == 0)
+        continue;
+      ++candidate_count;
+      if (best_candidate < 0 ||
+          geometry_candidate_is_better(candidate_results[i], candidate_results[best_candidate])) {
+        second_candidate = best_candidate;
+        best_candidate = i;
+      } else if (second_candidate < 0 ||
+                 geometry_candidate_is_better(candidate_results[i], candidate_results[second_candidate])) {
+        second_candidate = i;
+      }
+    }
+    if (best_candidate >= 0) {
+      GeometryResultGPU selected = candidate_results[best_candidate];
+      selected.candidate_count = candidate_count;
+      selected.second_assignment_score = (second_candidate >= 0)
+        ? candidate_results[second_candidate].assignment_score
+        : 1.0e300;
+      selected.assignment_score_gap = selected.second_assignment_score -
+        selected.assignment_score;
+      selected.assignment_ambiguous = (candidate_count > 1 &&
+        selected.assignment_score_gap < assignment_score_gap_min) ? 1 : 0;
+      selected.pair_conflict = 0;
+      selected.valid = (selected.assignment_ambiguous == 0) ? 1 : 0;
+      output[hydrogen_index] = selected;
+    }
+  }
+}
 }
 
 Proton_Tunneling::Proton_Tunneling(
@@ -233,7 +525,6 @@ void Proton_Tunneling::preprocess(
   (void)number_of_steps;
   (void)integrate;
   (void)group;
-  (void)box;
   (void)force;
 
   number_of_atoms_ = atom.number_of_atoms;
@@ -248,6 +539,9 @@ void Proton_Tunneling::preprocess(
   bead_copy_wall_time_ = 0.0;
   bead_analysis_wall_time_ = 0.0;
   total_observer_wall_time_ = 0.0;
+  geometry_kernel_wall_time_ = 0.0;
+  geometry_D2H_wall_time_ = 0.0;
+  state_machine_wall_time_ = 0.0;
   oxygen_local_index_.assign(number_of_atoms_, -1);
   oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
@@ -267,12 +561,17 @@ void Proton_Tunneling::preprocess(
   defect_records_.reserve(1024);
   window_records_.reserve(64);
   edge_window_records_.reserve(1024);
+  atom.position_per_atom.copy_to_host(cpu_position_.data());
+  build_oxygen_shell(box);
+  initialize_geometry_gpu();
+  CHECK(gpuEventCreate(&geometry_kernel_start_event_));
+  CHECK(gpuEventCreate(&geometry_kernel_end_event_));
   initialized_ = true;
 }
 
 void Proton_Tunneling::build_oxygen_shell(const Box& box)
 {
-  // ponytail: rebuild the small-box O shell with O(N_O^2) CPU distances; use a shared
+  // ponytail: build the initial O shell once with O(N_O^2) CPU distances; use a shared
   // neighbor list if this observer is later applied to large systems.
   oxygen_shell_neighbors_.assign(oxygen_indices_.size(), std::vector<int>());
   std::fill(oxygen_local_index_.begin(), oxygen_local_index_.end(), -1);
@@ -300,6 +599,128 @@ void Proton_Tunneling::build_oxygen_shell(const Box& box)
     oxygen_shell_neighbors_[i].reserve(shell_size);
     for (int j = 0; j < shell_size; ++j)
       oxygen_shell_neighbors_[i].push_back(distances[j].second);
+  }
+
+  oxygen_shell_offsets_cpu_.assign(oxygen_indices_.size() + 1, 0);
+  oxygen_shell_neighbors_cpu_.clear();
+  for (size_t i = 0; i < oxygen_shell_neighbors_.size(); ++i) {
+    oxygen_shell_neighbors_cpu_.insert(
+      oxygen_shell_neighbors_cpu_.end(),
+      oxygen_shell_neighbors_[i].begin(),
+      oxygen_shell_neighbors_[i].end());
+    oxygen_shell_offsets_cpu_[i + 1] =
+      static_cast<int>(oxygen_shell_neighbors_cpu_.size());
+  }
+}
+
+void Proton_Tunneling::initialize_geometry_gpu()
+{
+  oxygen_indices_gpu_.resize(oxygen_indices_.size());
+  oxygen_indices_gpu_.copy_from_host(oxygen_indices_.data());
+  hydrogen_indices_gpu_.resize(hydrogen_indices_.size());
+  hydrogen_indices_gpu_.copy_from_host(hydrogen_indices_.data());
+  oxygen_local_index_gpu_.resize(oxygen_local_index_.size());
+  oxygen_local_index_gpu_.copy_from_host(oxygen_local_index_.data());
+  oxygen_shell_offsets_gpu_.resize(oxygen_shell_offsets_cpu_.size());
+  oxygen_shell_offsets_gpu_.copy_from_host(oxygen_shell_offsets_cpu_.data());
+  if (!oxygen_shell_neighbors_cpu_.empty()) {
+    oxygen_shell_neighbors_gpu_.resize(oxygen_shell_neighbors_cpu_.size());
+    oxygen_shell_neighbors_gpu_.copy_from_host(oxygen_shell_neighbors_cpu_.data());
+  }
+  if (ion_field_enabled_) {
+    ion1_indices_gpu_.resize(ion1_indices_.size());
+    ion1_indices_gpu_.copy_from_host(ion1_indices_.data());
+    ion2_indices_gpu_.resize(ion2_indices_.size());
+    ion2_indices_gpu_.copy_from_host(ion2_indices_.data());
+  }
+  frame_geometries_gpu_.resize(frame_geometries_.size());
+  cpu_geometry_gpu_.resize(frame_geometries_.size());
+}
+
+void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
+{
+  const int number_of_hydrogens = static_cast<int>(hydrogen_indices_.size());
+  const auto total_start = std::chrono::high_resolution_clock::now();
+  CHECK(gpuEventRecord(geometry_kernel_start_event_, 0));
+  gpu_find_proton_geometry<<<number_of_hydrogens, 128>>>(
+    atom.position_per_atom.data(),
+    number_of_atoms_,
+    oxygen_indices_gpu_.data(),
+    static_cast<int>(oxygen_indices_.size()),
+    hydrogen_indices_gpu_.data(),
+    oxygen_local_index_gpu_.data(),
+    oxygen_shell_offsets_gpu_.data(),
+    oxygen_shell_neighbors_cpu_.empty() ? nullptr : oxygen_shell_neighbors_gpu_.data(),
+    ion_field_enabled_ ? ion1_indices_gpu_.data() : nullptr,
+    ion_field_enabled_ ? static_cast<int>(ion1_indices_.size()) : 0,
+    ion1_charge_,
+    ion_field_enabled_ ? ion2_indices_gpu_.data() : nullptr,
+    ion_field_enabled_ ? static_cast<int>(ion2_indices_.size()) : 0,
+    ion2_charge_,
+    box,
+    dOO_min_,
+    dOO_max_,
+    rperp_max_,
+    std::cos(oho_angle_min_deg_ * 0.017453292519943295),
+    assignment_path_excess_weight_,
+    assignment_score_gap_min_,
+    ion_field_enabled_ ? 1 : 0,
+    ion_field_cutoff_,
+    frame_geometries_gpu_.data());
+  GPU_CHECK_KERNEL
+  CHECK(gpuEventRecord(geometry_kernel_end_event_, 0));
+  frame_geometries_gpu_.copy_to_host(cpu_geometry_gpu_.data());
+  const auto total_end = std::chrono::high_resolution_clock::now();
+
+  float kernel_time_ms = 0.0f;
+  CHECK(gpuEventElapsedTime(
+    &kernel_time_ms,
+    geometry_kernel_start_event_,
+    geometry_kernel_end_event_));
+  const double total_time =
+    std::chrono::duration<double>(total_end - total_start).count();
+  const double kernel_time = static_cast<double>(kernel_time_ms) * 1.0e-3;
+  geometry_kernel_wall_time_ += kernel_time;
+  geometry_D2H_wall_time_ += std::max(0.0, total_time - kernel_time);
+
+  for (size_t i = 0; i < frame_geometries_.size(); ++i) {
+    const GeometryResultGPU& source = cpu_geometry_gpu_[i];
+    GeometryResult& target = frame_geometries_[i];
+    target = GeometryResult();
+    target.valid = source.valid != 0;
+    target.assignment_ambiguous = source.assignment_ambiguous != 0;
+    target.pair_conflict = source.pair_conflict != 0;
+    target.nearest_oxygen = source.nearest_oxygen;
+    target.oxygen_low = source.oxygen_low;
+    target.oxygen_high = source.oxygen_high;
+    target.candidate_count = source.candidate_count;
+    target.delta = source.delta;
+    target.dOO = source.dOO;
+    target.rperp = source.rperp;
+    target.path_excess = source.path_excess;
+    target.assignment_score = source.assignment_score;
+    target.second_assignment_score = source.second_assignment_score;
+    target.assignment_score_gap = source.assignment_score_gap;
+    target.low_to_high_dx = source.low_to_high_dx;
+    target.low_to_high_dy = source.low_to_high_dy;
+    target.low_to_high_dz = source.low_to_high_dz;
+    target.E_ion_nominal_parallel = source.E_ion_nominal_parallel;
+    target.nearest_ion_id = source.nearest_ion_id;
+    target.nearest_ion_distance = source.nearest_ion_distance;
+    target.nearest_ion1_distance = source.nearest_ion1_distance;
+    target.nearest_ion2_distance = source.nearest_ion2_distance;
+  }
+}
+
+void Proton_Tunneling::release_geometry_timing_events()
+{
+  if (geometry_kernel_start_event_ != nullptr) {
+    CHECK(gpuEventDestroy(geometry_kernel_start_event_));
+    geometry_kernel_start_event_ = nullptr;
+  }
+  if (geometry_kernel_end_event_ != nullptr) {
+    CHECK(gpuEventDestroy(geometry_kernel_end_event_));
+    geometry_kernel_end_event_ = nullptr;
   }
 }
 
@@ -884,7 +1305,6 @@ void Proton_Tunneling::observe_frame(
 {
   const auto observer_start = std::chrono::high_resolution_clock::now();
   ++observer_frame_count_;
-  atom.position_per_atom.copy_to_host(cpu_position_.data());
   bead_positions_cached_ = false;
   cached_number_of_beads_ = 0;
   if (window_sample_count_ == 0)
@@ -892,14 +1312,11 @@ void Proton_Tunneling::observe_frame(
 
   std::fill(hydrogen_count_.begin(), hydrogen_count_.end(), 0);
   std::fill(frame_cause_event_ids_.begin(), frame_cause_event_ids_.end(), -1);
-  build_oxygen_shell(box);
-  for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
-    const int hydrogen = hydrogen_indices_[h_index];
-    GeometryResult& geometry = frame_geometries_[h_index];
-    find_geometry(hydrogen, box, geometry);
+  compute_geometry_gpu(box, atom);
+  const auto state_machine_start = std::chrono::high_resolution_clock::now();
+  for (const GeometryResult& geometry : frame_geometries_)
     if (geometry.nearest_oxygen >= 0)
       ++hydrogen_count_[geometry.nearest_oxygen];
-  }
 
   std::unordered_map<unsigned long long, int> pair_assignment_counts;
   for (const GeometryResult& geometry : frame_geometries_) {
@@ -1092,6 +1509,8 @@ void Proton_Tunneling::observe_frame(
   if (window_sample_count_ == window_samples_)
     write_window(time_fs);
   const auto observer_end = std::chrono::high_resolution_clock::now();
+  state_machine_wall_time_ +=
+    std::chrono::duration<double>(observer_end - state_machine_start).count();
   total_observer_wall_time_ +=
     std::chrono::duration<double>(observer_end - observer_start).count();
 }
@@ -1581,6 +2000,7 @@ void Proton_Tunneling::postprocess(
   if (window_sample_count_ > 0)
     write_window(last_time_fs_);
   write_output_files();
+  release_geometry_timing_events();
   printf("Proton tunneling observer timing:\n");
   printf("    sampled observer frames: %lld\n", observer_frame_count_);
   if (bead_diagnostic_enabled_) {
@@ -1590,6 +2010,9 @@ void Proton_Tunneling::postprocess(
     printf("    bead pack + D2H wall time: %.6f s\n", bead_copy_wall_time_);
     printf("    bead analysis wall time: %.6f s\n", bead_analysis_wall_time_);
   }
+  printf("    geometry kernel wall time: %.6f s\n", geometry_kernel_wall_time_);
+  printf("    geometry D2H + host copy wall time: %.6f s\n", geometry_D2H_wall_time_);
+  printf("    CPU state-machine wall time: %.6f s\n", state_machine_wall_time_);
   printf("    total observer wall time: %.6f s\n", total_observer_wall_time_);
   initialized_ = false;
 }

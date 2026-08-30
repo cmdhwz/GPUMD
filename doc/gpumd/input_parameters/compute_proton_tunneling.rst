@@ -173,9 +173,14 @@ The bead coordinates are packed on the GPU into one staging buffer and copied to
 one synchronous transfer per sampled frame that needs a bead probe. This preserves the
 diagnostic result while avoiding one synchronization and device-to-host transfer per bead.
 At the end of the run, the observer prints the sampled-frame count, bead-probe-frame count,
-packed-copy count, copied bytes, pack-plus-copy wall time, bead-analysis wall time, and total
-observer wall time. The copy timing includes the packing kernel and the synchronous device-to-host
-copy; it does not include the force or integrator paths.
+packed-copy count, copied bytes, pack-plus-copy wall time, bead-analysis wall time, geometry-kernel
+wall time, compact geometry D2H/host-copy wall time, CPU state-machine wall time, and total observer
+wall time. The copy timing
+includes the packing kernel and the synchronous device-to-host copy; it does not include the force
+or integrator paths. The geometry shell used by the GPU observer is built once from the initial
+centroid structure; this fixed-topology optimization is intended for fixed-volume RPMD/NVE
+trajectories. Strongly deforming NPT or structure-search runs require a shell-rebuild policy
+before using this optimization.
 
 Use ``compute_proton_tunneling`` first in a short validation run and compare its pair/state
 assignment with the existing Python trajectory script. The transfer and defect streams are
