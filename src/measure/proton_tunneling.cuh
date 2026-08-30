@@ -57,6 +57,32 @@ public:
     const double temperature) override;
 
 private:
+  enum class QuantumCharacter
+  {
+    CLASSICAL_ONLY,
+    TUNNELING_LIKE,
+    OVERBARRIER_LIKE,
+    AMBIGUOUS
+  };
+
+  struct BeadDiagnostic
+  {
+    bool valid = false;
+    int num_beads = 0;
+    int n_minus = 0;
+    int n_zero = 0;
+    int n_plus = 0;
+    int kink_count = 0;
+    double probe_time_fs = 0.0;
+    double delta_centroid = 0.0;
+    double mean_delta = 0.0;
+    double sigma_delta = 0.0;
+    double delta_min = 0.0;
+    double delta_max = 0.0;
+    double span = 0.0;
+    QuantumCharacter character = QuantumCharacter::AMBIGUOUS;
+  };
+
   enum class AttemptOutcome
   {
     success,
@@ -137,11 +163,22 @@ private:
     double attempt_E_start = 0.0;
     double attempt_min_abs_delta = 0.0;
     double pending_start_time_fs = 0.0;
+    BeadDiagnostic best_bead_diagnostic;
   };
 
   void parse(const char** param, const int num_param, const Atom& atom);
   void build_oxygen_shell(const Box& box);
   void compute_ion_field(const Box& box, GeometryResult& geometry) const;
+  bool ensure_bead_positions(Atom& atom);
+  bool evaluate_bead_diagnostic(
+    Atom& atom,
+    const Box& box,
+    const int hydrogen,
+    const GeometryResult& geometry,
+    const double probe_time_fs,
+    BeadDiagnostic& diagnostic);
+  QuantumCharacter classify_quantum_character(const BeadDiagnostic& diagnostic) const;
+  const char* quantum_character_name(const QuantumCharacter character) const;
   bool find_geometry(
     const int hydrogen,
     const Box& box,
@@ -187,6 +224,9 @@ private:
   double dOO_max_ = 2.60;
   double rperp_max_ = 0.80;
   double oho_angle_min_deg_ = 120.0;
+  bool bead_diagnostic_enabled_ = false;
+  double bead_f_min_ = 0.20;
+  double bead_span_min_ = 0.20;
   int oxygen_shell_k_ = 8;
   double assignment_path_excess_weight_ = 0.50;
   double assignment_score_gap_min_ = 0.05;
@@ -210,6 +250,9 @@ private:
   std::vector<int> oxygen_local_index_;
   std::vector<std::vector<int>> oxygen_shell_neighbors_;
   std::vector<double> cpu_position_;
+  std::vector<double> cpu_position_beads_;
+  bool bead_positions_cached_ = false;
+  int cached_number_of_beads_ = 0;
   std::vector<int> hydrogen_count_;
   std::vector<int> previous_hydrogen_count_;
   std::vector<int> event_hydrogen_count_;
@@ -223,6 +266,7 @@ private:
   FILE* bias_file_ = nullptr;
   FILE* transfer_file_ = nullptr;
   FILE* attempt_file_ = nullptr;
+  FILE* bead_event_file_ = nullptr;
   FILE* defect_file_ = nullptr;
   FILE* edge_window_file_ = nullptr;
   FILE* bond_file_ = nullptr;

@@ -14,7 +14,8 @@
 */
 
 /*-----------------------------------------------------------------------------------------------100
-Track centroid O-H-O geometry, local proton-state bias, and persistent state changes.
+Track centroid O-H-O geometry, local proton-state bias, persistent state changes, and optional
+bead-resolved tunneling-like event diagnostics.
 
 This is deliberately an observer. It does not alter the NEP/qNEP energy, force, charge, or
 heat-current paths. The sparse transfer and defect streams can be reconstructed into defect
@@ -92,7 +93,8 @@ void Proton_Tunneling::parse(
   }
   int next_param = 8;
   const auto is_option = [](const char* value) {
-    return std::strcmp(value, "ion_field") == 0 || std::strcmp(value, "oho_angle") == 0;
+    return std::strcmp(value, "ion_field") == 0 || std::strcmp(value, "oho_angle") == 0 ||
+      std::strcmp(value, "bead_diagnostic") == 0;
   };
   if (next_param < num_param && !is_option(param[next_param])) {
     if (next_param + 1 >= num_param || is_option(param[next_param + 1])) {
@@ -102,6 +104,7 @@ void Proton_Tunneling::parse(
     hydrogen_symbol_ = param[next_param++];
   }
   bool angle_seen = false;
+  bool bead_diagnostic_seen = false;
   while (next_param < num_param) {
     if (std::strcmp(param[next_param], "oho_angle") == 0) {
       if (angle_seen || next_param + 1 >= num_param ||
@@ -128,12 +131,34 @@ void Proton_Tunneling::parse(
         PRINT_INPUT_ERROR("ion_field cutoff should be a positive number.");
       }
       next_param += 6;
+    } else if (std::strcmp(param[next_param], "bead_diagnostic") == 0) {
+      if (bead_diagnostic_seen) {
+        PRINT_INPUT_ERROR("bead_diagnostic may only be specified once.");
+      }
+      bead_diagnostic_seen = true;
+      bead_diagnostic_enabled_ = true;
+      ++next_param;
+      if (next_param < num_param && !is_option(param[next_param])) {
+        if (next_param + 1 >= num_param || is_option(param[next_param + 1]) ||
+            !is_valid_real(param[next_param], &bead_f_min_) ||
+            !is_valid_real(param[next_param + 1], &bead_span_min_)) {
+          PRINT_INPUT_ERROR(
+            "bead_diagnostic must be followed by f_min and span_min, or no values.");
+        }
+        next_param += 2;
+      } else {
+        bead_span_min_ = 2.0 * delta_cutoff_;
+      }
     } else {
       PRINT_INPUT_ERROR("unknown optional compute_proton_tunneling setting.");
     }
   }
   if (oho_angle_min_deg_ < 0.0 || oho_angle_min_deg_ > 180.0) {
     PRINT_INPUT_ERROR("oho_angle should be between 0 and 180 degrees.");
+  }
+  if (bead_diagnostic_enabled_ &&
+      (bead_f_min_ <= 0.0 || bead_f_min_ > 0.5 || bead_span_min_ <= 0.0)) {
+    PRINT_INPUT_ERROR("bead_diagnostic requires 0 < f_min <= 0.5 and span_min > 0.");
   }
   if (oxygen_symbol_.empty() || hydrogen_symbol_.empty() || oxygen_symbol_ == hydrogen_symbol_) {
     PRINT_INPUT_ERROR("proton tunneling O and H symbols should be different and non-empty.");
@@ -171,6 +196,10 @@ void Proton_Tunneling::parse(
   printf("    minimum O-H-O angle is %.6f degrees.\n", oho_angle_min_deg_);
   printf("    using oxygen symbol %s and hydrogen symbol %s.\n",
     oxygen_symbol_.c_str(), hydrogen_symbol_.c_str());
+  if (bead_diagnostic_enabled_) {
+    printf("    bead tunneling-like diagnostic is enabled with f_min %.6f and span_min %.6f Angstrom.\n",
+      bead_f_min_, bead_span_min_);
+  }
   if (ion_field_enabled_) {
     printf("    nominal ion field uses %s charge %.6f and %s charge %.6f within %.6f Angstrom.\n",
       ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
@@ -195,6 +224,8 @@ void Proton_Tunneling::preprocess(
   number_of_atoms_ = atom.number_of_atoms;
   time_step_ = time_step;
   cpu_position_.resize(number_of_atoms_ * 3);
+  bead_positions_cached_ = false;
+  cached_number_of_beads_ = 0;
   oxygen_local_index_.assign(number_of_atoms_, -1);
   oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
@@ -210,6 +241,8 @@ void Proton_Tunneling::preprocess(
   bias_file_ = my_fopen("proton_bias.out", "a");
   transfer_file_ = my_fopen("proton_transfer.out", "a");
   attempt_file_ = my_fopen("proton_attempt.out", "a");
+  if (bead_diagnostic_enabled_)
+    bead_event_file_ = my_fopen("proton_bead_event.out", "a");
   edge_window_file_ = my_fopen("proton_edge_window.out", "a");
   bond_file_ = my_fopen("proton_bond.out", "a");
   defect_file_ = my_fopen("proton_defect.out", "a");
@@ -221,6 +254,8 @@ void Proton_Tunneling::preprocess(
   if (ion_field_enabled_)
     fprintf(bias_file_, " ion_field %s %.10e %s %.10e %.10e",
       ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
+  if (bead_diagnostic_enabled_)
+    fprintf(bias_file_, " bead_diagnostic %.10e %.10e", bead_f_min_, bead_span_min_);
   fprintf(bias_file_, "\n");
   fprintf(bias_file_,
     "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
@@ -235,6 +270,12 @@ void Proton_Tunneling::preprocess(
     "# columns attempt_id time_start_fs time_end_fs H_id O_low O_high O_from O_target outcome "
     "delta_start min_abs_delta delta_end E_parallel_start E_parallel_end "
     "nearest_ion_id nearest_ion_distance\n");
+  if (bead_diagnostic_enabled_) {
+    fprintf(bead_event_file_,
+      "# columns attempt_id probe_time_fs H_id O_low O_high outcome num_beads "
+      "delta_centroid f_minus f_zero f_plus sigma_delta delta_min delta_max span "
+      "kink_count quantum_class\n");
+  }
   fprintf(defect_file_, "# columns time_fs O_id q_defect nH cause_event_id\n");
   fprintf(edge_window_file_,
     "# columns window_id time_start_fs time_end_fs O_low O_high geometry_occupancy "
@@ -253,6 +294,8 @@ void Proton_Tunneling::preprocess(
   fflush(bias_file_);
   fflush(transfer_file_);
   fflush(attempt_file_);
+  if (bead_event_file_ != nullptr)
+    fflush(bead_event_file_);
   fflush(defect_file_);
   fflush(edge_window_file_);
   fflush(bond_file_);
@@ -337,6 +380,164 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
   };
   accumulate_ion_field(ion1_indices_, ion1_charge_, geometry.nearest_ion1_distance);
   accumulate_ion_field(ion2_indices_, ion2_charge_, geometry.nearest_ion2_distance);
+}
+
+bool Proton_Tunneling::ensure_bead_positions(Atom& atom)
+{
+  if (!bead_diagnostic_enabled_ || atom.number_of_beads <= 1)
+    return true;
+  if (atom.position_beads.size() < static_cast<size_t>(atom.number_of_beads))
+    return false;
+  if (bead_positions_cached_ && cached_number_of_beads_ == atom.number_of_beads)
+    return true;
+
+  const size_t position_size = static_cast<size_t>(number_of_atoms_) * 3;
+  for (int bead = 0; bead < atom.number_of_beads; ++bead) {
+    if (atom.position_beads[bead].size() != position_size)
+      return false;
+  }
+
+  // ponytail: copy the complete bead frame once on demand; a small-box observer can
+  // use this simple path before a targeted H/O gather is justified by profiling.
+  cpu_position_beads_.resize(position_size * static_cast<size_t>(atom.number_of_beads));
+  for (int bead = 0; bead < atom.number_of_beads; ++bead) {
+    atom.position_beads[bead].copy_to_host(
+      cpu_position_beads_.data() + position_size * static_cast<size_t>(bead));
+  }
+  cached_number_of_beads_ = atom.number_of_beads;
+  bead_positions_cached_ = true;
+  return true;
+}
+
+Proton_Tunneling::QuantumCharacter Proton_Tunneling::classify_quantum_character(
+  const BeadDiagnostic& diagnostic) const
+{
+  if (diagnostic.num_beads <= 1)
+    return QuantumCharacter::CLASSICAL_ONLY;
+  if (!diagnostic.valid)
+    return QuantumCharacter::AMBIGUOUS;
+
+  const double f_minus = static_cast<double>(diagnostic.n_minus) / diagnostic.num_beads;
+  const double f_plus = static_cast<double>(diagnostic.n_plus) / diagnostic.num_beads;
+  if (f_minus >= bead_f_min_ && f_plus >= bead_f_min_ &&
+      diagnostic.kink_count >= 2 && diagnostic.span >= bead_span_min_)
+    return QuantumCharacter::TUNNELING_LIKE;
+
+  const int dominant_count = std::max(
+    diagnostic.n_zero, std::max(diagnostic.n_minus, diagnostic.n_plus));
+  if (diagnostic.kink_count == 0 &&
+      static_cast<double>(dominant_count) / diagnostic.num_beads >= 1.0 - bead_f_min_)
+    return QuantumCharacter::OVERBARRIER_LIKE;
+
+  return QuantumCharacter::AMBIGUOUS;
+}
+
+const char* Proton_Tunneling::quantum_character_name(const QuantumCharacter character) const
+{
+  switch (character) {
+  case QuantumCharacter::CLASSICAL_ONLY:
+    return "classical_only";
+  case QuantumCharacter::TUNNELING_LIKE:
+    return "tunneling_like";
+  case QuantumCharacter::OVERBARRIER_LIKE:
+    return "overbarrier_like";
+  case QuantumCharacter::AMBIGUOUS:
+    return "ambiguous";
+  }
+  return "ambiguous";
+}
+
+bool Proton_Tunneling::evaluate_bead_diagnostic(
+  Atom& atom,
+  const Box& box,
+  const int hydrogen,
+  const GeometryResult& geometry,
+  const double probe_time_fs,
+  BeadDiagnostic& diagnostic)
+{
+  diagnostic = BeadDiagnostic();
+  diagnostic.probe_time_fs = probe_time_fs;
+  diagnostic.delta_centroid = geometry.delta;
+  diagnostic.num_beads = std::max(1, atom.number_of_beads);
+
+  if (diagnostic.num_beads <= 1) {
+    diagnostic.valid = true;
+    diagnostic.mean_delta = geometry.delta;
+    diagnostic.sigma_delta = 0.0;
+    diagnostic.delta_min = geometry.delta;
+    diagnostic.delta_max = geometry.delta;
+    diagnostic.span = 0.0;
+    const int state = classify_delta(geometry.delta);
+    if (state < 0)
+      diagnostic.n_minus = 1;
+    else if (state > 0)
+      diagnostic.n_plus = 1;
+    else
+      diagnostic.n_zero = 1;
+    diagnostic.character = classify_quantum_character(diagnostic);
+    return true;
+  }
+
+  if (!ensure_bead_positions(atom)) {
+    diagnostic.character = classify_quantum_character(diagnostic);
+    return false;
+  }
+
+  const size_t position_size = static_cast<size_t>(number_of_atoms_) * 3;
+  const auto bead_delta = [&](const int bead) {
+    const double* position = cpu_position_beads_.data() + position_size * bead;
+    double low_x = position[geometry.oxygen_low] - position[hydrogen];
+    double low_y = position[geometry.oxygen_low + number_of_atoms_] -
+      position[hydrogen + number_of_atoms_];
+    double low_z = position[geometry.oxygen_low + 2 * number_of_atoms_] -
+      position[hydrogen + 2 * number_of_atoms_];
+    double high_x = position[geometry.oxygen_high] - position[hydrogen];
+    double high_y = position[geometry.oxygen_high + number_of_atoms_] -
+      position[hydrogen + number_of_atoms_];
+    double high_z = position[geometry.oxygen_high + 2 * number_of_atoms_] -
+      position[hydrogen + 2 * number_of_atoms_];
+    apply_mic(box, low_x, low_y, low_z);
+    apply_mic(box, high_x, high_y, high_z);
+    return std::sqrt(low_x * low_x + low_y * low_y + low_z * low_z) -
+      std::sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
+  };
+
+  std::vector<int> nonzero_signs;
+  nonzero_signs.reserve(diagnostic.num_beads);
+  double sum_delta = 0.0;
+  double sum_delta_square = 0.0;
+  diagnostic.delta_min = std::numeric_limits<double>::max();
+  diagnostic.delta_max = -std::numeric_limits<double>::max();
+  for (int bead = 0; bead < diagnostic.num_beads; ++bead) {
+    const double delta = bead_delta(bead);
+    sum_delta += delta;
+    sum_delta_square += delta * delta;
+    diagnostic.delta_min = std::min(diagnostic.delta_min, delta);
+    diagnostic.delta_max = std::max(diagnostic.delta_max, delta);
+    const int state = classify_delta(delta);
+    if (state < 0) {
+      ++diagnostic.n_minus;
+      nonzero_signs.push_back(-1);
+    } else if (state > 0) {
+      ++diagnostic.n_plus;
+      nonzero_signs.push_back(1);
+    } else {
+      ++diagnostic.n_zero;
+    }
+  }
+  diagnostic.mean_delta = sum_delta / diagnostic.num_beads;
+  diagnostic.sigma_delta = std::sqrt(std::max(
+    0.0, sum_delta_square / diagnostic.num_beads - diagnostic.mean_delta * diagnostic.mean_delta));
+  diagnostic.span = diagnostic.delta_max - diagnostic.delta_min;
+  if (nonzero_signs.size() > 1) {
+    for (size_t i = 0; i < nonzero_signs.size(); ++i) {
+      if (nonzero_signs[i] != nonzero_signs[(i + 1) % nonzero_signs.size()])
+        ++diagnostic.kink_count;
+    }
+  }
+  diagnostic.valid = true;
+  diagnostic.character = classify_quantum_character(diagnostic);
+  return true;
 }
 
 bool Proton_Tunneling::find_geometry(
@@ -519,6 +720,7 @@ void Proton_Tunneling::start_attempt(
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
+  hydrogen_state.best_bead_diagnostic = BeadDiagnostic();
 }
 
 const char* Proton_Tunneling::outcome_name(const AttemptOutcome outcome) const
@@ -620,6 +822,38 @@ void Proton_Tunneling::finish_attempt(
     nearest_ion_id_output,
     nearest_ion_distance_output);
 
+  if (bead_event_file_ != nullptr) {
+    const BeadDiagnostic& diagnostic = hydrogen_state.best_bead_diagnostic;
+    const double bead_nan = std::numeric_limits<double>::quiet_NaN();
+    const double inverse_num_beads = (diagnostic.valid && diagnostic.num_beads > 0)
+      ? 1.0 / diagnostic.num_beads
+      : 0.0;
+    const double f_minus = diagnostic.valid ? diagnostic.n_minus * inverse_num_beads : bead_nan;
+    const double f_zero = diagnostic.valid ? diagnostic.n_zero * inverse_num_beads : bead_nan;
+    const double f_plus = diagnostic.valid ? diagnostic.n_plus * inverse_num_beads : bead_nan;
+    fprintf(
+      bead_event_file_,
+      "%lld %.10e %d %d %d %s %d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %d %s\n",
+      hydrogen_state.attempt_id,
+      diagnostic.valid ? diagnostic.probe_time_fs : bead_nan,
+      hydrogen,
+      oxygen_low,
+      oxygen_high,
+      outcome_name(outcome),
+      diagnostic.num_beads,
+      diagnostic.valid ? diagnostic.delta_centroid : bead_nan,
+      f_minus,
+      f_zero,
+      f_plus,
+      diagnostic.valid ? diagnostic.sigma_delta : bead_nan,
+      diagnostic.valid ? diagnostic.delta_min : bead_nan,
+      diagnostic.valid ? diagnostic.delta_max : bead_nan,
+      diagnostic.valid ? diagnostic.span : bead_nan,
+      diagnostic.valid ? diagnostic.kink_count : -1,
+      quantum_character_name(diagnostic.character));
+    fflush(bead_event_file_);
+  }
+
   if (outcome == AttemptOutcome::success && geometry != nullptr) {
     const int nH_from_before = event_hydrogen_count_[oxygen_from];
     const int nH_to_before = event_hydrogen_count_[oxygen_target];
@@ -680,6 +914,7 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
+  hydrogen_state.best_bead_diagnostic = BeadDiagnostic();
 }
 
 void Proton_Tunneling::observe_frame(
@@ -688,6 +923,8 @@ void Proton_Tunneling::observe_frame(
   Atom& atom)
 {
   atom.position_per_atom.copy_to_host(cpu_position_.data());
+  bead_positions_cached_ = false;
+  cached_number_of_beads_ = 0;
   if (window_sample_count_ == 0)
     window_start_time_fs_ = time_fs;
 
@@ -724,6 +961,18 @@ void Proton_Tunneling::observe_frame(
     defect_state_initialized_ = true;
   }
   event_hydrogen_count_ = previous_hydrogen_count_;
+
+  const auto probe_attempt = [&](const int hydrogen,
+                                 const GeometryResult& geometry,
+                                 HydrogenState& hydrogen_state) {
+    if (!bead_diagnostic_enabled_)
+      return;
+    BeadDiagnostic diagnostic;
+    const bool evaluated = evaluate_bead_diagnostic(
+      atom, box, hydrogen, geometry, time_fs, diagnostic);
+    if (evaluated || !hydrogen_state.best_bead_diagnostic.valid)
+      hydrogen_state.best_bead_diagnostic = diagnostic;
+  };
 
   for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
     const int hydrogen = hydrogen_indices_[h_index];
@@ -795,12 +1044,15 @@ void Proton_Tunneling::observe_frame(
         // If sampling jumps across the dead band, retain the event rather than silently
         // losing it. With a sufficiently small sample interval, normal attempts start in state 0.
         start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry);
+        probe_attempt(hydrogen, geometry, hydrogen_state);
       }
 
       if (hydrogen_state.attempt_active) {
-        hydrogen_state.attempt_min_abs_delta = std::min(
-          hydrogen_state.attempt_min_abs_delta,
-          std::abs(geometry.delta));
+        const double abs_delta = std::abs(geometry.delta);
+        if (abs_delta < hydrogen_state.attempt_min_abs_delta) {
+          hydrogen_state.attempt_min_abs_delta = abs_delta;
+          probe_attempt(hydrogen, geometry, hydrogen_state);
+        }
         if (state == hydrogen_state.stable_state) {
           finish_attempt(
             hydrogen,
@@ -833,6 +1085,7 @@ void Proton_Tunneling::observe_frame(
         }
       } else if (state == 0) {
         start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry);
+        probe_attempt(hydrogen, geometry, hydrogen_state);
       }
     }
     hydrogen_state.last_delta = geometry.delta;
@@ -1145,12 +1398,15 @@ void Proton_Tunneling::postprocess(
   fclose(bias_file_);
   fclose(transfer_file_);
   fclose(attempt_file_);
+  if (bead_event_file_ != nullptr)
+    fclose(bead_event_file_);
   fclose(defect_file_);
   fclose(edge_window_file_);
   fclose(bond_file_);
   bias_file_ = nullptr;
   transfer_file_ = nullptr;
   attempt_file_ = nullptr;
+  bead_event_file_ = nullptr;
   defect_file_ = nullptr;
   edge_window_file_ = nullptr;
   bond_file_ = nullptr;

@@ -14,7 +14,7 @@ Syntax
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [bead_diagnostic [f_min span_min]]
 
 For example::
 
@@ -27,6 +27,21 @@ To require a more linear O-H-O geometry, add the optional angle setting::
 With a nominal Na/Cl ion-field proxy enabled, use one physical input line::
 
   compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0
+
+For RPMD/PIMD, enable the lightweight bead-resolved tunneling-like diagnostic with the
+default thresholds :math:`f_{\min}=0.20` and
+:math:`\text{span}_{\min}=2\,\text{delta\_cutoff}`:
+
+::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic
+
+The thresholds can be supplied explicitly as the minimum bead fraction in each signed
+well and the minimum bead-coordinate span, in Angstrom:
+
+::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic 0.20 0.20
 
 For each hydrogen, the nearest oxygen is used as an anchor and the second endpoint is selected
 from the anchor's top-8 oxygen shell with a mutual-neighbor check. The accepted pair is ordered
@@ -64,7 +79,8 @@ salt ice during comparison.
 Output
 ------
 
-The observer appends six files:
+The observer appends six files by default, plus ``proton_bead_event.out`` when the optional
+bead diagnostic is enabled:
 
 * ``proton_bias.out`` contains one line per sampled window. ``B_mean`` is the mean of
   :math:`|A_j|`, where :math:`A_j=(N_{j,+}-N_{j,-})/(N_{j,+}+N_{j,-})`; ``F_A_gt_0.2`` and
@@ -103,6 +119,16 @@ The observer appends six files:
   distances to the two configured ion species; their names are generated from the input symbols.
 * ``proton_bond.out`` contains accumulated per-pair geometry, state, and transition counts
   after the run.
+* ``proton_bead_event.out`` is written only when ``bead_diagnostic`` is enabled. It contains
+  one record for each finalized attempt, with the dynamical ``outcome`` and the independent
+  ``quantum_class`` label. ``probe_time_fs`` is the time of the best centroid probe;
+  ``f_minus``, ``f_zero``, and ``f_plus`` are the fractions of beads below, inside, and above
+  the centroid dead band. ``sigma_delta``, ``delta_min``, ``delta_max``, and ``span`` describe
+  the bead distribution, while ``kink_count`` counts cyclic signed-well changes. For a
+  multi-bead run where bead coordinates are unavailable, the record is ``ambiguous`` with
+  invalid floating-point fields. The file is intended for RPMD/PIMD diagnostics and is absent
+  when the optional diagnostic is not enabled; an explicitly enabled one-bead run is labeled
+  ``classical_only``.
 
 Chain-level labels such as ``recombined`` and ``pinned`` require temporal matching of the
 transfer and defect streams and are therefore left to offline analysis. The observer's
@@ -122,6 +148,21 @@ including only configured ions within the cutoff. The sign is positive along ``O
 ``O_high`` and the numerical unit is V/Å. This is not the full local electric field and does
 not use qNEP dynamic charges; it is an observer-side mechanism proxy and does not alter forces,
 PIMD/RPMD integration, qNEP, or HAC.
+
+When ``bead_diagnostic`` is enabled, each active attempt is probed at its smallest observed
+:math:`|\Delta_{\rm centroid}|`. The O--O pair is inherited from the centroid assignment and
+is not reselected independently for each bead. For bead :math:`s`, the diagnostic evaluates
+:math:`\Delta_s=d(H_s,O_{\rm low,s})-d(H_s,O_{\rm high,s})`, using the same minimum-image
+distance convention as the centroid observer. Beads are classified with the existing
+``delta_cutoff`` dead band. ``tunneling_like`` requires at least ``f_min`` of the beads in
+each signed well, at least two cyclic sign changes after dead-band beads are skipped, and a
+span of at least ``span_min``. A compact distribution dominated by one signed well or the
+dead band with no cyclic sign change is labeled ``overbarrier_like``; all other multi-bead
+cases are ``ambiguous``. A one-bead run is always labeled ``classical_only``.
+
+These labels identify tunneling-like ring-polymer geometry, not a rigorous quantum observable
+or proof that a particular RPMD trajectory tunneled. They should be checked against bead-number
+convergence, H/D isotope comparisons, and matched pure/salt-ice conditions.
 
 Use ``compute_proton_tunneling`` first in a short validation run and compare its pair/state
 assignment with the existing Python trajectory script. The transfer and defect streams are
