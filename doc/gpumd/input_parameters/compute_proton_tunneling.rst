@@ -14,7 +14,7 @@ Syntax
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [bead_diagnostic [f_min span_min]]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [bead_diagnostic [f_min span_min [center_max centroid_max]]]
 
 For example::
 
@@ -29,7 +29,9 @@ With a nominal Na/Cl ion-field proxy enabled, use one physical input line::
   compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0
 
 For RPMD/PIMD, enable the lightweight bead-resolved tunneling-like diagnostic with the
-default thresholds :math:`f_{\min}=0.20` and
+strict default thresholds :math:`f_{\min}=0.25`,
+:math:`f_{\mathrm{center,max}}=0.30`, and
+:math:`|\Delta_{\mathrm{centroid}}|_{\max}=0.10\,\mathrm{\AA}`, together with
 :math:`\text{span}_{\min}=2\,\text{delta\_cutoff}`:
 
 ::
@@ -37,11 +39,22 @@ default thresholds :math:`f_{\min}=0.20` and
   compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic
 
 The thresholds can be supplied explicitly as the minimum bead fraction in each signed
-well and the minimum bead-coordinate span, in Angstrom:
+well, the minimum bead-coordinate span, the maximum center-bead fraction, and the maximum
+absolute centroid displacement, in Angstrom:
 
 ::
 
-  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic 0.20 0.20
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic 0.25 0.20 0.30 0.10
+
+The strict classification is layered. ``two_well_delocalized`` requires both signed wells,
+the center-fraction limit, the minimum span, exactly two signed-well interfaces after center
+beads are skipped, and at most two center domains. To reject multi-domain patterns such as
+``LL00LLRR00RR``, the implementation also requires at most four complete cyclic state domains.
+``barrier_centered_tunneling_like`` additionally requires
+:math:`|\Delta_{\mathrm{centroid}}|\le0.10\,\mathrm{\AA}` by default. Thus the latter is
+the strict default label, while the former remains useful for detecting asymmetric salt-induced
+two-well delocalization without forcing its centroid to the barrier center. Multi-kink or
+multi-domain configurations remain ``ambiguous`` rather than being labeled tunneling-like.
 
 For each hydrogen, the nearest oxygen is used as an anchor and the second endpoint is selected
 from the anchor's top-8 oxygen shell with a mutual-neighbor check. The accepted pair is ordered
@@ -129,11 +142,18 @@ and completed edge windows.
   ``quantum_class`` label. ``probe_time_fs`` is the time of the best centroid probe;
   ``f_minus``, ``f_zero``, and ``f_plus`` are the fractions of beads below, inside, and above
   the centroid dead band. ``sigma_delta``, ``delta_min``, ``delta_max``, and ``span`` describe
-  the bead distribution, while ``kink_count`` counts cyclic signed-well changes. For a
-  multi-bead run where bead coordinates are unavailable, the record is ``ambiguous`` with
-  invalid floating-point fields. The file is intended for RPMD/PIMD diagnostics and is absent
-  when the optional diagnostic is not enabled; an explicitly enabled one-bead run is labeled
-  ``classical_only``.
+  the bead distribution. ``kink_count`` counts signed-well changes after center beads are
+  skipped; ``center_domain_count`` counts cyclic contiguous center runs; and
+  ``total_state_domain_count`` counts all cyclic domains of the three-state sequence.
+  ``two_well_span``, ``simple_two_domain_path``, ``barrier_centered``, and
+  ``strict_tunneling_like`` expose the individual strict filters as integer flags.
+  ``rms_neighbor_delta_jump`` and ``max_neighbor_delta_jump`` quantify bead-to-bead coordinate
+  jumps. ``quantum_class`` is ``two_well_delocalized`` or
+  ``barrier_centered_tunneling_like`` only when the corresponding layered criteria pass;
+  multi-kink or multi-domain cases remain ``ambiguous``. For a multi-bead run where bead
+  coordinates are unavailable, the record is ``ambiguous`` with invalid floating-point fields.
+  The file is intended for RPMD/PIMD diagnostics and is absent when the optional diagnostic is
+  not enabled; an explicitly enabled one-bead run is labeled ``classical_only``.
 
 Chain-level labels such as ``recombined`` and ``pinned`` require temporal matching of the
 transfer and defect streams and are therefore left to offline analysis. The observer's
@@ -159,11 +179,12 @@ When ``bead_diagnostic`` is enabled, each active attempt is probed at its smalle
 is not reselected independently for each bead. For bead :math:`s`, the diagnostic evaluates
 :math:`\Delta_s=d(H_s,O_{\rm low,s})-d(H_s,O_{\rm high,s})`, using the same minimum-image
 distance convention as the centroid observer. Beads are classified with the existing
-``delta_cutoff`` dead band. ``tunneling_like`` requires at least ``f_min`` of the beads in
-each signed well, at least two cyclic sign changes after dead-band beads are skipped, and a
-span of at least ``span_min``. A compact distribution dominated by one signed well or the
-dead band with no cyclic sign change is labeled ``overbarrier_like``; all other multi-bead
-cases are ``ambiguous``. A one-bead run is always labeled ``classical_only``.
+``delta_cutoff`` dead band. ``two_well_delocalized`` requires at least ``f_min`` of the beads in
+each signed well, exactly two cyclic sign changes after dead-band beads are skipped, and a
+span of at least ``span_min`` and the center-fraction limit. The strict path also rejects
+multi-domain patterns such as ``LL00LLRR00RR``. A compact distribution dominated by one signed
+well or the dead band with no cyclic sign change is labeled ``overbarrier_like``; all other
+multi-bead cases are ``ambiguous``. A one-bead run is always labeled ``classical_only``.
 
 These labels identify tunneling-like ring-polymer geometry, not a rigorous quantum observable
 or proof that a particular RPMD trajectory tunneled. They should be checked against bead-number

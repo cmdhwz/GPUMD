@@ -86,7 +86,8 @@ private:
   enum class QuantumCharacter
   {
     CLASSICAL_ONLY,
-    TUNNELING_LIKE,
+    TWO_WELL_DELOCALIZED,
+    BARRIER_CENTERED_TUNNELING_LIKE,
     OVERBARRIER_LIKE,
     AMBIGUOUS
   };
@@ -99,13 +100,24 @@ private:
     int n_zero = 0;
     int n_plus = 0;
     int kink_count = 0;
+    int center_domain_count = 0;
+    int total_state_domain_count = 0;
+    int two_well_span = 0;
+    int simple_two_domain_path = 0;
+    int barrier_centered = 0;
+    int strict_tunneling_like = 0;
     double probe_time_fs = 0.0;
     double delta_centroid = 0.0;
+    double f_minus = 0.0;
+    double f_zero = 0.0;
+    double f_plus = 0.0;
     double mean_delta = 0.0;
     double sigma_delta = 0.0;
     double delta_min = 0.0;
     double delta_max = 0.0;
     double span = 0.0;
+    double rms_neighbor_delta_jump = 0.0;
+    double max_neighbor_delta_jump = 0.0;
     QuantumCharacter character = QuantumCharacter::AMBIGUOUS;
   };
 
@@ -343,7 +355,9 @@ private:
   double rperp_max_ = 0.80;
   double oho_angle_min_deg_ = 120.0;
   bool bead_diagnostic_enabled_ = false;
-  double bead_f_min_ = 0.20;
+  double bead_f_min_ = 0.25;
+  double bead_center_max_ = 0.30;
+  double bead_centroid_max_ = 0.10;
   double bead_span_min_ = 0.20;
   int oxygen_shell_k_ = 8;
   double assignment_path_excess_weight_ = 0.50;
