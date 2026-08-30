@@ -259,68 +259,14 @@ void Proton_Tunneling::preprocess(
   window_assignment_ambiguous_count_ = 0;
   window_pair_conflict_count_ = 0;
   defect_state_initialized_ = false;
-
-  bias_file_ = my_fopen("proton_bias.out", "a");
-  transfer_file_ = my_fopen("proton_transfer.out", "a");
-  attempt_file_ = my_fopen("proton_attempt.out", "a");
-  if (bead_diagnostic_enabled_)
-    bead_event_file_ = my_fopen("proton_bead_event.out", "a");
-  edge_window_file_ = my_fopen("proton_edge_window.out", "a");
-  bond_file_ = my_fopen("proton_bond.out", "a");
-  defect_file_ = my_fopen("proton_defect.out", "a");
-
-  fprintf(bias_file_,
-    "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s oho_angle %.10e",
-    sample_interval_, window_samples_, delta_cutoff_, hold_samples_, dOO_min_, dOO_max_,
-    rperp_max_, oxygen_symbol_.c_str(), hydrogen_symbol_.c_str(), oho_angle_min_deg_);
-  if (ion_field_enabled_)
-    fprintf(bias_file_, " ion_field %s %.10e %s %.10e %.10e",
-      ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
-  if (bead_diagnostic_enabled_)
-    fprintf(bias_file_, " bead_diagnostic %.10e %.10e", bead_f_min_, bead_span_min_);
-  fprintf(bias_file_, "\n");
-  fprintf(bias_file_,
-    "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
-    "flip_rate_per_ps active_bonds positive_defects negative_defects valid_pairs_per_frame "
-    "assignment_ambiguous_samples pair_conflict_samples\n");
-
-  fprintf(transfer_file_,
-    "# columns event_id time_start_fs time_confirm_fs H_id O_from O_to O_pair_low O_pair_high "
-    "nH_from_before nH_to_before nH_from_after nH_to_after "
-    "q_from_before q_to_before q_from_after q_to_after dx dy dz delta_start delta_confirm\n");
-  fprintf(attempt_file_,
-    "# columns attempt_id time_start_fs time_end_fs H_id O_low O_high O_from O_target outcome "
-    "delta_start min_abs_delta delta_end E_parallel_start E_parallel_end "
-    "nearest_ion_id nearest_ion_distance\n");
-  if (bead_diagnostic_enabled_) {
-    fprintf(bead_event_file_,
-      "# columns attempt_id probe_time_fs H_id O_low O_high outcome num_beads "
-      "delta_centroid f_minus f_zero f_plus sigma_delta delta_min delta_max span "
-      "kink_count quantum_class\n");
-  }
-  fprintf(defect_file_, "# columns time_fs O_id q_defect nH cause_event_id\n");
-  fprintf(edge_window_file_,
-    "# columns window_id time_start_fs time_end_fs O_low O_high geometry_occupancy "
-    "n_plus n_minus n_deadband A abs_A DeltaF_over_kBT attempts successes returns geometry_lost "
-    "success_probability mean_delta mean_abs_delta mean_dOO mean_rperp "
-    "mean_E_parallel std_E_parallel corr_delta_E_parallel mean_E_success mean_E_return ");
-  if (ion_field_enabled_)
-    fprintf(edge_window_file_, "nearest_%s_distance nearest_%s_distance\n",
-      ion1_symbol_.c_str(), ion2_symbol_.c_str());
-  else
-    fprintf(edge_window_file_, "nearest_ion1_distance nearest_ion2_distance\n");
-  fprintf(bond_file_,
-    "# columns O_pair_low O_pair_high geometry_samples n_plus n_minus transitions "
-    "A abs_A mean_abs_delta\n");
-
-  fflush(bias_file_);
-  fflush(transfer_file_);
-  fflush(attempt_file_);
-  if (bead_event_file_ != nullptr)
-    fflush(bead_event_file_);
-  fflush(defect_file_);
-  fflush(edge_window_file_);
-  fflush(bond_file_);
+  attempt_records_.clear();
+  defect_records_.clear();
+  window_records_.clear();
+  edge_window_records_.clear();
+  attempt_records_.reserve(1024);
+  defect_records_.reserve(1024);
+  window_records_.reserve(64);
+  edge_window_records_.reserve(1024);
   initialized_ = true;
 }
 
@@ -865,57 +811,24 @@ void Proton_Tunneling::finish_attempt(
     ++window_stats.n_E_return;
   }
 
-  fprintf(
-    attempt_file_,
-    "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e %.10e %.10e %d %.10e\n",
-    hydrogen_state.attempt_id,
-    hydrogen_state.attempt_start_time_fs,
-    time_fs,
-    hydrogen,
-    oxygen_low,
-    oxygen_high,
-    oxygen_from,
-    oxygen_target,
-    outcome_name(outcome),
-    hydrogen_state.attempt_delta_start,
-    hydrogen_state.attempt_min_abs_delta,
-    delta_end,
-    E_start_output,
-    E_end_output,
-    nearest_ion_id_output,
-    nearest_ion_distance_output);
-
-  if (bead_event_file_ != nullptr) {
-    const BeadDiagnostic& diagnostic = hydrogen_state.best_bead_diagnostic;
-    const double bead_nan = std::numeric_limits<double>::quiet_NaN();
-    const double inverse_num_beads = (diagnostic.valid && diagnostic.num_beads > 0)
-      ? 1.0 / diagnostic.num_beads
-      : 0.0;
-    const double f_minus = diagnostic.valid ? diagnostic.n_minus * inverse_num_beads : bead_nan;
-    const double f_zero = diagnostic.valid ? diagnostic.n_zero * inverse_num_beads : bead_nan;
-    const double f_plus = diagnostic.valid ? diagnostic.n_plus * inverse_num_beads : bead_nan;
-    fprintf(
-      bead_event_file_,
-      "%lld %.10e %d %d %d %s %d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %d %s\n",
-      hydrogen_state.attempt_id,
-      diagnostic.valid ? diagnostic.probe_time_fs : bead_nan,
-      hydrogen,
-      oxygen_low,
-      oxygen_high,
-      outcome_name(outcome),
-      diagnostic.num_beads,
-      diagnostic.valid ? diagnostic.delta_centroid : bead_nan,
-      f_minus,
-      f_zero,
-      f_plus,
-      diagnostic.valid ? diagnostic.sigma_delta : bead_nan,
-      diagnostic.valid ? diagnostic.delta_min : bead_nan,
-      diagnostic.valid ? diagnostic.delta_max : bead_nan,
-      diagnostic.valid ? diagnostic.span : bead_nan,
-      diagnostic.valid ? diagnostic.kink_count : -1,
-      quantum_character_name(diagnostic.character));
-    fflush(bead_event_file_);
-  }
+  AttemptRecord record;
+  record.attempt_id = hydrogen_state.attempt_id;
+  record.time_start_fs = hydrogen_state.attempt_start_time_fs;
+  record.time_end_fs = time_fs;
+  record.hydrogen = hydrogen;
+  record.oxygen_low = oxygen_low;
+  record.oxygen_high = oxygen_high;
+  record.oxygen_from = oxygen_from;
+  record.oxygen_target = oxygen_target;
+  record.outcome = outcome;
+  record.delta_start = hydrogen_state.attempt_delta_start;
+  record.min_abs_delta = hydrogen_state.attempt_min_abs_delta;
+  record.delta_end = delta_end;
+  record.E_parallel_start = E_start_output;
+  record.E_parallel_end = E_end_output;
+  record.nearest_ion_id = nearest_ion_id_output;
+  record.nearest_ion_distance = nearest_ion_distance_output;
+  record.bead_diagnostic = hydrogen_state.best_bead_diagnostic;
 
   if (outcome == AttemptOutcome::success && geometry != nullptr) {
     const int nH_from_before = event_hydrogen_count_[oxygen_from];
@@ -936,32 +849,16 @@ void Proton_Tunneling::finish_attempt(
       dy = -dy;
       dz = -dz;
     }
-    fprintf(
-      transfer_file_,
-      "%lld %.10e %.10e %d %d %d %d %d %d %d %d %d %d %d %d %d "
-      "%.10e %.10e %.10e %.10e %.10e\n",
-      hydrogen_state.attempt_id,
-      hydrogen_state.attempt_start_time_fs,
-      time_fs,
-      hydrogen,
-      oxygen_from,
-      oxygen_target,
-      oxygen_low,
-      oxygen_high,
-      nH_from_before,
-      nH_to_before,
-      nH_from_after,
-      nH_to_after,
-      nH_from_before - 2,
-      nH_to_before - 2,
-      nH_from_after - 2,
-      nH_to_after - 2,
-      dx,
-      dy,
-      dz,
-      hydrogen_state.attempt_delta_start,
-      delta_end);
+    record.has_transfer = true;
+    record.nH_from_before = nH_from_before;
+    record.nH_to_before = nH_to_before;
+    record.nH_from_after = nH_from_after;
+    record.nH_to_after = nH_to_after;
+    record.dx = dx;
+    record.dy = dy;
+    record.dz = dz;
   }
+  attempt_records_.push_back(record);
 
   if (outcome == AttemptOutcome::success)
     hydrogen_state.stable_state = -hydrogen_state.attempt_from_state;
@@ -1019,9 +916,15 @@ void Proton_Tunneling::observe_frame(
   }
 
   if (!defect_state_initialized_) {
-    for (const int oxygen : oxygen_indices_)
-      fprintf(defect_file_, "%.10e %d %d %d %lld\n", time_fs, oxygen,
-        hydrogen_count_[oxygen] - 2, hydrogen_count_[oxygen], 0LL);
+    for (const int oxygen : oxygen_indices_) {
+      DefectRecord record;
+      record.time_fs = time_fs;
+      record.oxygen = oxygen;
+      record.q_defect = hydrogen_count_[oxygen] - 2;
+      record.hydrogen_count = hydrogen_count_[oxygen];
+      record.cause_event_id = 0;
+      defect_records_.push_back(record);
+    }
     previous_hydrogen_count_ = hydrogen_count_;
     defect_state_initialized_ = true;
   }
@@ -1165,12 +1068,17 @@ void Proton_Tunneling::observe_frame(
   }
 
   for (const int oxygen : oxygen_indices_) {
-    if (hydrogen_count_[oxygen] != previous_hydrogen_count_[oxygen])
-      fprintf(defect_file_, "%.10e %d %d %d %lld\n", time_fs, oxygen,
-        hydrogen_count_[oxygen] - 2, hydrogen_count_[oxygen], frame_cause_event_ids_[oxygen]);
+    if (hydrogen_count_[oxygen] != previous_hydrogen_count_[oxygen]) {
+      DefectRecord record;
+      record.time_fs = time_fs;
+      record.oxygen = oxygen;
+      record.q_defect = hydrogen_count_[oxygen] - 2;
+      record.hydrogen_count = hydrogen_count_[oxygen];
+      record.cause_event_id = frame_cause_event_ids_[oxygen];
+      defect_records_.push_back(record);
+    }
   }
   previous_hydrogen_count_ = hydrogen_count_;
-  fflush(defect_file_);
 
   for (const int oxygen : oxygen_indices_) {
     if (hydrogen_count_[oxygen] > 2)
@@ -1268,22 +1176,22 @@ void Proton_Tunneling::write_window(const double time_fs)
   const double negative_defects = static_cast<double>(window_negative_defect_sum_) /
     window_sample_count_;
 
-  fprintf(
-    bias_file_,
-    "%.10e %.10e %.10e %.10e %.10e %.10e %d %.10e %.10e %.10e %lld %lld\n",
-    time_fs,
-    b_mean,
-    f_02,
-    f_04,
-    mean_abs_delta_f,
-    flip_rate,
-    active_bonds,
-    positive_defects,
-    negative_defects,
-    valid_pairs_per_frame,
-    window_assignment_ambiguous_count_,
-    window_pair_conflict_count_);
-  fflush(bias_file_);
+  WindowRecord record;
+  record.window_id = window_id_;
+  record.time_start_fs = window_start_time_fs_;
+  record.time_end_fs = time_fs;
+  record.B_mean = b_mean;
+  record.f_02 = f_02;
+  record.f_04 = f_04;
+  record.mean_abs_delta_f = mean_abs_delta_f;
+  record.flip_rate = flip_rate;
+  record.active_bonds = active_bonds;
+  record.positive_defects = positive_defects;
+  record.negative_defects = negative_defects;
+  record.valid_pairs_per_frame = valid_pairs_per_frame;
+  record.assignment_ambiguous_samples = window_assignment_ambiguous_count_;
+  record.pair_conflict_samples = window_pair_conflict_count_;
+  window_records_.push_back(record);
 
   write_edge_window(window_start_time_fs_, time_fs);
 
@@ -1368,41 +1276,37 @@ void Proton_Tunneling::write_edge_window(
     const double nearest_ion2_distance = (ion_field_enabled_ && stats.geometry_samples > 0)
       ? stats.sum_nearest_ion2_distance / stats.geometry_samples
       : std::numeric_limits<double>::quiet_NaN();
-    fprintf(
-      edge_window_file_,
-      "%lld %.10e %.10e %d %d %.10e %lld %lld %lld %.10e %.10e %.10e "
-      "%lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e "
-      "%.10e %.10e %.10e %.10e %.10e %.10e %.10e\n",
-      window_id_,
-      time_start_fs,
-      time_end_fs,
-      oxygen_low,
-      oxygen_high,
-      geometry_occupancy,
-      stats.n_plus,
-      stats.n_minus,
-      stats.n_deadband,
-      asymmetry,
-      std::abs(asymmetry),
-      delta_f,
-      stats.attempts,
-      stats.successes,
-      stats.returns,
-      stats.geometry_lost,
-      success_probability,
-      mean_delta,
-      mean_abs_delta,
-      mean_dOO,
-      mean_rperp,
-      mean_E_parallel,
-      std_E_parallel,
-      corr_delta_E_parallel,
-      mean_E_success,
-      mean_E_return,
-      nearest_ion1_distance,
-      nearest_ion2_distance);
+    EdgeWindowRecord record;
+    record.window_id = window_id_;
+    record.time_start_fs = time_start_fs;
+    record.time_end_fs = time_end_fs;
+    record.oxygen_low = oxygen_low;
+    record.oxygen_high = oxygen_high;
+    record.geometry_occupancy = geometry_occupancy;
+    record.n_plus = stats.n_plus;
+    record.n_minus = stats.n_minus;
+    record.n_deadband = stats.n_deadband;
+    record.asymmetry = asymmetry;
+    record.abs_asymmetry = std::abs(asymmetry);
+    record.delta_f = delta_f;
+    record.attempts = stats.attempts;
+    record.successes = stats.successes;
+    record.returns = stats.returns;
+    record.geometry_lost = stats.geometry_lost;
+    record.success_probability = success_probability;
+    record.mean_delta = mean_delta;
+    record.mean_abs_delta = mean_abs_delta;
+    record.mean_dOO = mean_dOO;
+    record.mean_rperp = mean_rperp;
+    record.mean_E_parallel = mean_E_parallel;
+    record.std_E_parallel = std_E_parallel;
+    record.corr_delta_E_parallel = corr_delta_E_parallel;
+    record.mean_E_success = mean_E_success;
+    record.mean_E_return = mean_E_return;
+    record.nearest_ion1_distance = nearest_ion1_distance;
+    record.nearest_ion2_distance = nearest_ion2_distance;
+    edge_window_records_.push_back(record);
   }
-  fflush(edge_window_file_);
   ++window_id_;
 }
 
@@ -1433,7 +1337,216 @@ void Proton_Tunneling::write_final_bonds()
       std::abs(asymmetry),
       mean_abs_delta);
   }
-  fflush(bond_file_);
+}
+
+void Proton_Tunneling::write_output_files()
+{
+  bias_file_ = my_fopen("proton_bias.out", "a");
+  transfer_file_ = my_fopen("proton_transfer.out", "a");
+  attempt_file_ = my_fopen("proton_attempt.out", "a");
+  if (bead_diagnostic_enabled_)
+    bead_event_file_ = my_fopen("proton_bead_event.out", "a");
+  edge_window_file_ = my_fopen("proton_edge_window.out", "a");
+  bond_file_ = my_fopen("proton_bond.out", "a");
+  defect_file_ = my_fopen("proton_defect.out", "a");
+
+  fprintf(bias_file_,
+    "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s oho_angle %.10e",
+    sample_interval_, window_samples_, delta_cutoff_, hold_samples_, dOO_min_, dOO_max_,
+    rperp_max_, oxygen_symbol_.c_str(), hydrogen_symbol_.c_str(), oho_angle_min_deg_);
+  if (ion_field_enabled_)
+    fprintf(bias_file_, " ion_field %s %.10e %s %.10e %.10e",
+      ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
+  if (bead_diagnostic_enabled_)
+    fprintf(bias_file_, " bead_diagnostic %.10e %.10e", bead_f_min_, bead_span_min_);
+  fprintf(bias_file_, "\n");
+  fprintf(bias_file_,
+    "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
+    "flip_rate_per_ps active_bonds positive_defects negative_defects valid_pairs_per_frame "
+    "assignment_ambiguous_samples pair_conflict_samples\n");
+
+  fprintf(transfer_file_,
+    "# columns event_id time_start_fs time_confirm_fs H_id O_from O_to O_pair_low O_pair_high "
+    "nH_from_before nH_to_before nH_from_after nH_to_after "
+    "q_from_before q_to_before q_from_after q_to_after dx dy dz delta_start delta_confirm\n");
+  fprintf(attempt_file_,
+    "# columns attempt_id time_start_fs time_end_fs H_id O_low O_high O_from O_target outcome "
+    "delta_start min_abs_delta delta_end E_parallel_start E_parallel_end "
+    "nearest_ion_id nearest_ion_distance\n");
+  if (bead_diagnostic_enabled_) {
+    fprintf(bead_event_file_,
+      "# columns attempt_id probe_time_fs H_id O_low O_high outcome num_beads "
+      "delta_centroid f_minus f_zero f_plus sigma_delta delta_min delta_max span "
+      "kink_count quantum_class\n");
+  }
+  fprintf(defect_file_, "# columns time_fs O_id q_defect nH cause_event_id\n");
+  fprintf(edge_window_file_,
+    "# columns window_id time_start_fs time_end_fs O_low O_high geometry_occupancy "
+    "n_plus n_minus n_deadband A abs_A DeltaF_over_kBT attempts successes returns geometry_lost "
+    "success_probability mean_delta mean_abs_delta mean_dOO mean_rperp "
+    "mean_E_parallel std_E_parallel corr_delta_E_parallel mean_E_success mean_E_return ");
+  if (ion_field_enabled_)
+    fprintf(edge_window_file_, "nearest_%s_distance nearest_%s_distance\n",
+      ion1_symbol_.c_str(), ion2_symbol_.c_str());
+  else
+    fprintf(edge_window_file_, "nearest_ion1_distance nearest_ion2_distance\n");
+  fprintf(bond_file_,
+    "# columns O_pair_low O_pair_high geometry_samples n_plus n_minus transitions "
+    "A abs_A mean_abs_delta\n");
+
+  const double bead_nan = std::numeric_limits<double>::quiet_NaN();
+  for (const AttemptRecord& record : attempt_records_) {
+    fprintf(
+      attempt_file_,
+      "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e %.10e %.10e %d %.10e\n",
+      record.attempt_id,
+      record.time_start_fs,
+      record.time_end_fs,
+      record.hydrogen,
+      record.oxygen_low,
+      record.oxygen_high,
+      record.oxygen_from,
+      record.oxygen_target,
+      outcome_name(record.outcome),
+      record.delta_start,
+      record.min_abs_delta,
+      record.delta_end,
+      record.E_parallel_start,
+      record.E_parallel_end,
+      record.nearest_ion_id,
+      record.nearest_ion_distance);
+
+    if (bead_event_file_ != nullptr) {
+      const BeadDiagnostic& diagnostic = record.bead_diagnostic;
+      const double inverse_num_beads = (diagnostic.valid && diagnostic.num_beads > 0)
+        ? 1.0 / diagnostic.num_beads
+        : 0.0;
+      const double f_minus = diagnostic.valid ? diagnostic.n_minus * inverse_num_beads : bead_nan;
+      const double f_zero = diagnostic.valid ? diagnostic.n_zero * inverse_num_beads : bead_nan;
+      const double f_plus = diagnostic.valid ? diagnostic.n_plus * inverse_num_beads : bead_nan;
+      fprintf(
+        bead_event_file_,
+        "%lld %.10e %d %d %d %s %d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %d %s\n",
+        record.attempt_id,
+        diagnostic.valid ? diagnostic.probe_time_fs : bead_nan,
+        record.hydrogen,
+        record.oxygen_low,
+        record.oxygen_high,
+        outcome_name(record.outcome),
+        diagnostic.num_beads,
+        diagnostic.valid ? diagnostic.delta_centroid : bead_nan,
+        f_minus,
+        f_zero,
+        f_plus,
+        diagnostic.valid ? diagnostic.sigma_delta : bead_nan,
+        diagnostic.valid ? diagnostic.delta_min : bead_nan,
+        diagnostic.valid ? diagnostic.delta_max : bead_nan,
+        diagnostic.valid ? diagnostic.span : bead_nan,
+        diagnostic.valid ? diagnostic.kink_count : -1,
+        quantum_character_name(diagnostic.character));
+    }
+
+    if (record.has_transfer) {
+      fprintf(
+        transfer_file_,
+        "%lld %.10e %.10e %d %d %d %d %d %d %d %d %d %d %d %d %d "
+        "%.10e %.10e %.10e %.10e %.10e\n",
+        record.attempt_id,
+        record.time_start_fs,
+        record.time_end_fs,
+        record.hydrogen,
+        record.oxygen_from,
+        record.oxygen_target,
+        record.oxygen_low,
+        record.oxygen_high,
+        record.nH_from_before,
+        record.nH_to_before,
+        record.nH_from_after,
+        record.nH_to_after,
+        record.nH_from_before - 2,
+        record.nH_to_before - 2,
+        record.nH_from_after - 2,
+        record.nH_to_after - 2,
+        record.dx,
+        record.dy,
+        record.dz,
+        record.delta_start,
+        record.delta_end);
+    }
+  }
+
+  for (const DefectRecord& record : defect_records_)
+    fprintf(defect_file_, "%.10e %d %d %d %lld\n", record.time_fs, record.oxygen,
+      record.q_defect, record.hydrogen_count, record.cause_event_id);
+
+  for (const WindowRecord& record : window_records_)
+    fprintf(
+      bias_file_,
+      "%.10e %.10e %.10e %.10e %.10e %.10e %d %.10e %.10e %.10e %lld %lld\n",
+      record.time_end_fs,
+      record.B_mean,
+      record.f_02,
+      record.f_04,
+      record.mean_abs_delta_f,
+      record.flip_rate,
+      record.active_bonds,
+      record.positive_defects,
+      record.negative_defects,
+      record.valid_pairs_per_frame,
+      record.assignment_ambiguous_samples,
+      record.pair_conflict_samples);
+
+  for (const EdgeWindowRecord& record : edge_window_records_)
+    fprintf(
+      edge_window_file_,
+      "%lld %.10e %.10e %d %d %.10e %lld %lld %lld %.10e %.10e %.10e "
+      "%lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e "
+      "%.10e %.10e %.10e %.10e %.10e %.10e %.10e\n",
+      record.window_id,
+      record.time_start_fs,
+      record.time_end_fs,
+      record.oxygen_low,
+      record.oxygen_high,
+      record.geometry_occupancy,
+      record.n_plus,
+      record.n_minus,
+      record.n_deadband,
+      record.asymmetry,
+      record.abs_asymmetry,
+      record.delta_f,
+      record.attempts,
+      record.successes,
+      record.returns,
+      record.geometry_lost,
+      record.success_probability,
+      record.mean_delta,
+      record.mean_abs_delta,
+      record.mean_dOO,
+      record.mean_rperp,
+      record.mean_E_parallel,
+      record.std_E_parallel,
+      record.corr_delta_E_parallel,
+      record.mean_E_success,
+      record.mean_E_return,
+      record.nearest_ion1_distance,
+      record.nearest_ion2_distance);
+
+  write_final_bonds();
+  fclose(bias_file_);
+  fclose(transfer_file_);
+  fclose(attempt_file_);
+  if (bead_event_file_ != nullptr)
+    fclose(bead_event_file_);
+  fclose(defect_file_);
+  fclose(edge_window_file_);
+  fclose(bond_file_);
+  bias_file_ = nullptr;
+  transfer_file_ = nullptr;
+  attempt_file_ = nullptr;
+  bead_event_file_ = nullptr;
+  defect_file_ = nullptr;
+  edge_window_file_ = nullptr;
+  bond_file_ = nullptr;
 }
 
 void Proton_Tunneling::postprocess(
@@ -1467,22 +1580,7 @@ void Proton_Tunneling::postprocess(
   }
   if (window_sample_count_ > 0)
     write_window(last_time_fs_);
-  write_final_bonds();
-  fclose(bias_file_);
-  fclose(transfer_file_);
-  fclose(attempt_file_);
-  if (bead_event_file_ != nullptr)
-    fclose(bead_event_file_);
-  fclose(defect_file_);
-  fclose(edge_window_file_);
-  fclose(bond_file_);
-  bias_file_ = nullptr;
-  transfer_file_ = nullptr;
-  attempt_file_ = nullptr;
-  bead_event_file_ = nullptr;
-  defect_file_ = nullptr;
-  edge_window_file_ = nullptr;
-  bond_file_ = nullptr;
+  write_output_files();
   printf("Proton tunneling observer timing:\n");
   printf("    sampled observer frames: %lld\n", observer_frame_count_);
   if (bead_diagnostic_enabled_) {

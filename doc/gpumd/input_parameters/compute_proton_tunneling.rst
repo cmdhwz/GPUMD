@@ -80,7 +80,12 @@ Output
 ------
 
 The observer appends six files by default, plus ``proton_bead_event.out`` when the optional
-bead diagnostic is enabled:
+bead diagnostic is enabled. All records are accumulated during the run and these files are
+opened and written once during ``postprocess``; no proton-observer ``fprintf`` or ``fflush`` is
+performed during sampled ``process`` frames. If the run terminates abnormally before
+``postprocess``, the deferred records are not written. The records are held in host memory
+until the end of the run, so memory use grows with the number of attempts, defect changes,
+and completed edge windows.
 
 * ``proton_bias.out`` contains one line per sampled window. ``B_mean`` is the mean of
   :math:`|A_j|`, where :math:`A_j=(N_{j,+}-N_{j,-})/(N_{j,+}+N_{j,-})`; ``F_A_gt_0.2`` and

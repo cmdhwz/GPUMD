@@ -91,6 +91,94 @@ private:
     run_end
   };
 
+  struct AttemptRecord
+  {
+    long long attempt_id = 0;
+    double time_start_fs = 0.0;
+    double time_end_fs = 0.0;
+    int hydrogen = -1;
+    int oxygen_low = -1;
+    int oxygen_high = -1;
+    int oxygen_from = -1;
+    int oxygen_target = -1;
+    AttemptOutcome outcome = AttemptOutcome::run_end;
+    double delta_start = 0.0;
+    double min_abs_delta = 0.0;
+    double delta_end = 0.0;
+    double E_parallel_start = 0.0;
+    double E_parallel_end = 0.0;
+    int nearest_ion_id = -1;
+    double nearest_ion_distance = 0.0;
+    BeadDiagnostic bead_diagnostic;
+    bool has_transfer = false;
+    int nH_from_before = 0;
+    int nH_to_before = 0;
+    int nH_from_after = 0;
+    int nH_to_after = 0;
+    double dx = 0.0;
+    double dy = 0.0;
+    double dz = 0.0;
+  };
+
+  struct DefectRecord
+  {
+    double time_fs = 0.0;
+    int oxygen = -1;
+    int q_defect = 0;
+    int hydrogen_count = 0;
+    long long cause_event_id = -1;
+  };
+
+  struct WindowRecord
+  {
+    long long window_id = 0;
+    double time_start_fs = 0.0;
+    double time_end_fs = 0.0;
+    double B_mean = 0.0;
+    double f_02 = 0.0;
+    double f_04 = 0.0;
+    double mean_abs_delta_f = 0.0;
+    double flip_rate = 0.0;
+    int active_bonds = 0;
+    double positive_defects = 0.0;
+    double negative_defects = 0.0;
+    double valid_pairs_per_frame = 0.0;
+    long long assignment_ambiguous_samples = 0;
+    long long pair_conflict_samples = 0;
+  };
+
+  struct EdgeWindowRecord
+  {
+    long long window_id = 0;
+    double time_start_fs = 0.0;
+    double time_end_fs = 0.0;
+    int oxygen_low = -1;
+    int oxygen_high = -1;
+    double geometry_occupancy = 0.0;
+    long long n_plus = 0;
+    long long n_minus = 0;
+    long long n_deadband = 0;
+    double asymmetry = 0.0;
+    double abs_asymmetry = 0.0;
+    double delta_f = 0.0;
+    long long attempts = 0;
+    long long successes = 0;
+    long long returns = 0;
+    long long geometry_lost = 0;
+    double success_probability = 0.0;
+    double mean_delta = 0.0;
+    double mean_abs_delta = 0.0;
+    double mean_dOO = 0.0;
+    double mean_rperp = 0.0;
+    double mean_E_parallel = 0.0;
+    double std_E_parallel = 0.0;
+    double corr_delta_E_parallel = 0.0;
+    double mean_E_success = 0.0;
+    double mean_E_return = 0.0;
+    double nearest_ion1_distance = 0.0;
+    double nearest_ion2_distance = 0.0;
+  };
+
   struct GeometryResult
   {
     bool valid = false;
@@ -205,6 +293,7 @@ private:
   void write_window(const double time_fs);
   void write_edge_window(const double time_start_fs, const double time_end_fs);
   void write_final_bonds();
+  void write_output_files();
 
   int sample_interval_ = 1;
   int window_samples_ = 1000;
@@ -270,6 +359,11 @@ private:
   std::vector<GeometryResult> frame_geometries_;
   std::vector<HydrogenState> hydrogen_states_;
   bool defect_state_initialized_ = false;
+
+  std::vector<AttemptRecord> attempt_records_;
+  std::vector<DefectRecord> defect_records_;
+  std::vector<WindowRecord> window_records_;
+  std::vector<EdgeWindowRecord> edge_window_records_;
 
   std::unordered_map<unsigned long long, BondStats> window_bonds_;
   std::unordered_map<unsigned long long, BondStats> total_bonds_;
