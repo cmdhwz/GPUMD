@@ -32,29 +32,39 @@ For RPMD/PIMD, enable the lightweight bead-resolved tunneling-like diagnostic wi
 strict default thresholds :math:`f_{\min}=0.25`,
 :math:`f_{\mathrm{center,max}}=0.30`, and
 :math:`|\Delta_{\mathrm{centroid}}|_{\max}=0.10\,\mathrm{\AA}`, together with
-:math:`\text{span}_{\min}=2\,\text{delta\_cutoff}`:
+the legacy diagnostic :math:`\text{span}_{\min}=2\,\text{delta\_cutoff}`:
 
 ::
 
   compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic
 
 The thresholds can be supplied explicitly as the minimum bead fraction in each signed
-well, the minimum bead-coordinate span, the maximum center-bead fraction, and the maximum
-absolute centroid displacement, in Angstrom:
+well, the legacy minimum bead-coordinate span, the maximum center-bead fraction, and the
+maximum absolute centroid displacement, in Angstrom. The span is reported as
+``two_well_span`` but is not required by the final strict tunneling label:
 
 ::
 
-  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic 0.25 0.20 0.30 0.10
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H bead_diagnostic 0.25 0.25 0.30 0.10
 
 The strict classification is layered. ``two_well_delocalized`` requires both signed wells,
-the center-fraction limit, the minimum span, exactly two signed-well interfaces after center
-beads are skipped, and at most two center domains. To reject multi-domain patterns such as
+the center-fraction limit, exactly two signed-well interfaces after center beads are skipped,
+and at most four complete cyclic state domains with at most two center domains. The legacy
+``two_well_span`` flag additionally records the minimum span. To reject multi-domain patterns such as
 ``LL00LLRR00RR``, the implementation also requires at most four complete cyclic state domains.
 ``barrier_centered_tunneling_like`` additionally requires
 :math:`|\Delta_{\mathrm{centroid}}|\le0.10\,\mathrm{\AA}` by default. Thus the latter is
 the strict default label, while the former remains useful for detecting asymmetric salt-induced
 two-well delocalization without forcing its centroid to the barrier center. Multi-kink or
-multi-domain configurations remain ``ambiguous`` rather than being labeled tunneling-like.
+multi-domain configurations are labeled ``multi_kink_or_multi_domain`` rather than being
+called noise or strict tunneling.
+
+Each finalized attempt keeps two representative bead configurations. ``centroid_best`` is
+the sample with the smallest :math:`|\Delta_{\rm centroid}|`. ``delocalization_best`` is
+selected lexicographically by largest :math:`\min(f_-,f_+)`, smallest :math:`f_0`, passing
+``simple_two_domain_path``, largest ``robust_span`` (the 20--80 percentile span), and finally
+smallest :math:`|\Delta_{\rm centroid}|`. The two selections can occur at different times in
+an asymmetric salt-ice potential.
 
 For each hydrogen, the nearest oxygen is used as an anchor and the second endpoint is selected
 from the anchor's top-8 oxygen shell with a mutual-neighbor check. The accepted pair is ordered
@@ -138,19 +148,24 @@ and completed edge windows.
 * ``proton_bond.out`` contains accumulated per-pair geometry, state, and transition counts
   after the run.
 * ``proton_bead_event.out`` is written only when ``bead_diagnostic`` is enabled. It contains
-  one record for each finalized attempt, with the dynamical ``outcome`` and the independent
-  ``quantum_class`` label. ``probe_time_fs`` is the time of the best centroid probe;
+  two records for each finalized attempt, selected by ``selection_kind=centroid_best`` and
+  ``selection_kind=delocalization_best``, with the dynamical ``outcome`` and independent
+  ``quantum_class`` label. ``probe_time_fs`` is the time of the selected probe;
   ``f_minus``, ``f_zero``, and ``f_plus`` are the fractions of beads below, inside, and above
   the centroid dead band. ``sigma_delta``, ``delta_min``, ``delta_max``, and ``span`` describe
   the bead distribution. ``kink_count`` counts signed-well changes after center beads are
   skipped; ``center_domain_count`` counts cyclic contiguous center runs; and
   ``total_state_domain_count`` counts all cyclic domains of the three-state sequence.
-  ``two_well_span``, ``simple_two_domain_path``, ``barrier_centered``, and
-  ``strict_tunneling_like`` expose the individual strict filters as integer flags.
+  ``two_well_occupied``, ``two_well_span``, ``simple_two_domain_path``,
+  ``barrier_centered``, ``strict_tunneling_like``, and ``multi_kink_or_multi_domain`` expose
+  the individual strict filters as integer flags.
+  ``channel_valid_count`` and ``f_channel_valid`` report how many beads satisfy the same
+  fixed-pair O-H-O geometry filters; this is diagnostic only and is not a strict-label filter.
   ``rms_neighbor_delta_jump`` and ``max_neighbor_delta_jump`` quantify bead-to-bead coordinate
-  jumps. ``quantum_class`` is ``two_well_delocalized`` or
-  ``barrier_centered_tunneling_like`` only when the corresponding layered criteria pass;
-  multi-kink or multi-domain cases remain ``ambiguous``. For a multi-bead run where bead
+  jumps. ``quantum_class`` is ``two_well_delocalized``,
+  ``barrier_centered_tunneling_like``, ``compact_single_domain``, or
+  ``multi_kink_or_multi_domain`` when the corresponding criteria pass; other cases remain
+  ``ambiguous``. For a multi-bead run where bead
   coordinates are unavailable, the record is ``ambiguous`` with invalid floating-point fields.
   The file is intended for RPMD/PIMD diagnostics and is absent when the optional diagnostic is
   not enabled; an explicitly enabled one-bead run is labeled ``classical_only``.
@@ -180,10 +195,13 @@ is not reselected independently for each bead. For bead :math:`s`, the diagnosti
 :math:`\Delta_s=d(H_s,O_{\rm low,s})-d(H_s,O_{\rm high,s})`, using the same minimum-image
 distance convention as the centroid observer. Beads are classified with the existing
 ``delta_cutoff`` dead band. ``two_well_delocalized`` requires at least ``f_min`` of the beads in
-each signed well, exactly two cyclic sign changes after dead-band beads are skipped, and a
-span of at least ``span_min`` and the center-fraction limit. The strict path also rejects
+each signed well, no more than ``center_max`` center beads, exactly two cyclic sign changes
+after dead-band beads are skipped, and no more than four complete cyclic state domains. The
+legacy ``two_well_span`` flag additionally requires a span of at least ``span_min``. The strict
+path also rejects
 multi-domain patterns such as ``LL00LLRR00RR``. A compact distribution dominated by one signed
-well or the dead band with no cyclic sign change is labeled ``overbarrier_like``; all other
+well or the dead band with no cyclic sign change is labeled ``compact_single_domain``; a
+multi-kink or multi-domain configuration is labeled ``multi_kink_or_multi_domain``. Other
 multi-bead cases are ``ambiguous``. A one-bead run is always labeled ``classical_only``.
 
 These labels identify tunneling-like ring-polymer geometry, not a rigorous quantum observable

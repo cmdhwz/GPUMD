@@ -845,6 +845,27 @@ bool Proton_Tunneling::ensure_bead_positions(Atom& atom)
   return true;
 }
 
+bool Proton_Tunneling::is_better_delocalization_diagnostic(
+  const BeadDiagnostic& candidate,
+  const BeadDiagnostic& current) const
+{
+  if (!candidate.valid)
+    return false;
+  if (!current.valid)
+    return true;
+  const double candidate_well_occupancy = std::min(candidate.f_minus, candidate.f_plus);
+  const double current_well_occupancy = std::min(current.f_minus, current.f_plus);
+  if (candidate_well_occupancy != current_well_occupancy)
+    return candidate_well_occupancy > current_well_occupancy;
+  if (candidate.f_zero != current.f_zero)
+    return candidate.f_zero < current.f_zero;
+  if (candidate.simple_two_domain_path != current.simple_two_domain_path)
+    return candidate.simple_two_domain_path > current.simple_two_domain_path;
+  if (candidate.robust_span != current.robust_span)
+    return candidate.robust_span > current.robust_span;
+  return std::abs(candidate.delta_centroid) < std::abs(current.delta_centroid);
+}
+
 Proton_Tunneling::QuantumCharacter Proton_Tunneling::classify_quantum_character(
   const BeadDiagnostic& diagnostic) const
 {
@@ -853,18 +874,18 @@ Proton_Tunneling::QuantumCharacter Proton_Tunneling::classify_quantum_character(
   if (!diagnostic.valid)
     return QuantumCharacter::AMBIGUOUS;
 
-  const bool two_well_delocalized = diagnostic.two_well_span != 0 &&
-    diagnostic.f_zero <= bead_center_max_ && diagnostic.simple_two_domain_path != 0;
   if (diagnostic.barrier_centered != 0)
     return QuantumCharacter::BARRIER_CENTERED_TUNNELING_LIKE;
-  if (two_well_delocalized)
+  if (diagnostic.simple_two_domain_path != 0)
     return QuantumCharacter::TWO_WELL_DELOCALIZED;
+  if (diagnostic.multi_kink_or_multi_domain != 0)
+    return QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN;
 
   const int dominant_count = std::max(
     diagnostic.n_zero, std::max(diagnostic.n_minus, diagnostic.n_plus));
   if (diagnostic.kink_count == 0 &&
       static_cast<double>(dominant_count) / diagnostic.num_beads >= 1.0 - bead_f_min_)
-    return QuantumCharacter::OVERBARRIER_LIKE;
+    return QuantumCharacter::COMPACT_SINGLE_DOMAIN;
 
   return QuantumCharacter::AMBIGUOUS;
 }
@@ -878,8 +899,10 @@ const char* Proton_Tunneling::quantum_character_name(const QuantumCharacter char
     return "two_well_delocalized";
   case QuantumCharacter::BARRIER_CENTERED_TUNNELING_LIKE:
     return "barrier_centered_tunneling_like";
-  case QuantumCharacter::OVERBARRIER_LIKE:
-    return "overbarrier_like";
+  case QuantumCharacter::COMPACT_SINGLE_DOMAIN:
+    return "compact_single_domain";
+  case QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN:
+    return "multi_kink_or_multi_domain";
   case QuantumCharacter::AMBIGUOUS:
     return "ambiguous";
   }
@@ -919,6 +942,10 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
     diagnostic.f_plus = static_cast<double>(diagnostic.n_plus);
     diagnostic.center_domain_count = (state == 0) ? 1 : 0;
     diagnostic.total_state_domain_count = 1;
+    diagnostic.channel_valid_count = 1;
+    diagnostic.f_channel_valid = 1.0;
+    diagnostic.delta_q20 = geometry.delta;
+    diagnostic.delta_q80 = geometry.delta;
     diagnostic.character = classify_quantum_character(diagnostic);
     const auto analysis_end = std::chrono::high_resolution_clock::now();
     bead_analysis_wall_time_ +=
@@ -933,7 +960,8 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
 
   const auto analysis_start = std::chrono::high_resolution_clock::now();
   const size_t position_size = static_cast<size_t>(number_of_atoms_) * 3;
-  const auto bead_delta = [&](const int bead) {
+  const double angle_cosine_limit = std::cos(oho_angle_min_deg_ * 0.017453292519943295);
+  const auto bead_geometry = [&](const int bead, double& delta) {
     const double* position = cpu_position_beads_.data() + position_size * bead;
     double low_x = position[geometry.oxygen_low] - position[hydrogen];
     double low_y = position[geometry.oxygen_low + number_of_atoms_] -
@@ -947,8 +975,43 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
       position[hydrogen + 2 * number_of_atoms_];
     apply_mic(box, low_x, low_y, low_z);
     apply_mic(box, high_x, high_y, high_z);
-    return std::sqrt(low_x * low_x + low_y * low_y + low_z * low_z) -
-      std::sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
+    const double low_distance = std::sqrt(low_x * low_x + low_y * low_y + low_z * low_z);
+    const double high_distance = std::sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
+    if (low_distance > 0.0 && high_distance > 0.0)
+      delta = low_distance - high_distance;
+    double ox = position[geometry.oxygen_high] - position[geometry.oxygen_low];
+    double oy = position[geometry.oxygen_high + number_of_atoms_] -
+      position[geometry.oxygen_low + number_of_atoms_];
+    double oz = position[geometry.oxygen_high + 2 * number_of_atoms_] -
+      position[geometry.oxygen_low + 2 * number_of_atoms_];
+    apply_mic(box, ox, oy, oz);
+    const double dOO_square = ox * ox + oy * oy + oz * oz;
+    if (dOO_square < dOO_min_ * dOO_min_ || dOO_square > dOO_max_ * dOO_max_)
+      return false;
+    double hx_from_low = position[hydrogen] - position[geometry.oxygen_low];
+    double hy_from_low = position[hydrogen + number_of_atoms_] -
+      position[geometry.oxygen_low + number_of_atoms_];
+    double hz_from_low = position[hydrogen + 2 * number_of_atoms_] -
+      position[geometry.oxygen_low + 2 * number_of_atoms_];
+    apply_mic(box, hx_from_low, hy_from_low, hz_from_low);
+    const double projection = (hx_from_low * ox + hy_from_low * oy + hz_from_low * oz) /
+      dOO_square;
+    if (projection < -1.0e-10 || projection > 1.0 + 1.0e-10)
+      return false;
+    const double px = hx_from_low - projection * ox;
+    const double py = hy_from_low - projection * oy;
+    const double pz = hz_from_low - projection * oz;
+    const double rperp = std::sqrt(std::max(0.0, px * px + py * py + pz * pz));
+    if (rperp > rperp_max_)
+      return false;
+    if (low_distance <= 0.0 || high_distance <= 0.0 ||
+        low_distance > 1.60 || high_distance > 1.60)
+      return false;
+    const double angle_cosine = (low_x * high_x + low_y * high_y + low_z * high_z) /
+      (low_distance * high_distance);
+    if (angle_cosine > angle_cosine_limit)
+      return false;
+    return true;
   };
 
   std::vector<int> nonzero_signs;
@@ -960,8 +1023,11 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
   diagnostic.delta_min = std::numeric_limits<double>::max();
   diagnostic.delta_max = -std::numeric_limits<double>::max();
   for (int bead = 0; bead < diagnostic.num_beads; ++bead) {
-    const double delta = bead_delta(bead);
+    double delta = 0.0;
+    const bool channel_valid = bead_geometry(bead, delta);
     bead_deltas[bead] = delta;
+    if (channel_valid)
+      ++diagnostic.channel_valid_count;
     sum_delta += delta;
     sum_delta_square += delta * delta;
     diagnostic.delta_min = std::min(diagnostic.delta_min, delta);
@@ -983,6 +1049,7 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
   diagnostic.f_minus = diagnostic.n_minus * inverse_num_beads;
   diagnostic.f_zero = diagnostic.n_zero * inverse_num_beads;
   diagnostic.f_plus = diagnostic.n_plus * inverse_num_beads;
+  diagnostic.f_channel_valid = diagnostic.channel_valid_count * inverse_num_beads;
   diagnostic.sigma_delta = std::sqrt(std::max(
     0.0, sum_delta_square / diagnostic.num_beads - diagnostic.mean_delta * diagnostic.mean_delta));
   diagnostic.span = diagnostic.delta_max - diagnostic.delta_min;
@@ -1014,19 +1081,36 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
   if (zero_beads == diagnostic.num_beads)
     diagnostic.center_domain_count = 1;
   diagnostic.total_state_domain_count = (state_changes == 0) ? 1 : state_changes;
+  std::vector<double> sorted_deltas = bead_deltas;
+  std::sort(sorted_deltas.begin(), sorted_deltas.end());
+  const auto quantile = [&](const double fraction) {
+    const double position = fraction * (diagnostic.num_beads - 1);
+    const size_t lower = static_cast<size_t>(position);
+    const size_t upper = std::min(lower + 1, sorted_deltas.size() - 1);
+    const double weight = position - lower;
+    return sorted_deltas[lower] + weight * (sorted_deltas[upper] - sorted_deltas[lower]);
+  };
+  diagnostic.delta_q20 = quantile(0.20);
+  diagnostic.delta_q80 = quantile(0.80);
+  diagnostic.robust_span = diagnostic.delta_q80 - diagnostic.delta_q20;
+  diagnostic.centroid_minus_mean = diagnostic.delta_centroid - diagnostic.mean_delta;
   diagnostic.rms_neighbor_delta_jump = std::sqrt(
     sum_neighbor_delta_jump_square * inverse_num_beads);
+  diagnostic.two_well_occupied =
+    (diagnostic.f_minus >= bead_f_min_ && diagnostic.f_plus >= bead_f_min_) ? 1 : 0;
   diagnostic.two_well_span =
-    (diagnostic.f_minus >= bead_f_min_ && diagnostic.f_plus >= bead_f_min_ &&
+    (diagnostic.two_well_occupied != 0 &&
      diagnostic.span >= bead_span_min_) ? 1 : 0;
+  diagnostic.multi_kink_or_multi_domain =
+    (diagnostic.kink_count > 2 || diagnostic.center_domain_count > 2 ||
+     diagnostic.total_state_domain_count > 4) ? 1 : 0;
   // Reject split same-sign domains such as LL00LLRR00RR even though their
   // center-skipped signed sequence has only two L/R interfaces.
   diagnostic.simple_two_domain_path =
-    (diagnostic.kink_count == 2 && diagnostic.center_domain_count <= 2 &&
+    (diagnostic.two_well_occupied != 0 && diagnostic.f_zero <= bead_center_max_ &&
+     diagnostic.kink_count == 2 && diagnostic.center_domain_count <= 2 &&
      diagnostic.total_state_domain_count <= 4) ? 1 : 0;
-  const bool two_well_delocalized = diagnostic.two_well_span != 0 &&
-    diagnostic.f_zero <= bead_center_max_ && diagnostic.simple_two_domain_path != 0;
-  diagnostic.barrier_centered = (two_well_delocalized &&
+  diagnostic.barrier_centered = (diagnostic.simple_two_domain_path != 0 &&
     std::abs(diagnostic.delta_centroid) <= bead_centroid_max_) ? 1 : 0;
   diagnostic.strict_tunneling_like = diagnostic.barrier_centered;
   diagnostic.valid = true;
@@ -1217,7 +1301,8 @@ void Proton_Tunneling::start_attempt(
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
-  hydrogen_state.best_bead_diagnostic = BeadDiagnostic();
+  hydrogen_state.centroid_best = BeadDiagnostic();
+  hydrogen_state.delocalization_best = BeadDiagnostic();
 }
 
 const char* Proton_Tunneling::outcome_name(const AttemptOutcome outcome) const
@@ -1316,7 +1401,8 @@ void Proton_Tunneling::finish_attempt(
   record.E_parallel_end = E_end_output;
   record.nearest_ion_id = nearest_ion_id_output;
   record.nearest_ion_distance = nearest_ion_distance_output;
-  record.bead_diagnostic = hydrogen_state.best_bead_diagnostic;
+  record.centroid_best = hydrogen_state.centroid_best;
+  record.delocalization_best = hydrogen_state.delocalization_best;
 
   if (outcome == AttemptOutcome::success && geometry != nullptr) {
     const int nH_from_before = event_hydrogen_count_[oxygen_from];
@@ -1362,7 +1448,8 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
-  hydrogen_state.best_bead_diagnostic = BeadDiagnostic();
+  hydrogen_state.centroid_best = BeadDiagnostic();
+  hydrogen_state.delocalization_best = BeadDiagnostic();
 }
 
 void Proton_Tunneling::observe_frame(
@@ -1427,8 +1514,15 @@ void Proton_Tunneling::observe_frame(
     BeadDiagnostic diagnostic;
     const bool evaluated = evaluate_bead_diagnostic(
       atom, box, hydrogen, geometry, time_fs, diagnostic);
-    if (evaluated || !hydrogen_state.best_bead_diagnostic.valid)
-      hydrogen_state.best_bead_diagnostic = diagnostic;
+    if (!evaluated)
+      return;
+    if (!hydrogen_state.centroid_best.valid ||
+        std::abs(diagnostic.delta_centroid) <
+          std::abs(hydrogen_state.centroid_best.delta_centroid))
+      hydrogen_state.centroid_best = diagnostic;
+    if (is_better_delocalization_diagnostic(
+          diagnostic, hydrogen_state.delocalization_best))
+      hydrogen_state.delocalization_best = diagnostic;
   };
 
   for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
@@ -1501,14 +1595,13 @@ void Proton_Tunneling::observe_frame(
         // If sampling jumps across the dead band, retain the event rather than silently
         // losing it. With a sufficiently small sample interval, normal attempts start in state 0.
         start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry);
-        probe_attempt(hydrogen, geometry, hydrogen_state);
       }
 
       if (hydrogen_state.attempt_active) {
+        probe_attempt(hydrogen, geometry, hydrogen_state);
         const double abs_delta = std::abs(geometry.delta);
         if (abs_delta < hydrogen_state.attempt_min_abs_delta) {
           hydrogen_state.attempt_min_abs_delta = abs_delta;
-          probe_attempt(hydrogen, geometry, hydrogen_state);
         }
         if (state == hydrogen_state.stable_state) {
           finish_attempt(
@@ -1862,11 +1955,13 @@ void Proton_Tunneling::write_output_files()
     "nearest_ion_id nearest_ion_distance\n");
   if (bead_diagnostic_enabled_) {
     fprintf(bead_event_file_,
-      "# columns attempt_id probe_time_fs H_id O_low O_high outcome num_beads "
-      "delta_centroid f_minus f_zero f_plus sigma_delta delta_min delta_max span "
-      "kink_count center_domain_count total_state_domain_count two_well_span "
-      "simple_two_domain_path barrier_centered strict_tunneling_like "
-      "rms_neighbor_delta_jump max_neighbor_delta_jump quantum_class\n");
+      "# columns attempt_id selection_kind probe_time_fs H_id O_low O_high outcome num_beads "
+      "delta_centroid f_minus f_zero f_plus mean_delta centroid_minus_mean sigma_delta "
+      "delta_min delta_max span delta_q20 delta_q80 robust_span kink_count "
+      "center_domain_count total_state_domain_count two_well_occupied two_well_span "
+      "simple_two_domain_path barrier_centered strict_tunneling_like channel_valid_count "
+      "f_channel_valid multi_kink_or_multi_domain rms_neighbor_delta_jump "
+      "max_neighbor_delta_jump quantum_class\n");
   }
   fprintf(defect_file_, "# columns time_fs O_id q_defect nH cause_event_id\n");
   fprintf(edge_window_file_,
@@ -1906,39 +2001,53 @@ void Proton_Tunneling::write_output_files()
       record.nearest_ion_distance);
 
     if (bead_event_file_ != nullptr) {
-      const BeadDiagnostic& diagnostic = record.bead_diagnostic;
-      const double f_minus = diagnostic.valid ? diagnostic.f_minus : bead_nan;
-      const double f_zero = diagnostic.valid ? diagnostic.f_zero : bead_nan;
-      const double f_plus = diagnostic.valid ? diagnostic.f_plus : bead_nan;
-      fprintf(
-        bead_event_file_,
-        "%lld %.10e %d %d %d %s %d %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e "
-        "%d %d %d %d %d %d %d %.10e %.10e %s\n",
-        record.attempt_id,
-        diagnostic.valid ? diagnostic.probe_time_fs : bead_nan,
-        record.hydrogen,
-        record.oxygen_low,
-        record.oxygen_high,
-        outcome_name(record.outcome),
-        diagnostic.num_beads,
-        diagnostic.valid ? diagnostic.delta_centroid : bead_nan,
-        f_minus,
-        f_zero,
-        f_plus,
-        diagnostic.valid ? diagnostic.sigma_delta : bead_nan,
-        diagnostic.valid ? diagnostic.delta_min : bead_nan,
-        diagnostic.valid ? diagnostic.delta_max : bead_nan,
-        diagnostic.valid ? diagnostic.span : bead_nan,
-        diagnostic.valid ? diagnostic.kink_count : -1,
-        diagnostic.valid ? diagnostic.center_domain_count : -1,
-        diagnostic.valid ? diagnostic.total_state_domain_count : -1,
-        diagnostic.valid ? diagnostic.two_well_span : 0,
-        diagnostic.valid ? diagnostic.simple_two_domain_path : 0,
-        diagnostic.valid ? diagnostic.barrier_centered : 0,
-        diagnostic.valid ? diagnostic.strict_tunneling_like : 0,
-        diagnostic.valid ? diagnostic.rms_neighbor_delta_jump : bead_nan,
-        diagnostic.valid ? diagnostic.max_neighbor_delta_jump : bead_nan,
-        quantum_character_name(diagnostic.character));
+      const auto write_bead_event = [&](const char* selection_kind,
+                                        const BeadDiagnostic& diagnostic) {
+        const bool valid = diagnostic.valid;
+        fprintf(
+          bead_event_file_,
+          "%lld %s %.10e %d %d %d %s %d "
+          "%.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e "
+          "%d %d %d %d %d %d %d %d %d %d "
+          "%.10e %.10e %.10e %s\n",
+          record.attempt_id,
+          selection_kind,
+          valid ? diagnostic.probe_time_fs : bead_nan,
+          record.hydrogen,
+          record.oxygen_low,
+          record.oxygen_high,
+          outcome_name(record.outcome),
+          diagnostic.num_beads,
+          valid ? diagnostic.delta_centroid : bead_nan,
+          valid ? diagnostic.f_minus : bead_nan,
+          valid ? diagnostic.f_zero : bead_nan,
+          valid ? diagnostic.f_plus : bead_nan,
+          valid ? diagnostic.mean_delta : bead_nan,
+          valid ? diagnostic.centroid_minus_mean : bead_nan,
+          valid ? diagnostic.sigma_delta : bead_nan,
+          valid ? diagnostic.delta_min : bead_nan,
+          valid ? diagnostic.delta_max : bead_nan,
+          valid ? diagnostic.span : bead_nan,
+          valid ? diagnostic.delta_q20 : bead_nan,
+          valid ? diagnostic.delta_q80 : bead_nan,
+          valid ? diagnostic.robust_span : bead_nan,
+          valid ? diagnostic.kink_count : -1,
+          valid ? diagnostic.center_domain_count : -1,
+          valid ? diagnostic.total_state_domain_count : -1,
+          valid ? diagnostic.two_well_occupied : -1,
+          valid ? diagnostic.two_well_span : -1,
+          valid ? diagnostic.simple_two_domain_path : -1,
+          valid ? diagnostic.barrier_centered : -1,
+          valid ? diagnostic.strict_tunneling_like : -1,
+          valid ? diagnostic.channel_valid_count : -1,
+          valid ? diagnostic.multi_kink_or_multi_domain : -1,
+          valid ? diagnostic.f_channel_valid : bead_nan,
+          valid ? diagnostic.rms_neighbor_delta_jump : bead_nan,
+          valid ? diagnostic.max_neighbor_delta_jump : bead_nan,
+          quantum_character_name(diagnostic.character));
+      };
+      write_bead_event("centroid_best", record.centroid_best);
+      write_bead_event("delocalization_best", record.delocalization_best);
     }
 
     if (record.has_transfer) {

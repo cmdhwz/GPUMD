@@ -88,7 +88,8 @@ private:
     CLASSICAL_ONLY,
     TWO_WELL_DELOCALIZED,
     BARRIER_CENTERED_TUNNELING_LIKE,
-    OVERBARRIER_LIKE,
+    COMPACT_SINGLE_DOMAIN,
+    MULTI_KINK_OR_MULTI_DOMAIN,
     AMBIGUOUS
   };
 
@@ -102,20 +103,28 @@ private:
     int kink_count = 0;
     int center_domain_count = 0;
     int total_state_domain_count = 0;
+    int two_well_occupied = 0;
     int two_well_span = 0;
     int simple_two_domain_path = 0;
     int barrier_centered = 0;
     int strict_tunneling_like = 0;
+    int channel_valid_count = 0;
+    int multi_kink_or_multi_domain = 0;
     double probe_time_fs = 0.0;
     double delta_centroid = 0.0;
     double f_minus = 0.0;
     double f_zero = 0.0;
     double f_plus = 0.0;
+    double f_channel_valid = 0.0;
     double mean_delta = 0.0;
+    double centroid_minus_mean = 0.0;
     double sigma_delta = 0.0;
     double delta_min = 0.0;
     double delta_max = 0.0;
     double span = 0.0;
+    double delta_q20 = 0.0;
+    double delta_q80 = 0.0;
+    double robust_span = 0.0;
     double rms_neighbor_delta_jump = 0.0;
     double max_neighbor_delta_jump = 0.0;
     QuantumCharacter character = QuantumCharacter::AMBIGUOUS;
@@ -147,7 +156,8 @@ private:
     double E_parallel_end = 0.0;
     int nearest_ion_id = -1;
     double nearest_ion_distance = 0.0;
-    BeadDiagnostic bead_diagnostic;
+    BeadDiagnostic centroid_best;
+    BeadDiagnostic delocalization_best;
     bool has_transfer = false;
     int nH_from_before = 0;
     int nH_to_before = 0;
@@ -289,7 +299,8 @@ private:
     double attempt_E_start = 0.0;
     double attempt_min_abs_delta = 0.0;
     double pending_start_time_fs = 0.0;
-    BeadDiagnostic best_bead_diagnostic;
+    BeadDiagnostic centroid_best;
+    BeadDiagnostic delocalization_best;
   };
 
   void parse(const char** param, const int num_param, const Atom& atom);
@@ -307,6 +318,9 @@ private:
     const double probe_time_fs,
     BeadDiagnostic& diagnostic);
   QuantumCharacter classify_quantum_character(const BeadDiagnostic& diagnostic) const;
+  bool is_better_delocalization_diagnostic(
+    const BeadDiagnostic& candidate,
+    const BeadDiagnostic& current) const;
   const char* quantum_character_name(const QuantumCharacter character) const;
   bool find_geometry(
     const int hydrogen,
