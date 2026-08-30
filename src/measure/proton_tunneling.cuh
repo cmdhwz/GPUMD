@@ -251,8 +251,18 @@ private:
   std::vector<std::vector<int>> oxygen_shell_neighbors_;
   std::vector<double> cpu_position_;
   std::vector<double> cpu_position_beads_;
+  std::vector<double*> bead_position_ptrs_cpu_;
+  GPU_Vector<double*> bead_position_ptrs_gpu_;
+  GPU_Vector<double> bead_position_staging_gpu_;
   bool bead_positions_cached_ = false;
   int cached_number_of_beads_ = 0;
+  long long observer_frame_count_ = 0;
+  long long bead_probe_frame_count_ = 0;
+  long long bead_d2h_copy_count_ = 0;
+  unsigned long long bead_bytes_copied_ = 0;
+  double bead_copy_wall_time_ = 0.0;
+  double bead_analysis_wall_time_ = 0.0;
+  double total_observer_wall_time_ = 0.0;
   std::vector<int> hydrogen_count_;
   std::vector<int> previous_hydrogen_count_;
   std::vector<int> event_hydrogen_count_;

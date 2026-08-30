@@ -28,8 +28,10 @@ propagation chains offline.
 #include "model/box.cuh"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
+#include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -50,6 +52,19 @@ void decode_bond_key(
 {
   oxygen_low = static_cast<int>(key >> 32);
   oxygen_high = static_cast<int>(key & 0xffffffffULL);
+}
+
+__global__ void pack_bead_positions(
+  const int position_size,
+  const int number_of_beads,
+  double* const* position_beads,
+  double* packed_positions)
+{
+  const int component = blockDim.x * blockIdx.x + threadIdx.x;
+  const int bead = blockIdx.y;
+  if (bead < number_of_beads && component < position_size)
+    packed_positions[static_cast<size_t>(bead) * position_size + component] =
+      position_beads[bead][component];
 }
 }
 
@@ -226,6 +241,13 @@ void Proton_Tunneling::preprocess(
   cpu_position_.resize(number_of_atoms_ * 3);
   bead_positions_cached_ = false;
   cached_number_of_beads_ = 0;
+  observer_frame_count_ = 0;
+  bead_probe_frame_count_ = 0;
+  bead_d2h_copy_count_ = 0;
+  bead_bytes_copied_ = 0;
+  bead_copy_wall_time_ = 0.0;
+  bead_analysis_wall_time_ = 0.0;
+  total_observer_wall_time_ = 0.0;
   oxygen_local_index_.assign(number_of_atoms_, -1);
   oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
@@ -397,13 +419,46 @@ bool Proton_Tunneling::ensure_bead_positions(Atom& atom)
       return false;
   }
 
-  // ponytail: copy the complete bead frame once on demand; a small-box observer can
-  // use this simple path before a targeted H/O gather is justified by profiling.
-  cpu_position_beads_.resize(position_size * static_cast<size_t>(atom.number_of_beads));
-  for (int bead = 0; bead < atom.number_of_beads; ++bead) {
-    atom.position_beads[bead].copy_to_host(
-      cpu_position_beads_.data() + position_size * static_cast<size_t>(bead));
+  bool rebuild_pointer_array = bead_position_ptrs_cpu_.size() !=
+    static_cast<size_t>(atom.number_of_beads);
+  if (!rebuild_pointer_array) {
+    for (int bead = 0; bead < atom.number_of_beads; ++bead) {
+      if (bead_position_ptrs_cpu_[bead] != atom.position_beads[bead].data()) {
+        rebuild_pointer_array = true;
+        break;
+      }
+    }
   }
+  if (rebuild_pointer_array) {
+    bead_position_ptrs_cpu_.resize(atom.number_of_beads);
+    for (int bead = 0; bead < atom.number_of_beads; ++bead)
+      bead_position_ptrs_cpu_[bead] = atom.position_beads[bead].data();
+    bead_position_ptrs_gpu_.resize(atom.number_of_beads);
+    bead_position_ptrs_gpu_.copy_from_host(bead_position_ptrs_cpu_.data());
+  }
+
+  const size_t packed_size = position_size * static_cast<size_t>(atom.number_of_beads);
+  cpu_position_beads_.resize(position_size * static_cast<size_t>(atom.number_of_beads));
+  if (bead_position_staging_gpu_.size() != packed_size)
+    bead_position_staging_gpu_.resize(packed_size);
+
+  // ponytail: one small packing kernel plus one synchronous D2H copy keeps the
+  // observer simple while removing the per-bead synchronization bubbles.
+  const auto copy_start = std::chrono::high_resolution_clock::now();
+  const int block_size = 128;
+  const int grid_x = (static_cast<int>(position_size) + block_size - 1) / block_size;
+  pack_bead_positions<<<dim3(grid_x, atom.number_of_beads), block_size>>>(
+    static_cast<int>(position_size),
+    atom.number_of_beads,
+    bead_position_ptrs_gpu_.data(),
+    bead_position_staging_gpu_.data());
+  GPU_CHECK_KERNEL
+  bead_position_staging_gpu_.copy_to_host(cpu_position_beads_.data());
+  const auto copy_end = std::chrono::high_resolution_clock::now();
+  bead_copy_wall_time_ += std::chrono::duration<double>(copy_end - copy_start).count();
+  ++bead_d2h_copy_count_;
+  bead_bytes_copied_ += static_cast<unsigned long long>(packed_size * sizeof(double));
+
   cached_number_of_beads_ = atom.number_of_beads;
   bead_positions_cached_ = true;
   return true;
@@ -461,6 +516,7 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
   diagnostic.num_beads = std::max(1, atom.number_of_beads);
 
   if (diagnostic.num_beads <= 1) {
+    const auto analysis_start = std::chrono::high_resolution_clock::now();
     diagnostic.valid = true;
     diagnostic.mean_delta = geometry.delta;
     diagnostic.sigma_delta = 0.0;
@@ -475,6 +531,9 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
     else
       diagnostic.n_zero = 1;
     diagnostic.character = classify_quantum_character(diagnostic);
+    const auto analysis_end = std::chrono::high_resolution_clock::now();
+    bead_analysis_wall_time_ +=
+      std::chrono::duration<double>(analysis_end - analysis_start).count();
     return true;
   }
 
@@ -483,6 +542,7 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
     return false;
   }
 
+  const auto analysis_start = std::chrono::high_resolution_clock::now();
   const size_t position_size = static_cast<size_t>(number_of_atoms_) * 3;
   const auto bead_delta = [&](const int bead) {
     const double* position = cpu_position_beads_.data() + position_size * bead;
@@ -537,6 +597,9 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
   }
   diagnostic.valid = true;
   diagnostic.character = classify_quantum_character(diagnostic);
+  const auto analysis_end = std::chrono::high_resolution_clock::now();
+  bead_analysis_wall_time_ +=
+    std::chrono::duration<double>(analysis_end - analysis_start).count();
   return true;
 }
 
@@ -922,6 +985,8 @@ void Proton_Tunneling::observe_frame(
   const Box& box,
   Atom& atom)
 {
+  const auto observer_start = std::chrono::high_resolution_clock::now();
+  ++observer_frame_count_;
   atom.position_per_atom.copy_to_host(cpu_position_.data());
   bead_positions_cached_ = false;
   cached_number_of_beads_ = 0;
@@ -962,11 +1027,16 @@ void Proton_Tunneling::observe_frame(
   }
   event_hydrogen_count_ = previous_hydrogen_count_;
 
+  bool bead_probe_frame = false;
   const auto probe_attempt = [&](const int hydrogen,
                                  const GeometryResult& geometry,
                                  HydrogenState& hydrogen_state) {
     if (!bead_diagnostic_enabled_)
       return;
+    if (!bead_probe_frame) {
+      ++bead_probe_frame_count_;
+      bead_probe_frame = true;
+    }
     BeadDiagnostic diagnostic;
     const bool evaluated = evaluate_bead_diagnostic(
       atom, box, hydrogen, geometry, time_fs, diagnostic);
@@ -1113,6 +1183,9 @@ void Proton_Tunneling::observe_frame(
   last_time_fs_ = time_fs;
   if (window_sample_count_ == window_samples_)
     write_window(time_fs);
+  const auto observer_end = std::chrono::high_resolution_clock::now();
+  total_observer_wall_time_ +=
+    std::chrono::duration<double>(observer_end - observer_start).count();
 }
 
 void Proton_Tunneling::process(
@@ -1410,5 +1483,15 @@ void Proton_Tunneling::postprocess(
   defect_file_ = nullptr;
   edge_window_file_ = nullptr;
   bond_file_ = nullptr;
+  printf("Proton tunneling observer timing:\n");
+  printf("    sampled observer frames: %lld\n", observer_frame_count_);
+  if (bead_diagnostic_enabled_) {
+    printf("    bead probe frames: %lld\n", bead_probe_frame_count_);
+    printf("    packed bead D2H copies: %lld\n", bead_d2h_copy_count_);
+    printf("    bead bytes copied: %llu\n", bead_bytes_copied_);
+    printf("    bead pack + D2H wall time: %.6f s\n", bead_copy_wall_time_);
+    printf("    bead analysis wall time: %.6f s\n", bead_analysis_wall_time_);
+  }
+  printf("    total observer wall time: %.6f s\n", total_observer_wall_time_);
   initialized_ = false;
 }

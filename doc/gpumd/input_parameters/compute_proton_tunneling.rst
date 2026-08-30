@@ -164,6 +164,14 @@ These labels identify tunneling-like ring-polymer geometry, not a rigorous quant
 or proof that a particular RPMD trajectory tunneled. They should be checked against bead-number
 convergence, H/D isotope comparisons, and matched pure/salt-ice conditions.
 
+The bead coordinates are packed on the GPU into one staging buffer and copied to the CPU with
+one synchronous transfer per sampled frame that needs a bead probe. This preserves the
+diagnostic result while avoiding one synchronization and device-to-host transfer per bead.
+At the end of the run, the observer prints the sampled-frame count, bead-probe-frame count,
+packed-copy count, copied bytes, pack-plus-copy wall time, bead-analysis wall time, and total
+observer wall time. The copy timing includes the packing kernel and the synchronous device-to-host
+copy; it does not include the force or integrator paths.
+
 Use ``compute_proton_tunneling`` first in a short validation run and compare its pair/state
 assignment with the existing Python trajectory script. The transfer and defect streams are
 intentionally kept simple so that defect-chain lifetime, branching, recombination, spatial
