@@ -68,12 +68,19 @@ private:
   struct GeometryResult
   {
     bool valid = false;
+    bool assignment_ambiguous = false;
+    bool pair_conflict = false;
     int nearest_oxygen = -1;
     int oxygen_low = -1;
     int oxygen_high = -1;
+    int candidate_count = 0;
     double delta = 0.0;
     double dOO = 0.0;
     double rperp = 0.0;
+    double path_excess = 0.0;
+    double assignment_score = 0.0;
+    double second_assignment_score = 0.0;
+    double assignment_score_gap = 0.0;
     double low_to_high_dx = 0.0;
     double low_to_high_dy = 0.0;
     double low_to_high_dz = 0.0;
@@ -133,6 +140,8 @@ private:
   };
 
   void parse(const char** param, const int num_param, const Atom& atom);
+  void build_oxygen_shell(const Box& box);
+  void compute_ion_field(const Box& box, GeometryResult& geometry) const;
   bool find_geometry(
     const int hydrogen,
     const Box& box,
@@ -171,10 +180,16 @@ private:
   long long window_valid_pair_count_ = 0;
   long long window_positive_defect_sum_ = 0;
   long long window_negative_defect_sum_ = 0;
+  long long window_assignment_ambiguous_count_ = 0;
+  long long window_pair_conflict_count_ = 0;
   double delta_cutoff_ = 0.10;
   double dOO_min_ = 2.20;
   double dOO_max_ = 2.60;
   double rperp_max_ = 0.80;
+  double oho_angle_min_deg_ = 120.0;
+  int oxygen_shell_k_ = 8;
+  double assignment_path_excess_weight_ = 0.50;
+  double assignment_score_gap_min_ = 0.05;
   bool ion_field_enabled_ = false;
   std::string ion1_symbol_ = "Na";
   std::string ion2_symbol_ = "Cl";
@@ -192,6 +207,8 @@ private:
   std::vector<int> hydrogen_indices_;
   std::vector<int> ion1_indices_;
   std::vector<int> ion2_indices_;
+  std::vector<int> oxygen_local_index_;
+  std::vector<std::vector<int>> oxygen_shell_neighbors_;
   std::vector<double> cpu_position_;
   std::vector<int> hydrogen_count_;
   std::vector<int> previous_hydrogen_count_;

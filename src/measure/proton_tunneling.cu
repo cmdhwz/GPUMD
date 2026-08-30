@@ -32,6 +32,7 @@ propagation chains offline.
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace
 {
@@ -67,9 +68,8 @@ void Proton_Tunneling::parse(
 {
   printf("Compute centroid proton tunneling observer.\n");
 
-  if (num_param != 8 && num_param != 10 && num_param != 14 && num_param != 16) {
-    PRINT_INPUT_ERROR(
-      "compute_proton_tunneling should have 7 parameters, optional O/H symbols, and optional ion_field settings.");
+  if (num_param < 8) {
+    PRINT_INPUT_ERROR("compute_proton_tunneling should have at least 7 parameters.");
   }
   if (!is_valid_int(param[1], &sample_interval_) || sample_interval_ <= 0) {
     PRINT_INPUT_ERROR("proton tunneling sample interval should be a positive integer.");
@@ -91,27 +91,49 @@ void Proton_Tunneling::parse(
     PRINT_INPUT_ERROR("proton tunneling perpendicular-distance cutoff should be positive.");
   }
   int next_param = 8;
-  if (next_param < num_param && std::strcmp(param[next_param], "ion_field") != 0) {
+  const auto is_option = [](const char* value) {
+    return std::strcmp(value, "ion_field") == 0 || std::strcmp(value, "oho_angle") == 0;
+  };
+  if (next_param < num_param && !is_option(param[next_param])) {
+    if (next_param + 1 >= num_param || is_option(param[next_param + 1])) {
+      PRINT_INPUT_ERROR("proton tunneling O and H symbols must be provided as a pair.");
+    }
     oxygen_symbol_ = param[next_param++];
     hydrogen_symbol_ = param[next_param++];
   }
-  if (next_param < num_param) {
-    if (std::strcmp(param[next_param], "ion_field") != 0 || next_param + 6 != num_param) {
-      PRINT_INPUT_ERROR(
-        "ion_field must be followed by ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff.");
+  bool angle_seen = false;
+  while (next_param < num_param) {
+    if (std::strcmp(param[next_param], "oho_angle") == 0) {
+      if (angle_seen || next_param + 1 >= num_param ||
+          !is_valid_real(param[next_param + 1], &oho_angle_min_deg_)) {
+        PRINT_INPUT_ERROR("oho_angle must be followed by one angle in degrees.");
+      }
+      angle_seen = true;
+      next_param += 2;
+    } else if (std::strcmp(param[next_param], "ion_field") == 0) {
+      if (ion_field_enabled_ || next_param + 5 >= num_param) {
+        PRINT_INPUT_ERROR(
+          "ion_field must be followed by ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff.");
+      }
+      ion_field_enabled_ = true;
+      ion1_symbol_ = param[next_param + 1];
+      if (!is_valid_real(param[next_param + 2], &ion1_charge_)) {
+        PRINT_INPUT_ERROR("ion_field ion1 charge should be a number.");
+      }
+      ion2_symbol_ = param[next_param + 3];
+      if (!is_valid_real(param[next_param + 4], &ion2_charge_)) {
+        PRINT_INPUT_ERROR("ion_field ion2 charge should be a number.");
+      }
+      if (!is_valid_real(param[next_param + 5], &ion_field_cutoff_) || ion_field_cutoff_ <= 0.0) {
+        PRINT_INPUT_ERROR("ion_field cutoff should be a positive number.");
+      }
+      next_param += 6;
+    } else {
+      PRINT_INPUT_ERROR("unknown optional compute_proton_tunneling setting.");
     }
-    ion_field_enabled_ = true;
-    ion1_symbol_ = param[next_param + 1];
-    if (!is_valid_real(param[next_param + 2], &ion1_charge_)) {
-      PRINT_INPUT_ERROR("ion_field ion1 charge should be a number.");
-    }
-    ion2_symbol_ = param[next_param + 3];
-    if (!is_valid_real(param[next_param + 4], &ion2_charge_)) {
-      PRINT_INPUT_ERROR("ion_field ion2 charge should be a number.");
-    }
-    if (!is_valid_real(param[next_param + 5], &ion_field_cutoff_) || ion_field_cutoff_ <= 0.0) {
-      PRINT_INPUT_ERROR("ion_field cutoff should be a positive number.");
-    }
+  }
+  if (oho_angle_min_deg_ < 0.0 || oho_angle_min_deg_ > 180.0) {
+    PRINT_INPUT_ERROR("oho_angle should be between 0 and 180 degrees.");
   }
   if (oxygen_symbol_.empty() || hydrogen_symbol_.empty() || oxygen_symbol_ == hydrogen_symbol_) {
     PRINT_INPUT_ERROR("proton tunneling O and H symbols should be different and non-empty.");
@@ -146,6 +168,7 @@ void Proton_Tunneling::parse(
   printf("    state hold time is %d sampled frames.\n", hold_samples_);
   printf("    O-O range is %.6f to %.6f Angstrom.\n", dOO_min_, dOO_max_);
   printf("    perpendicular-distance cutoff is %.6f Angstrom.\n", rperp_max_);
+  printf("    minimum O-H-O angle is %.6f degrees.\n", oho_angle_min_deg_);
   printf("    using oxygen symbol %s and hydrogen symbol %s.\n",
     oxygen_symbol_.c_str(), hydrogen_symbol_.c_str());
   if (ion_field_enabled_) {
@@ -172,12 +195,16 @@ void Proton_Tunneling::preprocess(
   number_of_atoms_ = atom.number_of_atoms;
   time_step_ = time_step;
   cpu_position_.resize(number_of_atoms_ * 3);
+  oxygen_local_index_.assign(number_of_atoms_, -1);
+  oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
   previous_hydrogen_count_.resize(number_of_atoms_, 0);
   event_hydrogen_count_.resize(number_of_atoms_, 0);
   frame_cause_event_ids_.resize(number_of_atoms_, -1);
   frame_geometries_.resize(hydrogen_indices_.size());
   hydrogen_states_.resize(hydrogen_indices_.size());
+  window_assignment_ambiguous_count_ = 0;
+  window_pair_conflict_count_ = 0;
   defect_state_initialized_ = false;
 
   bias_file_ = my_fopen("proton_bias.out", "a");
@@ -188,16 +215,17 @@ void Proton_Tunneling::preprocess(
   defect_file_ = my_fopen("proton_defect.out", "a");
 
   fprintf(bias_file_,
-    "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s",
+    "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s oho_angle %.10e",
     sample_interval_, window_samples_, delta_cutoff_, hold_samples_, dOO_min_, dOO_max_,
-    rperp_max_, oxygen_symbol_.c_str(), hydrogen_symbol_.c_str());
+    rperp_max_, oxygen_symbol_.c_str(), hydrogen_symbol_.c_str(), oho_angle_min_deg_);
   if (ion_field_enabled_)
     fprintf(bias_file_, " ion_field %s %.10e %s %.10e %.10e",
       ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
   fprintf(bias_file_, "\n");
   fprintf(bias_file_,
     "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
-    "flip_rate_per_ps active_bonds positive_defects negative_defects valid_pairs_per_frame\n");
+    "flip_rate_per_ps active_bonds positive_defects negative_defects valid_pairs_per_frame "
+    "assignment_ambiguous_samples pair_conflict_samples\n");
 
   fprintf(transfer_file_,
     "# columns event_id time_start_fs time_confirm_fs H_id O_from O_to O_pair_low O_pair_high "
@@ -231,6 +259,86 @@ void Proton_Tunneling::preprocess(
   initialized_ = true;
 }
 
+void Proton_Tunneling::build_oxygen_shell(const Box& box)
+{
+  // ponytail: rebuild the small-box O shell with O(N_O^2) CPU distances; use a shared
+  // neighbor list if this observer is later applied to large systems.
+  oxygen_shell_neighbors_.assign(oxygen_indices_.size(), std::vector<int>());
+  std::fill(oxygen_local_index_.begin(), oxygen_local_index_.end(), -1);
+  for (size_t i = 0; i < oxygen_indices_.size(); ++i)
+    oxygen_local_index_[oxygen_indices_[i]] = static_cast<int>(i);
+
+  for (size_t i = 0; i < oxygen_indices_.size(); ++i) {
+    const int oxygen_i = oxygen_indices_[i];
+    std::vector<std::pair<double, int>> distances;
+    distances.reserve(oxygen_indices_.size() - 1);
+    for (size_t j = 0; j < oxygen_indices_.size(); ++j) {
+      if (i == j)
+        continue;
+      const int oxygen_j = oxygen_indices_[j];
+      double dx = cpu_position_[oxygen_j] - cpu_position_[oxygen_i];
+      double dy = cpu_position_[oxygen_j + number_of_atoms_] -
+        cpu_position_[oxygen_i + number_of_atoms_];
+      double dz = cpu_position_[oxygen_j + 2 * number_of_atoms_] -
+        cpu_position_[oxygen_i + 2 * number_of_atoms_];
+      apply_mic(box, dx, dy, dz);
+      distances.emplace_back(dx * dx + dy * dy + dz * dz, oxygen_j);
+    }
+    std::sort(distances.begin(), distances.end());
+    const int shell_size = std::min(oxygen_shell_k_, static_cast<int>(distances.size()));
+    oxygen_shell_neighbors_[i].reserve(shell_size);
+    for (int j = 0; j < shell_size; ++j)
+      oxygen_shell_neighbors_[i].push_back(distances[j].second);
+  }
+}
+
+void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometry) const
+{
+  if (!ion_field_enabled_)
+    return;
+
+  const double ox = geometry.low_to_high_dx;
+  const double oy = geometry.low_to_high_dy;
+  const double oz = geometry.low_to_high_dz;
+  const double inverse_dOO = 1.0 / geometry.dOO;
+  const double ex = ox * inverse_dOO;
+  const double ey = oy * inverse_dOO;
+  const double ez = oz * inverse_dOO;
+  geometry.nearest_ion_distance = std::numeric_limits<double>::max();
+  geometry.nearest_ion1_distance = std::numeric_limits<double>::max();
+  geometry.nearest_ion2_distance = std::numeric_limits<double>::max();
+  auto accumulate_ion_field = [&](const std::vector<int>& ions, const double charge,
+                                  double& nearest_species_distance) {
+    for (const int ion : ions) {
+      double ion_dx = cpu_position_[ion] - cpu_position_[geometry.oxygen_low];
+      double ion_dy = cpu_position_[ion + number_of_atoms_] -
+        cpu_position_[geometry.oxygen_low + number_of_atoms_];
+      double ion_dz = cpu_position_[ion + 2 * number_of_atoms_] -
+        cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
+      apply_mic(box, ion_dx, ion_dy, ion_dz);
+      double midpoint_to_ion_x = 0.5 * ox - ion_dx;
+      double midpoint_to_ion_y = 0.5 * oy - ion_dy;
+      double midpoint_to_ion_z = 0.5 * oz - ion_dz;
+      apply_mic(box, midpoint_to_ion_x, midpoint_to_ion_y, midpoint_to_ion_z);
+      const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
+        midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
+      const double distance = std::sqrt(distance_square);
+      nearest_species_distance = std::min(nearest_species_distance, distance);
+      if (distance < geometry.nearest_ion_distance) {
+        geometry.nearest_ion_distance = distance;
+        geometry.nearest_ion_id = ion;
+      }
+      if (distance <= ion_field_cutoff_ && distance > 1.0e-12) {
+        geometry.E_ion_nominal_parallel += K_C * charge *
+          (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
+          (distance_square * distance);
+      }
+    }
+  };
+  accumulate_ion_field(ion1_indices_, ion1_charge_, geometry.nearest_ion1_distance);
+  accumulate_ion_field(ion2_indices_, ion2_charge_, geometry.nearest_ion2_distance);
+}
+
 bool Proton_Tunneling::find_geometry(
   const int hydrogen,
   const Box& box,
@@ -239,14 +347,10 @@ bool Proton_Tunneling::find_geometry(
   geometry = GeometryResult();
 
   int first_oxygen = -1;
-  int second_oxygen = -1;
   double first_distance_square = std::numeric_limits<double>::max();
-  double second_distance_square = std::numeric_limits<double>::max();
-
   const double hx = cpu_position_[hydrogen];
   const double hy = cpu_position_[hydrogen + number_of_atoms_];
   const double hz = cpu_position_[hydrogen + 2 * number_of_atoms_];
-
   for (const int oxygen : oxygen_indices_) {
     double dx = cpu_position_[oxygen] - hx;
     double dy = cpu_position_[oxygen + number_of_atoms_] - hy;
@@ -254,117 +358,111 @@ bool Proton_Tunneling::find_geometry(
     apply_mic(box, dx, dy, dz);
     const double distance_square = dx * dx + dy * dy + dz * dz;
     if (distance_square < first_distance_square) {
-      second_oxygen = first_oxygen;
-      second_distance_square = first_distance_square;
       first_oxygen = oxygen;
       first_distance_square = distance_square;
-    } else if (distance_square < second_distance_square) {
-      second_oxygen = oxygen;
-      second_distance_square = distance_square;
     }
   }
-
-  if (first_oxygen < 0 || second_oxygen < 0)
+  if (first_oxygen < 0)
     return false;
-
   geometry.nearest_oxygen = first_oxygen;
-  geometry.oxygen_low = std::min(first_oxygen, second_oxygen);
-  geometry.oxygen_high = std::max(first_oxygen, second_oxygen);
-  const double low_oxygen_distance = (geometry.oxygen_low == first_oxygen)
-    ? std::sqrt(first_distance_square)
-    : std::sqrt(second_distance_square);
-  const double high_oxygen_distance = (geometry.oxygen_high == first_oxygen)
-    ? std::sqrt(first_distance_square)
-    : std::sqrt(second_distance_square);
-  geometry.delta = low_oxygen_distance - high_oxygen_distance;
-
-  double ox = cpu_position_[geometry.oxygen_high] - cpu_position_[geometry.oxygen_low];
-  double oy = cpu_position_[geometry.oxygen_high + number_of_atoms_] -
-    cpu_position_[geometry.oxygen_low + number_of_atoms_];
-  double oz = cpu_position_[geometry.oxygen_high + 2 * number_of_atoms_] -
-    cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
-  apply_mic(box, ox, oy, oz);
-  const double dOO_square = ox * ox + oy * oy + oz * oz;
-  if (dOO_square < dOO_min_ * dOO_min_ || dOO_square > dOO_max_ * dOO_max_)
+  const int anchor_local = (first_oxygen < static_cast<int>(oxygen_local_index_.size()))
+    ? oxygen_local_index_[first_oxygen]
+    : -1;
+  if (anchor_local < 0 || anchor_local >= static_cast<int>(oxygen_shell_neighbors_.size()))
     return false;
-  geometry.dOO = std::sqrt(dOO_square);
-  geometry.low_to_high_dx = ox;
-  geometry.low_to_high_dy = oy;
-  geometry.low_to_high_dz = oz;
 
-  if (ion_field_enabled_) {
-    const double inverse_dOO = 1.0 / geometry.dOO;
-    const double ex = ox * inverse_dOO;
-    const double ey = oy * inverse_dOO;
-    const double ez = oz * inverse_dOO;
-    geometry.nearest_ion_distance = std::numeric_limits<double>::max();
-    geometry.nearest_ion1_distance = std::numeric_limits<double>::max();
-    geometry.nearest_ion2_distance = std::numeric_limits<double>::max();
-    auto accumulate_ion_field = [&](const std::vector<int>& ions, const double charge,
-                                    double& nearest_species_distance) {
-      for (const int ion : ions) {
-        double ion_dx = cpu_position_[ion] - cpu_position_[geometry.oxygen_low];
-        double ion_dy = cpu_position_[ion + number_of_atoms_] -
-          cpu_position_[geometry.oxygen_low + number_of_atoms_];
-        double ion_dz = cpu_position_[ion + 2 * number_of_atoms_] -
-          cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
-        apply_mic(box, ion_dx, ion_dy, ion_dz);
-        double midpoint_to_ion_x = 0.5 * ox - ion_dx;
-        double midpoint_to_ion_y = 0.5 * oy - ion_dy;
-        double midpoint_to_ion_z = 0.5 * oz - ion_dz;
-        apply_mic(box, midpoint_to_ion_x, midpoint_to_ion_y, midpoint_to_ion_z);
-        const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
-          midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
-        const double distance = std::sqrt(distance_square);
-        nearest_species_distance = std::min(nearest_species_distance, distance);
-        if (distance < geometry.nearest_ion_distance) {
-          geometry.nearest_ion_distance = distance;
-          geometry.nearest_ion_id = ion;
-        }
-        if (distance <= ion_field_cutoff_ && distance > 1.0e-12) {
-          geometry.E_ion_nominal_parallel += K_C * charge *
-            (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
-            (distance_square * distance);
-        }
-      }
-    };
-    accumulate_ion_field(ion1_indices_, ion1_charge_, geometry.nearest_ion1_distance);
-    accumulate_ion_field(ion2_indices_, ion2_charge_, geometry.nearest_ion2_distance);
+  std::vector<GeometryResult> candidates;
+  const std::vector<int>& shell = oxygen_shell_neighbors_[anchor_local];
+  candidates.reserve(shell.size());
+  const double angle_cosine_limit = std::cos(oho_angle_min_deg_ * 0.017453292519943295);
+  for (const int second_oxygen : shell) {
+    const int second_local = (second_oxygen < static_cast<int>(oxygen_local_index_.size()))
+      ? oxygen_local_index_[second_oxygen]
+      : -1;
+    if (second_local < 0 ||
+        std::find(oxygen_shell_neighbors_[second_local].begin(),
+                  oxygen_shell_neighbors_[second_local].end(), first_oxygen) ==
+          oxygen_shell_neighbors_[second_local].end())
+      continue;
+
+    GeometryResult candidate;
+    candidate.nearest_oxygen = first_oxygen;
+    candidate.oxygen_low = std::min(first_oxygen, second_oxygen);
+    candidate.oxygen_high = std::max(first_oxygen, second_oxygen);
+    double ox = cpu_position_[candidate.oxygen_high] - cpu_position_[candidate.oxygen_low];
+    double oy = cpu_position_[candidate.oxygen_high + number_of_atoms_] -
+      cpu_position_[candidate.oxygen_low + number_of_atoms_];
+    double oz = cpu_position_[candidate.oxygen_high + 2 * number_of_atoms_] -
+      cpu_position_[candidate.oxygen_low + 2 * number_of_atoms_];
+    apply_mic(box, ox, oy, oz);
+    const double dOO_square = ox * ox + oy * oy + oz * oz;
+    if (dOO_square < dOO_min_ * dOO_min_ || dOO_square > dOO_max_ * dOO_max_)
+      continue;
+    candidate.dOO = std::sqrt(dOO_square);
+    candidate.low_to_high_dx = ox;
+    candidate.low_to_high_dy = oy;
+    candidate.low_to_high_dz = oz;
+
+    double hx_from_low = hx - cpu_position_[candidate.oxygen_low];
+    double hy_from_low = hy - cpu_position_[candidate.oxygen_low + number_of_atoms_];
+    double hz_from_low = hz - cpu_position_[candidate.oxygen_low + 2 * number_of_atoms_];
+    apply_mic(box, hx_from_low, hy_from_low, hz_from_low);
+    const double projection = (hx_from_low * ox + hy_from_low * oy + hz_from_low * oz) /
+      dOO_square;
+    if (projection < -1.0e-10 || projection > 1.0 + 1.0e-10)
+      continue;
+    const double px = hx_from_low - projection * ox;
+    const double py = hy_from_low - projection * oy;
+    const double pz = hz_from_low - projection * oz;
+    candidate.rperp = std::sqrt(std::max(0.0, px * px + py * py + pz * pz));
+    if (candidate.rperp > rperp_max_)
+      continue;
+
+    double low_x = cpu_position_[candidate.oxygen_low] - hx;
+    double low_y = cpu_position_[candidate.oxygen_low + number_of_atoms_] - hy;
+    double low_z = cpu_position_[candidate.oxygen_low + 2 * number_of_atoms_] - hz;
+    double high_x = cpu_position_[candidate.oxygen_high] - hx;
+    double high_y = cpu_position_[candidate.oxygen_high + number_of_atoms_] - hy;
+    double high_z = cpu_position_[candidate.oxygen_high + 2 * number_of_atoms_] - hz;
+    apply_mic(box, low_x, low_y, low_z);
+    apply_mic(box, high_x, high_y, high_z);
+    const double low_distance = std::sqrt(low_x * low_x + low_y * low_y + low_z * low_z);
+    const double high_distance = std::sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
+    if (low_distance <= 0.0 || high_distance <= 0.0 ||
+        low_distance > 1.60 || high_distance > 1.60)
+      continue;
+    const double angle_cosine = (low_x * high_x + low_y * high_y + low_z * high_z) /
+      (low_distance * high_distance);
+    if (angle_cosine > angle_cosine_limit)
+      continue;
+
+    candidate.delta = low_distance - high_distance;
+    candidate.path_excess = std::max(0.0, low_distance + high_distance - candidate.dOO);
+    candidate.assignment_score = candidate.rperp +
+      assignment_path_excess_weight_ * candidate.path_excess;
+    compute_ion_field(box, candidate);
+    candidates.push_back(candidate);
   }
 
-  double hx_from_low = hx - cpu_position_[geometry.oxygen_low];
-  double hy_from_low = hy - cpu_position_[geometry.oxygen_low + number_of_atoms_];
-  double hz_from_low = hz - cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
-  apply_mic(box, hx_from_low, hy_from_low, hz_from_low);
-  const double projection = (hx_from_low * ox + hy_from_low * oy + hz_from_low * oz) /
-    dOO_square;
-  const double px = hx_from_low - projection * ox;
-  const double py = hy_from_low - projection * oy;
-  const double pz = hz_from_low - projection * oz;
-  geometry.rperp = std::sqrt(px * px + py * py + pz * pz);
-  if (geometry.rperp > rperp_max_)
+  if (candidates.empty())
     return false;
-
-  // The two nearest O atoms must form a hydrogen-bond-like O-H-O geometry. This rejects
-  // most accidental pairs from the other interpenetrating ice-VII network.
-  double low_x = cpu_position_[geometry.oxygen_low] - hx;
-  double low_y = cpu_position_[geometry.oxygen_low + number_of_atoms_] - hy;
-  double low_z = cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_] - hz;
-  double high_x = cpu_position_[geometry.oxygen_high] - hx;
-  double high_y = cpu_position_[geometry.oxygen_high + number_of_atoms_] - hy;
-  double high_z = cpu_position_[geometry.oxygen_high + 2 * number_of_atoms_] - hz;
-  apply_mic(box, low_x, low_y, low_z);
-  apply_mic(box, high_x, high_y, high_z);
-  const double low_distance = low_oxygen_distance;
-  const double high_distance = high_oxygen_distance;
-  if (low_distance <= 0.0 || high_distance <= 0.0 ||
-      low_distance > 1.60 || high_distance > 1.60)
+  std::sort(candidates.begin(), candidates.end(), [](const GeometryResult& first,
+                                                     const GeometryResult& second) {
+    if (first.assignment_score != second.assignment_score)
+      return first.assignment_score < second.assignment_score;
+    return first.rperp < second.rperp;
+  });
+  geometry = candidates.front();
+  geometry.candidate_count = static_cast<int>(candidates.size());
+  geometry.second_assignment_score = (candidates.size() > 1)
+    ? candidates[1].assignment_score
+    : std::numeric_limits<double>::infinity();
+  geometry.assignment_score_gap = geometry.second_assignment_score - geometry.assignment_score;
+  if (candidates.size() > 1 && geometry.assignment_score_gap < assignment_score_gap_min_) {
+    geometry.valid = false;
+    geometry.assignment_ambiguous = true;
     return false;
-  const double angle_cosine = (low_x * high_x + low_y * high_y + low_z * high_z) /
-    (low_distance * high_distance);
-  if (angle_cosine > -0.5)
-    return false;
-
+  }
   geometry.valid = true;
   return true;
 }
@@ -595,12 +693,27 @@ void Proton_Tunneling::observe_frame(
 
   std::fill(hydrogen_count_.begin(), hydrogen_count_.end(), 0);
   std::fill(frame_cause_event_ids_.begin(), frame_cause_event_ids_.end(), -1);
+  build_oxygen_shell(box);
   for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
     const int hydrogen = hydrogen_indices_[h_index];
     GeometryResult& geometry = frame_geometries_[h_index];
     find_geometry(hydrogen, box, geometry);
     if (geometry.nearest_oxygen >= 0)
       ++hydrogen_count_[geometry.nearest_oxygen];
+  }
+
+  std::unordered_map<unsigned long long, int> pair_assignment_counts;
+  for (const GeometryResult& geometry : frame_geometries_) {
+    if (geometry.valid)
+      ++pair_assignment_counts[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)];
+  }
+  for (GeometryResult& geometry : frame_geometries_) {
+    if (geometry.valid && pair_assignment_counts[
+          make_bond_key(geometry.oxygen_low, geometry.oxygen_high)] > 1) {
+      geometry.valid = false;
+      geometry.assignment_ambiguous = true;
+      geometry.pair_conflict = true;
+    }
   }
 
   if (!defect_state_initialized_) {
@@ -619,6 +732,12 @@ void Proton_Tunneling::observe_frame(
 
     HydrogenState& hydrogen_state = hydrogen_states_[h_index];
     if (!valid_geometry) {
+      if (geometry.assignment_ambiguous) {
+        ++window_assignment_ambiguous_count_;
+        if (geometry.pair_conflict)
+          ++window_pair_conflict_count_;
+        continue;
+      }
       if (hydrogen_state.attempt_active) {
         finish_attempt(
           hydrogen,
@@ -825,7 +944,7 @@ void Proton_Tunneling::write_window(const double time_fs)
 
   fprintf(
     bias_file_,
-    "%.10e %.10e %.10e %.10e %.10e %.10e %d %.10e %.10e %.10e\n",
+    "%.10e %.10e %.10e %.10e %.10e %.10e %d %.10e %.10e %.10e %lld %lld\n",
     time_fs,
     b_mean,
     f_02,
@@ -835,7 +954,9 @@ void Proton_Tunneling::write_window(const double time_fs)
     active_bonds,
     positive_defects,
     negative_defects,
-    valid_pairs_per_frame);
+    valid_pairs_per_frame,
+    window_assignment_ambiguous_count_,
+    window_pair_conflict_count_);
   fflush(bias_file_);
 
   write_edge_window(window_start_time_fs_, time_fs);
@@ -847,6 +968,8 @@ void Proton_Tunneling::write_window(const double time_fs)
   window_valid_pair_count_ = 0;
   window_positive_defect_sum_ = 0;
   window_negative_defect_sum_ = 0;
+  window_assignment_ambiguous_count_ = 0;
+  window_pair_conflict_count_ = 0;
 }
 
 void Proton_Tunneling::write_edge_window(

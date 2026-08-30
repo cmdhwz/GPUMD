@@ -14,23 +14,29 @@ Syntax
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff]
 
 For example::
 
-  compute_proton_tunneling 5 1000 0.10 2 2.20 2.60 0.80 O H
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H
+
+To require a more linear O-H-O geometry, add the optional angle setting::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H oho_angle 150
 
 With a nominal Na/Cl ion-field proxy enabled, use one physical input line::
 
-  compute_proton_tunneling 5 1000 0.10 2 2.20 2.60 0.80 O H ion_field Na 1.0 Cl -1.0 8.0
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0
 
-The state variable for each hydrogen is
+For each hydrogen, the nearest oxygen is used as an anchor and the second endpoint is selected
+from the anchor's top-8 oxygen shell with a mutual-neighbor check. The accepted pair is ordered
+by atom index and its state variable is
 
 .. math::
 
    \Delta = d(\mathrm{H},\mathrm{O}_{\rm low}) - d(\mathrm{H},\mathrm{O}_{\rm high}),
 
-where the two nearest oxygen atoms are ordered by atom index. A state is positive when
+where the selected oxygen endpoints are ordered by atom index. A state is positive when
 :math:`\Delta > \text{delta\_cutoff}`, negative when it is below the negative cutoff, and
 unassigned inside the dead band. A state change must persist for ``hold_samples`` sampled
 frames before it is written as a transfer event.
@@ -43,11 +49,17 @@ jumps directly from one signed state to the other, the first opposite-state fram
 attempt so that the event is not silently discarded; a small sampling interval is still
 recommended when measuring barrier recrossing.
 
-The O-O range and perpendicular-distance cutoff are only the first geometric filter. The
-observer also requires an O-H-O angle above 120 degrees and both O-H distances below 1.60 Å;
-these fixed checks reduce false pairs involving the other interpenetrating ice-VII network.
-The numerical range should still be calibrated from the O-O RDF and joint O-O/perpendicular
-distance distribution at the target pressure.
+The optional ``oho_angle`` parameter is a minimum angle in degrees and defaults to 120. It must
+be between 0 and 180 degrees. The O-O range and perpendicular-distance cutoff are only the
+first geometric filter. The observer uses the nearest O atom to H as an anchor, considers only its eight nearest O
+neighbors, and requires the candidate pair to be mutual top-8 neighbors. It also requires H to
+lie between the two O atoms, the configured minimum O-H-O angle (120 degrees by default), and
+both O-H distances below 1.60 Å. If multiple candidates are nearly tied, or multiple H atoms
+are assigned to one O-O pair in the same frame, those samples are marked as assignment-ambiguous
+and skipped; they are not counted as physical geometry loss. The numerical O-O range should be
+calibrated from the ranked O-O distributions at the target pressure. For a 30 GPa structure,
+2.65 Å is a reasonable starting upper bound, but it should be kept identical for pure and
+salt ice during comparison.
 
 Output
 ------
@@ -59,12 +71,15 @@ The observer appends six files:
   ``F_A_gt_0.4`` are the fractions of active O-O pairs above the corresponding bias.
   ``mean_abs_DeltaF_over_kBT`` is the mean of :math:`|\ln(N_+/N_-)|` over pairs that sampled
   both states. Defect counts use nearest-O coordination relative to two hydrogens per oxygen.
+  The final ``assignment_ambiguous_samples`` and ``pair_conflict_samples`` columns report
+  strict-assignment samples skipped in that window.
 * ``proton_attempt.out`` contains every attempt, including ``return``, ``geometry_lost``, and
   ``run_end``. ``time_start_fs`` is the first dead-band frame and ``time_end_fs`` is the
   confirmation, return, geometry-loss, or run-end frame. ``E_parallel_start`` and
   ``E_parallel_end`` are the nominal-ion electric field projected along ``O_low`` to
   ``O_high``; ``nearest_ion_id`` and ``nearest_ion_distance`` refer to the event-end frame.
-  If ``ion_field`` is omitted, these fields are written as ``nan`` and ``-1``.
+  If ``ion_field`` is omitted, these fields are written as ``nan`` and ``-1``. Frames rejected
+  only because of strict-assignment ambiguity do not close an active attempt.
 * ``proton_transfer.out`` contains sparse, hold-confirmed hydrogen transfer events with the
   attempt start time and the confirmation time. Its ``event_id`` is the corresponding successful
   attempt ID. ``dx dy dz`` is the minimum-image vector from ``O_from`` to ``O_to``. Atom indices
