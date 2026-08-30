@@ -17,7 +17,8 @@
 Track centroid O-H-O geometry, local proton-state bias, and persistent state changes.
 
 This is deliberately an observer. It does not alter the NEP/qNEP energy, force, charge, or
-heat-current paths. The sparse transfer stream can be reconstructed into defect loops offline.
+heat-current paths. The sparse transfer and defect streams can be reconstructed into defect
+propagation chains offline.
 --------------------------------------------------------------------------------------------------*/
 
 #include "proton_tunneling.cuh"
@@ -66,9 +67,9 @@ void Proton_Tunneling::parse(
 {
   printf("Compute centroid proton tunneling observer.\n");
 
-  if (num_param != 8 && num_param != 10) {
+  if (num_param != 8 && num_param != 10 && num_param != 14 && num_param != 16) {
     PRINT_INPUT_ERROR(
-      "compute_proton_tunneling should have 7 parameters, with optional O and H symbols.");
+      "compute_proton_tunneling should have 7 parameters, optional O/H symbols, and optional ion_field settings.");
   }
   if (!is_valid_int(param[1], &sample_interval_) || sample_interval_ <= 0) {
     PRINT_INPUT_ERROR("proton tunneling sample interval should be a positive integer.");
@@ -89,12 +90,37 @@ void Proton_Tunneling::parse(
   if (!is_valid_real(param[7], &rperp_max_) || rperp_max_ <= 0.0) {
     PRINT_INPUT_ERROR("proton tunneling perpendicular-distance cutoff should be positive.");
   }
-  if (num_param == 10) {
-    oxygen_symbol_ = param[8];
-    hydrogen_symbol_ = param[9];
+  int next_param = 8;
+  if (next_param < num_param && std::strcmp(param[next_param], "ion_field") != 0) {
+    oxygen_symbol_ = param[next_param++];
+    hydrogen_symbol_ = param[next_param++];
+  }
+  if (next_param < num_param) {
+    if (std::strcmp(param[next_param], "ion_field") != 0 || next_param + 6 != num_param) {
+      PRINT_INPUT_ERROR(
+        "ion_field must be followed by ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff.");
+    }
+    ion_field_enabled_ = true;
+    ion1_symbol_ = param[next_param + 1];
+    if (!is_valid_real(param[next_param + 2], &ion1_charge_)) {
+      PRINT_INPUT_ERROR("ion_field ion1 charge should be a number.");
+    }
+    ion2_symbol_ = param[next_param + 3];
+    if (!is_valid_real(param[next_param + 4], &ion2_charge_)) {
+      PRINT_INPUT_ERROR("ion_field ion2 charge should be a number.");
+    }
+    if (!is_valid_real(param[next_param + 5], &ion_field_cutoff_) || ion_field_cutoff_ <= 0.0) {
+      PRINT_INPUT_ERROR("ion_field cutoff should be a positive number.");
+    }
   }
   if (oxygen_symbol_.empty() || hydrogen_symbol_.empty() || oxygen_symbol_ == hydrogen_symbol_) {
     PRINT_INPUT_ERROR("proton tunneling O and H symbols should be different and non-empty.");
+  }
+  if (ion_field_enabled_ &&
+      (ion1_symbol_.empty() || ion2_symbol_.empty() || ion1_symbol_ == ion2_symbol_ ||
+       ion1_symbol_ == oxygen_symbol_ || ion1_symbol_ == hydrogen_symbol_ ||
+       ion2_symbol_ == oxygen_symbol_ || ion2_symbol_ == hydrogen_symbol_)) {
+    PRINT_INPUT_ERROR("ion_field species should be distinct from each other and from O/H.");
   }
 
   for (int i = 0; i < atom.number_of_atoms; ++i) {
@@ -102,9 +128,16 @@ void Proton_Tunneling::parse(
       oxygen_indices_.push_back(i);
     if (atom.cpu_atom_symbol[i] == hydrogen_symbol_)
       hydrogen_indices_.push_back(i);
+    if (ion_field_enabled_ && atom.cpu_atom_symbol[i] == ion1_symbol_)
+      ion1_indices_.push_back(i);
+    if (ion_field_enabled_ && atom.cpu_atom_symbol[i] == ion2_symbol_)
+      ion2_indices_.push_back(i);
   }
   if (oxygen_indices_.empty() || hydrogen_indices_.empty()) {
     PRINT_INPUT_ERROR("compute_proton_tunneling could not find the requested O and H species.");
+  }
+  if (ion_field_enabled_ && (ion1_indices_.empty() || ion2_indices_.empty())) {
+    PRINT_INPUT_ERROR("ion_field could not find both requested ion species.");
   }
 
   printf("    sample interval is %d steps.\n", sample_interval_);
@@ -115,6 +148,10 @@ void Proton_Tunneling::parse(
   printf("    perpendicular-distance cutoff is %.6f Angstrom.\n", rperp_max_);
   printf("    using oxygen symbol %s and hydrogen symbol %s.\n",
     oxygen_symbol_.c_str(), hydrogen_symbol_.c_str());
+  if (ion_field_enabled_) {
+    printf("    nominal ion field uses %s charge %.6f and %s charge %.6f within %.6f Angstrom.\n",
+      ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
+  }
 }
 
 void Proton_Tunneling::preprocess(
@@ -136,32 +173,51 @@ void Proton_Tunneling::preprocess(
   time_step_ = time_step;
   cpu_position_.resize(number_of_atoms_ * 3);
   hydrogen_count_.resize(number_of_atoms_, 0);
+  previous_hydrogen_count_.resize(number_of_atoms_, 0);
+  event_hydrogen_count_.resize(number_of_atoms_, 0);
+  frame_cause_event_ids_.resize(number_of_atoms_, -1);
+  frame_geometries_.resize(hydrogen_indices_.size());
   hydrogen_states_.resize(hydrogen_indices_.size());
+  defect_state_initialized_ = false;
 
   bias_file_ = my_fopen("proton_bias.out", "a");
   transfer_file_ = my_fopen("proton_transfer.out", "a");
   attempt_file_ = my_fopen("proton_attempt.out", "a");
   edge_window_file_ = my_fopen("proton_edge_window.out", "a");
   bond_file_ = my_fopen("proton_bond.out", "a");
+  defect_file_ = my_fopen("proton_defect.out", "a");
 
   fprintf(bias_file_,
-    "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s\n",
+    "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s",
     sample_interval_, window_samples_, delta_cutoff_, hold_samples_, dOO_min_, dOO_max_,
     rperp_max_, oxygen_symbol_.c_str(), hydrogen_symbol_.c_str());
+  if (ion_field_enabled_)
+    fprintf(bias_file_, " ion_field %s %.10e %s %.10e %.10e",
+      ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
+  fprintf(bias_file_, "\n");
   fprintf(bias_file_,
     "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
     "flip_rate_per_ps active_bonds positive_defects negative_defects valid_pairs_per_frame\n");
 
   fprintf(transfer_file_,
     "# columns event_id time_start_fs time_confirm_fs H_id O_from O_to O_pair_low O_pair_high "
-    "dx dy dz delta_start delta_confirm nH_from nH_to\n");
+    "nH_from_before nH_to_before nH_from_after nH_to_after "
+    "q_from_before q_to_before q_from_after q_to_after dx dy dz delta_start delta_confirm\n");
   fprintf(attempt_file_,
     "# columns attempt_id time_start_fs time_end_fs H_id O_low O_high O_from O_target outcome "
-    "delta_start min_abs_delta delta_end\n");
+    "delta_start min_abs_delta delta_end E_parallel_start E_parallel_end "
+    "nearest_ion_id nearest_ion_distance\n");
+  fprintf(defect_file_, "# columns time_fs O_id q_defect nH cause_event_id\n");
   fprintf(edge_window_file_,
     "# columns window_id time_start_fs time_end_fs O_low O_high geometry_occupancy "
     "n_plus n_minus n_deadband A abs_A DeltaF_over_kBT attempts successes returns geometry_lost "
-    "success_probability mean_delta mean_abs_delta mean_dOO mean_rperp\n");
+    "success_probability mean_delta mean_abs_delta mean_dOO mean_rperp "
+    "mean_E_parallel std_E_parallel corr_delta_E_parallel mean_E_success mean_E_return ");
+  if (ion_field_enabled_)
+    fprintf(edge_window_file_, "nearest_%s_distance nearest_%s_distance\n",
+      ion1_symbol_.c_str(), ion2_symbol_.c_str());
+  else
+    fprintf(edge_window_file_, "nearest_ion1_distance nearest_ion2_distance\n");
   fprintf(bond_file_,
     "# columns O_pair_low O_pair_high geometry_samples n_plus n_minus transitions "
     "A abs_A mean_abs_delta\n");
@@ -169,6 +225,7 @@ void Proton_Tunneling::preprocess(
   fflush(bias_file_);
   fflush(transfer_file_);
   fflush(attempt_file_);
+  fflush(defect_file_);
   fflush(edge_window_file_);
   fflush(bond_file_);
   initialized_ = true;
@@ -235,6 +292,46 @@ bool Proton_Tunneling::find_geometry(
   geometry.low_to_high_dy = oy;
   geometry.low_to_high_dz = oz;
 
+  if (ion_field_enabled_) {
+    const double inverse_dOO = 1.0 / geometry.dOO;
+    const double ex = ox * inverse_dOO;
+    const double ey = oy * inverse_dOO;
+    const double ez = oz * inverse_dOO;
+    geometry.nearest_ion_distance = std::numeric_limits<double>::max();
+    geometry.nearest_ion1_distance = std::numeric_limits<double>::max();
+    geometry.nearest_ion2_distance = std::numeric_limits<double>::max();
+    auto accumulate_ion_field = [&](const std::vector<int>& ions, const double charge,
+                                    double& nearest_species_distance) {
+      for (const int ion : ions) {
+        double ion_dx = cpu_position_[ion] - cpu_position_[geometry.oxygen_low];
+        double ion_dy = cpu_position_[ion + number_of_atoms_] -
+          cpu_position_[geometry.oxygen_low + number_of_atoms_];
+        double ion_dz = cpu_position_[ion + 2 * number_of_atoms_] -
+          cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
+        apply_mic(box, ion_dx, ion_dy, ion_dz);
+        double midpoint_to_ion_x = 0.5 * ox - ion_dx;
+        double midpoint_to_ion_y = 0.5 * oy - ion_dy;
+        double midpoint_to_ion_z = 0.5 * oz - ion_dz;
+        apply_mic(box, midpoint_to_ion_x, midpoint_to_ion_y, midpoint_to_ion_z);
+        const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
+          midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
+        const double distance = std::sqrt(distance_square);
+        nearest_species_distance = std::min(nearest_species_distance, distance);
+        if (distance < geometry.nearest_ion_distance) {
+          geometry.nearest_ion_distance = distance;
+          geometry.nearest_ion_id = ion;
+        }
+        if (distance <= ion_field_cutoff_ && distance > 1.0e-12) {
+          geometry.E_ion_nominal_parallel += K_C * charge *
+            (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
+            (distance_square * distance);
+        }
+      }
+    };
+    accumulate_ion_field(ion1_indices_, ion1_charge_, geometry.nearest_ion1_distance);
+    accumulate_ion_field(ion2_indices_, ion2_charge_, geometry.nearest_ion2_distance);
+  }
+
   double hx_from_low = hx - cpu_position_[geometry.oxygen_low];
   double hy_from_low = hy - cpu_position_[geometry.oxygen_low + number_of_atoms_];
   double hz_from_low = hz - cpu_position_[geometry.oxygen_low + 2 * number_of_atoms_];
@@ -290,8 +387,16 @@ void Proton_Tunneling::record_bond(
   ++stats.geometry_samples;
   stats.sum_abs_delta += std::abs(geometry.delta);
   stats.sum_delta += geometry.delta;
+  stats.sum_delta_square += geometry.delta * geometry.delta;
   stats.sum_dOO += geometry.dOO;
   stats.sum_rperp += geometry.rperp;
+  if (ion_field_enabled_) {
+    stats.sum_E_parallel += geometry.E_ion_nominal_parallel;
+    stats.sum_E2_parallel += geometry.E_ion_nominal_parallel * geometry.E_ion_nominal_parallel;
+    stats.sum_delta_E_parallel += geometry.delta * geometry.E_ion_nominal_parallel;
+    stats.sum_nearest_ion1_distance += geometry.nearest_ion1_distance;
+    stats.sum_nearest_ion2_distance += geometry.nearest_ion2_distance;
+  }
   if (state > 0)
     ++stats.n_plus;
   else if (state < 0)
@@ -304,14 +409,15 @@ void Proton_Tunneling::start_attempt(
   HydrogenState& hydrogen_state,
   const int stable_state,
   const double time_fs,
-  const double delta)
+  const GeometryResult& geometry)
 {
   hydrogen_state.attempt_active = true;
   hydrogen_state.attempt_from_state = stable_state;
   hydrogen_state.attempt_id = next_attempt_id_++;
   hydrogen_state.attempt_start_time_fs = time_fs;
-  hydrogen_state.attempt_delta_start = delta;
-  hydrogen_state.attempt_min_abs_delta = std::abs(delta);
+  hydrogen_state.attempt_delta_start = geometry.delta;
+  hydrogen_state.attempt_E_start = geometry.E_ion_nominal_parallel;
+  hydrogen_state.attempt_min_abs_delta = std::abs(geometry.delta);
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
@@ -343,6 +449,21 @@ void Proton_Tunneling::finish_attempt(
   if (!hydrogen_state.attempt_active)
     return;
 
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double E_end = (geometry != nullptr)
+    ? geometry->E_ion_nominal_parallel
+    : hydrogen_state.last_E_parallel;
+  const int nearest_ion_id = (geometry != nullptr)
+    ? geometry->nearest_ion_id
+    : hydrogen_state.last_nearest_ion_id;
+  const double nearest_ion_distance = (geometry != nullptr)
+    ? geometry->nearest_ion_distance
+    : hydrogen_state.last_nearest_ion_distance;
+  const double E_start_output = ion_field_enabled_ ? hydrogen_state.attempt_E_start : nan;
+  const double E_end_output = ion_field_enabled_ ? E_end : nan;
+  const int nearest_ion_id_output = ion_field_enabled_ ? nearest_ion_id : -1;
+  const double nearest_ion_distance_output = ion_field_enabled_ ? nearest_ion_distance : nan;
+
   const int oxygen_low = hydrogen_state.oxygen_low;
   const int oxygen_high = hydrogen_state.oxygen_high;
   const int oxygen_from = (hydrogen_state.attempt_from_state < 0)
@@ -369,10 +490,21 @@ void Proton_Tunneling::finish_attempt(
     ++total_stats.geometry_lost;
     ++window_stats.geometry_lost;
   }
+  if (ion_field_enabled_ && outcome == AttemptOutcome::success) {
+    total_stats.sum_E_success += E_end;
+    window_stats.sum_E_success += E_end;
+    ++total_stats.n_E_success;
+    ++window_stats.n_E_success;
+  } else if (ion_field_enabled_ && outcome == AttemptOutcome::return_to_state) {
+    total_stats.sum_E_return += E_end;
+    window_stats.sum_E_return += E_end;
+    ++total_stats.n_E_return;
+    ++window_stats.n_E_return;
+  }
 
   fprintf(
     attempt_file_,
-    "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e\n",
+    "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e %.10e %.10e %d %.10e\n",
     hydrogen_state.attempt_id,
     hydrogen_state.attempt_start_time_fs,
     time_fs,
@@ -384,9 +516,23 @@ void Proton_Tunneling::finish_attempt(
     outcome_name(outcome),
     hydrogen_state.attempt_delta_start,
     hydrogen_state.attempt_min_abs_delta,
-    delta_end);
+    delta_end,
+    E_start_output,
+    E_end_output,
+    nearest_ion_id_output,
+    nearest_ion_distance_output);
 
   if (outcome == AttemptOutcome::success && geometry != nullptr) {
+    const int nH_from_before = event_hydrogen_count_[oxygen_from];
+    const int nH_to_before = event_hydrogen_count_[oxygen_target];
+    const int nH_from_after = nH_from_before - 1;
+    const int nH_to_after = nH_to_before + 1;
+    event_hydrogen_count_[oxygen_from] = nH_from_after;
+    event_hydrogen_count_[oxygen_target] = nH_to_after;
+    if (oxygen_from >= 0 && oxygen_from < static_cast<int>(frame_cause_event_ids_.size()))
+      frame_cause_event_ids_[oxygen_from] = hydrogen_state.attempt_id;
+    if (oxygen_target >= 0 && oxygen_target < static_cast<int>(frame_cause_event_ids_.size()))
+      frame_cause_event_ids_[oxygen_target] = hydrogen_state.attempt_id;
     double dx = geometry->low_to_high_dx;
     double dy = geometry->low_to_high_dy;
     double dz = geometry->low_to_high_dz;
@@ -397,7 +543,8 @@ void Proton_Tunneling::finish_attempt(
     }
     fprintf(
       transfer_file_,
-      "%lld %.10e %.10e %d %d %d %d %d %.10e %.10e %.10e %.10e %.10e %d %d\n",
+      "%lld %.10e %.10e %d %d %d %d %d %d %d %d %d %d %d %d %d "
+      "%.10e %.10e %.10e %.10e %.10e\n",
       hydrogen_state.attempt_id,
       hydrogen_state.attempt_start_time_fs,
       time_fs,
@@ -406,13 +553,19 @@ void Proton_Tunneling::finish_attempt(
       oxygen_target,
       oxygen_low,
       oxygen_high,
+      nH_from_before,
+      nH_to_before,
+      nH_from_after,
+      nH_to_after,
+      nH_from_before - 2,
+      nH_to_before - 2,
+      nH_from_after - 2,
+      nH_to_after - 2,
       dx,
       dy,
       dz,
       hydrogen_state.attempt_delta_start,
-      delta_end,
-      hydrogen_count_[oxygen_from],
-      hydrogen_count_[oxygen_target]);
+      delta_end);
   }
 
   if (outcome == AttemptOutcome::success)
@@ -424,6 +577,7 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.attempt_id = 0;
   hydrogen_state.attempt_start_time_fs = 0.0;
   hydrogen_state.attempt_delta_start = 0.0;
+  hydrogen_state.attempt_E_start = 0.0;
   hydrogen_state.attempt_min_abs_delta = 0.0;
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
@@ -440,12 +594,28 @@ void Proton_Tunneling::observe_frame(
     window_start_time_fs_ = time_fs;
 
   std::fill(hydrogen_count_.begin(), hydrogen_count_.end(), 0);
+  std::fill(frame_cause_event_ids_.begin(), frame_cause_event_ids_.end(), -1);
   for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
     const int hydrogen = hydrogen_indices_[h_index];
-    GeometryResult geometry;
-    const bool valid_geometry = find_geometry(hydrogen, box, geometry);
+    GeometryResult& geometry = frame_geometries_[h_index];
+    find_geometry(hydrogen, box, geometry);
     if (geometry.nearest_oxygen >= 0)
       ++hydrogen_count_[geometry.nearest_oxygen];
+  }
+
+  if (!defect_state_initialized_) {
+    for (const int oxygen : oxygen_indices_)
+      fprintf(defect_file_, "%.10e %d %d %d %lld\n", time_fs, oxygen,
+        hydrogen_count_[oxygen] - 2, hydrogen_count_[oxygen], 0LL);
+    previous_hydrogen_count_ = hydrogen_count_;
+    defect_state_initialized_ = true;
+  }
+  event_hydrogen_count_ = previous_hydrogen_count_;
+
+  for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
+    const int hydrogen = hydrogen_indices_[h_index];
+    const GeometryResult& geometry = frame_geometries_[h_index];
+    const bool valid_geometry = geometry.valid;
 
     HydrogenState& hydrogen_state = hydrogen_states_[h_index];
     if (!valid_geometry) {
@@ -505,7 +675,7 @@ void Proton_Tunneling::observe_frame(
       if (!hydrogen_state.attempt_active && state != hydrogen_state.stable_state) {
         // If sampling jumps across the dead band, retain the event rather than silently
         // losing it. With a sufficiently small sample interval, normal attempts start in state 0.
-        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry.delta);
+        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry);
       }
 
       if (hydrogen_state.attempt_active) {
@@ -519,7 +689,7 @@ void Proton_Tunneling::observe_frame(
             AttemptOutcome::return_to_state,
             time_fs,
             geometry.delta,
-            nullptr);
+            &geometry);
         } else if (state == -hydrogen_state.attempt_from_state) {
           if (hydrogen_state.pending_state == state) {
             ++hydrogen_state.pending_count;
@@ -543,11 +713,22 @@ void Proton_Tunneling::observe_frame(
           hydrogen_state.pending_start_time_fs = 0.0;
         }
       } else if (state == 0) {
-        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry.delta);
+        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry);
       }
     }
     hydrogen_state.last_delta = geometry.delta;
+    hydrogen_state.last_E_parallel = geometry.E_ion_nominal_parallel;
+    hydrogen_state.last_nearest_ion_id = geometry.nearest_ion_id;
+    hydrogen_state.last_nearest_ion_distance = geometry.nearest_ion_distance;
   }
+
+  for (const int oxygen : oxygen_indices_) {
+    if (hydrogen_count_[oxygen] != previous_hydrogen_count_[oxygen])
+      fprintf(defect_file_, "%.10e %d %d %d %lld\n", time_fs, oxygen,
+        hydrogen_count_[oxygen] - 2, hydrogen_count_[oxygen], frame_cause_event_ids_[oxygen]);
+  }
+  previous_hydrogen_count_ = hydrogen_count_;
+  fflush(defect_file_);
 
   for (const int oxygen : oxygen_indices_) {
     if (hydrogen_count_[oxygen] > 2)
@@ -707,10 +888,42 @@ void Proton_Tunneling::write_edge_window(
     const double mean_rperp = (stats.geometry_samples > 0)
       ? stats.sum_rperp / stats.geometry_samples
       : std::numeric_limits<double>::quiet_NaN();
+    const double mean_E_parallel = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_E_parallel / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double std_E_parallel = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? std::sqrt(std::max(0.0, stats.sum_E2_parallel / stats.geometry_samples -
+          mean_E_parallel * mean_E_parallel))
+      : std::numeric_limits<double>::quiet_NaN();
+    double corr_delta_E_parallel = std::numeric_limits<double>::quiet_NaN();
+    if (ion_field_enabled_ && stats.geometry_samples > 0) {
+      const double variance_delta = std::max(0.0,
+        stats.sum_delta_square / stats.geometry_samples - mean_delta * mean_delta);
+      const double variance_E = std::max(0.0,
+        stats.sum_E2_parallel / stats.geometry_samples - mean_E_parallel * mean_E_parallel);
+      if (variance_delta > 0.0 && variance_E > 0.0) {
+        const double covariance = stats.sum_delta_E_parallel / stats.geometry_samples -
+          mean_delta * mean_E_parallel;
+        corr_delta_E_parallel = covariance / std::sqrt(variance_delta * variance_E);
+      }
+    }
+    const double mean_E_success = (ion_field_enabled_ && stats.n_E_success > 0)
+      ? stats.sum_E_success / stats.n_E_success
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_E_return = (ion_field_enabled_ && stats.n_E_return > 0)
+      ? stats.sum_E_return / stats.n_E_return
+      : std::numeric_limits<double>::quiet_NaN();
+    const double nearest_ion1_distance = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_nearest_ion1_distance / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double nearest_ion2_distance = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_nearest_ion2_distance / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
     fprintf(
       edge_window_file_,
       "%lld %.10e %.10e %d %d %.10e %lld %lld %lld %.10e %.10e %.10e "
-      "%lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e\n",
+      "%lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e "
+      "%.10e %.10e %.10e %.10e %.10e %.10e %.10e\n",
       window_id_,
       time_start_fs,
       time_end_fs,
@@ -731,7 +944,14 @@ void Proton_Tunneling::write_edge_window(
       mean_delta,
       mean_abs_delta,
       mean_dOO,
-      mean_rperp);
+      mean_rperp,
+      mean_E_parallel,
+      std_E_parallel,
+      corr_delta_E_parallel,
+      mean_E_success,
+      mean_E_return,
+      nearest_ion1_distance,
+      nearest_ion2_distance);
   }
   fflush(edge_window_file_);
   ++window_id_;
@@ -802,11 +1022,13 @@ void Proton_Tunneling::postprocess(
   fclose(bias_file_);
   fclose(transfer_file_);
   fclose(attempt_file_);
+  fclose(defect_file_);
   fclose(edge_window_file_);
   fclose(bond_file_);
   bias_file_ = nullptr;
   transfer_file_ = nullptr;
   attempt_file_ = nullptr;
+  defect_file_ = nullptr;
   edge_window_file_ = nullptr;
   bond_file_ = nullptr;
   initialized_ = false;

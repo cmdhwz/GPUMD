@@ -77,6 +77,11 @@ private:
     double low_to_high_dx = 0.0;
     double low_to_high_dy = 0.0;
     double low_to_high_dz = 0.0;
+    double E_ion_nominal_parallel = 0.0;
+    int nearest_ion_id = -1;
+    double nearest_ion_distance = 0.0;
+    double nearest_ion1_distance = 0.0;
+    double nearest_ion2_distance = 0.0;
   };
 
   struct BondStats
@@ -92,8 +97,18 @@ private:
     long long geometry_lost = 0;
     double sum_abs_delta = 0.0;
     double sum_delta = 0.0;
+    double sum_delta_square = 0.0;
     double sum_dOO = 0.0;
     double sum_rperp = 0.0;
+    double sum_E_parallel = 0.0;
+    double sum_E2_parallel = 0.0;
+    double sum_delta_E_parallel = 0.0;
+    double sum_E_success = 0.0;
+    double sum_E_return = 0.0;
+    double sum_nearest_ion1_distance = 0.0;
+    double sum_nearest_ion2_distance = 0.0;
+    long long n_E_success = 0;
+    long long n_E_return = 0;
   };
 
   struct HydrogenState
@@ -104,11 +119,15 @@ private:
     int pending_state = 0;
     int pending_count = 0;
     double last_delta = 0.0;
+    double last_E_parallel = 0.0;
+    int last_nearest_ion_id = -1;
+    double last_nearest_ion_distance = 0.0;
     bool attempt_active = false;
     int attempt_from_state = 0;
     long long attempt_id = 0;
     double attempt_start_time_fs = 0.0;
     double attempt_delta_start = 0.0;
+    double attempt_E_start = 0.0;
     double attempt_min_abs_delta = 0.0;
     double pending_start_time_fs = 0.0;
   };
@@ -127,7 +146,7 @@ private:
     HydrogenState& hydrogen_state,
     const int stable_state,
     const double time_fs,
-    const double delta);
+    const GeometryResult& geometry);
   void finish_attempt(
     const int hydrogen,
     HydrogenState& hydrogen_state,
@@ -156,6 +175,12 @@ private:
   double dOO_min_ = 2.20;
   double dOO_max_ = 2.60;
   double rperp_max_ = 0.80;
+  bool ion_field_enabled_ = false;
+  std::string ion1_symbol_ = "Na";
+  std::string ion2_symbol_ = "Cl";
+  double ion1_charge_ = 1.0;
+  double ion2_charge_ = -1.0;
+  double ion_field_cutoff_ = 8.0;
   double time_step_ = 0.0;
   double window_start_time_fs_ = 0.0;
   double last_time_fs_ = 0.0;
@@ -165,15 +190,23 @@ private:
   std::string hydrogen_symbol_ = "H";
   std::vector<int> oxygen_indices_;
   std::vector<int> hydrogen_indices_;
+  std::vector<int> ion1_indices_;
+  std::vector<int> ion2_indices_;
   std::vector<double> cpu_position_;
   std::vector<int> hydrogen_count_;
+  std::vector<int> previous_hydrogen_count_;
+  std::vector<int> event_hydrogen_count_;
+  std::vector<long long> frame_cause_event_ids_;
+  std::vector<GeometryResult> frame_geometries_;
   std::vector<HydrogenState> hydrogen_states_;
+  bool defect_state_initialized_ = false;
 
   std::unordered_map<unsigned long long, BondStats> window_bonds_;
   std::unordered_map<unsigned long long, BondStats> total_bonds_;
   FILE* bias_file_ = nullptr;
   FILE* transfer_file_ = nullptr;
   FILE* attempt_file_ = nullptr;
+  FILE* defect_file_ = nullptr;
   FILE* edge_window_file_ = nullptr;
   FILE* bond_file_ = nullptr;
 };
