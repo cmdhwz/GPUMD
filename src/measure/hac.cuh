@@ -78,6 +78,7 @@ private:
   int use_centroid_heat_flux_ = 0;
   int split_qnep_heat_by_type_ = 0;
   int deferred_centroid_qnep_ = 0;
+  int deferred_diagnostic_stage_ = 0;
   bool deferred_centroid_enabled_ = false;
   Force* force_ = nullptr;
   int centroid_frame_size_ = 0;

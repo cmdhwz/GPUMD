@@ -77,10 +77,20 @@ void HAC::preprocess(
         is_ring_polymer_run && integrate.deform_x == 0 && integrate.deform_y == 0 &&
         integrate.deform_z == 0 && !integrate.use_scr_barostat &&
         (integrate.type != 33 || integrate.num_target_pressure_components == 0);
+      const bool deferred_storage_supported =
+        !split_qnep_heat_by_type_ && fixed_box && atom.number_of_beads > 1;
       const bool deferred_supported =
-        deferred_centroid_qnep_ != 0 && !split_qnep_heat_by_type_ && fixed_box &&
-        atom.number_of_beads > 1 && force.pimd_qnep_batch_available();
-      if (deferred_supported) {
+        deferred_centroid_qnep_ != 0 && deferred_storage_supported &&
+        force.pimd_qnep_batch_available();
+      if (deferred_diagnostic_stage_ == 1) {
+        deferred_centroid_enabled_ = true;
+        printf(
+          "    DIAGNOSTIC ONLY: no deferred trajectory cache will be allocated or saved.\n");
+        printf("    DIAGNOSTIC ONLY: no HAC or conductivity output will be generated.\n");
+      } else if (deferred_diagnostic_stage_ >= 2 && !deferred_storage_supported) {
+        PRINT_INPUT_ERROR(
+          "deferred diagnostic stages 2-4 require fixed-box PIMD/RPMD/TRPMD cache mode.\n");
+      } else if (deferred_supported || deferred_diagnostic_stage_ >= 2) {
         deferred_centroid_enabled_ = true;
         centroid_frame_size_ = atom.number_of_atoms * 3;
         centroid_position_chunk_gpu_.resize(
@@ -441,9 +451,15 @@ void HAC::process(
   const GPU_Vector<double>* centroid_virial_source = &centroid_virial_per_atom_;
   if (use_centroid_heat_flux_) {
     ++centroid_sampled_frames_;
+    if (deferred_diagnostic_stage_ == 1 ||
+        (deferred_centroid_enabled_ && deferred_diagnostic_stage_ == 2)) {
+      return;
+    }
     if (deferred_centroid_enabled_) {
       const int frame = (step + 1) / sample_interval - 1;
-      if (frame != centroid_frame_count_ || frame < 0 || frame >= number_of_steps / sample_interval) {
+      if (
+        frame != centroid_frame_count_ || frame < 0 ||
+        frame >= number_of_steps / sample_interval) {
         PRINT_INPUT_ERROR(
           "Deferred centroid samples must arrive in sequential HAC frame order.");
       }
@@ -458,7 +474,11 @@ void HAC::process(
       ++centroid_chunk_frame_count_;
       ++centroid_frame_count_;
       if (centroid_chunk_frame_count_ == deferred_centroid_chunk_size_) {
-        flush_deferred_centroid_chunk_();
+        if (deferred_diagnostic_stage_ == 0 || deferred_diagnostic_stage_ == 4) {
+          flush_deferred_centroid_chunk_();
+        } else {
+          centroid_chunk_frame_count_ = 0;
+        }
       }
       return;
     }
@@ -651,6 +671,20 @@ void HAC::postprocess(
   const int Nd = number_of_steps / sample_interval;
   const double dt = time_step * sample_interval;
   const double dt_in_ps = dt * TIME_UNIT_CONVERSION / 1000.0; // ps
+
+  if (deferred_diagnostic_stage_ != 0) {
+    if (deferred_diagnostic_stage_ == 4) {
+      flush_deferred_centroid_chunk_();
+    }
+    printf("DIAGNOSTIC ONLY: no HAC or conductivity output will be generated.\n");
+    printf("    deferred diagnostic stage = %d\n", deferred_diagnostic_stage_);
+    printf("    sampled frames = %lld\n", centroid_sampled_frames_);
+    printf("    centroid snapshot frames issued = %d\n", centroid_frame_count_);
+    printf("    trajectory staging/D2H wall time = %g s\n", deferred_staging_wall_time_);
+    print_line_2();
+    compute = 0;
+    return;
+  }
 
   if (deferred_centroid_enabled_) {
     flush_deferred_centroid_chunk_();
@@ -889,8 +923,9 @@ void HAC::parse(const char** param, int num_param)
 
   printf("Compute HAC.\n");
 
-  if (!(num_param == 4 || num_param == 5 || num_param == 6 || num_param == 7)) {
-    PRINT_INPUT_ERROR("compute_hac should have 3, 4, 5, or 6 parameters.\n");
+  if (!(num_param == 4 || num_param == 5 || num_param == 6 || num_param == 7 ||
+        num_param == 8)) {
+    PRINT_INPUT_ERROR("compute_hac should have 3, 4, 5, 6, or 7 parameters.\n");
   }
 
   if (!is_valid_int(param[1], &sample_interval)) {
@@ -932,13 +967,31 @@ void HAC::parse(const char** param, int num_param)
       printf("    output type-resolved electrostatic and non-electrostatic heat currents for qNEP.\n");
     }
   }
-  if (num_param == 7) {
+  if (num_param >= 7) {
     if (!is_valid_int(param[6], &deferred_centroid_qnep_)) {
       PRINT_INPUT_ERROR("deferred centroid qNEP flag for HAC should be an integer.\n");
     }
     if (deferred_centroid_qnep_ != 0) {
       printf(
         "    defer centroid qNEP evaluation to postprocess using fixed 32-frame batches.\n");
+    }
+  }
+  if (num_param >= 8) {
+    if (!is_valid_int(param[7], &deferred_diagnostic_stage_)) {
+      PRINT_INPUT_ERROR("deferred diagnostic stage for HAC should be an integer.\n");
+    }
+    if (deferred_diagnostic_stage_ < 0 || deferred_diagnostic_stage_ > 4) {
+      PRINT_INPUT_ERROR("deferred diagnostic stage for HAC should be in the range 0-4.\n");
+    }
+    if (deferred_diagnostic_stage_ != 0 &&
+        (use_centroid_heat_flux_ != 1 || split_qnep_heat_by_type_ != 0 ||
+         deferred_centroid_qnep_ != 1)) {
+      PRINT_INPUT_ERROR(
+        "deferred diagnostic stages require centroid=1, qNEP split=0, and deferred=1.\n");
+    }
+    if (deferred_diagnostic_stage_ != 0) {
+      printf("    deferred diagnostic stage is %d.\n", deferred_diagnostic_stage_);
+      printf("    DIAGNOSTIC ONLY: no HAC or conductivity output will be generated.\n");
     }
   }
 }
