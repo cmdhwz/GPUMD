@@ -64,6 +64,12 @@ void HAC::preprocess(
     if (number_of_frames <= 0 || Nc > number_of_frames) {
       PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
     }
+    if (deferred_diagnostic_stage_ == 1) {
+      deferred_centroid_enabled_ = true;
+      printf("    DIAGNOSTIC ONLY: count samples without allocating HAC buffers.\n");
+      printf("    DIAGNOSTIC ONLY: no HAC or conductivity output will be generated.\n");
+      return;
+    }
     heat_all.resize(NUM_OF_HEAT_COMPONENTS * number_of_frames);
     heat_all_by_type_.resize(atom.cpu_type_size.size() * NUM_OF_TYPE_HEAT_COMPONENTS * number_of_frames);
     atom.heat_per_atom.resize(atom.number_of_atoms * 5);
@@ -82,12 +88,7 @@ void HAC::preprocess(
       const bool deferred_supported =
         deferred_centroid_qnep_ != 0 && deferred_storage_supported &&
         force.pimd_qnep_batch_available();
-      if (deferred_diagnostic_stage_ == 1) {
-        deferred_centroid_enabled_ = true;
-        printf(
-          "    DIAGNOSTIC ONLY: no deferred trajectory cache will be allocated or saved.\n");
-        printf("    DIAGNOSTIC ONLY: no HAC or conductivity output will be generated.\n");
-      } else if (deferred_diagnostic_stage_ >= 2 && !deferred_storage_supported) {
+      if (deferred_diagnostic_stage_ >= 2 && !deferred_storage_supported) {
         PRINT_INPUT_ERROR(
           "deferred diagnostic stages 2-4 require fixed-box PIMD/RPMD/TRPMD cache mode.\n");
       } else if (deferred_supported || deferred_diagnostic_stage_ >= 2) {

@@ -61,8 +61,8 @@ Stages ``2``--``4`` additionally require a fixed-box PIMD/RPMD/TRPMD run so
 that the production deferred cache can be allocated. Stage ``1`` only counts
 sampling points and does not require that cache.
 
-* ``1``: count HAC sampling points only; do not allocate or save the deferred
-  trajectory cache.
+* ``1``: count HAC sampling points only; do not allocate HAC, centroid, or
+  deferred trajectory buffers.
 * ``2``: allocate the same deferred CPU/GPU cache as production, but do not
   run the snapshot store kernel.
 * ``3``: allocate the cache and run the GPU snapshot store, but do not perform
