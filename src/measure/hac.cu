@@ -25,6 +25,8 @@ Calculate the heat current autocorrelation (HAC) function.
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -45,10 +47,23 @@ void HAC::preprocess(
   Force& force)
 {
   if (compute) {
+    force_ = &force;
+    deferred_centroid_enabled_ = false;
+    centroid_frame_size_ = 0;
+    centroid_frame_count_ = 0;
+    centroid_chunk_frame_count_ = 0;
+    deferred_staging_wall_time_ = 0.0;
+    deferred_upload_wall_time_ = 0.0;
+    deferred_qnep_wall_time_ = 0.0;
+    deferred_heat_wall_time_ = 0.0;
+    deferred_hac_wall_time_ = 0.0;
     centroid_sampled_frames_ = 0;
     centroid_batch_cache_hits_ = 0;
     centroid_serial_fallbacks_ = 0;
     int number_of_frames = number_of_steps / sample_interval;
+    if (number_of_frames <= 0 || Nc > number_of_frames) {
+      PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
+    }
     heat_all.resize(NUM_OF_HEAT_COMPONENTS * number_of_frames);
     heat_all_by_type_.resize(atom.cpu_type_size.size() * NUM_OF_TYPE_HEAT_COMPONENTS * number_of_frames);
     atom.heat_per_atom.resize(atom.number_of_atoms * 5);
@@ -62,7 +77,40 @@ void HAC::preprocess(
         is_ring_polymer_run && integrate.deform_x == 0 && integrate.deform_y == 0 &&
         integrate.deform_z == 0 && !integrate.use_scr_barostat &&
         (integrate.type != 33 || integrate.num_target_pressure_components == 0);
-      if (fixed_box && atom.number_of_beads > 1) {
+      const bool deferred_supported =
+        deferred_centroid_qnep_ != 0 && !split_qnep_heat_by_type_ && fixed_box &&
+        atom.number_of_beads > 1 && force.pimd_qnep_batch_available();
+      if (deferred_supported) {
+        deferred_centroid_enabled_ = true;
+        centroid_frame_size_ = atom.number_of_atoms * 3;
+        centroid_position_chunk_gpu_.resize(
+          static_cast<size_t>(deferred_centroid_chunk_size_) * centroid_frame_size_);
+        centroid_velocity_chunk_gpu_.resize(
+          static_cast<size_t>(deferred_centroid_chunk_size_) * centroid_frame_size_);
+        centroid_position_frames_cpu_.resize(
+          static_cast<size_t>(number_of_frames) * centroid_frame_size_);
+        centroid_velocity_frames_cpu_.resize(
+          static_cast<size_t>(number_of_frames) * centroid_frame_size_);
+        deferred_position_frames_gpu_.resize(deferred_centroid_chunk_size_);
+        deferred_velocity_frames_gpu_.resize(deferred_centroid_chunk_size_);
+        deferred_potential_frames_gpu_.resize(deferred_centroid_chunk_size_);
+        deferred_force_frames_gpu_.resize(deferred_centroid_chunk_size_);
+        deferred_virial_frames_gpu_.resize(deferred_centroid_chunk_size_);
+        for (int frame = 0; frame < deferred_centroid_chunk_size_; ++frame) {
+          deferred_position_frames_gpu_[frame].resize(centroid_frame_size_);
+          deferred_velocity_frames_gpu_[frame].resize(centroid_frame_size_);
+          deferred_potential_frames_gpu_[frame].resize(atom.number_of_atoms);
+          deferred_force_frames_gpu_[frame].resize(atom.number_of_atoms * 3);
+          deferred_virial_frames_gpu_[frame].resize(atom.number_of_atoms * 9);
+        }
+        printf(
+          "    centroid qNEP evaluation is deferred to postprocess in fixed %d-frame batches.\n",
+          deferred_centroid_chunk_size_);
+      } else if (fixed_box && atom.number_of_beads > 1) {
+        if (deferred_centroid_qnep_ != 0) {
+          printf(
+            "    deferred centroid qNEP mode unavailable; using the normal sampled centroid path.\n");
+        }
         force.enable_pimd_centroid_probe(
           atom.number_of_atoms, atom.number_of_beads, sample_interval);
         if (force.pimd_centroid_probe_enabled()) {
@@ -85,6 +133,123 @@ void HAC::preprocess(
         electro_potential_per_atom_.resize(atom.number_of_atoms);
       }
     }
+  }
+}
+
+static __global__ void
+gpu_sum_heat(const int N, const int Nd, const int nd, const double* g_heat, double* g_heat_all);
+static __global__ void gpu_sum_heat_by_type(
+  const int N,
+  const int Nd,
+  const int nd,
+  const int number_of_types,
+  const int* g_type,
+  const double* g_heat,
+  double* g_heat_all_by_type);
+static void compute_centroid_heat(
+  const GPU_Vector<double>& mass,
+  const GPU_Vector<double>& potential_per_atom,
+  const GPU_Vector<double>& virial_per_atom,
+  const GPU_Vector<double>& velocity_per_atom,
+  GPU_Vector<double>& heat_per_atom,
+  const bool include_kinetic);
+
+static __global__ void gpu_store_centroid_frame(
+  const int frame_size,
+  const double* position,
+  const double* velocity,
+  double* position_frames,
+  double* velocity_frames,
+  const int frame)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < frame_size) {
+    const int offset = frame * frame_size;
+    position_frames[offset + n] = position[n];
+    velocity_frames[offset + n] = velocity[n];
+  }
+}
+
+void HAC::flush_deferred_centroid_chunk_()
+{
+  if (!deferred_centroid_enabled_ || centroid_chunk_frame_count_ == 0) {
+    return;
+  }
+  const int first_frame = centroid_frame_count_ - centroid_chunk_frame_count_;
+  const size_t offset = static_cast<size_t>(first_frame) * centroid_frame_size_;
+  const size_t size = static_cast<size_t>(centroid_chunk_frame_count_) * centroid_frame_size_;
+  const auto begin = std::chrono::high_resolution_clock::now();
+  centroid_position_chunk_gpu_.copy_to_host(centroid_position_frames_cpu_.data() + offset, size);
+  centroid_velocity_chunk_gpu_.copy_to_host(centroid_velocity_frames_cpu_.data() + offset, size);
+  deferred_staging_wall_time_ += std::chrono::duration<double>(
+    std::chrono::high_resolution_clock::now() - begin).count();
+  centroid_chunk_frame_count_ = 0;
+}
+
+void HAC::process_deferred_centroid_frames_(
+  Atom& atom, Box& box, const int number_of_frames, const int number_of_types, const int Nd)
+{
+  if (!deferred_centroid_enabled_ || force_ == nullptr || number_of_frames == 0) {
+    return;
+  }
+  const int N = atom.number_of_atoms;
+
+  for (int first_frame = 0; first_frame < number_of_frames;
+       first_frame += deferred_centroid_chunk_size_) {
+    const int frames_in_chunk = std::min(
+      deferred_centroid_chunk_size_, number_of_frames - first_frame);
+    const auto upload_begin = std::chrono::high_resolution_clock::now();
+    for (int frame = 0; frame < deferred_centroid_chunk_size_; ++frame) {
+      const int source_frame = first_frame + std::min(frame, frames_in_chunk - 1);
+      const size_t offset = static_cast<size_t>(source_frame) * centroid_frame_size_;
+      deferred_position_frames_gpu_[frame].copy_from_host(
+        centroid_position_frames_cpu_.data() + offset, centroid_frame_size_);
+      deferred_velocity_frames_gpu_[frame].copy_from_host(
+        centroid_velocity_frames_cpu_.data() + offset, centroid_frame_size_);
+    }
+    deferred_upload_wall_time_ += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - upload_begin).count();
+
+    const auto qnep_begin = std::chrono::high_resolution_clock::now();
+    if (!force_->compute_qnep_centroid_frames_batch(
+          box,
+          atom.type,
+          deferred_position_frames_gpu_,
+          deferred_potential_frames_gpu_,
+          deferred_force_frames_gpu_,
+          deferred_virial_frames_gpu_)) {
+      PRINT_INPUT_ERROR(
+        "Deferred centroid qNEP batch evaluation failed; use a fixed-box qNEP PIMD batch run.");
+    }
+    CHECK(gpuDeviceSynchronize());
+    deferred_qnep_wall_time_ += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - qnep_begin).count();
+
+    const auto heat_begin = std::chrono::high_resolution_clock::now();
+    for (int frame = 0; frame < frames_in_chunk; ++frame) {
+      const int nd = first_frame + frame;
+      compute_centroid_heat(
+        atom.mass,
+        deferred_potential_frames_gpu_[frame],
+        deferred_virial_frames_gpu_[frame],
+        deferred_velocity_frames_gpu_[frame],
+        atom.heat_per_atom,
+        true);
+      gpu_sum_heat<<<NUM_OF_HEAT_COMPONENTS, 1024>>>(
+        N, Nd, nd, atom.heat_per_atom.data(), heat_all.data());
+      gpu_sum_heat_by_type<<<number_of_types * NUM_OF_TYPE_HEAT_COMPONENTS, 1024>>>(
+        N,
+        Nd,
+        nd,
+        number_of_types,
+        atom.type.data(),
+        atom.heat_per_atom.data(),
+        heat_all_by_type_.data());
+    }
+    GPU_CHECK_KERNEL
+    CHECK(gpuDeviceSynchronize());
+    deferred_heat_wall_time_ += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - heat_begin).count();
   }
 }
 
@@ -276,6 +441,27 @@ void HAC::process(
   const GPU_Vector<double>* centroid_virial_source = &centroid_virial_per_atom_;
   if (use_centroid_heat_flux_) {
     ++centroid_sampled_frames_;
+    if (deferred_centroid_enabled_) {
+      const int frame = (step + 1) / sample_interval - 1;
+      if (frame != centroid_frame_count_ || frame < 0 || frame >= number_of_steps / sample_interval) {
+        PRINT_INPUT_ERROR(
+          "Deferred centroid samples must arrive in sequential HAC frame order.");
+      }
+      gpu_store_centroid_frame<<<(centroid_frame_size_ - 1) / 128 + 1, 128>>>(
+        centroid_frame_size_,
+        atom.position_per_atom.data(),
+        atom.velocity_per_atom.data(),
+        centroid_position_chunk_gpu_.data(),
+        centroid_velocity_chunk_gpu_.data(),
+        centroid_chunk_frame_count_);
+      GPU_CHECK_KERNEL
+      ++centroid_chunk_frame_count_;
+      ++centroid_frame_count_;
+      if (centroid_chunk_frame_count_ == deferred_centroid_chunk_size_) {
+        flush_deferred_centroid_chunk_();
+      }
+      return;
+    }
     if (force.pimd_centroid_probe_ready()) {
       ++centroid_batch_cache_hits_;
       centroid_potential_source = &force.get_pimd_centroid_potential();
@@ -466,6 +652,15 @@ void HAC::postprocess(
   const double dt = time_step * sample_interval;
   const double dt_in_ps = dt * TIME_UNIT_CONVERSION / 1000.0; // ps
 
+  if (deferred_centroid_enabled_) {
+    flush_deferred_centroid_chunk_();
+    if (centroid_frame_count_ != Nd) {
+      PRINT_INPUT_ERROR("The deferred centroid frame count does not match the HAC samples.");
+    }
+    process_deferred_centroid_frames_(
+      atom, box, Nd, static_cast<int>(atom.cpu_type_size.size()), Nd);
+  }
+
   std::vector<double> heat_current_cpu(Nd * NUM_OF_HEAT_COMPONENTS);
   heat_all.copy_to_host(heat_current_cpu.data());
 
@@ -624,6 +819,7 @@ void HAC::postprocess(
   std::vector<double> hac_cpu(Nc * NUM_OF_HEAT_COMPONENTS);
 
   // Here, the block size is fixed to 128, which is a good choice
+  const auto hac_begin = std::chrono::high_resolution_clock::now();
   gpu_find_hac<<<Nc, 128>>>(Nc, Nd, heat_all.data(), hac_gpu.data());
   GPU_CHECK_KERNEL
 
@@ -633,6 +829,10 @@ void HAC::postprocess(
   factor *= KAPPA_UNIT_CONVERSION;
 
   find_rtc(Nc, factor, hac_cpu.data(), rtc.data());
+  if (deferred_centroid_enabled_) {
+    deferred_hac_wall_time_ += std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - hac_begin).count();
+  }
   const char* output_file_name = use_centroid_heat_flux_ ? "hac_centroid.out" : "hac.out";
   FILE* fid = fopen(output_file_name, "a");
   const int number_of_output_data = Nc / output_interval;
@@ -669,6 +869,14 @@ void HAC::postprocess(
     printf("    sampled frames = %lld\n", centroid_sampled_frames_);
     printf("    qNEP batch cache hits = %lld\n", centroid_batch_cache_hits_);
     printf("    serial fallbacks = %lld\n", centroid_serial_fallbacks_);
+    if (deferred_centroid_enabled_) {
+      printf("    deferred centroid frames = %d\n", centroid_frame_count_);
+      printf("    trajectory staging/D2H wall time = %g s\n", deferred_staging_wall_time_);
+      printf("    deferred frame upload wall time = %g s\n", deferred_upload_wall_time_);
+      printf("    deferred qNEP batch wall time = %g s\n", deferred_qnep_wall_time_);
+      printf("    deferred heat accumulation wall time = %g s\n", deferred_heat_wall_time_);
+      printf("    HAC correlation wall time = %g s\n", deferred_hac_wall_time_);
+    }
   }
   print_line_2();
 
@@ -681,22 +889,31 @@ void HAC::parse(const char** param, int num_param)
 
   printf("Compute HAC.\n");
 
-  if (!(num_param == 4 || num_param == 5 || num_param == 6)) {
-    PRINT_INPUT_ERROR("compute_hac should have 3, 4, or 5 parameters.\n");
+  if (!(num_param == 4 || num_param == 5 || num_param == 6 || num_param == 7)) {
+    PRINT_INPUT_ERROR("compute_hac should have 3, 4, 5, or 6 parameters.\n");
   }
 
   if (!is_valid_int(param[1], &sample_interval)) {
     PRINT_INPUT_ERROR("sample interval for HAC should be an integer number.\n");
+  }
+  if (sample_interval <= 0) {
+    PRINT_INPUT_ERROR("sample interval for HAC should be positive.\n");
   }
   printf("    sample interval is %d.\n", sample_interval);
 
   if (!is_valid_int(param[2], &Nc)) {
     PRINT_INPUT_ERROR("Nc for HAC should be an integer number.\n");
   }
+  if (Nc <= 0) {
+    PRINT_INPUT_ERROR("Nc for HAC should be positive.\n");
+  }
   printf("    Nc is %d\n", Nc);
 
   if (!is_valid_int(param[3], &output_interval)) {
     PRINT_INPUT_ERROR("output_interval for HAC should be an integer number.\n");
+  }
+  if (output_interval <= 0) {
+    PRINT_INPUT_ERROR("output_interval for HAC should be positive.\n");
   }
   printf("    output_interval is %d\n", output_interval);
   if (num_param >= 5) {
@@ -707,12 +924,21 @@ void HAC::parse(const char** param, int num_param)
       printf("    use the full classical heat-flux operator on the current centroid structure.\n");
     }
   }
-  if (num_param == 6) {
+  if (num_param >= 6) {
     if (!is_valid_int(param[5], &split_qnep_heat_by_type_)) {
       PRINT_INPUT_ERROR("qNEP electrostatic split flag for HAC should be an integer.\n");
     }
     if (split_qnep_heat_by_type_ != 0) {
       printf("    output type-resolved electrostatic and non-electrostatic heat currents for qNEP.\n");
+    }
+  }
+  if (num_param == 7) {
+    if (!is_valid_int(param[6], &deferred_centroid_qnep_)) {
+      PRINT_INPUT_ERROR("deferred centroid qNEP flag for HAC should be an integer.\n");
+    }
+    if (deferred_centroid_qnep_ != 0) {
+      printf(
+        "    defer centroid qNEP evaluation to postprocess using fixed 32-frame batches.\n");
     }
   }
 }

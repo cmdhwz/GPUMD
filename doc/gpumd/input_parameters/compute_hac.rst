@@ -10,9 +10,9 @@ The results will be written to the :ref:`hac.out output file <hac_out>`.
 
 Syntax
 ------
-This keyword has 3 required parameters and up to 2 optional flags::
+This keyword has 3 required parameters and up to 3 optional flags::
 
-  compute_hac <sampling_interval> <correlation_steps> <output_interval> [use_centroid_heat_flux] [split_qnep_heat_by_type]
+  compute_hac <sampling_interval> <correlation_steps> <output_interval> [use_centroid_heat_flux] [split_qnep_heat_by_type] [deferred_centroid_qnep]
 
 The first parameter is the sampling interval for the heat current data.
 The second parameter is the maximum correlations steps.
@@ -24,7 +24,8 @@ If omitted, the default is 0.
 
 For a fixed-box PIMD, RPMD, or TRPMD run using a single qNEP potential and
 ``pimd_bead_batch on``, the centroid potential and virial are evaluated as one
-auxiliary lane of the existing qNEP bead batch. This avoids an additional
+auxiliary lane of the existing qNEP bead batch. This is the default behavior
+when ``deferred_centroid_qnep`` is 0, and avoids an additional
 single-configuration qNEP force call at every HAC sample. The auxiliary lane
 is not integrated and does not change the physical bead forces or ring-polymer
 dynamics. If these conditions are not met, the original single-configuration
@@ -34,6 +35,20 @@ The optional fifth parameter :attr:`split_qnep_heat_by_type` can be set to 1 to 
 additional type-resolved heat-current file with the electrostatic and non-electrostatic
 contributions separated for qNEP models.
 If omitted, the default is 0.
+
+The optional sixth parameter ``deferred_centroid_qnep`` enables delayed centroid
+heat-flux evaluation for fixed-box PIMD/RPMD/TRPMD runs with a single qNEP
+potential, ``pimd_bead_batch on``, and no qNEP type split. Set it to 1 to save
+the centroid position and velocity at each HAC sample during dynamics, then
+evaluate the saved frames in fixed batches of 32 during ``postprocess``. This
+keeps centroid qNEP work out of the dynamics loop. The saved trajectory uses
+host memory proportional to the number of HAC frames and is padded only inside
+the final 32-frame postprocessing batch. Unsupported runs, or a nonzero
+``split_qnep_heat_by_type``, fall back to the normal sampled centroid path.
+
+For example, with a 5-step sampling interval and 2000 HAC frames::
+
+  compute_hac 5 2000 1 1 0 1
 
 Examples
 --------

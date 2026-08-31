@@ -407,6 +407,10 @@ void Run::perform_a_run()
   mc.finalize();
   velocity.finalize();
   force.finalize();
+  const auto total_finish = std::chrono::high_resolution_clock::now();
+  printf(
+    "Total wall time including dynamics and postprocess = %g second.\n",
+    std::chrono::duration<double>(total_finish - time_begin).count());
   max_distance_per_step = 0.0;
 }
 

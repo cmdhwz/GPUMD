@@ -98,3 +98,10 @@ automatically by ``compute_hac`` when its centroid flag is 1; physical bead
 forces and the ring-polymer propagation are unchanged. Variable-box runs, SCR
 barostats, unsupported potentials, and non-batched runs retain the serial
 centroid-force fallback.
+
+To remove centroid qNEP work from the dynamics loop, add the optional
+``deferred_centroid_qnep`` flag to ``compute_hac``. With this flag set to 1,
+fixed-box qNEP PIMD/RPMD/TRPMD runs cache centroid positions and velocities at
+HAC samples and evaluate them later in fixed 32-frame qNEP batches. This mode
+is default-off, supports ``split_qnep_heat_by_type 0`` only, and falls back to
+the sampled auxiliary-lane or serial path when its requirements are not met.

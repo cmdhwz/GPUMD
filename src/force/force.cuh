@@ -131,6 +131,14 @@ public:
     const int number_of_atoms, const int number_of_beads, const int sample_interval);
   bool pimd_centroid_probe_enabled() const { return pimd_centroid_probe_enabled_; }
   bool pimd_centroid_probe_ready() const { return pimd_centroid_probe_ready_; }
+  bool pimd_qnep_batch_available() const { return can_use_pimd_qnep_batch_(); }
+  bool compute_qnep_centroid_frames_batch(
+    Box& box,
+    GPU_Vector<int>& type,
+    std::vector<GPU_Vector<double>>& position_frames,
+    std::vector<GPU_Vector<double>>& potential_frames,
+    std::vector<GPU_Vector<double>>& force_frames,
+    std::vector<GPU_Vector<double>>& virial_frames);
   const GPU_Vector<double>& get_pimd_centroid_potential() const
   {
     return pimd_centroid_potential_;

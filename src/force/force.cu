@@ -727,6 +727,53 @@ bool Force::try_compute_pimd_qnep_batch_(
   return used_batch;
 }
 
+bool Force::compute_qnep_centroid_frames_batch(
+  Box& box,
+  GPU_Vector<int>& type,
+  std::vector<GPU_Vector<double>>& position_frames,
+  std::vector<GPU_Vector<double>>& potential_frames,
+  std::vector<GPU_Vector<double>>& force_frames,
+  std::vector<GPU_Vector<double>>& virial_frames)
+{
+  if (!can_use_pimd_qnep_batch_() || position_frames.size() < 2 ||
+      potential_frames.size() != position_frames.size() ||
+      force_frames.size() != position_frames.size() ||
+      virial_frames.size() != position_frames.size()) {
+    return false;
+  }
+
+  std::vector<GPU_Vector<double>*> position_ptrs;
+  std::vector<GPU_Vector<double>*> potential_ptrs;
+  std::vector<GPU_Vector<double>*> force_ptrs;
+  std::vector<GPU_Vector<double>*> virial_ptrs;
+  const int number_of_frames = static_cast<int>(position_frames.size());
+  position_ptrs.reserve(number_of_frames);
+  potential_ptrs.reserve(number_of_frames);
+  force_ptrs.reserve(number_of_frames);
+  virial_ptrs.reserve(number_of_frames);
+  for (int frame = 0; frame < number_of_frames; ++frame) {
+    position_ptrs.push_back(&position_frames[frame]);
+    potential_ptrs.push_back(&potential_frames[frame]);
+    force_ptrs.push_back(&force_frames[frame]);
+    virial_ptrs.push_back(&virial_frames[frame]);
+  }
+
+  CHECK(gpuSetDevice(0));
+  box.set_is_orthogonal();
+  NEP_Charge* qnep = dynamic_cast<NEP_Charge*>(potentials[0].get());
+  if (!qnep) {
+    return false;
+  }
+  return qnep->compute_pimd_batch(
+    box,
+    type,
+    position_ptrs,
+    potential_ptrs,
+    force_ptrs,
+    virial_ptrs,
+    number_of_frames);
+}
+
 bool Force::try_compute_pimd_nep_batch_(
   Box& box,
   GPU_Vector<int>& type,

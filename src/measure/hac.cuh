@@ -61,6 +61,8 @@ public:
   void parse(const char**, int);
 
 private:
+  static constexpr int deferred_centroid_chunk_size_ = 32;
+
   GPU_Vector<double> heat_all;
   GPU_Vector<double> heat_all_by_type_;
   GPU_Vector<double> heat_all_by_type_electro_;
@@ -75,7 +77,31 @@ private:
   GPU_Vector<double> electro_heat_per_atom_;
   int use_centroid_heat_flux_ = 0;
   int split_qnep_heat_by_type_ = 0;
+  int deferred_centroid_qnep_ = 0;
+  bool deferred_centroid_enabled_ = false;
+  Force* force_ = nullptr;
+  int centroid_frame_size_ = 0;
+  int centroid_frame_count_ = 0;
+  int centroid_chunk_frame_count_ = 0;
+  GPU_Vector<double> centroid_position_chunk_gpu_;
+  GPU_Vector<double> centroid_velocity_chunk_gpu_;
+  std::vector<double> centroid_position_frames_cpu_;
+  std::vector<double> centroid_velocity_frames_cpu_;
+  std::vector<GPU_Vector<double>> deferred_position_frames_gpu_;
+  std::vector<GPU_Vector<double>> deferred_velocity_frames_gpu_;
+  std::vector<GPU_Vector<double>> deferred_potential_frames_gpu_;
+  std::vector<GPU_Vector<double>> deferred_force_frames_gpu_;
+  std::vector<GPU_Vector<double>> deferred_virial_frames_gpu_;
   long long centroid_sampled_frames_ = 0;
   long long centroid_batch_cache_hits_ = 0;
   long long centroid_serial_fallbacks_ = 0;
+  double deferred_staging_wall_time_ = 0.0;
+  double deferred_upload_wall_time_ = 0.0;
+  double deferred_qnep_wall_time_ = 0.0;
+  double deferred_heat_wall_time_ = 0.0;
+  double deferred_hac_wall_time_ = 0.0;
+
+  void flush_deferred_centroid_chunk_();
+  void process_deferred_centroid_frames_(
+    Atom& atom, Box& box, const int number_of_frames, const int number_of_types, const int Nd);
 };
