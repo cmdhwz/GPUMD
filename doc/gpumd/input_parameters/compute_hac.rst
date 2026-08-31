@@ -10,9 +10,9 @@ The results will be written to the :ref:`hac.out output file <hac_out>`.
 
 Syntax
 ------
-This keyword has 3 required parameters and up to 4 optional flags::
+This keyword has 3 required parameters and up to 3 optional flags::
 
-  compute_hac <sampling_interval> <correlation_steps> <output_interval> [use_centroid_heat_flux] [split_qnep_heat_by_type] [deferred_centroid_qnep] [deferred_diagnostic_stage]
+  compute_hac <sampling_interval> <correlation_steps> <output_interval> [use_centroid_heat_flux] [split_qnep_heat_by_type] [deferred_centroid_qnep]
 
 The first parameter is the sampling interval for the heat current data.
 The second parameter is the maximum correlations steps.
@@ -49,37 +49,6 @@ the final 32-frame postprocessing batch. Unsupported runs, or a nonzero
 For example, with a 5-step sampling interval and 2000 HAC frames::
 
   compute_hac 5 2000 1 1 0 1
-
-The optional seventh parameter ``deferred_diagnostic_stage`` is a development
-diagnostic control. It does not change the meaning of the preceding
-``deferred_centroid_qnep`` flag, and is only valid when
-``use_centroid_heat_flux=1``, ``split_qnep_heat_by_type=0``, and
-``deferred_centroid_qnep=1``. A nonzero stage produces no HAC, thermal
-conductivity, or heat-current output file. The stages are:
-
-Stages ``2``--``4`` additionally require a fixed-box PIMD/RPMD/TRPMD run so
-that the production deferred cache can be allocated. Stage ``1`` only counts
-sampling points and does not require that cache.
-
-* ``1``: count HAC sampling points only; do not allocate HAC, centroid, or
-  deferred trajectory buffers.
-* ``2``: allocate the same deferred CPU/GPU cache as production, but do not
-  run the snapshot store kernel.
-* ``3``: allocate the cache and run the GPU snapshot store, but do not perform
-  D2H copies.
-* ``4``: allocate, store, and perform chunked D2H copies, but do not evaluate
-  qNEP, HAC, or thermal conductivity in ``postprocess``.
-
-Stage ``0`` is the default production deferred mode. For example::
-
-  compute_hac 5 2000 1 1 0 1 1  # stage 1: sampling counter only
-  compute_hac 5 2000 1 1 0 1 2  # stage 2: cache allocation
-  compute_hac 5 2000 1 1 0 1 3  # stage 3: cache allocation + GPU store
-  compute_hac 5 2000 1 1 0 1 4  # stage 4: cache allocation + store + D2H
-  compute_hac 5 2000 1 1 0 1 0  # stage 0: complete deferred HAC
-
-These diagnostic stages are intended only to isolate performance costs and
-should not be used for production conductivity calculations.
 
 Examples
 --------

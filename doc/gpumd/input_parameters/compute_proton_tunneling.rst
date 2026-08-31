@@ -14,7 +14,7 @@ Syntax
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [bead_diagnostic [f_min span_min [center_max centroid_max]]]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [bead_diagnostic [f_min span_min [center_max centroid_max]]]
 
 For example::
 
@@ -27,6 +27,13 @@ To require a more linear O-H-O geometry, add the optional angle setting::
 With a nominal Na/Cl ion-field proxy enabled, use one physical input line::
 
   compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0
+
+To record a local Na/Cl environment for every valid O-H-O observation, append
+``local_environment``. The first two cutoffs are for the two species configured by
+``ion_field``; the third is the H--ion2 cutoff for the continuous O-H...ion2 angles,
+and the last is the threshold for the accompanying ``hcl_like`` fractions::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0 local_environment 3.5 3.5 3.0 150
 
 For RPMD/PIMD, enable the lightweight bead-resolved tunneling-like diagnostic with the
 strict default thresholds :math:`f_{\min}=0.25`,
@@ -122,6 +129,12 @@ and completed edge windows.
   confirmation, return, geometry-loss, or run-end frame. ``E_parallel_start`` and
   ``E_parallel_end`` are the nominal-ion electric field projected along ``O_low`` to
   ``O_high``; ``nearest_ion_id`` and ``nearest_ion_distance`` refer to the event-end frame.
+  ``delta_phi_start`` and ``delta_phi_end`` are the nominal-ion potential differences
+  :math:`\phi(O_{\rm high})-\phi(O_{\rm low})` at the attempt start and end. The final two
+  columns are ``delta_d_<ion1>_start`` and ``delta_d_<ion2>_start``, where
+  :math:`\Delta d_{\rm ion}=d(\mathrm{ion},O_{\rm high})-d(\mathrm{ion},O_{\rm low})`;
+  the species names come from ``ion_field``. These start-frame quantities are kept separate
+  from the event-end field because the local environment can change during a transfer attempt.
   If ``ion_field`` is omitted, these fields are written as ``nan`` and ``-1``. Frames rejected
   only because of strict-assignment ambiguity do not close an active attempt.
 * ``proton_transfer.out`` contains sparse, hold-confirmed hydrogen transfer events with the
@@ -143,8 +156,30 @@ and completed edge windows.
   :math:`N_{\rm success}/(N_{\rm success}+N_{\rm return})`; geometry loss and run-end are
   reported separately. When ``ion_field`` is enabled, the appended ``mean_E_parallel``,
   ``std_E_parallel``, ``corr_delta_E_parallel``, ``mean_E_success``, and ``mean_E_return``
-  columns summarize the nominal-ion field. The final two distance columns are the mean nearest
-  distances to the two configured ion species; their names are generated from the input symbols.
+  columns summarize the nominal-ion field. The first two distance columns are the mean nearest
+  distances to the two configured ion species measured from the O--O midpoint; their names are
+  generated from the input symbols. The appended signed-population columns are
+  ``log_population_ratio=ln(N_+/N_-)``,
+  ``beta_DeltaF_high_minus_low=-ln(N_+/N_-)``, and its absolute value. Thus a positive
+  ``beta_DeltaF_high_minus_low`` means that the ``O_high`` side has the higher inferred free
+  energy. The next three columns are the mean, standard deviation, and correlation of
+  ``delta_phi_ion`` with ``delta``. The remaining six columns give the mean ion1/ion2 distances
+  to ``O_low`` and ``O_high`` and their high-minus-low differences; these nearest-endpoint
+  distances scan the configured species, independently of the midpoint cutoff. The ion names
+  are generated from the input symbols. All signed-potential and side-resolved quantities are ``nan`` when
+  ``ion_field`` is disabled or the edge has no valid geometry samples.
+* ``proton_local_environment_window.out`` is written only when ``local_environment`` is enabled.
+  It contains one record per observed O-O edge and window. It reports mean O-H-O geometry,
+  endpoint hydrogen counts, donor/acceptor edge counts, the first three ion distances and
+  coordination numbers for each endpoint, endpoint distance differences, nearest ion2-to-H
+  distance, continuous O-H...ion2 angles, ``hcl_like`` fractions, and the nominal field and
+  potential-difference descriptors. Missing neighbors are excluded from the corresponding
+  distance mean and are reported as ``nan``.
+* ``proton_local_environment_event.out`` is written only when ``local_environment`` is enabled.
+  Each finalized attempt has ``start``, ``end``, and ``last_valid`` snapshots. When
+  ``bead_diagnostic`` is also enabled, valid ``centroid_best`` and ``delocalization_best``
+  snapshots are appended, binding the local environment to the dynamical outcome and the
+  independent quantum-geometry label.
 * ``proton_bond.out`` contains accumulated per-pair geometry, state, and transition counts
   after the run.
 * ``proton_bead_event.out`` is written only when ``bead_diagnostic`` is enabled. It contains
@@ -189,6 +224,19 @@ including only configured ions within the cutoff. The sign is positive along ``O
 not use qNEP dynamic charges; it is an observer-side mechanism proxy and does not alter forces,
 PIMD/RPMD integration, qNEP, or HAC.
 
+The same configured ions also provide the signed potential-difference proxy
+
+.. math::
+
+   \Delta\phi_{\rm ion}=\phi(O_{\rm high})-\phi(O_{\rm low})
+   =K_C\sum_i q_i\left(\frac{1}{r_{i,\rm high}}-\frac{1}{r_{i,\rm low}}\right).
+
+Only ions whose distance from the O--O midpoint is within ``ion_field``'s cutoff contribute,
+so this quantity uses the same truncated nominal-ion environment as ``E_parallel``. It is a
+signed mechanism proxy, not a qNEP electrostatic potential or a rigorous free-energy difference.
+With ``A>0`` denoting a population preference for ``O_high``, the simple point-charge picture
+predicts an anticorrelation between ``A`` and ``delta_phi_ion`` for a positive proton.
+
 When ``bead_diagnostic`` is enabled, each active attempt is probed at its smallest observed
 :math:`|\Delta_{\rm centroid}|`. The O--O pair is inherited from the centroid assignment and
 is not reselected independently for each bead. For bead :math:`s`, the diagnostic evaluates
@@ -220,6 +268,14 @@ or integrator paths. The geometry shell used by the GPU observer is built once f
 centroid structure; this fixed-topology optimization is intended for fixed-volume RPMD/NVE
 trajectories. Strongly deforming NPT or structure-search runs require a shell-rebuild policy
 before using this optimization.
+
+The optional ``local_environment`` observer is a nominal structural/mechanism proxy. It uses
+centroid positions and the same configured ion species as ``ion_field``. Its distances and
+coordination numbers are continuous descriptors, not fixed chemical coordination assignments.
+``hcl_like_low`` and ``hcl_like_high`` are thresholded summaries of the reported continuous
+angles. This implementation does not use qNEP dynamic charges, BECs, or polarizabilities;
+qNEP environment descriptors require a separate bead-batch charge interface and are intentionally
+not enabled by this option.
 
 Use ``compute_proton_tunneling`` first in a short validation run and compare its pair/state
 assignment with the existing Python trajectory script. The transfer and defect streams are

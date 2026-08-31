@@ -91,10 +91,15 @@ __device__ void compute_ion_field_gpu(
   GeometryResultGPU& geometry)
 {
   geometry.E_ion_nominal_parallel = 0.0;
+  geometry.delta_phi_ion = 0.0;
   geometry.nearest_ion_id = -1;
   geometry.nearest_ion_distance = 1.0e300;
   geometry.nearest_ion1_distance = 1.0e300;
   geometry.nearest_ion2_distance = 1.0e300;
+  geometry.nearest_ion1_to_low = 1.0e300;
+  geometry.nearest_ion1_to_high = 1.0e300;
+  geometry.nearest_ion2_to_low = 1.0e300;
+  geometry.nearest_ion2_to_high = 1.0e300;
   const double inverse_dOO = 1.0 / base_geometry.dOO;
   const double ex = base_geometry.low_to_high_dx * inverse_dOO;
   const double ey = base_geometry.low_to_high_dy * inverse_dOO;
@@ -107,6 +112,12 @@ __device__ void compute_ion_field_gpu(
     double& nearest_species_distance = (species == 0)
       ? geometry.nearest_ion1_distance
       : geometry.nearest_ion2_distance;
+    double& nearest_species_to_low = (species == 0)
+      ? geometry.nearest_ion1_to_low
+      : geometry.nearest_ion2_to_low;
+    double& nearest_species_to_high = (species == 0)
+      ? geometry.nearest_ion1_to_high
+      : geometry.nearest_ion2_to_high;
     for (int i = 0; i < ion_count; ++i) {
       const int ion = ions[i];
       double ion_dx = position[ion] - position[base_geometry.oxygen_low];
@@ -119,11 +130,26 @@ __device__ void compute_ion_field_gpu(
       double midpoint_to_ion_y = 0.5 * base_geometry.low_to_high_dy - ion_dy;
       double midpoint_to_ion_z = 0.5 * base_geometry.low_to_high_dz - ion_dz;
       apply_mic(box, midpoint_to_ion_x, midpoint_to_ion_y, midpoint_to_ion_z);
+      double ion_to_high_x = position[ion] - position[base_geometry.oxygen_high];
+      double ion_to_high_y = position[ion + number_of_atoms] -
+        position[base_geometry.oxygen_high + number_of_atoms];
+      double ion_to_high_z = position[ion + 2 * number_of_atoms] -
+        position[base_geometry.oxygen_high + 2 * number_of_atoms];
+      apply_mic(box, ion_to_high_x, ion_to_high_y, ion_to_high_z);
+      const double low_distance_square = ion_dx * ion_dx + ion_dy * ion_dy + ion_dz * ion_dz;
+      const double high_distance_square = ion_to_high_x * ion_to_high_x +
+        ion_to_high_y * ion_to_high_y + ion_to_high_z * ion_to_high_z;
+      const double low_distance = sqrt(low_distance_square);
+      const double high_distance = sqrt(high_distance_square);
       const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
         midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
       const double distance = sqrt(distance_square);
       if (distance < nearest_species_distance)
         nearest_species_distance = distance;
+      if (low_distance < nearest_species_to_low)
+        nearest_species_to_low = low_distance;
+      if (high_distance < nearest_species_to_high)
+        nearest_species_to_high = high_distance;
       if (distance < geometry.nearest_ion_distance) {
         geometry.nearest_ion_distance = distance;
         geometry.nearest_ion_id = ion;
@@ -132,6 +158,9 @@ __device__ void compute_ion_field_gpu(
         geometry.E_ion_nominal_parallel += K_C * charge *
           (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
           (distance_square * distance);
+        if (low_distance > 1.0e-12 && high_distance > 1.0e-12)
+          geometry.delta_phi_ion += K_C * charge *
+            (1.0 / high_distance - 1.0 / low_distance);
       }
     }
   }
@@ -358,6 +387,191 @@ __global__ void gpu_find_proton_geometry(
     }
   }
 }
+
+__device__ void update_nearest_three(
+  const double distance,
+  const double cutoff,
+  double& first,
+  double& second,
+  double& third,
+  int& coordination)
+{
+  if (distance > cutoff)
+    return;
+  ++coordination;
+  if (distance < first) {
+    third = second;
+    second = first;
+    first = distance;
+  } else if (distance < second) {
+    third = second;
+    second = distance;
+  } else if (distance < third) {
+    third = distance;
+  }
+}
+
+__device__ double angle_from_vectors(
+  const double ax,
+  const double ay,
+  const double az,
+  const double bx,
+  const double by,
+  const double bz)
+{
+  const double a2 = ax * ax + ay * ay + az * az;
+  const double b2 = bx * bx + by * by + bz * bz;
+  if (a2 <= 1.0e-24 || b2 <= 1.0e-24)
+    return -1.0;
+  double cosine = (ax * bx + ay * by + az * bz) / sqrt(a2 * b2);
+  cosine = fmax(-1.0, fmin(1.0, cosine));
+  return acos(cosine) * 57.29577951308232;
+}
+
+__global__ void gpu_compute_proton_local_environment(
+  const double* position,
+  const int number_of_atoms,
+  const int number_of_hydrogens,
+  const int* hydrogen_indices,
+  const GeometryResultGPU* geometries,
+  const int* ion1_indices,
+  const int ion1_count,
+  const int* ion2_indices,
+  const int ion2_count,
+  const Box box,
+  const double ion1_cutoff,
+  const double ion2_cutoff,
+  const double hcl_cutoff,
+  const double hcl_angle_min_deg,
+  LocalEnvironmentGPU* output)
+{
+  const int hydrogen_index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (hydrogen_index >= number_of_hydrogens)
+    return;
+  const GeometryResultGPU geometry = geometries[hydrogen_index];
+  LocalEnvironmentGPU environment = {};
+  environment.valid = 0;
+  environment.ion1_low_d1 = 1.0e300;
+  environment.ion1_low_d2 = 1.0e300;
+  environment.ion1_low_d3 = 1.0e300;
+  environment.ion1_high_d1 = 1.0e300;
+  environment.ion1_high_d2 = 1.0e300;
+  environment.ion1_high_d3 = 1.0e300;
+  environment.ion2_low_d1 = 1.0e300;
+  environment.ion2_low_d2 = 1.0e300;
+  environment.ion2_low_d3 = 1.0e300;
+  environment.ion2_high_d1 = 1.0e300;
+  environment.ion2_high_d2 = 1.0e300;
+  environment.ion2_high_d3 = 1.0e300;
+  environment.nearest_ion2_to_H = 1.0e300;
+  environment.angle_Olow_H_ion2 = -1.0;
+  environment.angle_Ohigh_H_ion2 = -1.0;
+  if (geometry.valid == 0) {
+    output[hydrogen_index] = environment;
+    return;
+  }
+
+  const int hydrogen = hydrogen_indices[hydrogen_index];
+  const int oxygen_low = geometry.oxygen_low;
+  const int oxygen_high = geometry.oxygen_high;
+  double low_x = position[oxygen_low] - position[hydrogen];
+  double low_y = position[oxygen_low + number_of_atoms] - position[hydrogen + number_of_atoms];
+  double low_z = position[oxygen_low + 2 * number_of_atoms] -
+    position[hydrogen + 2 * number_of_atoms];
+  double high_x = position[oxygen_high] - position[hydrogen];
+  double high_y = position[oxygen_high + number_of_atoms] -
+    position[hydrogen + number_of_atoms];
+  double high_z = position[oxygen_high + 2 * number_of_atoms] -
+    position[hydrogen + 2 * number_of_atoms];
+  apply_mic(box, low_x, low_y, low_z);
+  apply_mic(box, high_x, high_y, high_z);
+  const double low_distance = sqrt(low_x * low_x + low_y * low_y + low_z * low_z);
+  const double high_distance = sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
+  environment.valid = (low_distance > 1.0e-12 && high_distance > 1.0e-12) ? 1 : 0;
+  if (environment.valid == 0) {
+    output[hydrogen_index] = environment;
+    return;
+  }
+  environment.rOH_low = low_distance;
+  environment.rOH_high = high_distance;
+  environment.oho_angle = angle_from_vectors(low_x, low_y, low_z, high_x, high_y, high_z);
+  environment.dOO = geometry.dOO;
+  environment.rperp = geometry.rperp;
+  environment.path_excess = geometry.path_excess;
+  environment.delta_d_ion1 = 0.0;
+  environment.delta_d_ion2 = 0.0;
+  environment.E_parallel = geometry.E_ion_nominal_parallel;
+  environment.delta_phi_ion = geometry.delta_phi_ion;
+
+  for (int species = 0; species < 2; ++species) {
+    const int* ions = (species == 0) ? ion1_indices : ion2_indices;
+    const int ion_count = (species == 0) ? ion1_count : ion2_count;
+    const double cutoff = (species == 0) ? ion1_cutoff : ion2_cutoff;
+    for (int i = 0; i < ion_count; ++i) {
+      const int ion = ions[i];
+      double ion_low_x = position[ion] - position[oxygen_low];
+      double ion_low_y = position[ion + number_of_atoms] -
+        position[oxygen_low + number_of_atoms];
+      double ion_low_z = position[ion + 2 * number_of_atoms] -
+        position[oxygen_low + 2 * number_of_atoms];
+      double ion_high_x = position[ion] - position[oxygen_high];
+      double ion_high_y = position[ion + number_of_atoms] -
+        position[oxygen_high + number_of_atoms];
+      double ion_high_z = position[ion + 2 * number_of_atoms] -
+        position[oxygen_high + 2 * number_of_atoms];
+      apply_mic(box, ion_low_x, ion_low_y, ion_low_z);
+      apply_mic(box, ion_high_x, ion_high_y, ion_high_z);
+      const double low_ion_distance = sqrt(
+        ion_low_x * ion_low_x + ion_low_y * ion_low_y + ion_low_z * ion_low_z);
+      const double high_ion_distance = sqrt(
+        ion_high_x * ion_high_x + ion_high_y * ion_high_y + ion_high_z * ion_high_z);
+      if (species == 0) {
+        update_nearest_three(
+          low_ion_distance, cutoff, environment.ion1_low_d1, environment.ion1_low_d2,
+          environment.ion1_low_d3, environment.coord_ion1_low);
+        update_nearest_three(
+          high_ion_distance, cutoff, environment.ion1_high_d1, environment.ion1_high_d2,
+          environment.ion1_high_d3, environment.coord_ion1_high);
+      } else {
+        update_nearest_three(
+          low_ion_distance, cutoff, environment.ion2_low_d1, environment.ion2_low_d2,
+          environment.ion2_low_d3, environment.coord_ion2_low);
+        update_nearest_three(
+          high_ion_distance, cutoff, environment.ion2_high_d1, environment.ion2_high_d2,
+          environment.ion2_high_d3, environment.coord_ion2_high);
+        double ion_h_x = position[ion] - position[hydrogen];
+        double ion_h_y = position[ion + number_of_atoms] - position[hydrogen + number_of_atoms];
+        double ion_h_z = position[ion + 2 * number_of_atoms] -
+          position[hydrogen + 2 * number_of_atoms];
+        apply_mic(box, ion_h_x, ion_h_y, ion_h_z);
+        const double h_distance = sqrt(ion_h_x * ion_h_x + ion_h_y * ion_h_y + ion_h_z * ion_h_z);
+        if (h_distance < environment.nearest_ion2_to_H) {
+          environment.nearest_ion2_to_H = h_distance;
+          if (h_distance <= hcl_cutoff) {
+            environment.angle_Olow_H_ion2 = angle_from_vectors(
+              low_x, low_y, low_z, ion_h_x, ion_h_y, ion_h_z);
+            environment.angle_Ohigh_H_ion2 = angle_from_vectors(
+              high_x, high_y, high_z, ion_h_x, ion_h_y, ion_h_z);
+            environment.hcl_like_low =
+              environment.angle_Olow_H_ion2 >= hcl_angle_min_deg ? 1 : 0;
+            environment.hcl_like_high =
+              environment.angle_Ohigh_H_ion2 >= hcl_angle_min_deg ? 1 : 0;
+          } else {
+            environment.angle_Olow_H_ion2 = -1.0;
+            environment.angle_Ohigh_H_ion2 = -1.0;
+          }
+        }
+      }
+    }
+  }
+  environment.delta_d_ion1 =
+    (environment.ion1_low_d1 < 1.0e299 && environment.ion1_high_d1 < 1.0e299)
+      ? environment.ion1_high_d1 - environment.ion1_low_d1 : 1.0e300;
+  environment.delta_d_ion2 =
+    (environment.ion2_low_d1 < 1.0e299 && environment.ion2_high_d1 < 1.0e299)
+      ? environment.ion2_high_d1 - environment.ion2_low_d1 : 1.0e300;
+  output[hydrogen_index] = environment;
+}
 }
 
 Proton_Tunneling::Proton_Tunneling(
@@ -401,7 +615,8 @@ void Proton_Tunneling::parse(
   int next_param = 8;
   const auto is_option = [](const char* value) {
     return std::strcmp(value, "ion_field") == 0 || std::strcmp(value, "oho_angle") == 0 ||
-      std::strcmp(value, "bead_diagnostic") == 0;
+      std::strcmp(value, "bead_diagnostic") == 0 ||
+      std::strcmp(value, "local_environment") == 0;
   };
   if (next_param < num_param && !is_option(param[next_param])) {
     if (next_param + 1 >= num_param || is_option(param[next_param + 1])) {
@@ -412,6 +627,7 @@ void Proton_Tunneling::parse(
   }
   bool angle_seen = false;
   bool bead_diagnostic_seen = false;
+  bool local_environment_seen = false;
   while (next_param < num_param) {
     if (std::strcmp(param[next_param], "oho_angle") == 0) {
       if (angle_seen || next_param + 1 >= num_param ||
@@ -465,6 +681,25 @@ void Proton_Tunneling::parse(
       } else {
         bead_span_min_ = 2.0 * delta_cutoff_;
       }
+    } else if (std::strcmp(param[next_param], "local_environment") == 0) {
+      if (local_environment_seen || next_param + 4 >= num_param) {
+        PRINT_INPUT_ERROR(
+          "local_environment must be followed by ion1 cutoff ion2 cutoff H-Cl cutoff H-Cl angle.");
+      }
+      local_environment_seen = true;
+      local_environment_enabled_ = true;
+      if (!is_valid_real(param[next_param + 1], &local_ion1_cutoff_) ||
+          local_ion1_cutoff_ <= 0.0 ||
+          !is_valid_real(param[next_param + 2], &local_ion2_cutoff_) ||
+          local_ion2_cutoff_ <= 0.0 ||
+          !is_valid_real(param[next_param + 3], &local_hcl_cutoff_) ||
+          local_hcl_cutoff_ <= 0.0 ||
+          !is_valid_real(param[next_param + 4], &local_hcl_angle_min_deg_) ||
+          local_hcl_angle_min_deg_ < 0.0 || local_hcl_angle_min_deg_ > 180.0) {
+        PRINT_INPUT_ERROR(
+          "local_environment requires positive ion/H-Cl cutoffs and an H-Cl angle between 0 and 180 degrees.");
+      }
+      next_param += 5;
     } else {
       PRINT_INPUT_ERROR("unknown optional compute_proton_tunneling setting.");
     }
@@ -495,9 +730,9 @@ void Proton_Tunneling::parse(
       oxygen_indices_.push_back(i);
     if (atom.cpu_atom_symbol[i] == hydrogen_symbol_)
       hydrogen_indices_.push_back(i);
-    if (ion_field_enabled_ && atom.cpu_atom_symbol[i] == ion1_symbol_)
+    if ((ion_field_enabled_ || local_environment_enabled_) && atom.cpu_atom_symbol[i] == ion1_symbol_)
       ion1_indices_.push_back(i);
-    if (ion_field_enabled_ && atom.cpu_atom_symbol[i] == ion2_symbol_)
+    if ((ion_field_enabled_ || local_environment_enabled_) && atom.cpu_atom_symbol[i] == ion2_symbol_)
       ion2_indices_.push_back(i);
   }
   if (oxygen_indices_.empty() || hydrogen_indices_.empty()) {
@@ -524,6 +759,15 @@ void Proton_Tunneling::parse(
   if (ion_field_enabled_) {
     printf("    nominal ion field uses %s charge %.6f and %s charge %.6f within %.6f Angstrom.\n",
       ion1_symbol_.c_str(), ion1_charge_, ion2_symbol_.c_str(), ion2_charge_, ion_field_cutoff_);
+  }
+  if (local_environment_enabled_) {
+    printf("    local environment uses %s cutoff %.6f, %s cutoff %.6f, H-%s cutoff %.6f, "
+           "and H-%s angle %.6f degrees.\n",
+      ion1_symbol_.c_str(), local_ion1_cutoff_, ion2_symbol_.c_str(), local_ion2_cutoff_,
+      ion2_symbol_.c_str(), local_hcl_cutoff_, ion2_symbol_.c_str(), local_hcl_angle_min_deg_);
+    if (ion1_indices_.empty() || ion2_indices_.empty())
+      printf("    local environment warning: one or both configured ion species are absent; "
+             "missing descriptors will be reported as nan/0.\n");
   }
 }
 
@@ -571,10 +815,12 @@ void Proton_Tunneling::preprocess(
   defect_records_.clear();
   window_records_.clear();
   edge_window_records_.clear();
+  local_environment_window_records_.clear();
   attempt_records_.reserve(1024);
   defect_records_.reserve(1024);
   window_records_.reserve(64);
   edge_window_records_.reserve(1024);
+  local_environment_window_records_.reserve(64);
   atom.position_per_atom.copy_to_host(cpu_position_.data());
   build_oxygen_shell(box);
   initialize_geometry_gpu();
@@ -641,14 +887,21 @@ void Proton_Tunneling::initialize_geometry_gpu()
     oxygen_shell_neighbors_gpu_.resize(oxygen_shell_neighbors_cpu_.size());
     oxygen_shell_neighbors_gpu_.copy_from_host(oxygen_shell_neighbors_cpu_.data());
   }
-  if (ion_field_enabled_) {
+  if (ion_field_enabled_ || local_environment_enabled_) {
     ion1_indices_gpu_.resize(ion1_indices_.size());
-    ion1_indices_gpu_.copy_from_host(ion1_indices_.data());
+    if (!ion1_indices_.empty())
+      ion1_indices_gpu_.copy_from_host(ion1_indices_.data());
     ion2_indices_gpu_.resize(ion2_indices_.size());
-    ion2_indices_gpu_.copy_from_host(ion2_indices_.data());
+    if (!ion2_indices_.empty())
+      ion2_indices_gpu_.copy_from_host(ion2_indices_.data());
   }
   frame_geometries_gpu_.resize(frame_geometries_.size());
   cpu_geometry_gpu_.resize(frame_geometries_.size());
+  if (local_environment_enabled_) {
+    frame_local_environments_gpu_.resize(frame_geometries_.size());
+    cpu_local_environments_gpu_.resize(frame_geometries_.size());
+    frame_local_environments_.resize(frame_geometries_.size());
+  }
 }
 
 void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
@@ -719,10 +972,116 @@ void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
     target.low_to_high_dy = source.low_to_high_dy;
     target.low_to_high_dz = source.low_to_high_dz;
     target.E_ion_nominal_parallel = source.E_ion_nominal_parallel;
+    target.delta_phi_ion = source.delta_phi_ion;
     target.nearest_ion_id = source.nearest_ion_id;
     target.nearest_ion_distance = source.nearest_ion_distance;
     target.nearest_ion1_distance = source.nearest_ion1_distance;
     target.nearest_ion2_distance = source.nearest_ion2_distance;
+    target.nearest_ion1_to_low = source.nearest_ion1_to_low;
+    target.nearest_ion1_to_high = source.nearest_ion1_to_high;
+    target.nearest_ion2_to_low = source.nearest_ion2_to_low;
+    target.nearest_ion2_to_high = source.nearest_ion2_to_high;
+  }
+}
+
+void Proton_Tunneling::compute_local_environment_gpu(const Box& box, Atom& atom)
+{
+  if (!local_environment_enabled_)
+    return;
+  const int number_of_hydrogens = static_cast<int>(hydrogen_indices_.size());
+  const int block_size = 128;
+  const int grid_size = (number_of_hydrogens + block_size - 1) / block_size;
+  gpu_compute_proton_local_environment<<<grid_size, block_size>>>(
+    atom.position_per_atom.data(),
+    number_of_atoms_,
+    number_of_hydrogens,
+    hydrogen_indices_gpu_.data(),
+    frame_geometries_gpu_.data(),
+    ion1_indices_.empty() ? nullptr : ion1_indices_gpu_.data(),
+    static_cast<int>(ion1_indices_.size()),
+    ion2_indices_.empty() ? nullptr : ion2_indices_gpu_.data(),
+    static_cast<int>(ion2_indices_.size()),
+    box,
+    local_ion1_cutoff_,
+    local_ion2_cutoff_,
+    local_hcl_cutoff_,
+    local_hcl_angle_min_deg_,
+    frame_local_environments_gpu_.data());
+  GPU_CHECK_KERNEL
+  frame_local_environments_gpu_.copy_to_host(cpu_local_environments_gpu_.data());
+  for (size_t i = 0; i < frame_local_environments_.size(); ++i) {
+    const LocalEnvironmentGPU& source = cpu_local_environments_gpu_[i];
+    LocalEnvironment& target = frame_local_environments_[i];
+    target = LocalEnvironment();
+    target.valid = source.valid != 0 && frame_geometries_[i].valid;
+    target.rOH_low = source.rOH_low;
+    target.rOH_high = source.rOH_high;
+    target.oho_angle = source.oho_angle;
+    target.dOO = source.dOO;
+    target.rperp = source.rperp;
+    target.path_excess = source.path_excess;
+    target.ion1_low_d1 = source.ion1_low_d1;
+    target.ion1_low_d2 = source.ion1_low_d2;
+    target.ion1_low_d3 = source.ion1_low_d3;
+    target.ion1_high_d1 = source.ion1_high_d1;
+    target.ion1_high_d2 = source.ion1_high_d2;
+    target.ion1_high_d3 = source.ion1_high_d3;
+    target.ion2_low_d1 = source.ion2_low_d1;
+    target.ion2_low_d2 = source.ion2_low_d2;
+    target.ion2_low_d3 = source.ion2_low_d3;
+    target.ion2_high_d1 = source.ion2_high_d1;
+    target.ion2_high_d2 = source.ion2_high_d2;
+    target.ion2_high_d3 = source.ion2_high_d3;
+    target.coord_ion1_low = source.coord_ion1_low;
+    target.coord_ion1_high = source.coord_ion1_high;
+    target.coord_ion2_low = source.coord_ion2_low;
+    target.coord_ion2_high = source.coord_ion2_high;
+    target.delta_d_ion1 = source.delta_d_ion1;
+    target.delta_d_ion2 = source.delta_d_ion2;
+    target.nearest_ion2_to_H = source.nearest_ion2_to_H;
+    target.angle_Olow_H_ion2 = source.angle_Olow_H_ion2;
+    target.angle_Ohigh_H_ion2 = source.angle_Ohigh_H_ion2;
+    target.hcl_like_low = source.hcl_like_low;
+    target.hcl_like_high = source.hcl_like_high;
+    target.E_parallel = source.E_parallel;
+    target.delta_phi_ion = source.delta_phi_ion;
+  }
+}
+
+void Proton_Tunneling::assign_local_environment_topology()
+{
+  if (!local_environment_enabled_)
+    return;
+  std::unordered_map<unsigned long long, std::array<int, 4>> edge_topology;
+  for (size_t h_index = 0; h_index < frame_geometries_.size(); ++h_index) {
+    const GeometryResult& geometry = frame_geometries_[h_index];
+    LocalEnvironment& environment = frame_local_environments_[h_index];
+    if (!environment.valid)
+      continue;
+    environment.nH_low = hydrogen_count_[geometry.oxygen_low];
+    environment.nH_high = hydrogen_count_[geometry.oxygen_high];
+    const int state = classify_delta(geometry.delta);
+    if (state < 0) {
+      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][0];
+      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][3];
+    } else if (state > 0) {
+      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][1];
+      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][2];
+    }
+  }
+  for (size_t h_index = 0; h_index < frame_geometries_.size(); ++h_index) {
+    const GeometryResult& geometry = frame_geometries_[h_index];
+    LocalEnvironment& environment = frame_local_environments_[h_index];
+    if (!environment.valid)
+      continue;
+    const auto topology = edge_topology.find(
+      make_bond_key(geometry.oxygen_low, geometry.oxygen_high));
+    if (topology != edge_topology.end()) {
+      environment.donor_edges_low = topology->second[0];
+      environment.donor_edges_high = topology->second[1];
+      environment.acceptor_edges_low = topology->second[2];
+      environment.acceptor_edges_high = topology->second[3];
+    }
   }
 }
 
@@ -750,11 +1109,18 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
   const double ex = ox * inverse_dOO;
   const double ey = oy * inverse_dOO;
   const double ez = oz * inverse_dOO;
+  geometry.delta_phi_ion = 0.0;
   geometry.nearest_ion_distance = std::numeric_limits<double>::max();
   geometry.nearest_ion1_distance = std::numeric_limits<double>::max();
   geometry.nearest_ion2_distance = std::numeric_limits<double>::max();
+  geometry.nearest_ion1_to_low = std::numeric_limits<double>::max();
+  geometry.nearest_ion1_to_high = std::numeric_limits<double>::max();
+  geometry.nearest_ion2_to_low = std::numeric_limits<double>::max();
+  geometry.nearest_ion2_to_high = std::numeric_limits<double>::max();
   auto accumulate_ion_field = [&](const std::vector<int>& ions, const double charge,
-                                  double& nearest_species_distance) {
+                                  double& nearest_species_distance,
+                                  double& nearest_species_to_low,
+                                  double& nearest_species_to_high) {
     for (const int ion : ions) {
       double ion_dx = cpu_position_[ion] - cpu_position_[geometry.oxygen_low];
       double ion_dy = cpu_position_[ion + number_of_atoms_] -
@@ -766,10 +1132,23 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
       double midpoint_to_ion_y = 0.5 * oy - ion_dy;
       double midpoint_to_ion_z = 0.5 * oz - ion_dz;
       apply_mic(box, midpoint_to_ion_x, midpoint_to_ion_y, midpoint_to_ion_z);
+      double ion_to_high_x = cpu_position_[ion] - cpu_position_[geometry.oxygen_high];
+      double ion_to_high_y = cpu_position_[ion + number_of_atoms_] -
+        cpu_position_[geometry.oxygen_high + number_of_atoms_];
+      double ion_to_high_z = cpu_position_[ion + 2 * number_of_atoms_] -
+        cpu_position_[geometry.oxygen_high + 2 * number_of_atoms_];
+      apply_mic(box, ion_to_high_x, ion_to_high_y, ion_to_high_z);
+      const double low_distance_square = ion_dx * ion_dx + ion_dy * ion_dy + ion_dz * ion_dz;
+      const double high_distance_square = ion_to_high_x * ion_to_high_x +
+        ion_to_high_y * ion_to_high_y + ion_to_high_z * ion_to_high_z;
+      const double low_distance = std::sqrt(low_distance_square);
+      const double high_distance = std::sqrt(high_distance_square);
       const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
         midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
       const double distance = std::sqrt(distance_square);
       nearest_species_distance = std::min(nearest_species_distance, distance);
+      nearest_species_to_low = std::min(nearest_species_to_low, low_distance);
+      nearest_species_to_high = std::min(nearest_species_to_high, high_distance);
       if (distance < geometry.nearest_ion_distance) {
         geometry.nearest_ion_distance = distance;
         geometry.nearest_ion_id = ion;
@@ -778,11 +1157,18 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
         geometry.E_ion_nominal_parallel += K_C * charge *
           (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
           (distance_square * distance);
+        if (low_distance > 1.0e-12 && high_distance > 1.0e-12)
+          geometry.delta_phi_ion += K_C * charge *
+            (1.0 / high_distance - 1.0 / low_distance);
       }
     }
   };
-  accumulate_ion_field(ion1_indices_, ion1_charge_, geometry.nearest_ion1_distance);
-  accumulate_ion_field(ion2_indices_, ion2_charge_, geometry.nearest_ion2_distance);
+  accumulate_ion_field(
+    ion1_indices_, ion1_charge_, geometry.nearest_ion1_distance,
+    geometry.nearest_ion1_to_low, geometry.nearest_ion1_to_high);
+  accumulate_ion_field(
+    ion2_indices_, ion2_charge_, geometry.nearest_ion2_distance,
+    geometry.nearest_ion2_to_low, geometry.nearest_ion2_to_high);
 }
 
 bool Proton_Tunneling::ensure_bead_positions(Atom& atom)
@@ -1276,6 +1662,13 @@ void Proton_Tunneling::record_bond(
     stats.sum_delta_E_parallel += geometry.delta * geometry.E_ion_nominal_parallel;
     stats.sum_nearest_ion1_distance += geometry.nearest_ion1_distance;
     stats.sum_nearest_ion2_distance += geometry.nearest_ion2_distance;
+    stats.sum_delta_phi += geometry.delta_phi_ion;
+    stats.sum_delta_phi2 += geometry.delta_phi_ion * geometry.delta_phi_ion;
+    stats.sum_delta_delta_phi += geometry.delta * geometry.delta_phi_ion;
+    stats.sum_ion1_to_low += geometry.nearest_ion1_to_low;
+    stats.sum_ion1_to_high += geometry.nearest_ion1_to_high;
+    stats.sum_ion2_to_low += geometry.nearest_ion2_to_low;
+    stats.sum_ion2_to_high += geometry.nearest_ion2_to_high;
   }
   if (state > 0)
     ++stats.n_plus;
@@ -1285,11 +1678,81 @@ void Proton_Tunneling::record_bond(
     ++stats.n_deadband;
 }
 
+void Proton_Tunneling::record_local_environment(
+  const GeometryResult& geometry,
+  const LocalEnvironment& environment)
+{
+  if (!local_environment_enabled_ || !environment.valid)
+    return;
+  LocalEnvironmentStats& stats = window_local_environment_stats_[
+    make_bond_key(geometry.oxygen_low, geometry.oxygen_high)];
+  ++stats.samples;
+  stats.sum_delta += geometry.delta;
+  stats.sum_delta2 += geometry.delta * geometry.delta;
+  stats.sum_rOH_low += environment.rOH_low;
+  stats.sum_rOH_high += environment.rOH_high;
+  stats.sum_oho_angle += environment.oho_angle;
+  stats.sum_dOO += environment.dOO;
+  stats.sum_rperp += environment.rperp;
+  stats.sum_path_excess += environment.path_excess;
+  stats.sum_nH_low += environment.nH_low;
+  stats.sum_nH_high += environment.nH_high;
+  stats.sum_donor_edges_low += environment.donor_edges_low;
+  stats.sum_donor_edges_high += environment.donor_edges_high;
+  stats.sum_acceptor_edges_low += environment.acceptor_edges_low;
+  stats.sum_acceptor_edges_high += environment.acceptor_edges_high;
+  const auto add_distance = [](const double value, double& sum, long long& count) {
+    if (std::isfinite(value) && value < 1.0e299) {
+      sum += value;
+      ++count;
+    }
+  };
+  add_distance(environment.ion1_low_d1, stats.sum_ion1_low_d1, stats.count_ion1_low[0]);
+  add_distance(environment.ion1_low_d2, stats.sum_ion1_low_d2, stats.count_ion1_low[1]);
+  add_distance(environment.ion1_low_d3, stats.sum_ion1_low_d3, stats.count_ion1_low[2]);
+  add_distance(environment.ion1_high_d1, stats.sum_ion1_high_d1, stats.count_ion1_high[0]);
+  add_distance(environment.ion1_high_d2, stats.sum_ion1_high_d2, stats.count_ion1_high[1]);
+  add_distance(environment.ion1_high_d3, stats.sum_ion1_high_d3, stats.count_ion1_high[2]);
+  add_distance(environment.ion2_low_d1, stats.sum_ion2_low_d1, stats.count_ion2_low[0]);
+  add_distance(environment.ion2_low_d2, stats.sum_ion2_low_d2, stats.count_ion2_low[1]);
+  add_distance(environment.ion2_low_d3, stats.sum_ion2_low_d3, stats.count_ion2_low[2]);
+  add_distance(environment.ion2_high_d1, stats.sum_ion2_high_d1, stats.count_ion2_high[0]);
+  add_distance(environment.ion2_high_d2, stats.sum_ion2_high_d2, stats.count_ion2_high[1]);
+  add_distance(environment.ion2_high_d3, stats.sum_ion2_high_d3, stats.count_ion2_high[2]);
+  stats.sum_coord_ion1_low += environment.coord_ion1_low;
+  stats.sum_coord_ion1_high += environment.coord_ion1_high;
+  stats.sum_coord_ion2_low += environment.coord_ion2_low;
+  stats.sum_coord_ion2_high += environment.coord_ion2_high;
+  add_distance(environment.delta_d_ion1, stats.sum_delta_d_ion1, stats.count_delta_d_ion1);
+  add_distance(environment.delta_d_ion2, stats.sum_delta_d_ion2, stats.count_delta_d_ion2);
+  add_distance(
+    environment.nearest_ion2_to_H,
+    stats.sum_nearest_ion2_to_H,
+    stats.count_nearest_ion2_to_H);
+  if (environment.angle_Olow_H_ion2 >= 0.0) {
+    stats.sum_angle_Olow_H_ion2 += environment.angle_Olow_H_ion2;
+    ++stats.count_angle_Olow_H_ion2;
+  }
+  if (environment.angle_Ohigh_H_ion2 >= 0.0) {
+    stats.sum_angle_Ohigh_H_ion2 += environment.angle_Ohigh_H_ion2;
+    ++stats.count_angle_Ohigh_H_ion2;
+  }
+  stats.sum_hcl_like_low += environment.hcl_like_low;
+  stats.sum_hcl_like_high += environment.hcl_like_high;
+  if (ion_field_enabled_) {
+    stats.sum_E_parallel += environment.E_parallel;
+    stats.sum_delta_phi_ion += environment.delta_phi_ion;
+    stats.sum_delta_phi2 += environment.delta_phi_ion * environment.delta_phi_ion;
+    stats.sum_delta_delta_phi += geometry.delta * environment.delta_phi_ion;
+  }
+}
+
 void Proton_Tunneling::start_attempt(
   HydrogenState& hydrogen_state,
   const int stable_state,
   const double time_fs,
-  const GeometryResult& geometry)
+  const GeometryResult& geometry,
+  const LocalEnvironment& environment)
 {
   hydrogen_state.attempt_active = true;
   hydrogen_state.attempt_from_state = stable_state;
@@ -1297,7 +1760,14 @@ void Proton_Tunneling::start_attempt(
   hydrogen_state.attempt_start_time_fs = time_fs;
   hydrogen_state.attempt_delta_start = geometry.delta;
   hydrogen_state.attempt_E_start = geometry.E_ion_nominal_parallel;
+  hydrogen_state.attempt_delta_phi_start = geometry.delta_phi_ion;
+  hydrogen_state.attempt_delta_d_ion1_start = geometry.nearest_ion1_to_high -
+    geometry.nearest_ion1_to_low;
+  hydrogen_state.attempt_delta_d_ion2_start = geometry.nearest_ion2_to_high -
+    geometry.nearest_ion2_to_low;
   hydrogen_state.attempt_min_abs_delta = std::abs(geometry.delta);
+  hydrogen_state.last_environment = environment;
+  hydrogen_state.attempt_environment_start = environment;
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
@@ -1326,7 +1796,8 @@ void Proton_Tunneling::finish_attempt(
   const AttemptOutcome outcome,
   const double time_fs,
   const double delta_end,
-  const GeometryResult* geometry)
+  const GeometryResult* geometry,
+  const LocalEnvironment* environment)
 {
   if (!hydrogen_state.attempt_active)
     return;
@@ -1341,8 +1812,21 @@ void Proton_Tunneling::finish_attempt(
   const double nearest_ion_distance = (geometry != nullptr)
     ? geometry->nearest_ion_distance
     : hydrogen_state.last_nearest_ion_distance;
+  const double delta_phi_end = (geometry != nullptr)
+    ? geometry->delta_phi_ion
+    : hydrogen_state.last_delta_phi_ion;
   const double E_start_output = ion_field_enabled_ ? hydrogen_state.attempt_E_start : nan;
   const double E_end_output = ion_field_enabled_ ? E_end : nan;
+  const double delta_phi_start_output = ion_field_enabled_
+    ? hydrogen_state.attempt_delta_phi_start
+    : nan;
+  const double delta_phi_end_output = ion_field_enabled_ ? delta_phi_end : nan;
+  const double delta_d_ion1_start_output = ion_field_enabled_
+    ? hydrogen_state.attempt_delta_d_ion1_start
+    : nan;
+  const double delta_d_ion2_start_output = ion_field_enabled_
+    ? hydrogen_state.attempt_delta_d_ion2_start
+    : nan;
   const int nearest_ion_id_output = ion_field_enabled_ ? nearest_ion_id : -1;
   const double nearest_ion_distance_output = ion_field_enabled_ ? nearest_ion_distance : nan;
 
@@ -1399,8 +1883,17 @@ void Proton_Tunneling::finish_attempt(
   record.delta_end = delta_end;
   record.E_parallel_start = E_start_output;
   record.E_parallel_end = E_end_output;
+  record.delta_phi_start = delta_phi_start_output;
+  record.delta_phi_end = delta_phi_end_output;
+  record.delta_d_ion1_start = delta_d_ion1_start_output;
+  record.delta_d_ion2_start = delta_d_ion2_start_output;
   record.nearest_ion_id = nearest_ion_id_output;
   record.nearest_ion_distance = nearest_ion_distance_output;
+  record.environment_start = hydrogen_state.attempt_environment_start;
+  record.environment_last_valid = hydrogen_state.last_environment;
+  record.environment_end = (environment != nullptr)
+    ? *environment
+    : hydrogen_state.last_environment;
   record.centroid_best = hydrogen_state.centroid_best;
   record.delocalization_best = hydrogen_state.delocalization_best;
 
@@ -1432,6 +1925,16 @@ void Proton_Tunneling::finish_attempt(
     record.dy = dy;
     record.dz = dz;
   }
+  if (local_environment_enabled_) {
+    LocalEnvironmentStats& environment_stats = window_local_environment_stats_[key];
+    ++environment_stats.attempts;
+    if (outcome == AttemptOutcome::success)
+      ++environment_stats.successes;
+    else if (outcome == AttemptOutcome::return_to_state)
+      ++environment_stats.returns;
+    else if (outcome == AttemptOutcome::geometry_lost)
+      ++environment_stats.geometry_lost;
+  }
   attempt_records_.push_back(record);
 
   if (outcome == AttemptOutcome::success)
@@ -1444,7 +1947,12 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.attempt_start_time_fs = 0.0;
   hydrogen_state.attempt_delta_start = 0.0;
   hydrogen_state.attempt_E_start = 0.0;
+  hydrogen_state.attempt_delta_phi_start = 0.0;
+  hydrogen_state.attempt_delta_d_ion1_start = 0.0;
+  hydrogen_state.attempt_delta_d_ion2_start = 0.0;
   hydrogen_state.attempt_min_abs_delta = 0.0;
+  hydrogen_state.last_environment = LocalEnvironment();
+  hydrogen_state.attempt_environment_start = LocalEnvironment();
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
@@ -1485,6 +1993,8 @@ void Proton_Tunneling::observe_frame(
       geometry.pair_conflict = true;
     }
   }
+  compute_local_environment_gpu(box, atom);
+  assign_local_environment_topology();
 
   if (!defect_state_initialized_) {
     for (const int oxygen : oxygen_indices_) {
@@ -1504,7 +2014,8 @@ void Proton_Tunneling::observe_frame(
   bool bead_probe_frame = false;
   const auto probe_attempt = [&](const int hydrogen,
                                  const GeometryResult& geometry,
-                                 HydrogenState& hydrogen_state) {
+                                 HydrogenState& hydrogen_state,
+                                 const LocalEnvironment& environment) {
     if (!bead_diagnostic_enabled_)
       return;
     if (!bead_probe_frame) {
@@ -1516,6 +2027,7 @@ void Proton_Tunneling::observe_frame(
       atom, box, hydrogen, geometry, time_fs, diagnostic);
     if (!evaluated)
       return;
+    diagnostic.environment = environment;
     if (!hydrogen_state.centroid_best.valid ||
         std::abs(diagnostic.delta_centroid) <
           std::abs(hydrogen_state.centroid_best.delta_centroid))
@@ -1528,6 +2040,10 @@ void Proton_Tunneling::observe_frame(
   for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
     const int hydrogen = hydrogen_indices_[h_index];
     const GeometryResult& geometry = frame_geometries_[h_index];
+    const LocalEnvironment empty_environment;
+    const LocalEnvironment& local_environment = local_environment_enabled_
+      ? frame_local_environments_[h_index]
+      : empty_environment;
     const bool valid_geometry = geometry.valid;
 
     HydrogenState& hydrogen_state = hydrogen_states_[h_index];
@@ -1542,10 +2058,11 @@ void Proton_Tunneling::observe_frame(
         finish_attempt(
           hydrogen,
           hydrogen_state,
-          AttemptOutcome::geometry_lost,
-          time_fs,
-          hydrogen_state.last_delta,
-          nullptr);
+           AttemptOutcome::geometry_lost,
+           time_fs,
+           hydrogen_state.last_delta,
+           nullptr,
+           nullptr);
       }
       hydrogen_state = HydrogenState();
       continue;
@@ -1560,16 +2077,19 @@ void Proton_Tunneling::observe_frame(
         finish_attempt(
           hydrogen,
           hydrogen_state,
-          AttemptOutcome::geometry_lost,
-          time_fs,
-          hydrogen_state.last_delta,
-          nullptr);
+           AttemptOutcome::geometry_lost,
+           time_fs,
+           hydrogen_state.last_delta,
+           nullptr,
+           nullptr);
       }
       hydrogen_state = HydrogenState();
       hydrogen_state.oxygen_low = geometry.oxygen_low;
       hydrogen_state.oxygen_high = geometry.oxygen_high;
     }
 
+    if (local_environment.valid)
+      record_local_environment(geometry, local_environment);
     record_bond(window_bonds_, geometry, state);
     record_bond(total_bonds_, geometry, state);
 
@@ -1594,11 +2114,12 @@ void Proton_Tunneling::observe_frame(
       if (!hydrogen_state.attempt_active && state != hydrogen_state.stable_state) {
         // If sampling jumps across the dead band, retain the event rather than silently
         // losing it. With a sufficiently small sample interval, normal attempts start in state 0.
-        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry);
+        start_attempt(
+          hydrogen_state, hydrogen_state.stable_state, time_fs, geometry, local_environment);
       }
 
       if (hydrogen_state.attempt_active) {
-        probe_attempt(hydrogen, geometry, hydrogen_state);
+        probe_attempt(hydrogen, geometry, hydrogen_state, local_environment);
         const double abs_delta = std::abs(geometry.delta);
         if (abs_delta < hydrogen_state.attempt_min_abs_delta) {
           hydrogen_state.attempt_min_abs_delta = abs_delta;
@@ -1610,7 +2131,8 @@ void Proton_Tunneling::observe_frame(
             AttemptOutcome::return_to_state,
             time_fs,
             geometry.delta,
-            &geometry);
+            &geometry,
+            &local_environment);
         } else if (state == -hydrogen_state.attempt_from_state) {
           if (hydrogen_state.pending_state == state) {
             ++hydrogen_state.pending_count;
@@ -1626,7 +2148,8 @@ void Proton_Tunneling::observe_frame(
               AttemptOutcome::success,
               time_fs,
               geometry.delta,
-              &geometry);
+              &geometry,
+              &local_environment);
           }
         } else {
           hydrogen_state.pending_state = 0;
@@ -1634,14 +2157,17 @@ void Proton_Tunneling::observe_frame(
           hydrogen_state.pending_start_time_fs = 0.0;
         }
       } else if (state == 0) {
-        start_attempt(hydrogen_state, hydrogen_state.stable_state, time_fs, geometry);
-        probe_attempt(hydrogen, geometry, hydrogen_state);
+        start_attempt(
+          hydrogen_state, hydrogen_state.stable_state, time_fs, geometry, local_environment);
+        probe_attempt(hydrogen, geometry, hydrogen_state, local_environment);
       }
     }
     hydrogen_state.last_delta = geometry.delta;
     hydrogen_state.last_E_parallel = geometry.E_ion_nominal_parallel;
+    hydrogen_state.last_delta_phi_ion = geometry.delta_phi_ion;
     hydrogen_state.last_nearest_ion_id = geometry.nearest_ion_id;
     hydrogen_state.last_nearest_ion_distance = geometry.nearest_ion_distance;
+    hydrogen_state.last_environment = local_environment;
   }
 
   for (const int oxygen : oxygen_indices_) {
@@ -1773,8 +2299,11 @@ void Proton_Tunneling::write_window(const double time_fs)
   window_records_.push_back(record);
 
   write_edge_window(window_start_time_fs_, time_fs);
+  if (local_environment_enabled_)
+    write_local_environment_window(window_start_time_fs_, time_fs);
 
   window_bonds_.clear();
+  window_local_environment_stats_.clear();
   window_sample_count_ = 0;
   window_start_time_fs_ = 0.0;
   window_flip_count_ = 0;
@@ -1783,6 +2312,21 @@ void Proton_Tunneling::write_window(const double time_fs)
   window_negative_defect_sum_ = 0;
   window_assignment_ambiguous_count_ = 0;
   window_pair_conflict_count_ = 0;
+}
+
+void Proton_Tunneling::write_local_environment_window(
+  const double time_start_fs,
+  const double time_end_fs)
+{
+  for (const auto& item : window_local_environment_stats_) {
+    LocalEnvironmentWindowRecord record;
+    record.window_id = window_id_;
+    record.time_start_fs = time_start_fs;
+    record.time_end_fs = time_end_fs;
+    decode_bond_key(item.first, record.oxygen_low, record.oxygen_high);
+    record.stats = item.second;
+    local_environment_window_records_.push_back(record);
+  }
 }
 
 void Proton_Tunneling::write_edge_window(
@@ -1808,6 +2352,15 @@ void Proton_Tunneling::write_edge_window(
     const double delta_f = (stats.n_plus > 0 && stats.n_minus > 0)
       ? std::abs(std::log(static_cast<double>(stats.n_plus) /
                           static_cast<double>(stats.n_minus)))
+      : std::numeric_limits<double>::quiet_NaN();
+    const double log_population_ratio = (stats.n_plus > 0 && stats.n_minus > 0)
+      ? std::log(static_cast<double>(stats.n_plus) / static_cast<double>(stats.n_minus))
+      : std::numeric_limits<double>::quiet_NaN();
+    const double beta_DeltaF_high_minus_low = (stats.n_plus > 0 && stats.n_minus > 0)
+      ? -log_population_ratio
+      : std::numeric_limits<double>::quiet_NaN();
+    const double abs_beta_DeltaF = (stats.n_plus > 0 && stats.n_minus > 0)
+      ? std::abs(log_population_ratio)
       : std::numeric_limits<double>::quiet_NaN();
     const double success_probability = (completed_attempts > 0)
       ? static_cast<double>(stats.successes) / static_cast<double>(completed_attempts)
@@ -1855,6 +2408,45 @@ void Proton_Tunneling::write_edge_window(
     const double nearest_ion2_distance = (ion_field_enabled_ && stats.geometry_samples > 0)
       ? stats.sum_nearest_ion2_distance / stats.geometry_samples
       : std::numeric_limits<double>::quiet_NaN();
+    const double mean_delta_phi_ion = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_delta_phi / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double std_delta_phi_ion = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? std::sqrt(std::max(0.0, stats.sum_delta_phi2 / stats.geometry_samples -
+          mean_delta_phi_ion * mean_delta_phi_ion))
+      : std::numeric_limits<double>::quiet_NaN();
+    double corr_delta_delta_phi = std::numeric_limits<double>::quiet_NaN();
+    if (ion_field_enabled_ && stats.geometry_samples > 0) {
+      const double variance_delta = std::max(0.0,
+        stats.sum_delta_square / stats.geometry_samples - mean_delta * mean_delta);
+      const double variance_delta_phi = std::max(0.0,
+        stats.sum_delta_phi2 / stats.geometry_samples -
+        mean_delta_phi_ion * mean_delta_phi_ion);
+      if (variance_delta > 0.0 && variance_delta_phi > 0.0) {
+        const double covariance = stats.sum_delta_delta_phi / stats.geometry_samples -
+          mean_delta * mean_delta_phi_ion;
+        corr_delta_delta_phi = covariance /
+          std::sqrt(variance_delta * variance_delta_phi);
+      }
+    }
+    const double mean_ion1_to_O_low = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_ion1_to_low / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_ion1_to_O_high = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_ion1_to_high / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_delta_d_ion1 = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? mean_ion1_to_O_high - mean_ion1_to_O_low
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_ion2_to_O_low = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_ion2_to_low / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_ion2_to_O_high = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? stats.sum_ion2_to_high / stats.geometry_samples
+      : std::numeric_limits<double>::quiet_NaN();
+    const double mean_delta_d_ion2 = (ion_field_enabled_ && stats.geometry_samples > 0)
+      ? mean_ion2_to_O_high - mean_ion2_to_O_low
+      : std::numeric_limits<double>::quiet_NaN();
     EdgeWindowRecord record;
     record.window_id = window_id_;
     record.time_start_fs = time_start_fs;
@@ -1868,6 +2460,9 @@ void Proton_Tunneling::write_edge_window(
     record.asymmetry = asymmetry;
     record.abs_asymmetry = std::abs(asymmetry);
     record.delta_f = delta_f;
+    record.log_population_ratio = log_population_ratio;
+    record.beta_DeltaF_high_minus_low = beta_DeltaF_high_minus_low;
+    record.abs_beta_DeltaF = abs_beta_DeltaF;
     record.attempts = stats.attempts;
     record.successes = stats.successes;
     record.returns = stats.returns;
@@ -1884,6 +2479,15 @@ void Proton_Tunneling::write_edge_window(
     record.mean_E_return = mean_E_return;
     record.nearest_ion1_distance = nearest_ion1_distance;
     record.nearest_ion2_distance = nearest_ion2_distance;
+    record.mean_delta_phi_ion = mean_delta_phi_ion;
+    record.std_delta_phi_ion = std_delta_phi_ion;
+    record.corr_delta_delta_phi = corr_delta_delta_phi;
+    record.mean_ion1_to_O_low = mean_ion1_to_O_low;
+    record.mean_ion1_to_O_high = mean_ion1_to_O_high;
+    record.mean_delta_d_ion1 = mean_delta_d_ion1;
+    record.mean_ion2_to_O_low = mean_ion2_to_O_low;
+    record.mean_ion2_to_O_high = mean_ion2_to_O_high;
+    record.mean_delta_d_ion2 = mean_delta_d_ion2;
     edge_window_records_.push_back(record);
   }
   ++window_id_;
@@ -1918,6 +2522,79 @@ void Proton_Tunneling::write_final_bonds()
   }
 }
 
+void Proton_Tunneling::write_local_environment_event(
+  FILE* file,
+  const AttemptRecord& attempt,
+  const char* snapshot_kind,
+  const double time_fs,
+  const LocalEnvironment& environment,
+  const char* quantum_class)
+{
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const auto value = [&](const double x) {
+    return (environment.valid && std::isfinite(x) && x < 1.0e299) ? x : nan;
+  };
+  const auto count = [&](const int x) {
+    return environment.valid ? x : -1;
+  };
+  fprintf(
+    file,
+    "%lld %s %s %.10e %d %d %d %d "
+    "%.10e %.10e %.10e %.10e %.10e %.10e "
+    "%.10e %.10e %.10e %.10e %.10e %.10e "
+    "%.10e %.10e %.10e %.10e %.10e %.10e "
+    "%d %d %d %d "
+    "%.10e %.10e %.10e %.10e %.10e "
+    "%d %d %.10e %.10e "
+    "%d %d %d %d %d %d %s\n",
+    attempt.attempt_id,
+    snapshot_kind,
+    outcome_name(attempt.outcome),
+    environment.valid ? time_fs : nan,
+    attempt.hydrogen,
+    attempt.oxygen_low,
+    attempt.oxygen_high,
+    environment.valid ? 1 : 0,
+    value(environment.rOH_low),
+    value(environment.rOH_high),
+    value(environment.oho_angle),
+    value(environment.dOO),
+    value(environment.rperp),
+    value(environment.path_excess),
+    value(environment.ion1_low_d1),
+    value(environment.ion1_low_d2),
+    value(environment.ion1_low_d3),
+    value(environment.ion1_high_d1),
+    value(environment.ion1_high_d2),
+    value(environment.ion1_high_d3),
+    value(environment.ion2_low_d1),
+    value(environment.ion2_low_d2),
+    value(environment.ion2_low_d3),
+    value(environment.ion2_high_d1),
+    value(environment.ion2_high_d2),
+    value(environment.ion2_high_d3),
+    count(environment.coord_ion1_low),
+    count(environment.coord_ion1_high),
+    count(environment.coord_ion2_low),
+    count(environment.coord_ion2_high),
+    value(environment.delta_d_ion1),
+    value(environment.delta_d_ion2),
+    value(environment.nearest_ion2_to_H),
+    value(environment.angle_Olow_H_ion2),
+    value(environment.angle_Ohigh_H_ion2),
+    count(environment.hcl_like_low),
+    count(environment.hcl_like_high),
+    value(environment.E_parallel),
+    value(environment.delta_phi_ion),
+    count(environment.nH_low),
+    count(environment.nH_high),
+    count(environment.donor_edges_low),
+    count(environment.donor_edges_high),
+    count(environment.acceptor_edges_low),
+    count(environment.acceptor_edges_high),
+    quantum_class);
+}
+
 void Proton_Tunneling::write_output_files()
 {
   bias_file_ = my_fopen("proton_bias.out", "a");
@@ -1928,6 +2605,10 @@ void Proton_Tunneling::write_output_files()
   edge_window_file_ = my_fopen("proton_edge_window.out", "a");
   bond_file_ = my_fopen("proton_bond.out", "a");
   defect_file_ = my_fopen("proton_defect.out", "a");
+  if (local_environment_enabled_) {
+    local_environment_window_file_ = my_fopen("proton_local_environment_window.out", "a");
+    local_environment_event_file_ = my_fopen("proton_local_environment_event.out", "a");
+  }
 
   fprintf(bias_file_,
     "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s oho_angle %.10e",
@@ -1939,6 +2620,9 @@ void Proton_Tunneling::write_output_files()
   if (bead_diagnostic_enabled_)
     fprintf(bias_file_, " bead_diagnostic %.10e %.10e %.10e %.10e",
       bead_f_min_, bead_span_min_, bead_center_max_, bead_centroid_max_);
+  if (local_environment_enabled_)
+    fprintf(bias_file_, " local_environment %.10e %.10e %.10e %.10e",
+      local_ion1_cutoff_, local_ion2_cutoff_, local_hcl_cutoff_, local_hcl_angle_min_deg_);
   fprintf(bias_file_, "\n");
   fprintf(bias_file_,
     "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
@@ -1952,7 +2636,12 @@ void Proton_Tunneling::write_output_files()
   fprintf(attempt_file_,
     "# columns attempt_id time_start_fs time_end_fs H_id O_low O_high O_from O_target outcome "
     "delta_start min_abs_delta delta_end E_parallel_start E_parallel_end "
-    "nearest_ion_id nearest_ion_distance\n");
+    "nearest_ion_id nearest_ion_distance delta_phi_start delta_phi_end ");
+  if (ion_field_enabled_)
+    fprintf(attempt_file_, "delta_d_%s_start delta_d_%s_start\n",
+      ion1_symbol_.c_str(), ion2_symbol_.c_str());
+  else
+    fprintf(attempt_file_, "delta_d_ion1_start delta_d_ion2_start\n");
   if (bead_diagnostic_enabled_) {
     fprintf(bead_event_file_,
       "# columns attempt_id selection_kind probe_time_fs H_id O_low O_high outcome num_beads "
@@ -1970,19 +2659,73 @@ void Proton_Tunneling::write_output_files()
     "success_probability mean_delta mean_abs_delta mean_dOO mean_rperp "
     "mean_E_parallel std_E_parallel corr_delta_E_parallel mean_E_success mean_E_return ");
   if (ion_field_enabled_)
-    fprintf(edge_window_file_, "nearest_%s_distance nearest_%s_distance\n",
+    fprintf(edge_window_file_, "nearest_%s_distance nearest_%s_distance",
       ion1_symbol_.c_str(), ion2_symbol_.c_str());
   else
-    fprintf(edge_window_file_, "nearest_ion1_distance nearest_ion2_distance\n");
+    fprintf(edge_window_file_, "nearest_ion1_distance nearest_ion2_distance");
+  if (ion_field_enabled_)
+    fprintf(edge_window_file_,
+      " log_population_ratio beta_DeltaF_high_minus_low abs_beta_DeltaF "
+      "mean_delta_phi_ion std_delta_phi_ion corr_delta_delta_phi "
+      "mean_%s_to_O_low mean_%s_to_O_high mean_delta_d_%s "
+      "mean_%s_to_O_low mean_%s_to_O_high mean_delta_d_%s\n",
+      ion1_symbol_.c_str(), ion1_symbol_.c_str(), ion1_symbol_.c_str(),
+      ion2_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str());
+  else
+    fprintf(edge_window_file_,
+      " log_population_ratio beta_DeltaF_high_minus_low abs_beta_DeltaF "
+      "mean_delta_phi_ion std_delta_phi_ion corr_delta_delta_phi "
+      "mean_ion1_to_O_low mean_ion1_to_O_high mean_delta_d_ion1 "
+      "mean_ion2_to_O_low mean_ion2_to_O_high mean_delta_d_ion2\n");
   fprintf(bond_file_,
     "# columns O_pair_low O_pair_high geometry_samples n_plus n_minus transitions "
     "A abs_A mean_abs_delta\n");
+  if (local_environment_enabled_) {
+    fprintf(
+      local_environment_window_file_,
+      "# columns window_id time_start_fs time_end_fs O_low O_high samples "
+      "mean_delta mean_rOH_low mean_rOH_high mean_oho_angle mean_dOO mean_rperp mean_path_excess "
+      "mean_nH_low mean_nH_high mean_donor_edges_low mean_donor_edges_high "
+      "mean_acceptor_edges_low mean_acceptor_edges_high "
+      "mean_%s_low_d1 mean_%s_low_d2 mean_%s_low_d3 mean_%s_high_d1 mean_%s_high_d2 mean_%s_high_d3 "
+      "mean_%s_low_d1 mean_%s_low_d2 mean_%s_low_d3 mean_%s_high_d1 mean_%s_high_d2 mean_%s_high_d3 "
+      "mean_coord_%s_low mean_coord_%s_high mean_coord_%s_low mean_coord_%s_high "
+      "mean_delta_d_%s mean_delta_d_%s mean_nearest_%s_to_H mean_angle_Olow_H_%s "
+      "mean_angle_Ohigh_H_%s fraction_hcl_like_low fraction_hcl_like_high "
+      "mean_E_parallel mean_delta_phi_ion std_delta_phi_ion "
+      "corr_delta_delta_phi attempts successes returns geometry_lost\n",
+      ion1_symbol_.c_str(), ion1_symbol_.c_str(), ion1_symbol_.c_str(),
+      ion1_symbol_.c_str(), ion1_symbol_.c_str(), ion1_symbol_.c_str(),
+      ion2_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion2_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion1_symbol_.c_str(), ion1_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion1_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion2_symbol_.c_str(), ion2_symbol_.c_str());
+    fprintf(
+      local_environment_event_file_,
+      "# columns attempt_id snapshot_kind outcome time_fs H_id O_low O_high valid "
+      "rOH_low rOH_high oho_angle dOO rperp path_excess "
+      "%s_low_d1 %s_low_d2 %s_low_d3 %s_high_d1 %s_high_d2 %s_high_d3 "
+      "%s_low_d1 %s_low_d2 %s_low_d3 %s_high_d1 %s_high_d2 %s_high_d3 "
+      "coord_%s_low coord_%s_high coord_%s_low coord_%s_high delta_d_%s delta_d_%s "
+      "nearest_%s_to_H angle_Olow_H_%s angle_Ohigh_H_%s hcl_like_low hcl_like_high "
+      "E_parallel delta_phi_ion "
+      "nH_low nH_high donor_edges_low donor_edges_high acceptor_edges_low acceptor_edges_high quantum_class\n",
+      ion1_symbol_.c_str(), ion1_symbol_.c_str(), ion1_symbol_.c_str(),
+      ion1_symbol_.c_str(), ion1_symbol_.c_str(), ion1_symbol_.c_str(),
+      ion2_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion2_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion1_symbol_.c_str(), ion1_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion1_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
+      ion2_symbol_.c_str(), ion2_symbol_.c_str());
+  }
 
   const double bead_nan = std::numeric_limits<double>::quiet_NaN();
   for (const AttemptRecord& record : attempt_records_) {
     fprintf(
       attempt_file_,
-      "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e %.10e %.10e %d %.10e\n",
+      "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e %.10e %.10e %d %.10e "
+      "%.10e %.10e %.10e %.10e\n",
       record.attempt_id,
       record.time_start_fs,
       record.time_end_fs,
@@ -1998,7 +2741,11 @@ void Proton_Tunneling::write_output_files()
       record.E_parallel_start,
       record.E_parallel_end,
       record.nearest_ion_id,
-      record.nearest_ion_distance);
+      record.nearest_ion_distance,
+      record.delta_phi_start,
+      record.delta_phi_end,
+      record.delta_d_ion1_start,
+      record.delta_d_ion2_start);
 
     if (bead_event_file_ != nullptr) {
       const auto write_bead_event = [&](const char* selection_kind,
@@ -2048,6 +2795,28 @@ void Proton_Tunneling::write_output_files()
       };
       write_bead_event("centroid_best", record.centroid_best);
       write_bead_event("delocalization_best", record.delocalization_best);
+    }
+
+    if (local_environment_event_file_ != nullptr) {
+      write_local_environment_event(
+        local_environment_event_file_, record, "start", record.time_start_fs,
+        record.environment_start, "not_applicable");
+      write_local_environment_event(
+        local_environment_event_file_, record, "end", record.time_end_fs,
+        record.environment_end, "not_applicable");
+      write_local_environment_event(
+        local_environment_event_file_, record, "last_valid", record.time_end_fs,
+        record.environment_last_valid, "not_applicable");
+      if (record.centroid_best.valid)
+        write_local_environment_event(
+          local_environment_event_file_, record, "centroid_best",
+          record.centroid_best.probe_time_fs, record.centroid_best.environment,
+          quantum_character_name(record.centroid_best.character));
+      if (record.delocalization_best.valid)
+        write_local_environment_event(
+          local_environment_event_file_, record, "delocalization_best",
+          record.delocalization_best.probe_time_fs, record.delocalization_best.environment,
+          quantum_character_name(record.delocalization_best.character));
     }
 
     if (record.has_transfer) {
@@ -2105,7 +2874,8 @@ void Proton_Tunneling::write_output_files()
       edge_window_file_,
       "%lld %.10e %.10e %d %d %.10e %lld %lld %lld %.10e %.10e %.10e "
       "%lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e "
-      "%.10e %.10e %.10e %.10e %.10e %.10e %.10e\n",
+      "%.10e %.10e %.10e %.10e %.10e %.10e %.10e "
+      "%.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n",
       record.window_id,
       record.time_start_fs,
       record.time_end_fs,
@@ -2133,7 +2903,116 @@ void Proton_Tunneling::write_output_files()
       record.mean_E_success,
       record.mean_E_return,
       record.nearest_ion1_distance,
-      record.nearest_ion2_distance);
+      record.nearest_ion2_distance,
+      record.log_population_ratio,
+      record.beta_DeltaF_high_minus_low,
+      record.abs_beta_DeltaF,
+      record.mean_delta_phi_ion,
+      record.std_delta_phi_ion,
+      record.corr_delta_delta_phi,
+      record.mean_ion1_to_O_low,
+      record.mean_ion1_to_O_high,
+      record.mean_delta_d_ion1,
+      record.mean_ion2_to_O_low,
+      record.mean_ion2_to_O_high,
+      record.mean_delta_d_ion2);
+
+  if (local_environment_window_file_ != nullptr) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    for (const LocalEnvironmentWindowRecord& record : local_environment_window_records_) {
+      const LocalEnvironmentStats& stats = record.stats;
+      const auto mean = [&](const double sum, const long long count) {
+        return count > 0 ? sum / static_cast<double>(count) : nan;
+      };
+      const long long samples = stats.samples;
+      const double mean_delta = mean(stats.sum_delta, samples);
+      const double mean_phi = (ion_field_enabled_ && samples > 0)
+        ? stats.sum_delta_phi_ion / static_cast<double>(samples)
+        : nan;
+      const double std_phi = (ion_field_enabled_ && samples > 0)
+        ? std::sqrt(std::max(
+            0.0,
+            stats.sum_delta_phi2 / static_cast<double>(samples) - mean_phi * mean_phi))
+        : nan;
+      double corr_phi = nan;
+      if (ion_field_enabled_ && samples > 0) {
+        const double variance_delta = std::max(
+          0.0,
+          stats.sum_delta2 / static_cast<double>(samples) - mean_delta * mean_delta);
+        const double variance_phi = std::max(
+          0.0,
+          stats.sum_delta_phi2 / static_cast<double>(samples) - mean_phi * mean_phi);
+        if (variance_delta > 0.0 && variance_phi > 0.0) {
+          const double covariance = stats.sum_delta_delta_phi / static_cast<double>(samples) -
+            mean_delta * mean_phi;
+          corr_phi = covariance / std::sqrt(variance_delta * variance_phi);
+        }
+      }
+      fprintf(
+        local_environment_window_file_,
+        "%lld %.10e %.10e %d %d %lld",
+        record.window_id,
+        record.time_start_fs,
+        record.time_end_fs,
+        record.oxygen_low,
+        record.oxygen_high,
+        samples);
+      const auto write_mean_samples = [&](const double sum) {
+        fprintf(local_environment_window_file_, " %.10e", mean(sum, samples));
+      };
+      const auto write_mean_count = [&](const double sum, const long long count) {
+        fprintf(local_environment_window_file_, " %.10e", mean(sum, count));
+      };
+      write_mean_samples(stats.sum_delta);
+      write_mean_samples(stats.sum_rOH_low);
+      write_mean_samples(stats.sum_rOH_high);
+      write_mean_samples(stats.sum_oho_angle);
+      write_mean_samples(stats.sum_dOO);
+      write_mean_samples(stats.sum_rperp);
+      write_mean_samples(stats.sum_path_excess);
+      write_mean_samples(static_cast<double>(stats.sum_nH_low));
+      write_mean_samples(static_cast<double>(stats.sum_nH_high));
+      write_mean_samples(static_cast<double>(stats.sum_donor_edges_low));
+      write_mean_samples(static_cast<double>(stats.sum_donor_edges_high));
+      write_mean_samples(static_cast<double>(stats.sum_acceptor_edges_low));
+      write_mean_samples(static_cast<double>(stats.sum_acceptor_edges_high));
+      write_mean_count(stats.sum_ion1_low_d1, stats.count_ion1_low[0]);
+      write_mean_count(stats.sum_ion1_low_d2, stats.count_ion1_low[1]);
+      write_mean_count(stats.sum_ion1_low_d3, stats.count_ion1_low[2]);
+      write_mean_count(stats.sum_ion1_high_d1, stats.count_ion1_high[0]);
+      write_mean_count(stats.sum_ion1_high_d2, stats.count_ion1_high[1]);
+      write_mean_count(stats.sum_ion1_high_d3, stats.count_ion1_high[2]);
+      write_mean_count(stats.sum_ion2_low_d1, stats.count_ion2_low[0]);
+      write_mean_count(stats.sum_ion2_low_d2, stats.count_ion2_low[1]);
+      write_mean_count(stats.sum_ion2_low_d3, stats.count_ion2_low[2]);
+      write_mean_count(stats.sum_ion2_high_d1, stats.count_ion2_high[0]);
+      write_mean_count(stats.sum_ion2_high_d2, stats.count_ion2_high[1]);
+      write_mean_count(stats.sum_ion2_high_d3, stats.count_ion2_high[2]);
+      write_mean_samples(static_cast<double>(stats.sum_coord_ion1_low));
+      write_mean_samples(static_cast<double>(stats.sum_coord_ion1_high));
+      write_mean_samples(static_cast<double>(stats.sum_coord_ion2_low));
+      write_mean_samples(static_cast<double>(stats.sum_coord_ion2_high));
+      write_mean_count(stats.sum_delta_d_ion1, stats.count_delta_d_ion1);
+      write_mean_count(stats.sum_delta_d_ion2, stats.count_delta_d_ion2);
+      write_mean_count(stats.sum_nearest_ion2_to_H, stats.count_nearest_ion2_to_H);
+      write_mean_count(stats.sum_angle_Olow_H_ion2, stats.count_angle_Olow_H_ion2);
+      write_mean_count(stats.sum_angle_Ohigh_H_ion2, stats.count_angle_Ohigh_H_ion2);
+      fprintf(
+        local_environment_window_file_,
+        " %.10e %.10e %.10e %.10e %.10e %.10e %lld %lld %lld %lld\n",
+        mean(static_cast<double>(stats.sum_hcl_like_low), samples),
+        mean(static_cast<double>(stats.sum_hcl_like_high), samples),
+        (ion_field_enabled_ && samples > 0)
+          ? stats.sum_E_parallel / static_cast<double>(samples) : nan,
+        mean_phi,
+        std_phi,
+        corr_phi,
+        stats.attempts,
+        stats.successes,
+        stats.returns,
+        stats.geometry_lost);
+    }
+  }
 
   write_final_bonds();
   fclose(bias_file_);
@@ -2144,6 +3023,10 @@ void Proton_Tunneling::write_output_files()
   fclose(defect_file_);
   fclose(edge_window_file_);
   fclose(bond_file_);
+  if (local_environment_window_file_ != nullptr)
+    fclose(local_environment_window_file_);
+  if (local_environment_event_file_ != nullptr)
+    fclose(local_environment_event_file_);
   bias_file_ = nullptr;
   transfer_file_ = nullptr;
   attempt_file_ = nullptr;
@@ -2151,6 +3034,8 @@ void Proton_Tunneling::write_output_files()
   defect_file_ = nullptr;
   edge_window_file_ = nullptr;
   bond_file_ = nullptr;
+  local_environment_window_file_ = nullptr;
+  local_environment_event_file_ = nullptr;
 }
 
 void Proton_Tunneling::postprocess(
@@ -2179,6 +3064,7 @@ void Proton_Tunneling::postprocess(
         AttemptOutcome::run_end,
         last_time_fs_,
         hydrogen_state.last_delta,
+        nullptr,
         nullptr);
     }
   }
