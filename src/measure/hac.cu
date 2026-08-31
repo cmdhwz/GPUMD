@@ -19,6 +19,7 @@ Calculate the heat current autocorrelation (HAC) function.
 
 #include "compute_heat.cuh"
 #include "force/force.cuh"
+#include "integrate/integrate.cuh"
 #include "hac.cuh"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
@@ -44,6 +45,9 @@ void HAC::preprocess(
   Force& force)
 {
   if (compute) {
+    centroid_sampled_frames_ = 0;
+    centroid_batch_cache_hits_ = 0;
+    centroid_serial_fallbacks_ = 0;
     int number_of_frames = number_of_steps / sample_interval;
     heat_all.resize(NUM_OF_HEAT_COMPONENTS * number_of_frames);
     heat_all_by_type_.resize(atom.cpu_type_size.size() * NUM_OF_TYPE_HEAT_COMPONENTS * number_of_frames);
@@ -52,6 +56,21 @@ void HAC::preprocess(
       centroid_potential_per_atom_.resize(atom.number_of_atoms);
       centroid_force_per_atom_.resize(atom.number_of_atoms * 3);
       centroid_virial_per_atom_.resize(atom.number_of_atoms * 9);
+
+      const bool is_ring_polymer_run = integrate.type >= 31 && integrate.type <= 33;
+      const bool fixed_box =
+        is_ring_polymer_run && integrate.deform_x == 0 && integrate.deform_y == 0 &&
+        integrate.deform_z == 0 && !integrate.use_scr_barostat &&
+        (integrate.type != 33 || integrate.num_target_pressure_components == 0);
+      if (fixed_box && atom.number_of_beads > 1) {
+        force.enable_pimd_centroid_probe(atom.number_of_atoms, atom.number_of_beads);
+        if (force.pimd_centroid_probe_enabled()) {
+          printf("    centroid HAC will use the qNEP PIMD batch auxiliary lane.\n");
+        } else {
+          printf(
+            "    qNEP PIMD centroid cache unavailable; centroid HAC will use the serial fallback.\n");
+        }
+      }
     }
     if (split_qnep_heat_by_type_) {
       heat_all_by_type_electro_.resize(
@@ -252,23 +271,39 @@ void HAC::process(
     return;
 
   const int N = atom.number_of_atoms;
+  const GPU_Vector<double>* centroid_potential_source = &centroid_potential_per_atom_;
+  const GPU_Vector<double>* centroid_virial_source = &centroid_virial_per_atom_;
   if (use_centroid_heat_flux_) {
-    force.compute(
-      box,
-      atom.position_per_atom,
-      atom.type,
-      group,
-      centroid_potential_per_atom_,
-      centroid_force_per_atom_,
-      centroid_virial_per_atom_,
-      atom.velocity_per_atom,
-      atom.mass);
-    compute_centroid_heat(
-      atom.mass,
-      centroid_potential_per_atom_,
-      centroid_virial_per_atom_,
-      atom.velocity_per_atom,
-      atom.heat_per_atom);
+    ++centroid_sampled_frames_;
+    if (force.pimd_centroid_probe_ready()) {
+      ++centroid_batch_cache_hits_;
+      centroid_potential_source = &force.get_pimd_centroid_potential();
+      centroid_virial_source = &force.get_pimd_centroid_virial();
+      compute_centroid_heat(
+        atom.mass,
+        force.get_pimd_centroid_potential(),
+        force.get_pimd_centroid_virial(),
+        atom.velocity_per_atom,
+        atom.heat_per_atom);
+    } else {
+      ++centroid_serial_fallbacks_;
+      force.compute(
+        box,
+        atom.position_per_atom,
+        atom.type,
+        group,
+        centroid_potential_per_atom_,
+        centroid_force_per_atom_,
+        centroid_virial_per_atom_,
+        atom.velocity_per_atom,
+        atom.mass);
+      compute_centroid_heat(
+        atom.mass,
+        centroid_potential_per_atom_,
+        centroid_virial_per_atom_,
+        atom.velocity_per_atom,
+        atom.heat_per_atom);
+    }
   } else {
     compute_heat(atom.virial_per_atom, atom.velocity_per_atom, atom.heat_per_atom);
   }
@@ -286,12 +321,12 @@ void HAC::process(
       if (use_centroid_heat_flux_) {
         gpu_subtract_array<<<(N - 1) / 128 + 1, 128>>>(
           N,
-          centroid_potential_per_atom_.data(),
+          centroid_potential_source->data(),
           non_electro_potential_per_atom_.data(),
           electro_potential_per_atom_.data());
         gpu_subtract_array<<<((N * 9) - 1) / 128 + 1, 128>>>(
           N * 9,
-          centroid_virial_per_atom_.data(),
+          centroid_virial_source->data(),
           non_electro_virial_per_atom_.data(),
           electro_virial_per_atom_.data());
         GPU_CHECK_KERNEL
@@ -628,6 +663,12 @@ void HAC::postprocess(
   fclose(fid);
 
   printf("HAC and related quantities are calculated.\n");
+  if (use_centroid_heat_flux_) {
+    printf("Centroid HAC force source:\n");
+    printf("    sampled frames = %lld\n", centroid_sampled_frames_);
+    printf("    qNEP batch cache hits = %lld\n", centroid_batch_cache_hits_);
+    printf("    serial fallbacks = %lld\n", centroid_serial_fallbacks_);
+  }
   print_line_2();
 
   compute = 0;

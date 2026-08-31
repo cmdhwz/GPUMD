@@ -61,6 +61,13 @@ static __global__ void initialize_properties(
 static __global__ void gpu_apply_pbc(
   int N, Box box, double* g_x, double* g_y, double* g_z, int* g_position_image);
 
+static __global__ void gpu_compute_pimd_centroid_position(
+  const int N,
+  const int number_of_beads,
+  const Box box,
+  double* const* g_position_beads,
+  double* g_centroid_position);
+
 template <typename T>
 static void copy_gpu_buffer_between_devices(
   const int dst_device, T* dst, const int src_device, const T* src, const size_t count)
@@ -367,6 +374,10 @@ void Force::set_md_qnep_bec_required(const bool required)
 void Force::set_pimd_bead_batch(const bool enabled)
 {
   pimd_bead_batch_enabled_ = enabled;
+  pimd_centroid_probe_ready_ = false;
+  if (!enabled) {
+    pimd_centroid_probe_enabled_ = false;
+  }
   if (potentials.size() == 1 && potentials[0]) {
     const bool is_batch_potential =
       dynamic_cast<NEP_Charge*>(potentials[0].get()) ||
@@ -377,6 +388,34 @@ void Force::set_pimd_bead_batch(const bool enabled)
     }
   }
   apply_pimd_qnep_batch_bec_setting_();
+}
+
+void Force::enable_pimd_centroid_probe(const int number_of_atoms, const int number_of_beads)
+{
+  pimd_centroid_probe_enabled_ = false;
+  pimd_centroid_probe_ready_ = false;
+  pimd_centroid_number_of_beads_ = 0;
+
+  if (
+    number_of_atoms <= 0 || number_of_beads < 2 || number_of_atoms != number_of_atoms_ ||
+    !can_use_pimd_qnep_batch_()) {
+    return;
+  }
+
+  CHECK(gpuSetDevice(0));
+  pimd_centroid_position_.resize(number_of_atoms * 3);
+  pimd_centroid_potential_.resize(number_of_atoms);
+  pimd_centroid_force_.resize(number_of_atoms * 3);
+  pimd_centroid_virial_.resize(number_of_atoms * 9);
+  pimd_centroid_position_ptrs_.resize(number_of_beads);
+  pimd_centroid_position_ptrs_host_.clear();
+  pimd_centroid_position_ptrs_host_.reserve(number_of_beads);
+  pimd_centroid_number_of_beads_ = number_of_beads;
+  pimd_centroid_probe_enabled_ = true;
+
+  printf(
+    "Enabled qNEP PIMD centroid auxiliary batch lane (%d physical beads + 1 centroid lane).\n",
+    number_of_beads);
 }
 
 bool Force::pimd_qnep_bead_batch_active_() const
@@ -547,7 +586,44 @@ bool Force::can_use_pimd_nep_batch_() const
   Potential* primary = potentials[0].get();
   return primary && !primary->need_B_projection &&
          (dynamic_cast<NEP*>(primary) ||
-          (dynamic_cast<NEP_MULTIGPU*>(primary) && !primary_nep_model_path_.empty()));
+           (dynamic_cast<NEP_MULTIGPU*>(primary) && !primary_nep_model_path_.empty()));
+}
+
+void Force::compute_pimd_centroid_position_(
+  Box& box, std::vector<GPU_Vector<double>>& position_beads)
+{
+  const int number_of_beads = int(position_beads.size());
+  const int number_of_atoms = int(pimd_centroid_position_.size() / 3);
+  if (
+    number_of_beads < 2 || number_of_beads != pimd_centroid_number_of_beads_ ||
+    number_of_atoms <= 0) {
+    return;
+  }
+
+  std::vector<double*> position_ptrs(number_of_beads);
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    position_ptrs[bead_id] = position_beads[bead_id].data();
+  }
+  if (position_ptrs != pimd_centroid_position_ptrs_host_) {
+    pimd_centroid_position_ptrs_.copy_from_host(position_ptrs.data());
+    pimd_centroid_position_ptrs_host_ = std::move(position_ptrs);
+  }
+
+  gpu_compute_pimd_centroid_position<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    number_of_atoms,
+    number_of_beads,
+    box,
+    pimd_centroid_position_ptrs_.data(),
+    pimd_centroid_position_.data());
+  GPU_CHECK_KERNEL
+  gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    number_of_atoms,
+    box,
+    pimd_centroid_position_.data(),
+    pimd_centroid_position_.data() + number_of_atoms,
+    pimd_centroid_position_.data() + number_of_atoms * 2,
+    nullptr);
+  GPU_CHECK_KERNEL
 }
 
 bool Force::try_compute_pimd_qnep_batch_(
@@ -558,6 +634,7 @@ bool Force::try_compute_pimd_qnep_batch_(
   std::vector<GPU_Vector<double>>& force_beads,
   std::vector<GPU_Vector<double>>& virial_beads)
 {
+  pimd_centroid_probe_ready_ = false;
   if (!can_use_pimd_qnep_batch_()) {
     return false;
   }
@@ -598,11 +675,21 @@ bool Force::try_compute_pimd_qnep_batch_(
     virials.push_back(&virial_beads[bead_id]);
   }
 
+  if (pimd_centroid_probe_enabled_ && pimd_centroid_number_of_beads_ == number_of_beads) {
+    compute_pimd_centroid_position_(box, position_beads);
+    positions.push_back(&pimd_centroid_position_);
+    potentials_per_bead.push_back(&pimd_centroid_potential_);
+    forces.push_back(&pimd_centroid_force_);
+    virials.push_back(&pimd_centroid_virial_);
+  }
+
   NEP_Charge* qnep = dynamic_cast<NEP_Charge*>(potentials[0].get());
   const bool used_batch = qnep->compute_pimd_batch(
     box, type, positions, potentials_per_bead, forces, virials);
   if (used_batch) {
     temperature += number_of_beads * delta_T;
+    pimd_centroid_probe_ready_ =
+      pimd_centroid_probe_enabled_ && positions.size() == size_t(number_of_beads + 1);
   }
   return used_batch;
 }
@@ -796,6 +883,7 @@ void Force::compute_pimd_beads(
   std::vector<GPU_Vector<double>>& velocity_beads,
   GPU_Vector<double>& mass_per_atom)
 {
+  pimd_centroid_probe_ready_ = false;
   if (!can_use_pimd_bead_gpu_parallel_()) {
     if (
       try_compute_pimd_qnep_batch_(
@@ -873,6 +961,13 @@ void Force::compute_pimd_beads(
   pimd_bead_timing_.wrap_positions +=
     std::chrono::duration<double>(Clock::now() - wrap_begin).count();
 
+  if (pimd_centroid_probe_enabled_ && pimd_centroid_number_of_beads_ == number_of_beads) {
+    compute_pimd_centroid_position_(box, position_beads);
+    // Worker 0 may use a different host thread/default stream in the multi-GPU
+    // path, so make the auxiliary coordinates visible before launching it.
+    CHECK(gpuDeviceSynchronize());
+  }
+
   // Stage all remote coordinates first. Each remote bead then has dedicated buffers,
   // so force kernels can be queued without synchronizing and reusing one scratch output.
   const auto stage_begin = Clock::now();
@@ -900,6 +995,7 @@ void Force::compute_pimd_beads(
 
   const auto compute_begin = Clock::now();
   std::vector<double> worker_compute(number_of_workers, 0.0);
+  std::vector<int> worker_centroid_batch_used(number_of_workers, 0);
   std::vector<std::thread> workers;
   workers.reserve(number_of_workers);
   for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
@@ -922,10 +1018,14 @@ void Force::compute_pimd_beads(
           std::vector<GPU_Vector<double>*> worker_potentials;
           std::vector<GPU_Vector<double>*> worker_forces;
           std::vector<GPU_Vector<double>*> worker_virials;
-          worker_positions.reserve(bead_end - bead_begin);
-          worker_potentials.reserve(bead_end - bead_begin);
-          worker_forces.reserve(bead_end - bead_begin);
-          worker_virials.reserve(bead_end - bead_begin);
+          const bool add_centroid_lane =
+            worker_id == 0 && qnep && pimd_centroid_probe_enabled_ &&
+            pimd_centroid_number_of_beads_ == number_of_beads;
+          const int reserve_size = bead_end - bead_begin + (add_centroid_lane ? 1 : 0);
+          worker_positions.reserve(reserve_size);
+          worker_potentials.reserve(reserve_size);
+          worker_forces.reserve(reserve_size);
+          worker_virials.reserve(reserve_size);
           for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
             const int local_bead = bead_id - bead_begin;
             worker_positions.push_back(
@@ -936,6 +1036,12 @@ void Force::compute_pimd_beads(
               device_id == 0 ? &force_beads[bead_id] : &worker.force_beads[local_bead]);
             worker_virials.push_back(
               device_id == 0 ? &virial_beads[bead_id] : &worker.virial_beads[local_bead]);
+          }
+          if (add_centroid_lane) {
+            worker_positions.push_back(&pimd_centroid_position_);
+            worker_potentials.push_back(&pimd_centroid_potential_);
+            worker_forces.push_back(&pimd_centroid_force_);
+            worker_virials.push_back(&pimd_centroid_virial_);
           }
           if (qnep) {
             used_pimd_batch = qnep->compute_pimd_batch(
@@ -953,6 +1059,9 @@ void Force::compute_pimd_beads(
               worker_potentials,
               worker_forces,
               worker_virials);
+          }
+          if (used_pimd_batch && add_centroid_lane) {
+            worker_centroid_batch_used[worker_id] = 1;
           }
         }
       }
@@ -1014,6 +1123,7 @@ void Force::compute_pimd_beads(
   for (int worker_id = 0; worker_id < number_of_workers; ++worker_id) {
     pimd_bead_timing_.worker_compute[worker_id] += worker_compute[worker_id];
   }
+  pimd_centroid_probe_ready_ = worker_centroid_batch_used[0] != 0;
 
   // PIMD integration and restart state stay authoritative on GPU 0. Coordinates
   // were wrapped before staging, so only force-related outputs need to return.
@@ -1076,6 +1186,10 @@ void Force::compute_pimd_bead_range_on_device(
 
   if (bead_begin >= bead_end) {
     return;
+  }
+
+  if (device_id == 0 && bead_begin == 0) {
+    pimd_centroid_probe_ready_ = false;
   }
 
   CHECK(gpuSetDevice(device_id));
@@ -1210,6 +1324,8 @@ void Force::finalize()
 {
   compute_hnemd_ = false;
   compute_hnemdec_ = -1;
+  pimd_centroid_probe_enabled_ = false;
+  pimd_centroid_probe_ready_ = false;
   refresh_pimd_bead_gpu_workers_();
 }
 
@@ -1345,6 +1461,39 @@ static __global__ void gpu_apply_pbc(
     g_x[n] = box.cpu_h[0] * sx + box.cpu_h[1] * sy + box.cpu_h[2] * sz;
     g_y[n] = box.cpu_h[3] * sx + box.cpu_h[4] * sy + box.cpu_h[5] * sz;
     g_z[n] = box.cpu_h[6] * sx + box.cpu_h[7] * sy + box.cpu_h[8] * sz;
+  }
+}
+
+static __global__ void gpu_compute_pimd_centroid_position(
+  const int N,
+  const int number_of_beads,
+  const Box box,
+  double* const* g_position_beads,
+  double* g_centroid_position)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < N) {
+    const double reference_x = g_position_beads[0][n];
+    const double reference_y = g_position_beads[0][n + N];
+    const double reference_z = g_position_beads[0][n + N * 2];
+    double centroid_x = reference_x;
+    double centroid_y = reference_y;
+    double centroid_z = reference_z;
+
+    for (int bead_id = 1; bead_id < number_of_beads; ++bead_id) {
+      double dx = g_position_beads[bead_id][n] - reference_x;
+      double dy = g_position_beads[bead_id][n + N] - reference_y;
+      double dz = g_position_beads[bead_id][n + N * 2] - reference_z;
+      apply_mic(box, dx, dy, dz);
+      centroid_x += reference_x + dx;
+      centroid_y += reference_y + dy;
+      centroid_z += reference_z + dz;
+    }
+
+    const double inverse_number_of_beads = 1.0 / number_of_beads;
+    g_centroid_position[n] = centroid_x * inverse_number_of_beads;
+    g_centroid_position[n + N] = centroid_y * inverse_number_of_beads;
+    g_centroid_position[n + N * 2] = centroid_z * inverse_number_of_beads;
   }
 }
 

@@ -87,3 +87,11 @@ Centroid heat flux
 These controls do not alter the centroid heat-flux implementation selected by
 ``compute_hac ... use_centroid_heat_flux 1``. The NEP and qNEP force/virial
 paths used to construct the centroid heat flux remain active.
+
+For a fixed-box qNEP PIMD/RPMD/TRPMD run with ``pimd_bead_batch on``, the
+centroid qNEP force and virial are evaluated in the same bead batch as one
+auxiliary, non-integrated lane. This optimization is enabled automatically by
+``compute_hac`` when its centroid flag is 1; physical bead forces and the
+ring-polymer propagation are unchanged. Variable-box runs, SCR barostats,
+unsupported potentials, and non-batched runs retain the serial centroid-force
+fallback.

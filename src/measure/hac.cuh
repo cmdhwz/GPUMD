@@ -75,4 +75,7 @@ private:
   GPU_Vector<double> electro_heat_per_atom_;
   int use_centroid_heat_flux_ = 0;
   int split_qnep_heat_by_type_ = 0;
+  long long centroid_sampled_frames_ = 0;
+  long long centroid_batch_cache_hits_ = 0;
+  long long centroid_serial_fallbacks_ = 0;
 };
