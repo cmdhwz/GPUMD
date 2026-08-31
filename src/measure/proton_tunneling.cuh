@@ -15,7 +15,6 @@
 
 #pragma once
 #include "property.cuh"
-#include <array>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -636,8 +635,15 @@ private:
   double geometry_kernel_wall_time_ = 0.0;
   double geometry_D2H_wall_time_ = 0.0;
   double state_machine_wall_time_ = 0.0;
+  long long local_environment_copy_count_ = 0;
+  unsigned long long local_environment_bytes_copied_ = 0;
+  double local_environment_kernel_wall_time_ = 0.0;
+  double local_environment_D2H_wall_time_ = 0.0;
+  double local_environment_host_analysis_wall_time_ = 0.0;
   gpuEvent_t geometry_kernel_start_event_ = nullptr;
   gpuEvent_t geometry_kernel_end_event_ = nullptr;
+  gpuEvent_t local_environment_kernel_start_event_ = nullptr;
+  gpuEvent_t local_environment_kernel_end_event_ = nullptr;
   std::vector<int> hydrogen_count_;
   std::vector<int> previous_hydrogen_count_;
   std::vector<int> event_hydrogen_count_;

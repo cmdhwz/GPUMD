@@ -390,15 +390,10 @@ __global__ void gpu_find_proton_geometry(
 
 __device__ void update_nearest_three(
   const double distance,
-  const double cutoff,
   double& first,
   double& second,
-  double& third,
-  int& coordination)
+  double& third)
 {
-  if (distance > cutoff)
-    return;
-  ++coordination;
   if (distance < first) {
     third = second;
     second = first;
@@ -506,7 +501,6 @@ __global__ void gpu_compute_proton_local_environment(
   for (int species = 0; species < 2; ++species) {
     const int* ions = (species == 0) ? ion1_indices : ion2_indices;
     const int ion_count = (species == 0) ? ion1_count : ion2_count;
-    const double cutoff = (species == 0) ? ion1_cutoff : ion2_cutoff;
     for (int i = 0; i < ion_count; ++i) {
       const int ion = ions[i];
       double ion_low_x = position[ion] - position[oxygen_low];
@@ -526,19 +520,27 @@ __global__ void gpu_compute_proton_local_environment(
       const double high_ion_distance = sqrt(
         ion_high_x * ion_high_x + ion_high_y * ion_high_y + ion_high_z * ion_high_z);
       if (species == 0) {
+        if (low_ion_distance <= ion1_cutoff)
+          ++environment.coord_ion1_low;
+        if (high_ion_distance <= ion1_cutoff)
+          ++environment.coord_ion1_high;
         update_nearest_three(
-          low_ion_distance, cutoff, environment.ion1_low_d1, environment.ion1_low_d2,
-          environment.ion1_low_d3, environment.coord_ion1_low);
+          low_ion_distance, environment.ion1_low_d1, environment.ion1_low_d2,
+          environment.ion1_low_d3);
         update_nearest_three(
-          high_ion_distance, cutoff, environment.ion1_high_d1, environment.ion1_high_d2,
-          environment.ion1_high_d3, environment.coord_ion1_high);
+          high_ion_distance, environment.ion1_high_d1, environment.ion1_high_d2,
+          environment.ion1_high_d3);
       } else {
+        if (low_ion_distance <= ion2_cutoff)
+          ++environment.coord_ion2_low;
+        if (high_ion_distance <= ion2_cutoff)
+          ++environment.coord_ion2_high;
         update_nearest_three(
-          low_ion_distance, cutoff, environment.ion2_low_d1, environment.ion2_low_d2,
-          environment.ion2_low_d3, environment.coord_ion2_low);
+          low_ion_distance, environment.ion2_low_d1, environment.ion2_low_d2,
+          environment.ion2_low_d3);
         update_nearest_three(
-          high_ion_distance, cutoff, environment.ion2_high_d1, environment.ion2_high_d2,
-          environment.ion2_high_d3, environment.coord_ion2_high);
+          high_ion_distance, environment.ion2_high_d1, environment.ion2_high_d2,
+          environment.ion2_high_d3);
         double ion_h_x = position[ion] - position[hydrogen];
         double ion_h_y = position[ion + number_of_atoms] - position[hydrogen + number_of_atoms];
         double ion_h_z = position[ion + 2 * number_of_atoms] -
@@ -547,19 +549,16 @@ __global__ void gpu_compute_proton_local_environment(
         const double h_distance = sqrt(ion_h_x * ion_h_x + ion_h_y * ion_h_y + ion_h_z * ion_h_z);
         if (h_distance < environment.nearest_ion2_to_H) {
           environment.nearest_ion2_to_H = h_distance;
-          if (h_distance <= hcl_cutoff) {
-            environment.angle_Olow_H_ion2 = angle_from_vectors(
-              low_x, low_y, low_z, ion_h_x, ion_h_y, ion_h_z);
-            environment.angle_Ohigh_H_ion2 = angle_from_vectors(
-              high_x, high_y, high_z, ion_h_x, ion_h_y, ion_h_z);
-            environment.hcl_like_low =
-              environment.angle_Olow_H_ion2 >= hcl_angle_min_deg ? 1 : 0;
-            environment.hcl_like_high =
-              environment.angle_Ohigh_H_ion2 >= hcl_angle_min_deg ? 1 : 0;
-          } else {
-            environment.angle_Olow_H_ion2 = -1.0;
-            environment.angle_Ohigh_H_ion2 = -1.0;
-          }
+          environment.angle_Olow_H_ion2 = angle_from_vectors(
+            low_x, low_y, low_z, ion_h_x, ion_h_y, ion_h_z);
+          environment.angle_Ohigh_H_ion2 = angle_from_vectors(
+            high_x, high_y, high_z, ion_h_x, ion_h_y, ion_h_z);
+          environment.hcl_like_low =
+            (h_distance <= hcl_cutoff &&
+             environment.angle_Olow_H_ion2 >= hcl_angle_min_deg) ? 1 : 0;
+          environment.hcl_like_high =
+            (h_distance <= hcl_cutoff &&
+             environment.angle_Ohigh_H_ion2 >= hcl_angle_min_deg) ? 1 : 0;
         }
       }
     }
@@ -800,6 +799,11 @@ void Proton_Tunneling::preprocess(
   geometry_kernel_wall_time_ = 0.0;
   geometry_D2H_wall_time_ = 0.0;
   state_machine_wall_time_ = 0.0;
+  local_environment_copy_count_ = 0;
+  local_environment_bytes_copied_ = 0;
+  local_environment_kernel_wall_time_ = 0.0;
+  local_environment_D2H_wall_time_ = 0.0;
+  local_environment_host_analysis_wall_time_ = 0.0;
   oxygen_local_index_.assign(number_of_atoms_, -1);
   oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
@@ -826,6 +830,10 @@ void Proton_Tunneling::preprocess(
   initialize_geometry_gpu();
   CHECK(gpuEventCreate(&geometry_kernel_start_event_));
   CHECK(gpuEventCreate(&geometry_kernel_end_event_));
+  if (local_environment_enabled_) {
+    CHECK(gpuEventCreate(&local_environment_kernel_start_event_));
+    CHECK(gpuEventCreate(&local_environment_kernel_end_event_));
+  }
   initialized_ = true;
 }
 
@@ -991,6 +999,8 @@ void Proton_Tunneling::compute_local_environment_gpu(const Box& box, Atom& atom)
   const int number_of_hydrogens = static_cast<int>(hydrogen_indices_.size());
   const int block_size = 128;
   const int grid_size = (number_of_hydrogens + block_size - 1) / block_size;
+  const auto total_start = std::chrono::high_resolution_clock::now();
+  CHECK(gpuEventRecord(local_environment_kernel_start_event_, 0));
   gpu_compute_proton_local_environment<<<grid_size, block_size>>>(
     atom.position_per_atom.data(),
     number_of_atoms_,
@@ -1008,7 +1018,23 @@ void Proton_Tunneling::compute_local_environment_gpu(const Box& box, Atom& atom)
     local_hcl_angle_min_deg_,
     frame_local_environments_gpu_.data());
   GPU_CHECK_KERNEL
+  CHECK(gpuEventRecord(local_environment_kernel_end_event_, 0));
   frame_local_environments_gpu_.copy_to_host(cpu_local_environments_gpu_.data());
+  const auto copy_end = std::chrono::high_resolution_clock::now();
+  float kernel_time_ms = 0.0f;
+  CHECK(gpuEventElapsedTime(
+    &kernel_time_ms,
+    local_environment_kernel_start_event_,
+    local_environment_kernel_end_event_));
+  const double total_time =
+    std::chrono::duration<double>(copy_end - total_start).count();
+  const double kernel_time = static_cast<double>(kernel_time_ms) * 1.0e-3;
+  local_environment_kernel_wall_time_ += kernel_time;
+  local_environment_D2H_wall_time_ += std::max(0.0, total_time - kernel_time);
+  ++local_environment_copy_count_;
+  local_environment_bytes_copied_ += static_cast<unsigned long long>(
+    frame_local_environments_.size() * sizeof(LocalEnvironmentGPU));
+  const auto host_start = std::chrono::high_resolution_clock::now();
   for (size_t i = 0; i < frame_local_environments_.size(); ++i) {
     const LocalEnvironmentGPU& source = cpu_local_environments_gpu_[i];
     LocalEnvironment& target = frame_local_environments_[i];
@@ -1046,13 +1072,17 @@ void Proton_Tunneling::compute_local_environment_gpu(const Box& box, Atom& atom)
     target.E_parallel = source.E_parallel;
     target.delta_phi_ion = source.delta_phi_ion;
   }
+  const auto host_end = std::chrono::high_resolution_clock::now();
+  local_environment_host_analysis_wall_time_ +=
+    std::chrono::duration<double>(host_end - host_start).count();
 }
 
 void Proton_Tunneling::assign_local_environment_topology()
 {
   if (!local_environment_enabled_)
     return;
-  std::unordered_map<unsigned long long, std::array<int, 4>> edge_topology;
+  std::vector<int> donor_count(number_of_atoms_, 0);
+  std::vector<int> acceptor_count(number_of_atoms_, 0);
   for (size_t h_index = 0; h_index < frame_geometries_.size(); ++h_index) {
     const GeometryResult& geometry = frame_geometries_[h_index];
     LocalEnvironment& environment = frame_local_environments_[h_index];
@@ -1062,11 +1092,11 @@ void Proton_Tunneling::assign_local_environment_topology()
     environment.nH_high = hydrogen_count_[geometry.oxygen_high];
     const int state = classify_delta(geometry.delta);
     if (state < 0) {
-      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][0];
-      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][3];
+      ++donor_count[geometry.oxygen_low];
+      ++acceptor_count[geometry.oxygen_high];
     } else if (state > 0) {
-      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][1];
-      ++edge_topology[make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][2];
+      ++donor_count[geometry.oxygen_high];
+      ++acceptor_count[geometry.oxygen_low];
     }
   }
   for (size_t h_index = 0; h_index < frame_geometries_.size(); ++h_index) {
@@ -1074,14 +1104,10 @@ void Proton_Tunneling::assign_local_environment_topology()
     LocalEnvironment& environment = frame_local_environments_[h_index];
     if (!environment.valid)
       continue;
-    const auto topology = edge_topology.find(
-      make_bond_key(geometry.oxygen_low, geometry.oxygen_high));
-    if (topology != edge_topology.end()) {
-      environment.donor_edges_low = topology->second[0];
-      environment.donor_edges_high = topology->second[1];
-      environment.acceptor_edges_low = topology->second[2];
-      environment.acceptor_edges_high = topology->second[3];
-    }
+    environment.donor_edges_low = donor_count[geometry.oxygen_low];
+    environment.donor_edges_high = donor_count[geometry.oxygen_high];
+    environment.acceptor_edges_low = acceptor_count[geometry.oxygen_low];
+    environment.acceptor_edges_high = acceptor_count[geometry.oxygen_high];
   }
 }
 
@@ -1094,6 +1120,14 @@ void Proton_Tunneling::release_geometry_timing_events()
   if (geometry_kernel_end_event_ != nullptr) {
     CHECK(gpuEventDestroy(geometry_kernel_end_event_));
     geometry_kernel_end_event_ = nullptr;
+  }
+  if (local_environment_kernel_start_event_ != nullptr) {
+    CHECK(gpuEventDestroy(local_environment_kernel_start_event_));
+    local_environment_kernel_start_event_ = nullptr;
+  }
+  if (local_environment_kernel_end_event_ != nullptr) {
+    CHECK(gpuEventDestroy(local_environment_kernel_end_event_));
+    local_environment_kernel_end_event_ = nullptr;
   }
 }
 
@@ -2037,10 +2071,10 @@ void Proton_Tunneling::observe_frame(
       hydrogen_state.delocalization_best = diagnostic;
   };
 
+  const LocalEnvironment empty_environment;
   for (size_t h_index = 0; h_index < hydrogen_indices_.size(); ++h_index) {
     const int hydrogen = hydrogen_indices_[h_index];
     const GeometryResult& geometry = frame_geometries_[h_index];
-    const LocalEnvironment empty_environment;
     const LocalEnvironment& local_environment = local_environment_enabled_
       ? frame_local_environments_[h_index]
       : empty_environment;
@@ -2534,6 +2568,9 @@ void Proton_Tunneling::write_local_environment_event(
   const auto value = [&](const double x) {
     return (environment.valid && std::isfinite(x) && x < 1.0e299) ? x : nan;
   };
+  const auto angle_value = [&](const double x) {
+    return (environment.valid && std::isfinite(x) && x >= 0.0) ? x : nan;
+  };
   const auto count = [&](const int x) {
     return environment.valid ? x : -1;
   };
@@ -2580,8 +2617,8 @@ void Proton_Tunneling::write_local_environment_event(
     value(environment.delta_d_ion1),
     value(environment.delta_d_ion2),
     value(environment.nearest_ion2_to_H),
-    value(environment.angle_Olow_H_ion2),
-    value(environment.angle_Ohigh_H_ion2),
+    angle_value(environment.angle_Olow_H_ion2),
+    angle_value(environment.angle_Ohigh_H_ion2),
     count(environment.hcl_like_low),
     count(environment.hcl_like_high),
     value(environment.E_parallel),
@@ -3083,6 +3120,16 @@ void Proton_Tunneling::postprocess(
   }
   printf("    geometry kernel wall time: %.6f s\n", geometry_kernel_wall_time_);
   printf("    geometry D2H + host copy wall time: %.6f s\n", geometry_D2H_wall_time_);
+  if (local_environment_enabled_) {
+    printf("    local environment copies: %lld\n", local_environment_copy_count_);
+    printf("    local environment bytes copied: %llu\n", local_environment_bytes_copied_);
+    printf("    local environment kernel wall time: %.6f s\n",
+      local_environment_kernel_wall_time_);
+    printf("    local environment D2H wall time: %.6f s\n",
+      local_environment_D2H_wall_time_);
+    printf("    local environment host analysis wall time: %.6f s\n",
+      local_environment_host_analysis_wall_time_);
+  }
   printf("    CPU state-machine wall time: %.6f s\n", state_machine_wall_time_);
   printf("    total observer wall time: %.6f s\n", total_observer_wall_time_);
   initialized_ = false;

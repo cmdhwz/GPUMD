@@ -30,8 +30,10 @@ With a nominal Na/Cl ion-field proxy enabled, use one physical input line::
 
 To record a local Na/Cl environment for every valid O-H-O observation, append
 ``local_environment``. The first two cutoffs are for the two species configured by
-``ion_field``; the third is the H--ion2 cutoff for the continuous O-H...ion2 angles,
-and the last is the threshold for the accompanying ``hcl_like`` fractions::
+``ion_field`` and are used for endpoint coordination numbers; the third is the H--ion2
+cutoff and the last is the angle threshold for the accompanying ``hcl_like`` fractions.
+The nearest ion2-to-H distance and its two O-H...ion2 angles are retained whenever an
+ion2 exists; the H--ion2 cutoff is not used to discard those distances or angles::
 
   compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0 local_environment 3.5 3.5 3.0 150
 
@@ -170,11 +172,15 @@ and completed edge windows.
   ``ion_field`` is disabled or the edge has no valid geometry samples.
 * ``proton_local_environment_window.out`` is written only when ``local_environment`` is enabled.
   It contains one record per observed O-O edge and window. It reports mean O-H-O geometry,
-  endpoint hydrogen counts, donor/acceptor edge counts, the first three ion distances and
-  coordination numbers for each endpoint, endpoint distance differences, nearest ion2-to-H
-  distance, continuous O-H...ion2 angles, ``hcl_like`` fractions, and the nominal field and
-  potential-difference descriptors. Missing neighbors are excluded from the corresponding
-  distance mean and are reported as ``nan``.
+  endpoint hydrogen counts, donor/acceptor topology counts accumulated independently for
+  each endpoint O over all valid O-H-O assignments in the sampled frame, the globally nearest
+  three ion distances and cutoff-based coordination numbers for each endpoint, endpoint
+  distance differences, nearest ion2-to-H distance, continuous O-H...ion2 angles,
+  ``hcl_like`` fractions, and the nominal field and potential-difference descriptors. The
+  nearest-three distances are not truncated by the coordination cutoff; missing neighbors
+  are excluded from the corresponding distance mean and are reported as ``nan``. The
+  H--ion2 cutoff only affects the ``hcl_like`` flags/fractions, not the stored nearest-ion2
+  distance or angles.
 * ``proton_local_environment_event.out`` is written only when ``local_environment`` is enabled.
   Each finalized attempt has ``start``, ``end``, and ``last_valid`` snapshots. When
   ``bead_diagnostic`` is also enabled, valid ``centroid_best`` and ``delocalization_best``
@@ -255,6 +261,11 @@ multi-bead cases are ``ambiguous``. A one-bead run is always labeled ``classical
 These labels identify tunneling-like ring-polymer geometry, not a rigorous quantum observable
 or proof that a particular RPMD trajectory tunneled. They should be checked against bead-number
 convergence, H/D isotope comparisons, and matched pure/salt-ice conditions.
+
+When ``local_environment`` is enabled, the end-of-run timing summary also reports the number
+of local-environment GPU result copies, bytes transferred, kernel time, D2H time (including
+the synchronous wait outside the kernel event interval), and host-side result conversion time.
+These counters are diagnostic only and do not change the observer outputs.
 
 The bead coordinates are packed on the GPU into one staging buffer and copied to the CPU with
 one synchronous transfer per sampled frame that needs a bead probe. This preserves the
