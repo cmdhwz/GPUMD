@@ -375,6 +375,7 @@ void Force::set_pimd_bead_batch(const bool enabled)
 {
   pimd_bead_batch_enabled_ = enabled;
   pimd_centroid_probe_ready_ = false;
+  pimd_centroid_active_this_call_ = false;
   if (!enabled) {
     pimd_centroid_probe_enabled_ = false;
   }
@@ -390,15 +391,22 @@ void Force::set_pimd_bead_batch(const bool enabled)
   apply_pimd_qnep_batch_bec_setting_();
 }
 
-void Force::enable_pimd_centroid_probe(const int number_of_atoms, const int number_of_beads)
+void Force::enable_pimd_centroid_probe(
+  const int number_of_atoms, const int number_of_beads, const int sample_interval)
 {
   pimd_centroid_probe_enabled_ = false;
   pimd_centroid_probe_ready_ = false;
+  pimd_centroid_active_this_call_ = false;
   pimd_centroid_number_of_beads_ = 0;
+  pimd_centroid_sample_interval_ = 0;
+  pimd_force_call_count_ = -1;
+  pimd_physical_batch_calls_ = 0;
+  pimd_centroid_active_batch_calls_ = 0;
+  pimd_centroid_inactive_batch_calls_ = 0;
 
   if (
     number_of_atoms <= 0 || number_of_beads < 2 || number_of_atoms != number_of_atoms_ ||
-    !can_use_pimd_qnep_batch_()) {
+    sample_interval <= 0 || !can_use_pimd_qnep_batch_()) {
     return;
   }
 
@@ -411,11 +419,15 @@ void Force::enable_pimd_centroid_probe(const int number_of_atoms, const int numb
   pimd_centroid_position_ptrs_host_.clear();
   pimd_centroid_position_ptrs_host_.reserve(number_of_beads);
   pimd_centroid_number_of_beads_ = number_of_beads;
+  pimd_centroid_sample_interval_ = sample_interval;
   pimd_centroid_probe_enabled_ = true;
 
   printf(
     "Enabled qNEP PIMD centroid auxiliary batch lane (%d physical beads + 1 centroid lane).\n",
     number_of_beads);
+  printf(
+    "    centroid lane is active only every %d PIMD force call(s) matching HAC sampling.\n",
+    sample_interval);
 }
 
 bool Force::pimd_qnep_bead_batch_active_() const
@@ -664,10 +676,13 @@ bool Force::try_compute_pimd_qnep_batch_(
   std::vector<GPU_Vector<double>*> potentials_per_bead;
   std::vector<GPU_Vector<double>*> forces;
   std::vector<GPU_Vector<double>*> virials;
-  positions.reserve(number_of_beads);
-  potentials_per_bead.reserve(number_of_beads);
-  forces.reserve(number_of_beads);
-  virials.reserve(number_of_beads);
+  const bool add_centroid_lane =
+    pimd_centroid_probe_enabled_ && pimd_centroid_number_of_beads_ == number_of_beads;
+  const int capacity_number_of_beads = number_of_beads + (add_centroid_lane ? 1 : 0);
+  positions.reserve(capacity_number_of_beads);
+  potentials_per_bead.reserve(capacity_number_of_beads);
+  forces.reserve(capacity_number_of_beads);
+  virials.reserve(capacity_number_of_beads);
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     positions.push_back(&position_beads[bead_id]);
     potentials_per_bead.push_back(&potential_beads[bead_id]);
@@ -675,8 +690,10 @@ bool Force::try_compute_pimd_qnep_batch_(
     virials.push_back(&virial_beads[bead_id]);
   }
 
-  if (pimd_centroid_probe_enabled_ && pimd_centroid_number_of_beads_ == number_of_beads) {
-    compute_pimd_centroid_position_(box, position_beads);
+  if (add_centroid_lane) {
+    if (pimd_centroid_active_this_call_) {
+      compute_pimd_centroid_position_(box, position_beads);
+    }
     positions.push_back(&pimd_centroid_position_);
     potentials_per_bead.push_back(&pimd_centroid_potential_);
     forces.push_back(&pimd_centroid_force_);
@@ -684,12 +701,28 @@ bool Force::try_compute_pimd_qnep_batch_(
   }
 
   NEP_Charge* qnep = dynamic_cast<NEP_Charge*>(potentials[0].get());
+  const int active_number_of_beads =
+    number_of_beads + (add_centroid_lane && pimd_centroid_active_this_call_ ? 1 : 0);
   const bool used_batch = qnep->compute_pimd_batch(
-    box, type, positions, potentials_per_bead, forces, virials);
+    box,
+    type,
+    positions,
+    potentials_per_bead,
+    forces,
+    virials,
+    active_number_of_beads);
   if (used_batch) {
     temperature += number_of_beads * delta_T;
+    if (pimd_centroid_probe_enabled_) {
+      ++pimd_physical_batch_calls_;
+      if (pimd_centroid_active_this_call_) {
+        ++pimd_centroid_active_batch_calls_;
+      } else {
+        ++pimd_centroid_inactive_batch_calls_;
+      }
+    }
     pimd_centroid_probe_ready_ =
-      pimd_centroid_probe_enabled_ && positions.size() == size_t(number_of_beads + 1);
+      add_centroid_lane && pimd_centroid_active_this_call_;
   }
   return used_batch;
 }
@@ -883,7 +916,12 @@ void Force::compute_pimd_beads(
   std::vector<GPU_Vector<double>>& velocity_beads,
   GPU_Vector<double>& mass_per_atom)
 {
+  ++pimd_force_call_count_;
   pimd_centroid_probe_ready_ = false;
+  pimd_centroid_active_this_call_ =
+    pimd_centroid_probe_enabled_ && pimd_centroid_sample_interval_ > 0 &&
+    pimd_force_call_count_ > 0 &&
+    pimd_force_call_count_ % pimd_centroid_sample_interval_ == 0;
   if (!can_use_pimd_bead_gpu_parallel_()) {
     if (
       try_compute_pimd_qnep_batch_(
@@ -961,7 +999,9 @@ void Force::compute_pimd_beads(
   pimd_bead_timing_.wrap_positions +=
     std::chrono::duration<double>(Clock::now() - wrap_begin).count();
 
-  if (pimd_centroid_probe_enabled_ && pimd_centroid_number_of_beads_ == number_of_beads) {
+  if (
+    pimd_centroid_active_this_call_ &&
+    pimd_centroid_number_of_beads_ == number_of_beads) {
     compute_pimd_centroid_position_(box, position_beads);
     // Worker 0 may use a different host thread/default stream in the multi-GPU
     // path, so make the auxiliary coordinates visible before launching it.
@@ -995,6 +1035,7 @@ void Force::compute_pimd_beads(
 
   const auto compute_begin = Clock::now();
   std::vector<double> worker_compute(number_of_workers, 0.0);
+  std::vector<int> worker_pimd_batch_used(number_of_workers, 0);
   std::vector<int> worker_centroid_batch_used(number_of_workers, 0);
   std::vector<std::thread> workers;
   workers.reserve(number_of_workers);
@@ -1044,13 +1085,17 @@ void Force::compute_pimd_beads(
             worker_virials.push_back(&pimd_centroid_virial_);
           }
           if (qnep) {
+            const int active_number_of_beads =
+              bead_end - bead_begin +
+              (add_centroid_lane && pimd_centroid_active_this_call_ ? 1 : 0);
             used_pimd_batch = qnep->compute_pimd_batch(
               worker_box,
               device_id == 0 ? type : worker.type,
               worker_positions,
               worker_potentials,
               worker_forces,
-              worker_virials);
+              worker_virials,
+              active_number_of_beads);
           } else {
             used_pimd_batch = nep->compute_pimd_batch(
               worker_box,
@@ -1060,7 +1105,8 @@ void Force::compute_pimd_beads(
               worker_forces,
               worker_virials);
           }
-          if (used_pimd_batch && add_centroid_lane) {
+          worker_pimd_batch_used[worker_id] = used_pimd_batch ? 1 : 0;
+          if (used_pimd_batch && add_centroid_lane && pimd_centroid_active_this_call_) {
             worker_centroid_batch_used[worker_id] = 1;
           }
         }
@@ -1124,6 +1170,21 @@ void Force::compute_pimd_beads(
     pimd_bead_timing_.worker_compute[worker_id] += worker_compute[worker_id];
   }
   pimd_centroid_probe_ready_ = worker_centroid_batch_used[0] != 0;
+  bool all_workers_used_pimd_batch = true;
+  for (const int used : worker_pimd_batch_used) {
+    if (used == 0) {
+      all_workers_used_pimd_batch = false;
+      break;
+    }
+  }
+  if (pimd_centroid_probe_enabled_ && all_workers_used_pimd_batch) {
+    ++pimd_physical_batch_calls_;
+    if (pimd_centroid_active_this_call_) {
+      ++pimd_centroid_active_batch_calls_;
+    } else {
+      ++pimd_centroid_inactive_batch_calls_;
+    }
+  }
 
   // PIMD integration and restart state stay authoritative on GPU 0. Coordinates
   // were wrapped before staging, so only force-related outputs need to return.
@@ -1322,10 +1383,24 @@ static __global__ void initialize_properties(
 
 void Force::finalize()
 {
+  if (pimd_centroid_probe_enabled_) {
+    printf("PIMD centroid auxiliary lane scheduling:\n");
+    printf(
+      "    physical PIMD batch calls (including initial force) = %lld\n",
+      pimd_physical_batch_calls_);
+    printf("    centroid-active batch calls = %lld\n", pimd_centroid_active_batch_calls_);
+    printf("    centroid-inactive batch calls = %lld\n", pimd_centroid_inactive_batch_calls_);
+  }
   compute_hnemd_ = false;
   compute_hnemdec_ = -1;
   pimd_centroid_probe_enabled_ = false;
   pimd_centroid_probe_ready_ = false;
+  pimd_centroid_active_this_call_ = false;
+  pimd_centroid_sample_interval_ = 0;
+  pimd_force_call_count_ = 0;
+  pimd_physical_batch_calls_ = 0;
+  pimd_centroid_active_batch_calls_ = 0;
+  pimd_centroid_inactive_batch_calls_ = 0;
   refresh_pimd_bead_gpu_workers_();
 }
 

@@ -2826,18 +2826,22 @@ bool NEP_Charge::compute_pimd_batch(
   const std::vector<GPU_Vector<double>*>& position_beads,
   const std::vector<GPU_Vector<double>*>& potential_beads,
   const std::vector<GPU_Vector<double>*>& force_beads,
-  const std::vector<GPU_Vector<double>*>& virial_beads)
+  const std::vector<GPU_Vector<double>*>& virial_beads,
+  const int active_number_of_beads)
 {
-  const int number_of_beads = int(position_beads.size());
+  const int capacity_number_of_beads = int(position_beads.size());
+  const int number_of_beads =
+    active_number_of_beads < 0 ? capacity_number_of_beads : active_number_of_beads;
   if (
-    number_of_beads < 2 || potential_beads.size() != position_beads.size() ||
+    number_of_beads < 2 || number_of_beads > capacity_number_of_beads ||
+    capacity_number_of_beads < 2 || potential_beads.size() != position_beads.size() ||
     force_beads.size() != position_beads.size() ||
     virial_beads.size() != position_beads.size()) {
     return false;
   }
 
   const int N = type.size();
-  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+  for (int bead_id = 0; bead_id < capacity_number_of_beads; ++bead_id) {
     if (
       position_beads[bead_id]->size() != static_cast<size_t>(N) * 3 ||
       potential_beads[bead_id]->size() != static_cast<size_t>(N) ||
@@ -2859,13 +2863,19 @@ bool NEP_Charge::compute_pimd_batch(
       std::chrono::high_resolution_clock::now() - setup_begin).count();
   }
   auto& batch = *pimd_batch_data_;
+  const int previous_active_number_of_beads = batch.active_number_of_beads;
+  const bool active_lanes_added = number_of_beads > previous_active_number_of_beads;
+  if (active_lanes_added) {
+    batch.pointer_arrays_initialized = false;
+  }
+  batch.active_number_of_beads = number_of_beads;
 
   if (is_small_box) {
     // The cached list includes the skin, so explicit images must cover it too.
     const auto neighbor_begin = std::chrono::high_resolution_clock::now();
     get_expanded_box(paramb.rc_radial + 1.0, box, ebox);
     const int small_box_neighbor_size = 2000;
-    std::vector<int> initial_flags(number_of_beads, 0);
+    std::vector<int> initial_flags(capacity_number_of_beads, 0);
     bool box_changed = !batch.small_box_initialized;
     for (int component = 0; component < 9 && !box_changed; ++component) {
       if (batch.small_box_h[component] != box.cpu_h[component]) {
@@ -2874,9 +2884,13 @@ bool NEP_Charge::compute_pimd_batch(
     }
     if (box_changed || neighbor_always_rebuild_) {
       std::fill(initial_flags.begin(), initial_flags.end(), 1);
+    } else if (active_lanes_added) {
+      for (int bead_id = previous_active_number_of_beads; bead_id < number_of_beads; ++bead_id) {
+        initial_flags[bead_id] = 1;
+      }
     }
     batch.small_box_rebuild_flags.copy_from_host(initial_flags.data());
-    if (!box_changed && !neighbor_always_rebuild_) {
+    if (!box_changed && !neighbor_always_rebuild_ && !active_lanes_added) {
       Neighbor::check_atom_distance_batch(
         box,
         N,
@@ -2885,7 +2899,8 @@ bool NEP_Charge::compute_pimd_batch(
         batch.small_box_y0_ptrs,
         batch.small_box_z0_ptrs,
         batch.position_ptrs,
-        batch.small_box_rebuild_flags);
+        batch.small_box_rebuild_flags,
+        number_of_beads);
     }
 
     const int block_size = 64;
@@ -2967,7 +2982,8 @@ bool NEP_Charge::compute_pimd_batch(
       batch.small_box_x0_ptrs,
       batch.small_box_y0_ptrs,
       batch.small_box_z0_ptrs,
-      batch.small_box_rebuild_flags);
+      batch.small_box_rebuild_flags,
+      number_of_beads);
     if (profile) {
       CHECK(gpuDeviceSynchronize());
       pimd_batch_timing_.neighbor += std::chrono::duration<double>(
@@ -3257,7 +3273,8 @@ bool NEP_Charge::compute_pimd_batch(
     batch.cell_contents_batch,
     batch.cell_keys_batch,
     batch.cell_stride,
-    profile ? &neighbor_timing : nullptr);
+    profile ? &neighbor_timing : nullptr,
+    number_of_beads);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
     const double neighbor_time = std::chrono::duration<double>(

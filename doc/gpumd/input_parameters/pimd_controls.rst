@@ -90,8 +90,11 @@ paths used to construct the centroid heat flux remain active.
 
 For a fixed-box qNEP PIMD/RPMD/TRPMD run with ``pimd_bead_batch on``, the
 centroid qNEP force and virial are evaluated in the same bead batch as one
-auxiliary, non-integrated lane. This optimization is enabled automatically by
-``compute_hac`` when its centroid flag is 1; physical bead forces and the
-ring-polymer propagation are unchanged. Variable-box runs, SCR barostats,
-unsupported potentials, and non-batched runs retain the serial centroid-force
-fallback.
+auxiliary, non-integrated lane on HAC sampling force calls. The batch capacity
+is allocated once for ``P+1`` lanes, but non-sampling force calls activate only
+the ``P`` physical lanes, so the auxiliary centroid calculation is not
+performed at every integration step. This optimization is enabled
+automatically by ``compute_hac`` when its centroid flag is 1; physical bead
+forces and the ring-polymer propagation are unchanged. Variable-box runs, SCR
+barostats, unsupported potentials, and non-batched runs retain the serial
+centroid-force fallback.

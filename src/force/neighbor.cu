@@ -1017,30 +1017,34 @@ void Neighbor::find_neighbor_global_batch(
   GPU_Vector<int>& cell_contents_batch,
   GPU_Vector<int>& cell_keys_batch,
   int& cell_stride,
-  Neighbor_Batch_Timing* timing)
+  Neighbor_Batch_Timing* timing,
+  const int active_number_of_beads)
 {
-  const int number_of_beads = static_cast<int>(neighbors.size());
+  const int capacity_number_of_beads = static_cast<int>(neighbors.size());
+  const int number_of_beads =
+    active_number_of_beads < 0 ? capacity_number_of_beads : active_number_of_beads;
   const int N = type.size();
   if (
-    number_of_beads == 0 || position_beads.size() != neighbors.size() ||
-    position_ptrs.size() != static_cast<size_t>(number_of_beads) ||
-    NN_global_ptrs.size() != static_cast<size_t>(number_of_beads) ||
-    NL_global_ptrs.size() != static_cast<size_t>(number_of_beads) ||
-    x0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    y0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    z0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    rebuild_flags.size() != static_cast<size_t>(number_of_beads) ||
+    number_of_beads <= 0 || number_of_beads > capacity_number_of_beads ||
+    position_beads.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    position_ptrs.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    NN_global_ptrs.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    NL_global_ptrs.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    x0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    y0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    z0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    rebuild_flags.size() != static_cast<size_t>(capacity_number_of_beads) ||
     any_rebuild.size() != 1 ||
-    active_bead_ids.size() != static_cast<size_t>(number_of_beads) ||
-    x0_ptrs_host.size() != static_cast<size_t>(number_of_beads) ||
-    y0_ptrs_host.size() != static_cast<size_t>(number_of_beads) ||
-    z0_ptrs_host.size() != static_cast<size_t>(number_of_beads)) {
+    active_bead_ids.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    x0_ptrs_host.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    y0_ptrs_host.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    z0_ptrs_host.size() != static_cast<size_t>(capacity_number_of_beads)) {
     return;
   }
 
   using Clock = std::chrono::high_resolution_clock;
   const auto pointer_begin = Clock::now();
-  std::vector<int> initial_flags(number_of_beads, 0);
+  std::vector<int> initial_flags(capacity_number_of_beads, 0);
   bool need_distance_check = false;
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     Neighbor* neighbor = neighbors[bead_id];
@@ -1143,13 +1147,14 @@ void Neighbor::find_neighbor_global_batch(
   const int number_of_cells = num_bins[0] * num_bins[1] * num_bins[2];
   cell_stride = number_of_cells;
 
-  const size_t cell_batch_size = static_cast<size_t>(number_of_beads) * number_of_cells;
+  const size_t cell_batch_size =
+    static_cast<size_t>(capacity_number_of_beads) * number_of_cells;
   if (cell_count_batch.size() < cell_batch_size) {
     cell_count_batch.resize(cell_batch_size);
     cell_count_sum_batch.resize(cell_batch_size);
     cell_keys_batch.resize(cell_batch_size);
   }
-  const size_t contents_batch_size = static_cast<size_t>(number_of_beads) * N;
+  const size_t contents_batch_size = static_cast<size_t>(capacity_number_of_beads) * N;
   if (cell_contents_batch.size() < contents_batch_size) {
     cell_contents_batch.resize(contents_batch_size);
   }
@@ -1246,7 +1251,8 @@ void Neighbor::find_neighbor_global_batch(
     x0_batch,
     y0_batch,
     z0_batch,
-    rebuild_flags);
+    rebuild_flags,
+    number_of_beads);
   if (timing) {
     CHECK(gpuDeviceSynchronize());
   }
@@ -1265,14 +1271,18 @@ void Neighbor::check_atom_distance_batch(
   const GPU_Vector<double*>& y0_batch,
   const GPU_Vector<double*>& z0_batch,
   const GPU_Vector<double*>& position_batch,
-  GPU_Vector<int>& rebuild_flags)
+  GPU_Vector<int>& rebuild_flags,
+  const int active_number_of_beads)
 {
-  const int number_of_beads = static_cast<int>(position_batch.size());
+  const int capacity_number_of_beads = static_cast<int>(position_batch.size());
+  const int number_of_beads =
+    active_number_of_beads < 0 ? capacity_number_of_beads : active_number_of_beads;
   if (
-    number_of_beads == 0 || x0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    y0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    z0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    rebuild_flags.size() != static_cast<size_t>(number_of_beads)) {
+    number_of_beads <= 0 || number_of_beads > capacity_number_of_beads ||
+    x0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    y0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    z0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    rebuild_flags.size() != static_cast<size_t>(capacity_number_of_beads)) {
     return;
   }
   gpu_check_atom_distance_batch<<<
@@ -1295,14 +1305,18 @@ void Neighbor::update_reference_positions_batch(
   const GPU_Vector<double*>& x0_batch,
   const GPU_Vector<double*>& y0_batch,
   const GPU_Vector<double*>& z0_batch,
-  const GPU_Vector<int>& rebuild_flags)
+  const GPU_Vector<int>& rebuild_flags,
+  const int active_number_of_beads)
 {
-  const int number_of_beads = static_cast<int>(position_batch.size());
+  const int capacity_number_of_beads = static_cast<int>(position_batch.size());
+  const int number_of_beads =
+    active_number_of_beads < 0 ? capacity_number_of_beads : active_number_of_beads;
   if (
-    number_of_beads == 0 || x0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    y0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    z0_batch.size() != static_cast<size_t>(number_of_beads) ||
-    rebuild_flags.size() != static_cast<size_t>(number_of_beads)) {
+    number_of_beads <= 0 || number_of_beads > capacity_number_of_beads ||
+    x0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    y0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    z0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    rebuild_flags.size() != static_cast<size_t>(capacity_number_of_beads)) {
     return;
   }
   gpu_update_xyz0_batch_if_rebuild<<<

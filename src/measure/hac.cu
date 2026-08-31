@@ -63,7 +63,8 @@ void HAC::preprocess(
         integrate.deform_z == 0 && !integrate.use_scr_barostat &&
         (integrate.type != 33 || integrate.num_target_pressure_components == 0);
       if (fixed_box && atom.number_of_beads > 1) {
-        force.enable_pimd_centroid_probe(atom.number_of_atoms, atom.number_of_beads);
+        force.enable_pimd_centroid_probe(
+          atom.number_of_atoms, atom.number_of_beads, sample_interval);
         if (force.pimd_centroid_probe_enabled()) {
           printf("    centroid HAC will use the qNEP PIMD batch auxiliary lane.\n");
         } else {

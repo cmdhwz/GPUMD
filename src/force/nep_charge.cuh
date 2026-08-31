@@ -151,7 +151,8 @@ public:
     const std::vector<GPU_Vector<double>*>& position_beads,
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
-    const std::vector<GPU_Vector<double>*>& virial_beads);
+    const std::vector<GPU_Vector<double>*>& virial_beads,
+    const int active_number_of_beads = -1);
 
   const GPU_Vector<int>& get_NN_radial_ptr();
 
@@ -197,6 +198,7 @@ private:
   {
     int number_of_atoms = 0;
     int number_of_beads = 0;
+    int active_number_of_beads = 0;
     std::vector<std::unique_ptr<PIMD_Bead_Data>> beads;
     std::vector<double*> position_ptrs_host;
     std::vector<double*> potential_ptrs_host;

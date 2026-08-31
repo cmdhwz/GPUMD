@@ -127,7 +127,8 @@ public:
   void set_md_qnep_bec_mode(const int mode);
   void set_md_qnep_bec_required(const bool required);
   void set_pimd_bead_batch(const bool enabled);
-  void enable_pimd_centroid_probe(const int number_of_atoms, const int number_of_beads);
+  void enable_pimd_centroid_probe(
+    const int number_of_atoms, const int number_of_beads, const int sample_interval);
   bool pimd_centroid_probe_enabled() const { return pimd_centroid_probe_enabled_; }
   bool pimd_centroid_probe_ready() const { return pimd_centroid_probe_ready_; }
   const GPU_Vector<double>& get_pimd_centroid_potential() const
@@ -168,7 +169,13 @@ private:
   bool pimd_bead_batch_enabled_ = false;
   bool pimd_centroid_probe_enabled_ = false;
   bool pimd_centroid_probe_ready_ = false;
+  bool pimd_centroid_active_this_call_ = false;
   int pimd_centroid_number_of_beads_ = 0;
+  int pimd_centroid_sample_interval_ = 0;
+  long long pimd_force_call_count_ = 0;
+  long long pimd_physical_batch_calls_ = 0;
+  long long pimd_centroid_active_batch_calls_ = 0;
+  long long pimd_centroid_inactive_batch_calls_ = 0;
   GPU_Vector<double> pimd_centroid_position_;
   GPU_Vector<double> pimd_centroid_potential_;
   GPU_Vector<double> pimd_centroid_force_;

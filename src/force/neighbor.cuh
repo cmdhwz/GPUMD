@@ -180,7 +180,8 @@ public:
     GPU_Vector<int>& cell_contents_batch,
     GPU_Vector<int>& cell_keys_batch,
     int& cell_stride,
-    Neighbor_Batch_Timing* timing = nullptr);
+    Neighbor_Batch_Timing* timing = nullptr,
+    const int active_number_of_beads = -1);
   static void check_atom_distance_batch(
     const Box& box,
     const int number_of_atoms,
@@ -189,14 +190,16 @@ public:
     const GPU_Vector<double*>& y0_batch,
     const GPU_Vector<double*>& z0_batch,
     const GPU_Vector<double*>& position_batch,
-    GPU_Vector<int>& rebuild_flags);
+    GPU_Vector<int>& rebuild_flags,
+    const int active_number_of_beads = -1);
   static void update_reference_positions_batch(
     const int number_of_atoms,
     const GPU_Vector<double*>& position_batch,
     const GPU_Vector<double*>& x0_batch,
     const GPU_Vector<double*>& y0_batch,
     const GPU_Vector<double*>& z0_batch,
-    const GPU_Vector<int>& rebuild_flags);
+    const GPU_Vector<int>& rebuild_flags,
+    const int active_number_of_beads = -1);
   bool prepare_reference_positions(const int num_atoms)
   {
     const bool first = x0.size() == 0;

@@ -84,5 +84,10 @@ This enables both optional flags:
 
 At the end of a run with the centroid flag enabled, the log reports the
 number of centroid HAC samples served by the qNEP batch cache and the number
-that used the serial fallback. The split qNEP option still performs its
-separate non-electrostatic evaluation at sampled frames.
+that used the serial fallback. For fixed-box qNEP PIMD/RPMD/TRPMD runs, the
+auxiliary lane is allocated as part of a fixed ``P+1``-lane batch capacity but
+is active only on HAC sampling force calls; non-sampling force calls use only
+the ``P`` physical lanes. The log also reports the physical batch-call count
+(including the initial force evaluation) and the active/inactive auxiliary-lane
+counts. The split qNEP option still performs its separate non-electrostatic
+evaluation at sampled frames.
