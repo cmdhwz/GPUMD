@@ -536,6 +536,12 @@ void Force::print_pimd_nep_batch_profile() const
     printf("        many-body force = %g s.\n", timing.many_body);
     printf("        ZBL/DFTD3 = %g s.\n", timing.corrections);
     printf("        total batch potential = %g s.\n", timing.total);
+    printf(
+      "        PPPM full per-atom virial batch calls = %lld.\n",
+      timing.pppm_full_peratom_virial_batch_calls);
+    printf(
+      "        PPPM global-virial batch calls = %lld.\n",
+      timing.pppm_global_virial_batch_calls);
   };
 
   printf("PIMD NEP/qNEP batch stage timing:\n");
@@ -710,7 +716,8 @@ bool Force::try_compute_pimd_qnep_batch_(
     potentials_per_bead,
     forces,
     virials,
-    active_number_of_beads);
+    active_number_of_beads,
+    add_centroid_lane && pimd_centroid_active_this_call_);
   if (used_batch) {
     temperature += number_of_beads * delta_T;
     if (pimd_centroid_probe_enabled_) {
@@ -771,7 +778,8 @@ bool Force::compute_qnep_centroid_frames_batch(
     potential_ptrs,
     force_ptrs,
     virial_ptrs,
-    number_of_frames);
+    number_of_frames,
+    true);
 }
 
 bool Force::try_compute_pimd_nep_batch_(
@@ -1142,7 +1150,8 @@ void Force::compute_pimd_beads(
               worker_potentials,
               worker_forces,
               worker_virials,
-              active_number_of_beads);
+              active_number_of_beads,
+              add_centroid_lane && pimd_centroid_active_this_call_);
           } else {
             used_pimd_batch = nep->compute_pimd_batch(
               worker_box,

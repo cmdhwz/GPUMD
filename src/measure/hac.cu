@@ -58,8 +58,7 @@ void HAC::preprocess(
     deferred_heat_wall_time_ = 0.0;
     deferred_hac_wall_time_ = 0.0;
     centroid_sampled_frames_ = 0;
-    centroid_batch_cache_hits_ = 0;
-    centroid_serial_fallbacks_ = 0;
+    centroid_direct_evaluations_ = 0;
     int number_of_frames = number_of_steps / sample_interval;
     if (number_of_frames <= 0 || Nc > number_of_frames) {
       PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
@@ -111,14 +110,8 @@ void HAC::preprocess(
           printf(
             "    deferred centroid qNEP mode unavailable; using the normal sampled centroid path.\n");
         }
-        force.enable_pimd_centroid_probe(
-          atom.number_of_atoms, atom.number_of_beads, sample_interval);
-        if (force.pimd_centroid_probe_enabled()) {
-          printf("    centroid HAC will use the qNEP PIMD batch auxiliary lane.\n");
-        } else {
-          printf(
-            "    qNEP PIMD centroid cache unavailable; centroid HAC will use the serial fallback.\n");
-        }
+        printf(
+          "    centroid HAC will use a direct single-configuration qNEP evaluation at sampled frames.\n");
       }
     }
     if (split_qnep_heat_by_type_) {
@@ -462,35 +455,25 @@ void HAC::process(
       }
       return;
     }
-    if (force.pimd_centroid_probe_ready()) {
-      ++centroid_batch_cache_hits_;
-      centroid_potential_source = &force.get_pimd_centroid_potential();
-      centroid_virial_source = &force.get_pimd_centroid_virial();
-      compute_centroid_heat(
-        atom.mass,
-        force.get_pimd_centroid_potential(),
-        force.get_pimd_centroid_virial(),
-        atom.velocity_per_atom,
-        atom.heat_per_atom);
-    } else {
-      ++centroid_serial_fallbacks_;
-      force.compute(
-        box,
-        atom.position_per_atom,
-        atom.type,
-        group,
-        centroid_potential_per_atom_,
-        centroid_force_per_atom_,
-        centroid_virial_per_atom_,
-        atom.velocity_per_atom,
-        atom.mass);
-      compute_centroid_heat(
-        atom.mass,
-        centroid_potential_per_atom_,
-        centroid_virial_per_atom_,
-        atom.velocity_per_atom,
-        atom.heat_per_atom);
-    }
+    ++centroid_direct_evaluations_;
+    force.compute(
+      box,
+      atom.position_per_atom,
+      atom.type,
+      group,
+      centroid_potential_per_atom_,
+      centroid_force_per_atom_,
+      centroid_virial_per_atom_,
+      atom.velocity_per_atom,
+      atom.mass);
+    centroid_potential_source = &centroid_potential_per_atom_;
+    centroid_virial_source = &centroid_virial_per_atom_;
+    compute_centroid_heat(
+      atom.mass,
+      centroid_potential_per_atom_,
+      centroid_virial_per_atom_,
+      atom.velocity_per_atom,
+      atom.heat_per_atom);
   } else {
     compute_heat(atom.virial_per_atom, atom.velocity_per_atom, atom.heat_per_atom);
   }
@@ -867,8 +850,7 @@ void HAC::postprocess(
   if (use_centroid_heat_flux_) {
     printf("Centroid HAC force source:\n");
     printf("    sampled frames = %lld\n", centroid_sampled_frames_);
-    printf("    qNEP batch cache hits = %lld\n", centroid_batch_cache_hits_);
-    printf("    serial fallbacks = %lld\n", centroid_serial_fallbacks_);
+    printf("    direct centroid evaluations = %lld\n", centroid_direct_evaluations_);
     if (deferred_centroid_enabled_) {
       printf("    deferred centroid frames = %d\n", centroid_frame_count_);
       printf("    trajectory staging/D2H wall time = %g s\n", deferred_staging_wall_time_);

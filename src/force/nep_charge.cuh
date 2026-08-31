@@ -152,7 +152,8 @@ public:
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
     const std::vector<GPU_Vector<double>*>& virial_beads,
-    const int active_number_of_beads = -1);
+    const int active_number_of_beads = -1,
+    const bool request_peratom_virial = false);
 
   const GPU_Vector<int>& get_NN_radial_ptr();
 

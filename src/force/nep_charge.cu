@@ -2827,7 +2827,8 @@ bool NEP_Charge::compute_pimd_batch(
   const std::vector<GPU_Vector<double>*>& potential_beads,
   const std::vector<GPU_Vector<double>*>& force_beads,
   const std::vector<GPU_Vector<double>*>& virial_beads,
-  const int active_number_of_beads)
+  const int active_number_of_beads,
+  const bool request_peratom_virial)
 {
   const int capacity_number_of_beads = int(position_beads.size());
   const int number_of_beads =
@@ -3090,7 +3091,13 @@ bool NEP_Charge::compute_pimd_batch(
         batch.force_ptrs,
         batch.virial_ptrs,
         batch.potential_ptrs,
-        number_of_beads);
+        number_of_beads,
+        request_peratom_virial);
+      if (pppm.last_batch_used_peratom_virial()) {
+        ++pimd_batch_timing_.pppm_full_peratom_virial_batch_calls;
+      } else {
+        ++pimd_batch_timing_.pppm_global_virial_batch_calls;
+      }
     } else {
       for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
         auto& bead = *batch.beads[bead_id];
@@ -3417,7 +3424,13 @@ bool NEP_Charge::compute_pimd_batch(
       batch.force_ptrs,
       batch.virial_ptrs,
       batch.potential_ptrs,
-      number_of_beads);
+      number_of_beads,
+      request_peratom_virial);
+    if (pppm.last_batch_used_peratom_virial()) {
+      ++pimd_batch_timing_.pppm_full_peratom_virial_batch_calls;
+    } else {
+      ++pimd_batch_timing_.pppm_global_virial_batch_calls;
+    }
   } else {
     for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
       auto& bead = *batch.beads[bead_id];

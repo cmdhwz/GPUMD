@@ -23,13 +23,11 @@ full classical heat-flux operator on the instantaneous centroid structure during
 If omitted, the default is 0.
 
 For a fixed-box PIMD, RPMD, or TRPMD run using a single qNEP potential and
-``pimd_bead_batch on``, the centroid potential and virial are evaluated as one
-auxiliary lane of the existing qNEP bead batch. This is the default behavior
-when ``deferred_centroid_qnep`` is 0, and avoids an additional
-single-configuration qNEP force call at every HAC sample. The auxiliary lane
-is not integrated and does not change the physical bead forces or ring-polymer
-dynamics. If these conditions are not met, the original single-configuration
-centroid calculation is used as a safe fallback.
+``pimd_bead_batch on``, the physical bead batch uses the global reciprocal virial
+path. When ``use_centroid_heat_flux`` is 1, the current centroid structure is
+evaluated separately at each HAC sample with the complete per-atom virial path.
+This keeps the physical batch at ``P`` lanes and does not change the physical
+bead forces or ring-polymer dynamics.
 
 The optional fifth parameter :attr:`split_qnep_heat_by_type` can be set to 1 to export an
 additional type-resolved heat-current file with the electrostatic and non-electrostatic
@@ -97,12 +95,9 @@ This enables both optional flags:
   The file name is ``heat_current_type_resolved_qnep_split_centroid.out`` when the centroid flag is 1,
   and ``heat_current_type_resolved_qnep_split.out`` otherwise.
 
-At the end of a run with the centroid flag enabled, the log reports the
-number of centroid HAC samples served by the qNEP batch cache and the number
-that used the serial fallback. For fixed-box qNEP PIMD/RPMD/TRPMD runs, the
-auxiliary lane is allocated as part of a fixed ``P+1``-lane batch capacity but
-is active only on HAC sampling force calls; non-sampling force calls use only
-the ``P`` physical lanes. The log also reports the physical batch-call count
-(including the initial force evaluation) and the active/inactive auxiliary-lane
-counts. The split qNEP option still performs its separate non-electrostatic
-evaluation at sampled frames.
+At the end of a run with the centroid flag enabled, the log reports the number
+of direct centroid evaluations. With ``pimd_nep_batch_profile on``, qNEP batch
+timing also reports how many PPPM batches used the full per-atom reciprocal
+virial path and how many used the cheaper global-virial path. The split qNEP
+option still performs its separate non-electrostatic evaluation at sampled
+frames.

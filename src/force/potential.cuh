@@ -39,6 +39,8 @@ struct PIMD_Batch_Timing
   double total = 0.0;
   long long calls = 0;
   long long neighbor_rebuild_beads = 0;
+  long long pppm_full_peratom_virial_batch_calls = 0;
+  long long pppm_global_virial_batch_calls = 0;
 };
 
 class Potential

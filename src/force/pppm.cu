@@ -1062,6 +1062,7 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
 void PPPM::initialize(const float alpha_input)
 {
   need_peratom_virial = check_need_peratom_virial();
+  need_peratom_virial_every_batch = check_need_peratom_virial_every_batch();
   para.alpha = alpha_input;
   para.alpha_factor = 0.25f / (para.alpha * para.alpha);
   para.K[0] = 16;
@@ -1279,11 +1280,16 @@ void PPPM::find_force_batch(
   const GPU_Vector<double*>& force_per_atom,
   const GPU_Vector<double*>& virial_per_atom,
   const GPU_Vector<double*>& potential_per_atom,
-  const int number_of_beads)
+  const int number_of_beads,
+  const bool request_peratom_virial)
 {
   if (number_of_beads <= 0) {
+    last_batch_used_peratom_virial_ = false;
     return;
   }
+  const bool calculate_peratom_virial =
+    need_peratom_virial_every_batch || request_peratom_virial;
+  last_batch_used_peratom_virial_ = calculate_peratom_virial;
   find_para(N, box);
   allocate_batch_memory(number_of_beads);
   const int mesh_grid = (para.K0K1K2 - 1) / 64 + 1;
@@ -1318,7 +1324,7 @@ void PPPM::find_force_batch(
     mesh_batch.data(),
     mesh_inverse_batch.data());
   GPU_CHECK_KERNEL
-  if (need_peratom_virial) {
+  if (calculate_peratom_virial) {
     find_mesh_virial_batch<<<mesh_grid_batch, 64>>>(
       para,
       number_of_beads,
@@ -1338,7 +1344,7 @@ void PPPM::find_force_batch(
     std::cout << "GPUFFT error: batched inverse failed" << std::endl;
     exit(1);
   }
-  if (need_peratom_virial) {
+  if (calculate_peratom_virial) {
     if (gpufftExecC2C(
           plan_virial_batch,
           mesh_virial_batch.data(),

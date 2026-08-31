@@ -106,9 +106,10 @@ bool check_is_nep_charge()
   return is_nep_charge;
 }
 
-bool check_need_peratom_virial()
+static void scan_need_peratom_virial(bool& need_anywhere, bool& need_every_batch)
 {
-  bool need_peratom_virial = false;
+  need_anywhere = false;
+  need_every_batch = false;
   std::ifstream input_run("run.in");
   if (!input_run.is_open()) {
     PRINT_INPUT_ERROR("Cannot open run.in.");
@@ -117,39 +118,68 @@ bool check_need_peratom_virial()
   while (std::getline(input_run, line)) {
     std::vector<std::string> tokens = get_tokens(line);
     if (tokens.size() != 0) {
-      if (tokens[0] == "compute_hac" || 
-        tokens[0] == "compute_hnemd" || 
-        tokens[0] == "compute_hnemdec" || 
-        tokens[0] == "compute_shc" ||
-        tokens[0] == "compute_gkma" ||
-        tokens[0] == "compute_hnema") {
-        need_peratom_virial = true;
+      if (tokens[0] == "compute_hac") {
+        need_anywhere = true;
+        int centroid_flag = 0;
+        if (tokens.size() < 5) {
+          need_every_batch = true;
+        } else if (!is_valid_int(tokens[4].c_str(), &centroid_flag)) {
+          // The input parser will report the malformed flag later; keep the
+          // conservative old scheduling behavior during potential setup.
+          need_every_batch = true;
+        } else if (centroid_flag == 0) {
+          need_every_batch = true;
+        }
+      } else if (tokens[0] == "compute_hnemd" ||
+                 tokens[0] == "compute_hnemdec" ||
+                 tokens[0] == "compute_shc" ||
+                 tokens[0] == "compute_gkma" ||
+                 tokens[0] == "compute_hnema") {
+        need_anywhere = true;
+        need_every_batch = true;
         break;
       }
       if (tokens[0] == "compute") {
         for (const auto& token : tokens) {
           if (token == "virial" || token == "jp") {
-            need_peratom_virial = true;
+            need_anywhere = true;
+            need_every_batch = true;
             break;
           }
         }
-        if (need_peratom_virial) {
+        if (need_every_batch) {
           break;
         }
       }
       if (tokens[0] == "dump_xyz" || tokens[0] == "dump_netcdf") {
         for (const auto& token : tokens) {
           if (token == "virial") {
-            need_peratom_virial = true;
+            need_anywhere = true;
+            need_every_batch = true;
             break;
           }
         }
-        if (need_peratom_virial) {
+        if (need_every_batch) {
           break;
         }
       }
     }
   }
   input_run.close();
-  return need_peratom_virial;
+}
+
+bool check_need_peratom_virial()
+{
+  bool need_anywhere = false;
+  bool need_every_batch = false;
+  scan_need_peratom_virial(need_anywhere, need_every_batch);
+  return need_anywhere;
+}
+
+bool check_need_peratom_virial_every_batch()
+{
+  bool need_anywhere = false;
+  bool need_every_batch = false;
+  scan_need_peratom_virial(need_anywhere, need_every_batch);
+  return need_every_batch;
 }

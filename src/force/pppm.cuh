@@ -51,7 +51,9 @@ public:
     const GPU_Vector<double*>& force_per_atom,
     const GPU_Vector<double*>& virial_per_atom,
     const GPU_Vector<double*>& potential_per_atom,
-    const int number_of_beads);
+    const int number_of_beads,
+    const bool request_peratom_virial = false);
+  bool last_batch_used_peratom_virial() const { return last_batch_used_peratom_virial_; }
   struct Para {
     int K0K1K2;             // total number of mesh points
     int K0K1;               // K[0] * K[1]
@@ -88,6 +90,8 @@ private:
   void find_k_and_G(const double* box);
 
   bool need_peratom_virial = false;
+  bool need_peratom_virial_every_batch = false;
+  bool last_batch_used_peratom_virial_ = false;
   GPU_Vector<gpufftComplex> mesh_virial;
   gpufftHandle plan_virial = 0;
   GPU_Vector<gpufftComplex> mesh_virial_batch;

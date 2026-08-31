@@ -93,8 +93,7 @@ private:
   std::vector<GPU_Vector<double>> deferred_force_frames_gpu_;
   std::vector<GPU_Vector<double>> deferred_virial_frames_gpu_;
   long long centroid_sampled_frames_ = 0;
-  long long centroid_batch_cache_hits_ = 0;
-  long long centroid_serial_fallbacks_ = 0;
+  long long centroid_direct_evaluations_ = 0;
   double deferred_staging_wall_time_ = 0.0;
   double deferred_upload_wall_time_ = 0.0;
   double deferred_qnep_wall_time_ = 0.0;
