@@ -14,7 +14,7 @@ Syntax
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [bead_diagnostic [f_min span_min [center_max centroid_max]]]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [bead_diagnostic [f_min span_min [center_max centroid_max]]] [output netcdf filename [deflate_level]] [output_level summary|events|full] [snapshots endpoints|best|all]
 
 For example::
 
@@ -107,6 +107,34 @@ and skipped; they are not counted as physical geometry loss. The numerical O-O r
 calibrated from the ranked O-O distributions at the target pressure. For a 30 GPa structure,
 2.65 Å is a reasonable starting upper bound, but it should be kept identical for pure and
 salt ice during comparison.
+
+Compressed NetCDF output
+------------------------
+
+Text output remains the default. To write one compressed, self-contained NetCDF-4 observer file
+instead of the text files, add ``output netcdf`` with a new filename. The optional deflate level
+is an integer from 0 to 9 and defaults to 4. The file is created without clobbering an existing
+file; an existing file must be removed or renamed before rerunning::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0 output netcdf proton_observer.nc 4
+
+``output_level summary`` stores only window, edge-window, local-environment-window, and final
+bond tables. ``events`` adds attempts, confirmed transfers, sparse defect changes, and bead
+diagnostics. ``full`` additionally stores the five available local-environment event slots.
+The default NetCDF level is ``full``. ``snapshots endpoints`` keeps start/end local-environment
+slots, ``best`` keeps start/end plus the two representative bead selections, and ``all`` keeps
+all five available slots (start, end, last_valid, centroid_best, delocalization_best). The
+observer does not retain every sampled local-environment frame, so ``all`` means all retained
+event snapshots rather than every trajectory frame.
+
+The NetCDF file uses relational links rather than repeating O/H IDs: ``edge_id`` refers to the
+zero-based O pair in ``/edge/oxygen``, and ``window_index`` links an edge row to the corresponding
+row in ``/window``. Attempt rows use their zero-based row index as the implicit event ID.
+Continuous physical values are stored as ``double``; integer IDs and counts
+are stored as integer variables; outcome, quantum-class, and flag variables use compact byte
+types. All variables are chunked with shuffle and deflate compression. NetCDF output requires a
+GPUMD build with ``USE_NETCDF=1`` and NetCDF-4/HDF5 support. It is intended for separate output
+files per sample directory and does not append across runs.
 
 Output
 ------

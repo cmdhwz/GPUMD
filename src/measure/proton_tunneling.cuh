@@ -166,6 +166,26 @@ public:
     const double temperature) override;
 
 private:
+  enum class OutputFormat
+  {
+    TEXT,
+    NETCDF
+  };
+
+  enum class OutputLevel
+  {
+    SUMMARY,
+    EVENTS,
+    FULL
+  };
+
+  enum class SnapshotMode
+  {
+    ENDPOINTS,
+    BEST,
+    ALL
+  };
+
   enum class QuantumCharacter
   {
     CLASSICAL_ONLY,
@@ -553,6 +573,8 @@ private:
     const LocalEnvironment& environment,
     const char* quantum_class);
   void write_final_bonds();
+  void write_text_output_files();
+  void write_netcdf_output_file();
   void write_output_files();
 
   int sample_interval_ = 1;
@@ -596,6 +618,12 @@ private:
   double window_start_time_fs_ = 0.0;
   double last_time_fs_ = 0.0;
   bool initialized_ = false;
+
+  OutputFormat output_format_ = OutputFormat::TEXT;
+  OutputLevel output_level_ = OutputLevel::FULL;
+  SnapshotMode snapshot_mode_ = SnapshotMode::ALL;
+  std::string output_filename_ = "proton_observer.nc";
+  int compression_level_ = 4;
 
   std::string oxygen_symbol_ = "O";
   std::string hydrogen_symbol_ = "H";

@@ -30,15 +30,96 @@ propagation chains offline.
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#ifdef USE_NETCDF
+#include "netcdf.h"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
 namespace
 {
+#ifdef USE_NETCDF
+void netcdf_check(const int status, const char* operation)
+{
+  if (status != NC_NOERR) {
+    fprintf(stderr, "Proton observer NetCDF error in %s: %s\n", operation, nc_strerror(status));
+    std::exit(2);
+  }
+}
+
+void netcdf_text_attribute(const int group, const int variable, const char* name, const char* value)
+{
+  netcdf_check(
+    nc_put_att_text(group, variable, name, std::strlen(value), value), "nc_put_att_text");
+}
+
+int netcdf_dimension(const int group, const char* name, const size_t length)
+{
+  int dimension = -1;
+  netcdf_check(nc_def_dim(group, name, length, &dimension), "nc_def_dim");
+  return dimension;
+}
+
+int netcdf_variable(
+  const int group,
+  const char* name,
+  const nc_type type,
+  const std::vector<int>& dimensions,
+  const std::vector<size_t>& lengths,
+  const int compression_level)
+{
+  int variable = -1;
+  netcdf_check(
+    nc_def_var(group, name, type, static_cast<int>(dimensions.size()), dimensions.data(), &variable),
+    "nc_def_var");
+  if (!dimensions.empty()) {
+    std::vector<size_t> chunks(dimensions.size(), 1);
+    for (size_t i = 0; i < dimensions.size(); ++i)
+      chunks[i] = std::max<size_t>(1, std::min<size_t>(lengths[i], 16384));
+    netcdf_check(nc_def_var_chunking(group, variable, NC_CHUNKED, chunks.data()), "nc_def_var_chunking");
+    netcdf_check(
+      nc_def_var_deflate(group, variable, 1, 1, compression_level), "nc_def_var_deflate");
+  }
+  return variable;
+}
+
+void netcdf_write_double(const int group, const int variable, const std::vector<double>& values)
+{
+  if (!values.empty())
+    netcdf_check(nc_put_var_double(group, variable, values.data()), "nc_put_var_double");
+}
+
+void netcdf_write_int(const int group, const int variable, const std::vector<int>& values)
+{
+  if (!values.empty())
+    netcdf_check(nc_put_var_int(group, variable, values.data()), "nc_put_var_int");
+}
+
+void netcdf_write_ubyte(
+  const int group,
+  const int variable,
+  const std::vector<unsigned char>& values)
+{
+  if (!values.empty())
+    netcdf_check(nc_put_var_ubyte(group, variable, values.data()), "nc_put_var_ubyte");
+}
+
+void netcdf_write_longlong(
+  const int group,
+  const int variable,
+  const std::vector<long long>& values)
+{
+  if (!values.empty())
+    netcdf_check(nc_put_var_longlong(group, variable, values.data()), "nc_put_var_longlong");
+}
+
+#endif
+
 unsigned long long make_bond_key(const int oxygen_low, const int oxygen_high)
 {
   return (static_cast<unsigned long long>(static_cast<unsigned int>(oxygen_low)) << 32) |
@@ -615,7 +696,9 @@ void Proton_Tunneling::parse(
   const auto is_option = [](const char* value) {
     return std::strcmp(value, "ion_field") == 0 || std::strcmp(value, "oho_angle") == 0 ||
       std::strcmp(value, "bead_diagnostic") == 0 ||
-      std::strcmp(value, "local_environment") == 0;
+      std::strcmp(value, "local_environment") == 0 ||
+      std::strcmp(value, "output") == 0 || std::strcmp(value, "output_level") == 0 ||
+      std::strcmp(value, "snapshots") == 0;
   };
   if (next_param < num_param && !is_option(param[next_param])) {
     if (next_param + 1 >= num_param || is_option(param[next_param + 1])) {
@@ -627,6 +710,9 @@ void Proton_Tunneling::parse(
   bool angle_seen = false;
   bool bead_diagnostic_seen = false;
   bool local_environment_seen = false;
+  bool output_seen = false;
+  bool output_level_seen = false;
+  bool snapshots_seen = false;
   while (next_param < num_param) {
     if (std::strcmp(param[next_param], "oho_angle") == 0) {
       if (angle_seen || next_param + 1 >= num_param ||
@@ -699,6 +785,66 @@ void Proton_Tunneling::parse(
           "local_environment requires positive ion/H-Cl cutoffs and an H-Cl angle between 0 and 180 degrees.");
       }
       next_param += 5;
+    } else if (std::strcmp(param[next_param], "output") == 0) {
+      if (output_seen || next_param + 1 >= num_param) {
+        PRINT_INPUT_ERROR("output must be followed by text or netcdf settings.");
+      }
+      output_seen = true;
+      if (std::strcmp(param[next_param + 1], "text") == 0) {
+        output_format_ = OutputFormat::TEXT;
+        next_param += 2;
+      } else if (std::strcmp(param[next_param + 1], "netcdf") == 0) {
+#ifndef USE_NETCDF
+        PRINT_INPUT_ERROR(
+          "output netcdf requires a GPUMD build with USE_NETCDF=1 and NetCDF4 support.");
+#endif
+        if (next_param + 2 >= num_param || is_option(param[next_param + 2]) ||
+            std::strlen(param[next_param + 2]) == 0) {
+          PRINT_INPUT_ERROR("output netcdf must be followed by a filename and optional level.");
+        }
+        output_format_ = OutputFormat::NETCDF;
+        output_filename_ = param[next_param + 2];
+        next_param += 3;
+        if (next_param < num_param && !is_option(param[next_param])) {
+          if (!is_valid_int(param[next_param], &compression_level_) ||
+              compression_level_ < 0 || compression_level_ > 9) {
+            PRINT_INPUT_ERROR("NetCDF compression level should be an integer from 0 to 9.");
+          }
+          ++next_param;
+        }
+      } else {
+        PRINT_INPUT_ERROR("output format should be text or netcdf.");
+      }
+    } else if (std::strcmp(param[next_param], "output_level") == 0) {
+      if (output_level_seen || next_param + 1 >= num_param) {
+        PRINT_INPUT_ERROR("output_level must be followed by summary, events, or full.");
+      }
+      output_level_seen = true;
+      if (std::strcmp(param[next_param + 1], "summary") == 0) {
+        output_level_ = OutputLevel::SUMMARY;
+      } else if (std::strcmp(param[next_param + 1], "events") == 0) {
+        output_level_ = OutputLevel::EVENTS;
+      } else if (std::strcmp(param[next_param + 1], "full") == 0) {
+        output_level_ = OutputLevel::FULL;
+      } else {
+        PRINT_INPUT_ERROR("output_level should be summary, events, or full.");
+      }
+      next_param += 2;
+    } else if (std::strcmp(param[next_param], "snapshots") == 0) {
+      if (snapshots_seen || next_param + 1 >= num_param) {
+        PRINT_INPUT_ERROR("snapshots must be followed by endpoints, best, or all.");
+      }
+      snapshots_seen = true;
+      if (std::strcmp(param[next_param + 1], "endpoints") == 0) {
+        snapshot_mode_ = SnapshotMode::ENDPOINTS;
+      } else if (std::strcmp(param[next_param + 1], "best") == 0) {
+        snapshot_mode_ = SnapshotMode::BEST;
+      } else if (std::strcmp(param[next_param + 1], "all") == 0) {
+        snapshot_mode_ = SnapshotMode::ALL;
+      } else {
+        PRINT_INPUT_ERROR("snapshots should be endpoints, best, or all.");
+      }
+      next_param += 2;
     } else {
       PRINT_INPUT_ERROR("unknown optional compute_proton_tunneling setting.");
     }
@@ -740,6 +886,10 @@ void Proton_Tunneling::parse(
   if (ion_field_enabled_ && (ion1_indices_.empty() || ion2_indices_.empty())) {
     PRINT_INPUT_ERROR("ion_field could not find both requested ion species.");
   }
+  if (output_format_ != OutputFormat::NETCDF &&
+      (output_level_seen || snapshots_seen)) {
+    PRINT_INPUT_ERROR("output_level and snapshots require output netcdf.");
+  }
 
   printf("    sample interval is %d steps.\n", sample_interval_);
   printf("    window size is %d sampled frames.\n", window_samples_);
@@ -750,6 +900,14 @@ void Proton_Tunneling::parse(
   printf("    minimum O-H-O angle is %.6f degrees.\n", oho_angle_min_deg_);
   printf("    using oxygen symbol %s and hydrogen symbol %s.\n",
     oxygen_symbol_.c_str(), hydrogen_symbol_.c_str());
+  if (output_format_ == OutputFormat::NETCDF) {
+    const char* level = output_level_ == OutputLevel::SUMMARY ? "summary" :
+      (output_level_ == OutputLevel::EVENTS ? "events" : "full");
+    const char* snapshots = snapshot_mode_ == SnapshotMode::ENDPOINTS ? "endpoints" :
+      (snapshot_mode_ == SnapshotMode::BEST ? "best" : "all");
+    printf("    compressed NetCDF output is %s, deflate level %d, output level %s, snapshots %s.\n",
+      output_filename_.c_str(), compression_level_, level, snapshots);
+  }
   if (bead_diagnostic_enabled_) {
     printf("    strict bead diagnostic uses f_min %.6f, center_max %.6f, centroid_max %.6f, "
            "and span_min %.6f Angstrom.\n",
@@ -2632,7 +2790,7 @@ void Proton_Tunneling::write_local_environment_event(
     quantum_class);
 }
 
-void Proton_Tunneling::write_output_files()
+void Proton_Tunneling::write_text_output_files()
 {
   bias_file_ = my_fopen("proton_bias.out", "a");
   transfer_file_ = my_fopen("proton_transfer.out", "a");
@@ -3073,6 +3231,859 @@ void Proton_Tunneling::write_output_files()
   bond_file_ = nullptr;
   local_environment_window_file_ = nullptr;
   local_environment_event_file_ = nullptr;
+}
+
+void Proton_Tunneling::write_netcdf_output_file()
+{
+#ifndef USE_NETCDF
+  PRINT_INPUT_ERROR(
+    "proton observer NetCDF output requires a GPUMD build with USE_NETCDF=1 and NetCDF4 support.");
+#else
+  const bool include_events = output_level_ != OutputLevel::SUMMARY;
+  const bool include_full = output_level_ == OutputLevel::FULL;
+  int ncid = -1;
+  const int create_status = nc_create(
+    output_filename_.c_str(), NC_NETCDF4 | NC_NOCLOBBER, &ncid);
+  if (create_status != NC_NOERR) {
+    if (create_status == NC_EEXIST) {
+      fprintf(stderr,
+        "Proton observer NetCDF output %s already exists; remove or rename it before rerunning.\n",
+        output_filename_.c_str());
+    } else {
+      fprintf(stderr, "Proton observer cannot create NetCDF output %s: %s\n",
+        output_filename_.c_str(), nc_strerror(create_status));
+    }
+    std::exit(2);
+  }
+
+  netcdf_text_attribute(ncid, NC_GLOBAL, "program", "GPUMD");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "observer", "compute_proton_tunneling");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "format", "GPUMD proton observer NetCDF-4");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "1");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "oxygen_symbol", oxygen_symbol_.c_str());
+  netcdf_text_attribute(ncid, NC_GLOBAL, "hydrogen_symbol", hydrogen_symbol_.c_str());
+  netcdf_text_attribute(ncid, NC_GLOBAL, "ion1_symbol", ion1_symbol_.c_str());
+  netcdf_text_attribute(ncid, NC_GLOBAL, "ion2_symbol", ion2_symbol_.c_str());
+  const char* output_level = output_level_ == OutputLevel::SUMMARY ? "summary" :
+    (output_level_ == OutputLevel::EVENTS ? "events" : "full");
+  const char* snapshot_mode = snapshot_mode_ == SnapshotMode::ENDPOINTS ? "endpoints" :
+    (snapshot_mode_ == SnapshotMode::BEST ? "best" : "all");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "output_level", output_level);
+  netcdf_text_attribute(ncid, NC_GLOBAL, "snapshot_mode", snapshot_mode);
+  netcdf_text_attribute(ncid, NC_GLOBAL, "outcome_enum", "0=success,1=return,2=geometry_lost,3=run_end");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "quantum_class_enum",
+    "0=classical_only,1=two_well_delocalized,2=barrier_centered_tunneling_like,"
+    "3=compact_single_domain,4=multi_kink_or_multi_domain,5=ambiguous,255=not_applicable");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "compression", "shuffle=1,deflate=1");
+  netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "compression_level", NC_INT, 1,
+    &compression_level_), "nc_put_att_int");
+  netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "sample_interval", NC_INT, 1,
+    &sample_interval_), "nc_put_att_int");
+  netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "window_samples", NC_INT, 1,
+    &window_samples_), "nc_put_att_int");
+
+  std::vector<unsigned long long> edge_keys;
+  const auto add_edge = [&](const int oxygen_low, const int oxygen_high) {
+    if (oxygen_low >= 0 && oxygen_high >= 0)
+      edge_keys.push_back(make_bond_key(oxygen_low, oxygen_high));
+  };
+  for (const EdgeWindowRecord& record : edge_window_records_)
+    add_edge(record.oxygen_low, record.oxygen_high);
+  for (const LocalEnvironmentWindowRecord& record : local_environment_window_records_)
+    add_edge(record.oxygen_low, record.oxygen_high);
+  for (const AttemptRecord& record : attempt_records_)
+    add_edge(record.oxygen_low, record.oxygen_high);
+  for (const auto& item : total_bonds_) {
+    int oxygen_low;
+    int oxygen_high;
+    decode_bond_key(item.first, oxygen_low, oxygen_high);
+    add_edge(oxygen_low, oxygen_high);
+  }
+  std::sort(edge_keys.begin(), edge_keys.end());
+  edge_keys.erase(std::unique(edge_keys.begin(), edge_keys.end()), edge_keys.end());
+  std::unordered_map<unsigned long long, int> edge_ids;
+  edge_ids.reserve(edge_keys.size());
+  for (size_t i = 0; i < edge_keys.size(); ++i)
+    edge_ids[edge_keys[i]] = static_cast<int>(i);
+
+  std::unordered_map<long long, int> window_ids;
+  window_ids.reserve(window_records_.size());
+  for (size_t i = 0; i < window_records_.size(); ++i)
+    window_ids[window_records_[i].window_id] = static_cast<int>(i);
+
+  int edge_group = -1;
+  int edge_oxygen_var = -1;
+  if (!edge_keys.empty()) {
+    netcdf_check(nc_def_grp(ncid, "edge", &edge_group), "nc_def_grp");
+    const int edge_dim = netcdf_dimension(edge_group, "edge", edge_keys.size());
+    const int endpoint_dim = netcdf_dimension(edge_group, "endpoint", 2);
+    edge_oxygen_var = netcdf_variable(edge_group, "oxygen", NC_INT,
+      {edge_dim, endpoint_dim}, {edge_keys.size(), 2}, compression_level_);
+    netcdf_text_attribute(edge_group, edge_oxygen_var,
+      "description", "zero-based O atom indices; edge row is the edge_id");
+  }
+
+  int window_group = -1;
+  int window_time_var = -1;
+  int window_value_var = -1;
+  int window_count_var = -1;
+  std::vector<double> window_times;
+  std::vector<double> window_values;
+  std::vector<long long> window_counts;
+  const std::vector<const char*> window_value_names = {
+    "B_mean", "f_02", "f_04", "mean_abs_delta_f", "flip_rate_per_ps",
+    "positive_defects", "negative_defects", "valid_pairs_per_frame"};
+  const std::vector<const char*> window_count_names = {
+    "active_bonds", "assignment_ambiguous_samples", "pair_conflict_samples"};
+  if (!window_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "window", &window_group), "nc_def_grp");
+    const int window_dim = netcdf_dimension(window_group, "window", window_records_.size());
+    const int endpoint_dim = netcdf_dimension(window_group, "endpoint", 2);
+    const int value_dim = netcdf_dimension(window_group, "value", window_value_names.size());
+    const int count_dim = netcdf_dimension(window_group, "count", window_count_names.size());
+    window_time_var = netcdf_variable(window_group, "time_fs", NC_DOUBLE,
+      {window_dim, endpoint_dim}, {window_records_.size(), 2}, compression_level_);
+    window_value_var = netcdf_variable(window_group, "value", NC_DOUBLE,
+      {window_dim, value_dim}, {window_records_.size(), window_value_names.size()}, compression_level_);
+    window_count_var = netcdf_variable(window_group, "count", NC_INT64,
+      {window_dim, count_dim}, {window_records_.size(), window_count_names.size()}, compression_level_);
+    netcdf_text_attribute(window_group, window_value_var, "field_names",
+      "B_mean,f_02,f_04,mean_abs_delta_f,flip_rate_per_ps,positive_defects,negative_defects,valid_pairs_per_frame");
+    netcdf_text_attribute(window_group, window_count_var, "field_names",
+      "active_bonds,assignment_ambiguous_samples,pair_conflict_samples");
+    window_times.reserve(window_records_.size() * 2);
+    window_values.reserve(window_records_.size() * window_value_names.size());
+    window_counts.reserve(window_records_.size() * window_count_names.size());
+    for (const WindowRecord& record : window_records_) {
+      window_times.push_back(record.time_start_fs);
+      window_times.push_back(record.time_end_fs);
+      window_values.insert(window_values.end(), {
+        record.B_mean, record.f_02, record.f_04, record.mean_abs_delta_f, record.flip_rate,
+        record.positive_defects, record.negative_defects, record.valid_pairs_per_frame});
+      window_counts.insert(window_counts.end(), {
+        record.active_bonds, record.assignment_ambiguous_samples, record.pair_conflict_samples});
+    }
+  }
+
+  int edge_window_group = -1;
+  int edge_window_edge_var = -1;
+  int edge_window_window_var = -1;
+  int edge_window_value_var = -1;
+  int edge_window_count_var = -1;
+  std::vector<int> edge_window_edges;
+  std::vector<int> edge_window_windows;
+  std::vector<double> edge_window_values;
+  std::vector<long long> edge_window_counts;
+  const std::vector<const char*> edge_window_value_names = {
+    "geometry_occupancy", "asymmetry", "abs_asymmetry", "delta_f", "success_probability",
+    "mean_delta", "mean_abs_delta", "mean_dOO", "mean_rperp", "mean_E_parallel",
+    "std_E_parallel", "corr_delta_E_parallel", "mean_E_success", "mean_E_return",
+    "nearest_ion1_distance", "nearest_ion2_distance", "log_population_ratio",
+    "beta_DeltaF_high_minus_low", "abs_beta_DeltaF", "mean_delta_phi_ion",
+    "std_delta_phi_ion", "corr_delta_delta_phi", "mean_ion1_to_O_low", "mean_ion1_to_O_high",
+    "mean_delta_d_ion1", "mean_ion2_to_O_low", "mean_ion2_to_O_high", "mean_delta_d_ion2"};
+  const std::vector<const char*> edge_window_count_names = {
+    "n_plus", "n_minus", "n_deadband", "attempts", "successes", "returns", "geometry_lost"};
+  if (!edge_window_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "edge_window", &edge_window_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(edge_window_group, "row", edge_window_records_.size());
+    const int value_dim = netcdf_dimension(edge_window_group, "value", edge_window_value_names.size());
+    const int count_dim = netcdf_dimension(edge_window_group, "count", edge_window_count_names.size());
+    edge_window_edge_var = netcdf_variable(edge_window_group, "edge_id", NC_INT,
+      {row_dim}, {edge_window_records_.size()}, compression_level_);
+    edge_window_window_var = netcdf_variable(edge_window_group, "window_index", NC_INT,
+      {row_dim}, {edge_window_records_.size()}, compression_level_);
+    edge_window_value_var = netcdf_variable(edge_window_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {edge_window_records_.size(), edge_window_value_names.size()}, compression_level_);
+    edge_window_count_var = netcdf_variable(edge_window_group, "count", NC_INT64,
+      {row_dim, count_dim}, {edge_window_records_.size(), edge_window_count_names.size()}, compression_level_);
+    netcdf_text_attribute(edge_window_group, edge_window_value_var, "field_names",
+      "geometry_occupancy,asymmetry,abs_asymmetry,delta_f,success_probability,mean_delta,"
+      "mean_abs_delta,mean_dOO,mean_rperp,mean_E_parallel,std_E_parallel,corr_delta_E_parallel,"
+      "mean_E_success,mean_E_return,nearest_ion1_distance,nearest_ion2_distance,log_population_ratio,"
+      "beta_DeltaF_high_minus_low,abs_beta_DeltaF,mean_delta_phi_ion,std_delta_phi_ion,"
+      "corr_delta_delta_phi,mean_ion1_to_O_low,mean_ion1_to_O_high,mean_delta_d_ion1,"
+      "mean_ion2_to_O_low,mean_ion2_to_O_high,mean_delta_d_ion2");
+    netcdf_text_attribute(edge_window_group, edge_window_count_var, "field_names",
+      "n_plus,n_minus,n_deadband,attempts,successes,returns,geometry_lost");
+    edge_window_edges.reserve(edge_window_records_.size());
+    edge_window_windows.reserve(edge_window_records_.size());
+    edge_window_values.reserve(edge_window_records_.size() * edge_window_value_names.size());
+    edge_window_counts.reserve(edge_window_records_.size() * edge_window_count_names.size());
+    for (const EdgeWindowRecord& record : edge_window_records_) {
+      edge_window_edges.push_back(edge_ids[make_bond_key(record.oxygen_low, record.oxygen_high)]);
+      const auto window_item = window_ids.find(record.window_id);
+      edge_window_windows.push_back(window_item == window_ids.end() ? -1 : window_item->second);
+      edge_window_values.insert(edge_window_values.end(), {
+        record.geometry_occupancy, record.asymmetry, record.abs_asymmetry, record.delta_f,
+        record.success_probability, record.mean_delta, record.mean_abs_delta, record.mean_dOO,
+        record.mean_rperp, record.mean_E_parallel, record.std_E_parallel,
+        record.corr_delta_E_parallel, record.mean_E_success, record.mean_E_return,
+        record.nearest_ion1_distance, record.nearest_ion2_distance, record.log_population_ratio,
+        record.beta_DeltaF_high_minus_low, record.abs_beta_DeltaF, record.mean_delta_phi_ion,
+        record.std_delta_phi_ion, record.corr_delta_delta_phi, record.mean_ion1_to_O_low,
+        record.mean_ion1_to_O_high, record.mean_delta_d_ion1, record.mean_ion2_to_O_low,
+        record.mean_ion2_to_O_high, record.mean_delta_d_ion2});
+      edge_window_counts.insert(edge_window_counts.end(), {
+        record.n_plus, record.n_minus, record.n_deadband, record.attempts, record.successes,
+        record.returns, record.geometry_lost});
+    }
+  }
+
+  int bond_group = -1;
+  int bond_edge_var = -1;
+  int bond_value_var = -1;
+  int bond_count_var = -1;
+  std::vector<int> bond_edges;
+  std::vector<double> bond_values;
+  std::vector<long long> bond_counts;
+  if (!total_bonds_.empty()) {
+    const std::vector<const char*> bond_value_names = {"asymmetry", "abs_asymmetry", "mean_abs_delta"};
+    const std::vector<const char*> bond_count_names = {
+      "geometry_samples", "n_plus", "n_minus", "transitions"};
+    netcdf_check(nc_def_grp(ncid, "bond", &bond_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(bond_group, "row", total_bonds_.size());
+    const int value_dim = netcdf_dimension(bond_group, "value", bond_value_names.size());
+    const int count_dim = netcdf_dimension(bond_group, "count", bond_count_names.size());
+    bond_edge_var = netcdf_variable(bond_group, "edge_id", NC_INT,
+      {row_dim}, {total_bonds_.size()}, compression_level_);
+    bond_value_var = netcdf_variable(bond_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {total_bonds_.size(), bond_value_names.size()}, compression_level_);
+    bond_count_var = netcdf_variable(bond_group, "count", NC_INT64,
+      {row_dim, count_dim}, {total_bonds_.size(), bond_count_names.size()}, compression_level_);
+    netcdf_text_attribute(bond_group, bond_value_var, "field_names",
+      "asymmetry,abs_asymmetry,mean_abs_delta");
+    netcdf_text_attribute(bond_group, bond_count_var, "field_names",
+      "geometry_samples,n_plus,n_minus,transitions");
+    for (const auto& item : total_bonds_) {
+      int oxygen_low;
+      int oxygen_high;
+      decode_bond_key(item.first, oxygen_low, oxygen_high);
+      bond_edges.push_back(edge_ids[make_bond_key(oxygen_low, oxygen_high)]);
+      const BondStats& stats = item.second;
+      const long long biased_samples = stats.n_plus + stats.n_minus;
+      const double asymmetry = biased_samples > 0
+        ? static_cast<double>(stats.n_plus - stats.n_minus) / biased_samples :
+        std::numeric_limits<double>::quiet_NaN();
+      bond_values.insert(bond_values.end(), {
+        asymmetry, std::abs(asymmetry),
+        stats.geometry_samples > 0 ? stats.sum_abs_delta / stats.geometry_samples :
+          std::numeric_limits<double>::quiet_NaN()});
+      bond_counts.insert(bond_counts.end(), {
+        stats.geometry_samples, stats.n_plus, stats.n_minus, stats.transitions});
+    }
+  }
+
+  int local_window_group = -1;
+  int local_window_edge_var = -1;
+  int local_window_window_var = -1;
+  int local_window_value_var = -1;
+  int local_window_count_var = -1;
+  std::vector<int> local_window_edges;
+  std::vector<int> local_window_windows;
+  std::vector<double> local_window_values;
+  std::vector<long long> local_window_counts;
+  const std::vector<const char*> local_window_value_names = {
+    "mean_delta", "mean_rOH_low", "mean_rOH_high", "mean_oho_angle", "mean_dOO",
+    "mean_rperp", "mean_path_excess", "mean_nH_low", "mean_nH_high",
+    "mean_donor_edges_low", "mean_donor_edges_high", "mean_acceptor_edges_low",
+    "mean_acceptor_edges_high", "mean_ion1_low_d1", "mean_ion1_low_d2", "mean_ion1_low_d3",
+    "mean_ion1_high_d1", "mean_ion1_high_d2", "mean_ion1_high_d3", "mean_ion2_low_d1",
+    "mean_ion2_low_d2", "mean_ion2_low_d3", "mean_ion2_high_d1", "mean_ion2_high_d2",
+    "mean_ion2_high_d3", "mean_coord_ion1_low", "mean_coord_ion1_high",
+    "mean_coord_ion2_low", "mean_coord_ion2_high", "mean_delta_d_ion1", "mean_delta_d_ion2",
+    "mean_nearest_ion2_to_H", "mean_angle_Olow_H_ion2", "mean_angle_Ohigh_H_ion2",
+    "fraction_hcl_like_low", "fraction_hcl_like_high", "mean_E_parallel",
+    "mean_delta_phi_ion", "std_delta_phi_ion", "corr_delta_delta_phi"};
+  const std::vector<const char*> local_window_count_names = {
+    "samples", "attempts", "successes", "returns", "geometry_lost"};
+  const auto local_mean = [](const double sum, const long long count) {
+    return count > 0 ? sum / static_cast<double>(count) :
+      std::numeric_limits<double>::quiet_NaN();
+  };
+  if (local_environment_enabled_ && !local_environment_window_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "local_environment_window", &local_window_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(
+      local_window_group, "row", local_environment_window_records_.size());
+    const int value_dim = netcdf_dimension(
+      local_window_group, "value", local_window_value_names.size());
+    const int count_dim = netcdf_dimension(
+      local_window_group, "count", local_window_count_names.size());
+    local_window_edge_var = netcdf_variable(local_window_group, "edge_id", NC_INT,
+      {row_dim}, {local_environment_window_records_.size()}, compression_level_);
+    local_window_window_var = netcdf_variable(local_window_group, "window_index", NC_INT,
+      {row_dim}, {local_environment_window_records_.size()}, compression_level_);
+    local_window_value_var = netcdf_variable(local_window_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {local_environment_window_records_.size(), local_window_value_names.size()},
+      compression_level_);
+    local_window_count_var = netcdf_variable(local_window_group, "count", NC_INT64,
+      {row_dim, count_dim}, {local_environment_window_records_.size(), local_window_count_names.size()},
+      compression_level_);
+    netcdf_text_attribute(local_window_group, local_window_value_var, "field_names",
+      "mean_delta,mean_rOH_low,mean_rOH_high,mean_oho_angle,mean_dOO,mean_rperp,"
+      "mean_path_excess,mean_nH_low,mean_nH_high,mean_donor_edges_low,mean_donor_edges_high,"
+      "mean_acceptor_edges_low,mean_acceptor_edges_high,mean_ion1_low_d1,mean_ion1_low_d2,"
+      "mean_ion1_low_d3,mean_ion1_high_d1,mean_ion1_high_d2,mean_ion1_high_d3,mean_ion2_low_d1,"
+      "mean_ion2_low_d2,mean_ion2_low_d3,mean_ion2_high_d1,mean_ion2_high_d2,mean_ion2_high_d3,"
+      "mean_coord_ion1_low,mean_coord_ion1_high,mean_coord_ion2_low,mean_coord_ion2_high,"
+      "mean_delta_d_ion1,mean_delta_d_ion2,mean_nearest_ion2_to_H,mean_angle_Olow_H_ion2,"
+      "mean_angle_Ohigh_H_ion2,fraction_hcl_like_low,fraction_hcl_like_high,mean_E_parallel,"
+      "mean_delta_phi_ion,std_delta_phi_ion,corr_delta_delta_phi");
+    netcdf_text_attribute(local_window_group, local_window_count_var, "field_names",
+      "samples,attempts,successes,returns,geometry_lost");
+    for (const LocalEnvironmentWindowRecord& record : local_environment_window_records_) {
+      const LocalEnvironmentStats& stats = record.stats;
+      const long long samples = stats.samples;
+      const double mean_delta = local_mean(stats.sum_delta, samples);
+      const double mean_phi = ion_field_enabled_ && samples > 0
+        ? stats.sum_delta_phi_ion / samples : std::numeric_limits<double>::quiet_NaN();
+      const double std_phi = ion_field_enabled_ && samples > 0
+        ? std::sqrt(std::max(0.0, stats.sum_delta_phi2 / samples - mean_phi * mean_phi)) :
+        std::numeric_limits<double>::quiet_NaN();
+      double corr_phi = std::numeric_limits<double>::quiet_NaN();
+      if (ion_field_enabled_ && samples > 0) {
+        const double variance_delta = std::max(0.0, stats.sum_delta2 / samples - mean_delta * mean_delta);
+        const double variance_phi = std::max(0.0, stats.sum_delta_phi2 / samples - mean_phi * mean_phi);
+        if (variance_delta > 0.0 && variance_phi > 0.0) {
+          const double covariance = stats.sum_delta_delta_phi / samples - mean_delta * mean_phi;
+          corr_phi = covariance / std::sqrt(variance_delta * variance_phi);
+        }
+      }
+      local_window_edges.push_back(edge_ids[make_bond_key(record.oxygen_low, record.oxygen_high)]);
+      const auto window_item = window_ids.find(record.window_id);
+      local_window_windows.push_back(window_item == window_ids.end() ? -1 : window_item->second);
+      local_window_values.insert(local_window_values.end(), {
+        mean_delta,
+        local_mean(stats.sum_rOH_low, samples), local_mean(stats.sum_rOH_high, samples),
+        local_mean(stats.sum_oho_angle, samples), local_mean(stats.sum_dOO, samples),
+        local_mean(stats.sum_rperp, samples), local_mean(stats.sum_path_excess, samples),
+        local_mean(static_cast<double>(stats.sum_nH_low), samples),
+        local_mean(static_cast<double>(stats.sum_nH_high), samples),
+        local_mean(static_cast<double>(stats.sum_donor_edges_low), samples),
+        local_mean(static_cast<double>(stats.sum_donor_edges_high), samples),
+        local_mean(static_cast<double>(stats.sum_acceptor_edges_low), samples),
+        local_mean(static_cast<double>(stats.sum_acceptor_edges_high), samples),
+        local_mean(stats.sum_ion1_low_d1, stats.count_ion1_low[0]),
+        local_mean(stats.sum_ion1_low_d2, stats.count_ion1_low[1]),
+        local_mean(stats.sum_ion1_low_d3, stats.count_ion1_low[2]),
+        local_mean(stats.sum_ion1_high_d1, stats.count_ion1_high[0]),
+        local_mean(stats.sum_ion1_high_d2, stats.count_ion1_high[1]),
+        local_mean(stats.sum_ion1_high_d3, stats.count_ion1_high[2]),
+        local_mean(stats.sum_ion2_low_d1, stats.count_ion2_low[0]),
+        local_mean(stats.sum_ion2_low_d2, stats.count_ion2_low[1]),
+        local_mean(stats.sum_ion2_low_d3, stats.count_ion2_low[2]),
+        local_mean(stats.sum_ion2_high_d1, stats.count_ion2_high[0]),
+        local_mean(stats.sum_ion2_high_d2, stats.count_ion2_high[1]),
+        local_mean(stats.sum_ion2_high_d3, stats.count_ion2_high[2]),
+        local_mean(static_cast<double>(stats.sum_coord_ion1_low), samples),
+        local_mean(static_cast<double>(stats.sum_coord_ion1_high), samples),
+        local_mean(static_cast<double>(stats.sum_coord_ion2_low), samples),
+        local_mean(static_cast<double>(stats.sum_coord_ion2_high), samples),
+        local_mean(stats.sum_delta_d_ion1, stats.count_delta_d_ion1),
+        local_mean(stats.sum_delta_d_ion2, stats.count_delta_d_ion2),
+        local_mean(stats.sum_nearest_ion2_to_H, stats.count_nearest_ion2_to_H),
+        local_mean(stats.sum_angle_Olow_H_ion2, stats.count_angle_Olow_H_ion2),
+        local_mean(stats.sum_angle_Ohigh_H_ion2, stats.count_angle_Ohigh_H_ion2),
+        local_mean(static_cast<double>(stats.sum_hcl_like_low), samples),
+        local_mean(static_cast<double>(stats.sum_hcl_like_high), samples),
+        ion_field_enabled_ && samples > 0 ? stats.sum_E_parallel / samples :
+          std::numeric_limits<double>::quiet_NaN(),
+        mean_phi, std_phi, corr_phi});
+      local_window_counts.insert(local_window_counts.end(), {
+        stats.samples, stats.attempts, stats.successes, stats.returns, stats.geometry_lost});
+    }
+  }
+
+  int attempt_group = -1;
+  int attempt_time_var = -1;
+  int attempt_hydrogen_var = -1;
+  int attempt_edge_var = -1;
+  int attempt_from_var = -1;
+  int attempt_target_var = -1;
+  int attempt_outcome_var = -1;
+  int attempt_transfer_var = -1;
+  int attempt_nearest_ion_var = -1;
+  int attempt_value_var = -1;
+  std::vector<double> attempt_times;
+  std::vector<int> attempt_hydrogens;
+  std::vector<int> attempt_edges;
+  std::vector<int> attempt_from;
+  std::vector<int> attempt_target;
+  std::vector<unsigned char> attempt_outcomes;
+  std::vector<unsigned char> attempt_has_transfer;
+  std::vector<int> attempt_nearest_ions;
+  std::vector<double> attempt_values;
+  std::unordered_map<long long, int> attempt_rows;
+  const std::vector<const char*> attempt_value_names = {
+    "delta_start", "min_abs_delta", "delta_end", "E_parallel_start", "E_parallel_end",
+    "delta_phi_start", "delta_phi_end", "delta_d_ion1_start", "delta_d_ion2_start",
+    "nearest_ion_distance"};
+  if (include_events && !attempt_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "attempt", &attempt_group), "nc_def_grp");
+    const int attempt_dim = netcdf_dimension(attempt_group, "attempt", attempt_records_.size());
+    const int endpoint_dim = netcdf_dimension(attempt_group, "endpoint", 2);
+    const int value_dim = netcdf_dimension(attempt_group, "value", attempt_value_names.size());
+    attempt_time_var = netcdf_variable(attempt_group, "time_fs", NC_DOUBLE,
+      {attempt_dim, endpoint_dim}, {attempt_records_.size(), 2}, compression_level_);
+    attempt_hydrogen_var = netcdf_variable(attempt_group, "hydrogen", NC_INT,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_edge_var = netcdf_variable(attempt_group, "edge_id", NC_INT,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_from_var = netcdf_variable(attempt_group, "oxygen_from", NC_INT,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_target_var = netcdf_variable(attempt_group, "oxygen_target", NC_INT,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_outcome_var = netcdf_variable(attempt_group, "outcome", NC_UBYTE,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_transfer_var = netcdf_variable(attempt_group, "has_transfer", NC_UBYTE,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_nearest_ion_var = netcdf_variable(attempt_group, "nearest_ion_id", NC_INT,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_value_var = netcdf_variable(attempt_group, "value", NC_DOUBLE,
+      {attempt_dim, value_dim}, {attempt_records_.size(), attempt_value_names.size()}, compression_level_);
+    netcdf_text_attribute(attempt_group, attempt_time_var,
+      "description", "start and final times; attempt row is the implicit attempt_id order");
+    netcdf_text_attribute(attempt_group, attempt_outcome_var,
+      "enum", "0=success,1=return,2=geometry_lost,3=run_end");
+    netcdf_text_attribute(attempt_group, attempt_value_var, "field_names",
+      "delta_start,min_abs_delta,delta_end,E_parallel_start,E_parallel_end,delta_phi_start,"
+      "delta_phi_end,delta_d_ion1_start,delta_d_ion2_start,nearest_ion_distance");
+    attempt_times.reserve(attempt_records_.size() * 2);
+    attempt_hydrogens.reserve(attempt_records_.size());
+    attempt_edges.reserve(attempt_records_.size());
+    attempt_from.reserve(attempt_records_.size());
+    attempt_target.reserve(attempt_records_.size());
+    attempt_outcomes.reserve(attempt_records_.size());
+    attempt_has_transfer.reserve(attempt_records_.size());
+    attempt_nearest_ions.reserve(attempt_records_.size());
+    attempt_values.reserve(attempt_records_.size() * attempt_value_names.size());
+    for (size_t row = 0; row < attempt_records_.size(); ++row) {
+      const AttemptRecord& record = attempt_records_[row];
+      attempt_rows[record.attempt_id] = static_cast<int>(row);
+      attempt_times.push_back(record.time_start_fs);
+      attempt_times.push_back(record.time_end_fs);
+      attempt_hydrogens.push_back(record.hydrogen);
+      attempt_edges.push_back(edge_ids[make_bond_key(record.oxygen_low, record.oxygen_high)]);
+      attempt_from.push_back(record.oxygen_from);
+      attempt_target.push_back(record.oxygen_target);
+      const auto outcome_code = [&](const AttemptOutcome outcome) {
+        switch (outcome) {
+          case AttemptOutcome::success: return static_cast<unsigned char>(0);
+          case AttemptOutcome::return_to_state: return static_cast<unsigned char>(1);
+          case AttemptOutcome::geometry_lost: return static_cast<unsigned char>(2);
+          case AttemptOutcome::run_end: return static_cast<unsigned char>(3);
+        }
+        return static_cast<unsigned char>(3);
+      };
+      attempt_outcomes.push_back(outcome_code(record.outcome));
+      attempt_has_transfer.push_back(record.has_transfer ? 1 : 0);
+      attempt_nearest_ions.push_back(record.nearest_ion_id);
+      attempt_values.insert(attempt_values.end(), {
+        record.delta_start, record.min_abs_delta, record.delta_end,
+        record.E_parallel_start, record.E_parallel_end, record.delta_phi_start,
+        record.delta_phi_end, record.delta_d_ion1_start, record.delta_d_ion2_start,
+        record.nearest_ion_distance});
+    }
+  }
+
+  int transfer_group = -1;
+  int transfer_attempt_var = -1;
+  int transfer_value_var = -1;
+  int transfer_count_var = -1;
+  std::vector<int> transfer_attempts;
+  std::vector<double> transfer_values;
+  std::vector<long long> transfer_counts;
+  if (include_events && !attempt_records_.empty()) {
+    size_t transfer_count = 0;
+    for (const AttemptRecord& record : attempt_records_)
+      if (record.has_transfer)
+        ++transfer_count;
+    if (transfer_count > 0) {
+      const std::vector<const char*> transfer_value_names = {
+        "dx", "dy", "dz", "delta_start", "delta_confirm"};
+      const std::vector<const char*> transfer_count_names = {
+        "nH_from_before", "nH_to_before", "nH_from_after", "nH_to_after"};
+      netcdf_check(nc_def_grp(ncid, "transfer", &transfer_group), "nc_def_grp");
+      const int row_dim = netcdf_dimension(transfer_group, "row", transfer_count);
+      const int value_dim = netcdf_dimension(transfer_group, "value", transfer_value_names.size());
+      const int count_dim = netcdf_dimension(transfer_group, "count", transfer_count_names.size());
+      transfer_attempt_var = netcdf_variable(transfer_group, "attempt_index", NC_INT,
+        {row_dim}, {transfer_count}, compression_level_);
+      transfer_value_var = netcdf_variable(transfer_group, "value", NC_DOUBLE,
+        {row_dim, value_dim}, {transfer_count, transfer_value_names.size()}, compression_level_);
+      transfer_count_var = netcdf_variable(transfer_group, "count", NC_INT64,
+        {row_dim, count_dim}, {transfer_count, transfer_count_names.size()}, compression_level_);
+      netcdf_text_attribute(transfer_group, transfer_attempt_var,
+        "description", "zero-based row index into /attempt");
+      netcdf_text_attribute(transfer_group, transfer_value_var,
+        "field_names", "dx,dy,dz,delta_start,delta_confirm");
+      netcdf_text_attribute(transfer_group, transfer_count_var, "field_names",
+        "nH_from_before,nH_to_before,nH_from_after,nH_to_after");
+      transfer_attempts.reserve(transfer_count);
+      transfer_values.reserve(transfer_count * transfer_value_names.size());
+      transfer_counts.reserve(transfer_count * transfer_count_names.size());
+      for (const AttemptRecord& record : attempt_records_) {
+        if (!record.has_transfer)
+          continue;
+        transfer_attempts.push_back(attempt_rows[record.attempt_id]);
+        transfer_values.insert(transfer_values.end(), {
+          record.dx, record.dy, record.dz, record.delta_start, record.delta_end});
+        transfer_counts.insert(transfer_counts.end(), {
+          record.nH_from_before, record.nH_to_before,
+          record.nH_from_after, record.nH_to_after});
+      }
+    }
+  }
+
+  int defect_group = -1;
+  int defect_time_var = -1;
+  int defect_oxygen_var = -1;
+  int defect_hydrogen_count_var = -1;
+  int defect_cause_var = -1;
+  std::vector<double> defect_times;
+  std::vector<int> defect_oxygens;
+  std::vector<int> defect_hydrogen_counts;
+  std::vector<long long> defect_causes;
+  if (include_events && !defect_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "defect", &defect_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(defect_group, "row", defect_records_.size());
+    defect_time_var = netcdf_variable(defect_group, "time_fs", NC_DOUBLE,
+      {row_dim}, {defect_records_.size()}, compression_level_);
+    defect_oxygen_var = netcdf_variable(defect_group, "oxygen", NC_INT,
+      {row_dim}, {defect_records_.size()}, compression_level_);
+    defect_hydrogen_count_var = netcdf_variable(defect_group, "hydrogen_count", NC_INT,
+      {row_dim}, {defect_records_.size()}, compression_level_);
+    defect_cause_var = netcdf_variable(defect_group, "cause_event_id", NC_INT64,
+      {row_dim}, {defect_records_.size()}, compression_level_);
+    netcdf_text_attribute(defect_group, defect_cause_var,
+      "description", "one-based attempt_id; 0 is the initial state and -1 means unassigned");
+    for (const DefectRecord& record : defect_records_) {
+      defect_times.push_back(record.time_fs);
+      defect_oxygens.push_back(record.oxygen);
+      defect_hydrogen_counts.push_back(record.hydrogen_count);
+      defect_causes.push_back(record.cause_event_id);
+    }
+  }
+
+  int bead_group = -1;
+  int bead_valid_var = -1;
+  int bead_class_var = -1;
+  int bead_value_var = -1;
+  int bead_count_var = -1;
+  int bead_flag_var = -1;
+  std::vector<unsigned char> bead_valid;
+  std::vector<unsigned char> bead_classes;
+  std::vector<double> bead_values;
+  std::vector<int> bead_counts;
+  std::vector<unsigned char> bead_flags;
+  const std::vector<const char*> bead_value_names = {
+    "probe_time_fs", "delta_centroid", "f_minus", "f_zero", "f_plus", "f_channel_valid",
+    "mean_delta", "centroid_minus_mean", "sigma_delta", "delta_min", "delta_max", "span",
+    "delta_q20", "delta_q80", "robust_span", "rms_neighbor_delta_jump",
+    "max_neighbor_delta_jump"};
+  const std::vector<const char*> bead_count_names = {
+    "num_beads", "n_minus", "n_zero", "n_plus", "kink_count", "center_domain_count",
+    "total_state_domain_count", "channel_valid_count"};
+  const std::vector<const char*> bead_flag_names = {
+    "two_well_occupied", "two_well_span", "simple_two_domain_path", "barrier_centered",
+    "strict_tunneling_like", "multi_kink_or_multi_domain"};
+  if (include_events && bead_diagnostic_enabled_ && !attempt_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "bead", &bead_group), "nc_def_grp");
+    const int attempt_dim = netcdf_dimension(bead_group, "attempt", attempt_records_.size());
+    const int selection_dim = netcdf_dimension(bead_group, "selection", 2);
+    const int value_dim = netcdf_dimension(bead_group, "value", bead_value_names.size());
+    const int count_dim = netcdf_dimension(bead_group, "count", bead_count_names.size());
+    const int flag_dim = netcdf_dimension(bead_group, "flag", bead_flag_names.size());
+    bead_valid_var = netcdf_variable(bead_group, "valid", NC_UBYTE,
+      {attempt_dim, selection_dim}, {attempt_records_.size(), 2}, compression_level_);
+    bead_class_var = netcdf_variable(bead_group, "quantum_class", NC_UBYTE,
+      {attempt_dim, selection_dim}, {attempt_records_.size(), 2}, compression_level_);
+    bead_value_var = netcdf_variable(bead_group, "value", NC_DOUBLE,
+      {attempt_dim, selection_dim, value_dim},
+      {attempt_records_.size(), 2, bead_value_names.size()}, compression_level_);
+    bead_count_var = netcdf_variable(bead_group, "count", NC_INT,
+      {attempt_dim, selection_dim, count_dim},
+      {attempt_records_.size(), 2, bead_count_names.size()}, compression_level_);
+    bead_flag_var = netcdf_variable(bead_group, "flag", NC_UBYTE,
+      {attempt_dim, selection_dim, flag_dim},
+      {attempt_records_.size(), 2, bead_flag_names.size()}, compression_level_);
+    netcdf_text_attribute(bead_group, bead_valid_var,
+      "description", "selection index 0=centroid_best, 1=delocalization_best");
+    netcdf_text_attribute(bead_group, bead_class_var, "enum",
+      "0=classical_only,1=two_well_delocalized,2=barrier_centered_tunneling_like,"
+      "3=compact_single_domain,4=multi_kink_or_multi_domain,5=ambiguous");
+    netcdf_text_attribute(bead_group, bead_value_var, "field_names",
+      "probe_time_fs,delta_centroid,f_minus,f_zero,f_plus,f_channel_valid,mean_delta,"
+      "centroid_minus_mean,sigma_delta,delta_min,delta_max,span,delta_q20,delta_q80,"
+      "robust_span,rms_neighbor_delta_jump,max_neighbor_delta_jump");
+    netcdf_text_attribute(bead_group, bead_count_var, "field_names",
+      "num_beads,n_minus,n_zero,n_plus,kink_count,center_domain_count,total_state_domain_count,"
+      "channel_valid_count");
+    netcdf_text_attribute(bead_group, bead_flag_var, "field_names",
+      "two_well_occupied,two_well_span,simple_two_domain_path,barrier_centered,"
+      "strict_tunneling_like,multi_kink_or_multi_domain");
+    const auto class_code = [](const QuantumCharacter character) {
+      switch (character) {
+        case QuantumCharacter::CLASSICAL_ONLY: return static_cast<unsigned char>(0);
+        case QuantumCharacter::TWO_WELL_DELOCALIZED: return static_cast<unsigned char>(1);
+        case QuantumCharacter::BARRIER_CENTERED_TUNNELING_LIKE: return static_cast<unsigned char>(2);
+        case QuantumCharacter::COMPACT_SINGLE_DOMAIN: return static_cast<unsigned char>(3);
+        case QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN: return static_cast<unsigned char>(4);
+        case QuantumCharacter::AMBIGUOUS: return static_cast<unsigned char>(5);
+      }
+      return static_cast<unsigned char>(5);
+    };
+    const auto append_bead = [&](const BeadDiagnostic& diagnostic) {
+      const bool valid = diagnostic.valid;
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      bead_valid.push_back(valid ? 1 : 0);
+      bead_classes.push_back(valid ? class_code(diagnostic.character) : 5);
+      bead_values.insert(bead_values.end(), {
+        valid ? diagnostic.probe_time_fs : nan,
+        valid ? diagnostic.delta_centroid : nan,
+        valid ? diagnostic.f_minus : nan,
+        valid ? diagnostic.f_zero : nan,
+        valid ? diagnostic.f_plus : nan,
+        valid ? diagnostic.f_channel_valid : nan,
+        valid ? diagnostic.mean_delta : nan,
+        valid ? diagnostic.centroid_minus_mean : nan,
+        valid ? diagnostic.sigma_delta : nan,
+        valid ? diagnostic.delta_min : nan,
+        valid ? diagnostic.delta_max : nan,
+        valid ? diagnostic.span : nan,
+        valid ? diagnostic.delta_q20 : nan,
+        valid ? diagnostic.delta_q80 : nan,
+        valid ? diagnostic.robust_span : nan,
+        valid ? diagnostic.rms_neighbor_delta_jump : nan,
+        valid ? diagnostic.max_neighbor_delta_jump : nan});
+      bead_counts.insert(bead_counts.end(), {
+        valid ? diagnostic.num_beads : 0,
+        valid ? diagnostic.n_minus : -1,
+        valid ? diagnostic.n_zero : -1,
+        valid ? diagnostic.n_plus : -1,
+        valid ? diagnostic.kink_count : -1,
+        valid ? diagnostic.center_domain_count : -1,
+        valid ? diagnostic.total_state_domain_count : -1,
+        valid ? diagnostic.channel_valid_count : -1});
+      bead_flags.insert(bead_flags.end(), {
+        static_cast<unsigned char>(valid ? diagnostic.two_well_occupied : 0),
+        static_cast<unsigned char>(valid ? diagnostic.two_well_span : 0),
+        static_cast<unsigned char>(valid ? diagnostic.simple_two_domain_path : 0),
+        static_cast<unsigned char>(valid ? diagnostic.barrier_centered : 0),
+        static_cast<unsigned char>(valid ? diagnostic.strict_tunneling_like : 0),
+        static_cast<unsigned char>(valid ? diagnostic.multi_kink_or_multi_domain : 0)});
+    };
+    bead_valid.reserve(attempt_records_.size() * 2);
+    bead_classes.reserve(attempt_records_.size() * 2);
+    bead_values.reserve(attempt_records_.size() * 2 * bead_value_names.size());
+    bead_counts.reserve(attempt_records_.size() * 2 * bead_count_names.size());
+    bead_flags.reserve(attempt_records_.size() * 2 * bead_flag_names.size());
+    for (const AttemptRecord& record : attempt_records_) {
+      append_bead(record.centroid_best);
+      append_bead(record.delocalization_best);
+    }
+  }
+
+  int local_event_group = -1;
+  int local_event_time_var = -1;
+  int local_event_valid_var = -1;
+  int local_event_class_var = -1;
+  int local_event_value_var = -1;
+  int local_event_count_var = -1;
+  std::vector<double> local_event_times;
+  std::vector<unsigned char> local_event_valid;
+  std::vector<unsigned char> local_event_classes;
+  std::vector<double> local_event_values;
+  std::vector<int> local_event_counts;
+  const std::vector<const char*> local_event_value_names = {
+    "rOH_low", "rOH_high", "oho_angle", "dOO", "rperp", "path_excess",
+    "ion1_low_d1", "ion1_low_d2", "ion1_low_d3", "ion1_high_d1", "ion1_high_d2",
+    "ion1_high_d3", "ion2_low_d1", "ion2_low_d2", "ion2_low_d3", "ion2_high_d1",
+    "ion2_high_d2", "ion2_high_d3", "delta_d_ion1", "delta_d_ion2", "nearest_ion2_to_H",
+    "angle_Olow_H_ion2", "angle_Ohigh_H_ion2", "E_parallel", "delta_phi_ion"};
+  const std::vector<const char*> local_event_count_names = {
+    "nH_low", "nH_high", "donor_edges_low", "donor_edges_high", "acceptor_edges_low",
+    "acceptor_edges_high", "coord_ion1_low", "coord_ion1_high", "coord_ion2_low",
+    "coord_ion2_high", "hcl_like_low", "hcl_like_high"};
+  if (include_full && local_environment_enabled_ && !attempt_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "local_environment_event", &local_event_group), "nc_def_grp");
+    const int attempt_dim = netcdf_dimension(local_event_group, "attempt", attempt_records_.size());
+    const int snapshot_dim = netcdf_dimension(local_event_group, "snapshot", 5);
+    const int value_dim = netcdf_dimension(local_event_group, "value", local_event_value_names.size());
+    const int count_dim = netcdf_dimension(local_event_group, "count", local_event_count_names.size());
+    local_event_time_var = netcdf_variable(local_event_group, "time_fs", NC_DOUBLE,
+      {attempt_dim, snapshot_dim}, {attempt_records_.size(), 5}, compression_level_);
+    local_event_valid_var = netcdf_variable(local_event_group, "valid", NC_UBYTE,
+      {attempt_dim, snapshot_dim}, {attempt_records_.size(), 5}, compression_level_);
+    local_event_class_var = netcdf_variable(local_event_group, "quantum_class", NC_UBYTE,
+      {attempt_dim, snapshot_dim}, {attempt_records_.size(), 5}, compression_level_);
+    local_event_value_var = netcdf_variable(local_event_group, "value", NC_DOUBLE,
+      {attempt_dim, snapshot_dim, value_dim},
+      {attempt_records_.size(), 5, local_event_value_names.size()}, compression_level_);
+    local_event_count_var = netcdf_variable(local_event_group, "count", NC_INT,
+      {attempt_dim, snapshot_dim, count_dim},
+      {attempt_records_.size(), 5, local_event_count_names.size()}, compression_level_);
+    netcdf_text_attribute(local_event_group, local_event_time_var,
+      "snapshot_names", "0=start,1=end,2=last_valid,3=centroid_best,4=delocalization_best");
+    netcdf_text_attribute(local_event_group, local_event_valid_var,
+      "description", "selected snapshots are controlled by the global snapshot_mode attribute");
+    netcdf_text_attribute(local_event_group, local_event_class_var, "enum",
+      "0=classical_only,1=two_well_delocalized,2=barrier_centered_tunneling_like,"
+      "3=compact_single_domain,4=multi_kink_or_multi_domain,5=ambiguous,255=not_applicable");
+    netcdf_text_attribute(local_event_group, local_event_value_var, "field_names",
+      "rOH_low,rOH_high,oho_angle,dOO,rperp,path_excess,ion1_low_d1,ion1_low_d2,ion1_low_d3,"
+      "ion1_high_d1,ion1_high_d2,ion1_high_d3,ion2_low_d1,ion2_low_d2,ion2_low_d3,"
+      "ion2_high_d1,ion2_high_d2,ion2_high_d3,delta_d_ion1,delta_d_ion2,nearest_ion2_to_H,"
+      "angle_Olow_H_ion2,angle_Ohigh_H_ion2,E_parallel,delta_phi_ion");
+    netcdf_text_attribute(local_event_group, local_event_count_var, "field_names",
+      "nH_low,nH_high,donor_edges_low,donor_edges_high,acceptor_edges_low,acceptor_edges_high,"
+      "coord_ion1_low,coord_ion1_high,coord_ion2_low,coord_ion2_high,hcl_like_low,hcl_like_high");
+    local_event_times.reserve(attempt_records_.size() * 5);
+    local_event_valid.reserve(attempt_records_.size() * 5);
+    local_event_classes.reserve(attempt_records_.size() * 5);
+    local_event_values.reserve(attempt_records_.size() * 5 * local_event_value_names.size());
+    local_event_counts.reserve(attempt_records_.size() * 5 * local_event_count_names.size());
+    const auto class_code = [](const QuantumCharacter character) {
+      switch (character) {
+        case QuantumCharacter::CLASSICAL_ONLY: return static_cast<unsigned char>(0);
+        case QuantumCharacter::TWO_WELL_DELOCALIZED: return static_cast<unsigned char>(1);
+        case QuantumCharacter::BARRIER_CENTERED_TUNNELING_LIKE: return static_cast<unsigned char>(2);
+        case QuantumCharacter::COMPACT_SINGLE_DOMAIN: return static_cast<unsigned char>(3);
+        case QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN: return static_cast<unsigned char>(4);
+        case QuantumCharacter::AMBIGUOUS: return static_cast<unsigned char>(5);
+      }
+      return static_cast<unsigned char>(255);
+    };
+    for (const AttemptRecord& record : attempt_records_) {
+      const LocalEnvironment* environments[5] = {
+        &record.environment_start, &record.environment_end, &record.environment_last_valid,
+        &record.centroid_best.environment, &record.delocalization_best.environment};
+      const double times[5] = {
+        record.time_start_fs, record.time_end_fs, record.time_end_fs,
+        record.centroid_best.probe_time_fs, record.delocalization_best.probe_time_fs};
+      const unsigned char classes[5] = {
+        255, 255, 255,
+        class_code(record.centroid_best.character), class_code(record.delocalization_best.character)};
+      for (int snapshot = 0; snapshot < 5; ++snapshot) {
+        const bool selected = snapshot_mode_ == SnapshotMode::ALL ||
+          (snapshot_mode_ == SnapshotMode::BEST && snapshot != 2) ||
+          (snapshot_mode_ == SnapshotMode::ENDPOINTS && snapshot < 2);
+        const LocalEnvironment& environment = *environments[snapshot];
+        const bool valid = selected && environment.valid;
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        local_event_times.push_back(selected ? times[snapshot] : nan);
+        local_event_valid.push_back(valid ? 1 : 0);
+        local_event_classes.push_back(valid ? classes[snapshot] : 255);
+        local_event_values.insert(local_event_values.end(), {
+          valid ? environment.rOH_low : nan, valid ? environment.rOH_high : nan,
+          valid ? environment.oho_angle : nan, valid ? environment.dOO : nan,
+          valid ? environment.rperp : nan, valid ? environment.path_excess : nan,
+          valid ? environment.ion1_low_d1 : nan, valid ? environment.ion1_low_d2 : nan,
+          valid ? environment.ion1_low_d3 : nan, valid ? environment.ion1_high_d1 : nan,
+          valid ? environment.ion1_high_d2 : nan, valid ? environment.ion1_high_d3 : nan,
+          valid ? environment.ion2_low_d1 : nan, valid ? environment.ion2_low_d2 : nan,
+          valid ? environment.ion2_low_d3 : nan, valid ? environment.ion2_high_d1 : nan,
+          valid ? environment.ion2_high_d2 : nan, valid ? environment.ion2_high_d3 : nan,
+          valid ? environment.delta_d_ion1 : nan, valid ? environment.delta_d_ion2 : nan,
+          valid ? environment.nearest_ion2_to_H : nan,
+          valid ? environment.angle_Olow_H_ion2 : nan,
+          valid ? environment.angle_Ohigh_H_ion2 : nan,
+          valid ? environment.E_parallel : nan, valid ? environment.delta_phi_ion : nan});
+        local_event_counts.insert(local_event_counts.end(), {
+          valid ? environment.nH_low : -1, valid ? environment.nH_high : -1,
+          valid ? environment.donor_edges_low : -1, valid ? environment.donor_edges_high : -1,
+          valid ? environment.acceptor_edges_low : -1,
+          valid ? environment.acceptor_edges_high : -1,
+          valid ? environment.coord_ion1_low : -1, valid ? environment.coord_ion1_high : -1,
+          valid ? environment.coord_ion2_low : -1, valid ? environment.coord_ion2_high : -1,
+          valid ? environment.hcl_like_low : -1, valid ? environment.hcl_like_high : -1});
+      }
+    }
+  }
+
+  netcdf_check(nc_enddef(ncid), "nc_enddef");
+  if (edge_group >= 0) {
+    std::vector<int> edge_oxygen;
+    edge_oxygen.reserve(edge_keys.size() * 2);
+    for (const unsigned long long key : edge_keys) {
+      int oxygen_low;
+      int oxygen_high;
+      decode_bond_key(key, oxygen_low, oxygen_high);
+      edge_oxygen.push_back(oxygen_low);
+      edge_oxygen.push_back(oxygen_high);
+    }
+    netcdf_write_int(edge_group, edge_oxygen_var, edge_oxygen);
+  }
+  if (window_group >= 0) {
+    netcdf_write_double(window_group, window_time_var, window_times);
+    netcdf_write_double(window_group, window_value_var, window_values);
+    netcdf_write_longlong(window_group, window_count_var, window_counts);
+  }
+  if (edge_window_group >= 0) {
+    netcdf_write_int(edge_window_group, edge_window_edge_var, edge_window_edges);
+    netcdf_write_int(edge_window_group, edge_window_window_var, edge_window_windows);
+    netcdf_write_double(edge_window_group, edge_window_value_var, edge_window_values);
+    netcdf_write_longlong(edge_window_group, edge_window_count_var, edge_window_counts);
+  }
+  if (bond_group >= 0) {
+    netcdf_write_int(bond_group, bond_edge_var, bond_edges);
+    netcdf_write_double(bond_group, bond_value_var, bond_values);
+    netcdf_write_longlong(bond_group, bond_count_var, bond_counts);
+  }
+  if (local_window_group >= 0) {
+    netcdf_write_int(local_window_group, local_window_edge_var, local_window_edges);
+    netcdf_write_int(local_window_group, local_window_window_var, local_window_windows);
+    netcdf_write_double(local_window_group, local_window_value_var, local_window_values);
+    netcdf_write_longlong(local_window_group, local_window_count_var, local_window_counts);
+  }
+  if (attempt_group >= 0) {
+    netcdf_write_double(attempt_group, attempt_time_var, attempt_times);
+    netcdf_write_int(attempt_group, attempt_hydrogen_var, attempt_hydrogens);
+    netcdf_write_int(attempt_group, attempt_edge_var, attempt_edges);
+    netcdf_write_int(attempt_group, attempt_from_var, attempt_from);
+    netcdf_write_int(attempt_group, attempt_target_var, attempt_target);
+    netcdf_write_ubyte(attempt_group, attempt_outcome_var, attempt_outcomes);
+    netcdf_write_ubyte(attempt_group, attempt_transfer_var, attempt_has_transfer);
+    netcdf_write_int(attempt_group, attempt_nearest_ion_var, attempt_nearest_ions);
+    netcdf_write_double(attempt_group, attempt_value_var, attempt_values);
+  }
+  if (transfer_group >= 0) {
+    netcdf_write_int(transfer_group, transfer_attempt_var, transfer_attempts);
+    netcdf_write_double(transfer_group, transfer_value_var, transfer_values);
+    netcdf_write_longlong(transfer_group, transfer_count_var, transfer_counts);
+  }
+  if (defect_group >= 0) {
+    netcdf_write_double(defect_group, defect_time_var, defect_times);
+    netcdf_write_int(defect_group, defect_oxygen_var, defect_oxygens);
+    netcdf_write_int(defect_group, defect_hydrogen_count_var, defect_hydrogen_counts);
+    netcdf_write_longlong(defect_group, defect_cause_var, defect_causes);
+  }
+  if (bead_group >= 0) {
+    netcdf_write_ubyte(bead_group, bead_valid_var, bead_valid);
+    netcdf_write_ubyte(bead_group, bead_class_var, bead_classes);
+    netcdf_write_double(bead_group, bead_value_var, bead_values);
+    netcdf_write_int(bead_group, bead_count_var, bead_counts);
+    netcdf_write_ubyte(bead_group, bead_flag_var, bead_flags);
+  }
+  if (local_event_group >= 0) {
+    netcdf_write_double(local_event_group, local_event_time_var, local_event_times);
+    netcdf_write_ubyte(local_event_group, local_event_valid_var, local_event_valid);
+    netcdf_write_ubyte(local_event_group, local_event_class_var, local_event_classes);
+    netcdf_write_double(local_event_group, local_event_value_var, local_event_values);
+    netcdf_write_int(local_event_group, local_event_count_var, local_event_counts);
+  }
+  netcdf_check(nc_close(ncid), "nc_close");
+  printf("Proton observer wrote compressed NetCDF output %s (level=%s, deflate=%d).\n",
+    output_filename_.c_str(), output_level, compression_level_);
+#endif
+}
+
+void Proton_Tunneling::write_output_files()
+{
+  if (output_format_ == OutputFormat::NETCDF)
+    write_netcdf_output_file();
+  else
+    write_text_output_files();
 }
 
 void Proton_Tunneling::postprocess(
