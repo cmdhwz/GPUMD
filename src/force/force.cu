@@ -566,9 +566,8 @@ bool Force::can_use_pimd_bead_gpu_parallel_() const
     return false;
   }
   Potential* primary = potentials[0].get();
-  return !primary->need_B_projection &&
-         (dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary) ||
-          dynamic_cast<NEP_Charge*>(primary));
+  return dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary) ||
+         dynamic_cast<NEP_Charge*>(primary);
 }
 
 bool Force::can_use_pimd_qnep_batch_() const
@@ -581,7 +580,7 @@ bool Force::can_use_pimd_qnep_batch_() const
     return false;
   }
   Potential* primary = potentials[0].get();
-  return primary && !primary->need_B_projection && dynamic_cast<NEP_Charge*>(primary);
+  return primary && dynamic_cast<NEP_Charge*>(primary);
 }
 
 bool Force::can_use_pimd_nep_batch_() const
@@ -594,8 +593,7 @@ bool Force::can_use_pimd_nep_batch_() const
     return false;
   }
   Potential* primary = potentials[0].get();
-  return primary && !primary->need_B_projection &&
-         (dynamic_cast<NEP*>(primary) ||
+  return primary && (dynamic_cast<NEP*>(primary) ||
            (dynamic_cast<NEP_MULTIGPU*>(primary) && !primary_nep_model_path_.empty()));
 }
 
@@ -886,9 +884,6 @@ void Force::refresh_pimd_bead_gpu_workers_()
   const bool is_nep_worker = dynamic_cast<NEP*>(primary) || dynamic_cast<NEP_MULTIGPU*>(primary);
   const bool is_qnep_worker = dynamic_cast<NEP_Charge*>(primary);
   if (!(is_nep_worker || is_qnep_worker)) {
-    return;
-  }
-  if (primary->need_B_projection) {
     return;
   }
 
