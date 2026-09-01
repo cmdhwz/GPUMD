@@ -23,7 +23,7 @@ The driver class dealing with measurement.
 #include <string>
 #include <vector>
 
-void Measure::initialize(
+void Measure::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -32,30 +32,64 @@ void Measure::initialize(
   Box& box,
   Force& force)
 {
-  std::vector<std::string> property_names;
-  for (auto& prop : properties) {
-    if (prop->property_name == "") {
+  std::vector<std::string> action_names;
+  for (auto& action : actions) {
+    if (action->action_name == "") {
       printf("Dear developer:\n");
-      printf("    Please set the property name you developed.\n");
+      printf("    Please set the action name you developed.\n");
       exit(1);
     }
-
-    // dump_xyz and dump_netcdf are allowed to be called multiple times; others are not
+    // dump_xyz, dump_netcdf, add_force, add_spring, and add_efield are allowed to be called multiple times;
+    // others are not
     if (
-      prop->property_name != "dump_xyz" && prop->property_name != "dump_netcdf") {
-      for (auto& property_name : property_names) {
-        if (property_name == prop->property_name) {
-          std::cout << "There are multiple " << prop->property_name << " keywords within one run.\n";
+      action->action_name != "dump_xyz" && action->action_name != "dump_netcdf" &&
+      action->action_name != "add_force" && action->action_name != "add_spring" &&
+      action->action_name != "add_efield") {
+      for (auto& action_name : action_names) {
+        if (action_name == action->action_name) {
+          std::cout << "There are multiple " << action->action_name << " keywords within one run.\n";
           exit(1);
         }
       }
     }
-    property_names.emplace_back(prop->property_name);
+    action_names.emplace_back(action->action_name);
   }
 
 
-  for (auto& prop : properties) {
-    prop->preprocess(
+  for (auto& action : actions) {
+    action->pre_run(
+      number_of_steps,
+      time_step,
+      integrate,
+      group,
+      atom,
+      box,
+      force);
+  }
+
+  std::vector<std::string> property_names;
+  for (auto& property : properties) {
+    if (property->property_name == "") {
+      printf("Dear developer:\n");
+      printf("    Please set the property name you developed.\n");
+      exit(1);
+    }
+    // Legacy dump properties are not intended to be repeated, except for
+    // the historical dump_xyz/dump_netcdf cases.
+    if (property->property_name != "dump_xyz" && property->property_name != "dump_netcdf") {
+      for (auto& property_name : property_names) {
+        if (property_name == property->property_name) {
+          std::cout << "There are multiple " << property->property_name
+                    << " keywords within one run.\n";
+          exit(1);
+        }
+      }
+    }
+    property_names.emplace_back(property->property_name);
+  }
+
+  for (auto& property : properties) {
+    property->preprocess(
       number_of_steps,
       time_step,
       integrate,
@@ -66,7 +100,20 @@ void Measure::initialize(
   }
 }
 
-void Measure::finalize(
+void Measure::setup_force(
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  for (auto& action : actions) {
+    action->setup_force(time_step, integrate, group, atom, box, force);
+  }
+}
+
+void Measure::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
@@ -75,8 +122,8 @@ void Measure::finalize(
   const double temperature)
 {
 
-  for (auto& prop : properties) {
-    prop->postprocess(
+  for (auto& action : actions) {
+    action->post_run(
       atom,
       box,
       integrate,
@@ -85,10 +132,21 @@ void Measure::finalize(
       temperature);
   }
 
+  for (auto& property : properties) {
+    property->postprocess(
+      atom,
+      box,
+      integrate,
+      number_of_steps,
+      time_step,
+      temperature);
+  }
+
+  actions.clear();
   properties.clear();
 }
 
-void Measure::process(
+void Measure::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -102,8 +160,24 @@ void Measure::process(
   Atom& atom,
   Force& force)
 {
-  for (auto& prop : properties) {
-    prop->process(
+  for (auto& action : actions) {
+    action->end_of_step(
+      number_of_steps,
+      step,
+      fixed_group,
+      move_group,
+      global_time,
+      temperature,
+      integrate,
+      box,
+      group,
+      thermo,
+      atom,
+      force);
+  }
+
+  for (auto& property : properties) {
+    property->process(
       number_of_steps,
       step,
       fixed_group,
@@ -119,12 +193,53 @@ void Measure::process(
   }
 }
 
+void Measure::post_integrate1(
+  const int step,
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  for (auto& action : actions) {
+    action->post_integrate1(step, time_step, integrate, group, atom, box, force);
+  }
+}
+
+void Measure::pre_force(
+  const int step,
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  for (auto& action : actions) {
+    action->pre_force(step, time_step, integrate, group, atom, box, force);
+  }
+}
+
+void Measure::post_force(
+  const int step,
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  for (auto& action : actions) {
+    action->post_force(step, time_step, integrate, group, atom, box, force);
+  }
+}
 void Measure::process_dynamics(
   const int md_step,
   Box& box,
   Atom& atom)
 {
-  for (auto& prop : properties) {
-    prop->process_dynamics(md_step, box, atom);
+  for (auto& property : properties) {
+    property->process_dynamics(md_step, box, atom);
   }
 }

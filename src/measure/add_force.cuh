@@ -15,22 +15,36 @@
 
 #pragma once
 
+#include "action.cuh"
 #include <vector>
 
-class Atom;
-class Group;
-
-class Add_Force
+class Add_Force : public Action
 {
 public:
-  void parse(const char** param, int num_param, const std::vector<Group>& group);
-  void compute(const int step, const std::vector<Group>& groups, Atom& atom);
-  void finalize();
+  Add_Force(const char** param, int num_param, const std::vector<Group>& group);
+
+  void setup_force(
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
+
+  void post_force(
+    const int step,
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
 
 private:
-  int num_calls_ = 0;
-  int table_length_[10];
-  std::vector<double> force_table_[10];
-  int grouping_method_[10];
-  int group_id_[10];
+  void apply_force(const int md_step, std::vector<Group>& group, Atom& atom);
+
+  int table_length_ = 0;
+  std::vector<double> force_table_;
+  int grouping_method_ = 0;
+  int group_id_ = 0;
 };

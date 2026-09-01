@@ -105,7 +105,7 @@ Each mismatch is reported on its own line, naming the keyword, the value used by
       basis_size_radial: nep.in gives 6 (default), nep.txt gives 8.
       basis_size_angular: nep.in gives 6 (default), nep.txt gives 8.
 
-The same comparison is applied to the foundation model named by the :ref:`fine_tune keyword <kw_fine_tune>` and to the :ref:`nep.txt <nep_txt>` read by the :ref:`import_q_scaler keyword <kw_import_q_scaler>`, where a mismatch is always an error.
+The same comparison is applied to the :ref:`nep.txt <nep_txt>` read by the :ref:`import_q_scaler keyword <kw_import_q_scaler>`, where a mismatch is always an error.
 
 Example
 -------
@@ -124,6 +124,3 @@ Here is an example :attr:`nep.in` file using all the default parameters::
   batch         1000      # default
   population	50        # default
   generation	100000    # default
-
-The `NEP tutorial <https://github.com/brucefan1983/GPUMD/tree/master/examples/11_NEP_potential_PbTe/tutorial.ipynb>`_ illustrates the construction of a :term:`NEP` model.
-More examples can be found in `this repository <https://gitlab.com/brucefan1983/nep-data>`_.

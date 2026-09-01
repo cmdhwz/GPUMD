@@ -13,28 +13,15 @@
     along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#pragma once
+#include "action.cuh"
+#include <cstring>
 
-#include <vector>
 
-class Atom;
-class Group;
-class Force;
-
-class Add_Efield
+Action::Action(void)
 {
-public:
-  void parse(const char** param, int num_param, const std::vector<Group>& group);
-  void compute(const int step, const std::vector<Group>& groups, Atom& atom, Force& force);
-  void finalize();
-  bool requires_bec() const;
-
-private:
-  int num_calls_ = 0;
-  int table_length_[10];
-  std::vector<double> efield_table_[10];
-  int grouping_method_[10];
-  int group_id_[10];
-  bool is_nep_charge = false;
-  bool use_bec_[10] = {};
-};
+  // nothing now
+}
+Action::~Action(void)
+{
+  // nothing now
+}

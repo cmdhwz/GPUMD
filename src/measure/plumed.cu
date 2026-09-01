@@ -68,7 +68,7 @@ static __global__ void gpu_add_plumed_virial(
   }
 }
 
-void PLUMED::preprocess(
+void PLUMED::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -91,7 +91,7 @@ void PLUMED::preprocess(
 PLUMED::PLUMED(const char** param, int num_param)
 {
   parse(param, num_param);
-  property_name = "plumed";
+  action_name = "plumed";
 }
 
 void PLUMED::parse(const char** param, int num_param)
@@ -215,23 +215,36 @@ void PLUMED::calculate(int plumed_step, Box& box, Atom& atom)
   GPU_CHECK_KERNEL
 }
 
-void PLUMED::process_dynamics(
-  const int md_step,
+void PLUMED::setup_force(
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
   Box& box,
-  Atom& atom)
+  Force& force)
 {
-  // Biased PLUMED simulations require interval = 1. In this case PLUMED must
-  // modify force/virial before the second integration half-step. The initial
-  // md_step = 0 call supplies the bias force for the first half-step.
-  if (interval != 1) {
-    return;
+  if (interval == 1) {
+    step = 0;
+    calculate(step, box, atom);
   }
-  dynamics_mode = true;
-  step = md_step;
-  calculate(step, box, atom);
 }
 
-void PLUMED::process(
+void PLUMED::post_force(
+  const int step_input,
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  if (interval == 1) {
+    step = step_input + 1;
+    calculate(step, box, atom);
+  }
+}
+
+void PLUMED::end_of_step(
   const int number_of_steps,
   int step_input,
   const int fixed_group,
@@ -245,9 +258,9 @@ void PLUMED::process(
   Atom& atom,
   Force& force)
 {
-  // interval = 1 is handled in process_dynamics() so the PLUMED bias enters
-  // the velocity-Verlet integration at the correct point.
-  if (dynamics_mode || step_input % interval != 0) {
+  // interval = 1 is handled by setup_force() and post_force() so the PLUMED
+  // bias enters the velocity-Verlet integration at the correct point.
+  if (interval == 1 || step_input % interval != 0) {
     return;
   }
 
@@ -257,7 +270,7 @@ void PLUMED::process(
   calculate(step, box, atom);
 }
 
-void PLUMED::postprocess(
+void PLUMED::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,

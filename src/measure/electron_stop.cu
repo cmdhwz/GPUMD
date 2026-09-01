@@ -154,12 +154,8 @@ static __global__ void find_power_loss(int num_atoms, double* g_power_loss)
   }
 }
 
-void Electron_Stop::compute(double time_step, Atom& atom)
+void Electron_Stop::apply_stopping_force(const double time_step, Atom& atom)
 {
-  if (!do_electron_stop) {
-    return;
-  }
-
   find_stopping_force<<<(atom.number_of_atoms - 1) / 64 + 1, 64>>>(
     atom.number_of_atoms,
     num_points,
@@ -182,7 +178,10 @@ void Electron_Stop::compute(double time_step, Atom& atom)
   apply_electron_stopping<<<(atom.number_of_atoms - 1) / 64 + 1, 64>>>(
     atom.number_of_atoms, stopping_force.data(), atom.force_per_atom.data());
   GPU_CHECK_KERNEL
+}
 
+void Electron_Stop::accumulate_stopping_loss(Atom& atom)
+{
   find_power_loss<<<1, 1024>>>(atom.number_of_atoms, stopping_loss.data());
   GPU_CHECK_KERNEL
 
@@ -192,9 +191,50 @@ void Electron_Stop::compute(double time_step, Atom& atom)
   stopping_power_loss += power_loss_host;
 }
 
-void Electron_Stop::parse(
+void Electron_Stop::setup_force(
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  apply_stopping_force(time_step, atom);
+}
+
+void Electron_Stop::post_force(
+  const int step,
+  const double time_step,
+  Integrate& integrate,
+  std::vector<Group>& group,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  apply_stopping_force(time_step, atom);
+}
+
+void Electron_Stop::end_of_step(
+  const int,
+  int,
+  const int,
+  const int,
+  const double,
+  const double,
+  Integrate&,
+  Box&,
+  std::vector<Group>&,
+  GPU_Vector<double>&,
+  Atom& atom,
+  Force&)
+{
+  accumulate_stopping_loss(atom);
+}
+
+Electron_Stop::Electron_Stop(
   const char** param, int num_param, const int num_atoms, const int num_types)
 {
+  action_name = "electron_stop";
   printf("Apply electron stopping.\n");
   if (num_param != 2) {
     PRINT_INPUT_ERROR("electron_stop should have 1 parameter.\n");
@@ -250,14 +290,15 @@ void Electron_Stop::parse(
   stopping_power_gpu.copy_from_host(stopping_power_cpu.data());
   stopping_force.resize(num_atoms * 3);
   stopping_loss.resize(num_atoms);
-  do_electron_stop = true;
 }
 
-void Electron_Stop::finalize()
+void Electron_Stop::post_run(
+  Atom& atom,
+  Box& box,
+  Integrate& integrate,
+  const int number_of_steps,
+  const double time_step,
+  const double temperature)
 {
-  if (do_electron_stop) {
-    printf("Total electron stopping power loss = %g eV.\n", stopping_power_loss);
-  }
-  do_electron_stop = false;
-  stopping_power_loss = 0.0;
+  printf("Total electron stopping power loss = %g eV.\n", stopping_power_loss);
 }

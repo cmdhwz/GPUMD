@@ -37,7 +37,7 @@ Calculate the heat current autocorrelation (HAC) function.
 #define DIM 3
 
 // Allocate memory for recording heat current data
-void HAC::preprocess(
+void HAC::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -410,7 +410,7 @@ static void compute_centroid_heat(
 }
 
 // sample heat current data for HAC calculations.
-void HAC::process(
+void HAC::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -618,7 +618,7 @@ static void find_rtc(const int Nc, const double factor, const double* hac, doubl
 
 // Calculate HAC (heat currant auto-correlation function)
 // and RTC (running thermal conductivity)
-void HAC::postprocess(
+void HAC::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
@@ -928,5 +928,5 @@ void HAC::parse(const char** param, int num_param)
 HAC::HAC(const char** param, int num_param)
 {
   parse(param, num_param);
-  property_name = "compute_hac";
+  action_name = "compute_hac";
 }

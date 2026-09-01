@@ -14,6 +14,7 @@
 */
 
 #pragma once
+#include "action.cuh"
 #include "property.cuh"
 #include "utilities/gpu_vector.cuh"
 #include <memory>
@@ -28,7 +29,7 @@ class Ensemble;
 class Measure
 {
 public:
-  void initialize(
+  void pre_run(
     const int number_of_steps,
     const double time_step,
     Integrate& integrate,
@@ -37,7 +38,15 @@ public:
     Box& box,
     Force& force);
 
-  void finalize(
+  void setup_force(
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force);
+
+  void post_run(
     Atom& atom,
     Box& box,
     Integrate& integrate,
@@ -45,7 +54,7 @@ public:
     const double time_step,
     const double temperature);
 
-  void process(
+  void end_of_step(
     const int number_of_steps,
     int step,
     const int fixed_group,
@@ -59,15 +68,24 @@ public:
     Atom& atom,
     Force& force);
 
-  void process_dynamics(
-    const int md_step,
+  void post_integrate1(
+    const int step,
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
     Box& box,
-    Atom& atom);
+    Force& force);
 
   std::vector<std::unique_ptr<Property>> properties;
 
   bool requires_bec() const
   {
+    for (const auto& action : actions) {
+      if (action->requires_bec()) {
+        return true;
+      }
+    }
     for (const auto& property : properties) {
       if (property->requires_bec()) {
         return true;
@@ -75,4 +93,28 @@ public:
     }
     return false;
   }
+
+  void pre_force(
+    const int step,
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force);
+
+  void post_force(
+    const int step,
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force);
+
+
+  std::vector<std::unique_ptr<Action>> actions;
+
+  // Legacy Property observers retained for branch-local diagnostics.
+  void process_dynamics(const int md_step, Box& box, Atom& atom);
 };

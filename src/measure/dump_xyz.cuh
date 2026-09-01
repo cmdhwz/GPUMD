@@ -15,7 +15,7 @@
 
 #pragma once
 #include "parse_utilities.cuh"
-#include "property.cuh"
+#include "action.cuh"
 #include "utilities/gpu_vector.cuh"
 #include <string>
 #include <vector>
@@ -23,13 +23,13 @@ class Box;
 class Atom;
 class Group;
 
-class Dump_XYZ : public Property
+class Dump_XYZ : public Action
 {
 public:
   Dump_XYZ(const char** param, int num_param, const std::vector<Group>& groups, Atom& atom);
   bool requires_bec() const override { return quantities.has_bec_; }
   void parse(const char** param, int num_param, const std::vector<Group>& groups);
-  virtual void preprocess(
+  virtual void pre_run(
     const int number_of_steps,
     const double time_step,
     Integrate& integrate,
@@ -38,7 +38,7 @@ public:
     Box& box,
     Force& force);
 
-  virtual void process(
+  virtual void end_of_step(
     const int number_of_steps,
     int step,
     const int fixed_group,
@@ -52,7 +52,7 @@ public:
     Atom& atom,
     Force& force);
 
-  virtual void postprocess(
+  virtual void post_run(
     Atom& atom,
     Box& box,
     Integrate& integrate,

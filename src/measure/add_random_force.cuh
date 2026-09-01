@@ -14,28 +14,40 @@
 */
 
 #pragma once
-
+#include "action.cuh"
 #include "utilities/gpu_vector.cuh"
-#include <vector>
+#include "utilities/gpu_macro.cuh"
+#ifdef USE_HIP
+  #include <hiprand/hiprand_kernel.h>
+#else
+  #include <curand_kernel.h>
+#endif
 
-class Atom;
-
-class Electron_Stop
+class Add_Random_Force : public Action
 {
 public:
-  bool do_electron_stop = false;
-  double stopping_power_loss = 0.0;
-  void parse(const char** param, int num_param, const int num_atoms, const int num_types);
-  void compute(double time_step, Atom& atom);
-  void finalize();
+  Add_Random_Force(const char** param, int num_param, int number_of_atoms);
+
+  void setup_force(
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
+
+  void post_force(
+    const int step,
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
 
 private:
-  int num_points = 0;
-  double energy_min;
-  double energy_max;
-  double energy_interval;
-  std::vector<double> stopping_power_cpu;
-  GPU_Vector<double> stopping_power_gpu;
-  GPU_Vector<double> stopping_force;
-  GPU_Vector<double> stopping_loss;
+  GPU_Vector<gpurandState> curand_states_;
+  double force_variance_ = 0.0;
+
+  void apply_random_force(Atom& atom);
 };

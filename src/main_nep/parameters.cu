@@ -18,6 +18,7 @@
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -104,11 +105,11 @@ void Parameters::set_default_parameters()
   lambda_z = 0.5f;             // close to optimal
   force_delta = 0.0f;          // no modification of force loss
   batch_size = 1000;           // large enough in most cases
-  use_full_batch = 0;          // default is not to enable effective full-batch
   population_size = 50;        // almost optimal
   maximum_generation = 100000; // a good starting point
   save_potential = 100000;     // write checkpoint nep.txt files at these intervals
   save_potential_format = 1;   // 1 = include time stamp when writing checkpoint nep.txt files
+  save_potential_restart = 0;  // do not write checkpoint restart files by default
   output_interval = 100;       // write loss.out, nep.txt, nep.restart (and related output) every N generations
   initial_para = 1.0f;
   sigma0 = 0.1f;
@@ -277,10 +278,6 @@ void Parameters::calculate_parameters()
   if (train_mode == 2) {
     number_of_variables += number_of_variables_ann;
   }
-
-#ifdef TRAIN_CUTOFF
-    number_of_variables += num_types * 2;
-#endif
 
   if (!is_lambda_1_set) {
     lambda_1 = sqrt(number_of_variables * 1.0e-6f / num_types);
@@ -569,6 +566,213 @@ static void compare_float(
   }
 }
 
+static void compare_with_nep_txt_fine_tune(
+  Parameters& para, const std::string& filename, std::vector<std::string>& mismatches)
+{
+  NepTxtHeader header;
+  std::string error;
+  if (!read_nep_txt_header(filename, header, error)) {
+    mismatches.push_back(error);
+    return;
+  }
+  para.number_of_nep_txt_header_lines = header.number_of_header_lines;
+
+  std::vector<std::string> elements_nep89;
+  for (int n = 0; n < NUM_ELEMENTS; ++n) {
+    if (ELEMENTS[n] != "Po" && ELEMENTS[n] != "At" && ELEMENTS[n] != "Rn" &&
+        ELEMENTS[n] != "Fr" && ELEMENTS[n] != "Ra") {
+      elements_nep89.push_back(ELEMENTS[n]);
+    }
+  }
+  if (header.num_types != int(elements_nep89.size()) || header.elements != elements_nep89) {
+    mismatches.push_back(
+      "type: the fine-tune foundation model must contain the canonical 89 elements in the "
+      "expected order.");
+  }
+
+  std::vector<int> foundation_type_index(para.num_types, -1);
+  for (int n = 0; n < para.num_types; ++n) {
+    const auto it = std::find(header.elements.begin(), header.elements.end(), para.elements[n]);
+    if (it == header.elements.end()) {
+      mismatches.push_back(
+        "type: element " + para.elements[n] + " is not available in the foundation model.");
+    } else {
+      foundation_type_index[n] = int(it - header.elements.begin());
+    }
+  }
+
+  compare_int(
+    "version", para.version, para.is_version_set, header.version, filename, mismatches);
+  compare_int(
+    "model_type",
+    para.train_mode,
+    para.is_train_mode_set,
+    header.train_mode,
+    filename,
+    mismatches);
+  compare_int(
+    "charge_mode",
+    para.charge_mode,
+    para.is_charge_mode_set,
+    header.charge_mode,
+    filename,
+    mismatches);
+  compare_int("vdw", para.vdw, para.is_vdw_set, header.vdw, filename, mismatches);
+  compare_int(
+    "charge_vdw",
+    para.charge_vdw,
+    para.is_charge_vdw_set,
+    header.charge_vdw,
+    filename,
+    mismatches);
+
+  if (para.enable_zbl != header.enable_zbl) {
+    mismatches.push_back(
+      std::string("zbl: nep.in has ZBL ") + (para.enable_zbl ? "enabled" : "disabled") +
+      ", " + filename + " has it " + (header.enable_zbl ? "enabled" : "disabled") + ".");
+  } else if (para.enable_zbl) {
+    if (para.flexible_zbl != header.flexible_zbl) {
+      mismatches.push_back(
+        std::string("zbl: nep.in requests a ") +
+        (para.flexible_zbl ? "flexible" : "universal") + " ZBL potential, " + filename +
+        " holds a " + (header.flexible_zbl ? "flexible" : "universal") + " one.");
+    } else if (!para.flexible_zbl) {
+      compare_float(
+        "zbl (inner cutoff)",
+        para.zbl_rc_inner,
+        para.is_zbl_set,
+        header.zbl_rc_inner,
+        filename,
+        mismatches);
+      compare_float(
+        "zbl (outer cutoff)",
+        para.zbl_rc_outer,
+        para.is_zbl_set,
+        header.zbl_rc_outer,
+        filename,
+        mismatches);
+      compare_float(
+        "use_typewise_cutoff_zbl",
+        para.typewise_cutoff_zbl_factor,
+        para.is_use_typewise_cutoff_zbl_set,
+        header.typewise_cutoff_zbl_factor,
+        filename,
+        mismatches);
+    }
+  }
+
+  for (int n = 0; n < para.num_types; ++n) {
+    if (foundation_type_index[n] < 0) {
+      continue;
+    }
+    const int m = header.has_multiple_cutoffs ? foundation_type_index[n] : 0;
+    const std::string suffix = (para.num_types > 1) ? " for " + para.elements[n] : "";
+    compare_float(
+      "cutoff (radial)" + suffix,
+      para.rc_radial[n],
+      para.is_cutoff_set,
+      header.rc_radial[m],
+      filename,
+      mismatches);
+    compare_float(
+      "cutoff (angular)" + suffix,
+      para.rc_angular[n],
+      para.is_cutoff_set,
+      header.rc_angular[m],
+      filename,
+      mismatches);
+  }
+
+  compare_int(
+    "n_max_radial",
+    para.n_max_radial,
+    para.is_n_max_set,
+    header.n_max_radial,
+    filename,
+    mismatches);
+  compare_int(
+    "n_max_angular",
+    para.n_max_angular,
+    para.is_n_max_set,
+    header.n_max_angular,
+    filename,
+    mismatches);
+  compare_int(
+    "basis_size_radial",
+    para.basis_size_radial,
+    para.is_basis_size_set,
+    header.basis_size_radial,
+    filename,
+    mismatches);
+  compare_int(
+    "basis_size_angular",
+    para.basis_size_angular,
+    para.is_basis_size_set,
+    header.basis_size_angular,
+    filename,
+    mismatches);
+
+  compare_int(
+    "L_max", para.L_max, para.is_l_max_set, header.L_max, filename, mismatches);
+  compare_int(
+    "L_max_4body",
+    para.has_q_222 ? 2 : 0,
+    para.is_l_max_set,
+    header.has_q_222,
+    filename,
+    mismatches);
+  compare_int(
+    "L_max_5body",
+    para.has_q_1111,
+    para.is_l_max_set,
+    header.has_q_1111,
+    filename,
+    mismatches);
+  compare_int(
+    "has_q_112",
+    para.has_q_112,
+    para.is_l_max_set,
+    header.has_q_112,
+    filename,
+    mismatches);
+  compare_int(
+    "has_q_123",
+    para.has_q_123,
+    para.is_l_max_set,
+    header.has_q_123,
+    filename,
+    mismatches);
+  compare_int(
+    "has_q_233",
+    para.has_q_233,
+    para.is_l_max_set,
+    header.has_q_233,
+    filename,
+    mismatches);
+  compare_int(
+    "has_q_134",
+    para.has_q_134,
+    para.is_l_max_set,
+    header.has_q_134,
+    filename,
+    mismatches);
+
+  compare_int(
+    "neuron",
+    para.num_neurons1,
+    para.is_neuron_set,
+    header.num_neurons1,
+    filename,
+    mismatches);
+  compare_int(
+    "neuron (second hidden layer)",
+    (para.num_hidden_layers == 2) ? para.num_neurons2 : 0,
+    para.is_neuron_set,
+    header.num_neurons2,
+    filename,
+    mismatches);
+}
+
 void Parameters::compare_with_nep_txt(
   const std::string& filename, std::vector<std::string>& mismatches)
 {
@@ -744,7 +948,19 @@ void Parameters::check_existing_model()
   }
 
   if (fine_tune) {
-    check_nep_txt(fine_tune_nep_txt, true, "Correct nep.in to match the foundation model.");
+    std::vector<std::string> mismatches;
+    compare_with_nep_txt_fine_tune(*this, fine_tune_nep_txt, mismatches);
+    if (!mismatches.empty()) {
+      printf(
+        "The model in nep.in is inconsistent with the fine-tune foundation model %s:\n",
+        fine_tune_nep_txt.c_str());
+      for (const auto& mismatch : mismatches) {
+        printf("    %s\n", mismatch.c_str());
+      }
+      printf("Correct nep.in or use the matching fine-tune template.\n");
+      PRINT_INPUT_ERROR(
+        ("nep.in is inconsistent with " + fine_tune_nep_txt + ".").c_str());
+    }
     return; // the restart file to fine-tune from is named by the fine_tune keyword
   }
 
@@ -963,9 +1179,6 @@ void Parameters::report_inputs()
 
   if (is_batch_set) {
     printf("    (input)   batch size = %d.\n", batch_size);
-    if (use_full_batch) {
-      printf("        enable effective full-batch.\n");
-    }
   } else {
     printf("    (default) batch size = %d.\n", batch_size);
   }
@@ -1626,23 +1839,14 @@ void Parameters::parse_batch(const char** param, int num_param)
 {
   is_batch_set = true;
 
-  if (num_param != 2 && num_param != 3) {
-    PRINT_INPUT_ERROR("batch should have 1 or 2 parameters.\n");
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("batch should have 1 parameter.\n");
   }
   if (!is_valid_int(param[1], &batch_size)) {
     PRINT_INPUT_ERROR("batch size should be an integer.\n");
   }
   if (batch_size < 1) {
     PRINT_INPUT_ERROR("batch size should >= 1.");
-  }
-
-  if (num_param == 3) {
-    if (!is_valid_int(param[2], &use_full_batch)) {
-      PRINT_INPUT_ERROR("use_full_batch should be an integer.\n");
-    }
-    if (use_full_batch != 0 && use_full_batch != 1) {
-      PRINT_INPUT_ERROR("use_full_batch should = 0 or 1.");
-    }
   }
 }
 
@@ -1849,8 +2053,8 @@ void Parameters::parse_save_potential(const char** param, int num_param)
   if (!is_valid_int(param[1], &save_potential)) {
     PRINT_INPUT_ERROR("save_potential interval should be an integer.\n");
   }
-  if (save_potential < 0) {
-    PRINT_INPUT_ERROR("save_potential interval should be >= 0.");
+  if (save_potential <= 0) {
+    PRINT_INPUT_ERROR("save_potential interval should be > 0.");
   }
   if (!is_valid_int(param[2], &save_potential_format)) {
     PRINT_INPUT_ERROR("save_potential format should be an integer.\n");
