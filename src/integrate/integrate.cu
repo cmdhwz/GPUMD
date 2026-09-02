@@ -256,7 +256,8 @@ void Integrate::initialize(
             atom,
             pimd_use_exact_propagator,
             pimd_pile_scale,
-            pimd_fix_com));
+            pimd_fix_com,
+            pimd_reseed_from_centroid));
       } else {
         ensemble.reset(new Ensemble_PIMD(
           number_of_atoms,
@@ -269,13 +270,20 @@ void Integrate::initialize(
           pimd_use_exact_propagator,
           pimd_pile_scale,
           pimd_fix_com,
-          use_scr_barostat));
+          use_scr_barostat,
+          pimd_reseed_from_centroid));
       }
       break;
     default:
       printf("Illegal integrator!\n");
       break;
   }
+
+  // The reseed authorization is consumed by the PIMD constructor.  Clearing it
+  // here makes the keyword explicitly one-shot even if initialization is entered
+  // more than once before Integrate::finalize().
+  if (type == 33)
+    pimd_reseed_from_centroid = false;
 
   ensemble->atom = &atom;
   ensemble->box = &box;
@@ -298,6 +306,9 @@ void Integrate::finalize()
   deform_x = 0;
   deform_y = 0;
   deform_z = 0;
+  pimd_reseed_from_centroid = false;
+  pimd_restart_read_this_run = false;
+  pimd_previous_run_was_pimd = (type == 33);
   deform_xy = 0;
   deform_xz = 0;
   deform_yz = 0;

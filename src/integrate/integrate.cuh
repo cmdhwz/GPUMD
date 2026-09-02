@@ -117,6 +117,12 @@ public:
   double pimd_pile_scale = 2.0;
   // Remove only the global ring-polymer COM momentum when enabled.
   bool pimd_fix_com = true;
+  // Allow one continuous PIMD run to rebuild the ring polymer from the
+  // current centroid when the bead count changes.  RPMD/TRPMD never use it.
+  bool pimd_reseed_from_centroid = false;
+  bool pimd_restart_read_this_run = false;
+  // True only when the immediately preceding completed run was PIMD/PIMD-SCR.
+  bool pimd_previous_run_was_pimd = false;
   // True when a valid temperature for a ring-polymer run was supplied by the
   // input or restored from a PIMD restart file.
   bool ring_polymer_temperature_is_set = false;

@@ -55,6 +55,7 @@ private:
   void parse_pimd_propagator(const char** param, int num_param);
   void parse_pimd_pile_scale(const char** param, int num_param);
   void parse_pimd_fix_com(const char** param, int num_param);
+  void parse_pimd_reseed_from_centroid(const char** param, int num_param);
   void parse_pppm_mesh_spacing(const char** param, int num_param);
   void parse_velocity(const char** param, int num_param);
   void parse_change_box(const char** param, int num_param);

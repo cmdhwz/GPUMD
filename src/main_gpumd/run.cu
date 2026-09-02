@@ -397,9 +397,9 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     tokens[1] = get_compact_nep_filename(tokens[1]);
   }
   int num_param = tokens.size();
-  const int max_num_param = 32;
+  const int max_num_param = 64;
   if (num_param > max_num_param)
-    PRINT_INPUT_ERROR("The number of parameters should be less than 32.\n");
+    PRINT_INPUT_ERROR("The number of parameters should be less than 64.\n");
   const char* param[max_num_param];
   for (int n = 0; n < num_param; ++n) {
     param[n] = tokens[n].c_str();
@@ -445,6 +445,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_pile_scale(param, num_param);
   } else if (strcmp(param[0], "pimd_fix_com") == 0) {
     parse_pimd_fix_com(param, num_param);
+  } else if (strcmp(param[0], "pimd_reseed_from_centroid") == 0) {
+    parse_pimd_reseed_from_centroid(param, num_param);
   } else if (strcmp(param[0], "pimd_bead_gpu_parallel") == 0) {
     parse_pimd_bead_gpu_parallel(param, num_param);
   } else if (strcmp(param[0], "pimd_bead_neighbor_rebuild") == 0) {
@@ -726,9 +728,14 @@ void Run::parse_read_pimd_restart(const char** param, int num_param)
   if (integrate.type < 31 || integrate.number_of_beads < 2) {
     PRINT_INPUT_ERROR("read_pimd_restart should be used after a PIMD-related ensemble keyword.\n");
   }
+  if (integrate.pimd_reseed_from_centroid) {
+    PRINT_INPUT_ERROR(
+      "read_pimd_restart cannot be combined with pimd_reseed_from_centroid in the same run.");
+  }
 
   PIMD_Restart_Metadata restart_metadata;
   read_pimd_restart(param[1], integrate.number_of_beads, box, atom, &restart_metadata);
+  integrate.pimd_restart_read_this_run = true;
   if (restart_metadata.has_temperature) {
     if (integrate.ring_polymer_temperature_is_explicit) {
       const double temperature_tolerance =
@@ -751,6 +758,35 @@ void Run::parse_read_pimd_restart(const char** param, int num_param)
 
   printf("Read PIMD restart data from %s.\n", param[1]);
   printf("    number of beads = %d.\n", atom.number_of_beads);
+}
+
+void Run::parse_pimd_reseed_from_centroid(const char** param, int num_param)
+{
+  if (num_param != 1) {
+    PRINT_INPUT_ERROR("pimd_reseed_from_centroid should have no parameters.\n");
+  }
+  if (integrate.type != 33 || integrate.number_of_beads < 2) {
+    PRINT_INPUT_ERROR(
+      "pimd_reseed_from_centroid should be used after an ensemble pimd keyword.\n");
+  }
+  if (integrate.pimd_restart_read_this_run) {
+    PRINT_INPUT_ERROR(
+      "pimd_reseed_from_centroid cannot be combined with read_pimd_restart in the same run.\n");
+  }
+  if (atom.number_of_beads < 2) {
+    PRINT_INPUT_ERROR(
+      "pimd_reseed_from_centroid requires an already initialized PIMD ring polymer.\n");
+  }
+  if (!integrate.pimd_previous_run_was_pimd) {
+    PRINT_INPUT_ERROR(
+      "pimd_reseed_from_centroid requires the immediately preceding run to be PIMD.");
+  }
+  if (atom.number_of_beads == integrate.number_of_beads) {
+    PRINT_INPUT_ERROR(
+      "pimd_reseed_from_centroid requires a different target bead count.\n");
+  }
+  integrate.pimd_reseed_from_centroid = true;
+  printf("The next PIMD run will reseed all beads from the current centroid.\n");
 }
 
 void Run::parse_pimd_bead_gpu_parallel(const char** param, int num_param)

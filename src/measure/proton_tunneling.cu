@@ -39,6 +39,9 @@ propagation chains offline.
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <random>
+#include <set>
 #include <utility>
 
 namespace
@@ -135,6 +138,25 @@ void decode_bond_key(
   oxygen_high = static_cast<int>(key & 0xffffffffULL);
 }
 
+void cartesian_to_fractional(
+  const Box& box,
+  const double x,
+  const double y,
+  const double z,
+  double& sx,
+  double& sy,
+  double& sz)
+{
+  sx = box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z;
+  sy = box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z;
+  sz = box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z;
+}
+
+double wrapped_fractional_difference(const double value)
+{
+  return value - std::nearbyint(value);
+}
+
 __global__ void pack_bead_positions(
   const int position_size,
   const int number_of_beads,
@@ -169,6 +191,7 @@ __device__ void compute_ion_field_gpu(
   const int ion2_count,
   const double ion2_charge,
   const double ion_field_cutoff,
+  const int species_decomposition_enabled,
   GeometryResultGPU& geometry)
 {
   geometry.E_ion_nominal_parallel = 0.0;
@@ -181,6 +204,17 @@ __device__ void compute_ion_field_gpu(
   geometry.nearest_ion1_to_high = 1.0e300;
   geometry.nearest_ion2_to_low = 1.0e300;
   geometry.nearest_ion2_to_high = 1.0e300;
+  for (int species = 0; species < 2; ++species) {
+    geometry.ion_E_species[species] = 0.0;
+    geometry.ion_phi_species[species] = 0.0;
+    geometry.ion_abs_E_species[species] = 0.0;
+    geometry.ion_abs_phi_species[species] = 0.0;
+    geometry.nearest_ion_species_id[species] = -1;
+    geometry.dominant_ion_id[species] = -1;
+    geometry.dominant_ion_E[species] = 0.0;
+    geometry.dominant_ion_phi[species] = 0.0;
+    geometry.dominant_ion_distance[species] = 1.0e300;
+  }
   const double inverse_dOO = 1.0 / base_geometry.dOO;
   const double ex = base_geometry.low_to_high_dx * inverse_dOO;
   const double ey = base_geometry.low_to_high_dy * inverse_dOO;
@@ -225,8 +259,10 @@ __device__ void compute_ion_field_gpu(
       const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
         midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
       const double distance = sqrt(distance_square);
-      if (distance < nearest_species_distance)
+      if (distance < nearest_species_distance) {
         nearest_species_distance = distance;
+        geometry.nearest_ion_species_id[species] = ion;
+      }
       if (low_distance < nearest_species_to_low)
         nearest_species_to_low = low_distance;
       if (high_distance < nearest_species_to_high)
@@ -236,12 +272,31 @@ __device__ void compute_ion_field_gpu(
         geometry.nearest_ion_id = ion;
       }
       if (distance <= ion_field_cutoff && distance > 1.0e-12) {
-        geometry.E_ion_nominal_parallel += K_C * charge *
+        const double ion_E = K_C * charge *
           (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
           (distance_square * distance);
-        if (low_distance > 1.0e-12 && high_distance > 1.0e-12)
-          geometry.delta_phi_ion += K_C * charge *
-            (1.0 / high_distance - 1.0 / low_distance);
+        geometry.E_ion_nominal_parallel += ion_E;
+        double ion_phi = 0.0;
+        if (low_distance > 1.0e-12 && high_distance > 1.0e-12) {
+          ion_phi = K_C * charge * (1.0 / high_distance - 1.0 / low_distance);
+          geometry.delta_phi_ion += ion_phi;
+        }
+        if (species_decomposition_enabled != 0) {
+          geometry.ion_E_species[species] += ion_E;
+          geometry.ion_phi_species[species] += ion_phi;
+          geometry.ion_abs_E_species[species] += fabs(ion_E);
+          geometry.ion_abs_phi_species[species] += fabs(ion_phi);
+          const double dominant_metric = fabs(ion_phi);
+          const double current_metric = fabs(geometry.dominant_ion_phi[species]);
+          if (dominant_metric > current_metric ||
+              (dominant_metric == current_metric &&
+               (geometry.dominant_ion_id[species] < 0 || ion < geometry.dominant_ion_id[species]))) {
+            geometry.dominant_ion_id[species] = ion;
+            geometry.dominant_ion_E[species] = ion_E;
+            geometry.dominant_ion_phi[species] = ion_phi;
+            geometry.dominant_ion_distance[species] = distance;
+          }
+        }
       }
     }
   }
@@ -271,6 +326,7 @@ __global__ void gpu_find_proton_geometry(
   const double assignment_score_gap_min,
   const int ion_field_enabled,
   const double ion_field_cutoff,
+  const int local_influence_enabled,
   GeometryResultGPU* output)
 {
   const int hydrogen_index = blockIdx.x;
@@ -421,6 +477,7 @@ __global__ void gpu_find_proton_geometry(
                     ion2_count,
                     ion2_charge,
                     ion_field_cutoff,
+                    local_influence_enabled,
                     candidate);
                 }
                 candidate.valid = 1;
@@ -697,8 +754,13 @@ void Proton_Tunneling::parse(
     return std::strcmp(value, "ion_field") == 0 || std::strcmp(value, "oho_angle") == 0 ||
       std::strcmp(value, "bead_diagnostic") == 0 ||
       std::strcmp(value, "local_environment") == 0 ||
+      std::strcmp(value, "local_influence") == 0 ||
+      std::strcmp(value, "local_trace") == 0 ||
       std::strcmp(value, "output") == 0 || std::strcmp(value, "output_level") == 0 ||
-      std::strcmp(value, "snapshots") == 0;
+      std::strcmp(value, "snapshots") == 0 ||
+      std::strcmp(value, "causal_chain") == 0 ||
+      std::strcmp(value, "causal_lag_bins") == 0 ||
+      std::strcmp(value, "causal_null") == 0;
   };
   if (next_param < num_param && !is_option(param[next_param])) {
     if (next_param + 1 >= num_param || is_option(param[next_param + 1])) {
@@ -710,9 +772,13 @@ void Proton_Tunneling::parse(
   bool angle_seen = false;
   bool bead_diagnostic_seen = false;
   bool local_environment_seen = false;
+  bool local_influence_seen = false;
   bool output_seen = false;
   bool output_level_seen = false;
   bool snapshots_seen = false;
+  bool causal_chain_seen = false;
+  bool causal_lag_bins_seen = false;
+  bool causal_null_seen = false;
   while (next_param < num_param) {
     if (std::strcmp(param[next_param], "oho_angle") == 0) {
       if (angle_seen || next_param + 1 >= num_param ||
@@ -785,6 +851,38 @@ void Proton_Tunneling::parse(
           "local_environment requires positive ion/H-Cl cutoffs and an H-Cl angle between 0 and 180 degrees.");
       }
       next_param += 5;
+    } else if (std::strcmp(param[next_param], "local_influence") == 0) {
+      if (local_influence_seen) {
+        PRINT_INPUT_ERROR("local_influence may only be specified once.");
+      }
+      local_influence_seen = true;
+      local_influence_enabled_ = true;
+      ++next_param;
+    } else if (std::strcmp(param[next_param], "local_trace") == 0) {
+      if (next_param + 2 >= num_param || is_option(param[next_param + 1]) ||
+          is_option(param[next_param + 2])) {
+        PRINT_INPUT_ERROR("local_trace must be followed by two O atom indices.");
+      }
+      int oxygen_low = -1;
+      int oxygen_high = -1;
+      if (!is_valid_int(param[next_param + 1], &oxygen_low) ||
+          !is_valid_int(param[next_param + 2], &oxygen_high) ||
+          oxygen_low < 0 || oxygen_low >= atom.number_of_atoms ||
+          oxygen_high < 0 || oxygen_high >= atom.number_of_atoms ||
+          oxygen_low == oxygen_high) {
+        PRINT_INPUT_ERROR("local_trace O atom indices should be two distinct valid indices.");
+      }
+      if (atom.cpu_atom_symbol[oxygen_low] != oxygen_symbol_ ||
+          atom.cpu_atom_symbol[oxygen_high] != oxygen_symbol_) {
+        PRINT_INPUT_ERROR("local_trace indices must refer to the configured oxygen species.");
+      }
+      const int first = std::min(oxygen_low, oxygen_high);
+      const int second = std::max(oxygen_low, oxygen_high);
+      if (std::find(local_trace_edges_.begin(), local_trace_edges_.end(),
+                    std::make_pair(first, second)) == local_trace_edges_.end()) {
+        local_trace_edges_.emplace_back(first, second);
+      }
+      next_param += 3;
     } else if (std::strcmp(param[next_param], "output") == 0) {
       if (output_seen || next_param + 1 >= num_param) {
         PRINT_INPUT_ERROR("output must be followed by text or netcdf settings.");
@@ -845,6 +943,67 @@ void Proton_Tunneling::parse(
         PRINT_INPUT_ERROR("snapshots should be endpoints, best, or all.");
       }
       next_param += 2;
+    } else if (std::strcmp(param[next_param], "causal_chain") == 0) {
+      if (causal_chain_seen || next_param + 3 >= num_param) {
+        PRINT_INPUT_ERROR(
+          "causal_chain must be followed by search_max_fs sync_fs n_gap_thresholds and thresholds.");
+      }
+      causal_chain_seen = true;
+      causal_chain_enabled_ = true;
+      if (!is_valid_real(param[next_param + 1], &causal_search_max_fs_) ||
+          !is_valid_real(param[next_param + 2], &causal_sync_fs_)) {
+        PRINT_INPUT_ERROR("causal_chain time limits should be numbers.");
+      }
+      int number_of_thresholds = 0;
+      if (!is_valid_int(param[next_param + 3], &number_of_thresholds) ||
+          number_of_thresholds <= 0 ||
+          next_param + 3 + number_of_thresholds >= num_param) {
+        PRINT_INPUT_ERROR("causal_chain requires a positive number of gap thresholds.");
+      }
+      causal_gap_thresholds_fs_.clear();
+      causal_gap_thresholds_fs_.reserve(number_of_thresholds);
+      for (int i = 0; i < number_of_thresholds; ++i) {
+        double threshold = 0.0;
+        if (!is_valid_real(param[next_param + 4 + i], &threshold))
+          PRINT_INPUT_ERROR("causal_chain gap thresholds should be numbers.");
+        causal_gap_thresholds_fs_.push_back(threshold);
+      }
+      next_param += 4 + number_of_thresholds;
+    } else if (std::strcmp(param[next_param], "causal_lag_bins") == 0) {
+      if (causal_lag_bins_seen || next_param + 1 >= num_param) {
+        PRINT_INPUT_ERROR("causal_lag_bins must be followed by the number of bins and edges.");
+      }
+      causal_lag_bins_seen = true;
+      causal_chain_enabled_ = true;
+      int number_of_bins = 0;
+      if (!is_valid_int(param[next_param + 1], &number_of_bins) || number_of_bins <= 0 ||
+          next_param + 2 + number_of_bins >= num_param) {
+        PRINT_INPUT_ERROR("causal_lag_bins requires N bins followed by N+1 edges.");
+      }
+      causal_lag_bin_edges_fs_.clear();
+      causal_lag_bin_edges_fs_.reserve(number_of_bins + 1);
+      for (int i = 0; i <= number_of_bins; ++i) {
+        double edge = 0.0;
+        if (!is_valid_real(param[next_param + 2 + i], &edge))
+          PRINT_INPUT_ERROR("causal_lag_bins edges should be numbers.");
+        causal_lag_bin_edges_fs_.push_back(edge);
+      }
+      next_param += 3 + number_of_bins;
+    } else if (std::strcmp(param[next_param], "causal_null") == 0) {
+      if (causal_null_seen || next_param + 2 >= num_param) {
+        PRINT_INPUT_ERROR("causal_null must be followed by n_shifts and seed.");
+      }
+      causal_null_seen = true;
+      if (!is_valid_int(param[next_param + 1], &causal_null_shifts_) ||
+          causal_null_shifts_ <= 0) {
+        PRINT_INPUT_ERROR("causal_null n_shifts should be a positive integer.");
+      }
+      int seed = 0;
+      if (!is_valid_int(param[next_param + 2], &seed) || seed < 0)
+        PRINT_INPUT_ERROR("causal_null seed should be a non-negative integer.");
+      causal_null_seed_ = static_cast<unsigned long long>(seed);
+      causal_chain_enabled_ = true;
+      next_param += 3;
     } else {
       PRINT_INPUT_ERROR("unknown optional compute_proton_tunneling setting.");
     }
@@ -875,9 +1034,11 @@ void Proton_Tunneling::parse(
       oxygen_indices_.push_back(i);
     if (atom.cpu_atom_symbol[i] == hydrogen_symbol_)
       hydrogen_indices_.push_back(i);
-    if ((ion_field_enabled_ || local_environment_enabled_) && atom.cpu_atom_symbol[i] == ion1_symbol_)
+    if ((ion_field_enabled_ || local_environment_enabled_ || local_influence_enabled_) &&
+        atom.cpu_atom_symbol[i] == ion1_symbol_)
       ion1_indices_.push_back(i);
-    if ((ion_field_enabled_ || local_environment_enabled_) && atom.cpu_atom_symbol[i] == ion2_symbol_)
+    if ((ion_field_enabled_ || local_environment_enabled_ || local_influence_enabled_) &&
+        atom.cpu_atom_symbol[i] == ion2_symbol_)
       ion2_indices_.push_back(i);
   }
   if (oxygen_indices_.empty() || hydrogen_indices_.empty()) {
@@ -885,6 +1046,15 @@ void Proton_Tunneling::parse(
   }
   if (ion_field_enabled_ && (ion1_indices_.empty() || ion2_indices_.empty())) {
     PRINT_INPUT_ERROR("ion_field could not find both requested ion species.");
+  }
+  if (local_influence_enabled_ && !ion_field_enabled_) {
+    PRINT_INPUT_ERROR("local_influence requires ion_field.");
+  }
+  if (!local_trace_edges_.empty() && output_format_ != OutputFormat::NETCDF) {
+    PRINT_INPUT_ERROR("local_trace requires output netcdf.");
+  }
+  if (!local_trace_edges_.empty() && !ion_field_enabled_) {
+    PRINT_INPUT_ERROR("local_trace requires ion_field.");
   }
   if (output_format_ != OutputFormat::NETCDF &&
       (output_level_seen || snapshots_seen)) {
@@ -926,6 +1096,47 @@ void Proton_Tunneling::parse(
       printf("    local environment warning: one or both configured ion species are absent; "
              "missing descriptors will be reported as nan/0.\n");
   }
+  if (local_influence_enabled_)
+    printf("    local ion influence decomposition is enabled.\n");
+  if (!local_trace_edges_.empty())
+    printf("    local NetCDF traces requested for %zu O-O edges.\n", local_trace_edges_.size());
+  if (causal_chain_enabled_) {
+    if (causal_search_max_fs_ <= 0.0 || causal_sync_fs_ < 0.0 ||
+        causal_sync_fs_ > causal_search_max_fs_)
+      PRINT_INPUT_ERROR("causal_chain requires 0 <= sync_fs <= search_max_fs.");
+    if (causal_gap_thresholds_fs_.empty())
+      causal_gap_thresholds_fs_ = {causal_search_max_fs_};
+    for (size_t i = 0; i < causal_gap_thresholds_fs_.size(); ++i) {
+      if (causal_gap_thresholds_fs_[i] <= 0.0 ||
+          causal_gap_thresholds_fs_[i] > causal_search_max_fs_ ||
+          (i > 0 && causal_gap_thresholds_fs_[i] <= causal_gap_thresholds_fs_[i - 1]))
+        PRINT_INPUT_ERROR("causal_chain gap thresholds should be strictly increasing within search_max_fs.");
+    }
+    if (causal_lag_bin_edges_fs_.empty()) {
+      causal_lag_bin_edges_fs_ = {0.0, causal_sync_fs_, 5.0, 10.0, 20.0, 50.0, 100.0,
+                                  causal_search_max_fs_};
+      std::sort(causal_lag_bin_edges_fs_.begin(), causal_lag_bin_edges_fs_.end());
+      causal_lag_bin_edges_fs_.erase(
+        std::unique(causal_lag_bin_edges_fs_.begin(), causal_lag_bin_edges_fs_.end()),
+        causal_lag_bin_edges_fs_.end());
+    }
+    if (causal_lag_bin_edges_fs_.size() < 2 || causal_lag_bin_edges_fs_.front() < 0.0) {
+      PRINT_INPUT_ERROR("causal_lag_bins requires increasing non-negative edges.");
+    }
+    for (size_t i = 1; i < causal_lag_bin_edges_fs_.size(); ++i) {
+      if (causal_lag_bin_edges_fs_[i] <= causal_lag_bin_edges_fs_[i - 1] ||
+          causal_lag_bin_edges_fs_[i] > causal_search_max_fs_)
+        PRINT_INPUT_ERROR("causal_lag_bins edges should be strictly increasing within search_max_fs.");
+    }
+    if (causal_lag_bin_edges_fs_.back() < causal_search_max_fs_)
+      causal_lag_bin_edges_fs_.push_back(causal_search_max_fs_);
+    if (causal_null_shifts_ == 0)
+      causal_null_shifts_ = 32;
+    printf("    causal network searches %.6f fs with %.6f fs concerted tolerance.\n",
+      causal_search_max_fs_, causal_sync_fs_);
+    printf("    causal null baseline uses %d shifts and seed %llu.\n",
+      causal_null_shifts_, causal_null_seed_);
+  }
 }
 
 void Proton_Tunneling::preprocess(
@@ -938,9 +1149,12 @@ void Proton_Tunneling::preprocess(
   Force& force)
 {
   (void)number_of_steps;
-  (void)integrate;
   (void)group;
   (void)force;
+
+  if (local_influence_enabled_ && integrate.type != 33) {
+    PRINT_INPUT_ERROR("local_influence is currently supported only for ensemble pimd.");
+  }
 
   number_of_atoms_ = atom.number_of_atoms;
   time_step_ = time_step;
@@ -966,7 +1180,6 @@ void Proton_Tunneling::preprocess(
   oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
   previous_hydrogen_count_.resize(number_of_atoms_, 0);
-  event_hydrogen_count_.resize(number_of_atoms_, 0);
   frame_cause_event_ids_.resize(number_of_atoms_, -1);
   frame_geometries_.resize(hydrogen_indices_.size());
   hydrogen_states_.resize(hydrogen_indices_.size());
@@ -978,12 +1191,44 @@ void Proton_Tunneling::preprocess(
   window_records_.clear();
   edge_window_records_.clear();
   local_environment_window_records_.clear();
+  local_trace_records_.clear();
+  window_bonds_.clear();
+  total_bonds_.clear();
+  window_local_environment_stats_.clear();
+  dominant_ion_stats_[0].clear();
+  dominant_ion_stats_[1].clear();
   attempt_records_.reserve(1024);
   defect_records_.reserve(1024);
   window_records_.reserve(64);
   edge_window_records_.reserve(1024);
   local_environment_window_records_.reserve(64);
+  local_trace_records_.reserve(local_trace_edges_.size() * 1024);
+  attempt_concerted_group_ids_.clear();
+  concerted_group_records_.clear();
+  concerted_member_records_.clear();
+  causal_link_records_.clear();
+  chain_records_.clear();
+  chain_event_records_.clear();
+  causal_lag_histogram_records_.clear();
   atom.position_per_atom.copy_to_host(cpu_position_.data());
+  reference_oxygen_fractional_.assign(number_of_atoms_ * 3, 0.0);
+  reference_fractional_coordinates_valid_ = true;
+  for (const int oxygen : oxygen_indices_) {
+    double sx = 0.0;
+    double sy = 0.0;
+    double sz = 0.0;
+    cartesian_to_fractional(
+      box,
+      cpu_position_[oxygen],
+      cpu_position_[oxygen + number_of_atoms_],
+      cpu_position_[oxygen + 2 * number_of_atoms_],
+      sx,
+      sy,
+      sz);
+    reference_oxygen_fractional_[oxygen] = sx;
+    reference_oxygen_fractional_[oxygen + number_of_atoms_] = sy;
+    reference_oxygen_fractional_[oxygen + 2 * number_of_atoms_] = sz;
+  }
   build_oxygen_shell(box);
   initialize_geometry_gpu();
   CHECK(gpuEventCreate(&geometry_kernel_start_event_));
@@ -1075,6 +1320,8 @@ void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
   const int number_of_hydrogens = static_cast<int>(hydrogen_indices_.size());
   const auto total_start = std::chrono::high_resolution_clock::now();
   CHECK(gpuEventRecord(geometry_kernel_start_event_, 0));
+  const int species_decomposition_enabled =
+    (local_influence_enabled_ || !local_trace_edges_.empty()) ? 1 : 0;
   gpu_find_proton_geometry<<<number_of_hydrogens, 128>>>(
     atom.position_per_atom.data(),
     number_of_atoms_,
@@ -1099,6 +1346,7 @@ void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
     assignment_score_gap_min_,
     ion_field_enabled_ ? 1 : 0,
     ion_field_cutoff_,
+    species_decomposition_enabled,
     frame_geometries_gpu_.data());
   GPU_CHECK_KERNEL
   CHECK(gpuEventRecord(geometry_kernel_end_event_, 0));
@@ -1138,7 +1386,18 @@ void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
     target.low_to_high_dy = source.low_to_high_dy;
     target.low_to_high_dz = source.low_to_high_dz;
     target.E_ion_nominal_parallel = source.E_ion_nominal_parallel;
-    target.delta_phi_ion = source.delta_phi_ion;
+      target.delta_phi_ion = source.delta_phi_ion;
+      for (int species = 0; species < 2; ++species) {
+        target.ion_abs_E_species[species] = source.ion_abs_E_species[species];
+        target.ion_abs_phi_species[species] = source.ion_abs_phi_species[species];
+        target.ion_E_species[species] = source.ion_E_species[species];
+      target.ion_phi_species[species] = source.ion_phi_species[species];
+      target.nearest_ion_species_id[species] = source.nearest_ion_species_id[species];
+      target.dominant_ion_id[species] = source.dominant_ion_id[species];
+      target.dominant_ion_E[species] = source.dominant_ion_E[species];
+      target.dominant_ion_phi[species] = source.dominant_ion_phi[species];
+      target.dominant_ion_distance[species] = source.dominant_ion_distance[species];
+    }
     target.nearest_ion_id = source.nearest_ion_id;
     target.nearest_ion_distance = source.nearest_ion_distance;
     target.nearest_ion1_distance = source.nearest_ion1_distance;
@@ -1301,7 +1560,9 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
   const double ex = ox * inverse_dOO;
   const double ey = oy * inverse_dOO;
   const double ez = oz * inverse_dOO;
+  geometry.E_ion_nominal_parallel = 0.0;
   geometry.delta_phi_ion = 0.0;
+  geometry.nearest_ion_id = -1;
   geometry.nearest_ion_distance = std::numeric_limits<double>::max();
   geometry.nearest_ion1_distance = std::numeric_limits<double>::max();
   geometry.nearest_ion2_distance = std::numeric_limits<double>::max();
@@ -1309,7 +1570,19 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
   geometry.nearest_ion1_to_high = std::numeric_limits<double>::max();
   geometry.nearest_ion2_to_low = std::numeric_limits<double>::max();
   geometry.nearest_ion2_to_high = std::numeric_limits<double>::max();
+  for (int species = 0; species < 2; ++species) {
+    geometry.ion_E_species[species] = 0.0;
+    geometry.ion_phi_species[species] = 0.0;
+    geometry.ion_abs_E_species[species] = 0.0;
+    geometry.ion_abs_phi_species[species] = 0.0;
+    geometry.nearest_ion_species_id[species] = -1;
+    geometry.dominant_ion_id[species] = -1;
+    geometry.dominant_ion_E[species] = 0.0;
+    geometry.dominant_ion_phi[species] = 0.0;
+    geometry.dominant_ion_distance[species] = std::numeric_limits<double>::max();
+  }
   auto accumulate_ion_field = [&](const std::vector<int>& ions, const double charge,
+                                  const int species,
                                   double& nearest_species_distance,
                                   double& nearest_species_to_low,
                                   double& nearest_species_to_high) {
@@ -1338,7 +1611,10 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
       const double distance_square = midpoint_to_ion_x * midpoint_to_ion_x +
         midpoint_to_ion_y * midpoint_to_ion_y + midpoint_to_ion_z * midpoint_to_ion_z;
       const double distance = std::sqrt(distance_square);
-      nearest_species_distance = std::min(nearest_species_distance, distance);
+      if (distance < nearest_species_distance) {
+        nearest_species_distance = distance;
+        geometry.nearest_ion_species_id[species] = ion;
+      }
       nearest_species_to_low = std::min(nearest_species_to_low, low_distance);
       nearest_species_to_high = std::min(nearest_species_to_high, high_distance);
       if (distance < geometry.nearest_ion_distance) {
@@ -1346,20 +1622,39 @@ void Proton_Tunneling::compute_ion_field(const Box& box, GeometryResult& geometr
         geometry.nearest_ion_id = ion;
       }
       if (distance <= ion_field_cutoff_ && distance > 1.0e-12) {
-        geometry.E_ion_nominal_parallel += K_C * charge *
+        const double ion_E = K_C * charge *
           (midpoint_to_ion_x * ex + midpoint_to_ion_y * ey + midpoint_to_ion_z * ez) /
           (distance_square * distance);
-        if (low_distance > 1.0e-12 && high_distance > 1.0e-12)
-          geometry.delta_phi_ion += K_C * charge *
-            (1.0 / high_distance - 1.0 / low_distance);
+        geometry.E_ion_nominal_parallel += ion_E;
+        double ion_phi = 0.0;
+        if (low_distance > 1.0e-12 && high_distance > 1.0e-12) {
+          ion_phi = K_C * charge * (1.0 / high_distance - 1.0 / low_distance);
+          geometry.delta_phi_ion += ion_phi;
+        }
+        if (local_influence_enabled_ || !local_trace_edges_.empty()) {
+          geometry.ion_E_species[species] += ion_E;
+          geometry.ion_phi_species[species] += ion_phi;
+          geometry.ion_abs_E_species[species] += std::abs(ion_E);
+          geometry.ion_abs_phi_species[species] += std::abs(ion_phi);
+          const double dominant_metric = std::abs(ion_phi);
+          const double current_metric = std::abs(geometry.dominant_ion_phi[species]);
+          if (dominant_metric > current_metric ||
+              (dominant_metric == current_metric &&
+               (geometry.dominant_ion_id[species] < 0 || ion < geometry.dominant_ion_id[species]))) {
+            geometry.dominant_ion_id[species] = ion;
+            geometry.dominant_ion_E[species] = ion_E;
+            geometry.dominant_ion_phi[species] = ion_phi;
+            geometry.dominant_ion_distance[species] = distance;
+          }
+        }
       }
     }
   };
   accumulate_ion_field(
-    ion1_indices_, ion1_charge_, geometry.nearest_ion1_distance,
+    ion1_indices_, ion1_charge_, 0, geometry.nearest_ion1_distance,
     geometry.nearest_ion1_to_low, geometry.nearest_ion1_to_high);
   accumulate_ion_field(
-    ion2_indices_, ion2_charge_, geometry.nearest_ion2_distance,
+    ion2_indices_, ion2_charge_, 1, geometry.nearest_ion2_distance,
     geometry.nearest_ion2_to_low, geometry.nearest_ion2_to_high);
 }
 
@@ -1862,6 +2157,35 @@ void Proton_Tunneling::record_bond(
     stats.sum_ion2_to_low += geometry.nearest_ion2_to_low;
     stats.sum_ion2_to_high += geometry.nearest_ion2_to_high;
   }
+  if (local_influence_enabled_) {
+    const int state_index = state + 1;
+    for (int species = 0; species < 2; ++species) {
+      const double E = geometry.ion_E_species[species];
+      const double phi = geometry.ion_phi_species[species];
+      stats.sum_ion_E_species[species] += E;
+      stats.sum_ion_E2_species[species] += E * E;
+      stats.sum_ion_abs_E_species[species] += geometry.ion_abs_E_species[species];
+      stats.sum_ion_phi_species[species] += phi;
+      stats.sum_ion_phi2_species[species] += phi * phi;
+      stats.sum_ion_abs_phi_species[species] += geometry.ion_abs_phi_species[species];
+      stats.sum_ion_E_species_state[species][state_index] += E;
+      stats.sum_ion_E2_species_state[species][state_index] += E * E;
+      stats.sum_ion_phi_species_state[species][state_index] += phi;
+      stats.sum_ion_phi2_species_state[species][state_index] += phi * phi;
+      ++stats.ion_species_state_samples[species][state_index];
+
+      if (&bond_stats == &total_bonds_ && geometry.dominant_ion_id[species] >= 0) {
+        DominantIonStats& dominant = dominant_ion_stats_[species][
+          make_bond_key(geometry.oxygen_low, geometry.oxygen_high)][
+          geometry.dominant_ion_id[species]];
+        ++dominant.samples;
+        ++dominant.state_samples[state_index];
+        dominant.sum_E += geometry.dominant_ion_E[species];
+        dominant.sum_phi += geometry.dominant_ion_phi[species];
+        dominant.sum_distance += geometry.dominant_ion_distance[species];
+      }
+    }
+  }
   if (state > 0)
     ++stats.n_plus;
   else if (state < 0)
@@ -1939,6 +2263,180 @@ void Proton_Tunneling::record_local_environment(
   }
 }
 
+void Proton_Tunneling::record_local_traces(const double time_fs)
+{
+  if (local_trace_edges_.empty())
+    return;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const auto class_code = [](const QuantumCharacter character) {
+    switch (character) {
+    case QuantumCharacter::CLASSICAL_ONLY: return 0;
+    case QuantumCharacter::TWO_WELL_DELOCALIZED: return 1;
+    case QuantumCharacter::BARRIER_CENTERED_TUNNELING_LIKE: return 2;
+    case QuantumCharacter::COMPACT_SINGLE_DOMAIN: return 3;
+    case QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN: return 4;
+    case QuantumCharacter::AMBIGUOUS: return 5;
+    }
+    return 5;
+  };
+  for (const auto& requested_edge : local_trace_edges_) {
+    LocalTraceRecord record;
+    record.time_fs = time_fs;
+    record.oxygen_low = requested_edge.first;
+    record.oxygen_high = requested_edge.second;
+    record.delta = nan;
+    record.dOO = nan;
+    record.rperp = nan;
+    record.E_parallel = nan;
+    record.delta_phi_ion = nan;
+    for (int species = 0; species < 2; ++species) {
+      record.ion_E_species[species] = nan;
+      record.ion_phi_species[species] = nan;
+      record.ion_abs_E_species[species] = nan;
+      record.ion_abs_phi_species[species] = nan;
+      record.nearest_ion_distance[species] = nan;
+      record.nearest_ion_to_low[species] = nan;
+      record.nearest_ion_to_high[species] = nan;
+      record.dominant_ion_E[species] = nan;
+      record.dominant_ion_phi[species] = nan;
+      record.dominant_ion_distance[species] = nan;
+    }
+    record.nH_low = nan;
+    record.nH_high = nan;
+    record.donor_edges_low = nan;
+    record.donor_edges_high = nan;
+    record.acceptor_edges_low = nan;
+    record.acceptor_edges_high = nan;
+    record.ion1_low_d1 = nan;
+    record.ion1_low_d2 = nan;
+    record.ion1_low_d3 = nan;
+    record.ion1_high_d1 = nan;
+    record.ion1_high_d2 = nan;
+    record.ion1_high_d3 = nan;
+    record.ion2_low_d1 = nan;
+    record.ion2_low_d2 = nan;
+    record.ion2_low_d3 = nan;
+    record.ion2_high_d1 = nan;
+    record.ion2_high_d2 = nan;
+    record.ion2_high_d3 = nan;
+    record.coord_ion1_low = nan;
+    record.coord_ion1_high = nan;
+    record.coord_ion2_low = nan;
+    record.coord_ion2_high = nan;
+    record.delta_d_ion1 = nan;
+    record.delta_d_ion2 = nan;
+    record.nearest_ion2_to_H = nan;
+    record.angle_Olow_H_ion2 = nan;
+    record.angle_Ohigh_H_ion2 = nan;
+    record.hcl_like_low = nan;
+    record.hcl_like_high = nan;
+    record.bead_centroid_f_minus = nan;
+    record.bead_centroid_f_zero = nan;
+    record.bead_centroid_f_plus = nan;
+    record.bead_delocalized_f_minus = nan;
+    record.bead_delocalized_f_zero = nan;
+    record.bead_delocalized_f_plus = nan;
+    record.bead_centroid_span = nan;
+    record.bead_delocalized_span = nan;
+
+    int hydrogen_index = -1;
+    for (size_t h_index = 0; h_index < frame_geometries_.size(); ++h_index) {
+      const GeometryResult& geometry = frame_geometries_[h_index];
+      if (geometry.oxygen_low == requested_edge.first &&
+          geometry.oxygen_high == requested_edge.second && geometry.valid) {
+        hydrogen_index = static_cast<int>(h_index);
+        break;
+      }
+    }
+    if (hydrogen_index < 0) {
+      local_trace_records_.push_back(record);
+      continue;
+    }
+
+    const GeometryResult& geometry = frame_geometries_[hydrogen_index];
+    record.hydrogen = hydrogen_indices_[hydrogen_index];
+    record.valid = 1;
+    record.state = classify_delta(geometry.delta);
+    record.delta = geometry.delta;
+    record.dOO = geometry.dOO;
+    record.rperp = geometry.rperp;
+    record.E_parallel = geometry.E_ion_nominal_parallel;
+    record.delta_phi_ion = geometry.delta_phi_ion;
+    record.nH_low = hydrogen_count_[geometry.oxygen_low];
+    record.nH_high = hydrogen_count_[geometry.oxygen_high];
+    for (int species = 0; species < 2; ++species) {
+      if (ion_field_enabled_) {
+        record.nearest_ion_id[species] = geometry.nearest_ion_species_id[species];
+        record.dominant_ion_id[species] = geometry.dominant_ion_id[species];
+        record.ion_E_species[species] = geometry.ion_E_species[species];
+        record.ion_phi_species[species] = geometry.ion_phi_species[species];
+        record.ion_abs_E_species[species] = geometry.ion_abs_E_species[species];
+        record.ion_abs_phi_species[species] = geometry.ion_abs_phi_species[species];
+        record.nearest_ion_distance[species] = species == 0
+          ? geometry.nearest_ion1_distance : geometry.nearest_ion2_distance;
+        record.nearest_ion_to_low[species] = species == 0
+          ? geometry.nearest_ion1_to_low : geometry.nearest_ion2_to_low;
+        record.nearest_ion_to_high[species] = species == 0
+          ? geometry.nearest_ion1_to_high : geometry.nearest_ion2_to_high;
+        record.dominant_ion_E[species] = geometry.dominant_ion_E[species];
+        record.dominant_ion_phi[species] = geometry.dominant_ion_phi[species];
+        record.dominant_ion_distance[species] = geometry.dominant_ion_distance[species];
+      }
+    }
+    if (local_environment_enabled_) {
+      const LocalEnvironment& environment = frame_local_environments_[hydrogen_index];
+      if (environment.valid) {
+        record.donor_edges_low = environment.donor_edges_low;
+        record.donor_edges_high = environment.donor_edges_high;
+        record.acceptor_edges_low = environment.acceptor_edges_low;
+        record.acceptor_edges_high = environment.acceptor_edges_high;
+        record.ion1_low_d1 = environment.ion1_low_d1;
+        record.ion1_low_d2 = environment.ion1_low_d2;
+        record.ion1_low_d3 = environment.ion1_low_d3;
+        record.ion1_high_d1 = environment.ion1_high_d1;
+        record.ion1_high_d2 = environment.ion1_high_d2;
+        record.ion1_high_d3 = environment.ion1_high_d3;
+        record.ion2_low_d1 = environment.ion2_low_d1;
+        record.ion2_low_d2 = environment.ion2_low_d2;
+        record.ion2_low_d3 = environment.ion2_low_d3;
+        record.ion2_high_d1 = environment.ion2_high_d1;
+        record.ion2_high_d2 = environment.ion2_high_d2;
+        record.ion2_high_d3 = environment.ion2_high_d3;
+        record.coord_ion1_low = environment.coord_ion1_low;
+        record.coord_ion1_high = environment.coord_ion1_high;
+        record.coord_ion2_low = environment.coord_ion2_low;
+        record.coord_ion2_high = environment.coord_ion2_high;
+        record.delta_d_ion1 = environment.delta_d_ion1;
+        record.delta_d_ion2 = environment.delta_d_ion2;
+        record.nearest_ion2_to_H = environment.nearest_ion2_to_H;
+        record.angle_Olow_H_ion2 = environment.angle_Olow_H_ion2;
+        record.angle_Ohigh_H_ion2 = environment.angle_Ohigh_H_ion2;
+        record.hcl_like_low = environment.hcl_like_low;
+        record.hcl_like_high = environment.hcl_like_high;
+      }
+    }
+    if (bead_diagnostic_enabled_) {
+      const BeadDiagnostic& centroid = hydrogen_states_[hydrogen_index].centroid_best;
+      const BeadDiagnostic& delocalized = hydrogen_states_[hydrogen_index].delocalization_best;
+      record.bead_class[0] = class_code(centroid.character);
+      record.bead_class[1] = class_code(delocalized.character);
+      if (centroid.valid) {
+        record.bead_centroid_f_minus = centroid.f_minus;
+        record.bead_centroid_f_zero = centroid.f_zero;
+        record.bead_centroid_f_plus = centroid.f_plus;
+        record.bead_centroid_span = centroid.span;
+      }
+      if (delocalized.valid) {
+        record.bead_delocalized_f_minus = delocalized.f_minus;
+        record.bead_delocalized_f_zero = delocalized.f_zero;
+        record.bead_delocalized_f_plus = delocalized.f_plus;
+        record.bead_delocalized_span = delocalized.span;
+      }
+    }
+    local_trace_records_.push_back(record);
+  }
+}
+
 void Proton_Tunneling::start_attempt(
   HydrogenState& hydrogen_state,
   const int stable_state,
@@ -1963,6 +2461,13 @@ void Proton_Tunneling::start_attempt(
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
+  hydrogen_state.first_opposite_seen = false;
+  hydrogen_state.commit_seen = false;
+  hydrogen_state.time_first_opposite_fs = 0.0;
+  hydrogen_state.time_commit_fs = 0.0;
+  hydrogen_state.center_residence_fs = 0.0;
+  hydrogen_state.attempt_last_time_fs = time_fs;
+  hydrogen_state.attempt_last_state = classify_delta(geometry.delta);
   hydrogen_state.centroid_best = BeadDiagnostic();
   hydrogen_state.delocalization_best = BeadDiagnostic();
 }
@@ -2064,6 +2569,32 @@ void Proton_Tunneling::finish_attempt(
   record.attempt_id = hydrogen_state.attempt_id;
   record.time_start_fs = hydrogen_state.attempt_start_time_fs;
   record.time_end_fs = time_fs;
+  record.time_first_opposite_fs = hydrogen_state.first_opposite_seen
+    ? hydrogen_state.time_first_opposite_fs : nan;
+  record.time_commit_fs = hydrogen_state.commit_seen
+    ? hydrogen_state.time_commit_fs : nan;
+  record.time_confirm_fs = outcome == AttemptOutcome::success ? time_fs : nan;
+  record.center_residence_fs = hydrogen_state.center_residence_fs;
+  if (hydrogen_state.first_opposite_seen) {
+    record.crossing_duration_fs =
+      hydrogen_state.time_first_opposite_fs - hydrogen_state.attempt_start_time_fs;
+    if (hydrogen_state.commit_seen)
+      record.stabilization_delay_fs =
+        hydrogen_state.time_commit_fs - hydrogen_state.time_first_opposite_fs;
+  } else {
+    record.crossing_duration_fs = nan;
+    record.stabilization_delay_fs = nan;
+  }
+  if (outcome == AttemptOutcome::success && hydrogen_state.commit_seen) {
+    record.confirmation_delay_fs = time_fs - hydrogen_state.time_commit_fs;
+  } else {
+    record.confirmation_delay_fs = nan;
+  }
+  // The attempt itself has a well-defined duration for every outcome. Only
+  // milestone-dependent quantities above are NaN when that milestone was not
+  // reached.
+  record.attempt_duration_fs = time_fs - hydrogen_state.attempt_start_time_fs;
+  record.observer_frame = observer_frame_count_;
   record.hydrogen = hydrogen;
   record.oxygen_low = oxygen_low;
   record.oxygen_high = oxygen_high;
@@ -2090,16 +2621,10 @@ void Proton_Tunneling::finish_attempt(
   record.delocalization_best = hydrogen_state.delocalization_best;
 
   if (outcome == AttemptOutcome::success && geometry != nullptr) {
-    const int nH_from_before = event_hydrogen_count_[oxygen_from];
-    const int nH_to_before = event_hydrogen_count_[oxygen_target];
+    const int nH_from_before = previous_hydrogen_count_[oxygen_from];
+    const int nH_to_before = previous_hydrogen_count_[oxygen_target];
     const int nH_from_after = nH_from_before - 1;
     const int nH_to_after = nH_to_before + 1;
-    event_hydrogen_count_[oxygen_from] = nH_from_after;
-    event_hydrogen_count_[oxygen_target] = nH_to_after;
-    if (oxygen_from >= 0 && oxygen_from < static_cast<int>(frame_cause_event_ids_.size()))
-      frame_cause_event_ids_[oxygen_from] = hydrogen_state.attempt_id;
-    if (oxygen_target >= 0 && oxygen_target < static_cast<int>(frame_cause_event_ids_.size()))
-      frame_cause_event_ids_[oxygen_target] = hydrogen_state.attempt_id;
     double dx = geometry->low_to_high_dx;
     double dy = geometry->low_to_high_dy;
     double dz = geometry->low_to_high_dz;
@@ -2116,6 +2641,19 @@ void Proton_Tunneling::finish_attempt(
     record.dx = dx;
     record.dy = dy;
     record.dz = dz;
+    if (reference_fractional_coordinates_valid_ &&
+        oxygen_from >= 0 && oxygen_target >= 0 &&
+        oxygen_from < number_of_atoms_ && oxygen_target < number_of_atoms_) {
+      record.fractional_dx = wrapped_fractional_difference(
+        reference_oxygen_fractional_[oxygen_target] - reference_oxygen_fractional_[oxygen_from]);
+      record.fractional_dy = wrapped_fractional_difference(
+        reference_oxygen_fractional_[oxygen_target + number_of_atoms_] -
+        reference_oxygen_fractional_[oxygen_from + number_of_atoms_]);
+      record.fractional_dz = wrapped_fractional_difference(
+        reference_oxygen_fractional_[oxygen_target + 2 * number_of_atoms_] -
+        reference_oxygen_fractional_[oxygen_from + 2 * number_of_atoms_]);
+      record.fractional_step_valid = 1;
+    }
   }
   if (local_environment_enabled_) {
     LocalEnvironmentStats& environment_stats = window_local_environment_stats_[key];
@@ -2128,6 +2666,18 @@ void Proton_Tunneling::finish_attempt(
       ++environment_stats.geometry_lost;
   }
   attempt_records_.push_back(record);
+  if (record.has_transfer) {
+    const long long event_id = record.attempt_id;
+    const int touched_oxygens[2] = {record.oxygen_from, record.oxygen_target};
+    for (const int oxygen : touched_oxygens) {
+      if (oxygen < 0 || oxygen >= static_cast<int>(frame_cause_event_ids_.size()))
+        continue;
+      if (frame_cause_event_ids_[oxygen] < 0)
+        frame_cause_event_ids_[oxygen] = event_id;
+      else if (frame_cause_event_ids_[oxygen] != event_id)
+        frame_cause_event_ids_[oxygen] = -2;
+    }
+  }
 
   if (outcome == AttemptOutcome::success)
     hydrogen_state.stable_state = -hydrogen_state.attempt_from_state;
@@ -2148,6 +2698,13 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.pending_state = 0;
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
+  hydrogen_state.first_opposite_seen = false;
+  hydrogen_state.commit_seen = false;
+  hydrogen_state.time_first_opposite_fs = 0.0;
+  hydrogen_state.time_commit_fs = 0.0;
+  hydrogen_state.center_residence_fs = 0.0;
+  hydrogen_state.attempt_last_time_fs = 0.0;
+  hydrogen_state.attempt_last_state = 0;
   hydrogen_state.centroid_best = BeadDiagnostic();
   hydrogen_state.delocalization_best = BeadDiagnostic();
 }
@@ -2201,8 +2758,6 @@ void Proton_Tunneling::observe_frame(
     previous_hydrogen_count_ = hydrogen_count_;
     defect_state_initialized_ = true;
   }
-  event_hydrogen_count_ = previous_hydrogen_count_;
-
   bool bead_probe_frame = false;
   const auto probe_attempt = [&](const int hydrogen,
                                  const GeometryResult& geometry,
@@ -2247,6 +2802,9 @@ void Proton_Tunneling::observe_frame(
         continue;
       }
       if (hydrogen_state.attempt_active) {
+        const double dt = std::max(0.0, time_fs - hydrogen_state.attempt_last_time_fs);
+        if (hydrogen_state.attempt_last_state == 0)
+          hydrogen_state.center_residence_fs += dt;
         finish_attempt(
           hydrogen,
           hydrogen_state,
@@ -2262,6 +2820,14 @@ void Proton_Tunneling::observe_frame(
 
     ++window_valid_pair_count_;
     const int state = classify_delta(geometry.delta);
+
+    if (hydrogen_state.attempt_active) {
+      const double dt = std::max(0.0, time_fs - hydrogen_state.attempt_last_time_fs);
+      if (hydrogen_state.attempt_last_state == 0)
+        hydrogen_state.center_residence_fs += dt;
+      hydrogen_state.attempt_last_time_fs = time_fs;
+      hydrogen_state.attempt_last_state = state;
+    }
 
     if (hydrogen_state.oxygen_low != geometry.oxygen_low ||
         hydrogen_state.oxygen_high != geometry.oxygen_high) {
@@ -2326,6 +2892,10 @@ void Proton_Tunneling::observe_frame(
             &geometry,
             &local_environment);
         } else if (state == -hydrogen_state.attempt_from_state) {
+          if (!hydrogen_state.first_opposite_seen) {
+            hydrogen_state.first_opposite_seen = true;
+            hydrogen_state.time_first_opposite_fs = time_fs;
+          }
           if (hydrogen_state.pending_state == state) {
             ++hydrogen_state.pending_count;
           } else {
@@ -2334,6 +2904,8 @@ void Proton_Tunneling::observe_frame(
             hydrogen_state.pending_start_time_fs = time_fs;
           }
           if (hydrogen_state.pending_count >= hold_samples_) {
+            hydrogen_state.commit_seen = true;
+            hydrogen_state.time_commit_fs = hydrogen_state.pending_start_time_fs;
             finish_attempt(
               hydrogen,
               hydrogen_state,
@@ -2361,6 +2933,8 @@ void Proton_Tunneling::observe_frame(
     hydrogen_state.last_nearest_ion_distance = geometry.nearest_ion_distance;
     hydrogen_state.last_environment = local_environment;
   }
+
+  record_local_traces(time_fs);
 
   for (const int oxygen : oxygen_indices_) {
     if (hydrogen_count_[oxygen] != previous_hydrogen_count_[oxygen]) {
@@ -2391,6 +2965,690 @@ void Proton_Tunneling::observe_frame(
     std::chrono::duration<double>(observer_end - state_machine_start).count();
   total_observer_wall_time_ +=
     std::chrono::duration<double>(observer_end - observer_start).count();
+}
+
+int Proton_Tunneling::carrier_code(const CarrierType carrier) const
+{
+  return carrier == CarrierType::excess ? 0 : (carrier == CarrierType::deficit ? 1 : 2);
+}
+
+int Proton_Tunneling::temporal_code(const TemporalType temporal) const
+{
+  return temporal == TemporalType::sequential ? 0 :
+    (temporal == TemporalType::concerted ? 1 : 2);
+}
+
+int Proton_Tunneling::chain_class_code(const ChainClass chain_class) const
+{
+  switch (chain_class) {
+  case ChainClass::open: return 0;
+  case ChainClass::closed_local: return 1;
+  case ChainClass::closed_winding: return 2;
+  case ChainClass::branched: return 3;
+  case ChainClass::edge_rattling: return 4;
+  }
+  return 0;
+}
+
+const char* Proton_Tunneling::carrier_name(const CarrierType carrier) const
+{
+  switch (carrier) {
+  case CarrierType::excess: return "excess";
+  case CarrierType::deficit: return "deficit";
+  case CarrierType::edge_reversal: return "edge_reversal";
+  }
+  return "unknown";
+}
+
+const char* Proton_Tunneling::temporal_name(const TemporalType temporal) const
+{
+  switch (temporal) {
+  case TemporalType::sequential: return "sequential";
+  case TemporalType::concerted: return "concerted";
+  case TemporalType::temporally_invalid: return "temporally_invalid";
+  }
+  return "unknown";
+}
+
+const char* Proton_Tunneling::chain_class_name(const ChainClass chain_class) const
+{
+  switch (chain_class) {
+  case ChainClass::open: return "open";
+  case ChainClass::closed_local: return "closed_local";
+  case ChainClass::closed_winding: return "closed_winding";
+  case ChainClass::branched: return "branched";
+  case ChainClass::edge_rattling: return "edge_rattling";
+  }
+  return "unknown";
+}
+
+void Proton_Tunneling::build_causal_network()
+{
+  if (!causal_chain_enabled_)
+    return;
+
+  attempt_concerted_group_ids_.assign(attempt_records_.size(), -1);
+  concerted_group_records_.clear();
+  concerted_member_records_.clear();
+  causal_link_records_.clear();
+  chain_records_.clear();
+  chain_event_records_.clear();
+
+  std::vector<size_t> successful_events;
+  successful_events.reserve(attempt_records_.size());
+  for (size_t i = 0; i < attempt_records_.size(); ++i)
+    if (attempt_records_[i].has_transfer)
+      successful_events.push_back(i);
+
+  const auto first_opposite_time = [&](const AttemptRecord& record) {
+    return std::isfinite(record.time_first_opposite_fs)
+      ? record.time_first_opposite_fs : record.time_start_fs;
+  };
+  std::sort(successful_events.begin(), successful_events.end(),
+    [&](const size_t first, const size_t second) {
+      const double first_time = first_opposite_time(attempt_records_[first]);
+      const double second_time = first_opposite_time(attempt_records_[second]);
+      if (first_time != second_time)
+        return first_time < second_time;
+      return first < second;
+    });
+
+  long long next_group_id = 1;
+  size_t group_begin = 0;
+  while (group_begin < successful_events.size()) {
+    size_t group_end = group_begin + 1;
+    const double reference_time = first_opposite_time(attempt_records_[successful_events[group_begin]]);
+    while (group_end < successful_events.size() &&
+           first_opposite_time(attempt_records_[successful_events[group_end]]) - reference_time <=
+             causal_sync_fs_)
+      ++group_end;
+
+    ConcertedGroupRecord group;
+    group.group_id = next_group_id;
+    group.reference_time_fs = reference_time;
+    group.time_span_fs = first_opposite_time(attempt_records_[successful_events[group_end - 1]]) -
+      reference_time;
+    group.n_events = static_cast<int>(group_end - group_begin);
+    std::set<int> hydrogens;
+    std::set<int> oxygens;
+    std::set<unsigned long long> edges;
+    std::unordered_map<int, std::vector<int>> adjacency;
+    for (size_t position = group_begin; position < group_end; ++position) {
+      const size_t event_index = successful_events[position];
+      const AttemptRecord& event = attempt_records_[event_index];
+      attempt_concerted_group_ids_[event_index] = next_group_id;
+      concerted_member_records_.push_back({next_group_id, static_cast<long long>(event_index)});
+      hydrogens.insert(event.hydrogen);
+      oxygens.insert(event.oxygen_from);
+      oxygens.insert(event.oxygen_target);
+      edges.insert(make_bond_key(event.oxygen_low, event.oxygen_high));
+      adjacency[event.oxygen_from].push_back(event.oxygen_target);
+    }
+    group.n_unique_H = static_cast<int>(hydrogens.size());
+    group.n_unique_O = static_cast<int>(oxygens.size());
+    group.n_unique_edges = static_cast<int>(edges.size());
+
+    bool has_cycle = false;
+    for (const auto& start_item : adjacency) {
+      const int start = start_item.first;
+      std::vector<int> stack(1, start);
+      std::set<int> visited;
+      while (!stack.empty() && !has_cycle) {
+        const int current = stack.back();
+        stack.pop_back();
+        if (!visited.insert(current).second)
+          continue;
+        const auto next_item = adjacency.find(current);
+        if (next_item == adjacency.end())
+          continue;
+        for (const int next : next_item->second) {
+          if (next == start) {
+            has_cycle = true;
+            break;
+          }
+          if (visited.find(next) == visited.end())
+            stack.push_back(next);
+        }
+      }
+      if (has_cycle)
+        break;
+    }
+    group.has_closed_oxygen_cycle = has_cycle ? 1 : 0;
+    concerted_group_records_.push_back(group);
+    ++next_group_id;
+    group_begin = group_end;
+  }
+
+  const auto event_group = [&](const size_t event_index) {
+    return event_index < attempt_concerted_group_ids_.size()
+      ? attempt_concerted_group_ids_[event_index] : -1;
+  };
+  for (size_t parent_position = 0; parent_position < successful_events.size(); ++parent_position) {
+    const size_t parent_index = successful_events[parent_position];
+    const AttemptRecord& parent = attempt_records_[parent_index];
+    for (size_t child_position = 0; child_position < successful_events.size(); ++child_position) {
+      const size_t child_index = successful_events[child_position];
+      if (parent_index == child_index)
+        continue;
+      const AttemptRecord& child = attempt_records_[child_index];
+      const double parent_first = first_opposite_time(parent);
+      const double child_first = first_opposite_time(child);
+      const double causal_lag = child.time_start_fs - parent_first;
+      if (std::abs(causal_lag) > causal_search_max_fs_)
+        continue;
+
+      CarrierType carrier = CarrierType::excess;
+      const bool is_excess = parent.oxygen_target == child.oxygen_from;
+      const bool is_deficit = parent.oxygen_from == child.oxygen_target;
+      const bool is_reversal = parent.oxygen_from == child.oxygen_target &&
+        parent.oxygen_target == child.oxygen_from;
+      if (is_reversal)
+        carrier = CarrierType::edge_reversal;
+      else if (is_excess)
+        carrier = CarrierType::excess;
+      else if (is_deficit)
+        carrier = CarrierType::deficit;
+      else
+        continue;
+
+      CausalLinkRecord link;
+      link.parent_attempt_index = static_cast<long long>(parent_index);
+      link.child_attempt_index = static_cast<long long>(child_index);
+      link.shared_oxygen = is_excess ? parent.oxygen_target : parent.oxygen_from;
+      link.carrier_type = carrier;
+      link.causal_lag_fs = causal_lag;
+      link.lag_first_opposite_fs = child_first - parent_first;
+      link.lag_commit_fs = child.time_commit_fs - parent.time_commit_fs;
+      link.lag_confirm_fs = child.time_confirm_fs - parent.time_confirm_fs;
+      link.same_hydrogen = parent.hydrogen == child.hydrogen;
+      link.same_edge = parent.oxygen_low == child.oxygen_low &&
+        parent.oxygen_high == child.oxygen_high;
+      link.parent_group_id = event_group(parent_index);
+      link.child_group_id = event_group(child_index);
+      if (link.lag_first_opposite_fs > causal_sync_fs_)
+        link.temporal_type = TemporalType::sequential;
+      else if (link.lag_first_opposite_fs >= -causal_sync_fs_)
+        link.temporal_type = TemporalType::concerted;
+      else
+        link.temporal_type = TemporalType::temporally_invalid;
+
+      if (carrier == CarrierType::excess) {
+        const int parent_q = parent.nH_to_after - 2;
+        const int child_q = child.nH_from_before - 2;
+        link.defect_continuity = (parent_q > 0 && child_q > 0 &&
+                                  child.nH_from_after < child.nH_from_before) ? 1 : 0;
+      } else if (carrier == CarrierType::deficit) {
+        const int parent_q = parent.nH_from_after - 2;
+        const int child_q = child.nH_to_before - 2;
+        link.defect_continuity = (parent_q < 0 && child_q < 0 &&
+                                  child.nH_to_after > child.nH_to_before) ? 1 : 0;
+      } else {
+        link.defect_continuity = -1;
+      }
+      link.valid_relay = carrier != CarrierType::edge_reversal &&
+        link.temporal_type != TemporalType::temporally_invalid &&
+        link.defect_continuity == 1 && !link.same_hydrogen && !link.same_edge;
+      causal_link_records_.push_back(link);
+    }
+  }
+
+  std::map<std::pair<long long, int>, int> parent_candidate_count;
+  std::map<std::pair<long long, int>, int> child_candidate_count;
+  for (const CausalLinkRecord& link : causal_link_records_) {
+    if (!link.valid_relay)
+      continue;
+    ++parent_candidate_count[{link.parent_attempt_index, carrier_code(link.carrier_type)}];
+    ++child_candidate_count[{link.child_attempt_index, carrier_code(link.carrier_type)}];
+  }
+  for (CausalLinkRecord& link : causal_link_records_) {
+    if (!link.valid_relay)
+      continue;
+    link.alternative_child_count = std::max(0,
+      parent_candidate_count[{link.parent_attempt_index, carrier_code(link.carrier_type)}] - 1);
+    link.alternative_parent_count = std::max(0,
+      child_candidate_count[{link.child_attempt_index, carrier_code(link.carrier_type)}] - 1);
+  }
+
+  const auto better_primary = [&](const CausalLinkRecord& candidate,
+                                  const CausalLinkRecord& current) {
+    if (candidate.lag_first_opposite_fs != current.lag_first_opposite_fs)
+      return candidate.lag_first_opposite_fs < current.lag_first_opposite_fs;
+    if (candidate.lag_commit_fs != current.lag_commit_fs)
+      return candidate.lag_commit_fs < current.lag_commit_fs;
+    return candidate.child_attempt_index < current.child_attempt_index;
+  };
+  std::map<std::pair<long long, int>, size_t> primary_links;
+  for (size_t i = 0; i < causal_link_records_.size(); ++i) {
+    CausalLinkRecord& link = causal_link_records_[i];
+    if (!link.valid_relay || link.temporal_type != TemporalType::sequential ||
+        link.parent_group_id == link.child_group_id)
+      continue;
+    const std::pair<long long, int> key = {
+      link.parent_attempt_index, carrier_code(link.carrier_type)};
+    const auto current = primary_links.find(key);
+    if (current == primary_links.end() || better_primary(link, causal_link_records_[current->second]))
+      primary_links[key] = i;
+  }
+  for (const auto& item : primary_links)
+    causal_link_records_[item.second].primary_link = true;
+
+  std::vector<size_t> event_indices = successful_events;
+  std::map<size_t, size_t> event_position;
+  for (size_t i = 0; i < event_indices.size(); ++i)
+    event_position[event_indices[i]] = i;
+  std::vector<size_t> disjoint_parent(event_indices.size());
+  for (size_t i = 0; i < disjoint_parent.size(); ++i)
+    disjoint_parent[i] = i;
+  const auto find_root = [&](size_t index) {
+    size_t root = index;
+    while (disjoint_parent[root] != root)
+      root = disjoint_parent[root];
+    while (disjoint_parent[index] != index) {
+      const size_t next = disjoint_parent[index];
+      disjoint_parent[index] = root;
+      index = next;
+    }
+    return root;
+  };
+  const auto unite = [&](const size_t first, const size_t second) {
+    const size_t first_root = find_root(first);
+    const size_t second_root = find_root(second);
+    if (first_root != second_root)
+      disjoint_parent[second_root] = first_root;
+  };
+  for (const CausalLinkRecord& link : causal_link_records_) {
+    if (!link.valid_relay)
+      continue;
+    const auto parent_item = event_position.find(static_cast<size_t>(link.parent_attempt_index));
+    const auto child_item = event_position.find(static_cast<size_t>(link.child_attempt_index));
+    if (parent_item != event_position.end() && child_item != event_position.end())
+      unite(parent_item->second, child_item->second);
+  }
+  // Concerted members form one episode/supernode even when no directed
+  // relay can be selected between them. This prevents H-index ordering from
+  // splitting one same-time collective event into unrelated episodes.
+  std::map<long long, size_t> first_group_event;
+  for (const size_t event_index : event_indices) {
+    const long long group_id = event_group(event_index);
+    if (group_id < 0)
+      continue;
+    const auto item = event_position.find(event_index);
+    if (item == event_position.end())
+      continue;
+    const auto first = first_group_event.find(group_id);
+    if (first == first_group_event.end())
+      first_group_event[group_id] = item->second;
+    else
+      unite(first->second, item->second);
+  }
+
+  std::map<size_t, long long> episode_ids;
+  for (size_t i = 0; i < event_indices.size(); ++i) {
+    const size_t root = find_root(i);
+    const auto item = episode_ids.find(root);
+    const long long candidate_id = static_cast<long long>(event_indices[i]) + 1;
+    if (item == episode_ids.end() || candidate_id < item->second)
+      episode_ids[root] = candidate_id;
+  }
+
+  long long next_chain_id = 1;
+  const std::vector<double> chain_thresholds = causal_gap_thresholds_fs_.empty()
+    ? std::vector<double>(1, causal_search_max_fs_) : causal_gap_thresholds_fs_;
+  for (const double lag_threshold_fs : chain_thresholds) {
+    std::map<std::pair<long long, int>, size_t> outgoing;
+    std::map<std::pair<long long, int>, int> incoming_count;
+    for (size_t i = 0; i < causal_link_records_.size(); ++i) {
+      const CausalLinkRecord& link = causal_link_records_[i];
+      if (!link.primary_link || link.temporal_type != TemporalType::sequential ||
+          link.lag_first_opposite_fs <= causal_sync_fs_ ||
+          link.lag_first_opposite_fs > lag_threshold_fs)
+        continue;
+      outgoing[{link.parent_attempt_index, carrier_code(link.carrier_type)}] = i;
+      ++incoming_count[{link.child_attempt_index, carrier_code(link.carrier_type)}];
+    }
+
+    for (const CarrierType carrier : {CarrierType::excess, CarrierType::deficit}) {
+    const int carrier_id = carrier_code(carrier);
+    std::set<long long> used;
+    std::vector<size_t> roots;
+    for (const size_t event_index : event_indices) {
+      if (incoming_count.find({static_cast<long long>(event_index), carrier_id}) ==
+          incoming_count.end())
+        roots.push_back(event_index);
+    }
+    for (const size_t event_index : event_indices)
+      if (std::find(roots.begin(), roots.end(), event_index) == roots.end())
+        roots.push_back(event_index);
+
+    for (const size_t root_event : roots) {
+      if (used.find(static_cast<long long>(root_event)) != used.end())
+        continue;
+      std::vector<size_t> path;
+      size_t current = root_event;
+      while (used.insert(static_cast<long long>(current)).second) {
+        path.push_back(current);
+        const auto next = outgoing.find({static_cast<long long>(current), carrier_id});
+        if (next == outgoing.end())
+          break;
+        const CausalLinkRecord& link = causal_link_records_[next->second];
+        current = static_cast<size_t>(link.child_attempt_index);
+      }
+      if (path.empty())
+        continue;
+      std::set<size_t> path_events(path.begin(), path.end());
+
+      ChainRecord chain;
+      chain.chain_id = next_chain_id++;
+      const size_t root_position = event_position[path.front()];
+      chain.episode_id = episode_ids[find_root(root_position)];
+      chain.carrier_type = carrier;
+      chain.lag_threshold_fs = lag_threshold_fs;
+      chain.start_time_fs = attempt_records_[path.front()].time_start_fs;
+      chain.end_time_fs = attempt_records_[path.back()].time_confirm_fs;
+      if (!std::isfinite(chain.end_time_fs))
+        chain.end_time_fs = attempt_records_[path.back()].time_end_fs;
+      chain.n_events = static_cast<int>(path.size());
+      chain.start_O = carrier == CarrierType::excess
+        ? attempt_records_[path.front()].oxygen_target : attempt_records_[path.front()].oxygen_from;
+      chain.end_O = carrier == CarrierType::excess
+        ? attempt_records_[path.back()].oxygen_target : attempt_records_[path.back()].oxygen_from;
+      std::set<long long> groups;
+      double net_x = 0.0;
+      double net_y = 0.0;
+      double net_z = 0.0;
+      double frac_x = 0.0;
+      double frac_y = 0.0;
+      double frac_z = 0.0;
+      bool fractional_valid = true;
+      double current_x = 0.0;
+      double current_y = 0.0;
+      double current_z = 0.0;
+      long long gap_count = 0;
+      double gap_sum = 0.0;
+      bool branched = false;
+      bool edge_rattling = false;
+      int quantum_valid = 0;
+      int two_well = 0;
+      int strict_tunneling = 0;
+      int multi_kink = 0;
+      for (const size_t event_index : path) {
+        const AttemptRecord& event = attempt_records_[event_index];
+        groups.insert(event_group(event_index));
+        const BeadDiagnostic& diagnostic = event.delocalization_best.valid
+          ? event.delocalization_best : event.centroid_best;
+        if (diagnostic.valid) {
+          ++quantum_valid;
+          two_well += diagnostic.two_well_occupied != 0 ? 1 : 0;
+          strict_tunneling += diagnostic.strict_tunneling_like != 0 ? 1 : 0;
+          multi_kink += diagnostic.multi_kink_or_multi_domain != 0 ? 1 : 0;
+        }
+      }
+      for (size_t position = 1; position < path.size(); ++position) {
+        const size_t parent_index = path[position - 1];
+        const size_t child_index = path[position];
+        const auto link_item = outgoing.find({static_cast<long long>(parent_index), carrier_id});
+        if (link_item == outgoing.end())
+          continue;
+        const CausalLinkRecord& link = causal_link_records_[link_item->second];
+        const AttemptRecord& child = attempt_records_[child_index];
+        const double sign = carrier == CarrierType::excess ? 1.0 : -1.0;
+        const double dx = sign * child.dx;
+        const double dy = sign * child.dy;
+        const double dz = sign * child.dz;
+        const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        chain.path_length_A += distance;
+        net_x += dx;
+        net_y += dy;
+        net_z += dz;
+        current_x += dx;
+        current_y += dy;
+        current_z += dz;
+        chain.max_span_A = std::max(chain.max_span_A,
+          std::sqrt(current_x * current_x + current_y * current_y + current_z * current_z));
+        if (child.fractional_step_valid != 0) {
+          frac_x += sign * child.fractional_dx;
+          frac_y += sign * child.fractional_dy;
+          frac_z += sign * child.fractional_dz;
+        } else {
+          fractional_valid = false;
+        }
+        const double gap = link.lag_first_opposite_fs;
+        if (gap >= 0.0) {
+          gap_sum += gap;
+          chain.max_gap_fs = std::max(chain.max_gap_fs, gap);
+          ++gap_count;
+        }
+        if (link.alternative_parent_count > 0 || link.alternative_child_count > 0)
+          branched = true;
+        if (link.carrier_type == CarrierType::edge_reversal)
+          edge_rattling = true;
+      }
+      if (!edge_rattling) {
+        for (const CausalLinkRecord& link : causal_link_records_) {
+          if (link.carrier_type != CarrierType::edge_reversal)
+            continue;
+          if (path_events.find(static_cast<size_t>(link.parent_attempt_index)) == path_events.end())
+            continue;
+          const AttemptRecord& child_event =
+            attempt_records_[static_cast<size_t>(link.child_attempt_index)];
+          for (const size_t event_index : path) {
+            const AttemptRecord& path_event = attempt_records_[event_index];
+            if (path_event.oxygen_low == child_event.oxygen_low &&
+                path_event.oxygen_high == child_event.oxygen_high) {
+              edge_rattling = true;
+              break;
+            }
+          }
+          if (edge_rattling)
+            break;
+        }
+      }
+      chain.n_concerted_groups = static_cast<int>(groups.size()) -
+        (groups.find(-1) != groups.end() ? 1 : 0);
+      chain.net_dx = net_x;
+      chain.net_dy = net_y;
+      chain.net_dz = net_z;
+      chain.net_displacement_A = std::sqrt(net_x * net_x + net_y * net_y + net_z * net_z);
+      chain.fractional_net_x = frac_x;
+      chain.fractional_net_y = frac_y;
+      chain.fractional_net_z = frac_z;
+      // The carrier is born on the target (excess) or source (deficit) O of
+      // the first transfer. Closure therefore means that the propagated
+      // carrier reaches the opposite defect created by that same transfer,
+      // not that it returns to its first carrier site.
+      const AttemptRecord& first_event = attempt_records_[path.front()];
+      const int opposite_defect_O = carrier == CarrierType::excess
+        ? first_event.oxygen_from : first_event.oxygen_target;
+      chain.closed_by_oxygen_id = path.size() > 1 && chain.end_O == opposite_defect_O ? 1 : 0;
+      const double rounded_x = std::nearbyint(frac_x);
+      const double rounded_y = std::nearbyint(frac_y);
+      const double rounded_z = std::nearbyint(frac_z);
+      chain.winding_x = static_cast<int>(rounded_x);
+      chain.winding_y = static_cast<int>(rounded_y);
+      chain.winding_z = static_cast<int>(rounded_z);
+      chain.winding_residual = std::sqrt(
+        (frac_x - rounded_x) * (frac_x - rounded_x) +
+        (frac_y - rounded_y) * (frac_y - rounded_y) +
+        (frac_z - rounded_z) * (frac_z - rounded_z));
+      chain.winding_valid = fractional_valid && chain.winding_residual < winding_epsilon_ ? 1 : 0;
+      chain.mean_gap_fs = gap_count > 0 ? gap_sum / gap_count : 0.0;
+      chain.n_quantum_valid = quantum_valid;
+      chain.fraction_two_well = quantum_valid > 0
+        ? static_cast<double>(two_well) / quantum_valid : 0.0;
+      chain.fraction_strict_tunneling_like = quantum_valid > 0
+        ? static_cast<double>(strict_tunneling) / quantum_valid : 0.0;
+      chain.fraction_multi_kink = quantum_valid > 0
+        ? static_cast<double>(multi_kink) / quantum_valid : 0.0;
+      for (size_t position = 0; position + 1 < path.size(); ++position) {
+        const auto link_item = outgoing.find({static_cast<long long>(path[position]), carrier_id});
+        if (link_item != outgoing.end()) {
+          const CausalLinkRecord& link = causal_link_records_[link_item->second];
+          chain.alternative_parent_count += link.alternative_parent_count;
+          chain.alternative_child_count += link.alternative_child_count;
+        }
+      }
+      if (branched)
+        chain.chain_class = ChainClass::branched;
+      else if (edge_rattling)
+        chain.chain_class = ChainClass::edge_rattling;
+      else if (chain.closed_by_oxygen_id != 0 && chain.winding_valid != 0 &&
+               (chain.winding_x != 0 || chain.winding_y != 0 || chain.winding_z != 0))
+        chain.chain_class = ChainClass::closed_winding;
+      else if (chain.closed_by_oxygen_id != 0)
+        chain.chain_class = ChainClass::closed_local;
+      else
+        chain.chain_class = ChainClass::open;
+      for (size_t position = 0; position < path.size(); ++position)
+        chain_event_records_.push_back({chain.chain_id, static_cast<long long>(position),
+                                        static_cast<long long>(path[position])});
+      chain_records_.push_back(chain);
+    }
+  }
+}
+}
+
+void Proton_Tunneling::build_causal_lag_histogram()
+{
+  causal_lag_histogram_records_.clear();
+  if (!causal_chain_enabled_ || causal_lag_bin_edges_fs_.size() < 2)
+    return;
+
+  const size_t number_of_bins = causal_lag_bin_edges_fs_.size() - 1;
+  const auto first_opposite_time = [&](const AttemptRecord& record) {
+    return std::isfinite(record.time_first_opposite_fs)
+      ? record.time_first_opposite_fs : record.time_start_fs;
+  };
+  std::vector<std::vector<long long>> real_counts(2, std::vector<long long>(number_of_bins, 0));
+  const auto bin_index = [&](const double lag) {
+    for (size_t bin = 0; bin < number_of_bins; ++bin) {
+      const bool last = bin + 1 == number_of_bins;
+      if (lag >= causal_lag_bin_edges_fs_[bin] &&
+          (lag < causal_lag_bin_edges_fs_[bin + 1] ||
+           (last && lag <= causal_lag_bin_edges_fs_[bin + 1])))
+        return static_cast<int>(bin);
+    }
+    return -1;
+  };
+  for (const CausalLinkRecord& link : causal_link_records_) {
+    const int carrier = carrier_code(link.carrier_type);
+    if (carrier > 1 || !link.valid_relay)
+      continue;
+    const int bin = bin_index(link.lag_first_opposite_fs);
+    if (bin >= 0)
+      ++real_counts[carrier][bin];
+  }
+
+  std::vector<std::vector<std::vector<long long>>> null_counts(2,
+    std::vector<std::vector<long long>>(std::max(0, causal_null_shifts_),
+      std::vector<long long>(number_of_bins, 0)));
+  if (causal_null_shifts_ > 0) {
+    double global_min = std::numeric_limits<double>::max();
+    double global_max = -std::numeric_limits<double>::max();
+    for (const AttemptRecord& event : attempt_records_) {
+      if (!event.has_transfer)
+        continue;
+      const double time = first_opposite_time(event);
+      if (!std::isfinite(time))
+        continue;
+      global_min = std::min(global_min, time);
+      global_max = std::max(global_max, time);
+    }
+    const double period = global_max - global_min;
+    std::mt19937_64 random_engine(causal_null_seed_);
+    std::uniform_real_distribution<double> uniform_shift(0.0, std::max(0.0, period));
+    for (int shift_index = 0; shift_index < causal_null_shifts_; ++shift_index) {
+      std::map<std::pair<int, int>, double> shifts;
+      const auto event_position_oxygen = [&](const AttemptRecord& event,
+                                             const int carrier,
+                                             const bool parent_role) {
+        if (carrier == 0)
+          return parent_role ? event.oxygen_target : event.oxygen_from;
+        return parent_role ? event.oxygen_from : event.oxygen_target;
+      };
+      const auto random_circular_shift = [&]() {
+        double shift = period > 0.0 ? uniform_shift(random_engine) : 0.0;
+        if (period > 2.0 * causal_search_max_fs_ && shift < causal_search_max_fs_)
+          shift += causal_search_max_fs_;
+        return period > 0.0 ? std::fmod(shift, period) : 0.0;
+      };
+      for (const AttemptRecord& event : attempt_records_) {
+        if (!event.has_transfer)
+          continue;
+        for (int carrier = 0; carrier < 2; ++carrier) {
+          for (int role = 0; role < 2; ++role) {
+            const bool parent_role = role == 0;
+            const int oxygen = event_position_oxygen(event, carrier, parent_role);
+            shifts[{carrier * 2 + role, oxygen}] = random_circular_shift();
+          }
+        }
+      }
+      const auto shifted_time = [&](const size_t event_index, const int carrier,
+                                    const bool parent_role) {
+        const AttemptRecord& event = attempt_records_[event_index];
+        const int oxygen = event_position_oxygen(event, carrier, parent_role);
+        const auto shift_item = shifts.find({carrier * 2 + (parent_role ? 0 : 1), oxygen});
+        const double shift = shift_item == shifts.end() ? 0.0 : shift_item->second;
+        const double time = first_opposite_time(event);
+        if (period <= 0.0)
+          return time;
+        double result = std::fmod(time - global_min + shift, period);
+        if (result < 0.0)
+          result += period;
+        return global_min + result;
+      };
+      for (const CausalLinkRecord& link : causal_link_records_) {
+        const int carrier = carrier_code(link.carrier_type);
+        if (carrier > 1 || !link.valid_relay)
+          continue;
+        const size_t parent_index = static_cast<size_t>(link.parent_attempt_index);
+        const size_t child_index = static_cast<size_t>(link.child_attempt_index);
+        const double lag = shifted_time(child_index, carrier, false) -
+          shifted_time(parent_index, carrier, true);
+        const int bin = bin_index(lag);
+        if (bin >= 0)
+          ++null_counts[carrier][shift_index][bin];
+      }
+    }
+  }
+
+  for (int carrier = 0; carrier < 2; ++carrier) {
+    for (size_t bin = 0; bin < number_of_bins; ++bin) {
+      CausalLagHistogramRecord record;
+      record.carrier_type = carrier;
+      record.lag_bin_low_fs = causal_lag_bin_edges_fs_[bin];
+      record.lag_bin_high_fs = causal_lag_bin_edges_fs_[bin + 1];
+      record.real_count = real_counts[carrier][bin];
+      record.n_null_shifts = causal_null_shifts_;
+      if (causal_null_shifts_ > 0) {
+        double sum = 0.0;
+        for (int shift = 0; shift < causal_null_shifts_; ++shift)
+          sum += null_counts[carrier][shift][bin];
+        record.null_mean_count = sum / causal_null_shifts_;
+        double variance = 0.0;
+        for (int shift = 0; shift < causal_null_shifts_; ++shift) {
+          const double difference = null_counts[carrier][shift][bin] - record.null_mean_count;
+          variance += difference * difference;
+        }
+        record.null_std_count = std::sqrt(variance /
+          std::max(1, causal_null_shifts_ - 1));
+        if (record.null_mean_count > 0.0) {
+          record.g_causal = static_cast<double>(record.real_count) / record.null_mean_count;
+          record.g_causal_standard_error = record.null_std_count /
+            (std::sqrt(static_cast<double>(std::max(1, causal_null_shifts_))) *
+             record.null_mean_count);
+        } else {
+          record.g_causal = std::numeric_limits<double>::quiet_NaN();
+          record.g_causal_standard_error = std::numeric_limits<double>::quiet_NaN();
+        }
+      } else {
+        record.null_mean_count = std::numeric_limits<double>::quiet_NaN();
+        record.null_std_count = std::numeric_limits<double>::quiet_NaN();
+        record.g_causal = std::numeric_limits<double>::quiet_NaN();
+        record.g_causal_standard_error = std::numeric_limits<double>::quiet_NaN();
+      }
+      causal_lag_histogram_records_.push_back(record);
+    }
+  }
 }
 
 void Proton_Tunneling::process(
@@ -2804,6 +4062,17 @@ void Proton_Tunneling::write_text_output_files()
     local_environment_window_file_ = my_fopen("proton_local_environment_window.out", "a");
     local_environment_event_file_ = my_fopen("proton_local_environment_event.out", "a");
   }
+  if (local_influence_enabled_)
+    ion_influence_file_ = my_fopen("proton_ion_influence.out", "a");
+  if (causal_chain_enabled_) {
+    causal_link_file_ = my_fopen("proton_causal_link.out", "a");
+    concerted_group_file_ = my_fopen("proton_concerted_group.out", "a");
+    concerted_member_file_ = my_fopen("proton_concerted_member.out", "a");
+    chain_file_ = my_fopen("proton_chain.out", "a");
+    chain_event_file_ = my_fopen("proton_chain_event.out", "a");
+    if (causal_null_shifts_ > 0)
+      causal_lag_file_ = my_fopen("proton_causal_lag_histogram.out", "a");
+  }
 
   fprintf(bias_file_,
     "# compute_proton_tunneling %d %d %.10e %d %.10e %.10e %.10e %s %s oho_angle %.10e",
@@ -2818,6 +4087,18 @@ void Proton_Tunneling::write_text_output_files()
   if (local_environment_enabled_)
     fprintf(bias_file_, " local_environment %.10e %.10e %.10e %.10e",
       local_ion1_cutoff_, local_ion2_cutoff_, local_hcl_cutoff_, local_hcl_angle_min_deg_);
+  if (local_influence_enabled_)
+    fprintf(bias_file_, " local_influence");
+  if (causal_chain_enabled_) {
+    fprintf(bias_file_, " causal_chain %.10e %.10e %zu",
+      causal_search_max_fs_, causal_sync_fs_, causal_gap_thresholds_fs_.size());
+    for (const double threshold : causal_gap_thresholds_fs_)
+      fprintf(bias_file_, " %.10e", threshold);
+    fprintf(bias_file_, " causal_lag_bins %zu", causal_lag_bin_edges_fs_.size() - 1);
+    for (const double edge : causal_lag_bin_edges_fs_)
+      fprintf(bias_file_, " %.10e", edge);
+    fprintf(bias_file_, " causal_null %d %llu", causal_null_shifts_, causal_null_seed_);
+  }
   fprintf(bias_file_, "\n");
   fprintf(bias_file_,
     "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
@@ -2827,16 +4108,21 @@ void Proton_Tunneling::write_text_output_files()
   fprintf(transfer_file_,
     "# columns event_id time_start_fs time_confirm_fs H_id O_from O_to O_pair_low O_pair_high "
     "nH_from_before nH_to_before nH_from_after nH_to_after "
-    "q_from_before q_to_before q_from_after q_to_after dx dy dz delta_start delta_confirm\n");
+    "q_from_before q_to_before q_from_after q_to_after dx dy dz delta_start delta_confirm "
+    "fractional_dx fractional_dy fractional_dz fractional_step_valid\n");
   fprintf(attempt_file_,
     "# columns attempt_id time_start_fs time_end_fs H_id O_low O_high O_from O_target outcome "
     "delta_start min_abs_delta delta_end E_parallel_start E_parallel_end "
     "nearest_ion_id nearest_ion_distance delta_phi_start delta_phi_end ");
   if (ion_field_enabled_)
-    fprintf(attempt_file_, "delta_d_%s_start delta_d_%s_start\n",
+    fprintf(attempt_file_, "delta_d_%s_start delta_d_%s_start",
       ion1_symbol_.c_str(), ion2_symbol_.c_str());
   else
-    fprintf(attempt_file_, "delta_d_ion1_start delta_d_ion2_start\n");
+    fprintf(attempt_file_, "delta_d_ion1_start delta_d_ion2_start");
+  fprintf(attempt_file_,
+    " time_first_opposite_fs time_commit_fs time_confirm_fs center_residence_fs "
+    "crossing_duration_fs stabilization_delay_fs confirmation_delay_fs attempt_duration_fs "
+    "observer_frame\n");
   if (bead_diagnostic_enabled_) {
     fprintf(bead_event_file_,
       "# columns attempt_id selection_kind probe_time_fs H_id O_low O_high outcome num_beads "
@@ -2914,6 +4200,41 @@ void Proton_Tunneling::write_text_output_files()
       ion1_symbol_.c_str(), ion2_symbol_.c_str(), ion2_symbol_.c_str(),
       ion2_symbol_.c_str(), ion2_symbol_.c_str());
   }
+  if (ion_influence_file_ != nullptr) {
+    fprintf(ion_influence_file_,
+      "# columns O_low O_high species dominant_ion_id geometry_samples "
+      "state_minus state_deadband state_plus dominant_samples mean_E std_E mean_delta_phi "
+      "std_delta_phi mean_abs_E mean_abs_delta_phi cancellation_E cancellation_phi "
+      "mean_E_state_minus mean_E_state_deadband mean_E_state_plus "
+      "mean_delta_phi_state_minus mean_delta_phi_state_deadband mean_delta_phi_state_plus "
+      "dominant_fraction mean_dominant_E mean_dominant_delta_phi mean_dominant_distance "
+      "dominant_state_asymmetry dominant_state_minus dominant_state_deadband "
+      "dominant_state_plus\n");
+  }
+  if (causal_link_file_ != nullptr) {
+    fprintf(causal_link_file_,
+      "# columns parent_attempt_index child_attempt_index shared_oxygen carrier_type "
+      "temporal_type causal_lag_fs lag_first_opposite_fs lag_commit_fs lag_confirm_fs "
+      "defect_continuity same_hydrogen same_edge valid_relay primary_link "
+      "alternative_parent_count alternative_child_count parent_group_id child_group_id\n");
+    fprintf(concerted_group_file_,
+      "# columns group_id reference_time_fs time_span_fs n_events n_unique_H n_unique_O "
+      "n_unique_edges has_closed_oxygen_cycle\n");
+    fprintf(concerted_member_file_, "# columns group_id attempt_index\n");
+    fprintf(chain_file_,
+      "# columns chain_id episode_id carrier_type chain_class lag_threshold_fs start_time_fs "
+      "end_time_fs n_events n_concerted_groups start_O end_O path_length_A "
+      "net_displacement_A net_dx net_dy net_dz max_span_A mean_gap_fs max_gap_fs "
+      "n_quantum_valid fraction_two_well fraction_strict_tunneling_like fraction_multi_kink "
+      "alternative_parent_count alternative_child_count closed_by_oxygen_id "
+      "fractional_net_x fractional_net_y fractional_net_z winding_x winding_y winding_z "
+      "winding_residual winding_valid\n");
+    fprintf(chain_event_file_, "# columns chain_id position attempt_index\n");
+  }
+  if (causal_lag_file_ != nullptr)
+    fprintf(causal_lag_file_,
+      "# columns carrier_type lag_bin_low_fs lag_bin_high_fs real_count null_mean_count "
+      "null_std_count g_causal g_causal_standard_error n_null_shifts\n");
 
   const double bead_nan = std::numeric_limits<double>::quiet_NaN();
   for (const AttemptRecord& record : attempt_records_) {
@@ -2941,6 +4262,18 @@ void Proton_Tunneling::write_text_output_files()
       record.delta_phi_end,
       record.delta_d_ion1_start,
       record.delta_d_ion2_start);
+    fprintf(
+      attempt_file_,
+      " %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %lld\n",
+      record.time_first_opposite_fs,
+      record.time_commit_fs,
+      record.time_confirm_fs,
+      record.center_residence_fs,
+      record.crossing_duration_fs,
+      record.stabilization_delay_fs,
+      record.confirmation_delay_fs,
+      record.attempt_duration_fs,
+      record.observer_frame);
 
     if (bead_event_file_ != nullptr) {
       const auto write_bead_event = [&](const char* selection_kind,
@@ -3018,7 +4351,7 @@ void Proton_Tunneling::write_text_output_files()
       fprintf(
         transfer_file_,
         "%lld %.10e %.10e %d %d %d %d %d %d %d %d %d %d %d %d %d "
-        "%.10e %.10e %.10e %.10e %.10e\n",
+        "%.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %d\n",
         record.attempt_id,
         record.time_start_fs,
         record.time_end_fs,
@@ -3039,7 +4372,11 @@ void Proton_Tunneling::write_text_output_files()
         record.dy,
         record.dz,
         record.delta_start,
-        record.delta_end);
+        record.delta_end,
+        record.fractional_dx,
+        record.fractional_dy,
+        record.fractional_dz,
+        record.fractional_step_valid);
     }
   }
 
@@ -3209,6 +4546,162 @@ void Proton_Tunneling::write_text_output_files()
     }
   }
 
+  if (ion_influence_file_ != nullptr) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const auto mean = [&](const double sum, const long long count) {
+      return count > 0 ? sum / static_cast<double>(count) : nan;
+    };
+    const auto standard_deviation = [&](const double sum, const double sum_square,
+                                        const long long count) {
+      if (count <= 0)
+        return nan;
+      const double average = sum / static_cast<double>(count);
+        return std::sqrt(std::max(0.0,
+          sum_square / static_cast<double>(count) - average * average));
+    };
+    const auto cancellation = [&](const double signed_mean, const double absolute_mean) {
+      return std::isfinite(signed_mean) && std::isfinite(absolute_mean) && absolute_mean > 0.0
+        ? std::abs(signed_mean) / absolute_mean : nan;
+    };
+    for (const auto& item : total_bonds_) {
+      int oxygen_low;
+      int oxygen_high;
+      decode_bond_key(item.first, oxygen_low, oxygen_high);
+      const BondStats& stats = item.second;
+      for (int species = 0; species < 2; ++species) {
+        const auto edge_item = dominant_ion_stats_[species].find(item.first);
+        if (edge_item == dominant_ion_stats_[species].end() || edge_item->second.empty()) {
+          const long long counts[3] = {
+            stats.ion_species_state_samples[species][0],
+            stats.ion_species_state_samples[species][1],
+            stats.ion_species_state_samples[species][2]};
+          const double mean_E = mean(stats.sum_ion_E_species[species], stats.geometry_samples);
+          const double mean_phi = mean(stats.sum_ion_phi_species[species], stats.geometry_samples);
+          const double mean_abs_E = mean(
+            stats.sum_ion_abs_E_species[species], stats.geometry_samples);
+          const double mean_abs_phi = mean(
+            stats.sum_ion_abs_phi_species[species], stats.geometry_samples);
+          const double values[19] = {
+            mean_E,
+            standard_deviation(stats.sum_ion_E_species[species],
+                               stats.sum_ion_E2_species[species], stats.geometry_samples),
+            mean_phi,
+            standard_deviation(stats.sum_ion_phi_species[species],
+                               stats.sum_ion_phi2_species[species], stats.geometry_samples),
+            mean_abs_E,
+            mean_abs_phi,
+            cancellation(mean_E, mean_abs_E),
+            cancellation(mean_phi, mean_abs_phi),
+            mean(stats.sum_ion_E_species_state[species][0], counts[0]),
+            mean(stats.sum_ion_E_species_state[species][1], counts[1]),
+            mean(stats.sum_ion_E_species_state[species][2], counts[2]),
+            mean(stats.sum_ion_phi_species_state[species][0], counts[0]),
+            mean(stats.sum_ion_phi_species_state[species][1], counts[1]),
+            mean(stats.sum_ion_phi_species_state[species][2], counts[2]),
+            nan, nan, nan, nan, nan};
+          fprintf(ion_influence_file_, "%d %d %s -1 %lld %lld %lld %lld 0",
+            oxygen_low, oxygen_high, species == 0 ? ion1_symbol_.c_str() : ion2_symbol_.c_str(),
+            stats.geometry_samples, counts[0], counts[1], counts[2]);
+          for (const double value : values)
+            fprintf(ion_influence_file_, " %.10e", value);
+          fprintf(ion_influence_file_, " 0 0 0\n");
+          continue;
+        }
+        for (const auto& dominant_item : edge_item->second) {
+          const DominantIonStats& dominant = dominant_item.second;
+          const long long counts[3] = {
+            stats.ion_species_state_samples[species][0],
+            stats.ion_species_state_samples[species][1],
+            stats.ion_species_state_samples[species][2]};
+          const double mean_E = mean(stats.sum_ion_E_species[species], stats.geometry_samples);
+          const double mean_phi = mean(stats.sum_ion_phi_species[species], stats.geometry_samples);
+          const double mean_abs_E = mean(
+            stats.sum_ion_abs_E_species[species], stats.geometry_samples);
+          const double mean_abs_phi = mean(
+            stats.sum_ion_abs_phi_species[species], stats.geometry_samples);
+          const double values[19] = {
+            mean_E,
+            standard_deviation(stats.sum_ion_E_species[species],
+                               stats.sum_ion_E2_species[species], stats.geometry_samples),
+            mean_phi,
+            standard_deviation(stats.sum_ion_phi_species[species],
+                               stats.sum_ion_phi2_species[species], stats.geometry_samples),
+            mean_abs_E,
+            mean_abs_phi,
+            cancellation(mean_E, mean_abs_E),
+            cancellation(mean_phi, mean_abs_phi),
+            mean(stats.sum_ion_E_species_state[species][0], counts[0]),
+            mean(stats.sum_ion_E_species_state[species][1], counts[1]),
+            mean(stats.sum_ion_E_species_state[species][2], counts[2]),
+            mean(stats.sum_ion_phi_species_state[species][0], counts[0]),
+            mean(stats.sum_ion_phi_species_state[species][1], counts[1]),
+            mean(stats.sum_ion_phi_species_state[species][2], counts[2]),
+            stats.geometry_samples > 0
+              ? static_cast<double>(dominant.samples) / stats.geometry_samples : nan,
+            mean(dominant.sum_E, dominant.samples),
+            mean(dominant.sum_phi, dominant.samples),
+            mean(dominant.sum_distance, dominant.samples),
+            dominant.samples > 0
+              ? static_cast<double>(dominant.state_samples[0] - dominant.state_samples[2]) /
+                  dominant.samples : nan};
+          fprintf(ion_influence_file_, "%d %d %s %d %lld %lld %lld %lld %lld",
+            oxygen_low, oxygen_high, species == 0 ? ion1_symbol_.c_str() : ion2_symbol_.c_str(),
+            dominant_item.first, stats.geometry_samples, counts[0], counts[1], counts[2],
+            dominant.samples);
+          for (const double value : values)
+            fprintf(ion_influence_file_, " %.10e", value);
+          fprintf(ion_influence_file_, " %lld %lld %lld\n",
+            dominant.state_samples[0], dominant.state_samples[1], dominant.state_samples[2]);
+        }
+      }
+    }
+  }
+
+  if (causal_link_file_ != nullptr) {
+    for (const CausalLinkRecord& link : causal_link_records_)
+      fprintf(causal_link_file_,
+        "%lld %lld %d %s %s %.10e %.10e %.10e %.10e %d %d %d %d %d %d %d %lld %lld\n",
+        link.parent_attempt_index, link.child_attempt_index, link.shared_oxygen,
+        carrier_name(link.carrier_type), temporal_name(link.temporal_type),
+        link.causal_lag_fs, link.lag_first_opposite_fs, link.lag_commit_fs,
+        link.lag_confirm_fs, link.defect_continuity, link.same_hydrogen ? 1 : 0,
+        link.same_edge ? 1 : 0, link.valid_relay ? 1 : 0, link.primary_link ? 1 : 0,
+        link.alternative_parent_count, link.alternative_child_count,
+        link.parent_group_id, link.child_group_id);
+    for (const ConcertedGroupRecord& group : concerted_group_records_)
+      fprintf(concerted_group_file_, "%lld %.10e %.10e %d %d %d %d %d\n",
+        group.group_id, group.reference_time_fs, group.time_span_fs, group.n_events,
+        group.n_unique_H, group.n_unique_O, group.n_unique_edges,
+        group.has_closed_oxygen_cycle);
+    for (const ConcertedMemberRecord& member : concerted_member_records_)
+      fprintf(concerted_member_file_, "%lld %lld\n", member.group_id, member.attempt_index);
+    for (const ChainRecord& chain : chain_records_)
+      fprintf(chain_file_,
+        "%lld %lld %s %s %.10e %.10e %.10e %d %d %d %d %.10e %.10e %.10e %.10e %.10e "
+        "%.10e %.10e %.10e %d %.10e %.10e %.10e %.10e %.10e %d %.10e %.10e %.10e %d %d %d "
+        "%.10e %d\n",
+        chain.chain_id, chain.episode_id, carrier_name(chain.carrier_type),
+        chain_class_name(chain.chain_class), chain.lag_threshold_fs, chain.start_time_fs,
+        chain.end_time_fs, chain.n_events, chain.n_concerted_groups, chain.start_O,
+        chain.end_O, chain.path_length_A, chain.net_displacement_A, chain.net_dx,
+        chain.net_dy, chain.net_dz, chain.max_span_A, chain.mean_gap_fs, chain.max_gap_fs,
+        chain.n_quantum_valid, chain.fraction_two_well,
+        chain.fraction_strict_tunneling_like, chain.fraction_multi_kink,
+        chain.alternative_parent_count, chain.alternative_child_count,
+        chain.closed_by_oxygen_id, chain.fractional_net_x, chain.fractional_net_y,
+        chain.fractional_net_z, chain.winding_x, chain.winding_y, chain.winding_z,
+        chain.winding_residual, chain.winding_valid);
+    for (const ChainEventRecord& member : chain_event_records_)
+      fprintf(chain_event_file_, "%lld %lld %lld\n",
+        member.chain_id, member.position, member.attempt_index);
+  }
+  if (causal_lag_file_ != nullptr)
+    for (const CausalLagHistogramRecord& record : causal_lag_histogram_records_)
+      fprintf(causal_lag_file_, "%d %.10e %.10e %lld %.10e %.10e %.10e %.10e %d\n",
+        record.carrier_type, record.lag_bin_low_fs, record.lag_bin_high_fs,
+        record.real_count, record.null_mean_count, record.null_std_count,
+        record.g_causal, record.g_causal_standard_error, record.n_null_shifts);
+
   write_final_bonds();
   fclose(bias_file_);
   fclose(transfer_file_);
@@ -3222,6 +4715,20 @@ void Proton_Tunneling::write_text_output_files()
     fclose(local_environment_window_file_);
   if (local_environment_event_file_ != nullptr)
     fclose(local_environment_event_file_);
+  if (ion_influence_file_ != nullptr)
+    fclose(ion_influence_file_);
+  if (causal_link_file_ != nullptr)
+    fclose(causal_link_file_);
+  if (concerted_group_file_ != nullptr)
+    fclose(concerted_group_file_);
+  if (concerted_member_file_ != nullptr)
+    fclose(concerted_member_file_);
+  if (chain_file_ != nullptr)
+    fclose(chain_file_);
+  if (chain_event_file_ != nullptr)
+    fclose(chain_event_file_);
+  if (causal_lag_file_ != nullptr)
+    fclose(causal_lag_file_);
   bias_file_ = nullptr;
   transfer_file_ = nullptr;
   attempt_file_ = nullptr;
@@ -3231,6 +4738,13 @@ void Proton_Tunneling::write_text_output_files()
   bond_file_ = nullptr;
   local_environment_window_file_ = nullptr;
   local_environment_event_file_ = nullptr;
+  ion_influence_file_ = nullptr;
+  causal_link_file_ = nullptr;
+  concerted_group_file_ = nullptr;
+  concerted_member_file_ = nullptr;
+  chain_file_ = nullptr;
+  chain_event_file_ = nullptr;
+  causal_lag_file_ = nullptr;
 }
 
 void Proton_Tunneling::write_netcdf_output_file()
@@ -3259,11 +4773,13 @@ void Proton_Tunneling::write_netcdf_output_file()
   netcdf_text_attribute(ncid, NC_GLOBAL, "program", "GPUMD");
   netcdf_text_attribute(ncid, NC_GLOBAL, "observer", "compute_proton_tunneling");
   netcdf_text_attribute(ncid, NC_GLOBAL, "format", "GPUMD proton observer NetCDF-4");
-  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "1");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "4");
   netcdf_text_attribute(ncid, NC_GLOBAL, "oxygen_symbol", oxygen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "hydrogen_symbol", hydrogen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "ion1_symbol", ion1_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "ion2_symbol", ion2_symbol_.c_str());
+  netcdf_text_attribute(ncid, NC_GLOBAL, "local_influence",
+    local_influence_enabled_ ? "enabled" : "disabled");
   const char* output_level = output_level_ == OutputLevel::SUMMARY ? "summary" :
     (output_level_ == OutputLevel::EVENTS ? "events" : "full");
   const char* snapshot_mode = snapshot_mode_ == SnapshotMode::ENDPOINTS ? "endpoints" :
@@ -3281,6 +4797,39 @@ void Proton_Tunneling::write_netcdf_output_file()
     &sample_interval_), "nc_put_att_int");
   netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "window_samples", NC_INT, 1,
     &window_samples_), "nc_put_att_int");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "carrier_type_enum",
+    "0=excess,1=deficit,2=edge_reversal");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "temporal_type_enum",
+    "0=sequential,1=concerted,2=temporally_invalid");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "chain_class_enum",
+    "0=open,1=closed_local,2=closed_winding,3=branched,4=edge_rattling");
+  if (causal_chain_enabled_) {
+    char causal_search_text[64];
+    char causal_sync_text[64];
+    std::snprintf(causal_search_text, sizeof(causal_search_text), "%.17g", causal_search_max_fs_);
+    std::snprintf(causal_sync_text, sizeof(causal_sync_text), "%.17g", causal_sync_fs_);
+    netcdf_text_attribute(ncid, NC_GLOBAL, "causal_search_max_fs", causal_search_text);
+    netcdf_text_attribute(ncid, NC_GLOBAL, "causal_sync_fs", causal_sync_text);
+    std::string gap_text;
+    for (size_t i = 0; i < causal_gap_thresholds_fs_.size(); ++i) {
+      if (i > 0)
+        gap_text += ",";
+      gap_text += std::to_string(causal_gap_thresholds_fs_[i]);
+    }
+    std::string bin_text;
+    for (size_t i = 0; i < causal_lag_bin_edges_fs_.size(); ++i) {
+      if (i > 0)
+        bin_text += ",";
+      bin_text += std::to_string(causal_lag_bin_edges_fs_[i]);
+    }
+    netcdf_text_attribute(ncid, NC_GLOBAL, "causal_gap_thresholds_fs", gap_text.c_str());
+    netcdf_text_attribute(ncid, NC_GLOBAL, "causal_lag_bin_edges_fs", bin_text.c_str());
+    char causal_seed_text[64];
+    std::snprintf(causal_seed_text, sizeof(causal_seed_text), "%llu", causal_null_seed_);
+    netcdf_text_attribute(ncid, NC_GLOBAL, "causal_null_seed", causal_seed_text);
+    netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "causal_null_shifts", NC_INT, 1,
+      &causal_null_shifts_), "nc_put_att_int");
+  }
 
   std::vector<unsigned long long> edge_keys;
   const auto add_edge = [&](const int oxygen_low, const int oxygen_high) {
@@ -3299,6 +4848,8 @@ void Proton_Tunneling::write_netcdf_output_file()
     decode_bond_key(item.first, oxygen_low, oxygen_high);
     add_edge(oxygen_low, oxygen_high);
   }
+  for (const auto& edge : local_trace_edges_)
+    add_edge(edge.first, edge.second);
   std::sort(edge_keys.begin(), edge_keys.end());
   edge_keys.erase(std::unique(edge_keys.begin(), edge_keys.end()), edge_keys.end());
   std::unordered_map<unsigned long long, int> edge_ids;
@@ -3595,6 +5146,7 @@ void Proton_Tunneling::write_netcdf_output_file()
   }
 
   int attempt_group = -1;
+  int attempt_id_var = -1;
   int attempt_time_var = -1;
   int attempt_hydrogen_var = -1;
   int attempt_edge_var = -1;
@@ -3603,8 +5155,11 @@ void Proton_Tunneling::write_netcdf_output_file()
   int attempt_outcome_var = -1;
   int attempt_transfer_var = -1;
   int attempt_nearest_ion_var = -1;
+  int attempt_frame_var = -1;
+  int attempt_fractional_valid_var = -1;
   int attempt_value_var = -1;
   std::vector<double> attempt_times;
+  std::vector<long long> attempt_ids;
   std::vector<int> attempt_hydrogens;
   std::vector<int> attempt_edges;
   std::vector<int> attempt_from;
@@ -3612,17 +5167,24 @@ void Proton_Tunneling::write_netcdf_output_file()
   std::vector<unsigned char> attempt_outcomes;
   std::vector<unsigned char> attempt_has_transfer;
   std::vector<int> attempt_nearest_ions;
+  std::vector<long long> attempt_frames;
+  std::vector<unsigned char> attempt_fractional_valid;
   std::vector<double> attempt_values;
   std::unordered_map<long long, int> attempt_rows;
   const std::vector<const char*> attempt_value_names = {
     "delta_start", "min_abs_delta", "delta_end", "E_parallel_start", "E_parallel_end",
     "delta_phi_start", "delta_phi_end", "delta_d_ion1_start", "delta_d_ion2_start",
-    "nearest_ion_distance"};
+    "nearest_ion_distance", "time_first_opposite_fs", "time_commit_fs",
+    "time_confirm_fs", "center_residence_fs", "crossing_duration_fs",
+    "stabilization_delay_fs", "confirmation_delay_fs", "attempt_duration_fs",
+    "fractional_dx", "fractional_dy", "fractional_dz"};
   if (include_events && !attempt_records_.empty()) {
     netcdf_check(nc_def_grp(ncid, "attempt", &attempt_group), "nc_def_grp");
     const int attempt_dim = netcdf_dimension(attempt_group, "attempt", attempt_records_.size());
     const int endpoint_dim = netcdf_dimension(attempt_group, "endpoint", 2);
     const int value_dim = netcdf_dimension(attempt_group, "value", attempt_value_names.size());
+    attempt_id_var = netcdf_variable(attempt_group, "attempt_id", NC_INT64,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
     attempt_time_var = netcdf_variable(attempt_group, "time_fs", NC_DOUBLE,
       {attempt_dim, endpoint_dim}, {attempt_records_.size(), 2}, compression_level_);
     attempt_hydrogen_var = netcdf_variable(attempt_group, "hydrogen", NC_INT,
@@ -3639,16 +5201,24 @@ void Proton_Tunneling::write_netcdf_output_file()
       {attempt_dim}, {attempt_records_.size()}, compression_level_);
     attempt_nearest_ion_var = netcdf_variable(attempt_group, "nearest_ion_id", NC_INT,
       {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_frame_var = netcdf_variable(attempt_group, "observer_frame", NC_INT64,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
+    attempt_fractional_valid_var = netcdf_variable(attempt_group, "fractional_step_valid", NC_UBYTE,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
     attempt_value_var = netcdf_variable(attempt_group, "value", NC_DOUBLE,
       {attempt_dim, value_dim}, {attempt_records_.size(), attempt_value_names.size()}, compression_level_);
-    netcdf_text_attribute(attempt_group, attempt_time_var,
-      "description", "start and final times; attempt row is the implicit attempt_id order");
+    netcdf_text_attribute(attempt_group, attempt_id_var,
+      "description", "one-based attempt identifier; causal links use zero-based row indices");
     netcdf_text_attribute(attempt_group, attempt_outcome_var,
       "enum", "0=success,1=return,2=geometry_lost,3=run_end");
     netcdf_text_attribute(attempt_group, attempt_value_var, "field_names",
       "delta_start,min_abs_delta,delta_end,E_parallel_start,E_parallel_end,delta_phi_start,"
-      "delta_phi_end,delta_d_ion1_start,delta_d_ion2_start,nearest_ion_distance");
+      "delta_phi_end,delta_d_ion1_start,delta_d_ion2_start,nearest_ion_distance,"
+      "time_first_opposite_fs,time_commit_fs,time_confirm_fs,center_residence_fs,"
+      "crossing_duration_fs,stabilization_delay_fs,confirmation_delay_fs,attempt_duration_fs,"
+      "fractional_dx,fractional_dy,fractional_dz");
     attempt_times.reserve(attempt_records_.size() * 2);
+    attempt_ids.reserve(attempt_records_.size());
     attempt_hydrogens.reserve(attempt_records_.size());
     attempt_edges.reserve(attempt_records_.size());
     attempt_from.reserve(attempt_records_.size());
@@ -3656,10 +5226,13 @@ void Proton_Tunneling::write_netcdf_output_file()
     attempt_outcomes.reserve(attempt_records_.size());
     attempt_has_transfer.reserve(attempt_records_.size());
     attempt_nearest_ions.reserve(attempt_records_.size());
+    attempt_frames.reserve(attempt_records_.size());
+    attempt_fractional_valid.reserve(attempt_records_.size());
     attempt_values.reserve(attempt_records_.size() * attempt_value_names.size());
     for (size_t row = 0; row < attempt_records_.size(); ++row) {
       const AttemptRecord& record = attempt_records_[row];
       attempt_rows[record.attempt_id] = static_cast<int>(row);
+      attempt_ids.push_back(record.attempt_id);
       attempt_times.push_back(record.time_start_fs);
       attempt_times.push_back(record.time_end_fs);
       attempt_hydrogens.push_back(record.hydrogen);
@@ -3678,11 +5251,16 @@ void Proton_Tunneling::write_netcdf_output_file()
       attempt_outcomes.push_back(outcome_code(record.outcome));
       attempt_has_transfer.push_back(record.has_transfer ? 1 : 0);
       attempt_nearest_ions.push_back(record.nearest_ion_id);
+      attempt_frames.push_back(record.observer_frame);
+      attempt_fractional_valid.push_back(record.fractional_step_valid != 0 ? 1 : 0);
       attempt_values.insert(attempt_values.end(), {
         record.delta_start, record.min_abs_delta, record.delta_end,
         record.E_parallel_start, record.E_parallel_end, record.delta_phi_start,
         record.delta_phi_end, record.delta_d_ion1_start, record.delta_d_ion2_start,
-        record.nearest_ion_distance});
+        record.nearest_ion_distance, record.time_first_opposite_fs, record.time_commit_fs,
+        record.time_confirm_fs, record.center_residence_fs, record.crossing_duration_fs,
+        record.stabilization_delay_fs, record.confirmation_delay_fs, record.attempt_duration_fs,
+        record.fractional_dx, record.fractional_dy, record.fractional_dz});
     }
   }
 
@@ -3756,7 +5334,7 @@ void Proton_Tunneling::write_netcdf_output_file()
     defect_cause_var = netcdf_variable(defect_group, "cause_event_id", NC_INT64,
       {row_dim}, {defect_records_.size()}, compression_level_);
     netcdf_text_attribute(defect_group, defect_cause_var,
-      "description", "one-based attempt_id; 0 is the initial state and -1 means unassigned");
+      "description", "one-based attempt_id; 0 is initial, -1 unassigned, -2 multiple same-frame events");
     for (const DefectRecord& record : defect_records_) {
       defect_times.push_back(record.time_fs);
       defect_oxygens.push_back(record.oxygen);
@@ -4001,6 +5579,576 @@ void Proton_Tunneling::write_netcdf_output_file()
     }
   }
 
+  int influence_group = -1;
+  int influence_edge_var = -1;
+  int influence_species_var = -1;
+  int influence_dominant_ion_var = -1;
+  int influence_value_var = -1;
+  int influence_count_var = -1;
+  std::vector<int> influence_edges;
+  std::vector<int> influence_species;
+  std::vector<int> influence_dominant_ions;
+  std::vector<double> influence_values;
+  std::vector<long long> influence_counts;
+  const std::vector<const char*> influence_value_names = {
+    "mean_E_species", "std_E_species", "mean_delta_phi_species", "std_delta_phi_species",
+    "mean_abs_E_species", "mean_abs_delta_phi_species", "cancellation_E", "cancellation_phi",
+    "mean_E_state_minus", "mean_E_state_deadband", "mean_E_state_plus",
+    "mean_delta_phi_state_minus", "mean_delta_phi_state_deadband", "mean_delta_phi_state_plus",
+    "dominant_fraction", "mean_dominant_E", "mean_dominant_delta_phi",
+    "mean_dominant_distance", "dominant_state_asymmetry"};
+  const std::vector<const char*> influence_count_names = {
+    "state_minus", "state_deadband", "state_plus", "dominant_samples",
+    "dominant_state_minus", "dominant_state_deadband", "dominant_state_plus"};
+  if (local_influence_enabled_ && !total_bonds_.empty()) {
+    struct InfluenceRow
+    {
+      unsigned long long key;
+      int species;
+      int dominant_ion;
+    };
+    std::vector<InfluenceRow> rows;
+    for (const auto& item : total_bonds_) {
+      for (int species = 0; species < 2; ++species) {
+        const auto edge_item = dominant_ion_stats_[species].find(item.first);
+        if (edge_item == dominant_ion_stats_[species].end() || edge_item->second.empty()) {
+          rows.push_back({item.first, species, -1});
+        } else {
+          for (const auto& dominant_item : edge_item->second)
+            rows.push_back({item.first, species, dominant_item.first});
+        }
+      }
+    }
+    netcdf_check(nc_def_grp(ncid, "ion_influence_summary", &influence_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(influence_group, "row", rows.size());
+    const int count_dim = netcdf_dimension(
+      influence_group, "count", influence_count_names.size());
+    const int value_dim = netcdf_dimension(
+      influence_group, "value", influence_value_names.size());
+    influence_edge_var = netcdf_variable(influence_group, "edge_id", NC_INT,
+      {row_dim}, {rows.size()}, compression_level_);
+    influence_species_var = netcdf_variable(influence_group, "species", NC_INT,
+      {row_dim}, {rows.size()}, compression_level_);
+    influence_dominant_ion_var = netcdf_variable(influence_group, "dominant_ion_id", NC_INT,
+      {row_dim}, {rows.size()}, compression_level_);
+    influence_value_var = netcdf_variable(influence_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {rows.size(), influence_value_names.size()}, compression_level_);
+    influence_count_var = netcdf_variable(influence_group, "count", NC_INT64,
+      {row_dim, count_dim}, {rows.size(), influence_count_names.size()}, compression_level_);
+    netcdf_text_attribute(influence_group, influence_species_var, "enum",
+      "0=ion1,1=ion2; see global ion1_symbol and ion2_symbol");
+    netcdf_text_attribute(influence_group, influence_value_var, "field_names",
+      "mean_E_species,std_E_species,mean_delta_phi_species,std_delta_phi_species,"
+      "mean_abs_E_species,mean_abs_delta_phi_species,cancellation_E,cancellation_phi,"
+      "mean_E_state_minus,mean_E_state_deadband,mean_E_state_plus,"
+      "mean_delta_phi_state_minus,mean_delta_phi_state_deadband,mean_delta_phi_state_plus,"
+      "dominant_fraction,mean_dominant_E,mean_dominant_delta_phi,mean_dominant_distance,"
+      "dominant_state_asymmetry");
+    netcdf_text_attribute(influence_group, influence_count_var, "field_names",
+      "state_minus,state_deadband,state_plus,dominant_samples,dominant_state_minus,"
+      "dominant_state_deadband,dominant_state_plus");
+    netcdf_text_attribute(influence_group, influence_count_var, "state_order",
+      "state_minus,state_deadband,state_plus,dominant_samples,dominant_state_minus,"
+      "dominant_state_deadband,dominant_state_plus");
+    influence_edges.reserve(rows.size());
+    influence_species.reserve(rows.size());
+    influence_dominant_ions.reserve(rows.size());
+    influence_values.reserve(rows.size() * influence_value_names.size());
+    influence_counts.reserve(rows.size() * influence_count_names.size());
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const auto mean = [&](const double sum, const long long count) {
+      return count > 0 ? sum / static_cast<double>(count) : nan;
+    };
+    const auto standard_deviation = [&](const double sum, const double sum_square,
+                                        const long long count) {
+      if (count <= 0)
+        return nan;
+      const double average = sum / static_cast<double>(count);
+      return std::sqrt(std::max(0.0,
+        sum_square / static_cast<double>(count) - average * average));
+    };
+    for (const InfluenceRow& row : rows) {
+      const BondStats& stats = total_bonds_.at(row.key);
+      const long long samples = stats.geometry_samples;
+      const double mean_E = mean(stats.sum_ion_E_species[row.species], samples);
+      const double mean_phi = mean(stats.sum_ion_phi_species[row.species], samples);
+      const double mean_abs_E = mean(stats.sum_ion_abs_E_species[row.species], samples);
+      const double mean_abs_phi = mean(stats.sum_ion_abs_phi_species[row.species], samples);
+      const auto dominant_edge = dominant_ion_stats_[row.species].find(row.key);
+      const DominantIonStats* dominant = nullptr;
+      if (dominant_edge != dominant_ion_stats_[row.species].end() && row.dominant_ion >= 0) {
+        const auto dominant_item = dominant_edge->second.find(row.dominant_ion);
+        if (dominant_item != dominant_edge->second.end())
+          dominant = &dominant_item->second;
+      }
+      influence_edges.push_back(edge_ids[row.key]);
+      influence_species.push_back(row.species);
+      influence_dominant_ions.push_back(row.dominant_ion);
+      influence_values.insert(influence_values.end(), {
+        mean_E,
+        standard_deviation(stats.sum_ion_E_species[row.species],
+                           stats.sum_ion_E2_species[row.species], samples),
+        mean_phi,
+        standard_deviation(stats.sum_ion_phi_species[row.species],
+                           stats.sum_ion_phi2_species[row.species], samples),
+        mean_abs_E,
+        mean_abs_phi,
+        (std::isfinite(mean_E) && std::isfinite(mean_abs_E) && mean_abs_E > 0.0)
+          ? std::abs(mean_E) / mean_abs_E : nan,
+        (std::isfinite(mean_phi) && std::isfinite(mean_abs_phi) && mean_abs_phi > 0.0)
+          ? std::abs(mean_phi) / mean_abs_phi : nan,
+        mean(stats.sum_ion_E_species_state[row.species][0],
+             stats.ion_species_state_samples[row.species][0]),
+        mean(stats.sum_ion_E_species_state[row.species][1],
+             stats.ion_species_state_samples[row.species][1]),
+        mean(stats.sum_ion_E_species_state[row.species][2],
+             stats.ion_species_state_samples[row.species][2]),
+        mean(stats.sum_ion_phi_species_state[row.species][0],
+             stats.ion_species_state_samples[row.species][0]),
+        mean(stats.sum_ion_phi_species_state[row.species][1],
+             stats.ion_species_state_samples[row.species][1]),
+        mean(stats.sum_ion_phi_species_state[row.species][2],
+             stats.ion_species_state_samples[row.species][2]),
+        (dominant != nullptr && samples > 0)
+          ? static_cast<double>(dominant->samples) / samples : nan,
+        dominant != nullptr ? mean(dominant->sum_E, dominant->samples) : nan,
+        dominant != nullptr ? mean(dominant->sum_phi, dominant->samples) : nan,
+        dominant != nullptr ? mean(dominant->sum_distance, dominant->samples) : nan,
+        (dominant != nullptr && dominant->samples > 0)
+          ? static_cast<double>(dominant->state_samples[0] - dominant->state_samples[2]) /
+              dominant->samples : nan});
+      for (int state = 0; state < 3; ++state)
+        influence_counts.push_back(stats.ion_species_state_samples[row.species][state]);
+      influence_counts.push_back(dominant != nullptr ? dominant->samples : 0);
+      for (int state = 0; state < 3; ++state)
+        influence_counts.push_back(dominant != nullptr ? dominant->state_samples[state] : 0);
+    }
+  }
+
+  int trace_group = -1;
+  int trace_time_var = -1;
+  int trace_edge_var = -1;
+  int trace_hydrogen_var = -1;
+  int trace_valid_var = -1;
+  int trace_state_var = -1;
+  int trace_ion_id_var = -1;
+  int trace_dominant_ion_var = -1;
+  int trace_bead_class_var = -1;
+  int trace_value_var = -1;
+  std::vector<double> trace_times;
+  std::vector<int> trace_edges;
+  std::vector<int> trace_hydrogens;
+  std::vector<unsigned char> trace_valid;
+  std::vector<int> trace_states;
+  std::vector<int> trace_ion_ids;
+  std::vector<int> trace_dominant_ions;
+  std::vector<unsigned char> trace_bead_classes;
+  std::vector<double> trace_values;
+  const std::vector<const char*> trace_value_names = {
+    "delta", "dOO", "rperp", "E_parallel", "delta_phi_ion",
+    "ion1_E", "ion2_E", "ion1_delta_phi", "ion2_delta_phi",
+    "ion1_abs_E", "ion2_abs_E", "ion1_abs_delta_phi", "ion2_abs_delta_phi",
+    "nearest_ion1_distance", "nearest_ion2_distance",
+    "ion1_to_O_low", "ion1_to_O_high", "ion2_to_O_low", "ion2_to_O_high",
+    "dominant_ion1_E", "dominant_ion1_delta_phi", "dominant_ion1_distance",
+    "dominant_ion2_E", "dominant_ion2_delta_phi", "dominant_ion2_distance",
+    "nH_low", "nH_high", "hcl_like_low", "hcl_like_high",
+    "donor_edges_low", "donor_edges_high", "acceptor_edges_low", "acceptor_edges_high",
+    "ion1_low_d1", "ion1_low_d2", "ion1_low_d3", "ion1_high_d1", "ion1_high_d2",
+    "ion1_high_d3", "ion2_low_d1", "ion2_low_d2", "ion2_low_d3", "ion2_high_d1",
+    "ion2_high_d2", "ion2_high_d3", "coord_ion1_low", "coord_ion1_high",
+    "coord_ion2_low", "coord_ion2_high", "delta_d_ion1", "delta_d_ion2",
+    "nearest_ion2_to_H", "angle_Olow_H_ion2", "angle_Ohigh_H_ion2",
+    "centroid_f_minus", "centroid_f_zero", "centroid_f_plus", "centroid_span",
+    "delocalized_f_minus", "delocalized_f_zero", "delocalized_f_plus",
+    "delocalized_span"};
+  if (!local_trace_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "local_trace", &trace_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(trace_group, "row", local_trace_records_.size());
+    const int species_dim = netcdf_dimension(trace_group, "species", 2);
+    const int selection_dim = netcdf_dimension(trace_group, "selection", 2);
+    const int value_dim = netcdf_dimension(trace_group, "value", trace_value_names.size());
+    trace_time_var = netcdf_variable(trace_group, "time_fs", NC_DOUBLE,
+      {row_dim}, {local_trace_records_.size()}, compression_level_);
+    trace_edge_var = netcdf_variable(trace_group, "edge_id", NC_INT,
+      {row_dim}, {local_trace_records_.size()}, compression_level_);
+    trace_hydrogen_var = netcdf_variable(trace_group, "hydrogen", NC_INT,
+      {row_dim}, {local_trace_records_.size()}, compression_level_);
+    trace_valid_var = netcdf_variable(trace_group, "valid", NC_UBYTE,
+      {row_dim}, {local_trace_records_.size()}, compression_level_);
+    trace_state_var = netcdf_variable(trace_group, "state", NC_INT,
+      {row_dim}, {local_trace_records_.size()}, compression_level_);
+    trace_ion_id_var = netcdf_variable(trace_group, "nearest_ion_id", NC_INT,
+      {row_dim, species_dim}, {local_trace_records_.size(), 2}, compression_level_);
+    trace_dominant_ion_var = netcdf_variable(trace_group, "dominant_ion_id", NC_INT,
+      {row_dim, species_dim}, {local_trace_records_.size(), 2}, compression_level_);
+    trace_bead_class_var = netcdf_variable(trace_group, "bead_class", NC_UBYTE,
+      {row_dim, selection_dim}, {local_trace_records_.size(), 2}, compression_level_);
+    trace_value_var = netcdf_variable(trace_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {local_trace_records_.size(), trace_value_names.size()},
+      compression_level_);
+    netcdf_text_attribute(trace_group, trace_ion_id_var, "species_order", "0=ion1,1=ion2");
+    netcdf_text_attribute(trace_group, trace_bead_class_var, "selection_order",
+      "0=centroid_best,1=delocalization_best; 0=classical_only,1=two_well_delocalized,"
+      "2=barrier_centered_tunneling_like,3=compact_single_domain,"
+      "4=multi_kink_or_multi_domain,5=ambiguous");
+    netcdf_text_attribute(trace_group, trace_state_var, "state_order", "-1,0,+1");
+    netcdf_text_attribute(trace_group, trace_value_var, "field_names",
+      "delta,dOO,rperp,E_parallel,delta_phi_ion,ion1_E,ion2_E,ion1_delta_phi,"
+      "ion2_delta_phi,ion1_abs_E,ion2_abs_E,ion1_abs_delta_phi,ion2_abs_delta_phi,"
+      "nearest_ion1_distance,nearest_ion2_distance,ion1_to_O_low,"
+      "ion1_to_O_high,ion2_to_O_low,ion2_to_O_high,dominant_ion1_E,"
+      "dominant_ion1_delta_phi,dominant_ion1_distance,dominant_ion2_E,"
+      "dominant_ion2_delta_phi,dominant_ion2_distance,nH_low,nH_high,hcl_like_low,"
+      "hcl_like_high,donor_edges_low,donor_edges_high,acceptor_edges_low,"
+      "acceptor_edges_high,ion1_low_d1,ion1_low_d2,ion1_low_d3,ion1_high_d1,"
+      "ion1_high_d2,ion1_high_d3,ion2_low_d1,ion2_low_d2,ion2_low_d3,ion2_high_d1,"
+      "ion2_high_d2,ion2_high_d3,coord_ion1_low,coord_ion1_high,coord_ion2_low,"
+      "coord_ion2_high,delta_d_ion1,delta_d_ion2,nearest_ion2_to_H,"
+      "angle_Olow_H_ion2,angle_Ohigh_H_ion2,centroid_f_minus,centroid_f_zero,"
+      "centroid_f_plus,centroid_span,"
+      "delocalized_f_minus,delocalized_f_zero,delocalized_f_plus,delocalized_span");
+    trace_times.reserve(local_trace_records_.size());
+    trace_edges.reserve(local_trace_records_.size());
+    trace_hydrogens.reserve(local_trace_records_.size());
+    trace_valid.reserve(local_trace_records_.size());
+    trace_states.reserve(local_trace_records_.size());
+    trace_ion_ids.reserve(local_trace_records_.size() * 2);
+    trace_dominant_ions.reserve(local_trace_records_.size() * 2);
+    trace_bead_classes.reserve(local_trace_records_.size() * 2);
+    trace_values.reserve(local_trace_records_.size() * trace_value_names.size());
+    for (const LocalTraceRecord& record : local_trace_records_) {
+      trace_times.push_back(record.time_fs);
+      trace_edges.push_back(edge_ids[make_bond_key(record.oxygen_low, record.oxygen_high)]);
+      trace_hydrogens.push_back(record.hydrogen);
+      trace_valid.push_back(record.valid != 0 ? 1 : 0);
+      trace_states.push_back(record.valid != 0 ? record.state : 0);
+      for (int species = 0; species < 2; ++species) {
+        trace_ion_ids.push_back(record.nearest_ion_id[species]);
+        trace_dominant_ions.push_back(record.dominant_ion_id[species]);
+      }
+      trace_bead_classes.push_back(static_cast<unsigned char>(record.bead_class[0]));
+      trace_bead_classes.push_back(static_cast<unsigned char>(record.bead_class[1]));
+      trace_values.insert(trace_values.end(), {
+        record.delta, record.dOO, record.rperp, record.E_parallel, record.delta_phi_ion,
+        record.ion_E_species[0], record.ion_E_species[1], record.ion_phi_species[0],
+        record.ion_phi_species[1], record.ion_abs_E_species[0], record.ion_abs_E_species[1],
+        record.ion_abs_phi_species[0], record.ion_abs_phi_species[1],
+        record.nearest_ion_distance[0],
+        record.nearest_ion_distance[1], record.nearest_ion_to_low[0],
+        record.nearest_ion_to_high[0], record.nearest_ion_to_low[1],
+        record.nearest_ion_to_high[1], record.dominant_ion_E[0],
+        record.dominant_ion_phi[0], record.dominant_ion_distance[0],
+        record.dominant_ion_E[1], record.dominant_ion_phi[1],
+        record.dominant_ion_distance[1], record.nH_low, record.nH_high,
+        record.hcl_like_low, record.hcl_like_high, record.donor_edges_low,
+        record.donor_edges_high, record.acceptor_edges_low, record.acceptor_edges_high,
+        record.ion1_low_d1, record.ion1_low_d2, record.ion1_low_d3,
+        record.ion1_high_d1, record.ion1_high_d2, record.ion1_high_d3,
+        record.ion2_low_d1, record.ion2_low_d2, record.ion2_low_d3,
+        record.ion2_high_d1, record.ion2_high_d2, record.ion2_high_d3,
+        record.coord_ion1_low, record.coord_ion1_high, record.coord_ion2_low,
+        record.coord_ion2_high, record.delta_d_ion1, record.delta_d_ion2,
+        record.nearest_ion2_to_H, record.angle_Olow_H_ion2, record.angle_Ohigh_H_ion2,
+        record.bead_centroid_f_minus,
+        record.bead_centroid_f_zero, record.bead_centroid_f_plus,
+        record.bead_centroid_span, record.bead_delocalized_f_minus,
+        record.bead_delocalized_f_zero, record.bead_delocalized_f_plus,
+        record.bead_delocalized_span});
+    }
+  }
+
+  int concerted_group_group = -1;
+  int concerted_group_id_var = -1;
+  int concerted_group_reference_var = -1;
+  int concerted_group_span_var = -1;
+  int concerted_group_events_var = -1;
+  int concerted_group_hydrogens_var = -1;
+  int concerted_group_oxygens_var = -1;
+  int concerted_group_edges_var = -1;
+  int concerted_group_cycle_var = -1;
+  std::vector<long long> concerted_group_ids;
+  std::vector<double> concerted_group_references;
+  std::vector<double> concerted_group_spans;
+  std::vector<int> concerted_group_events;
+  std::vector<int> concerted_group_hydrogens;
+  std::vector<int> concerted_group_oxygens;
+  std::vector<int> concerted_group_edges;
+  std::vector<unsigned char> concerted_group_cycles;
+  if (include_events && causal_chain_enabled_ && !concerted_group_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "concerted_group", &concerted_group_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(
+      concerted_group_group, "group", concerted_group_records_.size());
+    concerted_group_id_var = netcdf_variable(concerted_group_group, "group_id", NC_INT64,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    concerted_group_reference_var = netcdf_variable(concerted_group_group, "reference_time_fs", NC_DOUBLE,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    concerted_group_span_var = netcdf_variable(concerted_group_group, "time_span_fs", NC_DOUBLE,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    concerted_group_events_var = netcdf_variable(concerted_group_group, "n_events", NC_INT,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    concerted_group_hydrogens_var = netcdf_variable(concerted_group_group, "n_unique_H", NC_INT,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    concerted_group_oxygens_var = netcdf_variable(concerted_group_group, "n_unique_O", NC_INT,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    concerted_group_edges_var = netcdf_variable(concerted_group_group, "n_unique_edges", NC_INT,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    concerted_group_cycle_var = netcdf_variable(concerted_group_group, "has_closed_oxygen_cycle", NC_UBYTE,
+      {row_dim}, {concerted_group_records_.size()}, compression_level_);
+    for (const ConcertedGroupRecord& record : concerted_group_records_) {
+      concerted_group_ids.push_back(record.group_id);
+      concerted_group_references.push_back(record.reference_time_fs);
+      concerted_group_spans.push_back(record.time_span_fs);
+      concerted_group_events.push_back(record.n_events);
+      concerted_group_hydrogens.push_back(record.n_unique_H);
+      concerted_group_oxygens.push_back(record.n_unique_O);
+      concerted_group_edges.push_back(record.n_unique_edges);
+      concerted_group_cycles.push_back(static_cast<unsigned char>(record.has_closed_oxygen_cycle));
+    }
+  }
+
+  int concerted_member_group = -1;
+  int concerted_member_group_var = -1;
+  int concerted_member_attempt_var = -1;
+  std::vector<long long> concerted_member_groups;
+  std::vector<long long> concerted_member_attempts;
+  if (include_events && causal_chain_enabled_ && !concerted_member_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "concerted_member", &concerted_member_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(
+      concerted_member_group, "row", concerted_member_records_.size());
+    concerted_member_group_var = netcdf_variable(concerted_member_group, "group_id", NC_INT64,
+      {row_dim}, {concerted_member_records_.size()}, compression_level_);
+    concerted_member_attempt_var = netcdf_variable(concerted_member_group, "attempt_index", NC_INT64,
+      {row_dim}, {concerted_member_records_.size()}, compression_level_);
+    for (const ConcertedMemberRecord& record : concerted_member_records_) {
+      concerted_member_groups.push_back(record.group_id);
+      concerted_member_attempts.push_back(record.attempt_index);
+    }
+  }
+
+  int causal_link_group = -1;
+  int causal_link_parent_var = -1;
+  int causal_link_child_var = -1;
+  int causal_link_shared_var = -1;
+  int causal_link_carrier_var = -1;
+  int causal_link_temporal_var = -1;
+  int causal_link_value_var = -1;
+  int causal_link_flag_var = -1;
+  int causal_link_alternative_var = -1;
+  int causal_link_group_var = -1;
+  std::vector<long long> causal_link_parents;
+  std::vector<long long> causal_link_children;
+  std::vector<int> causal_link_shared;
+  std::vector<unsigned char> causal_link_carriers;
+  std::vector<unsigned char> causal_link_temporals;
+  std::vector<double> causal_link_values;
+  std::vector<unsigned char> causal_link_flags;
+  std::vector<int> causal_link_alternatives;
+  std::vector<long long> causal_link_groups;
+  const std::vector<const char*> causal_link_value_names = {
+    "causal_lag_fs", "lag_first_opposite_fs", "lag_commit_fs", "lag_confirm_fs"};
+  const std::vector<const char*> causal_link_flag_names = {
+    "defect_continuity", "same_hydrogen", "same_edge", "valid_relay", "primary_link"};
+  const std::vector<const char*> causal_link_alternative_names = {
+    "alternative_parent_count", "alternative_child_count"};
+  if (include_events && causal_chain_enabled_ && !causal_link_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "causal_link", &causal_link_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(causal_link_group, "row", causal_link_records_.size());
+    const int value_dim = netcdf_dimension(
+      causal_link_group, "value", causal_link_value_names.size());
+    const int flag_dim = netcdf_dimension(
+      causal_link_group, "flag", causal_link_flag_names.size());
+    const int alternative_dim = netcdf_dimension(
+      causal_link_group, "alternative", causal_link_alternative_names.size());
+    causal_link_parent_var = netcdf_variable(causal_link_group, "parent_attempt_index", NC_INT64,
+      {row_dim}, {causal_link_records_.size()}, compression_level_);
+    causal_link_child_var = netcdf_variable(causal_link_group, "child_attempt_index", NC_INT64,
+      {row_dim}, {causal_link_records_.size()}, compression_level_);
+    causal_link_shared_var = netcdf_variable(causal_link_group, "shared_oxygen", NC_INT,
+      {row_dim}, {causal_link_records_.size()}, compression_level_);
+    causal_link_carrier_var = netcdf_variable(causal_link_group, "carrier_type", NC_UBYTE,
+      {row_dim}, {causal_link_records_.size()}, compression_level_);
+    causal_link_temporal_var = netcdf_variable(causal_link_group, "temporal_type", NC_UBYTE,
+      {row_dim}, {causal_link_records_.size()}, compression_level_);
+    causal_link_value_var = netcdf_variable(causal_link_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {causal_link_records_.size(), causal_link_value_names.size()}, compression_level_);
+    causal_link_flag_var = netcdf_variable(causal_link_group, "flag", NC_UBYTE,
+      {row_dim, flag_dim}, {causal_link_records_.size(), causal_link_flag_names.size()}, compression_level_);
+    causal_link_alternative_var = netcdf_variable(causal_link_group, "alternative", NC_INT,
+      {row_dim, alternative_dim}, {causal_link_records_.size(), causal_link_alternative_names.size()}, compression_level_);
+    causal_link_group_var = netcdf_variable(causal_link_group, "concerted_group_id", NC_INT64,
+      {row_dim, netcdf_dimension(causal_link_group, "endpoint", 2)},
+      {causal_link_records_.size(), 2}, compression_level_);
+    netcdf_text_attribute(causal_link_group, causal_link_carrier_var,
+      "enum", "0=excess,1=deficit,2=edge_reversal");
+    netcdf_text_attribute(causal_link_group, causal_link_temporal_var,
+      "enum", "0=sequential,1=concerted,2=temporally_invalid");
+    netcdf_text_attribute(causal_link_group, causal_link_value_var,
+      "field_names", "causal_lag_fs,lag_first_opposite_fs,lag_commit_fs,lag_confirm_fs");
+    netcdf_text_attribute(causal_link_group, causal_link_flag_var,
+      "field_names", "defect_continuity,same_hydrogen,same_edge,valid_relay,primary_link");
+    netcdf_text_attribute(causal_link_group, causal_link_flag_var,
+      "defect_continuity_enum", "0=no_continuity,1=continuous,2=edge_reversal");
+    netcdf_text_attribute(causal_link_group, causal_link_alternative_var,
+      "field_names", "alternative_parent_count,alternative_child_count");
+    for (const CausalLinkRecord& record : causal_link_records_) {
+      causal_link_parents.push_back(record.parent_attempt_index);
+      causal_link_children.push_back(record.child_attempt_index);
+      causal_link_shared.push_back(record.shared_oxygen);
+      causal_link_carriers.push_back(static_cast<unsigned char>(carrier_code(record.carrier_type)));
+      causal_link_temporals.push_back(static_cast<unsigned char>(temporal_code(record.temporal_type)));
+      causal_link_values.insert(causal_link_values.end(), {
+        record.causal_lag_fs, record.lag_first_opposite_fs,
+        record.lag_commit_fs, record.lag_confirm_fs});
+      causal_link_flags.insert(causal_link_flags.end(), {
+        static_cast<unsigned char>(record.defect_continuity < 0 ? 2 : record.defect_continuity),
+        static_cast<unsigned char>(record.same_hydrogen ? 1 : 0),
+        static_cast<unsigned char>(record.same_edge ? 1 : 0),
+        static_cast<unsigned char>(record.valid_relay ? 1 : 0),
+        static_cast<unsigned char>(record.primary_link ? 1 : 0)});
+      causal_link_alternatives.insert(causal_link_alternatives.end(), {
+        record.alternative_parent_count, record.alternative_child_count});
+      causal_link_groups.insert(causal_link_groups.end(), {
+        record.parent_group_id, record.child_group_id});
+    }
+  }
+
+  int chain_group = -1;
+  int chain_id_var = -1;
+  int chain_episode_var = -1;
+  int chain_carrier_var = -1;
+  int chain_class_var = -1;
+  int chain_value_var = -1;
+  int chain_count_var = -1;
+  std::vector<long long> chain_ids;
+  std::vector<long long> chain_episodes;
+  std::vector<unsigned char> chain_carriers;
+  std::vector<unsigned char> chain_classes;
+  std::vector<double> chain_values;
+  std::vector<int> chain_counts;
+  const std::vector<const char*> chain_value_names = {
+    "lag_threshold_fs", "start_time_fs", "end_time_fs", "path_length_A",
+    "net_displacement_A", "net_dx", "net_dy", "net_dz", "max_span_A",
+    "mean_gap_fs", "max_gap_fs", "fraction_two_well",
+    "fraction_strict_tunneling_like", "fraction_multi_kink", "fractional_net_x",
+    "fractional_net_y", "fractional_net_z", "winding_residual"};
+  const std::vector<const char*> chain_count_names = {
+    "n_events", "n_concerted_groups", "start_O", "end_O", "n_quantum_valid",
+    "alternative_parent_count", "alternative_child_count", "closed_by_oxygen_id",
+    "winding_x", "winding_y", "winding_z", "winding_valid"};
+  if (include_events && causal_chain_enabled_ && !chain_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "chain", &chain_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(chain_group, "row", chain_records_.size());
+    const int value_dim = netcdf_dimension(chain_group, "value", chain_value_names.size());
+    const int count_dim = netcdf_dimension(chain_group, "count", chain_count_names.size());
+    chain_id_var = netcdf_variable(chain_group, "chain_id", NC_INT64,
+      {row_dim}, {chain_records_.size()}, compression_level_);
+    chain_episode_var = netcdf_variable(chain_group, "episode_id", NC_INT64,
+      {row_dim}, {chain_records_.size()}, compression_level_);
+    chain_carrier_var = netcdf_variable(chain_group, "carrier_type", NC_UBYTE,
+      {row_dim}, {chain_records_.size()}, compression_level_);
+    chain_class_var = netcdf_variable(chain_group, "chain_class", NC_UBYTE,
+      {row_dim}, {chain_records_.size()}, compression_level_);
+    chain_value_var = netcdf_variable(chain_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {chain_records_.size(), chain_value_names.size()}, compression_level_);
+    chain_count_var = netcdf_variable(chain_group, "count", NC_INT,
+      {row_dim, count_dim}, {chain_records_.size(), chain_count_names.size()}, compression_level_);
+    netcdf_text_attribute(chain_group, chain_carrier_var,
+      "enum", "0=excess,1=deficit,2=edge_reversal");
+    netcdf_text_attribute(chain_group, chain_class_var,
+      "enum", "0=open,1=closed_local,2=closed_winding,3=branched,4=edge_rattling");
+    netcdf_text_attribute(chain_group, chain_value_var, "field_names",
+      "lag_threshold_fs,start_time_fs,end_time_fs,path_length_A,net_displacement_A,net_dx,net_dy,net_dz,"
+      "max_span_A,mean_gap_fs,max_gap_fs,fraction_two_well,fraction_strict_tunneling_like,"
+      "fraction_multi_kink,fractional_net_x,fractional_net_y,fractional_net_z,winding_residual");
+    netcdf_text_attribute(chain_group, chain_count_var, "field_names",
+      "n_events,n_concerted_groups,start_O,end_O,n_quantum_valid,alternative_parent_count,"
+      "alternative_child_count,closed_by_oxygen_id,winding_x,winding_y,winding_z,winding_valid");
+    for (const ChainRecord& record : chain_records_) {
+      chain_ids.push_back(record.chain_id);
+      chain_episodes.push_back(record.episode_id);
+      chain_carriers.push_back(static_cast<unsigned char>(carrier_code(record.carrier_type)));
+      chain_classes.push_back(static_cast<unsigned char>(chain_class_code(record.chain_class)));
+      chain_values.insert(chain_values.end(), {
+        record.lag_threshold_fs, record.start_time_fs, record.end_time_fs,
+        record.path_length_A, record.net_displacement_A, record.net_dx, record.net_dy,
+        record.net_dz, record.max_span_A, record.mean_gap_fs, record.max_gap_fs,
+        record.fraction_two_well, record.fraction_strict_tunneling_like,
+        record.fraction_multi_kink, record.fractional_net_x, record.fractional_net_y,
+        record.fractional_net_z, record.winding_residual});
+      chain_counts.insert(chain_counts.end(), {
+        record.n_events, record.n_concerted_groups, record.start_O, record.end_O,
+        record.n_quantum_valid, record.alternative_parent_count,
+        record.alternative_child_count, record.closed_by_oxygen_id, record.winding_x,
+        record.winding_y, record.winding_z, record.winding_valid});
+    }
+  }
+
+  int chain_event_group = -1;
+  int chain_event_chain_var = -1;
+  int chain_event_position_var = -1;
+  int chain_event_attempt_var = -1;
+  std::vector<long long> chain_event_chains;
+  std::vector<long long> chain_event_positions;
+  std::vector<long long> chain_event_attempts;
+  if (include_events && causal_chain_enabled_ && !chain_event_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "chain_event", &chain_event_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(chain_event_group, "row", chain_event_records_.size());
+    chain_event_chain_var = netcdf_variable(chain_event_group, "chain_id", NC_INT64,
+      {row_dim}, {chain_event_records_.size()}, compression_level_);
+    chain_event_position_var = netcdf_variable(chain_event_group, "position", NC_INT64,
+      {row_dim}, {chain_event_records_.size()}, compression_level_);
+    chain_event_attempt_var = netcdf_variable(chain_event_group, "attempt_index", NC_INT64,
+      {row_dim}, {chain_event_records_.size()}, compression_level_);
+    for (const ChainEventRecord& record : chain_event_records_) {
+      chain_event_chains.push_back(record.chain_id);
+      chain_event_positions.push_back(record.position);
+      chain_event_attempts.push_back(record.attempt_index);
+    }
+  }
+
+  int causal_lag_group = -1;
+  int causal_lag_carrier_var = -1;
+  int causal_lag_value_var = -1;
+  int causal_lag_real_var = -1;
+  int causal_lag_shift_var = -1;
+  std::vector<unsigned char> causal_lag_carriers;
+  std::vector<double> causal_lag_values;
+  std::vector<long long> causal_lag_reals;
+  std::vector<int> causal_lag_shifts;
+  const std::vector<const char*> causal_lag_value_names = {
+    "lag_bin_low_fs", "lag_bin_high_fs", "null_mean_count", "null_std_count",
+    "g_causal", "g_causal_standard_error"};
+  if (include_events && causal_chain_enabled_ && !causal_lag_histogram_records_.empty()) {
+    netcdf_check(nc_def_grp(ncid, "causal_lag_histogram", &causal_lag_group), "nc_def_grp");
+    const int row_dim = netcdf_dimension(
+      causal_lag_group, "row", causal_lag_histogram_records_.size());
+    const int value_dim = netcdf_dimension(
+      causal_lag_group, "value", causal_lag_value_names.size());
+    causal_lag_carrier_var = netcdf_variable(causal_lag_group, "carrier_type", NC_UBYTE,
+      {row_dim}, {causal_lag_histogram_records_.size()}, compression_level_);
+    causal_lag_value_var = netcdf_variable(causal_lag_group, "value", NC_DOUBLE,
+      {row_dim, value_dim}, {causal_lag_histogram_records_.size(), causal_lag_value_names.size()},
+      compression_level_);
+    causal_lag_real_var = netcdf_variable(causal_lag_group, "real_count", NC_INT64,
+      {row_dim}, {causal_lag_histogram_records_.size()}, compression_level_);
+    causal_lag_shift_var = netcdf_variable(causal_lag_group, "n_null_shifts", NC_INT,
+      {row_dim}, {causal_lag_histogram_records_.size()}, compression_level_);
+    netcdf_text_attribute(causal_lag_group, causal_lag_carrier_var,
+      "enum", "0=excess,1=deficit");
+    netcdf_text_attribute(causal_lag_group, causal_lag_value_var, "field_names",
+      "lag_bin_low_fs,lag_bin_high_fs,null_mean_count,null_std_count,g_causal,"
+      "g_causal_standard_error");
+    for (const CausalLagHistogramRecord& record : causal_lag_histogram_records_) {
+      causal_lag_carriers.push_back(static_cast<unsigned char>(record.carrier_type));
+      causal_lag_values.insert(causal_lag_values.end(), {
+        record.lag_bin_low_fs, record.lag_bin_high_fs, record.null_mean_count,
+        record.null_std_count, record.g_causal, record.g_causal_standard_error});
+      causal_lag_reals.push_back(record.real_count);
+      causal_lag_shifts.push_back(record.n_null_shifts);
+    }
+  }
+
   netcdf_check(nc_enddef(ncid), "nc_enddef");
   if (edge_group >= 0) {
     std::vector<int> edge_oxygen;
@@ -4037,6 +6185,7 @@ void Proton_Tunneling::write_netcdf_output_file()
     netcdf_write_longlong(local_window_group, local_window_count_var, local_window_counts);
   }
   if (attempt_group >= 0) {
+    netcdf_write_longlong(attempt_group, attempt_id_var, attempt_ids);
     netcdf_write_double(attempt_group, attempt_time_var, attempt_times);
     netcdf_write_int(attempt_group, attempt_hydrogen_var, attempt_hydrogens);
     netcdf_write_int(attempt_group, attempt_edge_var, attempt_edges);
@@ -4045,6 +6194,8 @@ void Proton_Tunneling::write_netcdf_output_file()
     netcdf_write_ubyte(attempt_group, attempt_outcome_var, attempt_outcomes);
     netcdf_write_ubyte(attempt_group, attempt_transfer_var, attempt_has_transfer);
     netcdf_write_int(attempt_group, attempt_nearest_ion_var, attempt_nearest_ions);
+    netcdf_write_longlong(attempt_group, attempt_frame_var, attempt_frames);
+    netcdf_write_ubyte(attempt_group, attempt_fractional_valid_var, attempt_fractional_valid);
     netcdf_write_double(attempt_group, attempt_value_var, attempt_values);
   }
   if (transfer_group >= 0) {
@@ -4071,6 +6222,72 @@ void Proton_Tunneling::write_netcdf_output_file()
     netcdf_write_ubyte(local_event_group, local_event_class_var, local_event_classes);
     netcdf_write_double(local_event_group, local_event_value_var, local_event_values);
     netcdf_write_int(local_event_group, local_event_count_var, local_event_counts);
+  }
+  if (influence_group >= 0) {
+    netcdf_write_int(influence_group, influence_edge_var, influence_edges);
+    netcdf_write_int(influence_group, influence_species_var, influence_species);
+    netcdf_write_int(influence_group, influence_dominant_ion_var, influence_dominant_ions);
+    netcdf_write_double(influence_group, influence_value_var, influence_values);
+    netcdf_write_longlong(influence_group, influence_count_var, influence_counts);
+  }
+  if (trace_group >= 0) {
+    netcdf_write_double(trace_group, trace_time_var, trace_times);
+    netcdf_write_int(trace_group, trace_edge_var, trace_edges);
+    netcdf_write_int(trace_group, trace_hydrogen_var, trace_hydrogens);
+    netcdf_write_ubyte(trace_group, trace_valid_var, trace_valid);
+    netcdf_write_int(trace_group, trace_state_var, trace_states);
+    netcdf_write_int(trace_group, trace_ion_id_var, trace_ion_ids);
+    netcdf_write_int(trace_group, trace_dominant_ion_var, trace_dominant_ions);
+    netcdf_write_ubyte(trace_group, trace_bead_class_var, trace_bead_classes);
+    netcdf_write_double(trace_group, trace_value_var, trace_values);
+  }
+  if (concerted_group_group >= 0) {
+    netcdf_write_longlong(concerted_group_group, concerted_group_id_var, concerted_group_ids);
+    netcdf_write_double(concerted_group_group, concerted_group_reference_var,
+      concerted_group_references);
+    netcdf_write_double(concerted_group_group, concerted_group_span_var, concerted_group_spans);
+    netcdf_write_int(concerted_group_group, concerted_group_events_var, concerted_group_events);
+    netcdf_write_int(concerted_group_group, concerted_group_hydrogens_var,
+      concerted_group_hydrogens);
+    netcdf_write_int(concerted_group_group, concerted_group_oxygens_var, concerted_group_oxygens);
+    netcdf_write_int(concerted_group_group, concerted_group_edges_var, concerted_group_edges);
+    netcdf_write_ubyte(concerted_group_group, concerted_group_cycle_var, concerted_group_cycles);
+  }
+  if (concerted_member_group >= 0) {
+    netcdf_write_longlong(concerted_member_group, concerted_member_group_var,
+      concerted_member_groups);
+    netcdf_write_longlong(concerted_member_group, concerted_member_attempt_var,
+      concerted_member_attempts);
+  }
+  if (causal_link_group >= 0) {
+    netcdf_write_longlong(causal_link_group, causal_link_parent_var, causal_link_parents);
+    netcdf_write_longlong(causal_link_group, causal_link_child_var, causal_link_children);
+    netcdf_write_int(causal_link_group, causal_link_shared_var, causal_link_shared);
+    netcdf_write_ubyte(causal_link_group, causal_link_carrier_var, causal_link_carriers);
+    netcdf_write_ubyte(causal_link_group, causal_link_temporal_var, causal_link_temporals);
+    netcdf_write_double(causal_link_group, causal_link_value_var, causal_link_values);
+    netcdf_write_ubyte(causal_link_group, causal_link_flag_var, causal_link_flags);
+    netcdf_write_int(causal_link_group, causal_link_alternative_var, causal_link_alternatives);
+    netcdf_write_longlong(causal_link_group, causal_link_group_var, causal_link_groups);
+  }
+  if (chain_group >= 0) {
+    netcdf_write_longlong(chain_group, chain_id_var, chain_ids);
+    netcdf_write_longlong(chain_group, chain_episode_var, chain_episodes);
+    netcdf_write_ubyte(chain_group, chain_carrier_var, chain_carriers);
+    netcdf_write_ubyte(chain_group, chain_class_var, chain_classes);
+    netcdf_write_double(chain_group, chain_value_var, chain_values);
+    netcdf_write_int(chain_group, chain_count_var, chain_counts);
+  }
+  if (chain_event_group >= 0) {
+    netcdf_write_longlong(chain_event_group, chain_event_chain_var, chain_event_chains);
+    netcdf_write_longlong(chain_event_group, chain_event_position_var, chain_event_positions);
+    netcdf_write_longlong(chain_event_group, chain_event_attempt_var, chain_event_attempts);
+  }
+  if (causal_lag_group >= 0) {
+    netcdf_write_ubyte(causal_lag_group, causal_lag_carrier_var, causal_lag_carriers);
+    netcdf_write_double(causal_lag_group, causal_lag_value_var, causal_lag_values);
+    netcdf_write_longlong(causal_lag_group, causal_lag_real_var, causal_lag_reals);
+    netcdf_write_int(causal_lag_group, causal_lag_shift_var, causal_lag_shifts);
   }
   netcdf_check(nc_close(ncid), "nc_close");
   printf("Proton observer wrote compressed NetCDF output %s (level=%s, deflate=%d).\n",
@@ -4118,6 +6335,8 @@ void Proton_Tunneling::postprocess(
   }
   if (window_sample_count_ > 0)
     write_window(last_time_fs_);
+  build_causal_network();
+  build_causal_lag_histogram();
   write_output_files();
   release_geometry_timing_events();
   printf("Proton tunneling observer timing:\n");

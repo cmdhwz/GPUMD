@@ -29,3 +29,10 @@ or start directly from a self-describing restart file::
 
     ensemble rpmd 32 300
     read_pimd_restart restart_beads.xyz
+
+Changing the bead count without a restart file is a separate operation available only
+between continuous PIMD runs. Select the new count with ``ensemble pimd`` and add the
+standalone ``pimd_reseed_from_centroid`` keyword before ``run``. It copies the current
+centroid position and velocity to every new bead and discards all old internal modes.
+It cannot be combined with ``read_pimd_restart`` in the same run, and RPMD/TRPMD bead
+counts remain unchanged by this feature.

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct GeometryResultGPU
@@ -41,8 +42,17 @@ struct GeometryResultGPU
   double low_to_high_dz;
   double E_ion_nominal_parallel;
   double delta_phi_ion;
+  double ion_E_species[2];
+  double ion_phi_species[2];
+  double ion_abs_E_species[2];
+  double ion_abs_phi_species[2];
   int nearest_ion_id;
   double nearest_ion_distance;
+  int nearest_ion_species_id[2];
+  int dominant_ion_id[2];
+  double dominant_ion_E[2];
+  double dominant_ion_phi[2];
+  double dominant_ion_distance[2];
   double nearest_ion1_distance;
   double nearest_ion2_distance;
   double nearest_ion1_to_low;
@@ -242,11 +252,43 @@ private:
     run_end
   };
 
+  enum class CarrierType
+  {
+    excess,
+    deficit,
+    edge_reversal
+  };
+
+  enum class TemporalType
+  {
+    sequential,
+    concerted,
+    temporally_invalid
+  };
+
+  enum class ChainClass
+  {
+    open,
+    closed_local,
+    closed_winding,
+    branched,
+    edge_rattling
+  };
+
   struct AttemptRecord
   {
     long long attempt_id = 0;
     double time_start_fs = 0.0;
     double time_end_fs = 0.0;
+    double time_first_opposite_fs = 0.0;
+    double time_commit_fs = 0.0;
+    double time_confirm_fs = 0.0;
+    double center_residence_fs = 0.0;
+    double crossing_duration_fs = 0.0;
+    double stabilization_delay_fs = 0.0;
+    double confirmation_delay_fs = 0.0;
+    double attempt_duration_fs = 0.0;
+    long long observer_frame = -1;
     int hydrogen = -1;
     int oxygen_low = -1;
     int oxygen_high = -1;
@@ -274,9 +316,111 @@ private:
     double dx = 0.0;
     double dy = 0.0;
     double dz = 0.0;
+    double fractional_dx = 0.0;
+    double fractional_dy = 0.0;
+    double fractional_dz = 0.0;
+    int fractional_step_valid = 0;
     LocalEnvironment environment_start;
     LocalEnvironment environment_end;
     LocalEnvironment environment_last_valid;
+  };
+
+  struct ConcertedGroupRecord
+  {
+    long long group_id = 0;
+    double reference_time_fs = 0.0;
+    double time_span_fs = 0.0;
+    int n_events = 0;
+    int n_unique_H = 0;
+    int n_unique_O = 0;
+    int n_unique_edges = 0;
+    int has_closed_oxygen_cycle = 0;
+  };
+
+  struct ConcertedMemberRecord
+  {
+    long long group_id = 0;
+    long long attempt_index = -1;
+  };
+
+  struct CausalLinkRecord
+  {
+    long long parent_attempt_index = -1;
+    long long child_attempt_index = -1;
+    int shared_oxygen = -1;
+    CarrierType carrier_type = CarrierType::excess;
+    TemporalType temporal_type = TemporalType::temporally_invalid;
+    double causal_lag_fs = 0.0;
+    double lag_first_opposite_fs = 0.0;
+    double lag_commit_fs = 0.0;
+    double lag_confirm_fs = 0.0;
+    int defect_continuity = 0;
+    bool same_hydrogen = false;
+    bool same_edge = false;
+    bool valid_relay = false;
+    bool primary_link = false;
+    int alternative_parent_count = 0;
+    int alternative_child_count = 0;
+    long long parent_group_id = -1;
+    long long child_group_id = -1;
+  };
+
+  struct ChainEventRecord
+  {
+    long long chain_id = -1;
+    long long position = 0;
+    long long attempt_index = -1;
+  };
+
+  struct ChainRecord
+  {
+    long long chain_id = 0;
+    long long episode_id = 0;
+    CarrierType carrier_type = CarrierType::excess;
+    ChainClass chain_class = ChainClass::open;
+    double lag_threshold_fs = 0.0;
+    double start_time_fs = 0.0;
+    double end_time_fs = 0.0;
+    int n_events = 0;
+    int n_concerted_groups = 0;
+    int start_O = -1;
+    int end_O = -1;
+    double path_length_A = 0.0;
+    double net_displacement_A = 0.0;
+    double net_dx = 0.0;
+    double net_dy = 0.0;
+    double net_dz = 0.0;
+    double max_span_A = 0.0;
+    double mean_gap_fs = 0.0;
+    double max_gap_fs = 0.0;
+    int n_quantum_valid = 0;
+    double fraction_two_well = 0.0;
+    double fraction_strict_tunneling_like = 0.0;
+    double fraction_multi_kink = 0.0;
+    int alternative_parent_count = 0;
+    int alternative_child_count = 0;
+    int closed_by_oxygen_id = 0;
+    double fractional_net_x = 0.0;
+    double fractional_net_y = 0.0;
+    double fractional_net_z = 0.0;
+    int winding_x = 0;
+    int winding_y = 0;
+    int winding_z = 0;
+    double winding_residual = 0.0;
+    int winding_valid = 0;
+  };
+
+  struct CausalLagHistogramRecord
+  {
+    int carrier_type = 0;
+    double lag_bin_low_fs = 0.0;
+    double lag_bin_high_fs = 0.0;
+    long long real_count = 0;
+    double null_mean_count = 0.0;
+    double null_std_count = 0.0;
+    double g_causal = 0.0;
+    double g_causal_standard_error = 0.0;
+    int n_null_shifts = 0;
   };
 
   struct DefectRecord
@@ -371,6 +515,8 @@ private:
     double low_to_high_dz = 0.0;
     double E_ion_nominal_parallel = 0.0;
     double delta_phi_ion = 0.0;
+    double ion_abs_E_species[2] = {};
+    double ion_abs_phi_species[2] = {};
     int nearest_ion_id = -1;
     double nearest_ion_distance = 0.0;
     double nearest_ion1_distance = 0.0;
@@ -379,6 +525,13 @@ private:
     double nearest_ion1_to_high = 0.0;
     double nearest_ion2_to_low = 0.0;
     double nearest_ion2_to_high = 0.0;
+    double ion_E_species[2] = {};
+    double ion_phi_species[2] = {};
+    int nearest_ion_species_id[2] = {-1, -1};
+    int dominant_ion_id[2] = {-1, -1};
+    double dominant_ion_E[2] = {};
+    double dominant_ion_phi[2] = {};
+    double dominant_ion_distance[2] = {};
   };
 
   struct BondStats
@@ -407,6 +560,17 @@ private:
     double sum_delta_phi = 0.0;
     double sum_delta_phi2 = 0.0;
     double sum_delta_delta_phi = 0.0;
+    double sum_ion_E_species[2] = {};
+    double sum_ion_E2_species[2] = {};
+    double sum_ion_abs_E_species[2] = {};
+    double sum_ion_phi_species[2] = {};
+    double sum_ion_phi2_species[2] = {};
+    double sum_ion_abs_phi_species[2] = {};
+    double sum_ion_E_species_state[2][3] = {};
+    double sum_ion_E2_species_state[2][3] = {};
+    double sum_ion_phi_species_state[2][3] = {};
+    double sum_ion_phi2_species_state[2][3] = {};
+    long long ion_species_state_samples[2][3] = {};
     double sum_ion1_to_low = 0.0;
     double sum_ion1_to_high = 0.0;
     double sum_ion2_to_low = 0.0;
@@ -484,6 +648,80 @@ private:
     LocalEnvironmentStats stats;
   };
 
+  struct DominantIonStats
+  {
+    long long samples = 0;
+    long long state_samples[3] = {};
+    double sum_E = 0.0;
+    double sum_phi = 0.0;
+    double sum_distance = 0.0;
+  };
+
+  struct LocalTraceRecord
+  {
+    double time_fs = 0.0;
+    int oxygen_low = -1;
+    int oxygen_high = -1;
+    int hydrogen = -1;
+    int valid = 0;
+    int state = 0;
+    int nearest_ion_id[2] = {-1, -1};
+    int dominant_ion_id[2] = {-1, -1};
+    int bead_class[2] = {5, 5};
+    double delta = 0.0;
+    double dOO = 0.0;
+    double rperp = 0.0;
+    double E_parallel = 0.0;
+    double delta_phi_ion = 0.0;
+    double ion_E_species[2] = {};
+    double ion_phi_species[2] = {};
+    double ion_abs_E_species[2] = {};
+    double ion_abs_phi_species[2] = {};
+    double nearest_ion_distance[2] = {};
+    double nearest_ion_to_low[2] = {};
+    double nearest_ion_to_high[2] = {};
+    double dominant_ion_E[2] = {};
+    double dominant_ion_phi[2] = {};
+    double dominant_ion_distance[2] = {};
+    double nH_low = 0.0;
+    double nH_high = 0.0;
+    double donor_edges_low = 0.0;
+    double donor_edges_high = 0.0;
+    double acceptor_edges_low = 0.0;
+    double acceptor_edges_high = 0.0;
+    double ion1_low_d1 = 0.0;
+    double ion1_low_d2 = 0.0;
+    double ion1_low_d3 = 0.0;
+    double ion1_high_d1 = 0.0;
+    double ion1_high_d2 = 0.0;
+    double ion1_high_d3 = 0.0;
+    double ion2_low_d1 = 0.0;
+    double ion2_low_d2 = 0.0;
+    double ion2_low_d3 = 0.0;
+    double ion2_high_d1 = 0.0;
+    double ion2_high_d2 = 0.0;
+    double ion2_high_d3 = 0.0;
+    double coord_ion1_low = 0.0;
+    double coord_ion1_high = 0.0;
+    double coord_ion2_low = 0.0;
+    double coord_ion2_high = 0.0;
+    double delta_d_ion1 = 0.0;
+    double delta_d_ion2 = 0.0;
+    double nearest_ion2_to_H = 0.0;
+    double angle_Olow_H_ion2 = 0.0;
+    double angle_Ohigh_H_ion2 = 0.0;
+    double hcl_like_low = 0.0;
+    double hcl_like_high = 0.0;
+    double bead_centroid_f_minus = 0.0;
+    double bead_centroid_f_zero = 0.0;
+    double bead_centroid_f_plus = 0.0;
+    double bead_delocalized_f_minus = 0.0;
+    double bead_delocalized_f_zero = 0.0;
+    double bead_delocalized_f_plus = 0.0;
+    double bead_centroid_span = 0.0;
+    double bead_delocalized_span = 0.0;
+  };
+
   struct HydrogenState
   {
     int oxygen_low = -1;
@@ -507,6 +745,13 @@ private:
     double attempt_delta_d_ion2_start = 0.0;
     double attempt_min_abs_delta = 0.0;
     double pending_start_time_fs = 0.0;
+    bool first_opposite_seen = false;
+    bool commit_seen = false;
+    double time_first_opposite_fs = 0.0;
+    double time_commit_fs = 0.0;
+    double center_residence_fs = 0.0;
+    double attempt_last_time_fs = 0.0;
+    int attempt_last_state = 0;
     LocalEnvironment last_environment;
     LocalEnvironment attempt_environment_start;
     BeadDiagnostic centroid_best;
@@ -557,6 +802,14 @@ private:
     const double delta_end,
     const GeometryResult* geometry,
     const LocalEnvironment* environment);
+  void build_causal_network();
+  void build_causal_lag_histogram();
+  int carrier_code(const CarrierType carrier) const;
+  int temporal_code(const TemporalType temporal) const;
+  int chain_class_code(const ChainClass chain_class) const;
+  const char* carrier_name(const CarrierType carrier) const;
+  const char* temporal_name(const TemporalType temporal) const;
+  const char* chain_class_name(const ChainClass chain_class) const;
   const char* outcome_name(const AttemptOutcome outcome) const;
   void observe_frame(const double time_fs, const Box& box, Atom& atom);
   void write_window(const double time_fs);
@@ -564,6 +817,7 @@ private:
   void record_local_environment(
     const GeometryResult& geometry,
     const LocalEnvironment& environment);
+  void record_local_traces(const double time_fs);
   void write_local_environment_window(const double time_start_fs, const double time_end_fs);
   void write_local_environment_event(
     FILE* file,
@@ -605,6 +859,7 @@ private:
   double local_ion2_cutoff_ = 0.0;
   double local_hcl_cutoff_ = 3.0;
   double local_hcl_angle_min_deg_ = 150.0;
+  bool local_influence_enabled_ = false;
   int oxygen_shell_k_ = 8;
   double assignment_path_excess_weight_ = 0.50;
   double assignment_score_gap_min_ = 0.05;
@@ -629,6 +884,7 @@ private:
   std::string hydrogen_symbol_ = "H";
   std::vector<int> oxygen_indices_;
   std::vector<int> hydrogen_indices_;
+  std::vector<std::pair<int, int>> local_trace_edges_;
   std::vector<int> ion1_indices_;
   std::vector<int> ion2_indices_;
   std::vector<int> oxygen_local_index_;
@@ -674,22 +930,42 @@ private:
   gpuEvent_t local_environment_kernel_end_event_ = nullptr;
   std::vector<int> hydrogen_count_;
   std::vector<int> previous_hydrogen_count_;
-  std::vector<int> event_hydrogen_count_;
   std::vector<long long> frame_cause_event_ids_;
   std::vector<GeometryResult> frame_geometries_;
   std::vector<LocalEnvironment> frame_local_environments_;
   std::vector<HydrogenState> hydrogen_states_;
   bool defect_state_initialized_ = false;
+  std::vector<double> reference_oxygen_fractional_;
+  bool reference_fractional_coordinates_valid_ = false;
+
+  bool causal_chain_enabled_ = false;
+  double causal_search_max_fs_ = 200.0;
+  double causal_sync_fs_ = 2.0;
+  std::vector<double> causal_gap_thresholds_fs_;
+  std::vector<double> causal_lag_bin_edges_fs_;
+  int causal_null_shifts_ = 0;
+  unsigned long long causal_null_seed_ = 1;
+  double winding_epsilon_ = 1.0e-5;
 
   std::vector<AttemptRecord> attempt_records_;
+  std::vector<long long> attempt_concerted_group_ids_;
+  std::vector<ConcertedGroupRecord> concerted_group_records_;
+  std::vector<ConcertedMemberRecord> concerted_member_records_;
+  std::vector<CausalLinkRecord> causal_link_records_;
+  std::vector<ChainRecord> chain_records_;
+  std::vector<ChainEventRecord> chain_event_records_;
+  std::vector<CausalLagHistogramRecord> causal_lag_histogram_records_;
   std::vector<DefectRecord> defect_records_;
   std::vector<WindowRecord> window_records_;
   std::vector<EdgeWindowRecord> edge_window_records_;
   std::vector<LocalEnvironmentWindowRecord> local_environment_window_records_;
+  std::vector<LocalTraceRecord> local_trace_records_;
 
   std::unordered_map<unsigned long long, BondStats> window_bonds_;
   std::unordered_map<unsigned long long, BondStats> total_bonds_;
   std::unordered_map<unsigned long long, LocalEnvironmentStats> window_local_environment_stats_;
+  std::unordered_map<unsigned long long, std::unordered_map<int, DominantIonStats>>
+    dominant_ion_stats_[2];
   FILE* bias_file_ = nullptr;
   FILE* transfer_file_ = nullptr;
   FILE* attempt_file_ = nullptr;
@@ -699,4 +975,11 @@ private:
   FILE* bond_file_ = nullptr;
   FILE* local_environment_window_file_ = nullptr;
   FILE* local_environment_event_file_ = nullptr;
+  FILE* ion_influence_file_ = nullptr;
+  FILE* causal_link_file_ = nullptr;
+  FILE* concerted_group_file_ = nullptr;
+  FILE* concerted_member_file_ = nullptr;
+  FILE* chain_file_ = nullptr;
+  FILE* chain_event_file_ = nullptr;
+  FILE* causal_lag_file_ = nullptr;
 };

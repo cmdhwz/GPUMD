@@ -45,7 +45,8 @@ public:
     Atom& atom,
     bool use_exact_propagator,
     double pile_scale,
-    bool fix_com);
+    bool fix_com,
+    bool reseed_from_centroid = false);
 
   Ensemble_PIMD(
     int number_of_atoms_input,
@@ -54,7 +55,8 @@ public:
     Atom& atom,
     bool use_exact_propagator,
     double pile_scale,
-    bool fix_com);
+    bool fix_com,
+    bool reseed_from_centroid = false);
 
   Ensemble_PIMD(
     int number_of_atoms_input,
@@ -67,7 +69,8 @@ public:
     bool use_exact_propagator,
     double pile_scale,
     bool fix_com,
-    bool use_scr_barostat);
+    bool use_scr_barostat,
+    bool reseed_from_centroid = false);
 
   virtual ~Ensemble_PIMD(void);
 
@@ -97,6 +100,7 @@ protected:
   double pile_scale_ = 2.0;
   bool fix_com_ = true;
   bool use_scr_barostat_ = false;
+  bool reseed_from_centroid_ = false;
   double omega_n;
   GPU_Vector<gpurandState> curand_states;
   GPU_Vector<double*> position_beads;

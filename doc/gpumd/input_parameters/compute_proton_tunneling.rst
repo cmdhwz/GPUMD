@@ -14,7 +14,7 @@ Syntax
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [bead_diagnostic [f_min span_min [center_max centroid_max]]] [output netcdf filename [deflate_level]] [output_level summary|events|full] [snapshots endpoints|best|all]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [local_influence] [local_trace O_low O_high] [bead_diagnostic [f_min span_min [center_max centroid_max]]] [causal_chain search_max_fs sync_fs N thresholds...] [causal_lag_bins N edges...] [causal_null N_shifts seed] [output netcdf filename [deflate_level]] [output_level summary|events|full] [snapshots endpoints|best|all]
 
 For example::
 
@@ -129,8 +129,9 @@ event snapshots rather than every trajectory frame.
 
 The NetCDF file uses relational links rather than repeating O/H IDs: ``edge_id`` refers to the
 zero-based O pair in ``/edge/oxygen``, and ``window_index`` links an edge row to the corresponding
-row in ``/window``. Attempt rows use their zero-based row index as the implicit event ID.
-Continuous physical values are stored as ``double``; integer IDs and counts
+row in ``/window``. Attempt rows contain an explicit one-based ``attempt_id``; causal and
+chain tables refer to zero-based attempt row indices so that links remain compact and stable
+inside the file. Continuous physical values are stored as ``double``; integer IDs and counts
 are stored as integer variables; outcome, quantum-class, and flag variables use compact byte
 types. All variables are chunked with shuffle and deflate compression. NetCDF output requires a
 GPUMD build with ``USE_NETCDF=1`` and NetCDF-4/HDF5 support. It is intended for separate output
@@ -139,7 +140,7 @@ files per sample directory and does not append across runs.
 Output
 ------
 
-The observer appends six files by default, plus ``proton_bead_event.out`` when the optional
+The observer writes the standard six files by default, plus ``proton_bead_event.out`` when the optional
 bead diagnostic is enabled. All records are accumulated during the run and these files are
 opened and written once during ``postprocess``; no proton-observer ``fprintf`` or ``fflush`` is
 performed during sampled ``process`` frames. If the run terminates abnormally before
@@ -176,7 +177,8 @@ and completed edge windows.
 * ``proton_defect.out`` writes the complete initial oxygen defect state once, then only oxygen
   records whose nearest-H count changes between sampled frames. ``cause_event_id`` is the
   successful transfer ID when that event touched the oxygen, ``-1`` for an unassigned count
-  change, and ``0`` for the initial state. This sparse stream is intended to reconstruct
+  change, ``-2`` when multiple same-frame transfers touched the oxygen, and ``0`` for the
+  initial state. This sparse stream is intended to reconstruct
   time-ordered defect propagation chains, including open chains and branches; GPUMD does not
   impose a strict closed-ring criterion or assign chain IDs.
 * ``proton_edge_window.out`` contains one record for every O-O edge observed so far in each
@@ -240,9 +242,11 @@ and completed edge windows.
   not enabled; an explicitly enabled one-bead run is labeled ``classical_only``.
 
 Chain-level labels such as ``recombined`` and ``pinned`` require temporal matching of the
-transfer and defect streams and are therefore left to offline analysis. The observer's
-``geometry_lost`` attempt outcome is the raw signal for a geometry-blocked propagation; it is
-not by itself proof that a defect chain was interrupted.
+transfer and defect streams and are therefore still left to offline analysis. When
+``causal_chain`` is enabled, the observer additionally writes reconstructed carrier branches
+and all retained candidate links. The observer's ``geometry_lost`` attempt outcome is the raw
+signal for a geometry-blocked propagation; it is not by itself proof that a defect chain was
+interrupted.
 
 The optional ``ion_field`` is only a nominal point-charge proxy. For each valid O-H-O edge it
 uses the midpoint of the minimum-image O-O vector and evaluates
@@ -321,3 +325,95 @@ assignment with the existing Python trajectory script. The transfer and defect s
 intentionally kept simple so that defect-chain lifetime, branching, recombination, spatial
 extent, and propagation failures can be reconstructed and refined offline without coupling
 those choices to the force calculation.
+
+Local ion-influence decomposition and traces
+--------------------------------------------
+
+When ``local_influence`` is present together with ``ion_field``, the observer separates
+the two configured ion species. It is currently accepted only for ``ensemble pimd``.
+The compressed NetCDF file contains ``/ion_influence_summary``. Each row refers to an O-O
+edge, one configured species, and one dominant ion ID (or ``-1`` when no dominant ion was
+found). It stores species-resolved field and potential means and standard deviations,
+their mean absolute contributions and cancellation ratios, means conditioned on
+negative/dead-band/positive proton states, and dominant-ion fractions, contributions,
+and state counts. Text output also writes the sparse
+``proton_ion_influence.out`` table. The dominant ion is chosen by the largest absolute
+single-ion contribution to ``delta_phi_ion`` within the existing ``ion_field`` cutoff;
+this is a descriptive decomposition, not a causal or full electrostatic assignment.
+
+The repeatable ``local_trace O_low O_high`` option requests a sparse per-sampled-frame
+trace for the specified zero-based oxygen pair. It requires both ``ion_field`` and
+``output netcdf``. The pair is linked through ``/edge/oxygen`` and records are stored in
+``/local_trace``. The group contains the current centroid geometry, total and per-species
+nominal fields/potential differences, signed and absolute species contributions, nearest
+and dominant ion IDs, local-environment distances/coordination/topology when available,
+and the two retained bead-diagnostic summaries. Missing geometry or optional descriptors
+are stored as invalid/NaN values. This trace is diagnostic and does not change the force
+or integration path.
+
+Dual-carrier defect-causal network
+-----------------------------------
+
+The optional ``causal_chain`` analysis reconstructs time-ordered propagation of both
+defect carriers from confirmed transfers. It is an observer-side postprocessing step and
+does not require a geometrically closed proton ring. For a transfer
+:math:`O_a\rightarrow O_b`, the excess carrier is placed at :math:`O_b` and the deficit
+carrier at :math:`O_a`. A later transfer continues the excess carrier when its donor is the
+parent excess site, and continues the deficit carrier when its acceptor is the parent deficit
+site. Exact reverse transfers on the same edge are retained as ``edge_reversal`` candidates
+but are excluded from long relay chains.
+
+The syntax is::
+
+  causal_chain <search_max_fs> <sync_fs> <N_thresholds> <threshold_1> ... <threshold_N>
+
+For example::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H causal_chain 200.0 2.0 4 10.0 20.0 50.0 100.0
+
+``search_max_fs`` limits candidate parent/child matching. ``sync_fs`` defines a concerted
+time tolerance; the default scientific starting value is 2 fs. The listed thresholds are
+independent maximum propagation gaps. A separate chain table is generated for each threshold,
+so the same trajectory can be tested at 10, 20, 50, and 100 fs without rerunning it.
+Temporal labels use the difference between the child and parent first-opposite times:
+``concerted`` when its absolute value is at most ``sync_fs``, ``sequential`` when it is
+larger and positive, and ``temporally_invalid`` when it is more negative than ``-sync_fs``.
+Concerted events are grouped using the full group span (maximum time minus minimum time),
+not a pairwise single-linkage rule. Same-frame transfers are staged during the hydrogen loop
+and their net oxygen changes are applied together after the frame, so H-index order does not
+define the defect update.
+
+The optional lag histogram and null model are::
+
+  causal_lag_bins <N_bins> <edge_0> ... <edge_N>
+  causal_null <N_shifts> <seed>
+
+For example::
+
+  causal_lag_bins 8 0.0 2.0 5.0 10.0 20.0 50.0 100.0 200.0
+  causal_null 32 20260902
+
+The lag histogram is separated into excess and deficit carriers. ``causal_null`` applies
+independent circular random time shifts to the O/carrier incoming and outgoing event streams
+for each null realization;
+the output reports real counts, null mean and standard deviation, :math:`g_{\rm causal}`,
+and its standard error. This is a descriptive causal-enrichment baseline, not a proof of a
+unique microscopic pathway.
+
+With causal analysis enabled, NetCDF-4 format version 4 adds the relational groups
+``/concerted_group``, ``/concerted_member``, ``/causal_link``, ``/chain``,
+``/chain_event``, and ``/causal_lag_histogram``. The text output additionally writes
+``proton_concerted_group.out``, ``proton_concerted_member.out``, ``proton_causal_link.out``,
+``proton_chain.out``, ``proton_chain_event.out``, and
+``proton_causal_lag_histogram.out``. Attempt rows retain the first-opposite, commit,
+confirmation, center-residence, crossing, stabilization, confirmation-delay, and total
+attempt timing fields; milestone fields that were not reached are ``nan``.
+
+Each primary chain is one carrier branch. Its record includes the selected gap threshold,
+event/group counts, O endpoints, path length, net displacement, gap statistics, fractions of
+quantum-valid/two-well/strict bead events, alternative-link counts, and periodic winding data.
+The chain class is ``open``, ``closed_local``, ``closed_winding``, ``branched``, or
+``edge_rattling``. ``closed_local`` and ``closed_winding`` are assigned only when the oxygen
+endpoint closure and fractional-step residual satisfy the configured internal winding
+tolerance. These labels describe the reconstructed event network; they do not turn an RPMD
+trajectory into a rigorous quantum path or a transport coefficient.

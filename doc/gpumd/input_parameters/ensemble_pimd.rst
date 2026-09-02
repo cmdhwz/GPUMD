@@ -23,7 +23,26 @@ In both cases, :attr:`num_beads` is the number of beads in the ring polymer, whi
 The first case is similar to the NVT ensemble with :attr:`nvt_lan` as the Langevin thermostat is used for both the internal and the centroid modes [Ceriotti2010]_. 
 The second case is similar to the NPT ensemble with :attr:`npt_ber`, where a Berendsen barostat is added compared to the first case.
 The pressure target is fixed during a run unless the pressure-ramp form below is used.
-Note that :attr:`pimd` or :attr:`pimd_scr` (that is, not :attr:`rpmd` or :attr:`trpmd` described below) must be the first run that requires to set :attr:`num_beads` and one cannot change :attr:`num_beads` from run to run.
+Note that :attr:`pimd` or :attr:`pimd_scr` (that is, not :attr:`rpmd` or :attr:`trpmd` described below) must be the first run that requires to set :attr:`num_beads`. By default one cannot change :attr:`num_beads` from run to run. A continuous PIMD sequence may explicitly discard the old internal modes and rebuild a new ring polymer from its current centroid with :attr:`pimd_reseed_from_centroid`; this exception is not available for RPMD or TRPMD.
+
+One-time centroid reseeding
+---------------------------
+
+For a continuous PIMD sequence, first complete a PIMD run and then select a different
+even bead count. Add the standalone keyword before the next :attr:`run`::
+
+    ensemble pimd 8 300 300 100
+    run 10000
+    ensemble pimd 32 300 300 100
+    pimd_reseed_from_centroid
+    run 10000
+
+The current centroid position and velocity are copied to every new bead. All old
+ring-polymer internal modes, forces, potentials, and virials are discarded; the first
+force evaluation of the new run recomputes the force data. The target bead count must
+differ from the current count, and the command cannot be combined with
+:attr:`read_pimd_restart` in either order. ``read_pimd_restart`` remains strict and
+requires an exact bead-count match.
 
 :attr:`pimd_scr`
 ^^^^^^^^^^^^^^^^^

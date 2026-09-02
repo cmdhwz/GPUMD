@@ -87,7 +87,8 @@ Ensemble_PIMD::Ensemble_PIMD(
   Atom& atom,
   bool use_exact_propagator_input,
   double pile_scale_input,
-  bool fix_com_input)
+  bool fix_com_input,
+  bool reseed_from_centroid_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -97,6 +98,7 @@ Ensemble_PIMD::Ensemble_PIMD(
   use_exact_propagator_ = use_exact_propagator_input;
   pile_scale_ = pile_scale_input;
   fix_com_ = fix_com_input;
+  reseed_from_centroid_ = reseed_from_centroid_input;
   initialize(atom);
 }
 
@@ -107,7 +109,8 @@ Ensemble_PIMD::Ensemble_PIMD(
   Atom& atom,
   bool use_exact_propagator_input,
   double pile_scale_input,
-  bool fix_com_input)
+  bool fix_com_input,
+  bool reseed_from_centroid_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -118,6 +121,7 @@ Ensemble_PIMD::Ensemble_PIMD(
   use_exact_propagator_ = use_exact_propagator_input;
   pile_scale_ = pile_scale_input;
   fix_com_ = fix_com_input;
+  reseed_from_centroid_ = reseed_from_centroid_input;
   initialize(atom);
 }
 
@@ -132,7 +136,8 @@ Ensemble_PIMD::Ensemble_PIMD(
   bool use_exact_propagator_input,
   double pile_scale_input,
   bool fix_com_input,
-  bool use_scr_barostat_input)
+  bool use_scr_barostat_input,
+  bool reseed_from_centroid_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -148,6 +153,7 @@ Ensemble_PIMD::Ensemble_PIMD(
   pile_scale_ = pile_scale_input;
   fix_com_ = fix_com_input;
   use_scr_barostat_ = use_scr_barostat_input;
+  reseed_from_centroid_ = reseed_from_centroid_input;
   initialize(atom);
   initialize_rng();
 }
@@ -169,7 +175,9 @@ void Ensemble_PIMD::initialize(Atom& atom)
   std::vector<double*> force_beads_cpu(number_of_beads);
   std::vector<double*> virial_beads_cpu(number_of_beads);
 
-  if (atom.number_of_beads == 0) {
+  const bool first_pimd_initialization = atom.number_of_beads == 0;
+  const bool bead_count_change = !first_pimd_initialization && atom.number_of_beads != number_of_beads;
+  if (first_pimd_initialization) {
     if (!thermostat_centroid) {
       PRINT_INPUT_ERROR("Cannot use RPMD or TRPMD before PIMD\n.");
     }
@@ -178,14 +186,27 @@ void Ensemble_PIMD::initialize(Atom& atom)
     atom.potential_beads.resize(number_of_beads);
     atom.force_beads.resize(number_of_beads);
     atom.virial_beads.resize(number_of_beads);
-  } else {
-    if (atom.number_of_beads != number_of_beads) {
+  } else if (bead_count_change) {
+    if (!thermostat_centroid || !reseed_from_centroid_) {
       PRINT_INPUT_ERROR("Cannot change the number of beads for PIMD runs\n.");
     }
+    // The centroid is stored independently in position_per_atom and
+    // velocity_per_atom.  Discard all old internal modes and all old force,
+    // potential, and virial buffers before creating the new ring polymer.
+    atom.position_beads.clear();
+    atom.velocity_beads.clear();
+    atom.potential_beads.clear();
+    atom.force_beads.clear();
+    atom.virial_beads.clear();
+    atom.position_beads.resize(number_of_beads);
+    atom.velocity_beads.resize(number_of_beads);
+    atom.potential_beads.resize(number_of_beads);
+    atom.force_beads.resize(number_of_beads);
+    atom.virial_beads.resize(number_of_beads);
   }
 
   for (int k = 0; k < number_of_beads; ++k) {
-    if (atom.number_of_beads == 0) {
+    if (first_pimd_initialization || bead_count_change) {
       atom.position_beads[k].resize(number_of_atoms * 3);
       atom.velocity_beads[k].resize(number_of_atoms * 3);
       atom.potential_beads[k].resize(number_of_atoms);
@@ -194,7 +215,9 @@ void Ensemble_PIMD::initialize(Atom& atom)
 
       atom.position_beads[k].copy_from_device(atom.position_per_atom.data());
       atom.velocity_beads[k].copy_from_device(atom.velocity_per_atom.data());
-      atom.force_beads[k].copy_from_device(atom.force_per_atom.data());
+      if (first_pimd_initialization) {
+        atom.force_beads[k].copy_from_device(atom.force_per_atom.data());
+      }
     }
 
     position_beads_cpu[k] = atom.position_beads[k].data();
