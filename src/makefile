@@ -15,7 +15,7 @@
 # some flags
 ###########################################################
 CC = nvcc
-CUDA_ARCH=-arch=sm_60
+CUDA_ARCH=-arch=sm_89
 # Enable dump_netcdf for Linux builds. Set NETCDF_ROOT when NetCDF is
 # installed outside the compiler's default include/library search paths.
 USE_NETCDF ?= 1
