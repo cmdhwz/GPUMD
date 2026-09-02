@@ -1011,9 +1011,9 @@ void Proton_Tunneling::parse(
         PRINT_INPUT_ERROR("causal_mode must be followed by raw or inline.");
       causal_mode_seen = true;
       if (std::strcmp(param[next_param + 1], "raw") == 0) {
-        causal_mode_ = CausalMode::raw;
+        causal_mode_ = CausalMode::RAW;
       } else if (std::strcmp(param[next_param + 1], "inline") == 0) {
-        causal_mode_ = CausalMode::inline;
+        causal_mode_ = CausalMode::INLINE;
       } else {
         PRINT_INPUT_ERROR("causal_mode should be raw or inline.");
       }
@@ -1153,7 +1153,7 @@ void Proton_Tunneling::parse(
     printf("    causal network searches %.6f fs with %.6f fs concerted tolerance.\n",
       causal_search_max_fs_, causal_sync_fs_);
     printf("    causal analysis mode is %s.\n",
-      causal_mode_ == CausalMode::raw ? "raw" : "inline");
+      causal_mode_ == CausalMode::RAW ? "raw" : "inline");
     printf("    causal null baseline uses %d shifts and seed %llu.\n",
       causal_null_shifts_, causal_null_seed_);
   }
@@ -4343,7 +4343,7 @@ void Proton_Tunneling::write_text_output_files()
   }
   if (local_influence_enabled_)
     ion_influence_file_ = my_fopen("proton_ion_influence.out", "a");
-  if (causal_chain_enabled_ && causal_mode_ == CausalMode::inline) {
+  if (causal_chain_enabled_ && causal_mode_ == CausalMode::INLINE) {
     causal_link_file_ = my_fopen("proton_causal_link.out", "a");
     concerted_group_file_ = my_fopen("proton_concerted_group.out", "a");
     concerted_member_file_ = my_fopen("proton_concerted_member.out", "a");
@@ -4378,7 +4378,7 @@ void Proton_Tunneling::write_text_output_files()
       fprintf(bias_file_, " %.10e", edge);
     fprintf(bias_file_, " causal_null %d %llu", causal_null_shifts_, causal_null_seed_);
     fprintf(bias_file_, " causal_mode %s",
-      causal_mode_ == CausalMode::raw ? "raw" : "inline");
+      causal_mode_ == CausalMode::RAW ? "raw" : "inline");
   }
   fprintf(bias_file_, "\n");
   fprintf(bias_file_,
@@ -5086,9 +5086,9 @@ void Proton_Tunneling::write_netcdf_output_file()
     "0=open,1=closed_local,2=closed_winding,3=branched,4=edge_rattling");
   if (causal_chain_enabled_) {
     netcdf_text_attribute(ncid, NC_GLOBAL, "causal_analysis_state",
-      causal_mode_ == CausalMode::raw ? "raw_only" : "complete");
+      causal_mode_ == CausalMode::RAW ? "raw_only" : "complete");
     netcdf_text_attribute(ncid, NC_GLOBAL, "causal_mode",
-      causal_mode_ == CausalMode::raw ? "raw" : "inline");
+      causal_mode_ == CausalMode::RAW ? "raw" : "inline");
     char causal_search_text[64];
     char causal_sync_text[64];
     std::snprintf(causal_search_text, sizeof(causal_search_text), "%.17g", causal_search_max_fs_);
@@ -6620,7 +6620,7 @@ void Proton_Tunneling::postprocess(
   }
   if (window_sample_count_ > 0)
     write_window(last_time_fs_);
-  if (causal_chain_enabled_ && causal_mode_ == CausalMode::inline) {
+  if (causal_chain_enabled_ && causal_mode_ == CausalMode::INLINE) {
     build_causal_network();
     build_causal_lag_histogram();
   }
