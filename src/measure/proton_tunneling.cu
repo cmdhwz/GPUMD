@@ -2917,9 +2917,12 @@ void Proton_Tunneling::observe_frame(
           if (!hydrogen_state.first_opposite_seen) {
             hydrogen_state.first_opposite_seen = true;
             hydrogen_state.time_first_opposite_fs = time_fs;
-            if (geometry.oxygen_from >= 0 && geometry.oxygen_target >= 0 &&
-                geometry.oxygen_from < number_of_atoms_ &&
-                geometry.oxygen_target < number_of_atoms_) {
+            const int oxygen_from = (hydrogen_state.attempt_from_state < 0)
+              ? geometry.oxygen_low : geometry.oxygen_high;
+            const int oxygen_target = (hydrogen_state.attempt_from_state < 0)
+              ? geometry.oxygen_high : geometry.oxygen_low;
+            if (oxygen_from >= 0 && oxygen_target >= 0 &&
+                oxygen_from < number_of_atoms_ && oxygen_target < number_of_atoms_) {
               // These are the actual counts in the first-opposite frame. Do
               // not reconstruct them again at confirmation time: with
               // hold_samples > 1 the current frame may already contain the
@@ -2927,13 +2930,13 @@ void Proton_Tunneling::observe_frame(
               // their net count change.
               hydrogen_state.first_opposite_counts_valid = true;
               hydrogen_state.first_opposite_nH_from_before =
-                previous_hydrogen_count_[geometry.oxygen_from];
+                previous_hydrogen_count_[oxygen_from];
               hydrogen_state.first_opposite_nH_to_before =
-                previous_hydrogen_count_[geometry.oxygen_target];
+                previous_hydrogen_count_[oxygen_target];
               hydrogen_state.first_opposite_nH_from_after =
-                hydrogen_count_[geometry.oxygen_from];
+                hydrogen_count_[oxygen_from];
               hydrogen_state.first_opposite_nH_to_after =
-                hydrogen_count_[geometry.oxygen_target];
+                hydrogen_count_[oxygen_target];
             }
           }
           if (hydrogen_state.pending_state == state) {
