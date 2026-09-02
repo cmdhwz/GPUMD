@@ -1115,6 +1115,10 @@ void Proton_Tunneling::parse(
     if (causal_lag_bin_edges_fs_.empty()) {
       causal_lag_bin_edges_fs_ = {0.0, causal_sync_fs_, 5.0, 10.0, 20.0, 50.0, 100.0,
                                   causal_search_max_fs_};
+      causal_lag_bin_edges_fs_.erase(
+        std::remove_if(causal_lag_bin_edges_fs_.begin(), causal_lag_bin_edges_fs_.end(),
+          [&](const double edge) { return edge < 0.0 || edge > causal_search_max_fs_; }),
+        causal_lag_bin_edges_fs_.end());
       std::sort(causal_lag_bin_edges_fs_.begin(), causal_lag_bin_edges_fs_.end());
       causal_lag_bin_edges_fs_.erase(
         std::unique(causal_lag_bin_edges_fs_.begin(), causal_lag_bin_edges_fs_.end()),
@@ -2463,6 +2467,11 @@ void Proton_Tunneling::start_attempt(
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
   hydrogen_state.first_opposite_seen = false;
+  hydrogen_state.first_opposite_counts_valid = false;
+  hydrogen_state.first_opposite_nH_from_before = 0;
+  hydrogen_state.first_opposite_nH_to_before = 0;
+  hydrogen_state.first_opposite_nH_from_after = 0;
+  hydrogen_state.first_opposite_nH_to_after = 0;
   hydrogen_state.commit_seen = false;
   hydrogen_state.time_first_opposite_fs = 0.0;
   hydrogen_state.time_commit_fs = 0.0;
@@ -2623,10 +2632,16 @@ void Proton_Tunneling::finish_attempt(
   record.delocalization_best = hydrogen_state.delocalization_best;
 
   if (outcome == AttemptOutcome::success && geometry != nullptr) {
-    const int nH_from_before = previous_hydrogen_count_[oxygen_from];
-    const int nH_to_before = previous_hydrogen_count_[oxygen_target];
-    const int nH_from_after = nH_from_before - 1;
-    const int nH_to_after = nH_to_before + 1;
+    const int nH_from_before = hydrogen_state.first_opposite_counts_valid
+      ? hydrogen_state.first_opposite_nH_from_before
+      : previous_hydrogen_count_[oxygen_from];
+    const int nH_to_before = hydrogen_state.first_opposite_counts_valid
+      ? hydrogen_state.first_opposite_nH_to_before
+      : previous_hydrogen_count_[oxygen_target];
+    const int nH_from_after = hydrogen_state.first_opposite_counts_valid
+      ? hydrogen_state.first_opposite_nH_from_after : nH_from_before - 1;
+    const int nH_to_after = hydrogen_state.first_opposite_counts_valid
+      ? hydrogen_state.first_opposite_nH_to_after : nH_to_before + 1;
     double dx = geometry->low_to_high_dx;
     double dy = geometry->low_to_high_dy;
     double dz = geometry->low_to_high_dz;
@@ -2701,6 +2716,11 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
   hydrogen_state.first_opposite_seen = false;
+  hydrogen_state.first_opposite_counts_valid = false;
+  hydrogen_state.first_opposite_nH_from_before = 0;
+  hydrogen_state.first_opposite_nH_to_before = 0;
+  hydrogen_state.first_opposite_nH_from_after = 0;
+  hydrogen_state.first_opposite_nH_to_after = 0;
   hydrogen_state.commit_seen = false;
   hydrogen_state.time_first_opposite_fs = 0.0;
   hydrogen_state.time_commit_fs = 0.0;
@@ -2897,6 +2917,24 @@ void Proton_Tunneling::observe_frame(
           if (!hydrogen_state.first_opposite_seen) {
             hydrogen_state.first_opposite_seen = true;
             hydrogen_state.time_first_opposite_fs = time_fs;
+            if (geometry.oxygen_from >= 0 && geometry.oxygen_target >= 0 &&
+                geometry.oxygen_from < number_of_atoms_ &&
+                geometry.oxygen_target < number_of_atoms_) {
+              // These are the actual counts in the first-opposite frame. Do
+              // not reconstruct them again at confirmation time: with
+              // hold_samples > 1 the current frame may already contain the
+              // transfer, and same-frame concerted events are represented by
+              // their net count change.
+              hydrogen_state.first_opposite_counts_valid = true;
+              hydrogen_state.first_opposite_nH_from_before =
+                previous_hydrogen_count_[geometry.oxygen_from];
+              hydrogen_state.first_opposite_nH_to_before =
+                previous_hydrogen_count_[geometry.oxygen_target];
+              hydrogen_state.first_opposite_nH_from_after =
+                hydrogen_count_[geometry.oxygen_from];
+              hydrogen_state.first_opposite_nH_to_after =
+                hydrogen_count_[geometry.oxygen_target];
+            }
           }
           if (hydrogen_state.pending_state == state) {
             ++hydrogen_state.pending_count;
@@ -3056,142 +3094,221 @@ void Proton_Tunneling::build_causal_network()
     });
 
   long long next_group_id = 1;
-  size_t group_begin = 0;
-  while (group_begin < successful_events.size()) {
-    size_t group_end = group_begin + 1;
-    const double reference_time = first_opposite_time(attempt_records_[successful_events[group_begin]]);
-    while (group_end < successful_events.size() &&
-           first_opposite_time(attempt_records_[successful_events[group_end]]) - reference_time <=
+  size_t bucket_begin = 0;
+  while (bucket_begin < successful_events.size()) {
+    size_t bucket_end = bucket_begin + 1;
+    const double reference_time =
+      first_opposite_time(attempt_records_[successful_events[bucket_begin]]);
+    while (bucket_end < successful_events.size() &&
+           first_opposite_time(attempt_records_[successful_events[bucket_end]]) - reference_time <=
              causal_sync_fs_)
-      ++group_end;
+      ++bucket_end;
 
-    ConcertedGroupRecord group;
-    group.group_id = next_group_id;
-    group.reference_time_fs = reference_time;
-    group.time_span_fs = first_opposite_time(attempt_records_[successful_events[group_end - 1]]) -
-      reference_time;
-    group.n_events = static_cast<int>(group_end - group_begin);
-    std::set<int> hydrogens;
-    std::set<int> oxygens;
-    std::set<unsigned long long> edges;
-    std::unordered_map<int, std::vector<int>> adjacency;
-    for (size_t position = group_begin; position < group_end; ++position) {
-      const size_t event_index = successful_events[position];
-      const AttemptRecord& event = attempt_records_[event_index];
-      attempt_concerted_group_ids_[event_index] = next_group_id;
-      concerted_member_records_.push_back({next_group_id, static_cast<long long>(event_index)});
-      hydrogens.insert(event.hydrogen);
-      oxygens.insert(event.oxygen_from);
-      oxygens.insert(event.oxygen_target);
-      edges.insert(make_bond_key(event.oxygen_low, event.oxygen_high));
-      adjacency[event.oxygen_from].push_back(event.oxygen_target);
-    }
-    group.n_unique_H = static_cast<int>(hydrogens.size());
-    group.n_unique_O = static_cast<int>(oxygens.size());
-    group.n_unique_edges = static_cast<int>(edges.size());
-
-    bool has_cycle = false;
-    for (const auto& start_item : adjacency) {
-      const int start = start_item.first;
-      std::vector<int> stack(1, start);
-      std::set<int> visited;
-      while (!stack.empty() && !has_cycle) {
-        const int current = stack.back();
-        stack.pop_back();
-        if (!visited.insert(current).second)
-          continue;
-        const auto next_item = adjacency.find(current);
-        if (next_item == adjacency.end())
-          continue;
-        for (const int next : next_item->second) {
-          if (next == start) {
-            has_cycle = true;
-            break;
-          }
-          if (visited.find(next) == visited.end())
-            stack.push_back(next);
-        }
+    // First make a time bucket, then split it by shared-O connectivity. This
+    // prevents distant, merely simultaneous transfers from becoming one
+    // concerted group.
+    const size_t bucket_size = bucket_end - bucket_begin;
+    std::vector<size_t> local_parent(bucket_size);
+    for (size_t i = 0; i < bucket_size; ++i)
+      local_parent[i] = i;
+    const auto local_root = [&](size_t index) {
+      size_t root = index;
+      while (local_parent[root] != root)
+        root = local_parent[root];
+      while (local_parent[index] != index) {
+        const size_t next = local_parent[index];
+        local_parent[index] = root;
+        index = next;
       }
-      if (has_cycle)
-        break;
+      return root;
+    };
+    const auto local_unite = [&](const size_t first, const size_t second) {
+      const size_t first_root = local_root(first);
+      const size_t second_root = local_root(second);
+      if (first_root != second_root)
+        local_parent[second_root] = first_root;
+    };
+    std::unordered_map<int, size_t> first_event_by_oxygen;
+    for (size_t local = 0; local < bucket_size; ++local) {
+      const AttemptRecord& event = attempt_records_[successful_events[bucket_begin + local]];
+      const int touched_oxygens[2] = {event.oxygen_from, event.oxygen_target};
+      for (const int oxygen : touched_oxygens) {
+        const auto item = first_event_by_oxygen.find(oxygen);
+        if (item == first_event_by_oxygen.end())
+          first_event_by_oxygen[oxygen] = local;
+        else
+          local_unite(item->second, local);
+      }
     }
-    group.has_closed_oxygen_cycle = has_cycle ? 1 : 0;
-    concerted_group_records_.push_back(group);
-    ++next_group_id;
-    group_begin = group_end;
+
+    std::map<size_t, std::vector<size_t>> components;
+    for (size_t local = 0; local < bucket_size; ++local)
+      components[local_root(local)].push_back(local);
+    for (const auto& component : components) {
+      ConcertedGroupRecord group;
+      group.group_id = next_group_id;
+      group.n_events = static_cast<int>(component.second.size());
+      group.reference_time_fs = std::numeric_limits<double>::max();
+      double last_time = -std::numeric_limits<double>::max();
+      std::set<int> hydrogens;
+      std::set<int> oxygens;
+      std::set<unsigned long long> edges;
+      std::unordered_map<int, std::vector<int>> adjacency;
+      for (const size_t local : component.second) {
+        const size_t event_index = successful_events[bucket_begin + local];
+        const AttemptRecord& event = attempt_records_[event_index];
+        const double event_time = first_opposite_time(event);
+        group.reference_time_fs = std::min(group.reference_time_fs, event_time);
+        last_time = std::max(last_time, event_time);
+        attempt_concerted_group_ids_[event_index] = next_group_id;
+        concerted_member_records_.push_back({next_group_id, static_cast<long long>(event_index)});
+        hydrogens.insert(event.hydrogen);
+        oxygens.insert(event.oxygen_from);
+        oxygens.insert(event.oxygen_target);
+        edges.insert(make_bond_key(event.oxygen_low, event.oxygen_high));
+        adjacency[event.oxygen_from].push_back(event.oxygen_target);
+      }
+      group.time_span_fs = last_time - group.reference_time_fs;
+      group.n_unique_H = static_cast<int>(hydrogens.size());
+      group.n_unique_O = static_cast<int>(oxygens.size());
+      group.n_unique_edges = static_cast<int>(edges.size());
+
+      bool has_cycle = false;
+      for (const auto& start_item : adjacency) {
+        const int start = start_item.first;
+        std::vector<int> stack(1, start);
+        std::set<int> visited;
+        while (!stack.empty() && !has_cycle) {
+          const int current = stack.back();
+          stack.pop_back();
+          if (!visited.insert(current).second)
+            continue;
+          const auto next_item = adjacency.find(current);
+          if (next_item == adjacency.end())
+            continue;
+          for (const int next : next_item->second) {
+            if (next == start) {
+              has_cycle = true;
+              break;
+            }
+            if (visited.find(next) == visited.end())
+              stack.push_back(next);
+          }
+        }
+        if (has_cycle)
+          break;
+      }
+      group.has_closed_oxygen_cycle = has_cycle ? 1 : 0;
+      concerted_group_records_.push_back(group);
+      ++next_group_id;
+    }
+    bucket_begin = bucket_end;
   }
 
   const auto event_group = [&](const size_t event_index) {
     return event_index < attempt_concerted_group_ids_.size()
       ? attempt_concerted_group_ids_[event_index] : -1;
   };
-  for (size_t parent_position = 0; parent_position < successful_events.size(); ++parent_position) {
-    const size_t parent_index = successful_events[parent_position];
+  using TimedEvent = std::pair<double, size_t>;
+  std::map<int, std::vector<TimedEvent>> children_by_source;
+  std::map<int, std::vector<TimedEvent>> children_by_target;
+  for (const size_t child_index : successful_events) {
+    const AttemptRecord& child = attempt_records_[child_index];
+    const double child_first = first_opposite_time(child);
+    children_by_source[child.oxygen_from].push_back({child_first, child_index});
+    children_by_target[child.oxygen_target].push_back({child_first, child_index});
+  }
+
+  std::set<std::pair<size_t, size_t>> emitted_reversal_links;
+  const auto append_candidate = [&](const size_t parent_index,
+                                    const size_t child_index,
+                                    const CarrierType requested_carrier,
+                                    const int shared_oxygen) {
+    if (parent_index == child_index)
+      return;
     const AttemptRecord& parent = attempt_records_[parent_index];
-    for (size_t child_position = 0; child_position < successful_events.size(); ++child_position) {
-      const size_t child_index = successful_events[child_position];
-      if (parent_index == child_index)
-        continue;
-      const AttemptRecord& child = attempt_records_[child_index];
-      const double parent_first = first_opposite_time(parent);
-      const double child_first = first_opposite_time(child);
-      const double causal_lag = child.time_start_fs - parent_first;
-      if (std::abs(causal_lag) > causal_search_max_fs_)
-        continue;
+    const AttemptRecord& child = attempt_records_[child_index];
+    const double parent_first = first_opposite_time(parent);
+    const double child_first = first_opposite_time(child);
+    const double first_opposite_lag = child_first - parent_first;
+    if (!std::isfinite(first_opposite_lag) ||
+        std::abs(first_opposite_lag) > causal_search_max_fs_)
+      return;
 
-      CarrierType carrier = CarrierType::excess;
-      const bool is_excess = parent.oxygen_target == child.oxygen_from;
-      const bool is_deficit = parent.oxygen_from == child.oxygen_target;
-      const bool is_reversal = parent.oxygen_from == child.oxygen_target &&
-        parent.oxygen_target == child.oxygen_from;
-      if (is_reversal)
-        carrier = CarrierType::edge_reversal;
-      else if (is_excess)
-        carrier = CarrierType::excess;
-      else if (is_deficit)
-        carrier = CarrierType::deficit;
-      else
-        continue;
+    const bool is_reversal = parent.oxygen_from == child.oxygen_target &&
+      parent.oxygen_target == child.oxygen_from;
+    const CarrierType carrier = is_reversal ? CarrierType::edge_reversal : requested_carrier;
+    if (is_reversal &&
+        !emitted_reversal_links.insert({parent_index, child_index}).second)
+      return;
 
-      CausalLinkRecord link;
-      link.parent_attempt_index = static_cast<long long>(parent_index);
-      link.child_attempt_index = static_cast<long long>(child_index);
-      link.shared_oxygen = is_excess ? parent.oxygen_target : parent.oxygen_from;
-      link.carrier_type = carrier;
-      link.causal_lag_fs = causal_lag;
-      link.lag_first_opposite_fs = child_first - parent_first;
-      link.lag_commit_fs = child.time_commit_fs - parent.time_commit_fs;
-      link.lag_confirm_fs = child.time_confirm_fs - parent.time_confirm_fs;
-      link.same_hydrogen = parent.hydrogen == child.hydrogen;
-      link.same_edge = parent.oxygen_low == child.oxygen_low &&
-        parent.oxygen_high == child.oxygen_high;
-      link.parent_group_id = event_group(parent_index);
-      link.child_group_id = event_group(child_index);
-      if (link.lag_first_opposite_fs > causal_sync_fs_)
-        link.temporal_type = TemporalType::sequential;
-      else if (link.lag_first_opposite_fs >= -causal_sync_fs_)
-        link.temporal_type = TemporalType::concerted;
-      else
-        link.temporal_type = TemporalType::temporally_invalid;
+    CausalLinkRecord link;
+    link.parent_attempt_index = static_cast<long long>(parent_index);
+    link.child_attempt_index = static_cast<long long>(child_index);
+    link.shared_oxygen = shared_oxygen;
+    link.carrier_type = carrier;
+    // Keep the start-based lag as a descriptive column. All candidate
+    // filtering and temporal labels use first-opposite lag below.
+    link.causal_lag_fs = child.time_start_fs - parent_first;
+    link.lag_first_opposite_fs = first_opposite_lag;
+    link.lag_commit_fs = child.time_commit_fs - parent.time_commit_fs;
+    link.lag_confirm_fs = child.time_confirm_fs - parent.time_confirm_fs;
+    link.same_hydrogen = parent.hydrogen == child.hydrogen;
+    link.same_edge = parent.oxygen_low == child.oxygen_low &&
+      parent.oxygen_high == child.oxygen_high;
+    link.parent_group_id = event_group(parent_index);
+    link.child_group_id = event_group(child_index);
+    if (first_opposite_lag > causal_sync_fs_)
+      link.temporal_type = TemporalType::sequential;
+    else if (first_opposite_lag >= -causal_sync_fs_)
+      link.temporal_type = TemporalType::concerted;
+    else
+      link.temporal_type = TemporalType::temporally_invalid;
 
-      if (carrier == CarrierType::excess) {
-        const int parent_q = parent.nH_to_after - 2;
-        const int child_q = child.nH_from_before - 2;
-        link.defect_continuity = (parent_q > 0 && child_q > 0 &&
-                                  child.nH_from_after < child.nH_from_before) ? 1 : 0;
-      } else if (carrier == CarrierType::deficit) {
-        const int parent_q = parent.nH_from_after - 2;
-        const int child_q = child.nH_to_before - 2;
-        link.defect_continuity = (parent_q < 0 && child_q < 0 &&
-                                  child.nH_to_after > child.nH_to_before) ? 1 : 0;
-      } else {
-        link.defect_continuity = -1;
-      }
-      link.valid_relay = carrier != CarrierType::edge_reversal &&
-        link.temporal_type != TemporalType::temporally_invalid &&
-        link.defect_continuity == 1 && !link.same_hydrogen && !link.same_edge;
-      causal_link_records_.push_back(link);
+    if (carrier == CarrierType::excess) {
+      const int parent_q = parent.nH_to_after - 2;
+      const int child_q = child.nH_from_before - 2;
+      link.defect_continuity = (parent_q > 0 && child_q > 0 &&
+                                child.nH_from_after < child.nH_from_before) ? 1 : 0;
+    } else if (carrier == CarrierType::deficit) {
+      const int parent_q = parent.nH_from_after - 2;
+      const int child_q = child.nH_to_before - 2;
+      link.defect_continuity = (parent_q < 0 && child_q < 0 &&
+                                child.nH_to_after > child.nH_to_before) ? 1 : 0;
+    } else {
+      link.defect_continuity = -1;
     }
+    link.valid_relay = carrier != CarrierType::edge_reversal &&
+      link.temporal_type != TemporalType::temporally_invalid &&
+      link.defect_continuity == 1 && !link.same_hydrogen && !link.same_edge;
+    causal_link_records_.push_back(link);
+  };
+
+  const auto append_candidates_in_window = [&](const size_t parent_index,
+                                                const CarrierType carrier,
+                                                const int shared_oxygen,
+                                                const std::vector<TimedEvent>& candidates) {
+    const double parent_first = first_opposite_time(attempt_records_[parent_index]);
+    const double lower_time = parent_first - causal_search_max_fs_;
+    const double upper_time = parent_first + causal_search_max_fs_;
+    const auto begin = std::lower_bound(candidates.begin(), candidates.end(), lower_time,
+      [](const TimedEvent& item, const double time) { return item.first < time; });
+    const auto end = std::upper_bound(candidates.begin(), candidates.end(), upper_time,
+      [](const double time, const TimedEvent& item) { return time < item.first; });
+    for (auto item = begin; item != end; ++item)
+      append_candidate(parent_index, item->second, carrier, shared_oxygen);
+  };
+
+  for (const size_t parent_index : successful_events) {
+    const AttemptRecord& parent = attempt_records_[parent_index];
+    const auto excess = children_by_source.find(parent.oxygen_target);
+    if (excess != children_by_source.end())
+      append_candidates_in_window(parent_index, CarrierType::excess,
+        parent.oxygen_target, excess->second);
+    const auto deficit = children_by_target.find(parent.oxygen_from);
+    if (deficit != children_by_target.end())
+      append_candidates_in_window(parent_index, CarrierType::deficit,
+        parent.oxygen_from, deficit->second);
   }
 
   std::map<std::pair<long long, int>, int> parent_candidate_count;
@@ -3297,16 +3414,40 @@ void Proton_Tunneling::build_causal_network()
   const std::vector<double> chain_thresholds = causal_gap_thresholds_fs_.empty()
     ? std::vector<double>(1, causal_search_max_fs_) : causal_gap_thresholds_fs_;
   for (const double lag_threshold_fs : chain_thresholds) {
-    std::map<std::pair<long long, int>, size_t> outgoing;
-    std::map<std::pair<long long, int>, int> incoming_count;
+    using LinkKey = std::pair<long long, int>;
+    std::map<LinkKey, std::vector<size_t>> threshold_candidates;
+    std::map<LinkKey, int> threshold_parent_count;
+    std::map<LinkKey, int> threshold_child_count;
     for (size_t i = 0; i < causal_link_records_.size(); ++i) {
       const CausalLinkRecord& link = causal_link_records_[i];
-      if (!link.primary_link || link.temporal_type != TemporalType::sequential ||
+      if (!link.valid_relay || link.temporal_type != TemporalType::sequential ||
+          link.parent_group_id == link.child_group_id ||
           link.lag_first_opposite_fs <= causal_sync_fs_ ||
           link.lag_first_opposite_fs > lag_threshold_fs)
         continue;
-      outgoing[{link.parent_attempt_index, carrier_code(link.carrier_type)}] = i;
-      ++incoming_count[{link.child_attempt_index, carrier_code(link.carrier_type)}];
+      const int carrier = carrier_code(link.carrier_type);
+      const LinkKey parent_key = {link.parent_attempt_index, carrier};
+      const LinkKey child_key = {link.child_attempt_index, carrier};
+      threshold_candidates[parent_key].push_back(i);
+      ++threshold_parent_count[parent_key];
+      ++threshold_child_count[child_key];
+    }
+
+    std::map<std::pair<long long, int>, size_t> outgoing;
+    std::map<std::pair<long long, int>, int> incoming_count;
+    std::map<size_t, std::pair<int, int>> threshold_alternatives;
+    for (const auto& item : threshold_candidates) {
+      size_t best = item.second.front();
+      for (const size_t candidate : item.second)
+        if (better_primary(causal_link_records_[candidate], causal_link_records_[best]))
+          best = candidate;
+      outgoing[item.first] = best;
+      const CausalLinkRecord& link = causal_link_records_[best];
+      incoming_count[{link.child_attempt_index, item.first.second}] =
+        threshold_child_count[{link.child_attempt_index, item.first.second}];
+      threshold_alternatives[best] = {
+        std::max(0, threshold_child_count[{link.child_attempt_index, item.first.second}] - 1),
+        std::max(0, threshold_parent_count[item.first] - 1)};
     }
 
     for (const CarrierType carrier : {CarrierType::excess, CarrierType::deficit}) {
@@ -3420,7 +3561,9 @@ void Proton_Tunneling::build_causal_network()
           chain.max_gap_fs = std::max(chain.max_gap_fs, gap);
           ++gap_count;
         }
-        if (link.alternative_parent_count > 0 || link.alternative_child_count > 0)
+        const auto alternatives = threshold_alternatives.find(link_item->second);
+        if (alternatives != threshold_alternatives.end() &&
+            (alternatives->second.first > 0 || alternatives->second.second > 0))
           branched = true;
         if (link.carrier_type == CarrierType::edge_reversal)
           edge_rattling = true;
@@ -3484,9 +3627,11 @@ void Proton_Tunneling::build_causal_network()
       for (size_t position = 0; position + 1 < path.size(); ++position) {
         const auto link_item = outgoing.find({static_cast<long long>(path[position]), carrier_id});
         if (link_item != outgoing.end()) {
-          const CausalLinkRecord& link = causal_link_records_[link_item->second];
-          chain.alternative_parent_count += link.alternative_parent_count;
-          chain.alternative_child_count += link.alternative_child_count;
+          const auto alternatives = threshold_alternatives.find(link_item->second);
+          if (alternatives != threshold_alternatives.end()) {
+            chain.alternative_parent_count += alternatives->second.first;
+            chain.alternative_child_count += alternatives->second.second;
+          }
         }
       }
       if (branched)
@@ -3531,6 +3676,11 @@ void Proton_Tunneling::build_causal_lag_histogram()
     }
     return -1;
   };
+  std::vector<size_t> successful_events;
+  successful_events.reserve(attempt_records_.size());
+  for (size_t i = 0; i < attempt_records_.size(); ++i)
+    if (attempt_records_[i].has_transfer)
+      successful_events.push_back(i);
   for (const CausalLinkRecord& link : causal_link_records_) {
     const int carrier = carrier_code(link.carrier_type);
     if (carrier > 1 || !link.valid_relay)
@@ -3556,10 +3706,11 @@ void Proton_Tunneling::build_causal_lag_histogram()
       global_max = std::max(global_max, time);
     }
     const double period = global_max - global_min;
-    std::mt19937_64 random_engine(causal_null_seed_);
-    std::uniform_real_distribution<double> uniform_shift(0.0, std::max(0.0, period));
-    for (int shift_index = 0; shift_index < causal_null_shifts_; ++shift_index) {
-      std::map<std::pair<int, int>, double> shifts;
+    if (period > 0.0 && std::isfinite(global_min) && std::isfinite(global_max)) {
+      std::mt19937_64 random_engine(causal_null_seed_);
+      std::uniform_real_distribution<double> uniform_shift(0.0, period);
+      using NullStream = std::vector<TimedEvent>;
+      using NullStreamKey = std::pair<int, int>;
       const auto event_position_oxygen = [&](const AttemptRecord& event,
                                              const int carrier,
                                              const bool parent_role) {
@@ -3567,48 +3718,90 @@ void Proton_Tunneling::build_causal_lag_histogram()
           return parent_role ? event.oxygen_target : event.oxygen_from;
         return parent_role ? event.oxygen_from : event.oxygen_target;
       };
-      const auto random_circular_shift = [&]() {
-        double shift = period > 0.0 ? uniform_shift(random_engine) : 0.0;
-        if (period > 2.0 * causal_search_max_fs_ && shift < causal_search_max_fs_)
-          shift += causal_search_max_fs_;
-        return period > 0.0 ? std::fmod(shift, period) : 0.0;
-      };
-      for (const AttemptRecord& event : attempt_records_) {
-        if (!event.has_transfer)
-          continue;
-        for (int carrier = 0; carrier < 2; ++carrier) {
-          for (int role = 0; role < 2; ++role) {
-            const bool parent_role = role == 0;
-            const int oxygen = event_position_oxygen(event, carrier, parent_role);
-            shifts[{carrier * 2 + role, oxygen}] = random_circular_shift();
-          }
+      const auto has_defect_continuity = [&](const AttemptRecord& parent,
+                                             const AttemptRecord& child,
+                                             const int carrier) {
+        if (carrier == 0) {
+          const int parent_q = parent.nH_to_after - 2;
+          const int child_q = child.nH_from_before - 2;
+          return parent_q > 0 && child_q > 0 &&
+            child.nH_from_after < child.nH_from_before;
         }
-      }
-      const auto shifted_time = [&](const size_t event_index, const int carrier,
-                                    const bool parent_role) {
-        const AttemptRecord& event = attempt_records_[event_index];
-        const int oxygen = event_position_oxygen(event, carrier, parent_role);
-        const auto shift_item = shifts.find({carrier * 2 + (parent_role ? 0 : 1), oxygen});
-        const double shift = shift_item == shifts.end() ? 0.0 : shift_item->second;
-        const double time = first_opposite_time(event);
-        if (period <= 0.0)
-          return time;
+        const int parent_q = parent.nH_from_after - 2;
+        const int child_q = child.nH_to_before - 2;
+        return parent_q < 0 && child_q < 0 &&
+          child.nH_to_after > child.nH_to_before;
+      };
+      const auto circular_time = [&](const double time, const double shift) {
         double result = std::fmod(time - global_min + shift, period);
         if (result < 0.0)
           result += period;
         return global_min + result;
       };
-      for (const CausalLinkRecord& link : causal_link_records_) {
-        const int carrier = carrier_code(link.carrier_type);
-        if (carrier > 1 || !link.valid_relay)
-          continue;
-        const size_t parent_index = static_cast<size_t>(link.parent_attempt_index);
-        const size_t child_index = static_cast<size_t>(link.child_attempt_index);
-        const double lag = shifted_time(child_index, carrier, false) -
-          shifted_time(parent_index, carrier, true);
-        const int bin = bin_index(lag);
-        if (bin >= 0)
-          ++null_counts[carrier][shift_index][bin];
+
+      for (int shift_index = 0; shift_index < causal_null_shifts_; ++shift_index) {
+        // Each carrier/oxygen/role stream gets one independent, uniform
+        // circular shift. Candidate links are rebuilt from these complete
+        // streams, so the null set is not preselected by real-time relays.
+        std::map<NullStreamKey, double> shifts;
+        std::map<NullStreamKey, NullStream> streams;
+        for (const size_t event_index : successful_events) {
+          const AttemptRecord& event = attempt_records_[event_index];
+          const double time = first_opposite_time(event);
+          for (int carrier = 0; carrier < 2; ++carrier) {
+            for (int role = 0; role < 2; ++role) {
+              const bool parent_role = role == 0;
+              const NullStreamKey key = {
+                carrier * 2 + role, event_position_oxygen(event, carrier, parent_role)};
+              if (shifts.find(key) == shifts.end())
+                shifts[key] = uniform_shift(random_engine);
+              streams[key].push_back({circular_time(time, shifts[key]), event_index});
+            }
+          }
+        }
+        for (auto& item : streams)
+          std::sort(item.second.begin(), item.second.end(),
+            [](const TimedEvent& first, const TimedEvent& second) {
+              if (first.first != second.first)
+                return first.first < second.first;
+              return first.second < second.second;
+            });
+
+        for (int carrier = 0; carrier < 2; ++carrier) {
+          for (const auto& parent_stream_item : streams) {
+            if (parent_stream_item.first.first != carrier * 2)
+              continue;
+            const int oxygen = parent_stream_item.first.second;
+            const NullStreamKey child_key = {carrier * 2 + 1, oxygen};
+            const auto child_stream_item = streams.find(child_key);
+            if (child_stream_item == streams.end())
+              continue;
+            const NullStream& children = child_stream_item->second;
+            for (const TimedEvent& parent_item : parent_stream_item.second) {
+              const double upper_time = parent_item.first + causal_search_max_fs_;
+              const auto child_begin = std::lower_bound(
+                children.begin(), children.end(), parent_item.first,
+                [](const TimedEvent& item, const double time) { return item.first < time; });
+              const auto child_end = std::upper_bound(
+                children.begin(), children.end(), upper_time,
+                [](const double time, const TimedEvent& item) { return time < item.first; });
+              for (auto child_item = child_begin; child_item != child_end; ++child_item) {
+                if (parent_item.second == child_item->second)
+                  continue;
+                const AttemptRecord& parent = attempt_records_[parent_item.second];
+                const AttemptRecord& child = attempt_records_[child_item->second];
+                if (parent.hydrogen == child.hydrogen ||
+                    (parent.oxygen_low == child.oxygen_low &&
+                     parent.oxygen_high == child.oxygen_high) ||
+                    !has_defect_continuity(parent, child, carrier))
+                  continue;
+                const int bin = bin_index(child_item->first - parent_item.first);
+                if (bin >= 0)
+                  ++null_counts[carrier][shift_index][bin];
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -3635,7 +3828,7 @@ void Proton_Tunneling::build_causal_lag_histogram()
           std::max(1, causal_null_shifts_ - 1));
         if (record.null_mean_count > 0.0) {
           record.g_causal = static_cast<double>(record.real_count) / record.null_mean_count;
-          record.g_causal_standard_error = record.null_std_count /
+          record.g_causal_standard_error = record.g_causal * record.null_std_count /
             (std::sqrt(static_cast<double>(std::max(1, causal_null_shifts_))) *
              record.null_mean_count);
         } else {

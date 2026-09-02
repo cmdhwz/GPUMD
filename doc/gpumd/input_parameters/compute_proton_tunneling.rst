@@ -375,13 +375,15 @@ For example::
 time tolerance; the default scientific starting value is 2 fs. The listed thresholds are
 independent maximum propagation gaps. A separate chain table is generated for each threshold,
 so the same trajectory can be tested at 10, 20, 50, and 100 fs without rerunning it.
-Temporal labels use the difference between the child and parent first-opposite times:
-``concerted`` when its absolute value is at most ``sync_fs``, ``sequential`` when it is
-larger and positive, and ``temporally_invalid`` when it is more negative than ``-sync_fs``.
-Concerted events are grouped using the full group span (maximum time minus minimum time),
-not a pairwise single-linkage rule. Same-frame transfers are staged during the hydrogen loop
-and their net oxygen changes are applied together after the frame, so H-index order does not
-define the defect update.
+Temporal labels and candidate-window filtering use the difference between the child and
+parent first-opposite times. ``concerted`` means that its absolute value is at most
+``sync_fs``, ``sequential`` means that it is larger and positive, and ``temporally_invalid``
+means that it is more negative than ``-sync_fs``. Concerted events are first placed into
+first-opposite time buckets and then split into connected components by shared oxygen atoms;
+distant transfers that merely happen at the same time are therefore not one group. For a
+confirmed transfer, the ``nH_*`` fields are taken from the actual first-opposite frame rather
+than reconstructed again at confirmation. If several transfers occur in that frame, these
+fields represent the frame-level net oxygen count change.
 
 The optional lag histogram and null model are::
 
@@ -394,8 +396,9 @@ For example::
   causal_null 32 20260902
 
 The lag histogram is separated into excess and deficit carriers. ``causal_null`` applies
-independent circular random time shifts to the O/carrier incoming and outgoing event streams
-for each null realization;
+independent, uniformly sampled circular time shifts to the complete O/carrier incoming and
+outgoing event streams for each null realization, then rebuilds candidate pairs from the
+shifted streams rather than reusing real ``valid_relay`` links;
 the output reports real counts, null mean and standard deviation, :math:`g_{\rm causal}`,
 and its standard error. This is a descriptive causal-enrichment baseline, not a proof of a
 unique microscopic pathway.
@@ -412,8 +415,17 @@ attempt timing fields; milestone fields that were not reached are ``nan``.
 Each primary chain is one carrier branch. Its record includes the selected gap threshold,
 event/group counts, O endpoints, path length, net displacement, gap statistics, fractions of
 quantum-valid/two-well/strict bead events, alternative-link counts, and periodic winding data.
+The alternative-link counts and ``branched`` class in each chain are recomputed within that
+chain's selected gap threshold; the corresponding fields in individual ``causal_link`` rows
+remain all-search-range diagnostics.
 The chain class is ``open``, ``closed_local``, ``closed_winding``, ``branched``, or
 ``edge_rattling``. ``closed_local`` and ``closed_winding`` are assigned only when the oxygen
 endpoint closure and fractional-step residual satisfy the configured internal winding
 tolerance. These labels describe the reconstructed event network; they do not turn an RPMD
-trajectory into a rigorous quantum path or a transport coefficient.
+trajectory into a rigorous quantum path or a transport coefficient. In particular, a
+``valid_relay``, ``chain_class``, or :math:`g_{\rm causal}`` value is an observer-derived
+classification/statistical baseline, not by itself a formal physical conclusion about
+quantum tunneling, a tunneling rate, or the microscopic cause of a thermal-conductivity
+change. Such conclusions require independent checks such as bead-number and isotope
+convergence, comparison of the raw bead distributions, and a rate/free-energy method with
+an explicitly defined quantum observable.

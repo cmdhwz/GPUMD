@@ -746,6 +746,11 @@ private:
     double attempt_min_abs_delta = 0.0;
     double pending_start_time_fs = 0.0;
     bool first_opposite_seen = false;
+    bool first_opposite_counts_valid = false;
+    int first_opposite_nH_from_before = 0;
+    int first_opposite_nH_to_before = 0;
+    int first_opposite_nH_from_after = 0;
+    int first_opposite_nH_to_after = 0;
     bool commit_seen = false;
     double time_first_opposite_fs = 0.0;
     double time_commit_fs = 0.0;
