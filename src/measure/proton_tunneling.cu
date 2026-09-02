@@ -3660,6 +3660,7 @@ void Proton_Tunneling::build_causal_lag_histogram()
   if (!causal_chain_enabled_ || causal_lag_bin_edges_fs_.size() < 2)
     return;
 
+  using TimedEvent = std::pair<double, size_t>;
   const size_t number_of_bins = causal_lag_bin_edges_fs_.size() - 1;
   const auto first_opposite_time = [&](const AttemptRecord& record) {
     return std::isfinite(record.time_first_opposite_fs)
