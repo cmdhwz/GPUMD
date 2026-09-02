@@ -1778,8 +1778,9 @@ const char* Proton_Tunneling::quantum_character_name(const QuantumCharacter char
     return "multi_kink_or_multi_domain";
   case QuantumCharacter::AMBIGUOUS:
     return "ambiguous";
+  default:
+    return "unknown";
   }
-  return "ambiguous";
 }
 
 bool Proton_Tunneling::evaluate_bead_diagnostic(
@@ -2276,8 +2277,8 @@ void Proton_Tunneling::record_local_traces(const double time_fs)
     case QuantumCharacter::COMPACT_SINGLE_DOMAIN: return 3;
     case QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN: return 4;
     case QuantumCharacter::AMBIGUOUS: return 5;
+    default: return 5;
     }
-    return 5;
   };
   for (const auto& requested_edge : local_trace_edges_) {
     LocalTraceRecord record;
@@ -2483,8 +2484,9 @@ const char* Proton_Tunneling::outcome_name(const AttemptOutcome outcome) const
     return "geometry_lost";
   case AttemptOutcome::run_end:
     return "run_end";
+  default:
+    return "unknown";
   }
-  return "unknown";
 }
 
 void Proton_Tunneling::finish_attempt(
@@ -2986,8 +2988,8 @@ int Proton_Tunneling::chain_class_code(const ChainClass chain_class) const
   case ChainClass::closed_winding: return 2;
   case ChainClass::branched: return 3;
   case ChainClass::edge_rattling: return 4;
+  default: return 0;
   }
-  return 0;
 }
 
 const char* Proton_Tunneling::carrier_name(const CarrierType carrier) const
@@ -2996,8 +2998,8 @@ const char* Proton_Tunneling::carrier_name(const CarrierType carrier) const
   case CarrierType::excess: return "excess";
   case CarrierType::deficit: return "deficit";
   case CarrierType::edge_reversal: return "edge_reversal";
+  default: return "unknown";
   }
-  return "unknown";
 }
 
 const char* Proton_Tunneling::temporal_name(const TemporalType temporal) const
@@ -3006,8 +3008,8 @@ const char* Proton_Tunneling::temporal_name(const TemporalType temporal) const
   case TemporalType::sequential: return "sequential";
   case TemporalType::concerted: return "concerted";
   case TemporalType::temporally_invalid: return "temporally_invalid";
+  default: return "unknown";
   }
-  return "unknown";
 }
 
 const char* Proton_Tunneling::chain_class_name(const ChainClass chain_class) const
@@ -3018,8 +3020,8 @@ const char* Proton_Tunneling::chain_class_name(const ChainClass chain_class) con
   case ChainClass::closed_winding: return "closed_winding";
   case ChainClass::branched: return "branched";
   case ChainClass::edge_rattling: return "edge_rattling";
+  default: return "unknown";
   }
-  return "unknown";
 }
 
 void Proton_Tunneling::build_causal_network()
@@ -4678,7 +4680,7 @@ void Proton_Tunneling::write_text_output_files()
     for (const ChainRecord& chain : chain_records_)
       fprintf(chain_file_,
         "%lld %lld %s %s %.10e %.10e %.10e %d %d %d %d %.10e %.10e %.10e %.10e %.10e "
-        "%.10e %.10e %.10e %d %.10e %.10e %.10e %.10e %.10e %d %.10e %.10e %.10e %d %d %d "
+        "%.10e %.10e %.10e %d %.10e %.10e %.10e %d %d %d %.10e %.10e %.10e %d %d %d "
         "%.10e %d\n",
         chain.chain_id, chain.episode_id, carrier_name(chain.carrier_type),
         chain_class_name(chain.chain_class), chain.lag_threshold_fs, chain.start_time_fs,
@@ -5245,8 +5247,8 @@ void Proton_Tunneling::write_netcdf_output_file()
           case AttemptOutcome::return_to_state: return static_cast<unsigned char>(1);
           case AttemptOutcome::geometry_lost: return static_cast<unsigned char>(2);
           case AttemptOutcome::run_end: return static_cast<unsigned char>(3);
+          default: return static_cast<unsigned char>(3);
         }
-        return static_cast<unsigned char>(3);
       };
       attempt_outcomes.push_back(outcome_code(record.outcome));
       attempt_has_transfer.push_back(record.has_transfer ? 1 : 0);
@@ -5408,8 +5410,8 @@ void Proton_Tunneling::write_netcdf_output_file()
         case QuantumCharacter::COMPACT_SINGLE_DOMAIN: return static_cast<unsigned char>(3);
         case QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN: return static_cast<unsigned char>(4);
         case QuantumCharacter::AMBIGUOUS: return static_cast<unsigned char>(5);
+        default: return static_cast<unsigned char>(5);
       }
-      return static_cast<unsigned char>(5);
     };
     const auto append_bead = [&](const BeadDiagnostic& diagnostic) {
       const bool valid = diagnostic.valid;
@@ -5529,8 +5531,8 @@ void Proton_Tunneling::write_netcdf_output_file()
         case QuantumCharacter::COMPACT_SINGLE_DOMAIN: return static_cast<unsigned char>(3);
         case QuantumCharacter::MULTI_KINK_OR_MULTI_DOMAIN: return static_cast<unsigned char>(4);
         case QuantumCharacter::AMBIGUOUS: return static_cast<unsigned char>(5);
+        default: return static_cast<unsigned char>(255);
       }
-      return static_cast<unsigned char>(255);
     };
     for (const AttemptRecord& record : attempt_records_) {
       const LocalEnvironment* environments[5] = {
