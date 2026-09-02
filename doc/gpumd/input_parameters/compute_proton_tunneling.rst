@@ -14,7 +14,7 @@ Syntax
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [local_influence] [local_trace O_low O_high] [bead_diagnostic [f_min span_min [center_max centroid_max]]] [causal_chain search_max_fs sync_fs N thresholds...] [causal_lag_bins N edges...] [causal_null N_shifts seed] [output netcdf filename [deflate_level]] [output_level summary|events|full] [snapshots endpoints|best|all]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [local_influence] [local_trace O_low O_high] [bead_diagnostic [f_min span_min [center_max centroid_max]]] [causal_chain search_max_fs sync_fs N thresholds...] [causal_lag_bins N edges...] [causal_null N_shifts seed] [causal_mode raw|inline] [output netcdf filename [deflate_level]] [output_level summary|events|full] [snapshots endpoints|best|all]
 
 For example::
 
@@ -403,7 +403,25 @@ the output reports real counts, null mean and standard deviation, :math:`g_{\rm 
 and its standard error. This is a descriptive causal-enrichment baseline, not a proof of a
 unique microscopic pathway.
 
-With causal analysis enabled, NetCDF-4 format version 4 adds the relational groups
+``causal_mode raw`` is the default production mode. It records the raw ``/attempt``,
+``/transfer``, ``/defect``, ``/bead``, and ``/edge`` event streams together with all causal
+configuration attributes, but skips inline group, chain, and null reconstruction. This keeps
+long RPMD trajectories focused on event collection; use the offline analyzer
+``tools/proton_causal_analyze.py`` to change thresholds or null seeds without rerunning the
+trajectory. ``causal_mode inline`` retains the complete in-GPUMD reconstruction and is
+intended for short regression or debugging runs. If ``causal_mode`` is omitted, it is
+equivalent to ``raw``.
+
+For example, a production run can collect raw events without performing the expensive
+causal reconstruction during RPMD::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H causal_chain 200 2 5 10 20 50 100 200 causal_lag_bins 8 0 2 5 10 20 50 100 200 causal_null 128 20260902 causal_mode raw output netcdf proton_observer.nc 4 output_level events
+
+The resulting file can be analyzed after the run with::
+
+  python tools/proton_causal_analyze.py proton_observer.nc --output proton_causal.nc --search 200 --sync 2 --gaps 10,20,50,100,200 --lag-bins 0,2,5,10,20,50,100,200 --null-shifts 128 --seed 20260902
+
+With ``causal_mode inline``, NetCDF-4 format version 5 adds the relational groups
 ``/concerted_group``, ``/concerted_member``, ``/causal_link``, ``/chain``,
 ``/chain_event``, and ``/causal_lag_histogram``. The text output additionally writes
 ``proton_concerted_group.out``, ``proton_concerted_member.out``, ``proton_causal_link.out``,
@@ -429,3 +447,9 @@ quantum tunneling, a tunneling rate, or the microscopic cause of a thermal-condu
 change. Such conclusions require independent checks such as bead-number and isotope
 convergence, comparison of the raw bead distributions, and a rate/free-energy method with
 an explicitly defined quantum observable.
+
+In ``causal_mode raw``, the NetCDF global attribute ``causal_analysis_state`` is
+``raw_only``; in ``inline`` mode it is ``complete``. The global attributes
+``causal_search_max_fs``, ``causal_sync_fs``, ``causal_gap_thresholds_fs``,
+``causal_lag_bin_edges_fs``, ``causal_null_shifts``, and ``causal_null_seed`` preserve the
+analysis configuration in either mode.

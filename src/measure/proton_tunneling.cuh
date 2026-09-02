@@ -189,6 +189,12 @@ private:
     FULL
   };
 
+  enum class CausalMode
+  {
+    raw,
+    inline
+  };
+
   enum class SnapshotMode
   {
     ENDPOINTS,
@@ -944,6 +950,7 @@ private:
   bool reference_fractional_coordinates_valid_ = false;
 
   bool causal_chain_enabled_ = false;
+  CausalMode causal_mode_ = CausalMode::raw;
   double causal_search_max_fs_ = 200.0;
   double causal_sync_fs_ = 2.0;
   std::vector<double> causal_gap_thresholds_fs_;

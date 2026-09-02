@@ -760,7 +760,8 @@ void Proton_Tunneling::parse(
       std::strcmp(value, "snapshots") == 0 ||
       std::strcmp(value, "causal_chain") == 0 ||
       std::strcmp(value, "causal_lag_bins") == 0 ||
-      std::strcmp(value, "causal_null") == 0;
+      std::strcmp(value, "causal_null") == 0 ||
+      std::strcmp(value, "causal_mode") == 0;
   };
   if (next_param < num_param && !is_option(param[next_param])) {
     if (next_param + 1 >= num_param || is_option(param[next_param + 1])) {
@@ -779,6 +780,7 @@ void Proton_Tunneling::parse(
   bool causal_chain_seen = false;
   bool causal_lag_bins_seen = false;
   bool causal_null_seen = false;
+  bool causal_mode_seen = false;
   while (next_param < num_param) {
     if (std::strcmp(param[next_param], "oho_angle") == 0) {
       if (angle_seen || next_param + 1 >= num_param ||
@@ -1004,6 +1006,18 @@ void Proton_Tunneling::parse(
       causal_null_seed_ = static_cast<unsigned long long>(seed);
       causal_chain_enabled_ = true;
       next_param += 3;
+    } else if (std::strcmp(param[next_param], "causal_mode") == 0) {
+      if (causal_mode_seen || next_param + 1 >= num_param)
+        PRINT_INPUT_ERROR("causal_mode must be followed by raw or inline.");
+      causal_mode_seen = true;
+      if (std::strcmp(param[next_param + 1], "raw") == 0) {
+        causal_mode_ = CausalMode::raw;
+      } else if (std::strcmp(param[next_param + 1], "inline") == 0) {
+        causal_mode_ = CausalMode::inline;
+      } else {
+        PRINT_INPUT_ERROR("causal_mode should be raw or inline.");
+      }
+      next_param += 2;
     } else {
       PRINT_INPUT_ERROR("unknown optional compute_proton_tunneling setting.");
     }
@@ -1138,6 +1152,8 @@ void Proton_Tunneling::parse(
       causal_null_shifts_ = 32;
     printf("    causal network searches %.6f fs with %.6f fs concerted tolerance.\n",
       causal_search_max_fs_, causal_sync_fs_);
+    printf("    causal analysis mode is %s.\n",
+      causal_mode_ == CausalMode::raw ? "raw" : "inline");
     printf("    causal null baseline uses %d shifts and seed %llu.\n",
       causal_null_shifts_, causal_null_seed_);
   }
@@ -3070,6 +3086,8 @@ void Proton_Tunneling::build_causal_network()
   if (!causal_chain_enabled_)
     return;
 
+  const auto network_start = std::chrono::steady_clock::now();
+
   attempt_concerted_group_ids_.assign(attempt_records_.size(), -1);
   concerted_group_records_.clear();
   concerted_member_records_.clear();
@@ -3416,6 +3434,12 @@ void Proton_Tunneling::build_causal_network()
   long long next_chain_id = 1;
   const std::vector<double> chain_thresholds = causal_gap_thresholds_fs_.empty()
     ? std::vector<double>(1, causal_search_max_fs_) : causal_gap_thresholds_fs_;
+  std::map<long long, std::vector<size_t>> reversal_links_by_parent;
+  for (size_t i = 0; i < causal_link_records_.size(); ++i) {
+    const CausalLinkRecord& link = causal_link_records_[i];
+    if (link.carrier_type == CarrierType::edge_reversal)
+      reversal_links_by_parent[link.parent_attempt_index].push_back(i);
+  }
   for (const double lag_threshold_fs : chain_thresholds) {
     using LinkKey = std::pair<long long, int>;
     std::map<LinkKey, std::vector<size_t>> threshold_candidates;
@@ -3462,9 +3486,11 @@ void Proton_Tunneling::build_causal_network()
           incoming_count.end())
         roots.push_back(event_index);
     }
-    for (const size_t event_index : event_indices)
-      if (std::find(roots.begin(), roots.end(), event_index) == roots.end())
+    for (const size_t event_index : event_indices) {
+      if (incoming_count.find({static_cast<long long>(event_index), carrier_id}) !=
+          incoming_count.end())
         roots.push_back(event_index);
+    }
 
     for (const size_t root_event : roots) {
       if (used.find(static_cast<long long>(root_event)) != used.end())
@@ -3481,7 +3507,11 @@ void Proton_Tunneling::build_causal_network()
       }
       if (path.empty())
         continue;
-      std::set<size_t> path_events(path.begin(), path.end());
+      std::set<unsigned long long> path_edges;
+      for (const size_t event_index : path) {
+        const AttemptRecord& event = attempt_records_[event_index];
+        path_edges.insert(make_bond_key(event.oxygen_low, event.oxygen_high));
+      }
 
       ChainRecord chain;
       chain.chain_id = next_chain_id++;
@@ -3572,17 +3602,17 @@ void Proton_Tunneling::build_causal_network()
           edge_rattling = true;
       }
       if (!edge_rattling) {
-        for (const CausalLinkRecord& link : causal_link_records_) {
-          if (link.carrier_type != CarrierType::edge_reversal)
+        for (const size_t event_index : path) {
+          const auto reversal_item = reversal_links_by_parent.find(
+            static_cast<long long>(event_index));
+          if (reversal_item == reversal_links_by_parent.end())
             continue;
-          if (path_events.find(static_cast<size_t>(link.parent_attempt_index)) == path_events.end())
-            continue;
-          const AttemptRecord& child_event =
-            attempt_records_[static_cast<size_t>(link.child_attempt_index)];
-          for (const size_t event_index : path) {
-            const AttemptRecord& path_event = attempt_records_[event_index];
-            if (path_event.oxygen_low == child_event.oxygen_low &&
-                path_event.oxygen_high == child_event.oxygen_high) {
+          for (const size_t link_index : reversal_item->second) {
+            const CausalLinkRecord& link = causal_link_records_[link_index];
+            const AttemptRecord& child_event =
+              attempt_records_[static_cast<size_t>(link.child_attempt_index)];
+            if (path_edges.find(make_bond_key(child_event.oxygen_low, child_event.oxygen_high)) !=
+                path_edges.end()) {
               edge_rattling = true;
               break;
             }
@@ -3654,6 +3684,17 @@ void Proton_Tunneling::build_causal_network()
       chain_records_.push_back(chain);
     }
   }
+  long long valid_links = 0;
+  for (const CausalLinkRecord& link : causal_link_records_)
+    if (link.valid_relay)
+      ++valid_links;
+  const double network_seconds = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - network_start).count();
+  printf("Causal network:\n");
+  printf("    successful events = %zu\n", successful_events.size());
+  printf("    candidate links = %zu\n", causal_link_records_.size());
+  printf("    valid links = %lld\n", valid_links);
+  printf("    network wall time = %.6f s\n", network_seconds);
 }
 }
 
@@ -3662,6 +3703,8 @@ void Proton_Tunneling::build_causal_lag_histogram()
   causal_lag_histogram_records_.clear();
   if (!causal_chain_enabled_ || causal_lag_bin_edges_fs_.size() < 2)
     return;
+
+  const auto null_start = std::chrono::steady_clock::now();
 
   using TimedEvent = std::pair<double, size_t>;
   const size_t number_of_bins = causal_lag_bin_edges_fs_.size() - 1;
@@ -3694,9 +3737,11 @@ void Proton_Tunneling::build_causal_lag_histogram()
       ++real_counts[carrier][bin];
   }
 
-  std::vector<std::vector<std::vector<long long>>> null_counts(2,
-    std::vector<std::vector<long long>>(std::max(0, causal_null_shifts_),
-      std::vector<long long>(number_of_bins, 0)));
+  std::vector<std::vector<double>> null_mean(2,
+    std::vector<double>(number_of_bins, 0.0));
+  std::vector<std::vector<double>> null_M2(2,
+    std::vector<double>(number_of_bins, 0.0));
+  int completed_null_shifts = 0;
   if (causal_null_shifts_ > 0) {
     double global_min = std::numeric_limits<double>::max();
     double global_max = -std::numeric_limits<double>::max();
@@ -3743,45 +3788,69 @@ void Proton_Tunneling::build_causal_lag_histogram()
         return global_min + result;
       };
 
+      std::map<NullStreamKey, int> stream_ids;
+      std::vector<NullStreamKey> stream_keys;
+      std::vector<std::vector<size_t>> stream_event_indices;
+      for (const size_t event_index : successful_events) {
+        const AttemptRecord& event = attempt_records_[event_index];
+        for (int carrier = 0; carrier < 2; ++carrier) {
+          for (int role = 0; role < 2; ++role) {
+            const NullStreamKey key = {
+              carrier * 2 + role, event_position_oxygen(event, carrier, role == 0)};
+            const auto item = stream_ids.find(key);
+            int stream_id = -1;
+            if (item == stream_ids.end()) {
+              stream_id = static_cast<int>(stream_keys.size());
+              stream_ids[key] = stream_id;
+              stream_keys.push_back(key);
+              stream_event_indices.emplace_back();
+            } else {
+              stream_id = item->second;
+            }
+            stream_event_indices[stream_id].push_back(event_index);
+          }
+        }
+      }
+      std::vector<double> stream_shifts(stream_keys.size(), 0.0);
+      std::vector<NullStream> streams(stream_keys.size());
+      std::vector<std::vector<long long>> shift_counts(2,
+        std::vector<long long>(number_of_bins, 0));
+      const int progress_stride = std::max(1, causal_null_shifts_ / 8);
       for (int shift_index = 0; shift_index < causal_null_shifts_; ++shift_index) {
+        for (auto& counts : shift_counts)
+          std::fill(counts.begin(), counts.end(), 0);
         // Each carrier/oxygen/role stream gets one independent, uniform
         // circular shift. Candidate links are rebuilt from these complete
         // streams, so the null set is not preselected by real-time relays.
-        std::map<NullStreamKey, double> shifts;
-        std::map<NullStreamKey, NullStream> streams;
-        for (const size_t event_index : successful_events) {
-          const AttemptRecord& event = attempt_records_[event_index];
-          const double time = first_opposite_time(event);
-          for (int carrier = 0; carrier < 2; ++carrier) {
-            for (int role = 0; role < 2; ++role) {
-              const bool parent_role = role == 0;
-              const NullStreamKey key = {
-                carrier * 2 + role, event_position_oxygen(event, carrier, parent_role)};
-              if (shifts.find(key) == shifts.end())
-                shifts[key] = uniform_shift(random_engine);
-              streams[key].push_back({circular_time(time, shifts[key]), event_index});
-            }
-          }
-        }
-        for (auto& item : streams)
-          std::sort(item.second.begin(), item.second.end(),
+        for (size_t stream_id = 0; stream_id < stream_keys.size(); ++stream_id) {
+          stream_shifts[stream_id] = uniform_shift(random_engine);
+          NullStream& stream = streams[stream_id];
+          stream.clear();
+          stream.reserve(stream_event_indices[stream_id].size());
+          for (const size_t event_index : stream_event_indices[stream_id])
+            stream.push_back({circular_time(
+              first_opposite_time(attempt_records_[event_index]), stream_shifts[stream_id]),
+              event_index});
+          std::sort(stream.begin(), stream.end(),
             [](const TimedEvent& first, const TimedEvent& second) {
               if (first.first != second.first)
                 return first.first < second.first;
               return first.second < second.second;
             });
+        }
 
         for (int carrier = 0; carrier < 2; ++carrier) {
-          for (const auto& parent_stream_item : streams) {
-            if (parent_stream_item.first.first != carrier * 2)
+          for (size_t parent_stream_id = 0; parent_stream_id < stream_keys.size(); ++parent_stream_id) {
+            if (stream_keys[parent_stream_id].first != carrier * 2)
               continue;
-            const int oxygen = parent_stream_item.first.second;
+            const int oxygen = stream_keys[parent_stream_id].second;
             const NullStreamKey child_key = {carrier * 2 + 1, oxygen};
-            const auto child_stream_item = streams.find(child_key);
-            if (child_stream_item == streams.end())
+            const auto child_stream_item = stream_ids.find(child_key);
+            if (child_stream_item == stream_ids.end())
               continue;
-            const NullStream& children = child_stream_item->second;
-            for (const TimedEvent& parent_item : parent_stream_item.second) {
+            const NullStream& parents = streams[parent_stream_id];
+            const NullStream& children = streams[child_stream_item->second];
+            for (const TimedEvent& parent_item : parents) {
               const double upper_time = parent_item.first + causal_search_max_fs_;
               const auto child_begin = std::lower_bound(
                 children.begin(), children.end(), parent_item.first,
@@ -3801,11 +3870,25 @@ void Proton_Tunneling::build_causal_lag_histogram()
                   continue;
                 const int bin = bin_index(child_item->first - parent_item.first);
                 if (bin >= 0)
-                  ++null_counts[carrier][shift_index][bin];
+                  ++shift_counts[carrier][bin];
               }
             }
           }
         }
+        ++completed_null_shifts;
+        for (int carrier = 0; carrier < 2; ++carrier) {
+          for (size_t bin = 0; bin < number_of_bins; ++bin) {
+            const double count = static_cast<double>(shift_counts[carrier][bin]);
+            const double delta = count - null_mean[carrier][bin];
+            null_mean[carrier][bin] += delta / completed_null_shifts;
+            const double delta2 = count - null_mean[carrier][bin];
+            null_M2[carrier][bin] += delta * delta2;
+          }
+        }
+        if ((shift_index + 1) % progress_stride == 0 ||
+            shift_index + 1 == causal_null_shifts_)
+          printf("    Causal null: completed shifts = %d/%d\n",
+            shift_index + 1, causal_null_shifts_);
       }
     }
   }
@@ -3817,23 +3900,15 @@ void Proton_Tunneling::build_causal_lag_histogram()
       record.lag_bin_low_fs = causal_lag_bin_edges_fs_[bin];
       record.lag_bin_high_fs = causal_lag_bin_edges_fs_[bin + 1];
       record.real_count = real_counts[carrier][bin];
-      record.n_null_shifts = causal_null_shifts_;
-      if (causal_null_shifts_ > 0) {
-        double sum = 0.0;
-        for (int shift = 0; shift < causal_null_shifts_; ++shift)
-          sum += null_counts[carrier][shift][bin];
-        record.null_mean_count = sum / causal_null_shifts_;
-        double variance = 0.0;
-        for (int shift = 0; shift < causal_null_shifts_; ++shift) {
-          const double difference = null_counts[carrier][shift][bin] - record.null_mean_count;
-          variance += difference * difference;
-        }
-        record.null_std_count = std::sqrt(variance /
-          std::max(1, causal_null_shifts_ - 1));
+      record.n_null_shifts = completed_null_shifts;
+      if (completed_null_shifts > 0) {
+        record.null_mean_count = null_mean[carrier][bin];
+        record.null_std_count = std::sqrt(null_M2[carrier][bin] /
+          std::max(1, completed_null_shifts - 1));
         if (record.null_mean_count > 0.0) {
           record.g_causal = static_cast<double>(record.real_count) / record.null_mean_count;
           record.g_causal_standard_error = record.g_causal * record.null_std_count /
-            (std::sqrt(static_cast<double>(std::max(1, causal_null_shifts_))) *
+            (std::sqrt(static_cast<double>(completed_null_shifts)) *
              record.null_mean_count);
         } else {
           record.g_causal = std::numeric_limits<double>::quiet_NaN();
@@ -3848,6 +3923,11 @@ void Proton_Tunneling::build_causal_lag_histogram()
       causal_lag_histogram_records_.push_back(record);
     }
   }
+  const double null_seconds = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - null_start).count();
+  printf("Causal null:\n");
+  printf("    completed shifts = %d/%d\n", completed_null_shifts, causal_null_shifts_);
+  printf("    null wall time = %.6f s\n", null_seconds);
 }
 
 void Proton_Tunneling::process(
@@ -4263,7 +4343,7 @@ void Proton_Tunneling::write_text_output_files()
   }
   if (local_influence_enabled_)
     ion_influence_file_ = my_fopen("proton_ion_influence.out", "a");
-  if (causal_chain_enabled_) {
+  if (causal_chain_enabled_ && causal_mode_ == CausalMode::inline) {
     causal_link_file_ = my_fopen("proton_causal_link.out", "a");
     concerted_group_file_ = my_fopen("proton_concerted_group.out", "a");
     concerted_member_file_ = my_fopen("proton_concerted_member.out", "a");
@@ -4297,6 +4377,8 @@ void Proton_Tunneling::write_text_output_files()
     for (const double edge : causal_lag_bin_edges_fs_)
       fprintf(bias_file_, " %.10e", edge);
     fprintf(bias_file_, " causal_null %d %llu", causal_null_shifts_, causal_null_seed_);
+    fprintf(bias_file_, " causal_mode %s",
+      causal_mode_ == CausalMode::raw ? "raw" : "inline");
   }
   fprintf(bias_file_, "\n");
   fprintf(bias_file_,
@@ -4972,7 +5054,7 @@ void Proton_Tunneling::write_netcdf_output_file()
   netcdf_text_attribute(ncid, NC_GLOBAL, "program", "GPUMD");
   netcdf_text_attribute(ncid, NC_GLOBAL, "observer", "compute_proton_tunneling");
   netcdf_text_attribute(ncid, NC_GLOBAL, "format", "GPUMD proton observer NetCDF-4");
-  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "4");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "5");
   netcdf_text_attribute(ncid, NC_GLOBAL, "oxygen_symbol", oxygen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "hydrogen_symbol", hydrogen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "ion1_symbol", ion1_symbol_.c_str());
@@ -5003,6 +5085,10 @@ void Proton_Tunneling::write_netcdf_output_file()
   netcdf_text_attribute(ncid, NC_GLOBAL, "chain_class_enum",
     "0=open,1=closed_local,2=closed_winding,3=branched,4=edge_rattling");
   if (causal_chain_enabled_) {
+    netcdf_text_attribute(ncid, NC_GLOBAL, "causal_analysis_state",
+      causal_mode_ == CausalMode::raw ? "raw_only" : "complete");
+    netcdf_text_attribute(ncid, NC_GLOBAL, "causal_mode",
+      causal_mode_ == CausalMode::raw ? "raw" : "inline");
     char causal_search_text[64];
     char causal_sync_text[64];
     std::snprintf(causal_search_text, sizeof(causal_search_text), "%.17g", causal_search_max_fs_);
@@ -6534,8 +6620,10 @@ void Proton_Tunneling::postprocess(
   }
   if (window_sample_count_ > 0)
     write_window(last_time_fs_);
-  build_causal_network();
-  build_causal_lag_histogram();
+  if (causal_chain_enabled_ && causal_mode_ == CausalMode::inline) {
+    build_causal_network();
+    build_causal_lag_histogram();
+  }
   write_output_files();
   release_geometry_timing_events();
   printf("Proton tunneling observer timing:\n");
