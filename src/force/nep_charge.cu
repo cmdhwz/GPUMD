@@ -1645,6 +1645,7 @@ static __global__ void find_partial_force_angular(
   }
 }
 
+template <int ABC_STRIDE>
 static __global__ void find_partial_force_angular_pimd_batch(
   NEP_Charge::ParaMB paramb,
   NEP_Charge::ANN annmb,
@@ -1692,7 +1693,7 @@ static __global__ void find_partial_force_angular_pimd_batch(
     g_f12z_batch + static_cast<size_t>(bead) * N * paramb.MN_angular;
 
   float Fp[MAX_DIM_ANGULAR] = {0.0f};
-  float sum_fxyz[NUM_OF_ABC * MAX_NUM_N];
+  float sum_fxyz[ABC_STRIDE * MAX_NUM_N];
   for (int d = 0; d < paramb.dim_angular; ++d) {
     Fp[d] = g_Fp[(paramb.n_max_radial + 1 + d) * N + n1] +
             g_charge_derivative[(paramb.n_max_radial + 1 + d) * N + n1] *
@@ -1701,7 +1702,7 @@ static __global__ void find_partial_force_angular_pimd_batch(
   const int num_abc = (paramb.L_max + 1) * (paramb.L_max + 1) - 1;
   for (int n = 0; n < paramb.n_max_angular + 1; ++n) {
     for (int abc = 0; abc < num_abc; ++abc) {
-      sum_fxyz[n * NUM_OF_ABC + abc] =
+      sum_fxyz[n * ABC_STRIDE + abc] =
         g_sum_fxyz[(n * num_abc + abc) * N + n1];
     }
   }
@@ -1746,7 +1747,7 @@ static __global__ void find_partial_force_angular_pimd_batch(
         gn12 += fn12[k] * annmb.c[c_index];
         gnp12 += fnp12[k] * annmb.c[c_index];
       }
-      accumulate_f12(
+      accumulate_f12<ABC_STRIDE>(
         paramb.L_max,
         paramb.has_q_222,
         paramb.has_q_1111,
@@ -3562,24 +3563,45 @@ bool NEP_Charge::compute_pimd_batch(
       std::chrono::high_resolution_clock::now() - radial_begin).count();
   }
   const auto angular_begin = std::chrono::high_resolution_clock::now();
-  find_partial_force_angular_pimd_batch<<<angular_grid, block_size>>>(
-    paramb,
-    annmb,
-    N,
-    N1,
-    N2,
-    box,
-    batch.NN_angular.data(),
-    batch.NL_angular.data(),
-    type.data(),
-    batch.position_ptrs.data(),
-    batch.Fp.data(),
-    batch.charge_derivative.data(),
-    batch.D_real_ptrs.data(),
-    batch.sum_fxyz.data(),
-    batch.f12x.data(),
-    batch.f12y.data(),
-    batch.f12z.data());
+  if (paramb.L_max <= 4) {
+    find_partial_force_angular_pimd_batch<24><<<angular_grid, block_size>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      batch.NN_angular.data(),
+      batch.NL_angular.data(),
+      type.data(),
+      batch.position_ptrs.data(),
+      batch.Fp.data(),
+      batch.charge_derivative.data(),
+      batch.D_real_ptrs.data(),
+      batch.sum_fxyz.data(),
+      batch.f12x.data(),
+      batch.f12y.data(),
+      batch.f12z.data());
+  } else {
+    find_partial_force_angular_pimd_batch<NUM_OF_ABC><<<angular_grid, block_size>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      batch.NN_angular.data(),
+      batch.NL_angular.data(),
+      type.data(),
+      batch.position_ptrs.data(),
+      batch.Fp.data(),
+      batch.charge_derivative.data(),
+      batch.D_real_ptrs.data(),
+      batch.sum_fxyz.data(),
+      batch.f12x.data(),
+      batch.f12y.data(),
+      batch.f12z.data());
+  }
   GPU_CHECK_KERNEL
   if (profile) {
     CHECK(gpuDeviceSynchronize());
