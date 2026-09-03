@@ -921,8 +921,12 @@ static __global__ void find_descriptor_pimd_batch(
       q[n] += gn12;
     }
   }
-  for (int n = 0; n <= paramb.n_max_angular; ++n) {
-    float s[NUM_OF_ABC] = {0.0f};
+  const int num_angular_channels = paramb.n_max_angular + 1;
+  const int num_abc = (paramb.L_max + 1) * (paramb.L_max + 1) - 1;
+  for (int n = 0; n < num_angular_channels; n += 2) {
+    float s0[NUM_OF_ABC] = {0.0f};
+    float s1[NUM_OF_ABC] = {0.0f};
+    const bool has_second_channel = n + 1 < num_angular_channels;
     for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
       const int n2 = g_NL_angular[n1 + N * i1];
       float x12 = g_x[n2] - x1;
@@ -935,14 +939,24 @@ static __global__ void find_descriptor_pimd_batch(
       find_fc(paramb.rc_angular, paramb.rcinv_angular, d12, fc12);
       float fn12[MAX_NUM_N];
       find_fn(paramb.basis_size_angular, paramb.rcinv_angular, d12, fc12, fn12);
-      float gn12 = 0.0f;
+      float gn0 = 0.0f;
+      float gn1 = 0.0f;
       for (int k = 0; k <= paramb.basis_size_angular; ++k) {
         int c_index =
           (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
         c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-        gn12 += fn12[k] * annmb.c[c_index];
+        gn0 += fn12[k] * annmb.c[c_index];
+        if (has_second_channel) {
+          c_index =
+            ((n + 1) * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
+          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
+          gn1 += fn12[k] * annmb.c[c_index];
+        }
       }
-      accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s);
+      accumulate_s(paramb.L_max, d12, x12, y12, z12, gn0, s0);
+      if (has_second_channel) {
+        accumulate_s(paramb.L_max, d12, x12, y12, z12, gn1, s1);
+      }
     }
     find_q(
       paramb.L_max,
@@ -952,13 +966,29 @@ static __global__ void find_descriptor_pimd_batch(
       paramb.has_q_123,
       paramb.has_q_233,
       paramb.has_q_134,
-      paramb.n_max_angular + 1,
+      num_angular_channels,
       n,
-      s,
+      s0,
       q + (paramb.n_max_radial + 1));
-    const int num_abc = (paramb.L_max + 1) * (paramb.L_max + 1) - 1;
     for (int abc = 0; abc < num_abc; ++abc) {
-      g_sum_fxyz[(n * num_abc + abc) * N + n1] = s[abc];
+      g_sum_fxyz[(n * num_abc + abc) * N + n1] = s0[abc];
+    }
+    if (has_second_channel) {
+      find_q(
+        paramb.L_max,
+        paramb.has_q_222,
+        paramb.has_q_1111,
+        paramb.has_q_112,
+        paramb.has_q_123,
+        paramb.has_q_233,
+        paramb.has_q_134,
+        num_angular_channels,
+        n + 1,
+        s1,
+        q + (paramb.n_max_radial + 1));
+      for (int abc = 0; abc < num_abc; ++abc) {
+        g_sum_fxyz[((n + 1) * num_abc + abc) * N + n1] = s1[abc];
+      }
     }
   }
   for (int d = 0; d < annmb.dim; ++d) {
