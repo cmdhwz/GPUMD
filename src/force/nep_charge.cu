@@ -1679,7 +1679,9 @@ static __global__ void find_partial_force_angular_pimd_batch(
   const double x1 = g_x[n1];
   const double y1 = g_y[n1];
   const double z1 = g_z[n1];
-  for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
+  const int shard = blockIdx.z;
+  const int shards = gridDim.z;
+  for (int i1 = shard; i1 < g_NN_angular[n1]; i1 += shards) {
     const int index = i1 * N + n1;
     const int n2 = g_NL_angular[n1 + N * i1];
     float x12 = g_x[n2] - x1;
@@ -3327,6 +3329,8 @@ bool NEP_Charge::compute_pimd_batch(
   const int block_size = 64;
   const int grid_size = (N2 - N1 - 1) / block_size + 1;
   const dim3 grid(grid_size, number_of_beads);
+  constexpr int angular_force_shards = 4;
+  const dim3 angular_grid(grid_size, number_of_beads, angular_force_shards);
   const auto initialize_begin = std::chrono::high_resolution_clock::now();
   initialize_pimd_batch_properties<<<dim3((N - 1) / 128 + 1, number_of_beads), 128>>>(
     N,
@@ -3528,7 +3532,7 @@ bool NEP_Charge::compute_pimd_batch(
       std::chrono::high_resolution_clock::now() - radial_begin).count();
   }
   const auto angular_begin = std::chrono::high_resolution_clock::now();
-  find_partial_force_angular_pimd_batch<<<grid, block_size>>>(
+  find_partial_force_angular_pimd_batch<<<angular_grid, block_size>>>(
     paramb,
     annmb,
     N,

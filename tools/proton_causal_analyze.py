@@ -8,7 +8,6 @@ online, so the number of shifts does not multiply memory usage.
 
 from __future__ import annotations
 
-import argparse
 import bisect
 import math
 from collections import defaultdict
@@ -21,16 +20,28 @@ except ImportError as error:
     raise SystemExit("proton_causal_analyze.py requires numpy and netCDF4-python") from error
 
 
+# Edit only this block before running the analyzer.
+INPUT_NETCDF = Path("proton_observer.nc")
+OUTPUT_NETCDF = Path("proton_causal.nc")
+
+# Matches: causal_chain 200 2 4 10 20 50 100
+SEARCH_MAX_FS = 200.0
+SYNC_FS = 2.0
+GAP_THRESHOLDS_FS = [10.0, 20.0, 50.0, 100.0]
+
+# Offline histogram settings. These are not required in run.in.
+LAG_BIN_EDGES_FS = [0.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+
+# causal_null is absent from the supplied run.in, so keep the null analysis off.
+# Set this to e.g. 128 to enable the offline null baseline.
+NULL_SHIFTS = 0
+NULL_SEED = 20260902
+
+
 def text_attr(value, default=""):
     if value is None:
         return default
     return value.decode() if isinstance(value, bytes) else str(value)
-
-
-def float_list(value):
-    if value is None:
-        return []
-    return [float(item) for item in text_attr(value).replace(";", ",").split(",") if item.strip()]
 
 
 def fields(variable):
@@ -646,51 +657,40 @@ def write_output(path, source_path, source, events, groups, links, chains, chain
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path)
-    parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--search", type=float, default=None)
-    parser.add_argument("--sync", type=float, default=None)
-    parser.add_argument("--gaps", default=None, help="comma-separated chain gap thresholds in fs")
-    parser.add_argument("--lag-bins", default=None, help="comma-separated lag-bin edges in fs")
-    parser.add_argument("--null-shifts", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=None)
-    args = parser.parse_args()
-    output = args.output or args.input.with_name("proton_causal.nc")
-    with Dataset(str(args.input), "r") as source:
-        def source_attr(name, default):
-            return source.getncattr(name) if name in source.ncattrs() else default
+    search = float(SEARCH_MAX_FS)
+    sync = float(SYNC_FS)
+    gaps = [float(value) for value in GAP_THRESHOLDS_FS]
+    bins = sorted(set(float(value) for value in LAG_BIN_EDGES_FS))
+    null_shifts = max(0, int(NULL_SHIFTS))
+    seed = int(NULL_SEED)
+    if not gaps:
+        gaps = [search]
+    if not bins:
+        bins = [0.0, search]
+    if bins[-1] < search:
+        bins.append(search)
+    if (len(bins) < 2 or bins[0] < 0.0 or
+            any(right <= left for left, right in zip(bins, bins[1:]))):
+        raise ValueError("LAG_BIN_EDGES_FS must be strictly increasing and non-negative")
+    if search <= 0.0 or sync < 0.0 or sync > search:
+        raise ValueError("require SEARCH_MAX_FS > 0 and 0 <= SYNC_FS <= SEARCH_MAX_FS")
+    if any(value <= 0.0 or value > search for value in gaps):
+        raise ValueError("GAP_THRESHOLDS_FS must be in (0, SEARCH_MAX_FS]")
 
-        search = args.search if args.search is not None else float(source_attr("causal_search_max_fs", 200.0))
-        sync = args.sync if args.sync is not None else float(source_attr("causal_sync_fs", 2.0))
-        gaps = float_list(args.gaps) if args.gaps is not None else float_list(
-            source_attr("causal_gap_thresholds_fs", ""))
-        bins = float_list(args.lag_bins) if args.lag_bins is not None else float_list(
-            source_attr("causal_lag_bin_edges_fs", ""))
-        null_shifts = args.null_shifts if args.null_shifts is not None else int(
-            source_attr("causal_null_shifts", 0))
-        seed = args.seed if args.seed is not None else int(source_attr("causal_null_seed", 1))
-        if not gaps:
-            gaps = [search]
-        if not bins:
-            bins = [0.0, search]
-        bins = sorted(set(bins))
-        if bins[-1] < search:
-            bins.append(search)
-        if (len(bins) < 2 or bins[0] < 0.0 or
-                any(right <= left for left, right in zip(bins, bins[1:]))):
-            raise ValueError("lag-bin edges must be strictly increasing and non-negative")
-        if search <= 0.0 or sync < 0.0 or sync > search:
-            raise ValueError("require search > 0 and 0 <= sync <= search")
+    with Dataset(str(INPUT_NETCDF), "r") as source:
+        print(f"input: {INPUT_NETCDF}", flush=True)
+        print(f"output: {OUTPUT_NETCDF}", flush=True)
+        print(f"causal settings: search={search:g} fs, sync={sync:g} fs, "
+              f"gaps={gaps}, null_shifts={null_shifts}", flush=True)
         events = read_events(source)
         print(f"raw events with transfers = {len(events)}", flush=True)
         groups, event_groups = concerted_groups(events, sync)
         links, _ = build_links(events, search, sync, event_groups)
         chains, chain_events = build_chains(events, links, groups, event_groups, gaps, sync)
-        histogram = lag_histogram(events, links, bins, search, max(0, null_shifts), seed)
-        write_output(output, args.input, source, events, groups, links, chains, chain_events,
-                     histogram, search, sync, gaps, bins, max(0, null_shifts), seed)
-        print(f"wrote {output}: {len(groups)} groups, {len(links)} links, "
+        histogram = lag_histogram(events, links, bins, search, null_shifts, seed)
+        write_output(OUTPUT_NETCDF, INPUT_NETCDF, source, events, groups, links, chains, chain_events,
+                     histogram, search, sync, gaps, bins, null_shifts, seed)
+        print(f"wrote {OUTPUT_NETCDF}: {len(groups)} groups, {len(links)} links, "
               f"{len(chains)} chains", flush=True)
 
 
