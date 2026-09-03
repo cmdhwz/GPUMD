@@ -255,7 +255,8 @@ private:
     success,
     return_to_state,
     geometry_lost,
-    run_end
+    run_end,
+    observation_gap
   };
 
   enum class CarrierType
@@ -294,6 +295,11 @@ private:
     double stabilization_delay_fs = 0.0;
     double confirmation_delay_fs = 0.0;
     double attempt_duration_fs = 0.0;
+    long long n_probe_frames = 0;
+    long long n_channel_good_frames = 0;
+    long long n_two_domain_frames = 0;
+    long long n_barrier_centered_frames = 0;
+    bool has_observation_gap = false;
     long long observer_frame = -1;
     int hydrogen = -1;
     int oxygen_low = -1;
@@ -474,6 +480,14 @@ private:
     long long successes = 0;
     long long returns = 0;
     long long geometry_lost = 0;
+    long long run_end = 0;
+    long long observation_gaps = 0;
+    double t_core_minus_fs = 0.0;
+    double t_core_plus_fs = 0.0;
+    double t_core_center_fs = 0.0;
+    double t_state_minus_fs = 0.0;
+    double t_state_plus_fs = 0.0;
+    double observation_gap_fs = 0.0;
     double success_probability = 0.0;
     double mean_delta = 0.0;
     double mean_abs_delta = 0.0;
@@ -551,6 +565,14 @@ private:
     long long successes = 0;
     long long returns = 0;
     long long geometry_lost = 0;
+    long long run_end = 0;
+    long long observation_gaps = 0;
+    double t_core_minus_fs = 0.0;
+    double t_core_plus_fs = 0.0;
+    double t_core_center_fs = 0.0;
+    double t_state_minus_fs = 0.0;
+    double t_state_plus_fs = 0.0;
+    double observation_gap_fs = 0.0;
     double sum_abs_delta = 0.0;
     double sum_delta = 0.0;
     double sum_delta_square = 0.0;
@@ -761,8 +783,20 @@ private:
     double time_first_opposite_fs = 0.0;
     double time_commit_fs = 0.0;
     double center_residence_fs = 0.0;
+    long long n_probe_frames = 0;
+    long long n_channel_good_frames = 0;
+    long long n_two_domain_frames = 0;
+    long long n_barrier_centered_frames = 0;
+    bool has_observation_gap = false;
     double attempt_last_time_fs = 0.0;
     int attempt_last_state = 0;
+    double last_observation_time_fs = 0.0;
+    int last_observed_state = 0;
+    bool observation_continuous = false;
+    bool observation_gap_active = false;
+    double observation_gap_last_time_fs = 0.0;
+    int observation_gap_oxygen_low = -1;
+    int observation_gap_oxygen_high = -1;
     LocalEnvironment last_environment;
     LocalEnvironment attempt_environment_start;
     BeadDiagnostic centroid_best;
@@ -799,6 +833,20 @@ private:
     std::unordered_map<unsigned long long, BondStats>& bond_stats,
     const GeometryResult& geometry,
     const int state);
+  void record_bond_time(
+    std::unordered_map<unsigned long long, BondStats>& bond_stats,
+    const unsigned long long key,
+    const int core_state,
+    const int stable_state,
+    const double duration_fs);
+  void record_observation_gap(
+    const unsigned long long key,
+    const double duration_fs);
+  void start_observation_gap(const unsigned long long key);
+  void update_observation_gap(HydrogenState& hydrogen_state, const double time_fs);
+  void begin_observation_gap(HydrogenState& hydrogen_state);
+  void close_observation_gap(HydrogenState& hydrogen_state, const double time_fs);
+  void reset_after_observation_gap(HydrogenState& hydrogen_state);
   void start_attempt(
     HydrogenState& hydrogen_state,
     const int stable_state,
@@ -822,6 +870,7 @@ private:
   const char* temporal_name(const TemporalType temporal) const;
   const char* chain_class_name(const ChainClass chain_class) const;
   const char* outcome_name(const AttemptOutcome outcome) const;
+  const char* ensemble_name() const;
   void observe_frame(const double time_fs, const Box& box, Atom& atom);
   void write_window(const double time_fs);
   void write_edge_window(const double time_start_fs, const double time_end_fs);
@@ -847,6 +896,8 @@ private:
   int hold_samples_ = 2;
   int window_sample_count_ = 0;
   int number_of_atoms_ = 0;
+  int number_of_beads_ = 0;
+  int ensemble_type_ = 0;
   long long window_id_ = 0;
   long long next_attempt_id_ = 1;
   long long window_flip_count_ = 0;

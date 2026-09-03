@@ -1177,6 +1177,8 @@ void Proton_Tunneling::preprocess(
   }
 
   number_of_atoms_ = atom.number_of_atoms;
+  number_of_beads_ = atom.number_of_beads;
+  ensemble_type_ = integrate.type;
   time_step_ = time_step;
   cpu_position_.resize(number_of_atoms_ * 3);
   bead_positions_cached_ = false;
@@ -2215,6 +2217,100 @@ void Proton_Tunneling::record_bond(
     ++stats.n_deadband;
 }
 
+void Proton_Tunneling::record_bond_time(
+  std::unordered_map<unsigned long long, BondStats>& bond_stats,
+  const unsigned long long key,
+  const int core_state,
+  const int stable_state,
+  const double duration_fs)
+{
+  if (duration_fs <= 0.0)
+    return;
+  BondStats& stats = bond_stats[key];
+  if (core_state < 0)
+    stats.t_core_minus_fs += duration_fs;
+  else if (core_state > 0)
+    stats.t_core_plus_fs += duration_fs;
+  else
+    stats.t_core_center_fs += duration_fs;
+  if (stable_state < 0)
+    stats.t_state_minus_fs += duration_fs;
+  else if (stable_state > 0)
+    stats.t_state_plus_fs += duration_fs;
+}
+
+void Proton_Tunneling::record_observation_gap(
+  const unsigned long long key,
+  const double duration_fs)
+{
+  if (duration_fs <= 0.0)
+    return;
+  window_bonds_[key].observation_gap_fs += duration_fs;
+  total_bonds_[key].observation_gap_fs += duration_fs;
+}
+
+void Proton_Tunneling::start_observation_gap(const unsigned long long key)
+{
+  ++window_bonds_[key].observation_gaps;
+  ++total_bonds_[key].observation_gaps;
+}
+
+void Proton_Tunneling::update_observation_gap(
+  HydrogenState& hydrogen_state,
+  const double time_fs)
+{
+  if (!hydrogen_state.observation_gap_active)
+    return;
+  const unsigned long long key = make_bond_key(
+    hydrogen_state.observation_gap_oxygen_low,
+    hydrogen_state.observation_gap_oxygen_high);
+  record_observation_gap(
+    key, std::max(0.0, time_fs - hydrogen_state.observation_gap_last_time_fs));
+  hydrogen_state.observation_gap_last_time_fs = time_fs;
+}
+
+void Proton_Tunneling::begin_observation_gap(HydrogenState& hydrogen_state)
+{
+  if (!hydrogen_state.observation_continuous ||
+      hydrogen_state.observation_gap_active ||
+      hydrogen_state.oxygen_low < 0 || hydrogen_state.oxygen_high < 0)
+    return;
+  hydrogen_state.observation_gap_active = true;
+  hydrogen_state.observation_gap_last_time_fs = hydrogen_state.last_observation_time_fs;
+  hydrogen_state.observation_gap_oxygen_low = hydrogen_state.oxygen_low;
+  hydrogen_state.observation_gap_oxygen_high = hydrogen_state.oxygen_high;
+  start_observation_gap(make_bond_key(
+    hydrogen_state.observation_gap_oxygen_low,
+    hydrogen_state.observation_gap_oxygen_high));
+  hydrogen_state.observation_continuous = false;
+}
+
+void Proton_Tunneling::close_observation_gap(
+  HydrogenState& hydrogen_state,
+  const double time_fs)
+{
+  if (!hydrogen_state.observation_gap_active)
+    return;
+  update_observation_gap(hydrogen_state, time_fs);
+  hydrogen_state.observation_gap_active = false;
+  hydrogen_state.observation_gap_last_time_fs = 0.0;
+  hydrogen_state.observation_gap_oxygen_low = -1;
+  hydrogen_state.observation_gap_oxygen_high = -1;
+}
+
+void Proton_Tunneling::reset_after_observation_gap(HydrogenState& hydrogen_state)
+{
+  const bool gap_active = hydrogen_state.observation_gap_active;
+  const double gap_last_time_fs = hydrogen_state.observation_gap_last_time_fs;
+  const int gap_oxygen_low = hydrogen_state.observation_gap_oxygen_low;
+  const int gap_oxygen_high = hydrogen_state.observation_gap_oxygen_high;
+  hydrogen_state = HydrogenState();
+  hydrogen_state.observation_gap_active = gap_active;
+  hydrogen_state.observation_gap_last_time_fs = gap_last_time_fs;
+  hydrogen_state.observation_gap_oxygen_low = gap_oxygen_low;
+  hydrogen_state.observation_gap_oxygen_high = gap_oxygen_high;
+}
+
 void Proton_Tunneling::record_local_environment(
   const GeometryResult& geometry,
   const LocalEnvironment& environment)
@@ -2492,6 +2588,11 @@ void Proton_Tunneling::start_attempt(
   hydrogen_state.time_first_opposite_fs = 0.0;
   hydrogen_state.time_commit_fs = 0.0;
   hydrogen_state.center_residence_fs = 0.0;
+  hydrogen_state.n_probe_frames = 0;
+  hydrogen_state.n_channel_good_frames = 0;
+  hydrogen_state.n_two_domain_frames = 0;
+  hydrogen_state.n_barrier_centered_frames = 0;
+  hydrogen_state.has_observation_gap = false;
   hydrogen_state.attempt_last_time_fs = time_fs;
   hydrogen_state.attempt_last_state = classify_delta(geometry.delta);
   hydrogen_state.centroid_best = BeadDiagnostic();
@@ -2509,8 +2610,24 @@ const char* Proton_Tunneling::outcome_name(const AttemptOutcome outcome) const
     return "geometry_lost";
   case AttemptOutcome::run_end:
     return "run_end";
+  case AttemptOutcome::observation_gap:
+    return "observation_gap";
   default:
     return "unknown";
+  }
+}
+
+const char* Proton_Tunneling::ensemble_name() const
+{
+  switch (ensemble_type_) {
+  case 31:
+    return "rpmd";
+  case 32:
+    return "trpmd";
+  case 33:
+    return "pimd";
+  default:
+    return "classical_or_other";
   }
 }
 
@@ -2579,6 +2696,9 @@ void Proton_Tunneling::finish_attempt(
   } else if (outcome == AttemptOutcome::geometry_lost) {
     ++total_stats.geometry_lost;
     ++window_stats.geometry_lost;
+  } else if (outcome == AttemptOutcome::run_end) {
+    ++total_stats.run_end;
+    ++window_stats.run_end;
   }
   if (ion_field_enabled_ && outcome == AttemptOutcome::success) {
     total_stats.sum_E_success += E_end;
@@ -2621,6 +2741,11 @@ void Proton_Tunneling::finish_attempt(
   // milestone-dependent quantities above are NaN when that milestone was not
   // reached.
   record.attempt_duration_fs = time_fs - hydrogen_state.attempt_start_time_fs;
+  record.n_probe_frames = hydrogen_state.n_probe_frames;
+  record.n_channel_good_frames = hydrogen_state.n_channel_good_frames;
+  record.n_two_domain_frames = hydrogen_state.n_two_domain_frames;
+  record.n_barrier_centered_frames = hydrogen_state.n_barrier_centered_frames;
+  record.has_observation_gap = hydrogen_state.has_observation_gap;
   record.observer_frame = observer_frame_count_;
   record.hydrogen = hydrogen;
   record.oxygen_low = oxygen_low;
@@ -2741,6 +2866,11 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.time_first_opposite_fs = 0.0;
   hydrogen_state.time_commit_fs = 0.0;
   hydrogen_state.center_residence_fs = 0.0;
+  hydrogen_state.n_probe_frames = 0;
+  hydrogen_state.n_channel_good_frames = 0;
+  hydrogen_state.n_two_domain_frames = 0;
+  hydrogen_state.n_barrier_centered_frames = 0;
+  hydrogen_state.has_observation_gap = false;
   hydrogen_state.attempt_last_time_fs = 0.0;
   hydrogen_state.attempt_last_state = 0;
   hydrogen_state.centroid_best = BeadDiagnostic();
@@ -2753,6 +2883,8 @@ void Proton_Tunneling::observe_frame(
   Atom& atom)
 {
   const auto observer_start = std::chrono::high_resolution_clock::now();
+  if (window_sample_count_ >= window_samples_)
+    write_window(last_time_fs_);
   ++observer_frame_count_;
   bead_positions_cached_ = false;
   cached_number_of_beads_ = 0;
@@ -2812,6 +2944,15 @@ void Proton_Tunneling::observe_frame(
       atom, box, hydrogen, geometry, time_fs, diagnostic);
     if (!evaluated)
       return;
+    ++hydrogen_state.n_probe_frames;
+    const bool all_bead_channels_valid =
+      diagnostic.channel_valid_count == diagnostic.num_beads;
+    if (all_bead_channels_valid)
+      ++hydrogen_state.n_channel_good_frames;
+    if (all_bead_channels_valid && diagnostic.simple_two_domain_path != 0)
+      ++hydrogen_state.n_two_domain_frames;
+    if (all_bead_channels_valid && diagnostic.barrier_centered != 0)
+      ++hydrogen_state.n_barrier_centered_frames;
     diagnostic.environment = environment;
     if (!hydrogen_state.centroid_best.valid ||
         std::abs(diagnostic.delta_centroid) <
@@ -2837,12 +2978,26 @@ void Proton_Tunneling::observe_frame(
         ++window_assignment_ambiguous_count_;
         if (geometry.pair_conflict)
           ++window_pair_conflict_count_;
+        begin_observation_gap(hydrogen_state);
+        update_observation_gap(hydrogen_state, time_fs);
+        if (hydrogen_state.attempt_active) {
+          hydrogen_state.has_observation_gap = true;
+          finish_attempt(
+            hydrogen,
+            hydrogen_state,
+            AttemptOutcome::observation_gap,
+            time_fs,
+            hydrogen_state.last_delta,
+            nullptr,
+            nullptr);
+        }
+        reset_after_observation_gap(hydrogen_state);
         continue;
       }
+      begin_observation_gap(hydrogen_state);
+      update_observation_gap(hydrogen_state, time_fs);
       if (hydrogen_state.attempt_active) {
-        const double dt = std::max(0.0, time_fs - hydrogen_state.attempt_last_time_fs);
-        if (hydrogen_state.attempt_last_state == 0)
-          hydrogen_state.center_residence_fs += dt;
+        hydrogen_state.has_observation_gap = true;
         finish_attempt(
           hydrogen,
           hydrogen_state,
@@ -2852,34 +3007,52 @@ void Proton_Tunneling::observe_frame(
            nullptr,
            nullptr);
       }
-      hydrogen_state = HydrogenState();
+      reset_after_observation_gap(hydrogen_state);
       continue;
     }
 
     ++window_valid_pair_count_;
     const int state = classify_delta(geometry.delta);
 
-    if (hydrogen_state.attempt_active) {
-      const double dt = std::max(0.0, time_fs - hydrogen_state.attempt_last_time_fs);
-      if (hydrogen_state.attempt_last_state == 0)
-        hydrogen_state.center_residence_fs += dt;
-      hydrogen_state.attempt_last_time_fs = time_fs;
-      hydrogen_state.attempt_last_state = state;
+    close_observation_gap(hydrogen_state, time_fs);
+    const bool same_edge = hydrogen_state.oxygen_low == geometry.oxygen_low &&
+      hydrogen_state.oxygen_high == geometry.oxygen_high;
+    if (hydrogen_state.observation_continuous && same_edge) {
+      const double dt = std::max(0.0, time_fs - hydrogen_state.last_observation_time_fs);
+      const unsigned long long key = make_bond_key(
+        hydrogen_state.oxygen_low, hydrogen_state.oxygen_high);
+      record_bond_time(
+        window_bonds_, key, hydrogen_state.last_observed_state,
+        hydrogen_state.stable_state, dt);
+      record_bond_time(
+        total_bonds_, key, hydrogen_state.last_observed_state,
+        hydrogen_state.stable_state, dt);
+      if (hydrogen_state.attempt_active) {
+        if (hydrogen_state.attempt_last_state == 0)
+          hydrogen_state.center_residence_fs += dt;
+        hydrogen_state.attempt_last_time_fs = time_fs;
+        hydrogen_state.attempt_last_state = state;
+      }
     }
 
-    if (hydrogen_state.oxygen_low != geometry.oxygen_low ||
-        hydrogen_state.oxygen_high != geometry.oxygen_high) {
+    if (hydrogen_state.observation_continuous && !same_edge) {
+      begin_observation_gap(hydrogen_state);
       if (hydrogen_state.attempt_active) {
+        hydrogen_state.has_observation_gap = true;
         finish_attempt(
           hydrogen,
           hydrogen_state,
-           AttemptOutcome::geometry_lost,
+           AttemptOutcome::observation_gap,
            time_fs,
            hydrogen_state.last_delta,
            nullptr,
            nullptr);
       }
-      hydrogen_state = HydrogenState();
+      close_observation_gap(hydrogen_state, time_fs);
+      reset_after_observation_gap(hydrogen_state);
+    }
+    if (hydrogen_state.oxygen_low != geometry.oxygen_low ||
+        hydrogen_state.oxygen_high != geometry.oxygen_high) {
       hydrogen_state.oxygen_low = geometry.oxygen_low;
       hydrogen_state.oxygen_high = geometry.oxygen_high;
     }
@@ -2991,6 +3164,9 @@ void Proton_Tunneling::observe_frame(
     hydrogen_state.last_nearest_ion_id = geometry.nearest_ion_id;
     hydrogen_state.last_nearest_ion_distance = geometry.nearest_ion_distance;
     hydrogen_state.last_environment = local_environment;
+    hydrogen_state.last_observation_time_fs = time_fs;
+    hydrogen_state.last_observed_state = state;
+    hydrogen_state.observation_continuous = true;
   }
 
   record_local_traces(time_fs);
@@ -3017,8 +3193,6 @@ void Proton_Tunneling::observe_frame(
 
   ++window_sample_count_;
   last_time_fs_ = time_fs;
-  if (window_sample_count_ == window_samples_)
-    write_window(time_fs);
   const auto observer_end = std::chrono::high_resolution_clock::now();
   state_machine_wall_time_ +=
     std::chrono::duration<double>(observer_end - state_machine_start).count();
@@ -4196,6 +4370,14 @@ void Proton_Tunneling::write_edge_window(
     record.successes = stats.successes;
     record.returns = stats.returns;
     record.geometry_lost = stats.geometry_lost;
+    record.run_end = stats.run_end;
+    record.observation_gaps = stats.observation_gaps;
+    record.t_core_minus_fs = stats.t_core_minus_fs;
+    record.t_core_plus_fs = stats.t_core_plus_fs;
+    record.t_core_center_fs = stats.t_core_center_fs;
+    record.t_state_minus_fs = stats.t_state_minus_fs;
+    record.t_state_plus_fs = stats.t_state_plus_fs;
+    record.observation_gap_fs = stats.observation_gap_fs;
     record.success_probability = success_probability;
     record.mean_delta = mean_delta;
     record.mean_abs_delta = mean_abs_delta;
@@ -4238,16 +4420,29 @@ void Proton_Tunneling::write_final_bonds()
       : std::numeric_limits<double>::quiet_NaN();
     fprintf(
       bond_file_,
-      "%d %d %lld %lld %lld %lld %.10e %.10e %.10e\n",
+      "%d %d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld "
+      "%.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n",
       oxygen_low,
       oxygen_high,
       stats.geometry_samples,
       stats.n_plus,
       stats.n_minus,
       stats.transitions,
+      stats.attempts,
+      stats.successes,
+      stats.returns,
+      stats.geometry_lost,
+      stats.run_end,
+      stats.observation_gaps,
       asymmetry,
       std::abs(asymmetry),
-      mean_abs_delta);
+      mean_abs_delta,
+      stats.t_core_minus_fs,
+      stats.t_core_plus_fs,
+      stats.t_core_center_fs,
+      stats.t_state_minus_fs,
+      stats.t_state_plus_fs,
+      stats.observation_gap_fs);
   }
 }
 
@@ -4380,7 +4575,15 @@ void Proton_Tunneling::write_text_output_files()
     fprintf(bias_file_, " causal_mode %s",
       causal_mode_ == CausalMode::RAW ? "raw" : "inline");
   }
-  fprintf(bias_file_, "\n");
+  fprintf(
+    bias_file_,
+    " ensemble %s number_of_beads %d time_step_fs %.10e sample_interval_fs %.10e "
+    "state_definition_version stable_state_v1_core_left_endpoint_v1 "
+    "bead_summary_definition all_bead_channels_valid\n",
+    ensemble_name(),
+    number_of_beads_,
+    time_step_ * TIME_UNIT_CONVERSION,
+    time_step_ * sample_interval_ * TIME_UNIT_CONVERSION);
   fprintf(bias_file_,
     "# columns time_fs B_mean F_A_gt_0.2 F_A_gt_0.4 mean_abs_DeltaF_over_kBT "
     "flip_rate_per_ps active_bonds positive_defects negative_defects valid_pairs_per_frame "
@@ -4403,7 +4606,8 @@ void Proton_Tunneling::write_text_output_files()
   fprintf(attempt_file_,
     " time_first_opposite_fs time_commit_fs time_confirm_fs center_residence_fs "
     "crossing_duration_fs stabilization_delay_fs confirmation_delay_fs attempt_duration_fs "
-    "observer_frame\n");
+    "n_probe_frames n_channel_good_frames n_two_domain_frames n_barrier_centered_frames "
+    "has_observation_gap observer_frame\n");
   if (bead_diagnostic_enabled_) {
     fprintf(bead_event_file_,
       "# columns attempt_id selection_kind probe_time_fs H_id O_low O_high outcome num_beads "
@@ -4418,6 +4622,8 @@ void Proton_Tunneling::write_text_output_files()
   fprintf(edge_window_file_,
     "# columns window_id time_start_fs time_end_fs O_low O_high geometry_occupancy "
     "n_plus n_minus n_deadband A abs_A DeltaF_over_kBT attempts successes returns geometry_lost "
+    "run_end observation_gaps t_core_minus_fs t_core_plus_fs t_core_center_fs "
+    "t_state_minus_fs t_state_plus_fs observation_gap_fs "
     "success_probability mean_delta mean_abs_delta mean_dOO mean_rperp "
     "mean_E_parallel std_E_parallel corr_delta_E_parallel mean_E_success mean_E_return ");
   if (ion_field_enabled_)
@@ -4441,7 +4647,9 @@ void Proton_Tunneling::write_text_output_files()
       "mean_ion2_to_O_low mean_ion2_to_O_high mean_delta_d_ion2\n");
   fprintf(bond_file_,
     "# columns O_pair_low O_pair_high geometry_samples n_plus n_minus transitions "
-    "A abs_A mean_abs_delta\n");
+    "attempts successes returns geometry_lost run_end observation_gaps "
+    "A abs_A mean_abs_delta t_core_minus_fs t_core_plus_fs t_core_center_fs "
+    "t_state_minus_fs t_state_plus_fs observation_gap_fs\n");
   if (local_environment_enabled_) {
     fprintf(
       local_environment_window_file_,
@@ -4545,7 +4753,8 @@ void Proton_Tunneling::write_text_output_files()
       record.delta_d_ion2_start);
     fprintf(
       attempt_file_,
-      " %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %lld\n",
+      " %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e "
+      "%lld %lld %lld %lld %d %lld\n",
       record.time_first_opposite_fs,
       record.time_commit_fs,
       record.time_confirm_fs,
@@ -4554,6 +4763,11 @@ void Proton_Tunneling::write_text_output_files()
       record.stabilization_delay_fs,
       record.confirmation_delay_fs,
       record.attempt_duration_fs,
+      record.n_probe_frames,
+      record.n_channel_good_frames,
+      record.n_two_domain_frames,
+      record.n_barrier_centered_frames,
+      record.has_observation_gap ? 1 : 0,
       record.observer_frame);
 
     if (bead_event_file_ != nullptr) {
@@ -4686,7 +4900,8 @@ void Proton_Tunneling::write_text_output_files()
     fprintf(
       edge_window_file_,
       "%lld %.10e %.10e %d %d %.10e %lld %lld %lld %.10e %.10e %.10e "
-      "%lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e "
+      "%lld %lld %lld %lld %lld %lld %.10e %.10e %.10e %.10e %.10e %.10e "
+      "%.10e %.10e %.10e %.10e %.10e "
       "%.10e %.10e %.10e %.10e %.10e %.10e %.10e "
       "%.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e\n",
       record.window_id,
@@ -4705,6 +4920,14 @@ void Proton_Tunneling::write_text_output_files()
       record.successes,
       record.returns,
       record.geometry_lost,
+      record.run_end,
+      record.observation_gaps,
+      record.t_core_minus_fs,
+      record.t_core_plus_fs,
+      record.t_core_center_fs,
+      record.t_state_minus_fs,
+      record.t_state_plus_fs,
+      record.observation_gap_fs,
       record.success_probability,
       record.mean_delta,
       record.mean_abs_delta,
@@ -5054,7 +5277,7 @@ void Proton_Tunneling::write_netcdf_output_file()
   netcdf_text_attribute(ncid, NC_GLOBAL, "program", "GPUMD");
   netcdf_text_attribute(ncid, NC_GLOBAL, "observer", "compute_proton_tunneling");
   netcdf_text_attribute(ncid, NC_GLOBAL, "format", "GPUMD proton observer NetCDF-4");
-  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "5");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "7");
   netcdf_text_attribute(ncid, NC_GLOBAL, "oxygen_symbol", oxygen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "hydrogen_symbol", hydrogen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "ion1_symbol", ion1_symbol_.c_str());
@@ -5067,7 +5290,9 @@ void Proton_Tunneling::write_netcdf_output_file()
     (snapshot_mode_ == SnapshotMode::BEST ? "best" : "all");
   netcdf_text_attribute(ncid, NC_GLOBAL, "output_level", output_level);
   netcdf_text_attribute(ncid, NC_GLOBAL, "snapshot_mode", snapshot_mode);
-  netcdf_text_attribute(ncid, NC_GLOBAL, "outcome_enum", "0=success,1=return,2=geometry_lost,3=run_end");
+  netcdf_text_attribute(
+    ncid, NC_GLOBAL, "outcome_enum",
+    "0=success,1=return,2=geometry_lost,3=run_end,4=observation_gap");
   netcdf_text_attribute(ncid, NC_GLOBAL, "quantum_class_enum",
     "0=classical_only,1=two_well_delocalized,2=barrier_centered_tunneling_like,"
     "3=compact_single_domain,4=multi_kink_or_multi_domain,5=ambiguous,255=not_applicable");
@@ -5078,6 +5303,45 @@ void Proton_Tunneling::write_netcdf_output_file()
     &sample_interval_), "nc_put_att_int");
   netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "window_samples", NC_INT, 1,
     &window_samples_), "nc_put_att_int");
+  netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "hold_samples", NC_INT, 1,
+    &hold_samples_), "nc_put_att_int");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "delta_cutoff", NC_DOUBLE, 1,
+    &delta_cutoff_), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "dOO_min", NC_DOUBLE, 1,
+    &dOO_min_), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "dOO_max", NC_DOUBLE, 1,
+    &dOO_max_), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "rperp_max", NC_DOUBLE, 1,
+    &rperp_max_), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "oho_angle_min_deg", NC_DOUBLE, 1,
+    &oho_angle_min_deg_), "nc_put_att_double");
+  const int bead_diagnostic_enabled = bead_diagnostic_enabled_ ? 1 : 0;
+  netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "bead_diagnostic_enabled", NC_INT, 1,
+    &bead_diagnostic_enabled), "nc_put_att_int");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "bead_f_min", NC_DOUBLE, 1,
+    &bead_f_min_), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "bead_span_min", NC_DOUBLE, 1,
+    &bead_span_min_), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "bead_center_max", NC_DOUBLE, 1,
+    &bead_center_max_), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "bead_centroid_max", NC_DOUBLE, 1,
+    &bead_centroid_max_), "nc_put_att_double");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "ensemble_type", ensemble_name());
+  netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "ensemble_type_code", NC_INT, 1,
+    &ensemble_type_), "nc_put_att_int");
+  netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "number_of_beads", NC_INT, 1,
+    &number_of_beads_), "nc_put_att_int");
+  const double time_step_fs = time_step_ * TIME_UNIT_CONVERSION;
+  const double sample_interval_fs = time_step_fs * sample_interval_;
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "time_step_fs", NC_DOUBLE, 1,
+    &time_step_fs), "nc_put_att_double");
+  netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "sample_interval_fs", NC_DOUBLE, 1,
+    &sample_interval_fs), "nc_put_att_double");
+  netcdf_text_attribute(
+    ncid, NC_GLOBAL, "state_definition_version",
+    "stable_state_v1_core_left_endpoint_v1");
+  netcdf_text_attribute(
+    ncid, NC_GLOBAL, "bead_summary_definition", "all_bead_channels_valid");
   netcdf_text_attribute(ncid, NC_GLOBAL, "carrier_type_enum",
     "0=excess,1=deficit,2=edge_reversal");
   netcdf_text_attribute(ncid, NC_GLOBAL, "temporal_type_enum",
@@ -5218,19 +5482,27 @@ void Proton_Tunneling::write_netcdf_output_file()
     "beta_DeltaF_high_minus_low", "abs_beta_DeltaF", "mean_delta_phi_ion",
     "std_delta_phi_ion", "corr_delta_delta_phi", "mean_ion1_to_O_low", "mean_ion1_to_O_high",
     "mean_delta_d_ion1", "mean_ion2_to_O_low", "mean_ion2_to_O_high", "mean_delta_d_ion2"};
+  // Residence fields are assigned to the interval's ending sampled frame.
+  const std::vector<const char*> edge_window_time_names = {
+    "t_core_minus_fs", "t_core_plus_fs", "t_core_center_fs", "t_state_minus_fs",
+    "t_state_plus_fs", "observation_gap_fs"};
   const std::vector<const char*> edge_window_count_names = {
-    "n_plus", "n_minus", "n_deadband", "attempts", "successes", "returns", "geometry_lost"};
+    "n_plus", "n_minus", "n_deadband", "attempts", "successes", "returns", "geometry_lost",
+    "run_end", "observation_gaps"};
   if (!edge_window_records_.empty()) {
     netcdf_check(nc_def_grp(ncid, "edge_window", &edge_window_group), "nc_def_grp");
     const int row_dim = netcdf_dimension(edge_window_group, "row", edge_window_records_.size());
-    const int value_dim = netcdf_dimension(edge_window_group, "value", edge_window_value_names.size());
+    const int value_dim = netcdf_dimension(
+      edge_window_group, "value", edge_window_value_names.size() + edge_window_time_names.size());
     const int count_dim = netcdf_dimension(edge_window_group, "count", edge_window_count_names.size());
     edge_window_edge_var = netcdf_variable(edge_window_group, "edge_id", NC_INT,
       {row_dim}, {edge_window_records_.size()}, compression_level_);
     edge_window_window_var = netcdf_variable(edge_window_group, "window_index", NC_INT,
       {row_dim}, {edge_window_records_.size()}, compression_level_);
     edge_window_value_var = netcdf_variable(edge_window_group, "value", NC_DOUBLE,
-      {row_dim, value_dim}, {edge_window_records_.size(), edge_window_value_names.size()}, compression_level_);
+      {row_dim, value_dim},
+      {edge_window_records_.size(), edge_window_value_names.size() + edge_window_time_names.size()},
+      compression_level_);
     edge_window_count_var = netcdf_variable(edge_window_group, "count", NC_INT64,
       {row_dim, count_dim}, {edge_window_records_.size(), edge_window_count_names.size()}, compression_level_);
     netcdf_text_attribute(edge_window_group, edge_window_value_var, "field_names",
@@ -5239,12 +5511,15 @@ void Proton_Tunneling::write_netcdf_output_file()
       "mean_E_success,mean_E_return,nearest_ion1_distance,nearest_ion2_distance,log_population_ratio,"
       "beta_DeltaF_high_minus_low,abs_beta_DeltaF,mean_delta_phi_ion,std_delta_phi_ion,"
       "corr_delta_delta_phi,mean_ion1_to_O_low,mean_ion1_to_O_high,mean_delta_d_ion1,"
-      "mean_ion2_to_O_low,mean_ion2_to_O_high,mean_delta_d_ion2");
+      "mean_ion2_to_O_low,mean_ion2_to_O_high,mean_delta_d_ion2,t_core_minus_fs,t_core_plus_fs,"
+      "t_core_center_fs,t_state_minus_fs,t_state_plus_fs,observation_gap_fs");
     netcdf_text_attribute(edge_window_group, edge_window_count_var, "field_names",
-      "n_plus,n_minus,n_deadband,attempts,successes,returns,geometry_lost");
+      "n_plus,n_minus,n_deadband,attempts,successes,returns,geometry_lost,run_end,observation_gaps");
     edge_window_edges.reserve(edge_window_records_.size());
     edge_window_windows.reserve(edge_window_records_.size());
-    edge_window_values.reserve(edge_window_records_.size() * edge_window_value_names.size());
+    edge_window_values.reserve(
+      edge_window_records_.size() *
+      (edge_window_value_names.size() + edge_window_time_names.size()));
     edge_window_counts.reserve(edge_window_records_.size() * edge_window_count_names.size());
     for (const EdgeWindowRecord& record : edge_window_records_) {
       edge_window_edges.push_back(edge_ids[make_bond_key(record.oxygen_low, record.oxygen_high)]);
@@ -5259,10 +5534,12 @@ void Proton_Tunneling::write_netcdf_output_file()
         record.beta_DeltaF_high_minus_low, record.abs_beta_DeltaF, record.mean_delta_phi_ion,
         record.std_delta_phi_ion, record.corr_delta_delta_phi, record.mean_ion1_to_O_low,
         record.mean_ion1_to_O_high, record.mean_delta_d_ion1, record.mean_ion2_to_O_low,
-        record.mean_ion2_to_O_high, record.mean_delta_d_ion2});
+        record.mean_ion2_to_O_high, record.mean_delta_d_ion2, record.t_core_minus_fs,
+        record.t_core_plus_fs, record.t_core_center_fs, record.t_state_minus_fs,
+        record.t_state_plus_fs, record.observation_gap_fs});
       edge_window_counts.insert(edge_window_counts.end(), {
         record.n_plus, record.n_minus, record.n_deadband, record.attempts, record.successes,
-        record.returns, record.geometry_lost});
+        record.returns, record.geometry_lost, record.run_end, record.observation_gaps});
     }
   }
 
@@ -5274,9 +5551,12 @@ void Proton_Tunneling::write_netcdf_output_file()
   std::vector<double> bond_values;
   std::vector<long long> bond_counts;
   if (!total_bonds_.empty()) {
-    const std::vector<const char*> bond_value_names = {"asymmetry", "abs_asymmetry", "mean_abs_delta"};
+    const std::vector<const char*> bond_value_names = {
+      "asymmetry", "abs_asymmetry", "mean_abs_delta", "t_core_minus_fs", "t_core_plus_fs",
+      "t_core_center_fs", "t_state_minus_fs", "t_state_plus_fs", "observation_gap_fs"};
     const std::vector<const char*> bond_count_names = {
-      "geometry_samples", "n_plus", "n_minus", "transitions"};
+      "geometry_samples", "n_plus", "n_minus", "transitions", "attempts", "successes",
+      "returns", "geometry_lost", "run_end", "observation_gaps"};
     netcdf_check(nc_def_grp(ncid, "bond", &bond_group), "nc_def_grp");
     const int row_dim = netcdf_dimension(bond_group, "row", total_bonds_.size());
     const int value_dim = netcdf_dimension(bond_group, "value", bond_value_names.size());
@@ -5288,9 +5568,11 @@ void Proton_Tunneling::write_netcdf_output_file()
     bond_count_var = netcdf_variable(bond_group, "count", NC_INT64,
       {row_dim, count_dim}, {total_bonds_.size(), bond_count_names.size()}, compression_level_);
     netcdf_text_attribute(bond_group, bond_value_var, "field_names",
-      "asymmetry,abs_asymmetry,mean_abs_delta");
+      "asymmetry,abs_asymmetry,mean_abs_delta,t_core_minus_fs,t_core_plus_fs,t_core_center_fs,"
+      "t_state_minus_fs,t_state_plus_fs,observation_gap_fs");
     netcdf_text_attribute(bond_group, bond_count_var, "field_names",
-      "geometry_samples,n_plus,n_minus,transitions");
+      "geometry_samples,n_plus,n_minus,transitions,attempts,successes,returns,geometry_lost,"
+      "run_end,observation_gaps");
     for (const auto& item : total_bonds_) {
       int oxygen_low;
       int oxygen_high;
@@ -5304,9 +5586,13 @@ void Proton_Tunneling::write_netcdf_output_file()
       bond_values.insert(bond_values.end(), {
         asymmetry, std::abs(asymmetry),
         stats.geometry_samples > 0 ? stats.sum_abs_delta / stats.geometry_samples :
-          std::numeric_limits<double>::quiet_NaN()});
+          std::numeric_limits<double>::quiet_NaN(),
+        stats.t_core_minus_fs, stats.t_core_plus_fs, stats.t_core_center_fs,
+        stats.t_state_minus_fs, stats.t_state_plus_fs, stats.observation_gap_fs});
       bond_counts.insert(bond_counts.end(), {
-        stats.geometry_samples, stats.n_plus, stats.n_minus, stats.transitions});
+        stats.geometry_samples, stats.n_plus, stats.n_minus, stats.transitions, stats.attempts,
+        stats.successes, stats.returns, stats.geometry_lost, stats.run_end,
+        stats.observation_gaps});
     }
   }
 
@@ -5443,6 +5729,8 @@ void Proton_Tunneling::write_netcdf_output_file()
   int attempt_frame_var = -1;
   int attempt_fractional_valid_var = -1;
   int attempt_value_var = -1;
+  int attempt_bead_count_var = -1;
+  int attempt_observation_gap_var = -1;
   std::vector<double> attempt_times;
   std::vector<long long> attempt_ids;
   std::vector<int> attempt_hydrogens;
@@ -5455,6 +5743,8 @@ void Proton_Tunneling::write_netcdf_output_file()
   std::vector<long long> attempt_frames;
   std::vector<unsigned char> attempt_fractional_valid;
   std::vector<double> attempt_values;
+  std::vector<long long> attempt_bead_counts;
+  std::vector<unsigned char> attempt_observation_gaps;
   std::unordered_map<long long, int> attempt_rows;
   const std::vector<const char*> attempt_value_names = {
     "delta_start", "min_abs_delta", "delta_end", "E_parallel_start", "E_parallel_end",
@@ -5463,11 +5753,16 @@ void Proton_Tunneling::write_netcdf_output_file()
     "time_confirm_fs", "center_residence_fs", "crossing_duration_fs",
     "stabilization_delay_fs", "confirmation_delay_fs", "attempt_duration_fs",
     "fractional_dx", "fractional_dy", "fractional_dz"};
+  const std::vector<const char*> attempt_bead_count_names = {
+    "n_probe_frames", "n_channel_good_frames", "n_two_domain_frames",
+    "n_barrier_centered_frames"};
   if (include_events && !attempt_records_.empty()) {
     netcdf_check(nc_def_grp(ncid, "attempt", &attempt_group), "nc_def_grp");
     const int attempt_dim = netcdf_dimension(attempt_group, "attempt", attempt_records_.size());
     const int endpoint_dim = netcdf_dimension(attempt_group, "endpoint", 2);
     const int value_dim = netcdf_dimension(attempt_group, "value", attempt_value_names.size());
+    const int bead_count_dim = netcdf_dimension(
+      attempt_group, "bead_count", attempt_bead_count_names.size());
     attempt_id_var = netcdf_variable(attempt_group, "attempt_id", NC_INT64,
       {attempt_dim}, {attempt_records_.size()}, compression_level_);
     attempt_time_var = netcdf_variable(attempt_group, "time_fs", NC_DOUBLE,
@@ -5492,16 +5787,25 @@ void Proton_Tunneling::write_netcdf_output_file()
       {attempt_dim}, {attempt_records_.size()}, compression_level_);
     attempt_value_var = netcdf_variable(attempt_group, "value", NC_DOUBLE,
       {attempt_dim, value_dim}, {attempt_records_.size(), attempt_value_names.size()}, compression_level_);
+    attempt_bead_count_var = netcdf_variable(attempt_group, "bead_count", NC_INT64,
+      {attempt_dim, bead_count_dim},
+      {attempt_records_.size(), attempt_bead_count_names.size()}, compression_level_);
+    attempt_observation_gap_var = netcdf_variable(attempt_group, "observation_gap", NC_UBYTE,
+      {attempt_dim}, {attempt_records_.size()}, compression_level_);
     netcdf_text_attribute(attempt_group, attempt_id_var,
       "description", "one-based attempt identifier; causal links use zero-based row indices");
     netcdf_text_attribute(attempt_group, attempt_outcome_var,
-      "enum", "0=success,1=return,2=geometry_lost,3=run_end");
+      "enum", "0=success,1=return,2=geometry_lost,3=run_end,4=observation_gap");
     netcdf_text_attribute(attempt_group, attempt_value_var, "field_names",
       "delta_start,min_abs_delta,delta_end,E_parallel_start,E_parallel_end,delta_phi_start,"
       "delta_phi_end,delta_d_ion1_start,delta_d_ion2_start,nearest_ion_distance,"
       "time_first_opposite_fs,time_commit_fs,time_confirm_fs,center_residence_fs,"
       "crossing_duration_fs,stabilization_delay_fs,confirmation_delay_fs,attempt_duration_fs,"
       "fractional_dx,fractional_dy,fractional_dz");
+    netcdf_text_attribute(attempt_group, attempt_bead_count_var, "field_names",
+      "n_probe_frames,n_channel_good_frames,n_two_domain_frames,n_barrier_centered_frames");
+    netcdf_text_attribute(attempt_group, attempt_observation_gap_var, "description",
+      "1 when the finalized attempt was interrupted by an observation gap");
     attempt_times.reserve(attempt_records_.size() * 2);
     attempt_ids.reserve(attempt_records_.size());
     attempt_hydrogens.reserve(attempt_records_.size());
@@ -5514,6 +5818,8 @@ void Proton_Tunneling::write_netcdf_output_file()
     attempt_frames.reserve(attempt_records_.size());
     attempt_fractional_valid.reserve(attempt_records_.size());
     attempt_values.reserve(attempt_records_.size() * attempt_value_names.size());
+    attempt_bead_counts.reserve(attempt_records_.size() * attempt_bead_count_names.size());
+    attempt_observation_gaps.reserve(attempt_records_.size());
     for (size_t row = 0; row < attempt_records_.size(); ++row) {
       const AttemptRecord& record = attempt_records_[row];
       attempt_rows[record.attempt_id] = static_cast<int>(row);
@@ -5530,6 +5836,7 @@ void Proton_Tunneling::write_netcdf_output_file()
           case AttemptOutcome::return_to_state: return static_cast<unsigned char>(1);
           case AttemptOutcome::geometry_lost: return static_cast<unsigned char>(2);
           case AttemptOutcome::run_end: return static_cast<unsigned char>(3);
+          case AttemptOutcome::observation_gap: return static_cast<unsigned char>(4);
           default: return static_cast<unsigned char>(3);
         }
       };
@@ -5546,6 +5853,10 @@ void Proton_Tunneling::write_netcdf_output_file()
         record.time_confirm_fs, record.center_residence_fs, record.crossing_duration_fs,
         record.stabilization_delay_fs, record.confirmation_delay_fs, record.attempt_duration_fs,
         record.fractional_dx, record.fractional_dy, record.fractional_dz});
+      attempt_bead_counts.insert(attempt_bead_counts.end(), {
+        record.n_probe_frames, record.n_channel_good_frames, record.n_two_domain_frames,
+        record.n_barrier_centered_frames});
+      attempt_observation_gaps.push_back(record.has_observation_gap ? 1 : 0);
     }
   }
 
@@ -6482,6 +6793,8 @@ void Proton_Tunneling::write_netcdf_output_file()
     netcdf_write_longlong(attempt_group, attempt_frame_var, attempt_frames);
     netcdf_write_ubyte(attempt_group, attempt_fractional_valid_var, attempt_fractional_valid);
     netcdf_write_double(attempt_group, attempt_value_var, attempt_values);
+    netcdf_write_longlong(attempt_group, attempt_bead_count_var, attempt_bead_counts);
+    netcdf_write_ubyte(attempt_group, attempt_observation_gap_var, attempt_observation_gaps);
   }
   if (transfer_group >= 0) {
     netcdf_write_int(transfer_group, transfer_attempt_var, transfer_attempts);
@@ -6607,6 +6920,7 @@ void Proton_Tunneling::postprocess(
 
   for (size_t h_index = 0; h_index < hydrogen_states_.size(); ++h_index) {
     HydrogenState& hydrogen_state = hydrogen_states_[h_index];
+    close_observation_gap(hydrogen_state, last_time_fs_);
     if (hydrogen_state.attempt_active) {
       finish_attempt(
         hydrogen_indices_[h_index],

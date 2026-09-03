@@ -137,6 +137,12 @@ types. All variables are chunked with shuffle and deflate compression. NetCDF ou
 GPUMD build with ``USE_NETCDF=1`` and NetCDF-4/HDF5 support. It is intended for separate output
 files per sample directory and does not append across runs.
 
+The current NetCDF schema is version 7. Global attributes record the ensemble type, bead count,
+physical time step, sampled-frame interval, all geometry/state thresholds, bead-diagnostic
+thresholds and switch, and the state/residence definition version. The ``/attempt`` group
+additionally stores the attempt-level bead probe counts and an observation-gap flag;
+``/edge_window`` and ``/bond`` store core/state residence times and observation-gap totals.
+
 Output
 ------
 
@@ -155,9 +161,10 @@ and completed edge windows.
   both states. Defect counts use nearest-O coordination relative to two hydrogens per oxygen.
   The final ``assignment_ambiguous_samples`` and ``pair_conflict_samples`` columns report
   strict-assignment samples skipped in that window.
-* ``proton_attempt.out`` contains every attempt, including ``return``, ``geometry_lost``, and
-  ``run_end``. ``time_start_fs`` is the first dead-band frame and ``time_end_fs`` is the
-  confirmation, return, geometry-loss, or run-end frame. ``E_parallel_start`` and
+* ``proton_attempt.out`` contains every attempt, including ``return``, ``geometry_lost``,
+  ``observation_gap``, and ``run_end``. ``time_start_fs`` is the first dead-band frame and
+  ``time_end_fs`` is the confirmation, return, geometry-loss, observation-gap, or run-end frame.
+  ``E_parallel_start`` and
   ``E_parallel_end`` are the nominal-ion electric field projected along ``O_low`` to
   ``O_high``; ``nearest_ion_id`` and ``nearest_ion_distance`` refer to the event-end frame.
   ``delta_phi_start`` and ``delta_phi_end`` are the nominal-ion potential differences
@@ -166,8 +173,14 @@ and completed edge windows.
   :math:`\Delta d_{\rm ion}=d(\mathrm{ion},O_{\rm high})-d(\mathrm{ion},O_{\rm low})`;
   the species names come from ``ion_field``. These start-frame quantities are kept separate
   from the event-end field because the local environment can change during a transfer attempt.
-  If ``ion_field`` is omitted, these fields are written as ``nan`` and ``-1``. Frames rejected
-  only because of strict-assignment ambiguity do not close an active attempt.
+  If ``ion_field`` is omitted, these fields are written as ``nan`` and ``-1``. The final
+  ``n_probe_frames``, ``n_channel_good_frames``, ``n_two_domain_frames``, and
+  ``n_barrier_centered_frames`` columns summarize evaluated bead probes for this attempt.
+  The latter three count only probes where every bead passed the fixed-pair channel geometry;
+  ``n_probe_frames=0`` means the bead classification is unknown, not non-tunneling. The
+  ``has_observation_gap`` column marks an attempt interrupted by an invalid, ambiguous, or
+  changed O-O assignment. Such an interruption resets the state machine and is not connected
+  across the missing interval.
 * ``proton_transfer.out`` contains sparse, hold-confirmed hydrogen transfer events with the
   attempt start time and the confirmation time. Its ``event_id`` is the corresponding successful
   attempt ID. ``dx dy dz`` is the minimum-image vector from ``O_from`` to ``O_to``. Atom indices
@@ -185,8 +198,15 @@ and completed edge windows.
   completed window. ``geometry_occupancy`` is the number of valid O-H-O observations divided
   by the number of sampled frames; it is normally between zero and one when one hydrogen is
   associated with an edge. ``success_probability`` uses only successes and returns, as
-  :math:`N_{\rm success}/(N_{\rm success}+N_{\rm return})`; geometry loss and run-end are
-  reported separately. When ``ion_field`` is enabled, the appended ``mean_E_parallel``,
+  :math:`N_{\rm success}/(N_{\rm success}+N_{\rm return})`; geometry loss, observation gaps,
+  and run-end are reported separately. The appended ``t_core_minus_fs``, ``t_core_plus_fs``, and
+  ``t_core_center_fs`` fields are time spent in the instantaneous negative, positive, and
+  dead-band centroid regions. ``t_state_minus_fs`` and ``t_state_plus_fs`` are time spent in a
+  state already confirmed by ``hold_samples``. Discontinuous or invalid observation intervals
+  are excluded, but valid samples during an active attempt remain included; until a success is
+  confirmed, ``t_state_*`` continues to use the attempt's source state. Intervals are assigned
+  to the ending sampled frame and use the actual sampled time difference. When ``ion_field`` is
+  enabled, the appended ``mean_E_parallel``,
   ``std_E_parallel``, ``corr_delta_E_parallel``, ``mean_E_success``, and ``mean_E_return``
   columns summarize the nominal-ion field. The first two distance columns are the mean nearest
   distances to the two configured ion species measured from the O--O midpoint; their names are
@@ -216,8 +236,9 @@ and completed edge windows.
   ``bead_diagnostic`` is also enabled, valid ``centroid_best`` and ``delocalization_best``
   snapshots are appended, binding the local environment to the dynamical outcome and the
   independent quantum-geometry label.
-* ``proton_bond.out`` contains accumulated per-pair geometry, state, and transition counts
-  after the run.
+* ``proton_bond.out`` contains accumulated per-pair geometry, state, transition, outcome,
+  residence-time, and observation-gap fields after the run. The ``t_core_*`` fields use the
+  instantaneous centroid classification, while ``t_state_*`` use the confirmed state machine.
 * ``proton_bead_event.out`` is written only when ``bead_diagnostic`` is enabled. It contains
   two records for each finalized attempt, selected by ``selection_kind=centroid_best`` and
   ``selection_kind=delocalization_best``, with the dynamical ``outcome`` and independent
@@ -231,7 +252,8 @@ and completed edge windows.
   ``barrier_centered``, ``strict_tunneling_like``, and ``multi_kink_or_multi_domain`` expose
   the individual strict filters as integer flags.
   ``channel_valid_count`` and ``f_channel_valid`` report how many beads satisfy the same
-  fixed-pair O-H-O geometry filters; this is diagnostic only and is not a strict-label filter.
+  fixed-pair O-H-O geometry filters; the original per-probe flags remain diagnostic only and
+  are not changed by the attempt-level counters.
   ``rms_neighbor_delta_jump`` and ``max_neighbor_delta_jump`` quantify bead-to-bead coordinate
   jumps. ``quantum_class`` is ``two_well_delocalized``,
   ``barrier_centered_tunneling_like``, ``compact_single_domain``, or
