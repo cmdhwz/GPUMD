@@ -2646,6 +2646,7 @@ void Proton_Tunneling::finish_attempt(
     ? hydrogen_state.time_commit_fs : nan;
   record.time_confirm_fs = outcome == AttemptOutcome::success ? time_fs : nan;
   record.center_residence_fs = hydrogen_state.center_residence_fs;
+  record.stabilization_delay_fs = nan;
   if (hydrogen_state.first_opposite_seen) {
     record.crossing_duration_fs =
       hydrogen_state.time_first_opposite_fs - hydrogen_state.attempt_start_time_fs;
@@ -2754,7 +2755,7 @@ void Proton_Tunneling::finish_attempt(
     for (const int oxygen : touched_oxygens) {
       if (oxygen < 0 || oxygen >= static_cast<int>(frame_cause_event_ids_.size()))
         continue;
-      if (frame_cause_event_ids_[oxygen] < 0)
+      if (frame_cause_event_ids_[oxygen] == -1)
         frame_cause_event_ids_[oxygen] = event_id;
       else if (frame_cause_event_ids_[oxygen] != event_id)
         frame_cause_event_ids_[oxygen] = -2;
@@ -3587,6 +3588,15 @@ void Proton_Tunneling::build_causal_network()
       int two_well = 0;
       int strict_tunneling = 0;
       int multi_kink = 0;
+      const double sign = carrier == CarrierType::excess ? 1.0 : -1.0;
+      const AttemptRecord& first_transfer = attempt_records_[path.front()];
+      if (first_transfer.fractional_step_valid != 0) {
+        frac_x += sign * first_transfer.fractional_dx;
+        frac_y += sign * first_transfer.fractional_dy;
+        frac_z += sign * first_transfer.fractional_dz;
+      } else {
+        fractional_valid = false;
+      }
       for (const size_t event_index : path) {
         const AttemptRecord& event = attempt_records_[event_index];
         groups.insert(event_group(event_index));
@@ -3607,7 +3617,6 @@ void Proton_Tunneling::build_causal_network()
           continue;
         const CausalLinkRecord& link = causal_link_records_[link_item->second];
         const AttemptRecord& child = attempt_records_[child_index];
-        const double sign = carrier == CarrierType::excess ? 1.0 : -1.0;
         const double dx = sign * child.dx;
         const double dy = sign * child.dy;
         const double dz = sign * child.dz;
@@ -3714,7 +3723,7 @@ void Proton_Tunneling::build_causal_network()
       else if (chain.closed_by_oxygen_id != 0 && chain.winding_valid != 0 &&
                (chain.winding_x != 0 || chain.winding_y != 0 || chain.winding_z != 0))
         chain.chain_class = ChainClass::closed_winding;
-      else if (chain.closed_by_oxygen_id != 0)
+      else if (chain.closed_by_oxygen_id != 0 && chain.winding_valid != 0)
         chain.chain_class = ChainClass::closed_local;
       else
         chain.chain_class = ChainClass::open;
@@ -4053,6 +4062,7 @@ void Proton_Tunneling::write_window(const double time_fs)
   write_edge_window(window_start_time_fs_, time_fs);
   if (local_environment_enabled_)
     write_local_environment_window(window_start_time_fs_, time_fs);
+  ++window_id_;
 
   window_bonds_.clear();
   window_local_environment_stats_.clear();
@@ -4250,7 +4260,6 @@ void Proton_Tunneling::write_edge_window(
     record.mean_delta_d_ion2 = mean_delta_d_ion2;
     edge_window_records_.push_back(record);
   }
-  ++window_id_;
 }
 
 void Proton_Tunneling::write_final_bonds()
@@ -4579,7 +4588,7 @@ void Proton_Tunneling::write_text_output_files()
     fprintf(
       attempt_file_,
       "%lld %.10e %.10e %d %d %d %d %d %s %.10e %.10e %.10e %.10e %.10e %d %.10e "
-      "%.10e %.10e %.10e %.10e\n",
+      "%.10e %.10e %.10e %.10e",
       record.attempt_id,
       record.time_start_fs,
       record.time_end_fs,
@@ -4627,8 +4636,8 @@ void Proton_Tunneling::write_text_output_files()
           bead_event_file_,
           "%lld %s %.10e %d %d %d %s %d "
           "%.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e %.10e "
-          "%d %d %d %d %d %d %d %d %d %d "
-          "%.10e %.10e %.10e %s\n",
+          "%d %d %d %d %d %d %d %d %d "
+          "%.10e %d %.10e %.10e %s\n",
           record.attempt_id,
           selection_kind,
           valid ? diagnostic.probe_time_fs : bead_nan,
@@ -4659,8 +4668,8 @@ void Proton_Tunneling::write_text_output_files()
           valid ? diagnostic.barrier_centered : -1,
           valid ? diagnostic.strict_tunneling_like : -1,
           valid ? diagnostic.channel_valid_count : -1,
-          valid ? diagnostic.multi_kink_or_multi_domain : -1,
           valid ? diagnostic.f_channel_valid : bead_nan,
+          valid ? diagnostic.multi_kink_or_multi_domain : -1,
           valid ? diagnostic.rms_neighbor_delta_jump : bead_nan,
           valid ? diagnostic.max_neighbor_delta_jump : bead_nan,
           quantum_character_name(diagnostic.character));
