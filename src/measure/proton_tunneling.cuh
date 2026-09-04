@@ -786,7 +786,6 @@ private:
     int pending_assignment_nH_to_after = -1;
     long long pending_assignment_from_defect_index = -1;
     long long pending_assignment_to_defect_index = -1;
-    double pending_assignment_time_fs = 0.0;
     bool commit_seen = false;
     double time_first_opposite_fs = 0.0;
     double time_commit_fs = 0.0;
@@ -796,7 +795,6 @@ private:
     long long n_two_domain_frames = 0;
     long long n_barrier_centered_frames = 0;
     bool has_observation_gap = false;
-    double attempt_last_time_fs = 0.0;
     int attempt_last_state = 0;
     double last_observation_time_fs = 0.0;
     int last_observed_state = 0;
@@ -855,8 +853,7 @@ private:
   void reset_attempt_tracking(HydrogenState& hydrogen_state);
   void update_assignment_change(
     HydrogenState& hydrogen_state,
-    const GeometryResult& geometry,
-    const double time_fs);
+    const GeometryResult& geometry);
   void assign_defect_event(const long long defect_index, const long long attempt_id);
   void start_attempt(
     HydrogenState& hydrogen_state,
@@ -972,7 +969,6 @@ private:
   std::vector<int> ion1_indices_;
   std::vector<int> ion2_indices_;
   std::vector<int> oxygen_local_index_;
-  std::vector<std::vector<int>> oxygen_shell_neighbors_;
   std::vector<int> oxygen_shell_offsets_cpu_;
   std::vector<int> oxygen_shell_neighbors_cpu_;
   GPU_Vector<int> oxygen_indices_gpu_;

@@ -382,7 +382,6 @@ __global__ void gpu_find_proton_geometry(
   __shared__ double nearest_distance_square[128];
   __shared__ int nearest_oxygen[128];
   __shared__ GeometryResultGPU candidate_results[8];
-  __shared__ int candidate_valid[8];
 
   double local_distance_square = 1.0e300;
   int local_oxygen = -1;
@@ -442,95 +441,79 @@ __global__ void gpu_find_proton_geometry(
     : 8;
   if (thread < 8) {
     candidate_results[thread] = {};
-    candidate_valid[thread] = 0;
   }
   __syncthreads();
 
   if (thread < shell_size) {
     const int second_oxygen = shell_neighbors[shell_begin + thread];
-    const int second_local = (second_oxygen < number_of_atoms)
-      ? oxygen_local_index[second_oxygen]
-      : -1;
-    bool mutual_neighbor = false;
-    if (second_local >= 0) {
-      for (int i = shell_offsets[second_local]; i < shell_offsets[second_local + 1]; ++i) {
-        if (shell_neighbors[i] == first_oxygen) {
-          mutual_neighbor = true;
-          break;
-        }
-      }
-    }
-    if (mutual_neighbor) {
-      GeometryResultGPU candidate = {};
-      candidate.nearest_oxygen = first_oxygen;
-      candidate.nearest_ion_id = -1;
-      candidate.oxygen_low = (first_oxygen < second_oxygen) ? first_oxygen : second_oxygen;
-      candidate.oxygen_high = (first_oxygen < second_oxygen) ? second_oxygen : first_oxygen;
-      double ox = position[candidate.oxygen_high] - position[candidate.oxygen_low];
-      double oy = position[candidate.oxygen_high + number_of_atoms] -
-        position[candidate.oxygen_low + number_of_atoms];
-      double oz = position[candidate.oxygen_high + 2 * number_of_atoms] -
-        position[candidate.oxygen_low + 2 * number_of_atoms];
-      apply_mic(box, ox, oy, oz);
-      const double dOO_square = ox * ox + oy * oy + oz * oz;
-      if (dOO_square >= dOO_min * dOO_min && dOO_square <= dOO_max * dOO_max) {
-        candidate.dOO = sqrt(dOO_square);
-        candidate.low_to_high_dx = ox;
-        candidate.low_to_high_dy = oy;
-        candidate.low_to_high_dz = oz;
+    GeometryResultGPU candidate = {};
+    candidate.nearest_oxygen = first_oxygen;
+    candidate.nearest_ion_id = -1;
+    candidate.oxygen_low = (first_oxygen < second_oxygen) ? first_oxygen : second_oxygen;
+    candidate.oxygen_high = (first_oxygen < second_oxygen) ? second_oxygen : first_oxygen;
+    double ox = position[candidate.oxygen_high] - position[candidate.oxygen_low];
+    double oy = position[candidate.oxygen_high + number_of_atoms] -
+      position[candidate.oxygen_low + number_of_atoms];
+    double oz = position[candidate.oxygen_high + 2 * number_of_atoms] -
+      position[candidate.oxygen_low + 2 * number_of_atoms];
+    apply_mic(box, ox, oy, oz);
+    const double dOO_square = ox * ox + oy * oy + oz * oz;
+    if (dOO_square >= dOO_min * dOO_min && dOO_square <= dOO_max * dOO_max) {
+      candidate.dOO = sqrt(dOO_square);
+      candidate.low_to_high_dx = ox;
+      candidate.low_to_high_dy = oy;
+      candidate.low_to_high_dz = oz;
 
-        double hx_from_low = hx - position[candidate.oxygen_low];
-        double hy_from_low = hy - position[candidate.oxygen_low + number_of_atoms];
-        double hz_from_low = hz - position[candidate.oxygen_low + 2 * number_of_atoms];
-        apply_mic(box, hx_from_low, hy_from_low, hz_from_low);
-        const double projection = (hx_from_low * ox + hy_from_low * oy + hz_from_low * oz) /
-          dOO_square;
-        if (projection >= -1.0e-10 && projection <= 1.0 + 1.0e-10) {
-          const double px = hx_from_low - projection * ox;
-          const double py = hy_from_low - projection * oy;
-          const double pz = hz_from_low - projection * oz;
-          candidate.rperp = sqrt(fmax(0.0, px * px + py * py + pz * pz));
-          if (candidate.rperp <= rperp_max) {
-            double low_x = position[candidate.oxygen_low] - hx;
-            double low_y = position[candidate.oxygen_low + number_of_atoms] - hy;
-            double low_z = position[candidate.oxygen_low + 2 * number_of_atoms] - hz;
-            double high_x = position[candidate.oxygen_high] - hx;
-            double high_y = position[candidate.oxygen_high + number_of_atoms] - hy;
-            double high_z = position[candidate.oxygen_high + 2 * number_of_atoms] - hz;
-            apply_mic(box, low_x, low_y, low_z);
-            apply_mic(box, high_x, high_y, high_z);
-            const double low_distance = sqrt(low_x * low_x + low_y * low_y + low_z * low_z);
-            const double high_distance = sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
-            if (low_distance > 0.0 && high_distance > 0.0 &&
-                low_distance <= 1.60 && high_distance <= 1.60) {
-              const double angle_cosine = (low_x * high_x + low_y * high_y + low_z * high_z) /
-                (low_distance * high_distance);
-              if (angle_cosine <= angle_cosine_limit) {
-                candidate.delta = low_distance - high_distance;
-                candidate.path_excess = fmax(0.0,
-                  low_distance + high_distance - candidate.dOO);
-                candidate.assignment_score = candidate.rperp +
-                  assignment_path_excess_weight * candidate.path_excess;
-                if (ion_field_enabled != 0) {
-                  compute_ion_field_gpu(
-                    position,
-                    number_of_atoms,
-                    box,
-                    candidate,
-                    ion1_indices,
-                    ion1_count,
-                    ion1_charge,
-                    ion2_indices,
-                    ion2_count,
-                    ion2_charge,
-                    ion_field_cutoff,
-                    local_influence_enabled,
-                    candidate);
-                }
-                candidate.valid = 1;
-                candidate_valid[thread] = 1;
-                candidate_results[thread] = candidate;
+      double hx_from_low = hx - position[candidate.oxygen_low];
+      double hy_from_low = hy - position[candidate.oxygen_low + number_of_atoms];
+      double hz_from_low = hz - position[candidate.oxygen_low + 2 * number_of_atoms];
+      apply_mic(box, hx_from_low, hy_from_low, hz_from_low);
+      const double projection = (hx_from_low * ox + hy_from_low * oy + hz_from_low * oz) /
+        dOO_square;
+      if (projection >= -1.0e-10 && projection <= 1.0 + 1.0e-10) {
+        const double px = hx_from_low - projection * ox;
+        const double py = hy_from_low - projection * oy;
+        const double pz = hz_from_low - projection * oz;
+        candidate.rperp = sqrt(fmax(0.0, px * px + py * py + pz * pz));
+        if (candidate.rperp <= rperp_max) {
+          double low_x = position[candidate.oxygen_low] - hx;
+          double low_y = position[candidate.oxygen_low + number_of_atoms] - hy;
+          double low_z = position[candidate.oxygen_low + 2 * number_of_atoms] - hz;
+          double high_x = position[candidate.oxygen_high] - hx;
+          double high_y = position[candidate.oxygen_high + number_of_atoms] - hy;
+          double high_z = position[candidate.oxygen_high + 2 * number_of_atoms] - hz;
+          apply_mic(box, low_x, low_y, low_z);
+          apply_mic(box, high_x, high_y, high_z);
+          const double low_distance = sqrt(low_x * low_x + low_y * low_y + low_z * low_z);
+          const double high_distance = sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
+          if (low_distance > 0.0 && high_distance > 0.0 &&
+              low_distance <= 1.60 && high_distance <= 1.60) {
+            const double angle_cosine = (low_x * high_x + low_y * high_y + low_z * high_z) /
+              (low_distance * high_distance);
+            if (angle_cosine <= angle_cosine_limit) {
+              candidate.delta = low_distance - high_distance;
+              candidate.path_excess = fmax(0.0,
+                low_distance + high_distance - candidate.dOO);
+              candidate.assignment_score = candidate.rperp +
+                assignment_path_excess_weight * candidate.path_excess;
+              if (ion_field_enabled != 0) {
+                compute_ion_field_gpu(
+                  position,
+                  number_of_atoms,
+                  box,
+                  candidate,
+                  ion1_indices,
+                  ion1_count,
+                  ion1_charge,
+                  ion2_indices,
+                  ion2_count,
+                  ion2_charge,
+                  ion_field_cutoff,
+                  local_influence_enabled,
+                  candidate);
               }
+              candidate.valid = 1;
+              candidate_results[thread] = candidate;
             }
           }
         }
@@ -544,7 +527,7 @@ __global__ void gpu_find_proton_geometry(
     int second_candidate = -1;
     int candidate_count = 0;
     for (int i = 0; i < shell_size; ++i) {
-      if (candidate_valid[i] == 0)
+      if (candidate_results[i].valid == 0)
         continue;
       ++candidate_count;
       if (best_candidate < 0 ||
@@ -1246,7 +1229,6 @@ void Proton_Tunneling::preprocess(
   local_environment_D2H_wall_time_ = 0.0;
   local_environment_host_analysis_wall_time_ = 0.0;
   oxygen_local_index_.assign(number_of_atoms_, -1);
-  oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
   previous_hydrogen_count_.resize(number_of_atoms_, 0);
   frame_defect_record_indices_.resize(number_of_atoms_, -1);
@@ -1313,7 +1295,7 @@ void Proton_Tunneling::build_oxygen_shell(const Box& box)
 {
   // ponytail: build the initial O shell once with O(N_O^2) CPU distances; use a shared
   // neighbor list if this observer is later applied to large systems.
-  oxygen_shell_neighbors_.assign(oxygen_indices_.size(), std::vector<int>());
+  std::vector<std::vector<int>> shell_neighbors(oxygen_indices_.size());
   std::fill(oxygen_local_index_.begin(), oxygen_local_index_.end(), -1);
   for (size_t i = 0; i < oxygen_indices_.size(); ++i)
     oxygen_local_index_[oxygen_indices_[i]] = static_cast<int>(i);
@@ -1334,20 +1316,24 @@ void Proton_Tunneling::build_oxygen_shell(const Box& box)
       apply_mic(box, dx, dy, dz);
       distances.emplace_back(dx * dx + dy * dy + dz * dz, oxygen_j);
     }
-    std::sort(distances.begin(), distances.end());
     const int shell_size = std::min(oxygen_shell_k_, static_cast<int>(distances.size()));
-    oxygen_shell_neighbors_[i].reserve(shell_size);
+    std::partial_sort(distances.begin(), distances.begin() + shell_size, distances.end());
+    shell_neighbors[i].reserve(shell_size);
     for (int j = 0; j < shell_size; ++j)
-      oxygen_shell_neighbors_[i].push_back(distances[j].second);
+      shell_neighbors[i].push_back(distances[j].second);
   }
 
   oxygen_shell_offsets_cpu_.assign(oxygen_indices_.size() + 1, 0);
   oxygen_shell_neighbors_cpu_.clear();
-  for (size_t i = 0; i < oxygen_shell_neighbors_.size(); ++i) {
-    oxygen_shell_neighbors_cpu_.insert(
-      oxygen_shell_neighbors_cpu_.end(),
-      oxygen_shell_neighbors_[i].begin(),
-      oxygen_shell_neighbors_[i].end());
+  // Filter against the complete original top-8 lists, preserving candidate order.
+  // The GPU consumes only mutual neighbors, so no reverse lookup is needed per frame.
+  for (size_t i = 0; i < shell_neighbors.size(); ++i) {
+    for (const int neighbor : shell_neighbors[i]) {
+      const auto& reverse_shell = shell_neighbors[oxygen_local_index_[neighbor]];
+      if (std::find(reverse_shell.begin(), reverse_shell.end(), oxygen_indices_[i]) !=
+          reverse_shell.end())
+        oxygen_shell_neighbors_cpu_.push_back(neighbor);
+    }
     oxygen_shell_offsets_cpu_[i + 1] =
       static_cast<int>(oxygen_shell_neighbors_cpu_.size());
   }
@@ -1920,14 +1906,13 @@ bool Proton_Tunneling::evaluate_bead_diagnostic(
   if (zero_beads == diagnostic.num_beads)
     diagnostic.center_domain_count = 1;
   diagnostic.total_state_domain_count = (state_changes == 0) ? 1 : state_changes;
-  std::vector<double> sorted_deltas = bead_deltas;
-  std::sort(sorted_deltas.begin(), sorted_deltas.end());
+  std::sort(bead_deltas.begin(), bead_deltas.end());
   const auto quantile = [&](const double fraction) {
     const double position = fraction * (diagnostic.num_beads - 1);
     const size_t lower = static_cast<size_t>(position);
-    const size_t upper = std::min(lower + 1, sorted_deltas.size() - 1);
+    const size_t upper = std::min(lower + 1, bead_deltas.size() - 1);
     const double weight = position - lower;
-    return sorted_deltas[lower] + weight * (sorted_deltas[upper] - sorted_deltas[lower]);
+    return bead_deltas[lower] + weight * (bead_deltas[upper] - bead_deltas[lower]);
   };
   diagnostic.delta_q20 = quantile(0.20);
   diagnostic.delta_q80 = quantile(0.80);
@@ -2495,7 +2480,6 @@ void Proton_Tunneling::start_attempt(
   reset_attempt_tracking(hydrogen_state);
   hydrogen_state.last_environment = environment;
   hydrogen_state.attempt_environment_start = environment;
-  hydrogen_state.attempt_last_time_fs = time_fs;
   hydrogen_state.attempt_last_state = classify_delta(geometry.delta);
 }
 
@@ -2514,7 +2498,6 @@ void Proton_Tunneling::reset_attempt_tracking(HydrogenState& hydrogen_state)
   hydrogen_state.pending_assignment_nH_to_after = -1;
   hydrogen_state.pending_assignment_from_defect_index = -1;
   hydrogen_state.pending_assignment_to_defect_index = -1;
-  hydrogen_state.pending_assignment_time_fs = 0.0;
   // Keep last_nearest_oxygen as valid-frame history across attempt resets.
   hydrogen_state.commit_seen = false;
   hydrogen_state.time_first_opposite_fs = 0.0;
@@ -2531,8 +2514,7 @@ void Proton_Tunneling::reset_attempt_tracking(HydrogenState& hydrogen_state)
 
 void Proton_Tunneling::update_assignment_change(
   HydrogenState& hydrogen_state,
-  const GeometryResult& geometry,
-  const double time_fs)
+  const GeometryResult& geometry)
 {
   const int previous_oxygen = hydrogen_state.last_nearest_oxygen;
   const int current_oxygen = geometry.nearest_oxygen;
@@ -2548,7 +2530,6 @@ void Proton_Tunneling::update_assignment_change(
       hydrogen_state.pending_assignment_to = -1;
       hydrogen_state.pending_assignment_from_defect_index = -1;
       hydrogen_state.pending_assignment_to_defect_index = -1;
-      hydrogen_state.pending_assignment_time_fs = 0.0;
     } else {
       hydrogen_state.pending_assignment_valid = true;
       hydrogen_state.pending_assignment_from = previous_oxygen;
@@ -2563,7 +2544,6 @@ void Proton_Tunneling::update_assignment_change(
         frame_defect_record_indices_[previous_oxygen];
       hydrogen_state.pending_assignment_to_defect_index =
         frame_defect_record_indices_[current_oxygen];
-      hydrogen_state.pending_assignment_time_fs = time_fs;
     }
   }
 }
@@ -2833,7 +2813,6 @@ void Proton_Tunneling::finish_attempt(
   hydrogen_state.attempt_min_abs_delta = 0.0;
   hydrogen_state.last_environment = LocalEnvironment();
   hydrogen_state.attempt_environment_start = LocalEnvironment();
-  hydrogen_state.attempt_last_time_fs = 0.0;
   hydrogen_state.attempt_last_state = 0;
   reset_attempt_tracking(hydrogen_state);
 }
@@ -2991,7 +2970,6 @@ void Proton_Tunneling::observe_frame(
       if (hydrogen_state.attempt_active) {
         if (hydrogen_state.attempt_last_state == 0)
           hydrogen_state.center_residence_fs += dt;
-        hydrogen_state.attempt_last_time_fs = time_fs;
         hydrogen_state.attempt_last_state = state;
       }
     }
@@ -3049,7 +3027,7 @@ void Proton_Tunneling::observe_frame(
       }
 
       if (hydrogen_state.attempt_active) {
-        update_assignment_change(hydrogen_state, geometry, time_fs);
+        update_assignment_change(hydrogen_state, geometry);
         probe_attempt(hydrogen, geometry, hydrogen_state, local_environment);
         const double abs_delta = std::abs(geometry.delta);
         if (abs_delta < hydrogen_state.attempt_min_abs_delta) {
@@ -3093,11 +3071,6 @@ void Proton_Tunneling::observe_frame(
           hydrogen_state.pending_count = 0;
           hydrogen_state.pending_start_time_fs = 0.0;
         }
-      } else if (state == 0) {
-        start_attempt(
-          hydrogen_state, hydrogen_state.stable_state, time_fs, geometry, local_environment);
-        update_assignment_change(hydrogen_state, geometry, time_fs);
-        probe_attempt(hydrogen, geometry, hydrogen_state, local_environment);
       }
     }
     hydrogen_state.last_nearest_oxygen = geometry.nearest_oxygen;
@@ -3618,9 +3591,6 @@ void Proton_Tunneling::build_causal_network()
       double frac_y = 0.0;
       double frac_z = 0.0;
       bool fractional_valid = true;
-      double current_x = 0.0;
-      double current_y = 0.0;
-      double current_z = 0.0;
       long long gap_count = 0;
       double gap_sum = 0.0;
       bool branched = false;
@@ -3666,11 +3636,8 @@ void Proton_Tunneling::build_causal_network()
         net_x += dx;
         net_y += dy;
         net_z += dz;
-        current_x += dx;
-        current_y += dy;
-        current_z += dz;
         chain.max_span_A = std::max(chain.max_span_A,
-          std::sqrt(current_x * current_x + current_y * current_y + current_z * current_z));
+          std::sqrt(net_x * net_x + net_y * net_y + net_z * net_z));
         if (child.fractional_step_valid != 0) {
           frac_x += sign * child.fractional_dx;
           frac_y += sign * child.fractional_dy;
@@ -3685,11 +3652,12 @@ void Proton_Tunneling::build_causal_network()
           ++gap_count;
         }
         const auto alternatives = threshold_alternatives.find(link_item->second);
-        if (alternatives != threshold_alternatives.end() &&
-            (alternatives->second.first > 0 || alternatives->second.second > 0))
-          branched = true;
-        if (link.carrier_type == CarrierType::edge_reversal)
-          edge_rattling = true;
+        if (alternatives != threshold_alternatives.end()) {
+          chain.alternative_parent_count += alternatives->second.first;
+          chain.alternative_child_count += alternatives->second.second;
+          if (alternatives->second.first > 0 || alternatives->second.second > 0)
+            branched = true;
+        }
       }
       if (!edge_rattling) {
         for (const size_t event_index : path) {
@@ -3751,16 +3719,6 @@ void Proton_Tunneling::build_causal_network()
         ? static_cast<double>(strict_tunneling) / quantum_valid : 0.0;
       chain.fraction_multi_kink = quantum_valid > 0
         ? static_cast<double>(multi_kink) / quantum_valid : 0.0;
-      for (size_t position = 0; position + 1 < path.size(); ++position) {
-        const auto link_item = outgoing.find({static_cast<long long>(path[position]), carrier_id});
-        if (link_item != outgoing.end()) {
-          const auto alternatives = threshold_alternatives.find(link_item->second);
-          if (alternatives != threshold_alternatives.end()) {
-            chain.alternative_parent_count += alternatives->second.first;
-            chain.alternative_child_count += alternatives->second.second;
-          }
-        }
-      }
       if (branched)
         chain.chain_class = ChainClass::branched;
       else if (edge_rattling)
@@ -4156,17 +4114,14 @@ void Proton_Tunneling::write_edge_window(
     const double asymmetry = (biased_samples > 0)
       ? static_cast<double>(stats.n_plus - stats.n_minus) / static_cast<double>(biased_samples)
       : std::numeric_limits<double>::quiet_NaN();
-    const double delta_f = (stats.n_plus > 0 && stats.n_minus > 0)
-      ? std::abs(std::log(static_cast<double>(stats.n_plus) /
-                          static_cast<double>(stats.n_minus)))
-      : std::numeric_limits<double>::quiet_NaN();
-    const double log_population_ratio = (stats.n_plus > 0 && stats.n_minus > 0)
+    const bool has_both_populations = stats.n_plus > 0 && stats.n_minus > 0;
+    const double log_population_ratio = has_both_populations
       ? std::log(static_cast<double>(stats.n_plus) / static_cast<double>(stats.n_minus))
       : std::numeric_limits<double>::quiet_NaN();
-    const double beta_DeltaF_high_minus_low = (stats.n_plus > 0 && stats.n_minus > 0)
+    const double beta_DeltaF_high_minus_low = has_both_populations
       ? -log_population_ratio
       : std::numeric_limits<double>::quiet_NaN();
-    const double abs_beta_DeltaF = (stats.n_plus > 0 && stats.n_minus > 0)
+    const double abs_beta_DeltaF = has_both_populations
       ? std::abs(log_population_ratio)
       : std::numeric_limits<double>::quiet_NaN();
     const double success_probability = (completed_attempts > 0)
@@ -4266,7 +4221,7 @@ void Proton_Tunneling::write_edge_window(
     record.n_deadband = stats.n_deadband;
     record.asymmetry = asymmetry;
     record.abs_asymmetry = std::abs(asymmetry);
-    record.delta_f = delta_f;
+    record.delta_f = abs_beta_DeltaF;
     record.log_population_ratio = log_population_ratio;
     record.beta_DeltaF_high_minus_low = beta_DeltaF_high_minus_low;
     record.abs_beta_DeltaF = abs_beta_DeltaF;
