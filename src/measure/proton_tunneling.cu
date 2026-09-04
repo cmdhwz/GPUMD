@@ -1249,7 +1249,7 @@ void Proton_Tunneling::preprocess(
   oxygen_shell_neighbors_.resize(oxygen_indices_.size());
   hydrogen_count_.resize(number_of_atoms_, 0);
   previous_hydrogen_count_.resize(number_of_atoms_, 0);
-  frame_cause_event_ids_.resize(number_of_atoms_, -1);
+  frame_defect_record_indices_.resize(number_of_atoms_, -1);
   frame_geometries_.resize(hydrogen_indices_.size());
   hydrogen_states_.resize(hydrogen_indices_.size());
   window_assignment_ambiguous_count_ = 0;
@@ -2505,11 +2505,17 @@ void Proton_Tunneling::reset_attempt_tracking(HydrogenState& hydrogen_state)
   hydrogen_state.pending_count = 0;
   hydrogen_state.pending_start_time_fs = 0.0;
   hydrogen_state.first_opposite_seen = false;
-  hydrogen_state.first_opposite_counts_valid = false;
-  hydrogen_state.first_opposite_nH_from_before = 0;
-  hydrogen_state.first_opposite_nH_to_before = 0;
-  hydrogen_state.first_opposite_nH_from_after = 0;
-  hydrogen_state.first_opposite_nH_to_after = 0;
+  hydrogen_state.pending_assignment_valid = false;
+  hydrogen_state.pending_assignment_from = -1;
+  hydrogen_state.pending_assignment_to = -1;
+  hydrogen_state.pending_assignment_nH_from_before = -1;
+  hydrogen_state.pending_assignment_nH_to_before = -1;
+  hydrogen_state.pending_assignment_nH_from_after = -1;
+  hydrogen_state.pending_assignment_nH_to_after = -1;
+  hydrogen_state.pending_assignment_from_defect_index = -1;
+  hydrogen_state.pending_assignment_to_defect_index = -1;
+  hydrogen_state.pending_assignment_time_fs = 0.0;
+  // Keep last_nearest_oxygen as valid-frame history across attempt resets.
   hydrogen_state.commit_seen = false;
   hydrogen_state.time_first_opposite_fs = 0.0;
   hydrogen_state.time_commit_fs = 0.0;
@@ -2521,6 +2527,60 @@ void Proton_Tunneling::reset_attempt_tracking(HydrogenState& hydrogen_state)
   hydrogen_state.has_observation_gap = false;
   hydrogen_state.centroid_best = BeadDiagnostic();
   hydrogen_state.delocalization_best = BeadDiagnostic();
+}
+
+void Proton_Tunneling::update_assignment_change(
+  HydrogenState& hydrogen_state,
+  const GeometryResult& geometry,
+  const double time_fs)
+{
+  const int previous_oxygen = hydrogen_state.last_nearest_oxygen;
+  const int current_oxygen = geometry.nearest_oxygen;
+  const bool valid_oxygen_pair = previous_oxygen >= 0 && current_oxygen >= 0 &&
+    previous_oxygen < static_cast<int>(hydrogen_count_.size()) &&
+    current_oxygen < static_cast<int>(hydrogen_count_.size());
+  if (valid_oxygen_pair && previous_oxygen != current_oxygen) {
+    if (hydrogen_state.pending_assignment_valid &&
+        hydrogen_state.pending_assignment_from == current_oxygen &&
+        hydrogen_state.pending_assignment_to == previous_oxygen) {
+      hydrogen_state.pending_assignment_valid = false;
+      hydrogen_state.pending_assignment_from = -1;
+      hydrogen_state.pending_assignment_to = -1;
+      hydrogen_state.pending_assignment_from_defect_index = -1;
+      hydrogen_state.pending_assignment_to_defect_index = -1;
+      hydrogen_state.pending_assignment_time_fs = 0.0;
+    } else {
+      hydrogen_state.pending_assignment_valid = true;
+      hydrogen_state.pending_assignment_from = previous_oxygen;
+      hydrogen_state.pending_assignment_to = current_oxygen;
+      hydrogen_state.pending_assignment_nH_from_before =
+        previous_hydrogen_count_[previous_oxygen];
+      hydrogen_state.pending_assignment_nH_to_before =
+        previous_hydrogen_count_[current_oxygen];
+      hydrogen_state.pending_assignment_nH_from_after = hydrogen_count_[previous_oxygen];
+      hydrogen_state.pending_assignment_nH_to_after = hydrogen_count_[current_oxygen];
+      hydrogen_state.pending_assignment_from_defect_index =
+        frame_defect_record_indices_[previous_oxygen];
+      hydrogen_state.pending_assignment_to_defect_index =
+        frame_defect_record_indices_[current_oxygen];
+      hydrogen_state.pending_assignment_time_fs = time_fs;
+    }
+  }
+}
+
+void Proton_Tunneling::assign_defect_event(
+  const long long defect_index,
+  const long long attempt_id)
+{
+  if (defect_index < 0 ||
+      defect_index >= static_cast<long long>(defect_records_.size()))
+    return;
+  long long& cause_event_id =
+    defect_records_[static_cast<size_t>(defect_index)].cause_event_id;
+  if (cause_event_id == -1)
+    cause_event_id = attempt_id;
+  else if (cause_event_id != attempt_id)
+    cause_event_id = -2;
 }
 
 const char* Proton_Tunneling::outcome_name(const AttemptOutcome outcome) const
@@ -2698,16 +2758,9 @@ void Proton_Tunneling::finish_attempt(
   record.delocalization_best = hydrogen_state.delocalization_best;
 
   if (outcome == AttemptOutcome::success && geometry != nullptr) {
-    const int nH_from_before = hydrogen_state.first_opposite_counts_valid
-      ? hydrogen_state.first_opposite_nH_from_before
-      : previous_hydrogen_count_[oxygen_from];
-    const int nH_to_before = hydrogen_state.first_opposite_counts_valid
-      ? hydrogen_state.first_opposite_nH_to_before
-      : previous_hydrogen_count_[oxygen_target];
-    const int nH_from_after = hydrogen_state.first_opposite_counts_valid
-      ? hydrogen_state.first_opposite_nH_from_after : nH_from_before - 1;
-    const int nH_to_after = hydrogen_state.first_opposite_counts_valid
-      ? hydrogen_state.first_opposite_nH_to_after : nH_to_before + 1;
+    const bool transfer_counts_valid = hydrogen_state.pending_assignment_valid &&
+      hydrogen_state.pending_assignment_from == oxygen_from &&
+      hydrogen_state.pending_assignment_to == oxygen_target;
     double dx = geometry->low_to_high_dx;
     double dy = geometry->low_to_high_dy;
     double dz = geometry->low_to_high_dz;
@@ -2717,10 +2770,15 @@ void Proton_Tunneling::finish_attempt(
       dz = -dz;
     }
     record.has_transfer = true;
-    record.nH_from_before = nH_from_before;
-    record.nH_to_before = nH_to_before;
-    record.nH_from_after = nH_from_after;
-    record.nH_to_after = nH_to_after;
+    record.transfer_counts_valid = transfer_counts_valid;
+    record.nH_from_before = transfer_counts_valid
+      ? hydrogen_state.pending_assignment_nH_from_before : -1;
+    record.nH_to_before = transfer_counts_valid
+      ? hydrogen_state.pending_assignment_nH_to_before : -1;
+    record.nH_from_after = transfer_counts_valid
+      ? hydrogen_state.pending_assignment_nH_from_after : -1;
+    record.nH_to_after = transfer_counts_valid
+      ? hydrogen_state.pending_assignment_nH_to_after : -1;
     record.dx = dx;
     record.dy = dy;
     record.dz = dz;
@@ -2749,16 +2807,13 @@ void Proton_Tunneling::finish_attempt(
       ++environment_stats.geometry_lost;
   }
   attempt_records_.push_back(record);
-  if (record.has_transfer) {
-    const long long event_id = record.attempt_id;
-    const int touched_oxygens[2] = {record.oxygen_from, record.oxygen_target};
-    for (const int oxygen : touched_oxygens) {
-      if (oxygen < 0 || oxygen >= static_cast<int>(frame_cause_event_ids_.size()))
-        continue;
-      if (frame_cause_event_ids_[oxygen] == -1)
-        frame_cause_event_ids_[oxygen] = event_id;
-      else if (frame_cause_event_ids_[oxygen] != event_id)
-        frame_cause_event_ids_[oxygen] = -2;
+  if (record.has_transfer && record.transfer_counts_valid) {
+    assign_defect_event(
+      hydrogen_state.pending_assignment_from_defect_index, record.attempt_id);
+    if (hydrogen_state.pending_assignment_to_defect_index !=
+        hydrogen_state.pending_assignment_from_defect_index) {
+      assign_defect_event(
+        hydrogen_state.pending_assignment_to_defect_index, record.attempt_id);
     }
   }
 
@@ -2798,7 +2853,6 @@ void Proton_Tunneling::observe_frame(
     window_start_time_fs_ = time_fs;
 
   std::fill(hydrogen_count_.begin(), hydrogen_count_.end(), 0);
-  std::fill(frame_cause_event_ids_.begin(), frame_cause_event_ids_.end(), -1);
   compute_geometry_gpu(box, atom);
   const auto state_machine_start = std::chrono::high_resolution_clock::now();
   for (const GeometryResult& geometry : frame_geometries_)
@@ -2833,6 +2887,20 @@ void Proton_Tunneling::observe_frame(
     }
     previous_hydrogen_count_ = hydrogen_count_;
     defect_state_initialized_ = true;
+  }
+  std::fill(frame_defect_record_indices_.begin(), frame_defect_record_indices_.end(), -1);
+  for (const int oxygen : oxygen_indices_) {
+    if (hydrogen_count_[oxygen] != previous_hydrogen_count_[oxygen]) {
+      DefectRecord record;
+      record.time_fs = time_fs;
+      record.oxygen = oxygen;
+      record.q_defect = hydrogen_count_[oxygen] - 2;
+      record.hydrogen_count = hydrogen_count_[oxygen];
+      record.cause_event_id = -1;
+      frame_defect_record_indices_[oxygen] =
+        static_cast<long long>(defect_records_.size());
+      defect_records_.push_back(record);
+    }
   }
   bool bead_probe_frame = false;
   const auto probe_attempt = [&](const int hydrogen,
@@ -2981,6 +3049,7 @@ void Proton_Tunneling::observe_frame(
       }
 
       if (hydrogen_state.attempt_active) {
+        update_assignment_change(hydrogen_state, geometry, time_fs);
         probe_attempt(hydrogen, geometry, hydrogen_state, local_environment);
         const double abs_delta = std::abs(geometry.delta);
         if (abs_delta < hydrogen_state.attempt_min_abs_delta) {
@@ -2999,27 +3068,6 @@ void Proton_Tunneling::observe_frame(
           if (!hydrogen_state.first_opposite_seen) {
             hydrogen_state.first_opposite_seen = true;
             hydrogen_state.time_first_opposite_fs = time_fs;
-            const int oxygen_from = (hydrogen_state.attempt_from_state < 0)
-              ? geometry.oxygen_low : geometry.oxygen_high;
-            const int oxygen_target = (hydrogen_state.attempt_from_state < 0)
-              ? geometry.oxygen_high : geometry.oxygen_low;
-            if (oxygen_from >= 0 && oxygen_target >= 0 &&
-                oxygen_from < number_of_atoms_ && oxygen_target < number_of_atoms_) {
-              // These are the actual counts in the first-opposite frame. Do
-              // not reconstruct them again at confirmation time: with
-              // hold_samples > 1 the current frame may already contain the
-              // transfer, and same-frame concerted events are represented by
-              // their net count change.
-              hydrogen_state.first_opposite_counts_valid = true;
-              hydrogen_state.first_opposite_nH_from_before =
-                previous_hydrogen_count_[oxygen_from];
-              hydrogen_state.first_opposite_nH_to_before =
-                previous_hydrogen_count_[oxygen_target];
-              hydrogen_state.first_opposite_nH_from_after =
-                hydrogen_count_[oxygen_from];
-              hydrogen_state.first_opposite_nH_to_after =
-                hydrogen_count_[oxygen_target];
-            }
           }
           if (hydrogen_state.pending_state == state) {
             ++hydrogen_state.pending_count;
@@ -3048,9 +3096,11 @@ void Proton_Tunneling::observe_frame(
       } else if (state == 0) {
         start_attempt(
           hydrogen_state, hydrogen_state.stable_state, time_fs, geometry, local_environment);
+        update_assignment_change(hydrogen_state, geometry, time_fs);
         probe_attempt(hydrogen, geometry, hydrogen_state, local_environment);
       }
     }
+    hydrogen_state.last_nearest_oxygen = geometry.nearest_oxygen;
     hydrogen_state.last_delta = geometry.delta;
     hydrogen_state.last_E_parallel = geometry.E_ion_nominal_parallel;
     hydrogen_state.last_delta_phi_ion = geometry.delta_phi_ion;
@@ -3064,17 +3114,6 @@ void Proton_Tunneling::observe_frame(
 
   record_local_traces(time_fs);
 
-  for (const int oxygen : oxygen_indices_) {
-    if (hydrogen_count_[oxygen] != previous_hydrogen_count_[oxygen]) {
-      DefectRecord record;
-      record.time_fs = time_fs;
-      record.oxygen = oxygen;
-      record.q_defect = hydrogen_count_[oxygen] - 2;
-      record.hydrogen_count = hydrogen_count_[oxygen];
-      record.cause_event_id = frame_cause_event_ids_[oxygen];
-      defect_records_.push_back(record);
-    }
-  }
   previous_hydrogen_count_ = hydrogen_count_;
 
   for (const int oxygen : oxygen_indices_) {
@@ -3159,6 +3198,8 @@ bool Proton_Tunneling::has_defect_continuity(
   const AttemptRecord& child,
   const CarrierType carrier) const
 {
+  if (!parent.transfer_counts_valid || !child.transfer_counts_valid)
+    return false;
   if (carrier == CarrierType::excess) {
     const int parent_q = parent.nH_to_after - 2;
     const int child_q = child.nH_from_before - 2;
@@ -3658,6 +3699,10 @@ void Proton_Tunneling::build_causal_network()
             continue;
           for (const size_t link_index : reversal_item->second) {
             const CausalLinkRecord& link = causal_link_records_[link_index];
+            if (link.temporal_type == TemporalType::temporally_invalid ||
+                link.lag_first_opposite_fs <= 0.0 ||
+                link.lag_first_opposite_fs > lag_threshold_fs)
+              continue;
             const AttemptRecord& child_event =
               attempt_records_[static_cast<size_t>(link.child_attempt_index)];
             if (path_edges.find(make_bond_key(child_event.oxygen_low, child_event.oxygen_high)) !=

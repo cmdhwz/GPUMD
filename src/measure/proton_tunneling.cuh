@@ -322,6 +322,7 @@ private:
     BeadDiagnostic centroid_best;
     BeadDiagnostic delocalization_best;
     bool has_transfer = false;
+    bool transfer_counts_valid = false;
     int nH_from_before = 0;
     int nH_to_before = 0;
     int nH_from_after = 0;
@@ -775,11 +776,17 @@ private:
     double attempt_min_abs_delta = 0.0;
     double pending_start_time_fs = 0.0;
     bool first_opposite_seen = false;
-    bool first_opposite_counts_valid = false;
-    int first_opposite_nH_from_before = 0;
-    int first_opposite_nH_to_before = 0;
-    int first_opposite_nH_from_after = 0;
-    int first_opposite_nH_to_after = 0;
+    int last_nearest_oxygen = -1;
+    bool pending_assignment_valid = false;
+    int pending_assignment_from = -1;
+    int pending_assignment_to = -1;
+    int pending_assignment_nH_from_before = -1;
+    int pending_assignment_nH_to_before = -1;
+    int pending_assignment_nH_from_after = -1;
+    int pending_assignment_nH_to_after = -1;
+    long long pending_assignment_from_defect_index = -1;
+    long long pending_assignment_to_defect_index = -1;
+    double pending_assignment_time_fs = 0.0;
     bool commit_seen = false;
     double time_first_opposite_fs = 0.0;
     double time_commit_fs = 0.0;
@@ -846,6 +853,11 @@ private:
   void close_observation_gap(HydrogenState& hydrogen_state, const double time_fs);
   void reset_after_observation_gap(HydrogenState& hydrogen_state);
   void reset_attempt_tracking(HydrogenState& hydrogen_state);
+  void update_assignment_change(
+    HydrogenState& hydrogen_state,
+    const GeometryResult& geometry,
+    const double time_fs);
+  void assign_defect_event(const long long defect_index, const long long attempt_id);
   void start_attempt(
     HydrogenState& hydrogen_state,
     const int stable_state,
@@ -1002,7 +1014,7 @@ private:
   gpuEvent_t local_environment_kernel_end_event_ = nullptr;
   std::vector<int> hydrogen_count_;
   std::vector<int> previous_hydrogen_count_;
-  std::vector<long long> frame_cause_event_ids_;
+  std::vector<long long> frame_defect_record_indices_;
   std::vector<GeometryResult> frame_geometries_;
   std::vector<LocalEnvironment> frame_local_environments_;
   std::vector<HydrogenState> hydrogen_states_;
