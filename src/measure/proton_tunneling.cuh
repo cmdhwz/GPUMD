@@ -15,6 +15,7 @@
 
 #pragma once
 #include "property.cuh"
+#include <array>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -810,7 +811,6 @@ private:
   void compute_local_environment_gpu(const Box& box, Atom& atom);
   void assign_local_environment_topology();
   void release_geometry_timing_events();
-  void compute_ion_field(const Box& box, GeometryResult& geometry) const;
   bool ensure_bead_positions(Atom& atom);
   bool evaluate_bead_diagnostic(
     Atom& atom,
@@ -823,11 +823,9 @@ private:
   bool is_better_delocalization_diagnostic(
     const BeadDiagnostic& candidate,
     const BeadDiagnostic& current) const;
+  int quantum_character_code(
+    const QuantumCharacter character, const int default_code) const;
   const char* quantum_character_name(const QuantumCharacter character) const;
-  bool find_geometry(
-    const int hydrogen,
-    const Box& box,
-    GeometryResult& geometry) const;
   int classify_delta(const double delta) const;
   void record_bond(
     std::unordered_map<unsigned long long, BondStats>& bond_stats,
@@ -847,6 +845,7 @@ private:
   void begin_observation_gap(HydrogenState& hydrogen_state);
   void close_observation_gap(HydrogenState& hydrogen_state, const double time_fs);
   void reset_after_observation_gap(HydrogenState& hydrogen_state);
+  void reset_attempt_tracking(HydrogenState& hydrogen_state);
   void start_attempt(
     HydrogenState& hydrogen_state,
     const int stable_state,
@@ -861,6 +860,17 @@ private:
     const double delta_end,
     const GeometryResult* geometry,
     const LocalEnvironment* environment);
+  double first_opposite_time(const AttemptRecord& record) const;
+  bool has_defect_continuity(
+    const AttemptRecord& parent,
+    const AttemptRecord& child,
+    const CarrierType carrier) const;
+  std::array<double, 19> ion_influence_values(
+    const BondStats& stats,
+    const int species,
+    const DominantIonStats* dominant) const;
+  std::array<double, 40> local_environment_values(
+    const LocalEnvironmentStats& stats) const;
   void build_causal_network();
   void build_causal_lag_histogram();
   int carrier_code(const CarrierType carrier) const;
