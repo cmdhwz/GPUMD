@@ -371,6 +371,7 @@ __global__ void gpu_find_proton_geometry(
   const double angle_cosine_limit,
   const double assignment_path_excess_weight,
   const double assignment_score_gap_min,
+  const int static_edge_distribution_enabled,
   const int ion_field_enabled,
   const double ion_field_cutoff,
   const int local_influence_enabled,
@@ -487,7 +488,8 @@ __global__ void gpu_find_proton_geometry(
           const double low_distance = sqrt(low_x * low_x + low_y * low_y + low_z * low_z);
           const double high_distance = sqrt(high_x * high_x + high_y * high_y + high_z * high_z);
           if (low_distance > 0.0 && high_distance > 0.0 &&
-              low_distance <= 1.60 && high_distance <= 1.60) {
+              (static_edge_distribution_enabled != 0 ||
+               (low_distance <= 1.60 && high_distance <= 1.60))) {
             const double angle_cosine = (low_x * high_x + low_y * high_y + low_z * high_z) /
               (low_distance * high_distance);
             if (angle_cosine <= angle_cosine_limit) {
@@ -791,7 +793,8 @@ void Proton_Tunneling::parse(
       std::strcmp(value, "causal_chain") == 0 ||
       std::strcmp(value, "causal_lag_bins") == 0 ||
       std::strcmp(value, "causal_null") == 0 ||
-      std::strcmp(value, "causal_mode") == 0;
+      std::strcmp(value, "causal_mode") == 0 ||
+      std::strcmp(value, "static_edge_distribution") == 0;
   };
   if (next_param < num_param && !is_option(param[next_param])) {
     if (next_param + 1 >= num_param || is_option(param[next_param + 1])) {
@@ -811,6 +814,7 @@ void Proton_Tunneling::parse(
   bool causal_lag_bins_seen = false;
   bool causal_null_seen = false;
   bool causal_mode_seen = false;
+  bool static_edge_distribution_seen = false;
   while (next_param < num_param) {
     if (std::strcmp(param[next_param], "oho_angle") == 0) {
       if (angle_seen || next_param + 1 >= num_param ||
@@ -1048,6 +1052,19 @@ void Proton_Tunneling::parse(
         PRINT_INPUT_ERROR("causal_mode should be raw or inline.");
       }
       next_param += 2;
+    } else if (std::strcmp(param[next_param], "static_edge_distribution") == 0) {
+      if (static_edge_distribution_seen || next_param + 3 >= num_param ||
+          is_option(param[next_param + 1]) || is_option(param[next_param + 2]) ||
+          is_option(param[next_param + 3]) ||
+          !is_valid_int(param[next_param + 1], &static_delta_bins_) ||
+          !is_valid_real(param[next_param + 2], &static_delta_min_) ||
+          !is_valid_real(param[next_param + 3], &static_delta_max_)) {
+        PRINT_INPUT_ERROR(
+          "static_edge_distribution must be followed by bins delta_min delta_max.");
+      }
+      static_edge_distribution_seen = true;
+      static_edge_distribution_enabled_ = true;
+      next_param += 4;
     } else {
       PRINT_INPUT_ERROR("unknown optional compute_proton_tunneling setting.");
     }
@@ -1104,6 +1121,18 @@ void Proton_Tunneling::parse(
       (output_level_seen || snapshots_seen)) {
     PRINT_INPUT_ERROR("output_level and snapshots require output netcdf.");
   }
+  if (static_edge_distribution_enabled_) {
+    if (output_format_ != OutputFormat::NETCDF)
+      PRINT_INPUT_ERROR("static_edge_distribution requires output netcdf.");
+    if (static_delta_bins_ <= 0 || static_delta_bins_ > 4096 ||
+        static_delta_max_ <= static_delta_min_)
+      PRINT_INPUT_ERROR(
+        "static_edge_distribution requires 1..4096 bins and delta_max > delta_min.");
+    if (bead_diagnostic_enabled_ || local_environment_enabled_ || local_influence_enabled_ ||
+        !local_trace_edges_.empty() || causal_chain_enabled_)
+      PRINT_INPUT_ERROR(
+        "static_edge_distribution cannot be combined with event, bead, or local diagnostics.");
+  }
 
   printf("    sample interval is %d steps.\n", sample_interval_);
   printf("    window size is %d sampled frames.\n", window_samples_);
@@ -1122,6 +1151,9 @@ void Proton_Tunneling::parse(
     printf("    compressed NetCDF output is %s, deflate level %d, output level %s, snapshots %s.\n",
       output_filename_.c_str(), compression_level_, level, snapshots);
   }
+  if (static_edge_distribution_enabled_)
+    printf("    PIMD static edge distribution uses %d delta bins from %.6f to %.6f Angstrom.\n",
+      static_delta_bins_, static_delta_min_, static_delta_max_);
   if (bead_diagnostic_enabled_) {
     printf("    strict bead diagnostic uses f_min %.6f, center_max %.6f, centroid_max %.6f, "
            "and span_min %.6f Angstrom.\n",
@@ -1209,6 +1241,16 @@ void Proton_Tunneling::preprocess(
   number_of_atoms_ = atom.number_of_atoms;
   number_of_beads_ = atom.number_of_beads;
   ensemble_type_ = integrate.type;
+  if (static_edge_distribution_enabled_ && ensemble_type_ != 33)
+    PRINT_INPUT_ERROR("static_edge_distribution is supported only for ensemble pimd.");
+  if (static_edge_distribution_enabled_) {
+    FILE* existing_output = std::fopen(output_filename_.c_str(), "rb");
+    if (existing_output != nullptr) {
+      std::fclose(existing_output);
+      PRINT_INPUT_ERROR(
+        "static_edge_distribution output already exists; remove or rename it before rerunning.");
+    }
+  }
   time_step_ = time_step;
   cpu_position_.resize(number_of_atoms_ * 3);
   bead_positions_cached_ = false;
@@ -1248,6 +1290,11 @@ void Proton_Tunneling::preprocess(
   window_local_environment_stats_.clear();
   dominant_ion_stats_[0].clear();
   dominant_ion_stats_[1].clear();
+  pimd_edge_stats_.clear();
+  static_temperature_sum_K_ = 0.0;
+  static_temperature_min_K_ = 0.0;
+  static_temperature_max_K_ = 0.0;
+  static_temperature_samples_ = 0;
   attempt_records_.reserve(1024);
   defect_records_.reserve(1024);
   window_records_.reserve(64);
@@ -1281,6 +1328,26 @@ void Proton_Tunneling::preprocess(
     reference_oxygen_fractional_[oxygen + 2 * number_of_atoms_] = sz;
   }
   build_oxygen_shell(box);
+  if (static_edge_distribution_enabled_) {
+    if (reference_edge_keys_.empty())
+      PRINT_INPUT_ERROR("static_edge_distribution found no mutual reference O-O edges.");
+    constexpr size_t static_histogram_memory_limit = 512ULL * 1024ULL * 1024ULL;
+    const size_t delta_bins = static_cast<size_t>(static_delta_bins_);
+    const size_t environment_bins = static_cast<size_t>(static_environment_bins_);
+    const size_t cells_per_edge = delta_bins * (1 + 3 * environment_bins);
+    const size_t estimated_bytes = reference_edge_keys_.size() * cells_per_edge * sizeof(long long);
+    if (estimated_bytes > static_histogram_memory_limit)
+      PRINT_INPUT_ERROR(
+        "static_edge_distribution histograms exceed 512 MiB; reduce delta bins or system size.");
+    pimd_edge_stats_.reserve(reference_edge_keys_.size());
+    for (const unsigned long long key : reference_edge_keys_) {
+      PimdEdgeStats& stats = pimd_edge_stats_[key];
+      stats.delta_hist.assign(static_delta_bins_, 0);
+      stats.delta_dOO_hist.assign(static_delta_bins_ * static_environment_bins_, 0);
+      stats.delta_ion1_hist.assign(static_delta_bins_ * static_environment_bins_, 0);
+      stats.delta_ion2_hist.assign(static_delta_bins_ * static_environment_bins_, 0);
+    }
+  }
   initialize_geometry_gpu();
   CHECK(gpuEventCreate(&geometry_kernel_start_event_));
   CHECK(gpuEventCreate(&geometry_kernel_end_event_));
@@ -1336,6 +1403,32 @@ void Proton_Tunneling::build_oxygen_shell(const Box& box)
     }
     oxygen_shell_offsets_cpu_[i + 1] =
       static_cast<int>(oxygen_shell_neighbors_cpu_.size());
+  }
+
+  reference_edge_keys_.clear();
+  for (size_t i = 0; i < shell_neighbors.size(); ++i) {
+    const int oxygen_low = oxygen_indices_[i];
+    for (int neighbor : shell_neighbors[i]) {
+      if (std::find(
+            shell_neighbors[oxygen_local_index_[neighbor]].begin(),
+            shell_neighbors[oxygen_local_index_[neighbor]].end(), oxygen_low) !=
+          shell_neighbors[oxygen_local_index_[neighbor]].end())
+        reference_edge_keys_.push_back(
+          make_bond_key(std::min(oxygen_low, neighbor), std::max(oxygen_low, neighbor)));
+    }
+  }
+  std::sort(reference_edge_keys_.begin(), reference_edge_keys_.end());
+  reference_edge_keys_.erase(
+    std::unique(reference_edge_keys_.begin(), reference_edge_keys_.end()),
+    reference_edge_keys_.end());
+  reference_edges_by_oxygen_.clear();
+  reference_edges_by_oxygen_.reserve(reference_edge_keys_.size() * 2);
+  for (const unsigned long long key : reference_edge_keys_) {
+    int oxygen_low;
+    int oxygen_high;
+    decode_bond_key(key, oxygen_low, oxygen_high);
+    reference_edges_by_oxygen_[oxygen_low].push_back(key);
+    reference_edges_by_oxygen_[oxygen_high].push_back(key);
   }
 }
 
@@ -1399,6 +1492,7 @@ void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
     std::cos(oho_angle_min_deg_ * 0.017453292519943295),
     assignment_path_excess_weight_,
     assignment_score_gap_min_,
+    static_edge_distribution_enabled_ ? 1 : 0,
     ion_field_enabled_ ? 1 : 0,
     ion_field_cutoff_,
     species_decomposition_enabled,
@@ -2015,6 +2109,221 @@ void Proton_Tunneling::record_bond(
     ++stats.n_minus;
   else
     ++stats.n_deadband;
+}
+
+void Proton_Tunneling::record_pimd_edge_distribution(const Box& box, Atom& atom)
+{
+  atom.position_per_atom.copy_to_host(cpu_position_.data());
+
+  std::unordered_map<unsigned long long, int> valid_counts;
+  std::unordered_map<unsigned long long, int> ambiguous_counts;
+  std::unordered_map<unsigned long long, int> filtered_counts;
+  std::unordered_map<unsigned long long, const GeometryResult*> unique_geometry;
+  valid_counts.reserve(frame_geometries_.size());
+  ambiguous_counts.reserve(frame_geometries_.size());
+  filtered_counts.reserve(frame_geometries_.size());
+  unique_geometry.reserve(frame_geometries_.size());
+  for (const GeometryResult& geometry : frame_geometries_) {
+    if (geometry.oxygen_low < 0 || geometry.oxygen_high < 0 ||
+        geometry.oxygen_low == geometry.oxygen_high)
+      continue;
+    const unsigned long long key = make_bond_key(geometry.oxygen_low, geometry.oxygen_high);
+    if (pimd_edge_stats_.find(key) == pimd_edge_stats_.end())
+      continue;
+    if (geometry.assignment_ambiguous)
+      ++ambiguous_counts[key];
+    if (geometry.valid) {
+      ++valid_counts[key];
+      unique_geometry[key] = &geometry;
+    }
+  }
+
+  // ponytail: use the nearest anchor's bounded O-O shell as the rejection fallback;
+  // avoid a second GPU candidate buffer, with at most eight host checks per H.
+  for (size_t h_index = 0; h_index < frame_geometries_.size(); ++h_index) {
+    const GeometryResult& geometry = frame_geometries_[h_index];
+    if (geometry.valid || geometry.assignment_ambiguous || geometry.nearest_oxygen < 0)
+      continue;
+    const auto incident = reference_edges_by_oxygen_.find(geometry.nearest_oxygen);
+    if (incident == reference_edges_by_oxygen_.end())
+      continue;
+    const int hydrogen = hydrogen_indices_[h_index];
+    double best_score = std::numeric_limits<double>::max();
+    unsigned long long best_key = 0;
+    for (const unsigned long long key : incident->second) {
+      int oxygen_low;
+      int oxygen_high;
+      decode_bond_key(key, oxygen_low, oxygen_high);
+      double ox = cpu_position_[oxygen_high] - cpu_position_[oxygen_low];
+      double oy = cpu_position_[oxygen_high + number_of_atoms_] -
+        cpu_position_[oxygen_low + number_of_atoms_];
+      double oz = cpu_position_[oxygen_high + 2 * number_of_atoms_] -
+        cpu_position_[oxygen_low + 2 * number_of_atoms_];
+      apply_mic(box, ox, oy, oz);
+      const double dOO_square = ox * ox + oy * oy + oz * oz;
+      if (dOO_square <= 0.0)
+        continue;
+      double hx = cpu_position_[hydrogen] - cpu_position_[oxygen_low];
+      double hy = cpu_position_[hydrogen + number_of_atoms_] -
+        cpu_position_[oxygen_low + number_of_atoms_];
+      double hz = cpu_position_[hydrogen + 2 * number_of_atoms_] -
+        cpu_position_[oxygen_low + 2 * number_of_atoms_];
+      apply_mic(box, hx, hy, hz);
+      const double projection = (hx * ox + hy * oy + hz * oz) / dOO_square;
+      if (projection < -1.0e-10 || projection > 1.0 + 1.0e-10)
+        continue;
+      const double px = hx - projection * ox;
+      const double py = hy - projection * oy;
+      const double pz = hz - projection * oz;
+      const double rperp = std::sqrt(px * px + py * py + pz * pz);
+      const double low_distance = std::sqrt(hx * hx + hy * hy + hz * hz);
+      double high_x = cpu_position_[hydrogen] - cpu_position_[oxygen_high];
+      double high_y = cpu_position_[hydrogen + number_of_atoms_] -
+        cpu_position_[oxygen_high + number_of_atoms_];
+      double high_z = cpu_position_[hydrogen + 2 * number_of_atoms_] -
+        cpu_position_[oxygen_high + 2 * number_of_atoms_];
+      apply_mic(box, high_x, high_y, high_z);
+      const double high_distance = std::sqrt(
+        high_x * high_x + high_y * high_y + high_z * high_z);
+      const double score = rperp + assignment_path_excess_weight_ * std::max(
+        0.0, low_distance + high_distance - std::sqrt(dOO_square));
+      if (score < best_score) {
+        best_score = score;
+        best_key = key;
+      }
+    }
+    if (best_score < std::numeric_limits<double>::max())
+      ++filtered_counts[best_key];
+  }
+
+  const auto bin_index = [](const double value, const double lower, const double upper,
+                            const int number_of_bins, long long& underflow,
+                            long long& overflow) {
+    if (!std::isfinite(value))
+      return -1;
+    if (value < lower) {
+      ++underflow;
+      return -1;
+    }
+    if (value >= upper) {
+      ++overflow;
+      return -1;
+    }
+    return std::min(number_of_bins - 1,
+      static_cast<int>((value - lower) * number_of_bins / (upper - lower)));
+  };
+
+  const auto nearest_ion_distance = [&](const int oxygen_low, const double ox, const double oy,
+                                        const double oz, const std::vector<int>& ions) {
+    double nearest = 1.0e300;
+    for (const int ion : ions) {
+      double ix = cpu_position_[ion] - cpu_position_[oxygen_low];
+      double iy = cpu_position_[ion + number_of_atoms_] -
+        cpu_position_[oxygen_low + number_of_atoms_];
+      double iz = cpu_position_[ion + 2 * number_of_atoms_] -
+        cpu_position_[oxygen_low + 2 * number_of_atoms_];
+      apply_mic(box, ix, iy, iz);
+      double mx = 0.5 * ox - ix;
+      double my = 0.5 * oy - iy;
+      double mz = 0.5 * oz - iz;
+      apply_mic(box, mx, my, mz);
+      nearest = std::min(nearest, std::sqrt(mx * mx + my * my + mz * mz));
+    }
+    return nearest < 1.0e299 ? nearest : std::numeric_limits<double>::quiet_NaN();
+  };
+
+  for (const unsigned long long key : reference_edge_keys_) {
+    PimdEdgeStats& stats = pimd_edge_stats_.at(key);
+    ++stats.n_frames;
+    int oxygen_low;
+    int oxygen_high;
+    decode_bond_key(key, oxygen_low, oxygen_high);
+
+    double ox = cpu_position_[oxygen_high] - cpu_position_[oxygen_low];
+    double oy = cpu_position_[oxygen_high + number_of_atoms_] -
+      cpu_position_[oxygen_low + number_of_atoms_];
+    double oz = cpu_position_[oxygen_high + 2 * number_of_atoms_] -
+      cpu_position_[oxygen_low + 2 * number_of_atoms_];
+    apply_mic(box, ox, oy, oz);
+    const double dOO = std::sqrt(ox * ox + oy * oy + oz * oz);
+    int dOO_bin = -1;
+    if (std::isfinite(dOO)) {
+      ++stats.n_dOO;
+      stats.sum_dOO += dOO;
+      dOO_bin = bin_index(
+        dOO, dOO_min_, dOO_max_, static_environment_bins_,
+        stats.dOO_underflow, stats.dOO_overflow);
+    }
+
+    const double ion1_distance = ion_field_enabled_ ? nearest_ion_distance(
+      oxygen_low, ox, oy, oz, ion1_indices_) : std::numeric_limits<double>::quiet_NaN();
+    const double ion2_distance = ion_field_enabled_ ? nearest_ion_distance(
+      oxygen_low, ox, oy, oz, ion2_indices_) : std::numeric_limits<double>::quiet_NaN();
+    int ion1_bin = -1;
+    int ion2_bin = -1;
+    if (std::isfinite(ion1_distance)) {
+      ++stats.n_ion1;
+      stats.sum_ion1 += ion1_distance;
+      ion1_bin = bin_index(
+        ion1_distance, 0.0, static_environment_max_, static_environment_bins_,
+        stats.ion1_underflow, stats.ion1_overflow);
+    }
+    if (std::isfinite(ion2_distance)) {
+      ++stats.n_ion2;
+      stats.sum_ion2 += ion2_distance;
+      ion2_bin = bin_index(
+        ion2_distance, 0.0, static_environment_max_, static_environment_bins_,
+        stats.ion2_underflow, stats.ion2_overflow);
+    }
+
+    const auto ambiguous = ambiguous_counts.find(key);
+    const auto valid = valid_counts.find(key);
+    const auto filtered = filtered_counts.find(key);
+    const int number_of_ambiguous = ambiguous == ambiguous_counts.end() ? 0 : ambiguous->second;
+    const int number_of_valid = valid == valid_counts.end() ? 0 : valid->second;
+    const int number_of_filtered = filtered == filtered_counts.end() ? 0 : filtered->second;
+    if (number_of_ambiguous > 0) {
+      ++stats.n_ambiguous;
+      continue;
+    }
+    if (number_of_valid + number_of_filtered > 1) {
+      ++stats.n_multiple_H;
+      continue;
+    }
+    if (number_of_valid == 0) {
+      if (number_of_filtered == 1)
+        ++stats.n_geometry_filtered;
+      else
+        ++stats.n_empty;
+      continue;
+    }
+
+    const GeometryResult& geometry = *unique_geometry.at(key);
+    if (!std::isfinite(geometry.delta)) {
+      ++stats.n_ambiguous;
+      continue;
+    }
+    ++stats.n_samples;
+    const int state = classify_delta(geometry.delta);
+    if (state < 0)
+      ++stats.n_minus;
+    else if (state > 0)
+      ++stats.n_plus;
+    if (std::abs(geometry.delta) < 0.10)
+      ++stats.n_center;
+
+    const int delta_bin = bin_index(
+      geometry.delta, static_delta_min_, static_delta_max_, static_delta_bins_,
+      stats.delta_underflow, stats.delta_overflow);
+    if (delta_bin >= 0)
+      ++stats.delta_hist[delta_bin];
+    if (delta_bin >= 0 && dOO_bin >= 0)
+      ++stats.delta_dOO_hist[delta_bin * static_environment_bins_ + dOO_bin];
+    if (delta_bin >= 0 && ion1_bin >= 0)
+      ++stats.delta_ion1_hist[delta_bin * static_environment_bins_ + ion1_bin];
+    if (delta_bin >= 0 && ion2_bin >= 0)
+      ++stats.delta_ion2_hist[delta_bin * static_environment_bins_ + ion2_bin];
+  }
 }
 
 void Proton_Tunneling::record_bond_time(
@@ -2834,6 +3143,16 @@ void Proton_Tunneling::observe_frame(
   std::fill(hydrogen_count_.begin(), hydrogen_count_.end(), 0);
   compute_geometry_gpu(box, atom);
   const auto state_machine_start = std::chrono::high_resolution_clock::now();
+  if (static_edge_distribution_enabled_) {
+    record_pimd_edge_distribution(box, atom);
+    last_time_fs_ = time_fs;
+    const auto observer_end = std::chrono::high_resolution_clock::now();
+    state_machine_wall_time_ +=
+      std::chrono::duration<double>(observer_end - state_machine_start).count();
+    total_observer_wall_time_ +=
+      std::chrono::duration<double>(observer_end - observer_start).count();
+    return;
+  }
   for (const GeometryResult& geometry : frame_geometries_)
     if (geometry.nearest_oxygen >= 0)
       ++hydrogen_count_[geometry.nearest_oxygen];
@@ -3982,7 +4301,6 @@ void Proton_Tunneling::process(
   (void)number_of_steps;
   (void)fixed_group;
   (void)move_group;
-  (void)temperature;
   (void)integrate;
   (void)group;
   (void)thermo;
@@ -3990,6 +4308,17 @@ void Proton_Tunneling::process(
   if (!initialized_ || (step + 1) % sample_interval_ != 0)
     return;
 
+  if (static_edge_distribution_enabled_ && temperature > 0.0) {
+    static_temperature_sum_K_ += temperature;
+    if (static_temperature_samples_ == 0) {
+      static_temperature_min_K_ = temperature;
+      static_temperature_max_K_ = temperature;
+    } else {
+      static_temperature_min_K_ = std::min(static_temperature_min_K_, temperature);
+      static_temperature_max_K_ = std::max(static_temperature_max_K_, temperature);
+    }
+    ++static_temperature_samples_;
+  }
   observe_frame(global_time * TIME_UNIT_CONVERSION, box, atom);
 }
 
@@ -4963,9 +5292,11 @@ void Proton_Tunneling::write_netcdf_output_file()
   netcdf_text_attribute(ncid, NC_GLOBAL, "program", "GPUMD");
   netcdf_text_attribute(ncid, NC_GLOBAL, "observer", "compute_proton_tunneling");
   netcdf_text_attribute(ncid, NC_GLOBAL, "format", "GPUMD proton observer NetCDF-4");
-  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "7");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "8");
   netcdf_text_attribute(ncid, NC_GLOBAL, "oxygen_symbol", oxygen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "hydrogen_symbol", hydrogen_symbol_.c_str());
+  netcdf_text_attribute(ncid, NC_GLOBAL, "analysis_mode",
+    static_edge_distribution_enabled_ ? "pimd_edge_distribution" : "event_observer");
   netcdf_text_attribute(ncid, NC_GLOBAL, "ion1_symbol", ion1_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "ion2_symbol", ion2_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "local_influence",
@@ -5023,6 +5354,29 @@ void Proton_Tunneling::write_netcdf_output_file()
     &time_step_fs), "nc_put_att_double");
   netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "sample_interval_fs", NC_DOUBLE, 1,
     &sample_interval_fs), "nc_put_att_double");
+  if (static_edge_distribution_enabled_) {
+    netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "static_delta_bins", NC_INT, 1,
+      &static_delta_bins_), "nc_put_att_int");
+    netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "static_delta_min", NC_DOUBLE, 1,
+      &static_delta_min_), "nc_put_att_double");
+    netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "static_delta_max", NC_DOUBLE, 1,
+      &static_delta_max_), "nc_put_att_double");
+    netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "static_environment_bins", NC_INT, 1,
+      &static_environment_bins_), "nc_put_att_int");
+    netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "static_environment_max", NC_DOUBLE, 1,
+      &static_environment_max_), "nc_put_att_double");
+    const double static_temperature_mean_K = static_temperature_samples_ > 0
+      ? static_temperature_sum_K_ / static_temperature_samples_ :
+        std::numeric_limits<double>::quiet_NaN();
+    netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "sampling_temperature_mean_K", NC_DOUBLE, 1,
+      &static_temperature_mean_K), "nc_put_att_double");
+    netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "sampling_temperature_min_K", NC_DOUBLE, 1,
+      &static_temperature_min_K_), "nc_put_att_double");
+    netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "sampling_temperature_max_K", NC_DOUBLE, 1,
+      &static_temperature_max_K_), "nc_put_att_double");
+    netcdf_check(nc_put_att_longlong(ncid, NC_GLOBAL, "sampling_temperature_samples",
+      NC_INT64, 1, &static_temperature_samples_), "nc_put_att_longlong");
+  }
   netcdf_text_attribute(
     ncid, NC_GLOBAL, "state_definition_version",
     "stable_state_v1_core_left_endpoint_v1");
@@ -5071,6 +5425,14 @@ void Proton_Tunneling::write_netcdf_output_file()
     if (oxygen_low >= 0 && oxygen_high >= 0)
       edge_keys.push_back(make_bond_key(oxygen_low, oxygen_high));
   };
+  if (static_edge_distribution_enabled_) {
+    for (const unsigned long long key : reference_edge_keys_) {
+      int oxygen_low;
+      int oxygen_high;
+      decode_bond_key(key, oxygen_low, oxygen_high);
+      add_edge(oxygen_low, oxygen_high);
+    }
+  }
   for (const EdgeWindowRecord& record : edge_window_records_)
     add_edge(record.oxygen_low, record.oxygen_high);
   for (const LocalEnvironmentWindowRecord& record : local_environment_window_records_)
@@ -5107,6 +5469,131 @@ void Proton_Tunneling::write_netcdf_output_file()
       {edge_dim, endpoint_dim}, {edge_keys.size(), 2}, compression_level_);
     netcdf_text_attribute(edge_group, edge_oxygen_var,
       "description", "zero-based O atom indices; edge row is the edge_id");
+  }
+
+  int static_group = -1;
+  int static_edge_var = -1;
+  int static_value_var = -1;
+  int static_count_var = -1;
+  int static_delta_edges_var = -1;
+  int static_dOO_edges_var = -1;
+  int static_ion_edges_var = -1;
+  int static_delta_hist_var = -1;
+  int static_delta_dOO_hist_var = -1;
+  int static_delta_ion1_hist_var = -1;
+  int static_delta_ion2_hist_var = -1;
+  std::vector<int> static_edges;
+  std::vector<double> static_values;
+  std::vector<long long> static_counts;
+  std::vector<double> static_delta_edges;
+  std::vector<double> static_dOO_edges;
+  std::vector<double> static_ion_edges;
+  const std::vector<const char*> static_value_names = {
+    "mean_dOO_A", "mean_ion1_distance_A", "mean_ion2_distance_A",
+    "beta_DeltaF_well", "DeltaF_well_eV", "P_center", "coverage"};
+  const std::vector<const char*> static_count_names = {
+    "n_frames", "n_samples", "n_minus", "n_plus", "n_center", "n_empty", "n_multiple_H",
+    "n_ambiguous", "n_geometry_filtered", "delta_underflow", "delta_overflow",
+    "dOO_underflow", "dOO_overflow",
+    "ion1_underflow", "ion1_overflow", "ion2_underflow", "ion2_overflow", "n_dOO", "n_ion1",
+    "n_ion2"};
+  if (static_edge_distribution_enabled_) {
+    netcdf_check(nc_def_grp(ncid, "pimd_edge_distribution", &static_group), "nc_def_grp");
+    const int edge_dim = netcdf_dimension(static_group, "edge", reference_edge_keys_.size());
+    const int delta_dim = netcdf_dimension(static_group, "delta_bin", static_delta_bins_);
+    const int delta_edge_dim = netcdf_dimension(static_group, "delta_bin_edge", static_delta_bins_ + 1);
+    const int environment_dim = netcdf_dimension(
+      static_group, "environment_bin", static_environment_bins_);
+    const int environment_edge_dim = netcdf_dimension(
+      static_group, "environment_bin_edge", static_environment_bins_ + 1);
+    const int value_dim = netcdf_dimension(static_group, "value", static_value_names.size());
+    const int count_dim = netcdf_dimension(static_group, "count", static_count_names.size());
+    static_edge_var = netcdf_variable(static_group, "edge_id", NC_INT,
+      {edge_dim}, {reference_edge_keys_.size()}, compression_level_);
+    static_value_var = netcdf_variable(static_group, "value", NC_DOUBLE,
+      {edge_dim, value_dim}, {reference_edge_keys_.size(), static_value_names.size()},
+      compression_level_);
+    static_count_var = netcdf_variable(static_group, "count", NC_INT64,
+      {edge_dim, count_dim}, {reference_edge_keys_.size(), static_count_names.size()},
+      compression_level_);
+    static_delta_edges_var = netcdf_variable(static_group, "delta_bin_edges_A", NC_DOUBLE,
+      {delta_edge_dim}, {static_delta_bins_ + 1}, compression_level_);
+    static_dOO_edges_var = netcdf_variable(static_group, "dOO_bin_edges_A", NC_DOUBLE,
+      {environment_edge_dim}, {static_environment_bins_ + 1}, compression_level_);
+    static_ion_edges_var = netcdf_variable(static_group, "ion_distance_bin_edges_A", NC_DOUBLE,
+      {environment_edge_dim}, {static_environment_bins_ + 1}, compression_level_);
+    static_delta_hist_var = netcdf_variable(static_group, "delta_histogram", NC_INT64,
+      {edge_dim, delta_dim}, {1, static_cast<size_t>(static_delta_bins_)}, compression_level_);
+    static_delta_dOO_hist_var = netcdf_variable(static_group, "delta_dOO_histogram", NC_INT64,
+      {edge_dim, delta_dim, environment_dim},
+      {1, static_cast<size_t>(static_delta_bins_), static_cast<size_t>(static_environment_bins_)},
+      compression_level_);
+    static_delta_ion1_hist_var = netcdf_variable(static_group, "delta_ion1_histogram", NC_INT64,
+      {edge_dim, delta_dim, environment_dim},
+      {1, static_cast<size_t>(static_delta_bins_), static_cast<size_t>(static_environment_bins_)},
+      compression_level_);
+    static_delta_ion2_hist_var = netcdf_variable(static_group, "delta_ion2_histogram", NC_INT64,
+      {edge_dim, delta_dim, environment_dim},
+      {1, static_cast<size_t>(static_delta_bins_), static_cast<size_t>(static_environment_bins_)},
+      compression_level_);
+    netcdf_text_attribute(static_group, NC_GLOBAL, "description",
+      "Centroid-coordinate free-energy bias over fixed reference O-O edges; unique H only.");
+    netcdf_text_attribute(static_group, NC_GLOBAL, "ion_statistics",
+      ion_field_enabled_ ? "enabled" : "disabled_no_ion_field");
+    netcdf_text_attribute(static_group, static_value_var, "field_names",
+      join_field_names(static_value_names).c_str());
+    netcdf_text_attribute(static_group, static_count_var, "field_names",
+      join_field_names(static_count_names).c_str());
+    netcdf_text_attribute(static_group, static_count_var, "state_definition",
+      "n_minus/n_plus use delta_cutoff; n_center uses abs(delta) < 0.10 A.");
+    netcdf_text_attribute(static_group, static_delta_hist_var, "description",
+      "Counts of unique, unambiguous single-H samples; out-of-range values are separate counts.");
+    netcdf_text_attribute(static_group, static_delta_dOO_hist_var, "description",
+      "Synchronous H(delta,dOO) counts for the same unique samples.");
+    netcdf_text_attribute(static_group, static_delta_ion1_hist_var, "description",
+      "Synchronous H(delta,r_ion1) counts; ion1 symbol is a global attribute.");
+    netcdf_text_attribute(static_group, static_delta_ion2_hist_var, "description",
+      "Synchronous H(delta,r_ion2) counts; ion2 symbol is a global attribute.");
+    static_delta_edges.reserve(static_delta_bins_ + 1);
+    static_dOO_edges.reserve(static_environment_bins_ + 1);
+    static_ion_edges.reserve(static_environment_bins_ + 1);
+    for (int i = 0; i <= static_delta_bins_; ++i)
+      static_delta_edges.push_back(static_delta_min_ +
+        (static_delta_max_ - static_delta_min_) * i / static_delta_bins_);
+    for (int i = 0; i <= static_environment_bins_; ++i) {
+      static_dOO_edges.push_back(dOO_min_ +
+        (dOO_max_ - dOO_min_) * i / static_environment_bins_);
+      static_ion_edges.push_back(static_environment_max_ * i / static_environment_bins_);
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double static_temperature_mean_K = static_temperature_samples_ > 0
+      ? static_temperature_sum_K_ / static_temperature_samples_ : nan;
+    const bool constant_temperature = static_temperature_samples_ > 0 &&
+      static_temperature_max_K_ - static_temperature_min_K_ <=
+        1.0e-8 * std::max(1.0, static_temperature_max_K_);
+    for (const unsigned long long key : reference_edge_keys_) {
+      const PimdEdgeStats& stats = pimd_edge_stats_.at(key);
+      const bool has_both_populations = stats.n_plus > 0 && stats.n_minus > 0;
+      const double beta_DeltaF_well = has_both_populations
+        ? -std::log(static_cast<double>(stats.n_plus) / stats.n_minus) : nan;
+      const double DeltaF_well_eV = has_both_populations && constant_temperature
+        ? beta_DeltaF_well * K_B * static_temperature_mean_K : nan;
+      const double mean_dOO = stats.n_dOO > 0 ? stats.sum_dOO / stats.n_dOO : nan;
+      const double mean_ion1 = stats.n_ion1 > 0 ? stats.sum_ion1 / stats.n_ion1 : nan;
+      const double mean_ion2 = stats.n_ion2 > 0 ? stats.sum_ion2 / stats.n_ion2 : nan;
+      static_edges.push_back(edge_ids.at(key));
+      static_values.insert(static_values.end(), {
+        mean_dOO, mean_ion1, mean_ion2, beta_DeltaF_well, DeltaF_well_eV,
+        stats.n_samples > 0 ? static_cast<double>(stats.n_center) / stats.n_samples : nan,
+        stats.n_frames > 0 ? static_cast<double>(stats.n_samples) / stats.n_frames : nan});
+      static_counts.insert(static_counts.end(), {
+        stats.n_frames, stats.n_samples, stats.n_minus, stats.n_plus, stats.n_center,
+        stats.n_empty, stats.n_multiple_H, stats.n_ambiguous, stats.n_geometry_filtered,
+        stats.delta_underflow,
+        stats.delta_overflow, stats.dOO_underflow, stats.dOO_overflow, stats.ion1_underflow,
+        stats.ion1_overflow, stats.ion2_underflow, stats.ion2_overflow, stats.n_dOO,
+        stats.n_ion1, stats.n_ion2});
+    }
   }
 
   int window_group = -1;
@@ -6270,6 +6757,32 @@ void Proton_Tunneling::write_netcdf_output_file()
     }
     netcdf_write_int(edge_group, edge_oxygen_var, edge_oxygen);
   }
+  if (static_group >= 0) {
+    netcdf_write_int(static_group, static_edge_var, static_edges);
+    netcdf_write_double(static_group, static_value_var, static_values);
+    netcdf_write_longlong(static_group, static_count_var, static_counts);
+    netcdf_write_double(static_group, static_delta_edges_var, static_delta_edges);
+    netcdf_write_double(static_group, static_dOO_edges_var, static_dOO_edges);
+    netcdf_write_double(static_group, static_ion_edges_var, static_ion_edges);
+    for (size_t edge = 0; edge < reference_edge_keys_.size(); ++edge) {
+      const PimdEdgeStats& stats = pimd_edge_stats_.at(reference_edge_keys_[edge]);
+      const size_t delta_start[] = {edge, 0};
+      const size_t delta_count[] = {1, static_cast<size_t>(static_delta_bins_)};
+      const size_t joint_start[] = {edge, 0, 0};
+      const size_t joint_count[] = {
+        1, static_cast<size_t>(static_delta_bins_),
+        static_cast<size_t>(static_environment_bins_)};
+      netcdf_check(nc_put_vara_longlong(
+        static_group, static_delta_hist_var, delta_start, delta_count, stats.delta_hist.data()),
+        "nc_put_vara_longlong");
+      netcdf_check(nc_put_vara_longlong(static_group, static_delta_dOO_hist_var,
+        joint_start, joint_count, stats.delta_dOO_hist.data()), "nc_put_vara_longlong");
+      netcdf_check(nc_put_vara_longlong(static_group, static_delta_ion1_hist_var,
+        joint_start, joint_count, stats.delta_ion1_hist.data()), "nc_put_vara_longlong");
+      netcdf_check(nc_put_vara_longlong(static_group, static_delta_ion2_hist_var,
+        joint_start, joint_count, stats.delta_ion2_hist.data()), "nc_put_vara_longlong");
+    }
+  }
   if (window_group >= 0) {
     netcdf_write_double(window_group, window_time_var, window_times);
     netcdf_write_double(window_group, window_value_var, window_values);
@@ -6430,25 +6943,27 @@ void Proton_Tunneling::postprocess(
   if (!initialized_)
     return;
 
-  for (size_t h_index = 0; h_index < hydrogen_states_.size(); ++h_index) {
-    HydrogenState& hydrogen_state = hydrogen_states_[h_index];
-    close_observation_gap(hydrogen_state, last_time_fs_);
-    if (hydrogen_state.attempt_active) {
-      finish_attempt(
-        hydrogen_indices_[h_index],
-        hydrogen_state,
-        AttemptOutcome::run_end,
-        last_time_fs_,
-        hydrogen_state.last_delta,
-        nullptr,
-        nullptr);
+  if (!static_edge_distribution_enabled_) {
+    for (size_t h_index = 0; h_index < hydrogen_states_.size(); ++h_index) {
+      HydrogenState& hydrogen_state = hydrogen_states_[h_index];
+      close_observation_gap(hydrogen_state, last_time_fs_);
+      if (hydrogen_state.attempt_active) {
+        finish_attempt(
+          hydrogen_indices_[h_index],
+          hydrogen_state,
+          AttemptOutcome::run_end,
+          last_time_fs_,
+          hydrogen_state.last_delta,
+          nullptr,
+          nullptr);
+      }
     }
-  }
-  if (window_sample_count_ > 0)
-    write_window(last_time_fs_);
-  if (causal_chain_enabled_ && causal_mode_ == CausalMode::INLINE) {
-    build_causal_network();
-    build_causal_lag_histogram();
+    if (window_sample_count_ > 0)
+      write_window(last_time_fs_);
+    if (causal_chain_enabled_ && causal_mode_ == CausalMode::INLINE) {
+      build_causal_network();
+      build_causal_lag_histogram();
+    }
   }
   write_output_files();
   release_geometry_timing_events();

@@ -516,6 +516,37 @@ private:
     double mean_delta_d_ion2 = 0.0;
   };
 
+  struct PimdEdgeStats
+  {
+    long long n_frames = 0;
+    long long n_samples = 0;
+    long long n_minus = 0;
+    long long n_plus = 0;
+    long long n_center = 0;
+    long long n_empty = 0;
+    long long n_multiple_H = 0;
+    long long n_ambiguous = 0;
+    long long n_geometry_filtered = 0;
+    long long delta_underflow = 0;
+    long long delta_overflow = 0;
+    long long dOO_underflow = 0;
+    long long dOO_overflow = 0;
+    long long ion1_underflow = 0;
+    long long ion1_overflow = 0;
+    long long ion2_underflow = 0;
+    long long ion2_overflow = 0;
+    long long n_dOO = 0;
+    long long n_ion1 = 0;
+    long long n_ion2 = 0;
+    double sum_dOO = 0.0;
+    double sum_ion1 = 0.0;
+    double sum_ion2 = 0.0;
+    std::vector<long long> delta_hist;
+    std::vector<long long> delta_dOO_hist;
+    std::vector<long long> delta_ion1_hist;
+    std::vector<long long> delta_ion2_hist;
+  };
+
   struct GeometryResult
   {
     bool valid = false;
@@ -814,6 +845,7 @@ private:
   void initialize_geometry_gpu();
   void compute_geometry_gpu(const Box& box, Atom& atom);
   void compute_local_environment_gpu(const Box& box, Atom& atom);
+  void record_pimd_edge_distribution(const Box& box, Atom& atom);
   void assign_local_environment_topology();
   void release_geometry_timing_events();
   bool ensure_bead_positions(Atom& atom);
@@ -954,6 +986,16 @@ private:
   double window_start_time_fs_ = 0.0;
   double last_time_fs_ = 0.0;
   bool initialized_ = false;
+  bool static_edge_distribution_enabled_ = false;
+  int static_delta_bins_ = 200;
+  double static_delta_min_ = -2.0;
+  double static_delta_max_ = 2.0;
+  int static_environment_bins_ = 32;
+  double static_environment_max_ = 16.0;
+  double static_temperature_sum_K_ = 0.0;
+  double static_temperature_min_K_ = 0.0;
+  double static_temperature_max_K_ = 0.0;
+  long long static_temperature_samples_ = 0;
 
   OutputFormat output_format_ = OutputFormat::TEXT;
   OutputLevel output_level_ = OutputLevel::FULL;
@@ -971,6 +1013,8 @@ private:
   std::vector<int> oxygen_local_index_;
   std::vector<int> oxygen_shell_offsets_cpu_;
   std::vector<int> oxygen_shell_neighbors_cpu_;
+  std::vector<unsigned long long> reference_edge_keys_;
+  std::unordered_map<int, std::vector<unsigned long long>> reference_edges_by_oxygen_;
   GPU_Vector<int> oxygen_indices_gpu_;
   GPU_Vector<int> hydrogen_indices_gpu_;
   GPU_Vector<int> oxygen_local_index_gpu_;
@@ -1041,6 +1085,7 @@ private:
   std::vector<EdgeWindowRecord> edge_window_records_;
   std::vector<LocalEnvironmentWindowRecord> local_environment_window_records_;
   std::vector<LocalTraceRecord> local_trace_records_;
+  std::unordered_map<unsigned long long, PimdEdgeStats> pimd_edge_stats_;
 
   std::unordered_map<unsigned long long, BondStats> window_bonds_;
   std::unordered_map<unsigned long long, BondStats> total_bonds_;

@@ -8,13 +8,15 @@
 This keyword enables a centroid-geometry observer for proton-state bias and persistent
 O-H-O state changes. It does not modify the potential, forces, qNEP charges, or heat current.
 For PIMD/RPMD it is called after the integrator has updated the centroid positions.
+The optional ``static_edge_distribution`` mode is a PIMD-only equilibrium statistic and
+does not build transfer attempts or causal chains.
 
 Syntax
 ------
 
 ::
 
-  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [local_influence] [local_trace O_low O_high] [bead_diagnostic [f_min span_min [center_max centroid_max]]] [causal_chain search_max_fs sync_fs N thresholds...] [causal_lag_bins N edges...] [causal_null N_shifts seed] [causal_mode raw|inline] [output netcdf filename [deflate_level]] [output_level summary|events|full] [snapshots endpoints|best|all]
+  compute_proton_tunneling <sample_interval> <window_samples> <delta_cutoff> <hold_samples> <dOO_min> <dOO_max> <rperp_max> [O_symbol H_symbol] [oho_angle angle_deg] [ion_field ion1_symbol ion1_charge ion2_symbol ion2_charge cutoff] [local_environment ion1_cutoff ion2_cutoff H-Cl_cutoff H-Cl_angle_min] [local_influence] [local_trace O_low O_high] [bead_diagnostic [f_min span_min [center_max centroid_max]]] [causal_chain search_max_fs sync_fs N thresholds...] [causal_lag_bins N edges...] [causal_null N_shifts seed] [causal_mode raw|inline] [static_edge_distribution N delta_min delta_max] [output netcdf filename [deflate_level]] [output_level summary|events|full] [snapshots endpoints|best|all]
 
 For example::
 
@@ -68,6 +70,28 @@ two-well delocalization without forcing its centroid to the barrier center. Mult
 multi-domain configurations are labeled ``multi_kink_or_multi_domain`` rather than being
 called noise or strict tunneling.
 
+For a PIMD centroid distribution over the fixed reference O-O candidate edges, use for example::
+
+  compute_proton_tunneling 5 1000 0.10 2 2.20 2.65 0.80 O H ion_field Na 1.0 Cl -1.0 8.0 static_edge_distribution 200 -2.0 2.0 output netcdf pimd_edge_distribution.nc 4
+
+This mode keeps every mutual top-8 reference edge in ``/edge/oxygen`` and writes
+``/pimd_edge_distribution``. A delta sample is accepted only when exactly one
+unambiguous H is assigned to that edge in the frame. ``n_empty``, ``n_multiple_H``,
+``n_ambiguous``, and ``n_geometry_filtered`` are retained instead of silently treating
+those frames as samples. ``n_empty`` means no H was geometrically associated with the edge;
+``n_geometry_filtered`` means an associated H was rejected by a configured geometry filter.
+If valid and geometry-filtered H candidates coexist on one edge, the frame is counted as
+``n_multiple_H`` and is not included in the delta distribution.
+The group stores the signed delta histogram, synchronous ``H(delta,dOO)``,
+``H(delta,r_ion1)``, and ``H(delta,r_ion2)`` histograms, with explicit bin edges and
+underflow/overflow counts. ``beta_DeltaF_well = -log(n_plus/n_minus)`` uses the direction
+``delta = d(O_low,H) - d(O_high,H)``; a one-sided population is reported as NaN rather than
+an infinite physical bias. ``DeltaF_well_eV`` is reported only when the sampled PIMD
+temperature is constant. ``P_center`` uses ``abs(delta) < 0.10`` and is a centroid
+quantity, not a quantum position probability.
+The example enables ion statistics explicitly. Without ``ion_field``, the ion histograms are
+present but marked ``disabled_no_ion_field`` and contain no ion samples; their means are NaN.
+
 Each finalized attempt keeps two representative bead configurations. ``centroid_best`` is
 the sample with the smallest :math:`|\Delta_{\rm centroid}|`. ``delocalization_best`` is
 selected lexicographically by largest :math:`\min(f_-,f_+)`, smallest :math:`f_0`, passing
@@ -106,7 +130,9 @@ are assigned to one O-O pair in the same frame, those samples are marked as assi
 and skipped; they are not counted as physical geometry loss. The numerical O-O range should be
 calibrated from the ranked O-O distributions at the target pressure. For a 30 GPa structure,
 2.65 Å is a reasonable starting upper bound, but it should be kept identical for pure and
-salt ice during comparison.
+salt ice during comparison. The 1.60 Å limit is retained for the event-observer mode;
+``static_edge_distribution`` removes it so asymmetric wells are not cut off by the assignment
+filter.
 
 Compressed NetCDF output
 ------------------------
@@ -137,7 +163,7 @@ types. All variables are chunked with shuffle and deflate compression. NetCDF ou
 GPUMD build with ``USE_NETCDF=1`` and NetCDF-4/HDF5 support. It is intended for separate output
 files per sample directory and does not append across runs.
 
-The current NetCDF schema is version 7. Global attributes record the ensemble type, bead count,
+The current NetCDF schema is version 8. Global attributes record the ensemble type, bead count,
 physical time step, sampled-frame interval, all geometry/state thresholds, bead-diagnostic
 thresholds and switch, and the state/residence definition version. The ``/attempt`` group
 additionally stores the attempt-level bead probe counts and an observation-gap flag;
