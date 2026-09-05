@@ -9,6 +9,7 @@ online, so the number of shifts does not multiply memory usage.
 from __future__ import annotations
 
 import bisect
+import argparse
 import math
 from collections import defaultdict
 from pathlib import Path
@@ -20,7 +21,7 @@ except ImportError as error:
     raise SystemExit("proton_causal_analyze.py requires numpy and netCDF4-python") from error
 
 
-# Edit only this block before running the analyzer.
+# Defaults; override these with the command-line options below.
 INPUT_NETCDF = Path("proton_observer.nc")
 OUTPUT_NETCDF = Path("proton_causal.nc")
 
@@ -438,9 +439,9 @@ def build_chains(events, links, groups, event_groups, thresholds, sync):
                     "net_dx": float(net[0]), "net_dy": float(net[1]), "net_dz": float(net[2]),
                     "max_span": max_span, "mean_gap": float(np.mean(gaps)) if gaps else 0.0,
                     "max_gap": max(gaps) if gaps else 0.0, "n_groups": len(used_groups),
-                    "n_quantum": quantum, "fraction_two_well": two_well / quantum if quantum else 0.0,
-                    "fraction_strict": strict / quantum if quantum else 0.0,
-                    "fraction_multi": multi / quantum if quantum else 0.0,
+                    "n_quantum": quantum, "fraction_two_well": two_well / quantum if quantum else math.nan,
+                    "fraction_strict": strict / quantum if quantum else math.nan,
+                    "fraction_multi": multi / quantum if quantum else math.nan,
                     "alt_parent": alternative_parent, "alt_child": alternative_child,
                     "closed_O": closed, "frac_x": float(frac[0]), "frac_y": float(frac[1]),
                     "frac_z": float(frac[2]), "winding_x": int(rounded[0]),
@@ -656,13 +657,35 @@ def write_output(path, source_path, source, events, groups, links, chains, chain
         one_dim(group, "n_null_shifts", "i4", [row[8] for row in histogram])
 
 
+def comma_separated_floats(value):
+    try:
+        return [float(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected comma-separated numbers") from error
+
+
 def main():
-    search = float(SEARCH_MAX_FS)
-    sync = float(SYNC_FS)
-    gaps = [float(value) for value in GAP_THRESHOLDS_FS]
-    bins = sorted(set(float(value) for value in LAG_BIN_EDGES_FS))
-    null_shifts = max(0, int(NULL_SHIFTS))
-    seed = int(NULL_SEED)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input_netcdf", nargs="?", type=Path, default=INPUT_NETCDF)
+    parser.add_argument("--output", dest="output_netcdf", type=Path, default=OUTPUT_NETCDF)
+    parser.add_argument("--search", type=float, default=SEARCH_MAX_FS, metavar="FS")
+    parser.add_argument("--sync", type=float, default=SYNC_FS, metavar="FS")
+    parser.add_argument("--gaps", type=comma_separated_floats,
+                        default=GAP_THRESHOLDS_FS, metavar="FS,...")
+    parser.add_argument("--lag-bins", type=comma_separated_floats,
+                        default=LAG_BIN_EDGES_FS, metavar="FS,...")
+    parser.add_argument("--null-shifts", type=int, default=NULL_SHIFTS, metavar="N")
+    parser.add_argument("--seed", type=int, default=NULL_SEED, metavar="N")
+    args = parser.parse_args()
+
+    input_netcdf = args.input_netcdf
+    output_netcdf = args.output_netcdf
+    search = float(args.search)
+    sync = float(args.sync)
+    gaps = [float(value) for value in args.gaps]
+    bins = sorted(set(float(value) for value in args.lag_bins))
+    null_shifts = max(0, int(args.null_shifts))
+    seed = int(args.seed)
     if not gaps:
         gaps = [search]
     if not bins:
@@ -677,9 +700,9 @@ def main():
     if any(value <= 0.0 or value > search for value in gaps):
         raise ValueError("GAP_THRESHOLDS_FS must be in (0, SEARCH_MAX_FS]")
 
-    with Dataset(str(INPUT_NETCDF), "r") as source:
-        print(f"input: {INPUT_NETCDF}", flush=True)
-        print(f"output: {OUTPUT_NETCDF}", flush=True)
+    with Dataset(str(input_netcdf), "r") as source:
+        print(f"input: {input_netcdf}", flush=True)
+        print(f"output: {output_netcdf}", flush=True)
         print(f"causal settings: search={search:g} fs, sync={sync:g} fs, "
               f"gaps={gaps}, null_shifts={null_shifts}", flush=True)
         events = read_events(source)
@@ -688,9 +711,9 @@ def main():
         links, _ = build_links(events, search, sync, event_groups)
         chains, chain_events = build_chains(events, links, groups, event_groups, gaps, sync)
         histogram = lag_histogram(events, links, bins, search, null_shifts, seed)
-        write_output(OUTPUT_NETCDF, INPUT_NETCDF, source, events, groups, links, chains, chain_events,
+        write_output(output_netcdf, input_netcdf, source, events, groups, links, chains, chain_events,
                      histogram, search, sync, gaps, bins, null_shifts, seed)
-        print(f"wrote {OUTPUT_NETCDF}: {len(groups)} groups, {len(links)} links, "
+        print(f"wrote {output_netcdf}: {len(groups)} groups, {len(links)} links, "
               f"{len(chains)} chains", flush=True)
 
 

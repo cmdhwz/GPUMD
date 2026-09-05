@@ -31,6 +31,7 @@ struct GeometryResultGPU
   int oxygen_low;
   int oxygen_high;
   int candidate_count;
+  unsigned int ambiguous_candidate_mask;
   double delta;
   double dOO;
   double rperp;
@@ -556,6 +557,7 @@ private:
     int oxygen_low = -1;
     int oxygen_high = -1;
     int candidate_count = 0;
+    unsigned int ambiguous_candidate_mask = 0;
     double delta = 0.0;
     double dOO = 0.0;
     double rperp = 0.0;

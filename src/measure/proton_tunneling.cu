@@ -551,6 +551,15 @@ __global__ void gpu_find_proton_geometry(
         selected.assignment_score;
       selected.assignment_ambiguous = (candidate_count > 1 &&
         selected.assignment_score_gap < assignment_score_gap_min) ? 1 : 0;
+      selected.ambiguous_candidate_mask = 0;
+      if (selected.assignment_ambiguous != 0) {
+        for (int i = 0; i < shell_size; ++i) {
+          if (candidate_results[i].valid != 0 &&
+              candidate_results[i].assignment_score - selected.assignment_score <
+                assignment_score_gap_min)
+            selected.ambiguous_candidate_mask |= 1u << i;
+        }
+      }
       selected.pair_conflict = 0;
       selected.valid = (selected.assignment_ambiguous == 0) ? 1 : 0;
       output[hydrogen_index] = selected;
@@ -1524,6 +1533,7 @@ void Proton_Tunneling::compute_geometry_gpu(const Box& box, Atom& atom)
     target.oxygen_low = source.oxygen_low;
     target.oxygen_high = source.oxygen_high;
     target.candidate_count = source.candidate_count;
+    target.ambiguous_candidate_mask = source.ambiguous_candidate_mask;
     target.delta = source.delta;
     target.dOO = source.dOO;
     target.rperp = source.rperp;
@@ -2130,8 +2140,29 @@ void Proton_Tunneling::record_pimd_edge_distribution(const Box& box, Atom& atom)
     const unsigned long long key = make_bond_key(geometry.oxygen_low, geometry.oxygen_high);
     if (pimd_edge_stats_.find(key) == pimd_edge_stats_.end())
       continue;
-    if (geometry.assignment_ambiguous)
+    if (geometry.assignment_ambiguous) {
       ++ambiguous_counts[key];
+      const unsigned int mask = geometry.ambiguous_candidate_mask;
+      if (mask != 0 && geometry.nearest_oxygen >= 0 &&
+          geometry.nearest_oxygen < number_of_atoms_) {
+        const int anchor_local = oxygen_local_index_[geometry.nearest_oxygen];
+        if (anchor_local >= 0) {
+          const int shell_begin = oxygen_shell_offsets_cpu_[anchor_local];
+          const int shell_end = oxygen_shell_offsets_cpu_[anchor_local + 1];
+          for (int slot = 0; slot < shell_end - shell_begin && slot < 8; ++slot) {
+            if ((mask & (1u << slot)) == 0)
+              continue;
+            const int neighbor = oxygen_shell_neighbors_cpu_[shell_begin + slot];
+            const unsigned long long candidate_key = make_bond_key(
+              std::min(geometry.nearest_oxygen, neighbor),
+              std::max(geometry.nearest_oxygen, neighbor));
+            if (candidate_key != key &&
+                pimd_edge_stats_.find(candidate_key) != pimd_edge_stats_.end())
+              ++ambiguous_counts[candidate_key];
+          }
+        }
+      }
+    }
     if (geometry.valid) {
       ++valid_counts[key];
       unique_geometry[key] = &geometry;
@@ -4033,11 +4064,14 @@ void Proton_Tunneling::build_causal_network()
       chain.mean_gap_fs = gap_count > 0 ? gap_sum / gap_count : 0.0;
       chain.n_quantum_valid = quantum_valid;
       chain.fraction_two_well = quantum_valid > 0
-        ? static_cast<double>(two_well) / quantum_valid : 0.0;
+        ? static_cast<double>(two_well) / quantum_valid
+        : std::numeric_limits<double>::quiet_NaN();
       chain.fraction_strict_tunneling_like = quantum_valid > 0
-        ? static_cast<double>(strict_tunneling) / quantum_valid : 0.0;
+        ? static_cast<double>(strict_tunneling) / quantum_valid
+        : std::numeric_limits<double>::quiet_NaN();
       chain.fraction_multi_kink = quantum_valid > 0
-        ? static_cast<double>(multi_kink) / quantum_valid : 0.0;
+        ? static_cast<double>(multi_kink) / quantum_valid
+        : std::numeric_limits<double>::quiet_NaN();
       if (branched)
         chain.chain_class = ChainClass::branched;
       else if (edge_rattling)
