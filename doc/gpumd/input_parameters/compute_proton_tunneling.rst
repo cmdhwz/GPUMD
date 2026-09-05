@@ -82,9 +82,11 @@ those frames as samples. ``n_empty`` means no H was geometrically associated wit
 ``n_geometry_filtered`` means an associated H was rejected by a configured geometry filter.
 If valid and geometry-filtered H candidates coexist on one edge, the frame is counted as
 ``n_multiple_H`` and is not included in the delta distribution.
-The group stores the signed delta histogram, synchronous ``H(delta,dOO)``,
-``H(delta,r_ion1)``, and ``H(delta,r_ion2)`` histograms, with explicit bin edges and
-underflow/overflow counts. ``beta_DeltaF_well = -log(n_plus/n_minus)`` uses the direction
+The group stores the signed delta histogram with explicit bin edges and
+underflow/overflow counts. It also stores the mean O--O distance and, when ``ion_field``
+is enabled, the mean nearest-ion distances for each edge. These compact edge descriptors
+can be used to group the delta distributions by geometry or ion proximity without retaining
+three memory-intensive joint histograms. ``beta_DeltaF_well = -log(n_plus/n_minus)`` uses the direction
 ``delta = d(O_low,H) - d(O_high,H)``; a one-sided population is reported as NaN rather than
 an infinite physical bias. ``DeltaF_well_eV`` is reported only when the sampled PIMD
 temperature is constant. ``P_center`` uses ``abs(delta) < 0.10`` and is a centroid

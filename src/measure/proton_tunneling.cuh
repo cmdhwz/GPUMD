@@ -530,12 +530,6 @@ private:
     long long n_geometry_filtered = 0;
     long long delta_underflow = 0;
     long long delta_overflow = 0;
-    long long dOO_underflow = 0;
-    long long dOO_overflow = 0;
-    long long ion1_underflow = 0;
-    long long ion1_overflow = 0;
-    long long ion2_underflow = 0;
-    long long ion2_overflow = 0;
     long long n_dOO = 0;
     long long n_ion1 = 0;
     long long n_ion2 = 0;
@@ -543,9 +537,6 @@ private:
     double sum_ion1 = 0.0;
     double sum_ion2 = 0.0;
     std::vector<long long> delta_hist;
-    std::vector<long long> delta_dOO_hist;
-    std::vector<long long> delta_ion1_hist;
-    std::vector<long long> delta_ion2_hist;
   };
 
   struct GeometryResult
@@ -992,8 +983,6 @@ private:
   int static_delta_bins_ = 200;
   double static_delta_min_ = -2.0;
   double static_delta_max_ = 2.0;
-  int static_environment_bins_ = 32;
-  double static_environment_max_ = 16.0;
   double static_temperature_sum_K_ = 0.0;
   double static_temperature_min_K_ = 0.0;
   double static_temperature_max_K_ = 0.0;

@@ -1342,9 +1342,8 @@ void Proton_Tunneling::preprocess(
       PRINT_INPUT_ERROR("static_edge_distribution found no mutual reference O-O edges.");
     constexpr size_t static_histogram_memory_limit = 512ULL * 1024ULL * 1024ULL;
     const size_t delta_bins = static_cast<size_t>(static_delta_bins_);
-    const size_t environment_bins = static_cast<size_t>(static_environment_bins_);
-    const size_t cells_per_edge = delta_bins * (1 + 3 * environment_bins);
-    const size_t estimated_bytes = reference_edge_keys_.size() * cells_per_edge * sizeof(long long);
+    const size_t estimated_bytes =
+      reference_edge_keys_.size() * delta_bins * sizeof(long long);
     if (estimated_bytes > static_histogram_memory_limit)
       PRINT_INPUT_ERROR(
         "static_edge_distribution histograms exceed 512 MiB; reduce delta bins or system size.");
@@ -1352,9 +1351,6 @@ void Proton_Tunneling::preprocess(
     for (const unsigned long long key : reference_edge_keys_) {
       PimdEdgeStats& stats = pimd_edge_stats_[key];
       stats.delta_hist.assign(static_delta_bins_, 0);
-      stats.delta_dOO_hist.assign(static_delta_bins_ * static_environment_bins_, 0);
-      stats.delta_ion1_hist.assign(static_delta_bins_ * static_environment_bins_, 0);
-      stats.delta_ion2_hist.assign(static_delta_bins_ * static_environment_bins_, 0);
     }
   }
   initialize_geometry_gpu();
@@ -2277,34 +2273,22 @@ void Proton_Tunneling::record_pimd_edge_distribution(const Box& box, Atom& atom)
       cpu_position_[oxygen_low + 2 * number_of_atoms_];
     apply_mic(box, ox, oy, oz);
     const double dOO = std::sqrt(ox * ox + oy * oy + oz * oz);
-    int dOO_bin = -1;
     if (std::isfinite(dOO)) {
       ++stats.n_dOO;
       stats.sum_dOO += dOO;
-      dOO_bin = bin_index(
-        dOO, dOO_min_, dOO_max_, static_environment_bins_,
-        stats.dOO_underflow, stats.dOO_overflow);
     }
 
     const double ion1_distance = ion_field_enabled_ ? nearest_ion_distance(
       oxygen_low, ox, oy, oz, ion1_indices_) : std::numeric_limits<double>::quiet_NaN();
     const double ion2_distance = ion_field_enabled_ ? nearest_ion_distance(
       oxygen_low, ox, oy, oz, ion2_indices_) : std::numeric_limits<double>::quiet_NaN();
-    int ion1_bin = -1;
-    int ion2_bin = -1;
     if (std::isfinite(ion1_distance)) {
       ++stats.n_ion1;
       stats.sum_ion1 += ion1_distance;
-      ion1_bin = bin_index(
-        ion1_distance, 0.0, static_environment_max_, static_environment_bins_,
-        stats.ion1_underflow, stats.ion1_overflow);
     }
     if (std::isfinite(ion2_distance)) {
       ++stats.n_ion2;
       stats.sum_ion2 += ion2_distance;
-      ion2_bin = bin_index(
-        ion2_distance, 0.0, static_environment_max_, static_environment_bins_,
-        stats.ion2_underflow, stats.ion2_overflow);
     }
 
     const auto ambiguous = ambiguous_counts.find(key);
@@ -2348,12 +2332,6 @@ void Proton_Tunneling::record_pimd_edge_distribution(const Box& box, Atom& atom)
       stats.delta_underflow, stats.delta_overflow);
     if (delta_bin >= 0)
       ++stats.delta_hist[delta_bin];
-    if (delta_bin >= 0 && dOO_bin >= 0)
-      ++stats.delta_dOO_hist[delta_bin * static_environment_bins_ + dOO_bin];
-    if (delta_bin >= 0 && ion1_bin >= 0)
-      ++stats.delta_ion1_hist[delta_bin * static_environment_bins_ + ion1_bin];
-    if (delta_bin >= 0 && ion2_bin >= 0)
-      ++stats.delta_ion2_hist[delta_bin * static_environment_bins_ + ion2_bin];
   }
 }
 
@@ -5395,10 +5373,6 @@ void Proton_Tunneling::write_netcdf_output_file()
       &static_delta_min_), "nc_put_att_double");
     netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "static_delta_max", NC_DOUBLE, 1,
       &static_delta_max_), "nc_put_att_double");
-    netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "static_environment_bins", NC_INT, 1,
-      &static_environment_bins_), "nc_put_att_int");
-    netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "static_environment_max", NC_DOUBLE, 1,
-      &static_environment_max_), "nc_put_att_double");
     const double static_temperature_mean_K = static_temperature_samples_ > 0
       ? static_temperature_sum_K_ / static_temperature_samples_ :
         std::numeric_limits<double>::quiet_NaN();
@@ -5510,36 +5484,23 @@ void Proton_Tunneling::write_netcdf_output_file()
   int static_value_var = -1;
   int static_count_var = -1;
   int static_delta_edges_var = -1;
-  int static_dOO_edges_var = -1;
-  int static_ion_edges_var = -1;
   int static_delta_hist_var = -1;
-  int static_delta_dOO_hist_var = -1;
-  int static_delta_ion1_hist_var = -1;
-  int static_delta_ion2_hist_var = -1;
   std::vector<int> static_edges;
   std::vector<double> static_values;
   std::vector<long long> static_counts;
   std::vector<double> static_delta_edges;
-  std::vector<double> static_dOO_edges;
-  std::vector<double> static_ion_edges;
   const std::vector<const char*> static_value_names = {
     "mean_dOO_A", "mean_ion1_distance_A", "mean_ion2_distance_A",
     "beta_DeltaF_well", "DeltaF_well_eV", "P_center", "coverage"};
   const std::vector<const char*> static_count_names = {
     "n_frames", "n_samples", "n_minus", "n_plus", "n_center", "n_empty", "n_multiple_H",
     "n_ambiguous", "n_geometry_filtered", "delta_underflow", "delta_overflow",
-    "dOO_underflow", "dOO_overflow",
-    "ion1_underflow", "ion1_overflow", "ion2_underflow", "ion2_overflow", "n_dOO", "n_ion1",
-    "n_ion2"};
+    "n_dOO", "n_ion1", "n_ion2"};
   if (static_edge_distribution_enabled_) {
     netcdf_check(nc_def_grp(ncid, "pimd_edge_distribution", &static_group), "nc_def_grp");
     const int edge_dim = netcdf_dimension(static_group, "edge", reference_edge_keys_.size());
     const int delta_dim = netcdf_dimension(static_group, "delta_bin", static_delta_bins_);
     const int delta_edge_dim = netcdf_dimension(static_group, "delta_bin_edge", static_delta_bins_ + 1);
-    const int environment_dim = netcdf_dimension(
-      static_group, "environment_bin", static_environment_bins_);
-    const int environment_edge_dim = netcdf_dimension(
-      static_group, "environment_bin_edge", static_environment_bins_ + 1);
     const int value_dim = netcdf_dimension(static_group, "value", static_value_names.size());
     const int count_dim = netcdf_dimension(static_group, "count", static_count_names.size());
     static_edge_var = netcdf_variable(static_group, "edge_id", NC_INT,
@@ -5552,24 +5513,8 @@ void Proton_Tunneling::write_netcdf_output_file()
       compression_level_);
     static_delta_edges_var = netcdf_variable(static_group, "delta_bin_edges_A", NC_DOUBLE,
       {delta_edge_dim}, {static_cast<size_t>(static_delta_bins_ + 1)}, compression_level_);
-    static_dOO_edges_var = netcdf_variable(static_group, "dOO_bin_edges_A", NC_DOUBLE,
-      {environment_edge_dim}, {static_cast<size_t>(static_environment_bins_ + 1)}, compression_level_);
-    static_ion_edges_var = netcdf_variable(static_group, "ion_distance_bin_edges_A", NC_DOUBLE,
-      {environment_edge_dim}, {static_cast<size_t>(static_environment_bins_ + 1)}, compression_level_);
     static_delta_hist_var = netcdf_variable(static_group, "delta_histogram", NC_INT64,
       {edge_dim, delta_dim}, {1, static_cast<size_t>(static_delta_bins_)}, compression_level_);
-    static_delta_dOO_hist_var = netcdf_variable(static_group, "delta_dOO_histogram", NC_INT64,
-      {edge_dim, delta_dim, environment_dim},
-      {1, static_cast<size_t>(static_delta_bins_), static_cast<size_t>(static_environment_bins_)},
-      compression_level_);
-    static_delta_ion1_hist_var = netcdf_variable(static_group, "delta_ion1_histogram", NC_INT64,
-      {edge_dim, delta_dim, environment_dim},
-      {1, static_cast<size_t>(static_delta_bins_), static_cast<size_t>(static_environment_bins_)},
-      compression_level_);
-    static_delta_ion2_hist_var = netcdf_variable(static_group, "delta_ion2_histogram", NC_INT64,
-      {edge_dim, delta_dim, environment_dim},
-      {1, static_cast<size_t>(static_delta_bins_), static_cast<size_t>(static_environment_bins_)},
-      compression_level_);
     netcdf_text_attribute(static_group, NC_GLOBAL, "description",
       "Centroid-coordinate free-energy bias over fixed reference O-O edges; unique H only.");
     netcdf_text_attribute(static_group, NC_GLOBAL, "ion_statistics",
@@ -5582,23 +5527,10 @@ void Proton_Tunneling::write_netcdf_output_file()
       "n_minus/n_plus use delta_cutoff; n_center uses abs(delta) < 0.10 A.");
     netcdf_text_attribute(static_group, static_delta_hist_var, "description",
       "Counts of unique, unambiguous single-H samples; out-of-range values are separate counts.");
-    netcdf_text_attribute(static_group, static_delta_dOO_hist_var, "description",
-      "Synchronous H(delta,dOO) counts for the same unique samples.");
-    netcdf_text_attribute(static_group, static_delta_ion1_hist_var, "description",
-      "Synchronous H(delta,r_ion1) counts; ion1 symbol is a global attribute.");
-    netcdf_text_attribute(static_group, static_delta_ion2_hist_var, "description",
-      "Synchronous H(delta,r_ion2) counts; ion2 symbol is a global attribute.");
     static_delta_edges.reserve(static_delta_bins_ + 1);
-    static_dOO_edges.reserve(static_environment_bins_ + 1);
-    static_ion_edges.reserve(static_environment_bins_ + 1);
     for (int i = 0; i <= static_delta_bins_; ++i)
       static_delta_edges.push_back(static_delta_min_ +
         (static_delta_max_ - static_delta_min_) * i / static_delta_bins_);
-    for (int i = 0; i <= static_environment_bins_; ++i) {
-      static_dOO_edges.push_back(dOO_min_ +
-        (dOO_max_ - dOO_min_) * i / static_environment_bins_);
-      static_ion_edges.push_back(static_environment_max_ * i / static_environment_bins_);
-    }
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double static_temperature_mean_K = static_temperature_samples_ > 0
       ? static_temperature_sum_K_ / static_temperature_samples_ : nan;
@@ -5623,10 +5555,7 @@ void Proton_Tunneling::write_netcdf_output_file()
       static_counts.insert(static_counts.end(), {
         stats.n_frames, stats.n_samples, stats.n_minus, stats.n_plus, stats.n_center,
         stats.n_empty, stats.n_multiple_H, stats.n_ambiguous, stats.n_geometry_filtered,
-        stats.delta_underflow,
-        stats.delta_overflow, stats.dOO_underflow, stats.dOO_overflow, stats.ion1_underflow,
-        stats.ion1_overflow, stats.ion2_underflow, stats.ion2_overflow, stats.n_dOO,
-        stats.n_ion1, stats.n_ion2});
+        stats.delta_underflow, stats.delta_overflow, stats.n_dOO, stats.n_ion1, stats.n_ion2});
     }
   }
 
@@ -6796,25 +6725,13 @@ void Proton_Tunneling::write_netcdf_output_file()
     netcdf_write_double(static_group, static_value_var, static_values);
     netcdf_write_longlong(static_group, static_count_var, static_counts);
     netcdf_write_double(static_group, static_delta_edges_var, static_delta_edges);
-    netcdf_write_double(static_group, static_dOO_edges_var, static_dOO_edges);
-    netcdf_write_double(static_group, static_ion_edges_var, static_ion_edges);
     for (size_t edge = 0; edge < reference_edge_keys_.size(); ++edge) {
       const PimdEdgeStats& stats = pimd_edge_stats_.at(reference_edge_keys_[edge]);
       const size_t delta_start[] = {edge, 0};
       const size_t delta_count[] = {1, static_cast<size_t>(static_delta_bins_)};
-      const size_t joint_start[] = {edge, 0, 0};
-      const size_t joint_count[] = {
-        1, static_cast<size_t>(static_delta_bins_),
-        static_cast<size_t>(static_environment_bins_)};
       netcdf_check(nc_put_vara_longlong(
         static_group, static_delta_hist_var, delta_start, delta_count, stats.delta_hist.data()),
         "nc_put_vara_longlong");
-      netcdf_check(nc_put_vara_longlong(static_group, static_delta_dOO_hist_var,
-        joint_start, joint_count, stats.delta_dOO_hist.data()), "nc_put_vara_longlong");
-      netcdf_check(nc_put_vara_longlong(static_group, static_delta_ion1_hist_var,
-        joint_start, joint_count, stats.delta_ion1_hist.data()), "nc_put_vara_longlong");
-      netcdf_check(nc_put_vara_longlong(static_group, static_delta_ion2_hist_var,
-        joint_start, joint_count, stats.delta_ion2_hist.data()), "nc_put_vara_longlong");
     }
   }
   if (window_group >= 0) {
