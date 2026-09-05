@@ -5517,11 +5517,11 @@ void Proton_Tunneling::write_netcdf_output_file()
       {edge_dim, count_dim}, {reference_edge_keys_.size(), static_count_names.size()},
       compression_level_);
     static_delta_edges_var = netcdf_variable(static_group, "delta_bin_edges_A", NC_DOUBLE,
-      {delta_edge_dim}, {static_delta_bins_ + 1}, compression_level_);
+      {delta_edge_dim}, {static_cast<size_t>(static_delta_bins_ + 1)}, compression_level_);
     static_dOO_edges_var = netcdf_variable(static_group, "dOO_bin_edges_A", NC_DOUBLE,
-      {environment_edge_dim}, {static_environment_bins_ + 1}, compression_level_);
+      {environment_edge_dim}, {static_cast<size_t>(static_environment_bins_ + 1)}, compression_level_);
     static_ion_edges_var = netcdf_variable(static_group, "ion_distance_bin_edges_A", NC_DOUBLE,
-      {environment_edge_dim}, {static_environment_bins_ + 1}, compression_level_);
+      {environment_edge_dim}, {static_cast<size_t>(static_environment_bins_ + 1)}, compression_level_);
     static_delta_hist_var = netcdf_variable(static_group, "delta_histogram", NC_INT64,
       {edge_dim, delta_dim}, {1, static_cast<size_t>(static_delta_bins_)}, compression_level_);
     static_delta_dOO_hist_var = netcdf_variable(static_group, "delta_dOO_histogram", NC_INT64,
