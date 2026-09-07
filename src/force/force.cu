@@ -761,6 +761,17 @@ bool Force::compute_qnep_centroid_frames_batch(
   if (!qnep) {
     return false;
   }
+  const int number_of_atoms = type.size();
+  for (GPU_Vector<double>& position_frame : position_frames) {
+    gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      box,
+      position_frame.data(),
+      position_frame.data() + number_of_atoms,
+      position_frame.data() + number_of_atoms * 2,
+      nullptr);
+  }
+  GPU_CHECK_KERNEL
   return qnep->compute_pimd_batch(
     box,
     type,

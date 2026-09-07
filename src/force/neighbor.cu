@@ -841,8 +841,23 @@ __global__ void gpu_check_atom_distance_batch(
     float dx = position[n] - x_old_batch[bead][n];
     float dy = position[n + N] - y_old_batch[bead][n];
     float dz = position[n + N * 2] - z_old_batch[bead][n];
+    const float raw_dx = dx;
+    const float raw_dy = dy;
+    const float raw_dz = dz;
+    const float sx =
+      box.float_h[9] * raw_dx + box.float_h[10] * raw_dy + box.float_h[11] * raw_dz;
+    const float sy =
+      box.float_h[12] * raw_dx + box.float_h[13] * raw_dy + box.float_h[14] * raw_dz;
+    const float sz =
+      box.float_h[15] * raw_dx + box.float_h[16] * raw_dy + box.float_h[17] * raw_dz;
+    const int image_shift_x = box.pbc_x == 1 ? static_cast<int>(nearbyint(sx)) : 0;
+    const int image_shift_y = box.pbc_y == 1 ? static_cast<int>(nearbyint(sy)) : 0;
+    const int image_shift_z = box.pbc_z == 1 ? static_cast<int>(nearbyint(sz)) : 0;
     apply_mic(box, dx, dy, dz);
-    if ((dx * dx + dy * dy + dz * dz) > d2) {
+    // Batched small-box lists cache explicit periodic image numbers. A wrapped
+    // coordinate can have a small MIC displacement while changing those images.
+    if (image_shift_x != 0 || image_shift_y != 0 || image_shift_z != 0 ||
+        (dx * dx + dy * dy + dz * dz) > d2) {
       atomicExch(&rebuild_block, 1);
     }
   }

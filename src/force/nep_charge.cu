@@ -4007,6 +4007,9 @@ void NEP_Charge::compute_non_electro(
     dftd3.compute(
       box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
   }
+  // Keep the shared charge output neutral after a descriptor-only pass.
+  zero_total_charge<<<1, 1024>>>(type.size(), nep_data.charge.data());
+  GPU_CHECK_KERNEL
 }
 
 const GPU_Vector<int>& NEP_Charge::get_NN_radial_ptr() { return nep_data.NN_radial; }
