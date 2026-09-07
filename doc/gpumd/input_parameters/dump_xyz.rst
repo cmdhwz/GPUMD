@@ -31,6 +31,15 @@ If it is omitted, data for the whole system will be output.
 
 * Then one can write the properties to be output, and the allowed properties include: :attr:`mass`, :attr:`velocity`, :attr:`force`, :attr:`potential`, :attr:`virial`, :attr:`charge`, :attr:`bec`, :attr:`group_labels`, and :attr:`unwrapped_position`.
 
+For a classical qNEP run, the additional diagnostic properties are
+``raw_charge``, ``charge_dudq_raw``, ``charge_dudq``, ``raw_charge_rate``,
+``charge_rate``, ``virial_nep``, ``virial_electrostatic_fixed``, and
+``virial_dynamic_charge``.  Charge rates are written in e/fs and virials in eV.
+These diagnostics are allocated and evaluated only when requested.  The three
+virial components require extra force evaluations on every output frame.
+These diagnostics cannot be combined with the ``group`` option because their
+charge projections use whole-system means.
+
 The :attr:`group_labels` property writes one integer column per grouping method, holding the label of the group each atom belongs to.
 
 * The wrapped positions will always be included in the output.
@@ -51,6 +60,11 @@ Examples
 
     # dump forces with the full precision of the underlying double-precision values:
     dump_xyz 100 forces.xyz precision double force
+
+    # inspect the qNEP charge projection, time derivative, and virial split:
+    dump_xyz 100 charge_debug.xyz precision double virial charge raw_charge \
+      charge_dudq_raw charge_dudq raw_charge_rate charge_rate \
+      virial_nep virial_electrostatic_fixed virial_dynamic_charge
 
     run 1000000
 

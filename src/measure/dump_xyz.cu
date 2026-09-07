@@ -19,6 +19,7 @@ Dump per-atom data to user-specified file(s) in the extended XYZ format
 
 #include "dump_xyz.cuh"
 #include "force/force.cuh"
+#include "force/nep_charge.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "parse_utilities.cuh"
@@ -103,6 +104,17 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
   bool group_seen = false;
   bool precision_seen = false;
 
+  auto set_qnep_quantity = [this](bool& flag, const char* token) {
+    if (!is_nep_charge) {
+      PRINT_INPUT_ERROR("qNEP charge diagnostics require an NEP-charge model.\n");
+    }
+    if (flag) {
+      PRINT_INPUT_ERROR("A qNEP charge diagnostic is specified more than once in dump_xyz.\n");
+    }
+    flag = true;
+    printf("    has %s.\n", token);
+  };
+
   for (int m = 3; m < num_param; ++m) {
     if (strcmp(param[m], "group") == 0) {
       if (group_seen) {
@@ -128,6 +140,38 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
       }
       parse_precision(param, num_param, m, precision_);
       precision_seen = true;
+      continue;
+    }
+    if (strcmp(param[m], "raw_charge") == 0) {
+      set_qnep_quantity(has_raw_charge_, param[m]);
+      continue;
+    }
+    if (strcmp(param[m], "charge_dudq_raw") == 0) {
+      set_qnep_quantity(has_charge_dudq_raw_, param[m]);
+      continue;
+    }
+    if (strcmp(param[m], "charge_dudq") == 0) {
+      set_qnep_quantity(has_charge_dudq_, param[m]);
+      continue;
+    }
+    if (strcmp(param[m], "raw_charge_rate") == 0) {
+      set_qnep_quantity(has_raw_charge_rate_, param[m]);
+      continue;
+    }
+    if (strcmp(param[m], "charge_rate") == 0) {
+      set_qnep_quantity(has_charge_rate_, param[m]);
+      continue;
+    }
+    if (strcmp(param[m], "virial_nep") == 0) {
+      set_qnep_quantity(has_virial_nep_, param[m]);
+      continue;
+    }
+    if (strcmp(param[m], "virial_electrostatic_fixed") == 0) {
+      set_qnep_quantity(has_virial_electrostatic_fixed_, param[m]);
+      continue;
+    }
+    if (strcmp(param[m], "virial_dynamic_charge") == 0) {
+      set_qnep_quantity(has_virial_dynamic_charge_, param[m]);
       continue;
     }
     if (!parse_dump_quantity(param[m], quantities, is_nep_charge, groups, "dump_xyz")) {
@@ -174,6 +218,42 @@ void Dump_XYZ::pre_run(
   if (quantities.has_bec_) {
     cpu_bec_.resize(atom.number_of_atoms * 9);
   }
+  if (has_charge_diagnostics() && grouping_method_ >= 0) {
+    PRINT_INPUT_ERROR("qNEP charge diagnostics cannot be combined with grouped dump_xyz.\n");
+  }
+  if (quantities.has_bec_ || (is_nep_charge && (quantities.has_charge_ || has_charge_diagnostics()))) {
+    if (force.potentials.empty()) {
+      PRINT_INPUT_ERROR("dump_xyz requires a potential for the requested properties.\n");
+    }
+    potential_ = force.potentials[0].get();
+  }
+  if (is_nep_charge && (quantities.has_charge_ || has_charge_diagnostics())) {
+    qnep_ = dynamic_cast<NEP_Charge*>(potential_);
+  }
+  if (has_charge_diagnostics()) {
+    if (integrate.type >= 31 && integrate.type <= 33) {
+      PRINT_INPUT_ERROR("qNEP charge diagnostics in dump_xyz currently support classical MD only.\n");
+    }
+    if (force.potentials.size() != 1) {
+      PRINT_INPUT_ERROR("qNEP charge diagnostics require exactly one potential.\n");
+    }
+    if (!qnep_) PRINT_INPUT_ERROR("qNEP charge diagnostics require NEP-charge as the main potential.\n");
+    qnep_->enable_charge_diagnostics();
+  }
+  if (has_raw_charge_) cpu_charge_raw_.resize(atom.number_of_atoms);
+  if (has_charge_dudq_raw_) cpu_charge_dudq_raw_.resize(atom.number_of_atoms);
+  if (has_charge_dudq_) cpu_charge_dudq_.resize(atom.number_of_atoms);
+  if (has_raw_charge_rate_) cpu_charge_rate_raw_.resize(atom.number_of_atoms);
+  if (has_charge_rate_) cpu_charge_rate_.resize(atom.number_of_atoms);
+  if (has_virial_nep_ || has_virial_electrostatic_fixed_ || has_virial_dynamic_charge_) {
+    const int size = atom.number_of_atoms * 9;
+    gpu_virial_nep_.resize(size);
+    gpu_virial_electrostatic_fixed_.resize(size);
+    gpu_virial_dynamic_charge_.resize(size);
+    if (has_virial_nep_) cpu_virial_nep_.resize(size);
+    if (has_virial_electrostatic_fixed_) cpu_virial_electrostatic_fixed_.resize(size);
+    if (has_virial_dynamic_charge_) cpu_virial_dynamic_charge_.resize(size);
+  }
 }
 
 void Dump_XYZ::print_tensor(const char* name, const double* tensor)
@@ -215,6 +295,26 @@ void Dump_XYZ::output_line2(
     box.cpu_h[5],
     box.cpu_h[8]};
   print_tensor("Lattice", lattice);
+
+  if (has_charge_diagnostics()) {
+    fprintf(
+      fid_,
+      " qnep_charge_mode=%d electrostatic_solver=%s ewald_alpha=%.9g realspace_cutoff=%.9g",
+      qnep_->get_charge_mode(),
+      qnep_->uses_pppm() ? "PPPM" : "Ewald",
+      qnep_->get_ewald_alpha(),
+      qnep_->get_realspace_cutoff());
+    if (qnep_->uses_pppm()) {
+      const int* mesh = qnep_->get_pppm_mesh();
+      fprintf(
+        fid_,
+        " pppm_mesh=\"%d %d %d\" pppm_mesh_spacing=%.17g",
+        mesh[0],
+        mesh[1],
+        mesh[2],
+        qnep_->get_pppm_mesh_spacing());
+    }
+  }
 
   // energy and virial (symmetric tensor) in eV, and stress (symmetric tensor) in eV/A^3
   double cpu_thermo[8];
@@ -259,6 +359,11 @@ void Dump_XYZ::output_line2(
   if (quantities.has_charge_) {
     fprintf(fid_, ":charge:R:1");
   }
+  if (has_raw_charge_) fprintf(fid_, ":charge_raw:R:1");
+  if (has_charge_dudq_raw_) fprintf(fid_, ":charge_dudq_raw:R:1");
+  if (has_charge_dudq_) fprintf(fid_, ":charge_dudq:R:1");
+  if (has_raw_charge_rate_) fprintf(fid_, ":charge_rate_raw:R:1");
+  if (has_charge_rate_) fprintf(fid_, ":charge_rate:R:1");
   if (quantities.has_bec_) {
     fprintf(fid_, ":bec:R:9");
   }
@@ -277,6 +382,9 @@ void Dump_XYZ::output_line2(
   if (quantities.has_virial_) {
     fprintf(fid_, ":virial:R:9");
   }
+  if (has_virial_nep_) fprintf(fid_, ":virial_nep:R:9");
+  if (has_virial_electrostatic_fixed_) fprintf(fid_, ":virial_electrostatic_fixed:R:9");
+  if (has_virial_dynamic_charge_) fprintf(fid_, ":virial_dynamic_charge:R:9");
   if (quantities.has_group_) {
     const int num_grouping_methods = groups.size();
     fprintf(fid_, ":group:I:%d", num_grouping_methods);
@@ -284,6 +392,23 @@ void Dump_XYZ::output_line2(
 
   // Over
   fprintf(fid_, "\n");
+}
+
+void Dump_XYZ::pre_force(
+  const int step,
+  const double,
+  Integrate&,
+  std::vector<Group>&,
+  Atom&,
+  Box&,
+  Force&)
+{
+  if (has_charge_snapshot() && (step + 1) % dump_interval_ == 0) {
+    qnep_->request_charge_diagnostics_for_next_force();
+  }
+  if (has_virial_dynamic_charge_ && (step + 1) % dump_interval_ == 0) {
+    qnep_->request_peratom_virial_for_next_force();
+  }
 }
 
 void Dump_XYZ::end_of_step(
@@ -314,14 +439,13 @@ void Dump_XYZ::end_of_step(
   }
   if (quantities.has_charge_) {
     if (is_nep_charge) {
-      GPU_Vector<float>& nep_charge = force.potentials[0]->get_charge_reference();
-      nep_charge.copy_to_host(atom.cpu_charge.data());
+      qnep_->get_charge_reference().copy_to_host(atom.cpu_charge.data());
     } else {
       atom.charge.copy_to_host(atom.cpu_charge.data());
     }
   }
   if (quantities.has_bec_) {
-    GPU_Vector<float>& gpu_bec = force.potentials[0]->get_bec_reference();
+    GPU_Vector<float>& gpu_bec = potential_->get_bec_reference();
     gpu_bec.copy_to_host(cpu_bec_.data());
   }
   if (quantities.has_velocity_) {
@@ -338,6 +462,38 @@ void Dump_XYZ::end_of_step(
   }
   if (quantities.has_virial_) {
     atom.virial_per_atom.copy_to_host(cpu_virial_per_atom_.data());
+  }
+  if (has_raw_charge_) qnep_->get_raw_charge_reference().copy_to_host(cpu_charge_raw_.data());
+  if (has_charge_dudq_raw_)
+    qnep_->get_raw_D_reference().copy_to_host(cpu_charge_dudq_raw_.data());
+  if (has_charge_dudq_) qnep_->get_D_reference().copy_to_host(cpu_charge_dudq_.data());
+  if (has_raw_charge_rate_ || has_charge_rate_) {
+    qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
+    if (has_raw_charge_rate_)
+      qnep_->get_raw_charge_rate_reference().copy_to_host(cpu_charge_rate_raw_.data());
+    if (has_charge_rate_)
+      qnep_->get_charge_rate_reference().copy_to_host(cpu_charge_rate_.data());
+  }
+  if (has_virial_nep_ || has_virial_electrostatic_fixed_ || has_virial_dynamic_charge_) {
+    const bool need_virial_nep = has_virial_nep_ || has_virial_dynamic_charge_;
+    const bool need_virial_electrostatic_fixed =
+      has_virial_electrostatic_fixed_ || has_virial_dynamic_charge_;
+    qnep_->compute_virial_components(
+      box,
+      atom.type,
+      atom.position_per_atom,
+      atom.virial_per_atom,
+      need_virial_nep,
+      need_virial_electrostatic_fixed,
+      has_virial_dynamic_charge_,
+      gpu_virial_nep_,
+      gpu_virial_electrostatic_fixed_,
+      gpu_virial_dynamic_charge_);
+    if (has_virial_nep_) gpu_virial_nep_.copy_to_host(cpu_virial_nep_.data());
+    if (has_virial_electrostatic_fixed_)
+      gpu_virial_electrostatic_fixed_.copy_to_host(cpu_virial_electrostatic_fixed_.data());
+    if (has_virial_dynamic_charge_)
+      gpu_virial_dynamic_charge_.copy_to_host(cpu_virial_dynamic_charge_.data());
   }
 
   if (separated_) {
@@ -370,6 +526,13 @@ void Dump_XYZ::end_of_step(
     if (quantities.has_charge_) {
       fprintf(fid_, fmt_.c_str(), atom.cpu_charge[m]);
     }
+    if (has_raw_charge_) fprintf(fid_, fmt_.c_str(), cpu_charge_raw_[m]);
+    if (has_charge_dudq_raw_) fprintf(fid_, fmt_.c_str(), cpu_charge_dudq_raw_[m]);
+    if (has_charge_dudq_) fprintf(fid_, fmt_.c_str(), cpu_charge_dudq_[m]);
+    if (has_raw_charge_rate_)
+      fprintf(fid_, fmt_.c_str(), cpu_charge_rate_raw_[m] / TIME_UNIT_CONVERSION);
+    if (has_charge_rate_)
+      fprintf(fid_, fmt_.c_str(), cpu_charge_rate_[m] / TIME_UNIT_CONVERSION);
     if (quantities.has_bec_) {
       for (int d = 0; d < 9; ++d) {
         fprintf(fid_, fmt_.c_str(), cpu_bec_[m + atom.number_of_atoms * d]);
@@ -403,6 +566,22 @@ void Dump_XYZ::end_of_step(
         fprintf(fid_, fmt_.c_str(), cpu_virial_per_atom_[m + atom.number_of_atoms * index[d]]);
       }
     }
+    const int virial_index[9] = {0, 3, 4, 6, 1, 5, 7, 8, 2};
+    if (has_virial_nep_)
+      for (int d = 0; d < 9; ++d)
+        fprintf(fid_, fmt_.c_str(), cpu_virial_nep_[m + atom.number_of_atoms * virial_index[d]]);
+    if (has_virial_electrostatic_fixed_)
+      for (int d = 0; d < 9; ++d)
+        fprintf(
+          fid_,
+          fmt_.c_str(),
+          cpu_virial_electrostatic_fixed_[m + atom.number_of_atoms * virial_index[d]]);
+    if (has_virial_dynamic_charge_)
+      for (int d = 0; d < 9; ++d)
+        fprintf(
+          fid_,
+          fmt_.c_str(),
+          cpu_virial_dynamic_charge_[m + atom.number_of_atoms * virial_index[d]]);
     if (quantities.has_group_) {
       for (int d = 0; d < groups.size(); ++d) {
         fprintf(fid_, " %d", groups[d].cpu_label[m]);

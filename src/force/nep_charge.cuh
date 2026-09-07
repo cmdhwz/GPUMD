@@ -47,6 +47,11 @@ struct NEP_Charge_Data {
   GPU_Vector<float> charge;
   GPU_Vector<float> charge_derivative;
   GPU_Vector<float> bec;               // BEC
+  GPU_Vector<float> charge_raw;
+  GPU_Vector<float> D_raw;
+  GPU_Vector<float> D_projected;
+  GPU_Vector<float> charge_rate_raw;
+  GPU_Vector<float> charge_rate;
 };
 
 class NEP_Charge : public Potential
@@ -165,6 +170,37 @@ public:
 
   GPU_Vector<float>& get_bec_reference();
 
+  void enable_charge_diagnostics();
+  void request_charge_diagnostics_for_next_force();
+  void request_peratom_virial_for_next_force();
+  void compute_charge_rate(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& velocity);
+  void compute_virial_components(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& total_virial,
+    const bool need_nep,
+    const bool need_electrostatic_fixed,
+    const bool need_dynamic_charge,
+    GPU_Vector<double>& virial_nep,
+    GPU_Vector<double>& virial_electrostatic_fixed,
+    GPU_Vector<double>& virial_dynamic_charge);
+  GPU_Vector<float>& get_raw_charge_reference() { return nep_data.charge_raw; }
+  GPU_Vector<float>& get_raw_D_reference() { return nep_data.D_raw; }
+  GPU_Vector<float>& get_D_reference() { return nep_data.D_projected; }
+  GPU_Vector<float>& get_raw_charge_rate_reference() { return nep_data.charge_rate_raw; }
+  GPU_Vector<float>& get_charge_rate_reference() { return nep_data.charge_rate; }
+  int get_charge_mode() const { return paramb.charge_mode; }
+  bool uses_pppm() const { return use_pppm; }
+  float get_ewald_alpha() const { return charge_para.alpha; }
+  float get_realspace_cutoff() const { return paramb.rc_radial; }
+  double get_pppm_mesh_spacing() const { return pppm.get_mesh_spacing(); }
+  const int* get_pppm_mesh() const { return pppm.get_mesh(); }
+
   virtual void set_neighbor_rebuild(const bool value);
   void set_pppm_mesh_spacing(const double value) override { pppm.set_mesh_spacing(value); }
   void set_md_qnep_bec(const bool enabled) override { md_qnep_bec_enabled_ = enabled; }
@@ -273,6 +309,9 @@ private:
   bool md_qnep_bec_enabled_ = true;
   bool pimd_batch_bec_enabled_ = true;
   bool pimd_batch_profile_enabled_ = false;
+  bool charge_diagnostics_enabled_ = false;
+  bool charge_diagnostics_requested_ = false;
+  bool peratom_virial_requested_ = false;
   PIMD_Batch_Timing pimd_batch_timing_;
   long long neighbor_large_box_calls_ = 0;
   long long neighbor_small_box_calls_ = 0;

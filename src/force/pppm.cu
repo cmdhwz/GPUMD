@@ -931,11 +931,35 @@ PPPM::~PPPM()
   if (plan_inverse_batch != 0) {
     gpufftDestroy(plan_inverse_batch);
   }
-  if (need_peratom_virial && plan_virial != 0) {
+  if (plan_virial != 0) {
     gpufftDestroy(plan_virial);
   }
-  if (need_peratom_virial && plan_virial_batch != 0) {
+  if (plan_virial_batch != 0) {
     gpufftDestroy(plan_virial_batch);
+  }
+}
+
+void PPPM::allocate_virial_memory()
+{
+  if (plan_virial != 0) {
+    return;
+  }
+  mesh_virial.resize(para.K0K1K2 * 6);
+  int n[3] = {para.K[2], para.K[1], para.K[0]};
+  if (gpufftPlanMany(
+        &plan_virial,
+        3,
+        n,
+        NULL,
+        1,
+        para.K0K1K2,
+        NULL,
+        1,
+        para.K0K1K2,
+        GPUFFT_C2C,
+        6) != GPUFFT_SUCCESS) {
+    std::cout << "GPUFFT error: plan_virial creation failed" << std::endl;
+    exit(1);
   }
 }
 
@@ -977,14 +1001,6 @@ void PPPM::allocate_memory()
     exit(1);
   }
 
-  if (need_peratom_virial) {
-    mesh_virial.resize(para.K0K1K2 * 6);
-    int n[3] = {para.K[2], para.K[1], para.K[0]};
-    if (gpufftPlanMany(&plan_virial, 3, n, NULL, 1, para.K0K1K2, NULL, 1, para.K0K1K2, GPUFFT_C2C, 6) != GPUFFT_SUCCESS) {
-      std::cout << "GPUFFT error: plan_virial creation failed" << std::endl;
-      exit(1);
-    }
-  }
 }
 
 void PPPM::allocate_batch_memory(const int number_of_beads)
@@ -1111,9 +1127,14 @@ void PPPM::find_force(
   GPU_Vector<float>& D_real,
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom,
-  GPU_Vector<double>& potential_per_atom)
+  GPU_Vector<double>& potential_per_atom,
+  const bool request_peratom_virial)
 {
   find_para(N, box);
+  const bool calculate_peratom_virial = need_peratom_virial || request_peratom_virial;
+  if (calculate_peratom_virial && plan_virial == 0) {
+    allocate_virial_memory();
+  }
 
   find_k_and_G_opt<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
     para, 
@@ -1162,7 +1183,7 @@ void PPPM::find_force(
     mesh_G.data());
   GPU_CHECK_KERNEL
 
-  if (need_peratom_virial) {
+  if (calculate_peratom_virial) {
     find_mesh_virial<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
       para,
       kx.data(),
@@ -1199,7 +1220,7 @@ void PPPM::find_force(
     exit(1);
   }
 
-  if (need_peratom_virial) {
+  if (calculate_peratom_virial) {
     if (gpufftExecC2C(plan_virial, mesh_virial.data(), mesh_virial.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
       std::cout << "GPUFFT error: ExecC2C Inverse failed" << std::endl;
       exit(1);

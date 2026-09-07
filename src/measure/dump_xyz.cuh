@@ -22,6 +22,8 @@
 class Box;
 class Atom;
 class Group;
+class NEP_Charge;
+class Potential;
 
 class Dump_XYZ : public Action
 {
@@ -37,6 +39,15 @@ public:
     Atom& atom,
     Box& box,
     Force& force);
+
+  void pre_force(
+    const int step,
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
 
   virtual void end_of_step(
     const int number_of_steps,
@@ -62,6 +73,8 @@ public:
 
 private:
   bool is_nep_charge = false;
+  Potential* potential_ = nullptr;
+  NEP_Charge* qnep_ = nullptr;
   int grouping_method_ = -1;
   int group_id_ = -1;
   int dump_interval_ = 1;
@@ -79,6 +92,36 @@ private:
   GPU_Vector<double> gpu_total_virial_;
   std::vector<double> cpu_total_virial_;
   std::vector<float> cpu_bec_;
+  bool has_raw_charge_ = false;
+  bool has_charge_dudq_raw_ = false;
+  bool has_charge_dudq_ = false;
+  bool has_raw_charge_rate_ = false;
+  bool has_charge_rate_ = false;
+  bool has_virial_nep_ = false;
+  bool has_virial_electrostatic_fixed_ = false;
+  bool has_virial_dynamic_charge_ = false;
+  std::vector<float> cpu_charge_raw_;
+  std::vector<float> cpu_charge_dudq_raw_;
+  std::vector<float> cpu_charge_dudq_;
+  std::vector<float> cpu_charge_rate_raw_;
+  std::vector<float> cpu_charge_rate_;
+  GPU_Vector<double> gpu_virial_nep_;
+  GPU_Vector<double> gpu_virial_electrostatic_fixed_;
+  GPU_Vector<double> gpu_virial_dynamic_charge_;
+  std::vector<double> cpu_virial_nep_;
+  std::vector<double> cpu_virial_electrostatic_fixed_;
+  std::vector<double> cpu_virial_dynamic_charge_;
+
+  bool has_charge_diagnostics() const
+  {
+    return has_raw_charge_ || has_charge_dudq_raw_ || has_charge_dudq_ || has_raw_charge_rate_ ||
+           has_charge_rate_ || has_virial_nep_ || has_virial_electrostatic_fixed_ ||
+           has_virial_dynamic_charge_;
+  }
+  bool has_charge_snapshot() const
+  {
+    return has_raw_charge_ || has_charge_dudq_raw_ || has_charge_dudq_;
+  }
 
   void print_tensor(const char* name, const double* tensor);
 

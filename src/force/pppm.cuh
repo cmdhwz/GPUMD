@@ -29,6 +29,8 @@ public:
   ~PPPM();
   void initialize(const float alpha_input);
   void set_mesh_spacing(const double value) { mesh_spacing = value; }
+  double get_mesh_spacing() const { return mesh_spacing; }
+  const int* get_mesh() const { return para.K; }
   void find_force(
     const int N,
     const int N1,
@@ -39,7 +41,8 @@ public:
     GPU_Vector<float>& D_real,
     GPU_Vector<double>& force_per_atom,
     GPU_Vector<double>& virial_per_atom,
-    GPU_Vector<double>& potential_per_atom);
+    GPU_Vector<double>& potential_per_atom,
+    const bool request_peratom_virial = false);
   void find_force_batch(
     const int N,
     const int N1,
@@ -85,6 +88,7 @@ private:
   gpufftHandle plan_inverse_batch = 0;
   int batch_capacity = 0;
   void allocate_memory();
+  void allocate_virial_memory();
   void allocate_batch_memory(const int number_of_beads);
   void find_para(const int N, const Box& box);
   void find_k_and_G(const double* box);
