@@ -20,6 +20,7 @@ Dump per-atom data to user-specified file(s) in the extended XYZ format
 #include "dump_xyz.cuh"
 #include "force/force.cuh"
 #include "force/nep_charge.cuh"
+#include "integrate/integrate.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "parse_utilities.cuh"
