@@ -33,6 +33,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/compute_chunk.cuh"
 #include "measure/compute_dpdt.cuh"
 #include "measure/compute_es.cuh"
+#include "measure/qnep_projection.cuh"
 #include "measure/dos.cuh"
 #include "measure/deform.cuh"
 #include "measure/dump_beads.cuh"
@@ -587,6 +588,12 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     std::unique_ptr<Action> action;
     action.reset(new Compute_dpdt(param, num_param));
     measure.actions.emplace_back(std::move(action));
+  } else if (strcmp(param[0], "compute_qnep_projection") == 0) {
+    std::unique_ptr<Action> action;
+    action.reset(new QNEP_Projection(param, num_param));
+    // Run before other actions so their qNEP recomputations cannot overwrite
+    // the diagnostics captured by the main force evaluation.
+    measure.actions.insert(measure.actions.begin(), std::move(action));
   } else if (strcmp(param[0], "compute_es") == 0) {
     std::unique_ptr<Action> action;
     action.reset(new Compute_es(param, num_param));
