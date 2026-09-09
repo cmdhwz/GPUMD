@@ -177,7 +177,14 @@ public:
     Box& box,
     const GPU_Vector<int>& type,
     const GPU_Vector<double>& position,
-    const GPU_Vector<double>& velocity);
+    const GPU_Vector<double>& velocity,
+    GPU_Vector<double>* channel_per_atom = nullptr);
+  void compute_charge_heat_channels(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& velocity,
+    GPU_Vector<double>& channel_per_atom); // SoA: radial xyz, then angular xyz.
   void compute_virial_components(
     Box& box,
     const GPU_Vector<int>& type,

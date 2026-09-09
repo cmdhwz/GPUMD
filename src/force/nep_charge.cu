@@ -2862,7 +2862,7 @@ void NEP_Charge::compute(
   }
 }
 
-static __device__ __forceinline__ float find_charge_rate_radial_pair(
+static __device__ __forceinline__ void find_charge_gradient_radial_pair(
   const NEP_Charge::ParaMB paramb,
   const NEP_Charge::ANN annmb,
   const int N,
@@ -2870,15 +2870,13 @@ static __device__ __forceinline__ float find_charge_rate_radial_pair(
   const int n2,
   const int* g_type,
   const float r12[3],
-  const double* g_vx,
-  const double* g_vy,
-  const double* g_vz,
-  const float* g_charge_derivative)
+  const float* g_charge_derivative,
+  float f12[3])
 {
   const int t1 = g_type[n1];
   const int t2 = g_type[n2];
   const float d12 = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
-  float fc12, fcp12, fn12[MAX_NUM_N], fnp12[MAX_NUM_N], f12[3] = {0.0f};
+  float fc12, fcp12, fn12[MAX_NUM_N], fnp12[MAX_NUM_N];
   find_fc_and_fcp(paramb.rc_radial, paramb.rcinv_radial, d12, fc12, fcp12);
   find_fn_and_fnp(
     paramb.basis_size_radial, paramb.rcinv_radial, d12, fc12, fcp12, fn12, fnp12);
@@ -2892,27 +2890,23 @@ static __device__ __forceinline__ float find_charge_rate_radial_pair(
     const float tmp12 = g_charge_derivative[n1 + n * N] * gnp12 / d12;
     for (int d = 0; d < 3; ++d) f12[d] += tmp12 * r12[d];
   }
-  return f12[0] * (g_vx[n2] - g_vx[n1]) + f12[1] * (g_vy[n2] - g_vy[n1]) +
-         f12[2] * (g_vz[n2] - g_vz[n1]);
 }
 
-static __device__ __forceinline__ float find_charge_rate_angular_pair(
+static __device__ __forceinline__ void find_charge_gradient_angular_pair(
   const NEP_Charge::ParaMB paramb,
   const NEP_Charge::ANN annmb,
   const int n1,
   const int n2,
   const int* g_type,
   const float r12[3],
-  const double* g_vx,
-  const double* g_vy,
-  const double* g_vz,
   const float* Fp,
-  const float* sum_fxyz)
+  const float* sum_fxyz,
+  float f12[3])
 {
   const int t1 = g_type[n1];
   const int t2 = g_type[n2];
   const float d12 = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
-  float fc12, fcp12, fn12[MAX_NUM_N], fnp12[MAX_NUM_N], f12[3] = {0.0f};
+  float fc12, fcp12, fn12[MAX_NUM_N], fnp12[MAX_NUM_N];
   find_fc_and_fcp(paramb.rc_angular, paramb.rcinv_angular, d12, fc12, fcp12);
   find_fn_and_fnp(
     paramb.basis_size_angular, paramb.rcinv_angular, d12, fc12, fcp12, fn12, fnp12);
@@ -2948,8 +2942,28 @@ static __device__ __forceinline__ float find_charge_rate_angular_pair(
       sum_fxyz,
       f12);
   }
-  return f12[0] * (g_vx[n2] - g_vx[n1]) + f12[1] * (g_vy[n2] - g_vy[n1]) +
-         f12[2] * (g_vz[n2] - g_vz[n1]);
+}
+
+static __device__ __forceinline__ void accumulate_charge_heat_channel(
+  const int N,
+  const int n1,
+  const int n2,
+  const float r12[3],
+  const float f12[3],
+  const double* g_vx,
+  const double* g_vy,
+  const double* g_vz,
+  const float* g_D_projected,
+  const int component_offset,
+  double* g_channel)
+{
+  if (g_channel == nullptr) return;
+  const double gv = static_cast<double>(f12[0]) * g_vx[n2] +
+                    static_cast<double>(f12[1]) * g_vy[n2] +
+                    static_cast<double>(f12[2]) * g_vz[n2];
+  const double factor = -static_cast<double>(g_D_projected[n1]) * gv;
+  for (int d = 0; d < 3; ++d)
+    g_channel[n1 + (component_offset + d) * N] += factor * static_cast<double>(r12[d]);
 }
 
 static __global__ void find_charge_rate_radial(
@@ -2969,7 +2983,9 @@ static __global__ void find_charge_rate_radial(
   const double* g_vy,
   const double* g_vz,
   const float* g_charge_derivative,
-  float* g_charge_rate)
+  float* g_charge_rate,
+  const float* g_D_projected,
+  double* g_channel)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 >= N2) return;
@@ -2978,8 +2994,15 @@ static __global__ void find_charge_rate_radial(
     float r12[3] = {
       float(g_x[n2] - g_x[n1]), float(g_y[n2] - g_y[n1]), float(g_z[n2] - g_z[n1])};
     apply_mic(box, r12[0], r12[1], r12[2]);
-    g_charge_rate[n1] += find_charge_rate_radial_pair(
-      paramb, annmb, N, n1, n2, g_type, r12, g_vx, g_vy, g_vz, g_charge_derivative);
+    float f12[3] = {0.0f, 0.0f, 0.0f};
+    find_charge_gradient_radial_pair(paramb, annmb, N, n1, n2, g_type, r12, g_charge_derivative, f12);
+    if (g_charge_rate != nullptr) {
+      g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
+                            f12[1] * (g_vy[n2] - g_vy[n1]) +
+                            f12[2] * (g_vz[n2] - g_vz[n1]);
+    }
+    accumulate_charge_heat_channel(
+      N, n1, n2, r12, f12, g_vx, g_vy, g_vz, g_D_projected, 0, g_channel);
   }
 }
 
@@ -3001,7 +3024,9 @@ static __global__ void find_charge_rate_angular(
   const double* g_vz,
   const float* g_charge_derivative,
   const float* g_sum_fxyz,
-  float* g_charge_rate)
+  float* g_charge_rate,
+  const float* g_D_projected,
+  double* g_channel)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 >= N2) return;
@@ -3018,8 +3043,15 @@ static __global__ void find_charge_rate_angular(
     float r12[3] = {
       float(g_x[n2] - g_x[n1]), float(g_y[n2] - g_y[n1]), float(g_z[n2] - g_z[n1])};
     apply_mic(box, r12[0], r12[1], r12[2]);
-    g_charge_rate[n1] += find_charge_rate_angular_pair(
-      paramb, annmb, n1, n2, g_type, r12, g_vx, g_vy, g_vz, Fp, sum_fxyz);
+    float f12[3] = {0.0f, 0.0f, 0.0f};
+    find_charge_gradient_angular_pair(paramb, annmb, n1, n2, g_type, r12, Fp, sum_fxyz, f12);
+    if (g_charge_rate != nullptr) {
+      g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
+                            f12[1] * (g_vy[n2] - g_vy[n1]) +
+                            f12[2] * (g_vz[n2] - g_vz[n1]);
+    }
+    accumulate_charge_heat_channel(
+      N, n1, n2, r12, f12, g_vx, g_vy, g_vz, g_D_projected, 3, g_channel);
   }
 }
 
@@ -3039,7 +3071,9 @@ static __global__ void find_charge_rate_radial_small_box(
   const double* g_vy,
   const double* g_vz,
   const float* g_charge_derivative,
-  float* g_charge_rate)
+  float* g_charge_rate,
+  const float* g_D_projected,
+  double* g_channel)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 >= N2) return;
@@ -3047,8 +3081,15 @@ static __global__ void find_charge_rate_radial_small_box(
     const int index = n1 + N * i1;
     const int n2 = g_NL[index];
     const float r12[3] = {g_x12[index], g_y12[index], g_z12[index]};
-    g_charge_rate[n1] += find_charge_rate_radial_pair(
-      paramb, annmb, N, n1, n2, g_type, r12, g_vx, g_vy, g_vz, g_charge_derivative);
+    float f12[3] = {0.0f, 0.0f, 0.0f};
+    find_charge_gradient_radial_pair(paramb, annmb, N, n1, n2, g_type, r12, g_charge_derivative, f12);
+    if (g_charge_rate != nullptr) {
+      g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
+                            f12[1] * (g_vy[n2] - g_vy[n1]) +
+                            f12[2] * (g_vz[n2] - g_vz[n1]);
+    }
+    accumulate_charge_heat_channel(
+      N, n1, n2, r12, f12, g_vx, g_vy, g_vz, g_D_projected, 0, g_channel);
   }
 }
 
@@ -3069,7 +3110,9 @@ static __global__ void find_charge_rate_angular_small_box(
   const double* g_vz,
   const float* g_charge_derivative,
   const float* g_sum_fxyz,
-  float* g_charge_rate)
+  float* g_charge_rate,
+  const float* g_D_projected,
+  double* g_channel)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 >= N2) return;
@@ -3085,8 +3128,15 @@ static __global__ void find_charge_rate_angular_small_box(
     const int index = n1 + N * i1;
     const int n2 = g_NL[index];
     const float r12[3] = {g_x12[index], g_y12[index], g_z12[index]};
-    g_charge_rate[n1] += find_charge_rate_angular_pair(
-      paramb, annmb, n1, n2, g_type, r12, g_vx, g_vy, g_vz, Fp, sum_fxyz);
+    float f12[3] = {0.0f, 0.0f, 0.0f};
+    find_charge_gradient_angular_pair(paramb, annmb, n1, n2, g_type, r12, Fp, sum_fxyz, f12);
+    if (g_charge_rate != nullptr) {
+      g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
+                            f12[1] * (g_vy[n2] - g_vy[n1]) +
+                            f12[2] * (g_vz[n2] - g_vz[n1]);
+    }
+    accumulate_charge_heat_channel(
+      N, n1, n2, r12, f12, g_vx, g_vy, g_vz, g_D_projected, 3, g_channel);
   }
 }
 
@@ -4314,12 +4364,25 @@ void NEP_Charge::compute_charge_rate(
   Box& box,
   const GPU_Vector<int>& type,
   const GPU_Vector<double>& position,
-  const GPU_Vector<double>& velocity)
+  const GPU_Vector<double>& velocity,
+  GPU_Vector<double>* channel_per_atom)
 {
   const int N = nep_data.charge.size();
   const int block_size = 64;
   const int grid_size = (N2 - N1 - 1) / block_size + 1;
-  nep_data.charge_rate_raw.fill(0.0f);
+  float* charge_rate = nullptr;
+  const float* D_projected = nullptr;
+  double* channel = nullptr;
+  if (channel_per_atom == nullptr) {
+    nep_data.charge_rate_raw.fill(0.0f);
+    charge_rate = nep_data.charge_rate_raw.data();
+  } else {
+    if (channel_per_atom->size() != static_cast<size_t>(N) * 6)
+      channel_per_atom->resize(static_cast<size_t>(N) * 6);
+    channel_per_atom->fill(0.0);
+    D_projected = nep_data.D_projected.data();
+    channel = channel_per_atom->data();
+  }
   if (get_expanded_box(paramb.rc_radial, box, ebox)) {
     const int size_x12 = small_box_data.r12.size() / 6;
     find_charge_rate_radial_small_box<<<grid_size, block_size>>>(
@@ -4338,7 +4401,9 @@ void NEP_Charge::compute_charge_rate(
       velocity.data() + N,
       velocity.data() + N * 2,
       nep_data.charge_derivative.data(),
-      nep_data.charge_rate_raw.data());
+      charge_rate,
+      D_projected,
+      channel);
     find_charge_rate_angular_small_box<<<grid_size, block_size>>>(
       paramb,
       annmb,
@@ -4356,7 +4421,9 @@ void NEP_Charge::compute_charge_rate(
       velocity.data() + N * 2,
       nep_data.charge_derivative.data(),
       nep_data.sum_fxyz.data(),
-      nep_data.charge_rate_raw.data());
+      charge_rate,
+      D_projected,
+      channel);
   } else {
     find_charge_rate_radial<<<grid_size, block_size>>>(
       paramb,
@@ -4375,7 +4442,9 @@ void NEP_Charge::compute_charge_rate(
       velocity.data() + N,
       velocity.data() + N * 2,
       nep_data.charge_derivative.data(),
-      nep_data.charge_rate_raw.data());
+      charge_rate,
+      D_projected,
+      channel);
     find_charge_rate_angular<<<grid_size, block_size>>>(
       paramb,
       annmb,
@@ -4394,12 +4463,26 @@ void NEP_Charge::compute_charge_rate(
       velocity.data() + N * 2,
       nep_data.charge_derivative.data(),
       nep_data.sum_fxyz.data(),
-      nep_data.charge_rate_raw.data());
+      charge_rate,
+      D_projected,
+      channel);
   }
   GPU_CHECK_KERNEL
-  nep_data.charge_rate.copy_from_device(nep_data.charge_rate_raw.data());
-  zero_total_charge<<<1, 1024>>>(N, nep_data.charge_rate.data());
-  GPU_CHECK_KERNEL
+  if (channel_per_atom == nullptr) {
+    nep_data.charge_rate.copy_from_device(nep_data.charge_rate_raw.data());
+    zero_total_charge<<<1, 1024>>>(N, nep_data.charge_rate.data());
+    GPU_CHECK_KERNEL
+  }
+}
+
+void NEP_Charge::compute_charge_heat_channels(
+  Box& box,
+  const GPU_Vector<int>& type,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& velocity,
+  GPU_Vector<double>& channel_per_atom)
+{
+  compute_charge_rate(box, type, position, velocity, &channel_per_atom);
 }
 
 void NEP_Charge::compute_virial_components(

@@ -71,6 +71,7 @@ private:
   void check_fixed_cell(const Box&) const;
 
   int sample_interval_ = 1;
+  bool g1_channel_ = false;
   NEP_Charge* qnep_ = nullptr;
   double initial_cell_[9] = {0.0};
   int number_of_pair_blocks_ = 0;
@@ -78,5 +79,15 @@ private:
   GPU_Vector<double> gpu_partial_;
   GPU_Vector<double> gpu_total_;
   std::vector<double> cpu_total_;
+  GPU_Vector<double> gpu_channel_per_atom_;
+  GPU_Vector<double> gpu_channel_total_;
+  GPU_Vector<double> gpu_virial_nep_;
+  GPU_Vector<double> gpu_virial_electrostatic_fixed_;
+  GPU_Vector<double> gpu_virial_dynamic_charge_;
+  GPU_Vector<double> gpu_virial_heat_per_atom_;
+  GPU_Vector<double> gpu_virial_heat_total_;
+  std::vector<double> cpu_channel_total_;
+  std::vector<double> cpu_virial_heat_total_;
   FILE* fid_ = nullptr;
+  FILE* fid_channel_ = nullptr;
 };
