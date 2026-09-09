@@ -87,6 +87,11 @@ public:
     Box& box,
     Atom& atom,
     GPU_Vector<double>& thermo);
+  void get_ring_polymer_energy(
+    double& kinetic,
+    double& spring,
+    double& nonham_work);
+  void reset_nonham_work();
   void enable_distributed(int num_devices, Atom& atom, GPU_Vector<double>& thermo);
   bool distributed_enabled() const { return distributed_enabled_; }
   void compute_force_distributed(Force& force, Box& box, std::vector<Group>& group, Atom& atom);
@@ -116,6 +121,7 @@ protected:
   double free_ring_polymer_cached_omega_n_ = 0.0;
   double free_ring_polymer_cached_time_step_ = 0.0;
   GPU_Vector<double> kinetic_energy_virial_part;
+  GPU_Vector<double> nonham_work_per_atom_;
 
   GPU_Vector<double> sum_1024; // for intermidiate summation
 

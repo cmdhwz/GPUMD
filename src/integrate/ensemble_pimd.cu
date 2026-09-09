@@ -69,6 +69,72 @@ void copy_gpu_vector_between_devices_(
     destination_device, destination.data(), source_device, source.data(), destination.size());
 }
 
+static __global__ void gpu_find_ring_polymer_energy(
+  const int number_of_atoms,
+  const int number_of_beads,
+  const double omega_n,
+  const double* g_mass,
+  double** g_position_beads,
+  double** g_velocity_beads,
+  const double* g_nonham_work_per_atom,
+  double* g_energy)
+{
+  const int tid = threadIdx.x;
+  __shared__ double s_kinetic[1024];
+  __shared__ double s_spring[1024];
+  __shared__ double s_nonham_work[1024];
+
+  double kinetic = 0.0;
+  double spring = 0.0;
+  double nonham_work = 0.0;
+  const int number_of_bead_atoms = number_of_atoms * number_of_beads;
+  for (int index = tid; index < number_of_bead_atoms; index += blockDim.x) {
+    const int bead = index / number_of_atoms;
+    const int n = index - bead * number_of_atoms;
+    const int next_bead = (bead + 1 == number_of_beads) ? 0 : bead + 1;
+    const int index_y = number_of_atoms + n;
+    const int index_z = 2 * number_of_atoms + n;
+
+    const double* position = g_position_beads[bead];
+    const double* next_position = g_position_beads[next_bead];
+    const double* velocity = g_velocity_beads[bead];
+
+    const double vx = velocity[n];
+    const double vy = velocity[index_y];
+    const double vz = velocity[index_z];
+    kinetic += 0.5 * g_mass[n] * (vx * vx + vy * vy + vz * vz);
+
+    double dx = position[n] - next_position[n];
+    double dy = position[index_y] - next_position[index_y];
+    double dz = position[index_z] - next_position[index_z];
+    spring += 0.5 * g_mass[n] * omega_n * omega_n * (dx * dx + dy * dy + dz * dz);
+    if (g_nonham_work_per_atom != nullptr && bead == 0) {
+      nonham_work += g_nonham_work_per_atom[n];
+    }
+  }
+
+  s_kinetic[tid] = kinetic;
+  s_spring[tid] = spring;
+  s_nonham_work[tid] = nonham_work;
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_kinetic[tid] += s_kinetic[tid + offset];
+      s_spring[tid] += s_spring[tid + offset];
+      s_nonham_work[tid] += s_nonham_work[tid + offset];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const double inverse_number_of_beads = 1.0 / number_of_beads;
+    g_energy[0] = s_kinetic[0] * inverse_number_of_beads;
+    g_energy[1] = s_spring[0] * inverse_number_of_beads;
+    g_energy[2] = s_nonham_work[0];
+  }
+}
+
 } // namespace
 
 void Ensemble_PIMD::initialize_rng()
@@ -265,6 +331,38 @@ void Ensemble_PIMD::initialize(Atom& atom)
   int grid_size = (number_of_atoms - 1) / 128 + 1;
   initialize_curand_states<<<grid_size, 128>>>(curand_states.data(), number_of_atoms, rand());
   GPU_CHECK_KERNEL
+}
+
+void Ensemble_PIMD::get_ring_polymer_energy(
+  double& kinetic,
+  double& spring,
+  double& nonham_work)
+{
+  double* g_nonham_work =
+    thermostat_internal && nonham_work_per_atom_.size() == number_of_atoms
+      ? nonham_work_per_atom_.data()
+      : nullptr;
+  gpu_find_ring_polymer_energy<<<1, 1024>>>(
+    number_of_atoms,
+    number_of_beads,
+    omega_n,
+    atom->mass.data(),
+    position_beads.data(),
+    velocity_beads.data(),
+    g_nonham_work,
+    sum_1024.data());
+  GPU_CHECK_KERNEL
+
+  double energy[3];
+  sum_1024.copy_to_host(energy, 3);
+  kinetic = energy[0];
+  spring = energy[1];
+  nonham_work = energy[2];
+}
+
+void Ensemble_PIMD::reset_nonham_work()
+{
+  nonham_work_per_atom_.resize(number_of_atoms, 0.0);
 }
 
 void Ensemble_PIMD::update_free_ring_polymer_propagator_(const double time_step)
@@ -531,6 +629,27 @@ static __global__ void gpu_nve_2(
   }
 }
 
+static __device__ double device_bead_kinetic(
+  const int atom,
+  const int number_of_atoms,
+  const int number_of_beads,
+  const double* g_mass,
+  double** g_velocity)
+{
+  const int index_y = number_of_atoms + atom;
+  const int index_z = 2 * number_of_atoms + atom;
+  const double mass = g_mass[atom];
+  double kinetic = 0.0;
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    const double* velocity = g_velocity[bead];
+    kinetic += 0.5 * mass * (
+      velocity[atom] * velocity[atom] +
+      velocity[index_y] * velocity[index_y] +
+      velocity[index_z] * velocity[index_z]);
+  }
+  return kinetic;
+}
+
 static __global__ void gpu_langevin(
   const bool thermostat_centroid,
   const int number_of_atoms,
@@ -543,10 +662,15 @@ static __global__ void gpu_langevin(
   const double* free_ring_polymer_frequency,
   const double* transformation_matrix,
   const double* g_mass,
-  double** velocity)
+  double** velocity,
+  double* g_nonham_work_per_atom)
 {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (n < number_of_atoms) {
+    const double kinetic_before =
+      g_nonham_work_per_atom == nullptr
+        ? 0.0
+        : device_bead_kinetic(n, number_of_atoms, number_of_beads, g_mass, velocity);
 
     double velocity_normal[MAX_NUM_BEADS * 3];
 
@@ -594,6 +718,13 @@ static __global__ void gpu_langevin(
         velocity[j][index_dn] = temp_velocity;
       }
     }
+
+    if (g_nonham_work_per_atom != nullptr) {
+      const double kinetic_after =
+        device_bead_kinetic(n, number_of_atoms, number_of_beads, g_mass, velocity);
+      g_nonham_work_per_atom[n] +=
+        (kinetic_after - kinetic_before) / number_of_beads;
+    }
   }
 }
 
@@ -640,10 +771,18 @@ gpu_find_momentum_beads(const int number_of_atoms, const double* g_mass, double*
 }
 
 static __global__ void gpu_correct_momentum_beads(
-  const int number_of_atoms, const int number_of_beads, double** g_velocity)
+  const int number_of_atoms,
+  const int number_of_beads,
+  const double* g_mass,
+  double** g_velocity,
+  double* g_nonham_work_per_atom)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < number_of_atoms) {
+    const double kinetic_before =
+      g_nonham_work_per_atom == nullptr
+        ? 0.0
+        : device_bead_kinetic(i, number_of_atoms, number_of_beads, g_mass, g_velocity);
     double total_momentum[3] = {0.0};
     for (int k = 0; k < number_of_beads; ++k) {
       for (int d = 0; d < 3; ++d) {
@@ -657,6 +796,13 @@ static __global__ void gpu_correct_momentum_beads(
         g_velocity[k][i + d * number_of_atoms] -=
           total_momentum[d] * inverse_of_ring_polymer_mass;
       }
+    }
+
+    if (g_nonham_work_per_atom != nullptr) {
+      const double kinetic_after =
+        device_bead_kinetic(i, number_of_atoms, number_of_beads, g_mass, g_velocity);
+      g_nonham_work_per_atom[i] +=
+        (kinetic_after - kinetic_before) / number_of_beads;
     }
   }
 }
@@ -1063,6 +1209,10 @@ static __global__ void gpu_pressure_triclinic(
 void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
 {
   if (thermostat_internal) {
+    double* nonham_work =
+      nonham_work_per_atom_.size() == number_of_atoms
+        ? nonham_work_per_atom_.data()
+        : nullptr;
     gpu_langevin<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
       thermostat_centroid,
       number_of_atoms,
@@ -1075,7 +1225,8 @@ void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
       free_ring_polymer_frequency.data(),
       transformation_matrix.data(),
       atom.mass.data(),
-      velocity_beads.data());
+      velocity_beads.data(),
+      nonham_work);
     GPU_CHECK_KERNEL
 
     if (fix_com_) {
@@ -1084,7 +1235,11 @@ void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
       GPU_CHECK_KERNEL
 
       gpu_correct_momentum_beads<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
-        number_of_atoms, number_of_beads, velocity_beads.data());
+        number_of_atoms,
+        number_of_beads,
+        atom.mass.data(),
+        velocity_beads.data(),
+        nonham_work);
       GPU_CHECK_KERNEL
     }
   }

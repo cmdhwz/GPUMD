@@ -17,6 +17,7 @@
 #include "action.cuh"
 #include "utilities/gpu_vector.cuh"
 class Box;
+class Ensemble_PIMD;
 
 class Dump_Thermo : public Action
 {
@@ -58,6 +59,10 @@ public:
 
 private:
   int dump_interval_ = 1;
+  bool rp_energy_ = false;
+  bool conserved_reference_set_ = false;
+  double h_conserved_reference_ = 0.0;
+  Ensemble_PIMD* rp_ensemble_ = nullptr;
   FILE* fid_;
   char filename_[200];
 };
