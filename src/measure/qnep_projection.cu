@@ -218,10 +218,38 @@ void QNEP_Projection::pre_run(
     initial_cell_[i] = box.cpu_h[i];
 
   qnep_->enable_charge_diagnostics();
-  if (!g1_channel_) qnep_->enable_delta_j_q_k_diagnostics();
+  qnep_->enable_delta_j_q_k_diagnostics();
   if (!g1_channel_) atom.enable_unwrapped_position();
 
   const int N = atom.number_of_atoms;
+  fid_delta_j_q_k_ = my_fopen("delta_j_q_k.out", "a");
+  fprintf(fid_delta_j_q_k_, "# compute_qnep_projection %d\n", sample_interval_);
+  fprintf(fid_delta_j_q_k_, "# observable delta_j_q_k\n");
+  fprintf(fid_delta_j_q_k_, "# format_version 1\n");
+  fprintf(fid_delta_j_q_k_, "# num_atoms %d\n", N);
+  fprintf(
+    fid_delta_j_q_k_,
+    "# cell %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+    box.cpu_h[0], box.cpu_h[3], box.cpu_h[6],
+    box.cpu_h[1], box.cpu_h[4], box.cpu_h[7],
+    box.cpu_h[2], box.cpu_h[5], box.cpu_h[8]);
+  fprintf(fid_delta_j_q_k_, "# phase exp(+ikr)\n");
+  fprintf(fid_delta_j_q_k_, "# charge projected\n");
+  fprintf(fid_delta_j_q_k_, "# charge_rate projected\n");
+  fprintf(fid_delta_j_q_k_, "# k0 excluded\n");
+  fprintf(fid_delta_j_q_k_, "# kernel continuous_ewald_reference\n");
+  fprintf(fid_delta_j_q_k_, "# ewald_alpha %.17g 1/Angstrom\n", qnep_->get_ewald_alpha());
+  fprintf(fid_delta_j_q_k_, "# reciprocal_k_cutoff k_squared < (2*pi*alpha)^2\n");
+  fprintf(
+    fid_delta_j_q_k_,
+    "# reciprocal_k_convention n1>0 or n1=0,n2>0 or n1=n2=0,n3>0\n");
+  fprintf(fid_delta_j_q_k_, "# units sum_q=e sum_qdot=e/fs delta_j_q_k=eV Angstrom/fs\n");
+  fprintf(
+    fid_delta_j_q_k_,
+    "# columns step time_fs sum_q sum_qdot nk delta_j_q_k_x delta_j_q_k_y delta_j_q_k_z\n");
+  gpu_delta_j_q_k_.resize(3);
+  cpu_delta_j_q_k_.resize(3);
+
   if (g1_channel_) {
     fid_channel_ = my_fopen("charge_heat_diagnostic.out", "a");
     fprintf(fid_channel_, "# compute_qnep_projection %d g1_channel\n", sample_interval_);
@@ -258,32 +286,6 @@ void QNEP_Projection::pre_run(
     cpu_channel_total_.resize(NUM_CHANNEL_COMPONENTS);
     cpu_virial_heat_total_.resize(NUM_HEAT_COMPONENTS);
   } else {
-    fid_delta_j_q_k_ = my_fopen("delta_j_q_k.out", "a");
-    fprintf(fid_delta_j_q_k_, "# compute_qnep_projection %d\n", sample_interval_);
-    fprintf(fid_delta_j_q_k_, "# observable delta_j_q_k\n");
-    fprintf(fid_delta_j_q_k_, "# format_version 1\n");
-    fprintf(fid_delta_j_q_k_, "# num_atoms %d\n", N);
-    fprintf(
-      fid_delta_j_q_k_,
-      "# cell %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
-      box.cpu_h[0], box.cpu_h[3], box.cpu_h[6],
-      box.cpu_h[1], box.cpu_h[4], box.cpu_h[7],
-      box.cpu_h[2], box.cpu_h[5], box.cpu_h[8]);
-    fprintf(fid_delta_j_q_k_, "# phase exp(+ikr)\n");
-    fprintf(fid_delta_j_q_k_, "# charge projected\n");
-    fprintf(fid_delta_j_q_k_, "# charge_rate projected\n");
-    fprintf(fid_delta_j_q_k_, "# k0 excluded\n");
-    fprintf(fid_delta_j_q_k_, "# kernel continuous_ewald_reference\n");
-    fprintf(fid_delta_j_q_k_, "# ewald_alpha %.17g 1/Angstrom\n", qnep_->get_ewald_alpha());
-    fprintf(fid_delta_j_q_k_, "# reciprocal_k_cutoff k_squared < (2*pi*alpha)^2\n");
-    fprintf(
-      fid_delta_j_q_k_,
-      "# reciprocal_k_convention n1>0 or n1=0,n2>0 or n1=n2=0,n3>0\n");
-    fprintf(fid_delta_j_q_k_, "# units sum_q=e sum_qdot=e/fs delta_j_q_k=eV Angstrom/fs\n");
-    fprintf(
-      fid_delta_j_q_k_,
-      "# columns step time_fs sum_q sum_qdot nk delta_j_q_k_x delta_j_q_k_y delta_j_q_k_z\n");
-
     fid_ = my_fopen("qnep_projection.out", "a");
     fprintf(fid_, "# compute_qnep_projection %d\n", sample_interval_);
     fprintf(fid_, "# format_version 1\n");
@@ -306,8 +308,6 @@ void QNEP_Projection::pre_run(
     gpu_partial_.resize(number_of_pair_blocks_ * NUM_OUTPUTS);
     gpu_total_.resize(NUM_OUTPUTS);
     cpu_total_.resize(NUM_OUTPUTS);
-    gpu_delta_j_q_k_.resize(3);
-    cpu_delta_j_q_k_.resize(3);
   }
 }
 
@@ -355,6 +355,29 @@ void QNEP_Projection::end_of_step(
     return;
 
   check_fixed_cell(box);
+  qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
+  double sum_charge = 0.0;
+  double sum_charge_rate = 0.0;
+  const int num_kpoints = qnep_->compute_delta_j_q_k(
+    box,
+    atom.position_per_atom,
+    gpu_delta_j_q_k_,
+    sum_charge,
+    sum_charge_rate);
+  gpu_delta_j_q_k_.copy_to_host(cpu_delta_j_q_k_.data());
+  const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
+  fprintf(
+    fid_delta_j_q_k_,
+    "%d %.17g %.17g %.17g %d %.17g %.17g %.17g\n",
+    step + 1,
+    global_time * TIME_UNIT_CONVERSION,
+    sum_charge,
+    sum_charge_rate * inv_time_conversion,
+    num_kpoints,
+    cpu_delta_j_q_k_[0] * inv_time_conversion,
+    cpu_delta_j_q_k_[1] * inv_time_conversion,
+    cpu_delta_j_q_k_[2] * inv_time_conversion);
+
   if (g1_channel_) {
     qnep_->compute_charge_heat_channels(
       box, atom.type, atom.position_per_atom, atom.velocity_per_atom, gpu_channel_per_atom_);
@@ -408,31 +431,10 @@ void QNEP_Projection::end_of_step(
       jx_virial,
       jy_virial,
       jz_virial);
-    return;
   }
 
-  qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
-  double sum_charge = 0.0;
-  double sum_charge_rate = 0.0;
-  const int num_kpoints = qnep_->compute_delta_j_q_k(
-    box,
-    atom.position_per_atom,
-    gpu_delta_j_q_k_,
-    sum_charge,
-    sum_charge_rate);
-  gpu_delta_j_q_k_.copy_to_host(cpu_delta_j_q_k_.data());
-  const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
-  fprintf(
-    fid_delta_j_q_k_,
-    "%d %.17g %.17g %.17g %d %.17g %.17g %.17g\n",
-    step + 1,
-    global_time * TIME_UNIT_CONVERSION,
-    sum_charge,
-    sum_charge_rate * inv_time_conversion,
-    num_kpoints,
-    cpu_delta_j_q_k_[0] * inv_time_conversion,
-    cpu_delta_j_q_k_[1] * inv_time_conversion,
-    cpu_delta_j_q_k_[2] * inv_time_conversion);
+  if (g1_channel_)
+    return;
 
   const GPU_Vector<float>& D = qnep_->get_raw_D_reference();
   const GPU_Vector<float>& s = qnep_->get_raw_charge_rate_reference();
@@ -512,7 +514,7 @@ void QNEP_Projection::parse(const char** param, int num_param)
     g1_channel_ = true;
   }
   printf(
-    g1_channel_ ? "Compute classical qNEP G[1] channel diagnostics.\n"
+    g1_channel_ ? "Compute classical qNEP G[1] channel and reciprocal diagnostics.\n"
                 : "Compute classical qNEP projection diagnostics.\n");
   printf("    sample interval is %d.\n", sample_interval_);
 }
