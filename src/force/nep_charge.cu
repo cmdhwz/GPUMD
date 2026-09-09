@@ -4350,6 +4350,11 @@ void NEP_Charge::enable_charge_diagnostics()
   nep_data.charge_rate.resize(N);
 }
 
+void NEP_Charge::enable_delta_j_q_k_diagnostics()
+{
+  ewald.initialize(charge_para.alpha);
+}
+
 void NEP_Charge::request_charge_diagnostics_for_next_force()
 {
   charge_diagnostics_requested_ = true;
@@ -4483,6 +4488,27 @@ void NEP_Charge::compute_charge_heat_channels(
   GPU_Vector<double>& channel_per_atom)
 {
   compute_charge_rate(box, type, position, velocity, &channel_per_atom);
+}
+
+int NEP_Charge::compute_delta_j_q_k(
+  const Box& box,
+  const GPU_Vector<double>& position,
+  GPU_Vector<double>& delta_j_q_k,
+  double& sum_charge,
+  double& sum_charge_rate)
+{
+  const int N = nep_data.charge.size();
+  return ewald.compute_delta_j_q_k(
+    N,
+    N1,
+    N2,
+    box.cpu_h,
+    nep_data.charge,
+    nep_data.charge_rate,
+    position,
+    delta_j_q_k,
+    sum_charge,
+    sum_charge_rate);
 }
 
 void NEP_Charge::compute_virial_components(

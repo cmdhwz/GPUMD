@@ -171,6 +171,7 @@ public:
   GPU_Vector<float>& get_bec_reference();
 
   void enable_charge_diagnostics();
+  void enable_delta_j_q_k_diagnostics();
   void request_charge_diagnostics_for_next_force();
   void request_peratom_virial_for_next_force();
   void compute_charge_rate(
@@ -185,6 +186,12 @@ public:
     const GPU_Vector<double>& position,
     const GPU_Vector<double>& velocity,
     GPU_Vector<double>& channel_per_atom); // SoA: radial xyz, then angular xyz.
+  int compute_delta_j_q_k(
+    const Box& box,
+    const GPU_Vector<double>& position,
+    GPU_Vector<double>& delta_j_q_k,
+    double& sum_charge,
+    double& sum_charge_rate);
   void compute_virial_components(
     Box& box,
     const GPU_Vector<int>& type,

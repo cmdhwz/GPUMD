@@ -22,6 +22,17 @@ public:
   Ewald();
   ~Ewald();
   void initialize(const float alpha_input);
+  int compute_delta_j_q_k(
+    const int N,
+    const int N1,
+    const int N2,
+    const double* box,
+    const GPU_Vector<float>& charge,
+    const GPU_Vector<float>& charge_rate,
+    const GPU_Vector<double>& position,
+    GPU_Vector<double>& delta_j_q_k,
+    double& sum_charge,
+    double& sum_charge_rate);
   void find_force(
     const int N,
     const int N1,
@@ -44,5 +55,7 @@ private:
     GPU_Vector<float> G;
     GPU_Vector<float> S_real;
     GPU_Vector<float> S_imag;
+    GPU_Vector<double> delta_j_q_k_partial;
+    GPU_Vector<double> charge_sums;
     void find_k_and_G(const double* box);
 };

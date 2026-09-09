@@ -172,6 +172,112 @@ static __global__ void find_structure_factor(
   }
 }
 
+static __global__ void find_delta_j_q_k(
+  const int N1,
+  const int N2,
+  const int num_kpoints,
+  const float alpha_factor,
+  const float* g_charge,
+  const float* g_charge_rate,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  const float* g_kx,
+  const float* g_ky,
+  const float* g_kz,
+  const float* g_G,
+  double* g_partial)
+{
+  const int nk = blockIdx.x * blockDim.x + threadIdx.x;
+  if (nk < num_kpoints) {
+    const double kx = g_kx[nk];
+    const double ky = g_ky[nk];
+    const double kz = g_kz[nk];
+    const double ksq = kx * kx + ky * ky + kz * kz;
+    double rho_real = 0.0;
+    double rho_imag = 0.0;
+    double sigma_real = 0.0;
+    double sigma_imag = 0.0;
+    for (int n = N1; n < N2; ++n) {
+      const double kr = kx * g_x[n] + ky * g_y[n] + kz * g_z[n];
+      const double c = cos(kr);
+      const double s = sin(kr);
+      const double q = g_charge[n];
+      const double qdot = g_charge_rate[n];
+      rho_real += q * c;
+      rho_imag += q * s;
+      sigma_real += qdot * c;
+      sigma_imag += qdot * s;
+    }
+
+    // exp(+i k.r): Im(rho sigma*) = rho_imag*sigma_real - rho_real*sigma_imag.
+    const double im_rho_sigma = rho_imag * sigma_real - rho_real * sigma_imag;
+    // G stores A_k/V for one representative of each +/-k pair.
+    const double factor = static_cast<double>(K_C_SP) * static_cast<double>(g_G[nk]) *
+                          (2.0 / ksq + 2.0 * static_cast<double>(alpha_factor)) *
+                          im_rho_sigma;
+    g_partial[nk] = factor * kx;
+    g_partial[nk + num_kpoints] = factor * ky;
+    g_partial[nk + num_kpoints * 2] = factor * kz;
+  }
+}
+
+static __global__ void sum_charge_and_rate(
+  const int N1,
+  const int N2,
+  const float* g_charge,
+  const float* g_charge_rate,
+  double* g_sums)
+{
+  const int tid = threadIdx.x;
+  __shared__ double s_charge[1024];
+  __shared__ double s_charge_rate[1024];
+  double charge = 0.0;
+  double charge_rate = 0.0;
+  for (int n = N1 + tid; n < N2; n += 1024) {
+    charge += g_charge[n];
+    charge_rate += g_charge_rate[n];
+  }
+  s_charge[tid] = charge;
+  s_charge_rate[tid] = charge_rate;
+  __syncthreads();
+
+  for (int offset = 512; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_charge[tid] += s_charge[tid + offset];
+      s_charge_rate[tid] += s_charge_rate[tid + offset];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    g_sums[0] = s_charge[0];
+    g_sums[1] = s_charge_rate[0];
+  }
+}
+
+static __global__ void reduce_delta_j_q_k(
+  const int num_values,
+  const int num_components,
+  const double* g_partial,
+  double* g_total)
+{
+  const int component = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (component >= num_components) return;
+  __shared__ double s_data[1024];
+  double sum = 0.0;
+  for (int n = tid; n < num_values; n += 1024)
+    sum += g_partial[n + component * num_values];
+  s_data[tid] = sum;
+  __syncthreads();
+
+  for (int offset = 512; offset > 0; offset >>= 1) {
+    if (tid < offset) s_data[tid] += s_data[tid + offset];
+    __syncthreads();
+  }
+  if (tid == 0) g_total[component] = s_data[0];
+}
+
 static __global__ void find_force_charge_reciprocal_space(
   const int N,
   const int N1,
@@ -244,6 +350,49 @@ static __global__ void find_force_charge_reciprocal_space(
     g_fy[n] += charge_factor * temp_force_sum[1];
     g_fz[n] += charge_factor * temp_force_sum[2];
   }
+}
+
+int Ewald::compute_delta_j_q_k(
+  const int N,
+  const int N1,
+  const int N2,
+  const double* box,
+  const GPU_Vector<float>& charge,
+  const GPU_Vector<float>& charge_rate,
+  const GPU_Vector<double>& position,
+  GPU_Vector<double>& delta_j_q_k,
+  double& sum_charge,
+  double& sum_charge_rate)
+{
+  find_k_and_G(box);
+  if (delta_j_q_k.size() != 3) delta_j_q_k.resize(3);
+  if (delta_j_q_k_partial.size() != static_cast<size_t>(num_kpoints) * 3)
+    delta_j_q_k_partial.resize(static_cast<size_t>(num_kpoints) * 3);
+  if (charge_sums.size() != 2) charge_sums.resize(2);
+
+  sum_charge_and_rate<<<1, 1024>>>(
+    N1, N2, charge.data(), charge_rate.data(), charge_sums.data());
+  find_delta_j_q_k<<<(num_kpoints - 1) / 64 + 1, 64>>>(
+    N1,
+    N2,
+    num_kpoints,
+    alpha_factor,
+    charge.data(),
+    charge_rate.data(),
+    position.data(),
+    position.data() + N,
+    position.data() + N * 2,
+    kx.data(),
+    ky.data(),
+    kz.data(),
+    G.data(),
+    delta_j_q_k_partial.data());
+  reduce_delta_j_q_k<<<3, 1024>>>(
+    num_kpoints, 3, delta_j_q_k_partial.data(), delta_j_q_k.data());
+  GPU_CHECK_KERNEL
+  charge_sums.copy_to_host(&sum_charge, 1, 0);
+  charge_sums.copy_to_host(&sum_charge_rate, 1, 1);
+  return num_kpoints;
 }
 
 void Ewald::find_force(

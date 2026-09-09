@@ -86,8 +86,11 @@ private:
   GPU_Vector<double> gpu_virial_dynamic_charge_;
   GPU_Vector<double> gpu_virial_heat_per_atom_;
   GPU_Vector<double> gpu_virial_heat_total_;
+  GPU_Vector<double> gpu_delta_j_q_k_;
   std::vector<double> cpu_channel_total_;
   std::vector<double> cpu_virial_heat_total_;
+  std::vector<double> cpu_delta_j_q_k_;
   FILE* fid_ = nullptr;
   FILE* fid_channel_ = nullptr;
+  FILE* fid_delta_j_q_k_ = nullptr;
 };
