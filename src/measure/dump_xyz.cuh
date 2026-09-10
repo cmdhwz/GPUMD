@@ -100,6 +100,8 @@ private:
   bool has_virial_nep_ = false;
   bool has_virial_electrostatic_fixed_ = false;
   bool has_virial_dynamic_charge_ = false;
+  bool has_pppm_debug_ = false;
+  std::string pppm_debug_prefix_;
   std::vector<float> cpu_charge_raw_;
   std::vector<float> cpu_charge_dudq_raw_;
   std::vector<float> cpu_charge_dudq_;

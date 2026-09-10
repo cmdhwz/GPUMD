@@ -22,8 +22,10 @@ The k-space part of the PPPM method.
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
 #include <cmath>
-#include <vector>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <vector>
 
 namespace{
 
@@ -939,6 +941,103 @@ PPPM::~PPPM()
   }
 }
 
+void PPPM::write_debug(
+  const int N,
+  const int N1,
+  const int N2,
+  const Box& box,
+  const GPU_Vector<float>& charge,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<float>& D_real)
+{
+  const int M = para.K0K1K2;
+  std::vector<gpufftComplex> h_mesh_charge(M), h_mesh(M), h_mesh_fourier(M), h_mesh_G(M);
+  std::vector<float> h_kx(M), h_ky(M), h_kz(M), h_G(M);
+  std::vector<float> h_charge(N), h_D_real(N);
+  std::vector<double> h_position(3 * N);
+
+  debug_mesh_charge_.copy_to_host(h_mesh_charge.data());
+  mesh.copy_to_host(h_mesh.data());
+  debug_mesh_fourier_.copy_to_host(h_mesh_fourier.data());
+  mesh_G.copy_to_host(h_mesh_G.data());
+  kx.copy_to_host(h_kx.data());
+  ky.copy_to_host(h_ky.data());
+  kz.copy_to_host(h_kz.data());
+  G.copy_to_host(h_G.data());
+  charge.copy_to_host(h_charge.data());
+  position.copy_to_host(h_position.data());
+  D_real.copy_to_host(h_D_real.data());
+
+  std::ofstream mesh_file(debug_prefix_ + "_mesh.out", std::ios::app);
+  std::ofstream kspace_file(debug_prefix_ + "_kspace.out", std::ios::app);
+  std::ofstream atom_file(debug_prefix_ + "_atom.out", std::ios::app);
+  if (!mesh_file || !kspace_file || !atom_file) {
+    std::cerr << "Cannot open PPPM debug output files with prefix " << debug_prefix_ << ".\n";
+    exit(1);
+  }
+  mesh_file << std::setprecision(17);
+  kspace_file << std::setprecision(17);
+  atom_file << std::setprecision(17);
+
+  auto write_header = [&](std::ofstream& file) {
+    file << "# pppm_frame " << debug_frame_ << "\n";
+    file << "# pppm_number_of_atoms " << N << "\n";
+    file << "# pppm_mesh_size " << para.K[0] << " " << para.K[1] << " " << para.K[2] << "\n";
+    file << "# pppm_indexing gx-fastest gy-middle gz-slowest\n";
+    file << "# K_C_SP " << K_C_SP << " potential_factor " << para.potential_factor << "\n";
+    file << "# box_h";
+    for (int d = 0; d < 9; ++d) file << " " << box.cpu_h[d];
+    file << "\n";
+    file << "# box_h_inverse";
+    for (int d = 0; d < 9; ++d) file << " " << box.cpu_h[9 + d];
+    file << "\n";
+  };
+
+  write_header(mesh_file);
+  mesh_file << "# fft_forward unnormalized fft_inverse unnormalized\n";
+  mesh_file << "# mesh_charge=Q_g=sum_i q_i W_gi (not a density)\n";
+  mesh_file << "# mesh_potential=IFFT_unnormalized(Gopt*S)\n";
+  mesh_file << "# columns gx gy gz mesh_charge_real mesh_charge_imag mesh_potential_real mesh_potential_imag\n";
+  for (int iz = 0; iz < para.K[2]; ++iz) {
+    for (int iy = 0; iy < para.K[1]; ++iy) {
+      for (int ix = 0; ix < para.K[0]; ++ix) {
+        const int n = ix + para.K[0] * (iy + para.K[1] * iz);
+        mesh_file << ix << " " << iy << " " << iz << " " << h_mesh_charge[n].x << " "
+                  << h_mesh_charge[n].y << " " << h_mesh_G[n].x << " " << h_mesh_G[n].y << "\n";
+      }
+    }
+  }
+
+  write_header(kspace_file);
+  kspace_file << "# zero_mode Gopt=0\n";
+  kspace_file << "# columns ix iy iz nx ny nz kx ky kz S_real S_imag Gopt Phi_real Phi_imag\n";
+  for (int iz = 0; iz < para.K[2]; ++iz) {
+    for (int iy = 0; iy < para.K[1]; ++iy) {
+      for (int ix = 0; ix < para.K[0]; ++ix) {
+        const int n = ix + para.K[0] * (iy + para.K[1] * iz);
+        const int nx = ix >= para.K_half[0] ? ix - para.K[0] : ix;
+        const int ny = iy >= para.K_half[1] ? iy - para.K[1] : iy;
+        const int nz = iz >= para.K_half[2] ? iz - para.K[2] : iz;
+        kspace_file << ix << " " << iy << " " << iz << " " << nx << " " << ny << " " << nz
+                    << " " << h_kx[n] << " " << h_ky[n] << " " << h_kz[n] << " " << h_mesh[n].x
+                    << " " << h_mesh[n].y << " " << h_G[n] << " " << h_mesh_fourier[n].x << " "
+                    << h_mesh_fourier[n].y << "\n";
+      }
+    }
+  }
+
+  write_header(atom_file);
+  atom_file << "# pppm_atom_range " << N1 << " " << N2 << "\n";
+  atom_file << "# D_recip=2*K_C_SP*T^T*mesh_potential before real-space and zero-mean projection; "
+               "u_recip=0.5*q*D_recip\n";
+  atom_file << "# columns atom_id x y z charge D_recip u_recip\n";
+  for (int n = 0; n < N; ++n) {
+    const double u_recip = 0.5 * double(h_charge[n]) * double(h_D_real[n]);
+    atom_file << n << " " << h_position[n] << " " << h_position[N + n] << " " << h_position[2 * N + n]
+              << " " << h_charge[n] << " " << h_D_real[n] << " " << u_recip << "\n";
+  }
+}
+
 void PPPM::allocate_virial_memory()
 {
   if (plan_virial != 0) {
@@ -1131,6 +1230,14 @@ void PPPM::find_force(
   const bool request_peratom_virial)
 {
   find_para(N, box);
+  if (debug_requested_) {
+    if (
+      debug_mesh_charge_.size() != static_cast<size_t>(para.K0K1K2) ||
+      debug_mesh_fourier_.size() != static_cast<size_t>(para.K0K1K2)) {
+      debug_mesh_charge_.resize(para.K0K1K2);
+      debug_mesh_fourier_.resize(para.K0K1K2);
+    }
+  }
   const bool calculate_peratom_virial = need_peratom_virial || request_peratom_virial;
   if (calculate_peratom_virial && plan_virial == 0) {
     allocate_virial_memory();
@@ -1158,6 +1265,9 @@ void PPPM::find_force(
     position_per_atom.data() + N * 2,
     mesh.data());
   GPU_CHECK_KERNEL
+  if (debug_requested_) {
+    debug_mesh_charge_.copy_from_device(mesh.data());
+  }
 
   if (gpufftExecC2C(plan, mesh.data(), mesh.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
     std::cout << "GPUFFT error: ExecC2C Forward failed" << std::endl;
@@ -1182,6 +1292,9 @@ void PPPM::find_force(
     mesh.data(),
     mesh_G.data());
   GPU_CHECK_KERNEL
+  if (debug_requested_) {
+    debug_mesh_fourier_.copy_from_device(mesh_G.data());
+  }
 
   if (calculate_peratom_virial) {
     find_mesh_virial<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
@@ -1287,6 +1400,10 @@ void PPPM::find_force(
       virial_per_atom.data(),
       potential_per_atom.data());
     GPU_CHECK_KERNEL
+  }
+  if (debug_requested_) {
+    write_debug(N, N1, N2, box, charge, position_per_atom, D_real);
+    debug_requested_ = false;
   }
 }
 

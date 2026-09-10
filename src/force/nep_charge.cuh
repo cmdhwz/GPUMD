@@ -174,6 +174,10 @@ public:
   void enable_delta_j_q_k_diagnostics();
   void request_charge_diagnostics_for_next_force();
   void request_peratom_virial_for_next_force();
+  void request_pppm_debug_for_next_force(const char* prefix, const int frame)
+  {
+    pppm.request_debug_for_next_force(prefix, frame);
+  }
   void compute_charge_rate(
     Box& box,
     const GPU_Vector<int>& type,

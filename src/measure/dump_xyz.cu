@@ -143,6 +143,18 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
       precision_seen = true;
       continue;
     }
+    if (strcmp(param[m], "pppm_debug") == 0) {
+      if (!is_nep_charge) {
+        PRINT_INPUT_ERROR("pppm_debug requires an NEP-charge model.\n");
+      }
+      if (has_pppm_debug_ || m + 1 >= num_param) {
+        PRINT_INPUT_ERROR("pppm_debug should be followed by one output prefix.\n");
+      }
+      has_pppm_debug_ = true;
+      pppm_debug_prefix_ = param[++m];
+      printf("    PPPM debug output prefix: %s.\n", pppm_debug_prefix_.c_str());
+      continue;
+    }
     if (strcmp(param[m], "raw_charge") == 0) {
       set_qnep_quantity(has_raw_charge_, param[m]);
       continue;
@@ -222,13 +234,18 @@ void Dump_XYZ::pre_run(
   if (has_charge_diagnostics() && grouping_method_ >= 0) {
     PRINT_INPUT_ERROR("qNEP charge diagnostics cannot be combined with grouped dump_xyz.\n");
   }
-  if (quantities.has_bec_ || (is_nep_charge && (quantities.has_charge_ || has_charge_diagnostics()))) {
+  if (has_pppm_debug_ && grouping_method_ >= 0) {
+    PRINT_INPUT_ERROR("pppm_debug cannot be combined with grouped dump_xyz.\n");
+  }
+  if (
+    quantities.has_bec_ ||
+    (is_nep_charge && (quantities.has_charge_ || has_charge_diagnostics() || has_pppm_debug_))) {
     if (force.potentials.empty()) {
       PRINT_INPUT_ERROR("dump_xyz requires a potential for the requested properties.\n");
     }
     potential_ = force.potentials[0].get();
   }
-  if (is_nep_charge && (quantities.has_charge_ || has_charge_diagnostics())) {
+  if (is_nep_charge && (quantities.has_charge_ || has_charge_diagnostics() || has_pppm_debug_)) {
     qnep_ = dynamic_cast<NEP_Charge*>(potential_);
   }
   if (has_charge_diagnostics()) {
@@ -240,6 +257,17 @@ void Dump_XYZ::pre_run(
     }
     if (!qnep_) PRINT_INPUT_ERROR("qNEP charge diagnostics require NEP-charge as the main potential.\n");
     qnep_->enable_charge_diagnostics();
+  }
+  if (has_pppm_debug_) {
+    if (integrate.type >= 31 && integrate.type <= 33) {
+      PRINT_INPUT_ERROR("pppm_debug currently supports classical MD only.\n");
+    }
+    if (force.potentials.size() != 1 || !qnep_) {
+      PRINT_INPUT_ERROR("pppm_debug requires NEP-charge as the only potential.\n");
+    }
+    if (!qnep_->uses_pppm()) {
+      PRINT_INPUT_ERROR("pppm_debug requires kspace_method pppm.\n");
+    }
   }
   if (has_raw_charge_) cpu_charge_raw_.resize(atom.number_of_atoms);
   if (has_charge_dudq_raw_) cpu_charge_dudq_raw_.resize(atom.number_of_atoms);
@@ -409,6 +437,9 @@ void Dump_XYZ::pre_force(
   }
   if (has_virial_dynamic_charge_ && (step + 1) % dump_interval_ == 0) {
     qnep_->request_peratom_virial_for_next_force();
+  }
+  if (has_pppm_debug_ && (step + 1) % dump_interval_ == 0) {
+    qnep_->request_pppm_debug_for_next_force(pppm_debug_prefix_.c_str(), step + 1);
   }
 }
 

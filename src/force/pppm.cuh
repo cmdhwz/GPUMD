@@ -16,6 +16,7 @@
 #pragma once
 #include "utilities/gpu_vector.cuh"
 #include "model/box.cuh"
+#include <string>
 #ifdef USE_HIP
   #include <hipfft/hipfft.h>
 #else
@@ -31,6 +32,12 @@ public:
   void set_mesh_spacing(const double value) { mesh_spacing = value; }
   double get_mesh_spacing() const { return mesh_spacing; }
   const int* get_mesh() const { return para.K; }
+  void request_debug_for_next_force(const char* prefix, const int frame)
+  {
+    debug_requested_ = true;
+    debug_prefix_ = prefix;
+    debug_frame_ = frame;
+  }
   void find_force(
     const int N,
     const int N1,
@@ -81,6 +88,11 @@ private:
   GPU_Vector<gpufftComplex> mesh_x;
   GPU_Vector<gpufftComplex> mesh_y;
   GPU_Vector<gpufftComplex> mesh_z;
+  bool debug_requested_ = false;
+  std::string debug_prefix_;
+  int debug_frame_ = 0;
+  GPU_Vector<gpufftComplex> debug_mesh_charge_;
+  GPU_Vector<gpufftComplex> debug_mesh_fourier_;
   gpufftHandle plan = 0;
   GPU_Vector<gpufftComplex> mesh_batch;
   GPU_Vector<gpufftComplex> mesh_inverse_batch;
@@ -92,6 +104,14 @@ private:
   void allocate_batch_memory(const int number_of_beads);
   void find_para(const int N, const Box& box);
   void find_k_and_G(const double* box);
+  void write_debug(
+    const int N,
+    const int N1,
+    const int N2,
+    const Box& box,
+    const GPU_Vector<float>& charge,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<float>& D_real);
 
   bool need_peratom_virial = false;
   bool need_peratom_virial_every_batch = false;
