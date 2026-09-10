@@ -23,6 +23,25 @@
   #include <cufft.h>
 #endif
 
+struct PPPMAssignmentAtomDebug
+{
+  int atom_id;
+  float q;
+  double x, y, z;
+  float sx, sy, sz;
+  int ix, iy, iz;
+  float dx, dy, dz;
+  float Wx[5], Wy[5], Wz[5];
+};
+
+struct PPPMAssignmentStencilDebug
+{
+  int n0, n1, n2;
+  int neighbor0, neighbor1, neighbor2;
+  int neighbor012;
+  float W, qW;
+};
+
 class PPPM
 {
 public:
@@ -35,9 +54,11 @@ public:
   void request_debug_for_next_force(const char* prefix, const int frame)
   {
     debug_requested_ = true;
+    debug_call_index_ = 0;
     debug_prefix_ = prefix;
     debug_frame_ = frame;
   }
+  void finish_debug_force_evaluation() { debug_requested_ = false; }
   void find_force(
     const int N,
     const int N1,
@@ -89,10 +110,19 @@ private:
   GPU_Vector<gpufftComplex> mesh_y;
   GPU_Vector<gpufftComplex> mesh_z;
   bool debug_requested_ = false;
+  int debug_call_index_ = 0;
   std::string debug_prefix_;
   int debug_frame_ = 0;
   GPU_Vector<gpufftComplex> debug_mesh_charge_;
   GPU_Vector<gpufftComplex> debug_mesh_fourier_;
+  GPU_Vector<PPPMAssignmentAtomDebug> debug_assignment_atoms_;
+  GPU_Vector<PPPMAssignmentStencilDebug> debug_assignment_stencil_;
+  double debug_mesh_before_assignment_max_real_ = 0.0;
+  double debug_mesh_before_assignment_max_imag_ = 0.0;
+  double debug_mesh_before_assignment_rms_real_ = 0.0;
+  double debug_mesh_before_assignment_rms_imag_ = 0.0;
+  double debug_mesh_before_assignment_sum_real_ = 0.0;
+  double debug_mesh_after_assignment_sum_real_ = 0.0;
   gpufftHandle plan = 0;
   GPU_Vector<gpufftComplex> mesh_batch;
   GPU_Vector<gpufftComplex> mesh_inverse_batch;
@@ -111,7 +141,8 @@ private:
     const Box& box,
     const GPU_Vector<float>& charge,
     const GPU_Vector<double>& position,
-    const GPU_Vector<float>& D_real);
+    const GPU_Vector<float>& D_real,
+    const int pppm_call_index);
 
   bool need_peratom_virial = false;
   bool need_peratom_virial_every_batch = false;

@@ -29,6 +29,8 @@ The k-space part of the PPPM method.
 
 namespace{
 
+constexpr const char* PPPM_DEBUG_SOURCE_SIGNATURE = "PPPM_ASSIGN_DEBUG_20260910_V1";
+
 int get_best_K(const int m)
 {
   int n = 16;
@@ -143,7 +145,9 @@ __global__ void find_mesh(
   const double* g_x,
   const double* g_y,
   const double* g_z,
-  gpufftComplex* g_mesh)
+  gpufftComplex* g_mesh,
+  PPPMAssignmentAtomDebug* g_debug_atoms,
+  PPPMAssignmentStencilDebug* g_debug_stencil)
 {
   const int n = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n < N2) {
@@ -169,6 +173,29 @@ __global__ void find_mesh(
       Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy + W_coeff[d][1]) * dy + W_coeff[d][0];
       Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz + W_coeff[d][1]) * dz + W_coeff[d][0];
     }
+    const int debug_slot = n - N1;
+    if (g_debug_atoms != nullptr && debug_slot < 8) {
+      PPPMAssignmentAtomDebug& d = g_debug_atoms[debug_slot];
+      d.atom_id = n;
+      d.q = q;
+      d.x = x;
+      d.y = y;
+      d.z = z;
+      d.sx = sx;
+      d.sy = sy;
+      d.sz = sz;
+      d.ix = ix;
+      d.iy = iy;
+      d.iz = iz;
+      d.dx = dx;
+      d.dy = dy;
+      d.dz = dz;
+      for (int d0 = 0; d0 < 5; ++d0) {
+        d.Wx[d0] = Wx[d0];
+        d.Wy[d0] = Wy[d0];
+        d.Wz[d0] = Wz[d0];
+      }
+    }
     for (int n0 = -2; n0 <= 2; ++n0) {
       const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);  // can be 0, ..., K[0]-1
       for (int n1 = -2; n1 <= 2; ++n1) {
@@ -177,7 +204,21 @@ __global__ void find_mesh(
           const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);  // can be 0, ..., K[2]-1
           const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
           const float W = Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2];
-          atomicAdd(&g_mesh[neighbor012].x, q * W);
+          const float qW = q * W;
+          if (g_debug_stencil != nullptr && n == 0) {
+            const int debug_index = (n0 + 2) * 25 + (n1 + 2) * 5 + (n2 + 2);
+            PPPMAssignmentStencilDebug& d = g_debug_stencil[debug_index];
+            d.n0 = n0;
+            d.n1 = n1;
+            d.n2 = n2;
+            d.neighbor0 = neighbor0;
+            d.neighbor1 = neighbor1;
+            d.neighbor2 = neighbor2;
+            d.neighbor012 = neighbor012;
+            d.W = W;
+            d.qW = qW;
+          }
+          atomicAdd(&g_mesh[neighbor012].x, qW);
         }
       }
     }
@@ -948,13 +989,16 @@ void PPPM::write_debug(
   const Box& box,
   const GPU_Vector<float>& charge,
   const GPU_Vector<double>& position,
-  const GPU_Vector<float>& D_real)
+  const GPU_Vector<float>& D_real,
+  const int pppm_call_index)
 {
   const int M = para.K0K1K2;
   std::vector<gpufftComplex> h_mesh_charge(M), h_mesh(M), h_mesh_fourier(M), h_mesh_G(M);
   std::vector<float> h_kx(M), h_ky(M), h_kz(M), h_G(M);
   std::vector<float> h_charge(N), h_D_real(N);
   std::vector<double> h_position(3 * N);
+  std::vector<PPPMAssignmentAtomDebug> h_assignment_atoms(8);
+  std::vector<PPPMAssignmentStencilDebug> h_assignment_stencil(125);
 
   debug_mesh_charge_.copy_to_host(h_mesh_charge.data());
   mesh.copy_to_host(h_mesh.data());
@@ -964,23 +1008,52 @@ void PPPM::write_debug(
   ky.copy_to_host(h_ky.data());
   kz.copy_to_host(h_kz.data());
   G.copy_to_host(h_G.data());
-  charge.copy_to_host(h_charge.data());
-  position.copy_to_host(h_position.data());
-  D_real.copy_to_host(h_D_real.data());
+  charge.copy_to_host(h_charge.data(), N);
+  position.copy_to_host(h_position.data(), 3 * N);
+  D_real.copy_to_host(h_D_real.data(), N);
+  debug_assignment_atoms_.copy_to_host(h_assignment_atoms.data(), 8);
+  debug_assignment_stencil_.copy_to_host(h_assignment_stencil.data(), 125);
+  double sum_charge_N1_N2 = 0.0;
+  for (int n = N1; n < N2; ++n) {
+    sum_charge_N1_N2 += static_cast<double>(h_charge[n]);
+  }
 
   std::ofstream mesh_file(debug_prefix_ + "_mesh.out", std::ios::app);
   std::ofstream kspace_file(debug_prefix_ + "_kspace.out", std::ios::app);
   std::ofstream atom_file(debug_prefix_ + "_atom.out", std::ios::app);
-  if (!mesh_file || !kspace_file || !atom_file) {
+  std::ofstream assignment_atom_file(debug_prefix_ + "_assignment_atom.out", std::ios::app);
+  std::ofstream assignment_stencil_file(
+    debug_prefix_ + "_assignment_stencil_atom0.out", std::ios::app);
+  if (!mesh_file || !kspace_file || !atom_file || !assignment_atom_file || !assignment_stencil_file) {
     std::cerr << "Cannot open PPPM debug output files with prefix " << debug_prefix_ << ".\n";
     exit(1);
   }
   mesh_file << std::setprecision(17);
   kspace_file << std::setprecision(17);
   atom_file << std::setprecision(17);
+  assignment_atom_file << std::setprecision(17);
+  assignment_stencil_file << std::setprecision(17);
 
   auto write_header = [&](std::ofstream& file) {
     file << "# pppm_frame " << debug_frame_ << "\n";
+    file << "# source_signature " << PPPM_DEBUG_SOURCE_SIGNATURE << "\n";
+    file << "# pppm_N " << N << "\n";
+    file << "# pppm_N1 " << N1 << "\n";
+    file << "# pppm_N2 " << N2 << "\n";
+    file << "# pppm_call_index " << pppm_call_index << "\n";
+    file << "# sum_charge_N1_N2 " << sum_charge_N1_N2 << "\n";
+    file << "# mesh_before_assignment_max_real "
+         << debug_mesh_before_assignment_max_real_ << "\n";
+    file << "# mesh_before_assignment_max_imag "
+         << debug_mesh_before_assignment_max_imag_ << "\n";
+    file << "# mesh_before_assignment_rms_real "
+         << debug_mesh_before_assignment_rms_real_ << "\n";
+    file << "# mesh_before_assignment_rms_imag "
+         << debug_mesh_before_assignment_rms_imag_ << "\n";
+    file << "# mesh_before_assignment_sum_real "
+         << debug_mesh_before_assignment_sum_real_ << "\n";
+    file << "# mesh_after_assignment_sum_real "
+         << debug_mesh_after_assignment_sum_real_ << "\n";
     file << "# pppm_number_of_atoms " << N << "\n";
     file << "# pppm_mesh_size " << para.K[0] << " " << para.K[1] << " " << para.K[2] << "\n";
     file << "# pppm_indexing gx-fastest gy-middle gz-slowest\n";
@@ -1034,7 +1107,34 @@ void PPPM::write_debug(
   for (int n = 0; n < N; ++n) {
     const double u_recip = 0.5 * double(h_charge[n]) * double(h_D_real[n]);
     atom_file << n << " " << h_position[n] << " " << h_position[N + n] << " " << h_position[2 * N + n]
-              << " " << h_charge[n] << " " << h_D_real[n] << " " << u_recip << "\n";
+               << " " << h_charge[n] << " " << h_D_real[n] << " " << u_recip << "\n";
+  }
+
+  write_header(assignment_atom_file);
+  assignment_atom_file << "# columns atom_id q x y z sx sy sz ix iy iz dx dy dz"
+                          " Wx0 Wx1 Wx2 Wx3 Wx4 Wy0 Wy1 Wy2 Wy3 Wy4 Wz0 Wz1 Wz2 Wz3 Wz4\n";
+  const int debug_atom_count = N2 - N1 < 8 ? N2 - N1 : 8;
+  for (int i = 0; i < debug_atom_count; ++i) {
+    const PPPMAssignmentAtomDebug& d = h_assignment_atoms[i];
+    assignment_atom_file << d.atom_id << " " << d.q << " " << d.x << " " << d.y << " " << d.z
+                         << " " << d.sx << " " << d.sy << " " << d.sz << " " << d.ix << " "
+                         << d.iy << " " << d.iz << " " << d.dx << " " << d.dy << " " << d.dz;
+    for (int j = 0; j < 5; ++j) assignment_atom_file << " " << d.Wx[j];
+    for (int j = 0; j < 5; ++j) assignment_atom_file << " " << d.Wy[j];
+    for (int j = 0; j < 5; ++j) assignment_atom_file << " " << d.Wz[j];
+    assignment_atom_file << "\n";
+  }
+
+  write_header(assignment_stencil_file);
+  assignment_stencil_file << "# pppm_stencil_atom 0\n";
+  assignment_stencil_file << "# columns n0 n1 n2 neighbor0 neighbor1 neighbor2 neighbor012 W qW\n";
+  if (N1 <= 0 && 0 < N2) {
+    for (int i = 0; i < 125; ++i) {
+      const PPPMAssignmentStencilDebug& d = h_assignment_stencil[i];
+      assignment_stencil_file << d.n0 << " " << d.n1 << " " << d.n2 << " " << d.neighbor0
+                              << " " << d.neighbor1 << " " << d.neighbor2 << " " << d.neighbor012
+                              << " " << d.W << " " << d.qW << "\n";
+    }
   }
 }
 
@@ -1230,12 +1330,19 @@ void PPPM::find_force(
   const bool request_peratom_virial)
 {
   find_para(N, box);
+  const int pppm_call_index = debug_requested_ ? debug_call_index_++ : -1;
   if (debug_requested_) {
     if (
       debug_mesh_charge_.size() != static_cast<size_t>(para.K0K1K2) ||
       debug_mesh_fourier_.size() != static_cast<size_t>(para.K0K1K2)) {
       debug_mesh_charge_.resize(para.K0K1K2);
       debug_mesh_fourier_.resize(para.K0K1K2);
+    }
+    if (debug_assignment_atoms_.size() != 8) {
+      debug_assignment_atoms_.resize(8);
+    }
+    if (debug_assignment_stencil_.size() != 125) {
+      debug_assignment_stencil_.resize(125);
     }
   }
   const bool calculate_peratom_virial = need_peratom_virial || request_peratom_virial;
@@ -1254,6 +1361,35 @@ void PPPM::find_force(
   set_mesh_to_zero<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(para, mesh.data());
   GPU_CHECK_KERNEL
 
+  if (debug_requested_) {
+    std::vector<gpufftComplex> h_mesh_before(para.K0K1K2);
+    mesh.copy_to_host(h_mesh_before.data(), para.K0K1K2);
+    double sum_sq_real = 0.0;
+    double sum_sq_imag = 0.0;
+    debug_mesh_before_assignment_max_real_ = 0.0;
+    debug_mesh_before_assignment_max_imag_ = 0.0;
+    debug_mesh_before_assignment_sum_real_ = 0.0;
+    for (const gpufftComplex& value : h_mesh_before) {
+      const double real = static_cast<double>(value.x);
+      const double imag = static_cast<double>(value.y);
+      const double abs_real = std::fabs(real);
+      const double abs_imag = std::fabs(imag);
+      if (abs_real > debug_mesh_before_assignment_max_real_) {
+        debug_mesh_before_assignment_max_real_ = abs_real;
+      }
+      if (abs_imag > debug_mesh_before_assignment_max_imag_) {
+        debug_mesh_before_assignment_max_imag_ = abs_imag;
+      }
+      sum_sq_real += real * real;
+      sum_sq_imag += imag * imag;
+      debug_mesh_before_assignment_sum_real_ += real;
+    }
+    debug_mesh_before_assignment_rms_real_ =
+      std::sqrt(sum_sq_real / para.K0K1K2);
+    debug_mesh_before_assignment_rms_imag_ =
+      std::sqrt(sum_sq_imag / para.K0K1K2);
+  }
+
   find_mesh<<<(N - 1) / 64 + 1, 64>>>(
     N1,
     N2,
@@ -1263,10 +1399,18 @@ void PPPM::find_force(
     position_per_atom.data(),
     position_per_atom.data() + N,
     position_per_atom.data() + N * 2,
-    mesh.data());
+    mesh.data(),
+    debug_requested_ ? debug_assignment_atoms_.data() : nullptr,
+    debug_requested_ ? debug_assignment_stencil_.data() : nullptr);
   GPU_CHECK_KERNEL
   if (debug_requested_) {
     debug_mesh_charge_.copy_from_device(mesh.data());
+    std::vector<gpufftComplex> h_mesh_after(para.K0K1K2);
+    mesh.copy_to_host(h_mesh_after.data(), para.K0K1K2);
+    debug_mesh_after_assignment_sum_real_ = 0.0;
+    for (const gpufftComplex& value : h_mesh_after) {
+      debug_mesh_after_assignment_sum_real_ += static_cast<double>(value.x);
+    }
   }
 
   if (gpufftExecC2C(plan, mesh.data(), mesh.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
@@ -1402,8 +1546,7 @@ void PPPM::find_force(
     GPU_CHECK_KERNEL
   }
   if (debug_requested_) {
-    write_debug(N, N1, N2, box, charge, position_per_atom, D_real);
-    debug_requested_ = false;
+    write_debug(N, N1, N2, box, charge, position_per_atom, D_real, pppm_call_index);
   }
 }
 

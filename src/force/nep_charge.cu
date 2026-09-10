@@ -2856,6 +2856,7 @@ void NEP_Charge::compute(
       true,
       md_qnep_bec_enabled_);
   }
+  pppm.finish_debug_force_evaluation();
   if (has_dftd3) {
     dftd3.compute(
       box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
