@@ -594,6 +594,10 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     // Run before other actions so their qNEP recomputations cannot overwrite
     // the diagnostics captured by the main force evaluation.
     measure.actions.insert(measure.actions.begin(), std::move(action));
+  } else if (strcmp(param[0], "compute_qnep_current_diag") == 0) {
+    std::unique_ptr<Action> action;
+    action.reset(new QNEP_Projection(param, num_param, true));
+    measure.actions.insert(measure.actions.begin(), std::move(action));
   } else if (strcmp(param[0], "compute_es") == 0) {
     std::unique_ptr<Action> action;
     action.reset(new Compute_es(param, num_param));

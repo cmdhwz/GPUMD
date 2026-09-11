@@ -27,6 +27,7 @@ Classical qNEP projection diagnostic for heat-current derivation.
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -180,6 +181,50 @@ void __global__ gpu_sum_components(
   if (tid == 0) g_total[component] = s_data[0];
 }
 
+void __global__ gpu_sum_conventional_current(
+  const int N,
+  const double* mass,
+  const double* potential,
+  const double* velocity,
+  double* total)
+{
+  const int tid = threadIdx.x;
+  __shared__ double sx[REDUCE_THREADS];
+  __shared__ double sy[REDUCE_THREADS];
+  __shared__ double sz[REDUCE_THREADS];
+
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  double sum_z = 0.0;
+  for (int n = tid; n < N; n += REDUCE_THREADS) {
+    const double vx = velocity[n];
+    const double vy = velocity[n + N];
+    const double vz = velocity[n + 2 * N];
+    const double energy = 0.5 * mass[n] * (vx * vx + vy * vy + vz * vz) + potential[n];
+    sum_x += energy * vx;
+    sum_y += energy * vy;
+    sum_z += energy * vz;
+  }
+  sx[tid] = sum_x;
+  sy[tid] = sum_y;
+  sz[tid] = sum_z;
+  __syncthreads();
+
+  for (int offset = REDUCE_THREADS >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      sx[tid] += sx[tid + offset];
+      sy[tid] += sy[tid + offset];
+      sz[tid] += sz[tid + offset];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    total[0] = sx[0];
+    total[1] = sy[0];
+    total[2] = sz[0];
+  }
+}
+
 } // namespace
 
 void QNEP_Projection::pre_run(
@@ -218,10 +263,54 @@ void QNEP_Projection::pre_run(
     initial_cell_[i] = box.cpu_h[i];
 
   qnep_->enable_charge_diagnostics();
-  qnep_->enable_delta_j_q_k_diagnostics();
-  if (!g1_channel_) atom.enable_unwrapped_position();
+  if (!complete_current_) qnep_->enable_delta_j_q_k_diagnostics();
+  if (complete_current_ || !g1_channel_) atom.enable_unwrapped_position();
 
   const int N = atom.number_of_atoms;
+  if (complete_current_) {
+    if (time_step != 0.0) {
+      PRINT_INPUT_ERROR(
+        "compute_qnep_current_diag currently requires time_step 0 so charge/geometry remain in one frame.\n");
+    }
+    if (!qnep_->uses_pppm()) {
+      PRINT_INPUT_ERROR("compute_qnep_current_diag requires kspace_method pppm.\n");
+    }
+    box.set_is_orthogonal();
+    if (!box.is_orthogonal) {
+      PRINT_INPUT_ERROR(
+        "compute_qnep_current_diag candidate_v1 currently requires an orthogonal cell.\n");
+    }
+
+    fid_complete_current_ = my_fopen("qnep_complete_current_diag.csv", "a");
+    fseek(fid_complete_current_, 0, SEEK_END);
+    if (ftell(fid_complete_current_) == 0) {
+      fprintf(fid_complete_current_, "# units eV*Angstrom/fs\n");
+      fprintf(
+        fid_complete_current_,
+        "step,time_fs,J_conv_x,J_conv_y,J_conv_z,J_nep_x,J_nep_y,J_nep_z,"
+        "J_elec_fixed_x,J_elec_fixed_y,J_elec_fixed_z,J_dyn_local_x,J_dyn_local_y,J_dyn_local_z,"
+        "J_base_x,J_base_y,J_base_z,DeltaJ_q_pppm_x,DeltaJ_q_pppm_y,DeltaJ_q_pppm_z,"
+        "J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
+        "J_proj_D_x,J_proj_D_y,J_proj_D_z,J_cand_A_x,J_cand_A_y,J_cand_A_z,"
+        "J_cand_B_x,J_cand_B_y,J_cand_B_z,J_cand_D_x,J_cand_D_y,J_cand_D_z,"
+        "virial_decomposition_error\n");
+    }
+
+    number_of_pair_blocks_ = (N + PAIR_THREADS - 1) / PAIR_THREADS;
+    gpu_means_.resize(2);
+    gpu_partial_.resize(number_of_pair_blocks_ * NUM_OUTPUTS);
+    gpu_total_.resize(NUM_OUTPUTS);
+    gpu_current_total_.resize(3);
+    cpu_total_.resize(NUM_OUTPUTS);
+    gpu_virial_nep_.resize(static_cast<size_t>(N) * 9);
+    gpu_virial_electrostatic_fixed_.resize(static_cast<size_t>(N) * 9);
+    gpu_virial_dynamic_charge_.resize(static_cast<size_t>(N) * 9);
+    gpu_virial_heat_per_atom_.resize(static_cast<size_t>(N) * NUM_HEAT_COMPONENTS);
+    gpu_virial_heat_total_.resize(NUM_HEAT_COMPONENTS);
+    cpu_virial_heat_total_.resize(NUM_HEAT_COMPONENTS);
+    return;
+  }
+
   fid_delta_j_q_k_ = my_fopen("delta_j_q_k.out", "a");
   fprintf(fid_delta_j_q_k_, "# compute_qnep_projection %d\n", sample_interval_);
   fprintf(fid_delta_j_q_k_, "# observable delta_j_q_k\n");
@@ -331,6 +420,156 @@ void QNEP_Projection::check_fixed_cell(const Box& box) const
   }
 }
 
+void QNEP_Projection::compute_projection_currents(
+  const int N,
+  const Box& box,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& unwrapped_position,
+  const GPU_Vector<float>& D,
+  const GPU_Vector<float>& s)
+{
+  gpu_reduce_means<<<1, REDUCE_THREADS>>>(N, D.data(), s.data(), gpu_means_.data());
+  GPU_CHECK_KERNEL
+  gpu_compute_pair_sums<<<number_of_pair_blocks_, PAIR_THREADS>>>(
+    N,
+    box,
+    position.data(),
+    unwrapped_position.data(),
+    D.data(),
+    s.data(),
+    gpu_means_.data(),
+    gpu_partial_.data());
+  GPU_CHECK_KERNEL
+  gpu_reduce_pair_sums<<<1, NUM_OUTPUTS>>>(
+    number_of_pair_blocks_, gpu_partial_.data(), gpu_total_.data());
+  GPU_CHECK_KERNEL
+  gpu_total_.copy_to_host(cpu_total_.data());
+}
+
+void QNEP_Projection::sum_virial_current(
+  const GPU_Vector<double>& virial,
+  const GPU_Vector<double>& velocity,
+  double current[3])
+{
+  const int N = velocity.size() / 3;
+  compute_heat(virial, velocity, gpu_virial_heat_per_atom_);
+  gpu_sum_components<<<NUM_HEAT_COMPONENTS, REDUCE_THREADS>>>(
+    N,
+    NUM_HEAT_COMPONENTS,
+    gpu_virial_heat_per_atom_.data(),
+    gpu_virial_heat_total_.data());
+  GPU_CHECK_KERNEL
+  gpu_virial_heat_total_.copy_to_host(cpu_virial_heat_total_.data());
+  current[0] = cpu_virial_heat_total_[0] + cpu_virial_heat_total_[1];
+  current[1] = cpu_virial_heat_total_[2] + cpu_virial_heat_total_[3];
+  current[2] = cpu_virial_heat_total_[4];
+}
+
+void QNEP_Projection::write_complete_current(
+  const int step,
+  const double global_time,
+  Box& box,
+  Atom& atom)
+{
+  const int N = atom.number_of_atoms;
+  double delta_j_q_pppm[3] = {0.0, 0.0, 0.0};
+  qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
+  qnep_->diagnose_dynamic_charge(
+    N,
+    0,
+    N,
+    0,
+    step + 1,
+    global_time * TIME_UNIT_CONVERSION,
+    box,
+    atom.position_per_atom,
+    false,
+    delta_j_q_pppm);
+
+  // Capture the main-force qNEP projection buffers before diagnostic virial
+  // recomputation can refresh shared qNEP work arrays.
+  const GPU_Vector<float>& D = qnep_->get_raw_D_reference();
+  const GPU_Vector<float>& s = qnep_->get_raw_charge_rate_reference();
+  compute_projection_currents(
+    N,
+    box,
+    atom.position_per_atom,
+    atom.unwrapped_position,
+    D,
+    s);
+
+  qnep_->compute_virial_components(
+    box,
+    atom.type,
+    atom.position_per_atom,
+    atom.virial_per_atom,
+    true,
+    true,
+    true,
+    gpu_virial_nep_,
+    gpu_virial_electrostatic_fixed_,
+    gpu_virial_dynamic_charge_);
+
+  double j_conv[3] = {0.0, 0.0, 0.0};
+  gpu_sum_conventional_current<<<1, REDUCE_THREADS>>>(
+    N,
+    atom.mass.data(),
+    atom.potential_per_atom.data(),
+    atom.velocity_per_atom.data(),
+    gpu_current_total_.data());
+  GPU_CHECK_KERNEL
+  gpu_current_total_.copy_to_host(j_conv);
+
+  double j_nep[3] = {0.0, 0.0, 0.0};
+  double j_elec_fixed[3] = {0.0, 0.0, 0.0};
+  double j_dyn_local[3] = {0.0, 0.0, 0.0};
+  double j_virial_total[3] = {0.0, 0.0, 0.0};
+  sum_virial_current(gpu_virial_nep_, atom.velocity_per_atom, j_nep);
+  sum_virial_current(
+    gpu_virial_electrostatic_fixed_, atom.velocity_per_atom, j_elec_fixed);
+  sum_virial_current(gpu_virial_dynamic_charge_, atom.velocity_per_atom, j_dyn_local);
+  sum_virial_current(atom.virial_per_atom, atom.velocity_per_atom, j_virial_total);
+
+  const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
+  double j_base[3] = {0.0, 0.0, 0.0};
+  double j_projection[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+  double j_candidate[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+  for (int d = 0; d < 3; ++d) {
+    j_base[d] = (j_conv[d] + j_nep[d] + j_elec_fixed[d] + j_dyn_local[d]) * inv_time_conversion;
+    j_projection[0][d] = cpu_total_[d] * inv_time_conversion;
+    j_projection[1][d] = cpu_total_[d + 3] * inv_time_conversion;
+    j_projection[2][d] = cpu_total_[d + 6] * inv_time_conversion;
+    for (int x = 0; x < 3; ++x)
+      j_candidate[x][d] = j_base[d] + delta_j_q_pppm[d] + j_projection[x][d];
+  }
+
+  double virial_decomposition_error = 0.0;
+  for (int d = 0; d < 3; ++d) {
+    const double error = std::fabs(
+      (j_virial_total[d] - j_nep[d] - j_elec_fixed[d] - j_dyn_local[d]) * inv_time_conversion);
+    if (error > virial_decomposition_error) virial_decomposition_error = error;
+  }
+
+  fprintf(
+    fid_complete_current_,
+    "%d,%.17g",
+    step + 1,
+    global_time * TIME_UNIT_CONVERSION);
+  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_conv[d] * inv_time_conversion);
+  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_nep[d] * inv_time_conversion);
+  for (int d = 0; d < 3; ++d)
+    fprintf(fid_complete_current_, ",%.17g", j_elec_fixed[d] * inv_time_conversion);
+  for (int d = 0; d < 3; ++d)
+    fprintf(fid_complete_current_, ",%.17g", j_dyn_local[d] * inv_time_conversion);
+  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_base[d]);
+  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", delta_j_q_pppm[d]);
+  for (int x = 0; x < 3; ++x)
+    for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_projection[x][d]);
+  for (int x = 0; x < 3; ++x)
+    for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_candidate[x][d]);
+  fprintf(fid_complete_current_, ",%.17g\n", virial_decomposition_error);
+}
+
 void QNEP_Projection::pre_force(
   const int step,
   const double,
@@ -365,6 +604,10 @@ void QNEP_Projection::end_of_step(
     return;
 
   check_fixed_cell(box);
+  if (complete_current_) {
+    write_complete_current(step, global_time, box, atom);
+    return;
+  }
   qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
   double sum_charge = 0.0;
   double sum_charge_rate = 0.0;
@@ -449,23 +692,13 @@ void QNEP_Projection::end_of_step(
   const GPU_Vector<float>& D = qnep_->get_raw_D_reference();
   const GPU_Vector<float>& s = qnep_->get_raw_charge_rate_reference();
   const int N = atom.number_of_atoms;
-
-  gpu_reduce_means<<<1, REDUCE_THREADS>>>(N, D.data(), s.data(), gpu_means_.data());
-  GPU_CHECK_KERNEL
-  gpu_compute_pair_sums<<<number_of_pair_blocks_, PAIR_THREADS>>>(
+  compute_projection_currents(
     N,
     box,
-    atom.position_per_atom.data(),
-    atom.unwrapped_position.data(),
-    D.data(),
-    s.data(),
-    gpu_means_.data(),
-    gpu_partial_.data());
-  GPU_CHECK_KERNEL
-  gpu_reduce_pair_sums<<<1, NUM_OUTPUTS>>>(
-    number_of_pair_blocks_, gpu_partial_.data(), gpu_total_.data());
-  GPU_CHECK_KERNEL
-  gpu_total_.copy_to_host(cpu_total_.data());
+    atom.position_per_atom,
+    atom.unwrapped_position,
+    D,
+    s);
 
   fprintf(
     fid_,
@@ -523,6 +756,10 @@ void QNEP_Projection::post_run(
     fclose(fid_projection_current_diag_);
     fid_projection_current_diag_ = nullptr;
   }
+  if (fid_complete_current_ != nullptr) {
+    fclose(fid_complete_current_);
+    fid_complete_current_ = nullptr;
+  }
 }
 
 void QNEP_Projection::parse(const char** param, int num_param)
@@ -537,19 +774,24 @@ void QNEP_Projection::parse(const char** param, int num_param)
     PRINT_INPUT_ERROR("sample interval for compute_qnep_projection should be positive.\n");
   }
   if (num_param == 3) {
+    if (complete_current_) {
+      PRINT_INPUT_ERROR("compute_qnep_current_diag has only one parameter: the sample interval.\n");
+    }
     if (std::strcmp(param[2], "g1_channel") != 0) {
       PRINT_INPUT_ERROR("The optional compute_qnep_projection mode must be g1_channel.\n");
     }
     g1_channel_ = true;
   }
   printf(
-    g1_channel_ ? "Compute classical qNEP G[1] channel and reciprocal diagnostics.\n"
-                : "Compute classical qNEP projection diagnostics.\n");
+    complete_current_ ? "Compute complete qNEP A/B/D candidate-current diagnostics.\n"
+                       : g1_channel_ ? "Compute classical qNEP G[1] channel and reciprocal diagnostics.\n"
+                                     : "Compute classical qNEP projection diagnostics.\n");
   printf("    sample interval is %d.\n", sample_interval_);
 }
 
-QNEP_Projection::QNEP_Projection(const char** param, int num_param)
+QNEP_Projection::QNEP_Projection(const char** param, int num_param, bool complete_current)
+  : complete_current_(complete_current)
 {
   parse(param, num_param);
-  action_name = "compute_qnep_projection";
+  action_name = complete_current_ ? "compute_qnep_current_diag" : "compute_qnep_projection";
 }

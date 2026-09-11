@@ -193,7 +193,8 @@ public:
     const double time_fs,
     const Box& box,
     const GPU_Vector<double>& position,
-    const bool write_debug);
+    const bool write_debug,
+    double* delta_j_q_pppm = nullptr);
   void compute_charge_heat_channels(
     Box& box,
     const GPU_Vector<int>& type,

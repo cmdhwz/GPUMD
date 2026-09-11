@@ -24,7 +24,7 @@ class NEP_Charge;
 class QNEP_Projection : public Action
 {
 public:
-  QNEP_Projection(const char**, int);
+  QNEP_Projection(const char**, int, bool complete_current = false);
 
   void pre_run(
     const int number_of_steps,
@@ -69,15 +69,33 @@ public:
 private:
   void parse(const char**, int);
   void check_fixed_cell(const Box&) const;
+  void compute_projection_currents(
+    const int N,
+    const Box& box,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& unwrapped_position,
+    const GPU_Vector<float>& D,
+    const GPU_Vector<float>& s);
+  void sum_virial_current(
+    const GPU_Vector<double>& virial,
+    const GPU_Vector<double>& velocity,
+    double current[3]);
+  void write_complete_current(
+    const int step,
+    const double global_time,
+    Box& box,
+    Atom& atom);
 
   int sample_interval_ = 1;
   bool g1_channel_ = false;
+  bool complete_current_ = false;
   NEP_Charge* qnep_ = nullptr;
   double initial_cell_[9] = {0.0};
   int number_of_pair_blocks_ = 0;
   GPU_Vector<double> gpu_means_;
   GPU_Vector<double> gpu_partial_;
   GPU_Vector<double> gpu_total_;
+  GPU_Vector<double> gpu_current_total_;
   std::vector<double> cpu_total_;
   GPU_Vector<double> gpu_channel_per_atom_;
   GPU_Vector<double> gpu_channel_total_;
@@ -94,4 +112,5 @@ private:
   FILE* fid_channel_ = nullptr;
   FILE* fid_delta_j_q_k_ = nullptr;
   FILE* fid_projection_current_diag_ = nullptr;
+  FILE* fid_complete_current_ = nullptr;
 };

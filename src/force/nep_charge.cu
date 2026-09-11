@@ -4500,7 +4500,8 @@ void NEP_Charge::diagnose_dynamic_charge(
   const double time_fs,
   const Box& box,
   const GPU_Vector<double>& position,
-  const bool write_debug)
+  const bool write_debug,
+  double* delta_j_q_pppm)
 {
   pppm.diagnose_dynamic_charge(
     N,
@@ -4513,7 +4514,8 @@ void NEP_Charge::diagnose_dynamic_charge(
     nep_data.charge,
     nep_data.charge_rate,
     position,
-    write_debug);
+    write_debug,
+    delta_j_q_pppm);
 }
 
 int NEP_Charge::compute_delta_j_q_k(

@@ -95,7 +95,8 @@ public:
     const GPU_Vector<float>& charge,
     const GPU_Vector<float>& charge_rate,
     const GPU_Vector<double>& position,
-    const bool write_debug);
+    const bool write_debug,
+    double* delta_j_q_pppm = nullptr);
   bool last_batch_used_peratom_virial() const { return last_batch_used_peratom_virial_; }
   struct Para {
     int K0K1K2;             // total number of mesh points

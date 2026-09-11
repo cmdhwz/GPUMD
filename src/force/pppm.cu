@@ -1933,8 +1933,14 @@ void PPPM::diagnose_dynamic_charge(
   const GPU_Vector<float>& charge,
   const GPU_Vector<float>& charge_rate,
   const GPU_Vector<double>& position,
-  const bool write_debug)
+  const bool write_debug,
+  double* delta_j_q_pppm)
 {
+  if (delta_j_q_pppm != nullptr) {
+    delta_j_q_pppm[0] = 0.0;
+    delta_j_q_pppm[1] = 0.0;
+    delta_j_q_pppm[2] = 0.0;
+  }
   if (N <= 0 || N1 < 0 || N2 > N || N1 >= N2) {
     std::cerr << "PPPM dynamic-q diagnostic: invalid atom range." << std::endl;
     return;
@@ -2237,6 +2243,11 @@ void PPPM::diagnose_dynamic_charge(
     J_ass[1] + J_mesh[1],
     J_ass[2] + J_mesh[2]};
   const double inv_time = 1.0 / TIME_UNIT_CONVERSION;
+  if (delta_j_q_pppm != nullptr) {
+    delta_j_q_pppm[0] = DeltaJ[0] * inv_time;
+    delta_j_q_pppm[1] = DeltaJ[1] * inv_time;
+    delta_j_q_pppm[2] = DeltaJ[2] * inv_time;
+  }
 
   auto write_dynamic_metadata = [](std::ofstream& file) {
     file << "# source_signature = " << PPPM_DYNAMIC_SOURCE_SIGNATURE << "\n";
