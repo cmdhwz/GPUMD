@@ -18,6 +18,7 @@
 #include "model/box.cuh"
 #include <sstream>
 #include <string>
+#include <vector>
 #ifdef USE_HIP
   #include <hipfft/hipfft.h>
 #else
@@ -150,6 +151,33 @@ private:
   std::ostringstream dynamic_check_buffer_;
   std::string dynamic_atom_debug_buffer_;
   std::string dynamic_kspace_debug_buffer_;
+  GPU_Vector<gpufftComplex> dynamic_Q_;
+  GPU_Vector<gpufftComplex> dynamic_S_;
+  GPU_Vector<gpufftComplex> dynamic_Ax_;
+  GPU_Vector<gpufftComplex> dynamic_Ay_;
+  GPU_Vector<gpufftComplex> dynamic_Az_;
+  GPU_Vector<gpufftComplex> dynamic_Bx_;
+  GPU_Vector<gpufftComplex> dynamic_By_;
+  GPU_Vector<gpufftComplex> dynamic_Bz_;
+  GPU_Vector<gpufftComplex> dynamic_L1S_x_;
+  GPU_Vector<gpufftComplex> dynamic_L1S_y_;
+  GPU_Vector<gpufftComplex> dynamic_L1S_z_;
+  GPU_Vector<float> dynamic_d_raw_x_;
+  GPU_Vector<float> dynamic_d_raw_y_;
+  GPU_Vector<float> dynamic_d_raw_z_;
+  GPU_Vector<float> dynamic_d_x_;
+  GPU_Vector<float> dynamic_d_y_;
+  GPU_Vector<float> dynamic_d_z_;
+  bool dynamic_operator_cache_valid_ = false;
+  int dynamic_operator_N_ = -1;
+  int dynamic_operator_K_[3] = {-1, -1, -1};
+  float dynamic_operator_alpha_ = 0.0f;
+  double dynamic_operator_box_[9] = {0.0};
+  bool dynamic_operator_finite_ = false;
+  double dynamic_operator_max_odd_error_[3] = {0.0, 0.0, 0.0};
+  std::vector<float> dynamic_h_d_x_;
+  std::vector<float> dynamic_h_d_y_;
+  std::vector<float> dynamic_h_d_z_;
   GPU_Vector<gpufftComplex> debug_mesh_charge_;
   GPU_Vector<gpufftComplex> debug_mesh_fourier_;
   GPU_Vector<PPPMAssignmentAtomDebug> debug_assignment_atoms_;

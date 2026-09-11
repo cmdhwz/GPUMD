@@ -1632,6 +1632,7 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
 
 void PPPM::initialize(const float alpha_input)
 {
+  dynamic_operator_cache_valid_ = false;
   need_peratom_virial = check_need_peratom_virial();
   need_peratom_virial_every_batch = check_need_peratom_virial_every_batch();
   para.alpha = alpha_input;
@@ -2089,26 +2090,130 @@ bool PPPM::diagnose_dynamic_charge(
   const int grid_size = (M - 1) / 64 + 1;
   const gpufftComplex zero = {0.0f, 0.0f};
 
-  GPU_Vector<gpufftComplex> Q(M, zero);
-  GPU_Vector<gpufftComplex> S(M, zero);
-  GPU_Vector<gpufftComplex> Ax(M, zero);
-  GPU_Vector<gpufftComplex> Ay(M, zero);
-  GPU_Vector<gpufftComplex> Az(M, zero);
-  GPU_Vector<gpufftComplex> Bx(M, zero);
-  GPU_Vector<gpufftComplex> By(M, zero);
-  GPU_Vector<gpufftComplex> Bz(M, zero);
-  GPU_Vector<gpufftComplex> L1S_x(M, zero);
-  GPU_Vector<gpufftComplex> L1S_y(M, zero);
-  GPU_Vector<gpufftComplex> L1S_z(M, zero);
-  GPU_Vector<float> d_raw_x(M);
-  GPU_Vector<float> d_raw_y(M);
-  GPU_Vector<float> d_raw_z(M);
-  GPU_Vector<float> d_x(M);
-  GPU_Vector<float> d_y(M);
-  GPU_Vector<float> d_z(M);
+  GPU_Vector<gpufftComplex>& Q = dynamic_Q_;
+  GPU_Vector<gpufftComplex>& S = dynamic_S_;
+  GPU_Vector<gpufftComplex>& Ax = dynamic_Ax_;
+  GPU_Vector<gpufftComplex>& Ay = dynamic_Ay_;
+  GPU_Vector<gpufftComplex>& Az = dynamic_Az_;
+  GPU_Vector<gpufftComplex>& Bx = dynamic_Bx_;
+  GPU_Vector<gpufftComplex>& By = dynamic_By_;
+  GPU_Vector<gpufftComplex>& Bz = dynamic_Bz_;
+  GPU_Vector<gpufftComplex>& L1S_x = dynamic_L1S_x_;
+  GPU_Vector<gpufftComplex>& L1S_y = dynamic_L1S_y_;
+  GPU_Vector<gpufftComplex>& L1S_z = dynamic_L1S_z_;
+  GPU_Vector<float>& d_raw_x = dynamic_d_raw_x_;
+  GPU_Vector<float>& d_raw_y = dynamic_d_raw_y_;
+  GPU_Vector<float>& d_raw_z = dynamic_d_raw_z_;
+  GPU_Vector<float>& d_x = dynamic_d_x_;
+  GPU_Vector<float>& d_y = dynamic_d_y_;
+  GPU_Vector<float>& d_z = dynamic_d_z_;
 
-  find_k_and_G_opt<<<grid_size, 64>>>(para, kx.data(), ky.data(), kz.data(), G.data());
-  GPU_CHECK_KERNEL
+  if (Q.size() != static_cast<size_t>(M)) {
+    Q.resize(M);
+    S.resize(M);
+    Ax.resize(M);
+    Ay.resize(M);
+    Az.resize(M);
+    Bx.resize(M);
+    By.resize(M);
+    Bz.resize(M);
+    L1S_x.resize(M);
+    L1S_y.resize(M);
+    L1S_z.resize(M);
+    d_raw_x.resize(M);
+    d_raw_y.resize(M);
+    d_raw_z.resize(M);
+    d_x.resize(M);
+    d_y.resize(M);
+    d_z.resize(M);
+    dynamic_h_d_x_.resize(M);
+    dynamic_h_d_y_.resize(M);
+    dynamic_h_d_z_.resize(M);
+    dynamic_operator_cache_valid_ = false;
+  }
+
+  Q.fill(zero);
+  S.fill(zero);
+  Ax.fill(zero);
+  Ay.fill(zero);
+  Az.fill(zero);
+  Bx.fill(zero);
+  By.fill(zero);
+  Bz.fill(zero);
+
+  bool operator_cache_match = dynamic_operator_cache_valid_ && dynamic_operator_N_ == N &&
+    dynamic_operator_alpha_ == para.alpha;
+  for (int d = 0; d < 3; ++d) {
+    operator_cache_match = operator_cache_match && dynamic_operator_K_[d] == para.K[d];
+  }
+  for (int i = 0; i < 9; ++i) {
+    operator_cache_match = operator_cache_match && dynamic_operator_box_[i] == box.cpu_h[i];
+  }
+  if (!operator_cache_match) {
+    find_k_and_G_opt<<<grid_size, 64>>>(para, kx.data(), ky.data(), kz.data(), G.data());
+    GPU_CHECK_KERNEL
+
+    find_dynamic_d_raw<<<grid_size, 64>>>(
+      para,
+      box,
+      kx.data(),
+      ky.data(),
+      kz.data(),
+      G.data(),
+      d_raw_x.data(),
+      d_raw_y.data(),
+      d_raw_z.data());
+    GPU_CHECK_KERNEL
+    project_dynamic_d<<<grid_size, 64>>>(
+      para,
+      d_raw_x.data(),
+      d_raw_y.data(),
+      d_raw_z.data(),
+      d_x.data(),
+      d_y.data(),
+      d_z.data());
+    GPU_CHECK_KERNEL
+
+    d_x.copy_to_host(dynamic_h_d_x_.data(), M);
+    d_y.copy_to_host(dynamic_h_d_y_.data(), M);
+    d_z.copy_to_host(dynamic_h_d_z_.data(), M);
+    dynamic_operator_finite_ = true;
+    dynamic_operator_max_odd_error_[0] = 0.0;
+    dynamic_operator_max_odd_error_[1] = 0.0;
+    dynamic_operator_max_odd_error_[2] = 0.0;
+    for (int n = 0; n < M; ++n) {
+      if (!std::isfinite(static_cast<double>(dynamic_h_d_x_[n])) ||
+          !std::isfinite(static_cast<double>(dynamic_h_d_y_[n])) ||
+          !std::isfinite(static_cast<double>(dynamic_h_d_z_[n]))) {
+        dynamic_operator_finite_ = false;
+      }
+      const int iz = n / para.K0K1;
+      const int iy = (n - iz * para.K0K1) / para.K[0];
+      const int ix = n % para.K[0];
+      const int ix_bar = (para.K[0] - ix) % para.K[0];
+      const int iy_bar = (para.K[1] - iy) % para.K[1];
+      const int iz_bar = (para.K[2] - iz) % para.K[2];
+      const int n_bar = ix_bar + para.K[0] * (iy_bar + para.K[1] * iz_bar);
+      const double odd_x =
+        std::fabs(double(dynamic_h_d_x_[n_bar]) + double(dynamic_h_d_x_[n]));
+      const double odd_y =
+        std::fabs(double(dynamic_h_d_y_[n_bar]) + double(dynamic_h_d_y_[n]));
+      const double odd_z =
+        std::fabs(double(dynamic_h_d_z_[n_bar]) + double(dynamic_h_d_z_[n]));
+      if (odd_x > dynamic_operator_max_odd_error_[0])
+        dynamic_operator_max_odd_error_[0] = odd_x;
+      if (odd_y > dynamic_operator_max_odd_error_[1])
+        dynamic_operator_max_odd_error_[1] = odd_y;
+      if (odd_z > dynamic_operator_max_odd_error_[2])
+        dynamic_operator_max_odd_error_[2] = odd_z;
+    }
+    dynamic_operator_N_ = N;
+    dynamic_operator_alpha_ = para.alpha;
+    for (int d = 0; d < 3; ++d) dynamic_operator_K_[d] = para.K[d];
+    for (int i = 0; i < 9; ++i) dynamic_operator_box_[i] = box.cpu_h[i];
+    dynamic_operator_cache_valid_ = true;
+  }
+
   find_dynamic_mesh<<<(N2 - N1 - 1) / 64 + 1, 64>>>(
     N1,
     N2,
@@ -2127,27 +2232,6 @@ bool PPPM::diagnose_dynamic_charge(
     Bx.data(),
     By.data(),
     Bz.data());
-  GPU_CHECK_KERNEL
-
-  find_dynamic_d_raw<<<grid_size, 64>>>(
-    para,
-    box,
-    kx.data(),
-    ky.data(),
-    kz.data(),
-    G.data(),
-    d_raw_x.data(),
-    d_raw_y.data(),
-    d_raw_z.data());
-  GPU_CHECK_KERNEL
-  project_dynamic_d<<<grid_size, 64>>>(
-    para,
-    d_raw_x.data(),
-    d_raw_y.data(),
-    d_raw_z.data(),
-    d_x.data(),
-    d_y.data(),
-    d_z.data());
   GPU_CHECK_KERNEL
 
   std::vector<float> h_q(N), h_qdot(N);
@@ -2219,10 +2303,9 @@ bool PPPM::diagnose_dynamic_charge(
   L1S_y.copy_to_host(h_L1S_y.data(), M);
   L1S_z.copy_to_host(h_L1S_z.data(), M);
 
-  std::vector<float> h_d_x(M), h_d_y(M), h_d_z(M);
-  d_x.copy_to_host(h_d_x.data(), M);
-  d_y.copy_to_host(h_d_y.data(), M);
-  d_z.copy_to_host(h_d_z.data(), M);
+  const std::vector<float>& h_d_x = dynamic_h_d_x_;
+  const std::vector<float>& h_d_y = dynamic_h_d_y_;
+  const std::vector<float>& h_d_z = dynamic_h_d_z_;
   std::vector<float> h_kx, h_ky, h_kz, h_G;
   std::vector<float> h_d_raw_x, h_d_raw_y, h_d_raw_z;
   if (emit_debug) {
@@ -2258,8 +2341,8 @@ bool PPPM::diagnose_dynamic_charge(
     return true;
   };
   bool all_values_finite =
-    finite_float(h_q) && finite_float(h_qdot) && finite_float(h_d_x) && finite_float(h_d_y) &&
-    finite_float(h_d_z) && finite_complex(h_Q) && finite_complex(h_S) && finite_complex(h_Ax) &&
+    finite_float(h_q) && finite_float(h_qdot) && dynamic_operator_finite_ && finite_complex(h_Q) &&
+    finite_complex(h_S) && finite_complex(h_Ax) &&
     finite_complex(h_Ay) && finite_complex(h_Az) && finite_complex(h_Bx) && finite_complex(h_By) &&
     finite_complex(h_Bz) && finite_complex(h_rho) && finite_complex(h_s) && finite_complex(h_LQ) &&
     finite_complex(h_LS) && finite_complex(h_L1S_x) && finite_complex(h_L1S_y) &&
@@ -2305,7 +2388,10 @@ bool PPPM::diagnose_dynamic_charge(
   double J_ass_right[3] = {0.0, 0.0, 0.0};
   double J_mesh_fourier[3] = {0.0, 0.0, 0.0};
   double J_mesh_realspace[3] = {0.0, 0.0, 0.0};
-  double max_odd_error[3] = {0.0, 0.0, 0.0};
+  double max_odd_error[3] = {
+    dynamic_operator_max_odd_error_[0],
+    dynamic_operator_max_odd_error_[1],
+    dynamic_operator_max_odd_error_[2]};
   double max_imag_L1S[3] = {0.0, 0.0, 0.0};
   for (int n = 0; n < M; ++n) {
     J_ass_left[0] -= double(K_C_SP) * double(h_Ax[n].x) * double(h_LS[n].x);
@@ -2325,19 +2411,6 @@ bool PPPM::diagnose_dynamic_charge(
     J_mesh_realspace[1] += double(K_C_SP) * double(h_Q[n].x) * double(h_L1S_y[n].x) / M;
     J_mesh_realspace[2] += double(K_C_SP) * double(h_Q[n].x) * double(h_L1S_z[n].x) / M;
 
-    const int iz = n / para.K0K1;
-    const int iy = (n - iz * para.K0K1) / para.K[0];
-    const int ix = n % para.K[0];
-    const int ix_bar = (para.K[0] - ix) % para.K[0];
-    const int iy_bar = (para.K[1] - iy) % para.K[1];
-    const int iz_bar = (para.K[2] - iz) % para.K[2];
-    const int n_bar = ix_bar + para.K[0] * (iy_bar + para.K[1] * iz_bar);
-    const double odd_x = std::fabs(double(h_d_x[n_bar]) + double(h_d_x[n]));
-    const double odd_y = std::fabs(double(h_d_y[n_bar]) + double(h_d_y[n]));
-    const double odd_z = std::fabs(double(h_d_z[n_bar]) + double(h_d_z[n]));
-    if (odd_x > max_odd_error[0]) max_odd_error[0] = odd_x;
-    if (odd_y > max_odd_error[1]) max_odd_error[1] = odd_y;
-    if (odd_z > max_odd_error[2]) max_odd_error[2] = odd_z;
     const double imag_x = std::fabs(double(h_L1S_x[n].y) / M);
     const double imag_y = std::fabs(double(h_L1S_y[n].y) / M);
     const double imag_z = std::fabs(double(h_L1S_z[n].y) / M);
