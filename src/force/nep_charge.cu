@@ -4491,6 +4491,31 @@ void NEP_Charge::compute_charge_heat_channels(
   compute_charge_rate(box, type, position, velocity, &channel_per_atom);
 }
 
+void NEP_Charge::diagnose_dynamic_charge(
+  const int N,
+  const int N1,
+  const int N2,
+  const int bead_id,
+  const int step,
+  const double time_fs,
+  const Box& box,
+  const GPU_Vector<double>& position,
+  const bool write_debug)
+{
+  pppm.diagnose_dynamic_charge(
+    N,
+    N1,
+    N2,
+    bead_id,
+    step,
+    time_fs,
+    box,
+    nep_data.charge,
+    nep_data.charge_rate,
+    position,
+    write_debug);
+}
+
 int NEP_Charge::compute_delta_j_q_k(
   const Box& box,
   const GPU_Vector<double>& position,

@@ -29,6 +29,7 @@ Dump per-atom data to user-specified file(s) in the extended XYZ format
 #include "utilities/gpu_macro.cuh"
 #include "utilities/gpu_vector.cuh"
 #include "utilities/read_file.cuh"
+#include <cmath>
 #include <cstring>
 
 static __global__ void gpu_sum(const int N, const double* g_data, double* g_data_sum)
@@ -155,6 +156,20 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
       printf("    PPPM debug output prefix: %s.\n", pppm_debug_prefix_.c_str());
       continue;
     }
+    if (strcmp(param[m], "pppm_dynamic_q") == 0 || strcmp(param[m], "pppm_dynamic_q_debug") == 0) {
+      if (!is_nep_charge) {
+        PRINT_INPUT_ERROR("pppm_dynamic_q requires an NEP-charge model.\n");
+      }
+      if (has_pppm_dynamic_q_) {
+        PRINT_INPUT_ERROR("pppm_dynamic_q is specified more than once in dump_xyz.\n");
+      }
+      has_pppm_dynamic_q_ = true;
+      has_pppm_dynamic_q_debug_ = strcmp(param[m], "pppm_dynamic_q_debug") == 0;
+      printf(
+        "    PPPM dynamic-q diagnostic%s.\n",
+        has_pppm_dynamic_q_debug_ ? " with atom/k-space debug" : "");
+      continue;
+    }
     if (strcmp(param[m], "raw_charge") == 0) {
       set_qnep_quantity(has_raw_charge_, param[m]);
       continue;
@@ -249,6 +264,7 @@ void Dump_XYZ::pre_run(
     qnep_ = dynamic_cast<NEP_Charge*>(potential_);
   }
   if (has_charge_diagnostics()) {
+    // ponytail: dynamic-q currently stays classical-only; add a batch qdot path before enabling PIMD.
     if (integrate.type >= 31 && integrate.type <= 33) {
       PRINT_INPUT_ERROR("qNEP charge diagnostics in dump_xyz currently support classical MD only.\n");
     }
@@ -268,6 +284,20 @@ void Dump_XYZ::pre_run(
     if (!qnep_->uses_pppm()) {
       PRINT_INPUT_ERROR("pppm_debug requires kspace_method pppm.\n");
     }
+  }
+  if (has_pppm_dynamic_q_ && !qnep_->uses_pppm()) {
+    PRINT_INPUT_ERROR("pppm_dynamic_q requires kspace_method pppm.\n");
+  }
+  if (has_pppm_dynamic_q_) {
+    if (time_step != 0.0) {
+      PRINT_INPUT_ERROR(
+        "pppm_dynamic_q currently requires time_step 0 so charge/geometry remain in one frame.\n");
+    }
+    if (!box.is_orthogonal) {
+      PRINT_INPUT_ERROR("pppm_dynamic_q candidate_v1 currently requires an orthogonal cell.\n");
+    }
+    for (int d = 0; d < 9; ++d) dynamic_cell_reference_[d] = box.cpu_h[d];
+    dynamic_cell_reference_set_ = true;
   }
   if (has_raw_charge_) cpu_charge_raw_.resize(atom.number_of_atoms);
   if (has_charge_dudq_raw_) cpu_charge_dudq_raw_.resize(atom.number_of_atoms);
@@ -460,6 +490,19 @@ void Dump_XYZ::end_of_step(
   if ((step + 1) % dump_interval_ != 0)
     return;
 
+  if (has_pppm_dynamic_q_ && dynamic_cell_reference_set_) {
+    if (!box.is_orthogonal) {
+      PRINT_INPUT_ERROR("pppm_dynamic_q requires an orthogonal cell at every diagnostic frame.\n");
+    }
+    for (int d = 0; d < 9; ++d) {
+      const double reference = dynamic_cell_reference_[d];
+      const double scale = std::fabs(reference) > 1.0 ? std::fabs(reference) : 1.0;
+      if (std::fabs(box.cpu_h[d] - reference) > 1.0e-12 * scale) {
+        PRINT_INPUT_ERROR("pppm_dynamic_q requires a fixed cell; the box changed after pre_run.\n");
+      }
+    }
+  }
+
   int number_of_atoms_to_dump = atom.number_of_atoms;
   if (grouping_method_ >= 0) {
     number_of_atoms_to_dump = groups[grouping_method_].cpu_size[group_id_];
@@ -499,12 +542,24 @@ void Dump_XYZ::end_of_step(
   if (has_charge_dudq_raw_)
     qnep_->get_raw_D_reference().copy_to_host(cpu_charge_dudq_raw_.data());
   if (has_charge_dudq_) qnep_->get_D_reference().copy_to_host(cpu_charge_dudq_.data());
-  if (has_raw_charge_rate_ || has_charge_rate_) {
+  if (has_raw_charge_rate_ || has_charge_rate_ || has_pppm_dynamic_q_) {
     qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
     if (has_raw_charge_rate_)
       qnep_->get_raw_charge_rate_reference().copy_to_host(cpu_charge_rate_raw_.data());
     if (has_charge_rate_)
       qnep_->get_charge_rate_reference().copy_to_host(cpu_charge_rate_.data());
+  }
+  if (has_pppm_dynamic_q_) {
+    qnep_->diagnose_dynamic_charge(
+      atom.number_of_atoms,
+      0,
+      atom.number_of_atoms,
+      0,
+      step + 1,
+      global_time * TIME_UNIT_CONVERSION,
+      box,
+      atom.position_per_atom,
+      has_pppm_dynamic_q_debug_);
   }
   if (has_virial_nep_ || has_virial_electrostatic_fixed_ || has_virial_dynamic_charge_) {
     const bool need_virial_nep = has_virial_nep_ || has_virial_dynamic_charge_;

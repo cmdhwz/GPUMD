@@ -101,6 +101,10 @@ private:
   bool has_virial_electrostatic_fixed_ = false;
   bool has_virial_dynamic_charge_ = false;
   bool has_pppm_debug_ = false;
+  bool has_pppm_dynamic_q_ = false;
+  bool has_pppm_dynamic_q_debug_ = false;
+  bool dynamic_cell_reference_set_ = false;
+  double dynamic_cell_reference_[9] = {0.0};
   std::string pppm_debug_prefix_;
   std::vector<float> cpu_charge_raw_;
   std::vector<float> cpu_charge_dudq_raw_;
@@ -118,7 +122,7 @@ private:
   {
     return has_raw_charge_ || has_charge_dudq_raw_ || has_charge_dudq_ || has_raw_charge_rate_ ||
            has_charge_rate_ || has_virial_nep_ || has_virial_electrostatic_fixed_ ||
-           has_virial_dynamic_charge_;
+           has_virial_dynamic_charge_ || has_pppm_dynamic_q_;
   }
   bool has_charge_snapshot() const
   {

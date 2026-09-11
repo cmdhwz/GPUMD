@@ -84,6 +84,18 @@ public:
     const GPU_Vector<double*>& potential_per_atom,
     const int number_of_beads,
     const bool request_peratom_virial = false);
+  void diagnose_dynamic_charge(
+    const int N,
+    const int N1,
+    const int N2,
+    const int bead_id,
+    const int step,
+    const double time_fs,
+    const Box& box,
+    const GPU_Vector<float>& charge,
+    const GPU_Vector<float>& charge_rate,
+    const GPU_Vector<double>& position,
+    const bool write_debug);
   bool last_batch_used_peratom_virial() const { return last_batch_used_peratom_virial_; }
   struct Para {
     int K0K1K2;             // total number of mesh points
@@ -113,6 +125,8 @@ private:
   int debug_call_index_ = 0;
   std::string debug_prefix_;
   int debug_frame_ = 0;
+  long long dynamic_call_index_ = 0;
+  bool dynamic_debug_written_ = false;
   GPU_Vector<gpufftComplex> debug_mesh_charge_;
   GPU_Vector<gpufftComplex> debug_mesh_fourier_;
   GPU_Vector<PPPMAssignmentAtomDebug> debug_assignment_atoms_;

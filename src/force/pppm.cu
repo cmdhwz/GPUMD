@@ -25,11 +25,14 @@ The k-space part of the PPPM method.
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 namespace{
 
 constexpr const char* PPPM_DEBUG_SOURCE_SIGNATURE = "PPPM_ASSIGN_DEBUG_20260910_V1";
+constexpr const char* PPPM_DYNAMIC_SOURCE_SIGNATURE = "PPPM_DYNAMIC_Q_DIAG";
+constexpr const char* PPPM_DYNAMIC_FORMULA_VERSION = "candidate_v1";
 
 int get_best_K(const int m)
 {
@@ -222,6 +225,239 @@ __global__ void find_mesh(
         }
       }
     }
+  }
+}
+
+__device__ inline float dynamic_sinc_with_derivative(const float x, float& derivative)
+{
+  const float x2 = x * x;
+  if (x2 <= 1.0f) {
+    float value = 0.0f;
+    float power = 1.0f;
+    float previous_power = 1.0f;
+    derivative = 0.0f;
+    for (int i = 0; i < 6; ++i) {
+      value += sinc_coeff[i] * power;
+      if (i > 0) {
+        derivative += 2.0f * i * sinc_coeff[i] * x * previous_power;
+      }
+      previous_power = power;
+      power *= x2;
+    }
+    return value;
+  }
+  const float sin_x = sin(x);
+  derivative = (x * cos(x) - sin_x) / (x * x);
+  return sin_x / x;
+}
+
+__device__ inline float dynamic_G_polynomial(const float z)
+{
+  return (((G_coeff[4] * z + G_coeff[3]) * z + G_coeff[2]) * z + G_coeff[1]) * z + G_coeff[0];
+}
+
+__device__ inline float dynamic_G_polynomial_derivative(const float z)
+{
+  return ((4.0f * G_coeff[4] * z + 3.0f * G_coeff[3]) * z + 2.0f * G_coeff[2]) * z + G_coeff[1];
+}
+
+__device__ inline float dynamic_log_influence_derivative(const float u)
+{
+  float sinc_derivative = 0.0f;
+  const float sinc_value = dynamic_sinc_with_derivative(u, sinc_derivative);
+  const float sin_u = sin(u);
+  const float z = sin_u * sin_u;
+  const float denominator = dynamic_G_polynomial(z);
+  if (sinc_value == 0.0f || denominator == 0.0f) return 0.0f;
+  return 10.0f * sinc_derivative / sinc_value -
+         4.0f * sin_u * cos(u) * dynamic_G_polynomial_derivative(z) / denominator;
+}
+
+__global__ void find_dynamic_d_raw(
+  const PPPM::Para para,
+  const Box box,
+  const float* g_kx,
+  const float* g_ky,
+  const float* g_kz,
+  const float* g_G,
+  float* g_d_raw_x,
+  float* g_d_raw_y,
+  float* g_d_raw_z)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < para.K0K1K2) {
+    int nk[3];
+    nk[2] = n / para.K0K1;
+    nk[1] = (n - nk[2] * para.K0K1) / para.K[0];
+    nk[0] = n % para.K[0];
+    for (int d = 0; d < 3; ++d) {
+      if (nk[d] >= para.K_half[d]) nk[d] -= para.K[d];
+    }
+
+    const float kx = g_kx[n];
+    const float ky = g_ky[n];
+    const float kz = g_kz[n];
+    const float ksq = kx * kx + ky * ky + kz * kz;
+    if (ksq == 0.0f) {
+      g_d_raw_x[n] = 0.0f;
+      g_d_raw_y[n] = 0.0f;
+      g_d_raw_z[n] = 0.0f;
+      return;
+    }
+
+    const float gamma0 = dynamic_log_influence_derivative(
+      0.5f * para.two_pi_over_K[0] * nk[0]);
+    const float gamma1 = dynamic_log_influence_derivative(
+      0.5f * para.two_pi_over_K[1] * nk[1]);
+    const float gamma2 = dynamic_log_influence_derivative(
+      0.5f * para.two_pi_over_K[2] * nk[2]);
+
+    const float h0x = static_cast<float>(box.cpu_h[0]) / para.K[0];
+    const float h0y = static_cast<float>(box.cpu_h[3]) / para.K[0];
+    const float h0z = static_cast<float>(box.cpu_h[6]) / para.K[0];
+    const float h1x = static_cast<float>(box.cpu_h[1]) / para.K[1];
+    const float h1y = static_cast<float>(box.cpu_h[4]) / para.K[1];
+    const float h1z = static_cast<float>(box.cpu_h[7]) / para.K[1];
+    const float h2x = static_cast<float>(box.cpu_h[2]) / para.K[2];
+    const float h2y = static_cast<float>(box.cpu_h[5]) / para.K[2];
+    const float h2z = static_cast<float>(box.cpu_h[8]) / para.K[2];
+    const float radial_derivative = -2.0f / ksq - 2.0f * para.alpha_factor;
+    const float prefactor = static_cast<float>(para.K0K1K2) * g_G[n];
+    g_d_raw_x[n] = prefactor *
+      (radial_derivative * kx + 0.5f * (gamma0 * h0x + gamma1 * h1x + gamma2 * h2x));
+    g_d_raw_y[n] = prefactor *
+      (radial_derivative * ky + 0.5f * (gamma0 * h0y + gamma1 * h1y + gamma2 * h2y));
+    g_d_raw_z[n] = prefactor *
+      (radial_derivative * kz + 0.5f * (gamma0 * h0z + gamma1 * h1z + gamma2 * h2z));
+  }
+}
+
+__global__ void project_dynamic_d(
+  const PPPM::Para para,
+  const float* g_d_raw_x,
+  const float* g_d_raw_y,
+  const float* g_d_raw_z,
+  float* g_d_x,
+  float* g_d_y,
+  float* g_d_z)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < para.K0K1K2) {
+    const int iz = n / para.K0K1;
+    const int iy = (n - iz * para.K0K1) / para.K[0];
+    const int ix = n % para.K[0];
+    const int ix_bar = (para.K[0] - ix) % para.K[0];
+    const int iy_bar = (para.K[1] - iy) % para.K[1];
+    const int iz_bar = (para.K[2] - iz) % para.K[2];
+    const int n_bar = ix_bar + para.K[0] * (iy_bar + para.K[1] * iz_bar);
+    if (n == n_bar) {
+      g_d_x[n] = 0.0f;
+      g_d_y[n] = 0.0f;
+      g_d_z[n] = 0.0f;
+      return;
+    }
+    // candidate_v1: Cartesian Nyquist-plane projection is valid only for orthogonal cells.
+    g_d_x[n] = (para.K[0] % 2 == 0 && ix == para.K_half[0])
+      ? 0.0f
+      : 0.5f * (g_d_raw_x[n] - g_d_raw_x[n_bar]);
+    g_d_y[n] = (para.K[1] % 2 == 0 && iy == para.K_half[1])
+      ? 0.0f
+      : 0.5f * (g_d_raw_y[n] - g_d_raw_y[n_bar]);
+    g_d_z[n] = (para.K[2] % 2 == 0 && iz == para.K_half[2])
+      ? 0.0f
+      : 0.5f * (g_d_raw_z[n] - g_d_raw_z[n_bar]);
+  }
+}
+
+__global__ void find_dynamic_mesh(
+  const int N1,
+  const int N2,
+  const PPPM::Para para,
+  const Box box,
+  const float* g_charge,
+  const float* g_charge_rate,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  gpufftComplex* g_Q,
+  gpufftComplex* g_S,
+  gpufftComplex* g_Ax,
+  gpufftComplex* g_Ay,
+  gpufftComplex* g_Az,
+  gpufftComplex* g_Bx,
+  gpufftComplex* g_By,
+  gpufftComplex* g_Bz)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (n < N2) {
+    const double x = g_x[n];
+    const double y = g_y[n];
+    const double z = g_z[n];
+    const float q = g_charge[n];
+    const float qdot = g_charge_rate[n];
+    const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+    const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+    const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+    const int ix = int(sx + 0.5f);
+    const int iy = int(sy + 0.5f);
+    const int iz = int(sz + 0.5f);
+    const float dx = sx - ix;
+    const float dy = sy - iy;
+    const float dz = sz - iz;
+    float Wx[5] = {0.0f};
+    float Wy[5] = {0.0f};
+    float Wz[5] = {0.0f};
+    for (int d = 0; d < 5; ++d) {
+      Wx[d] = (((W_coeff[d][4] * dx + W_coeff[d][3]) * dx + W_coeff[d][2]) * dx + W_coeff[d][1]) * dx + W_coeff[d][0];
+      Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy + W_coeff[d][1]) * dy + W_coeff[d][0];
+      Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz + W_coeff[d][1]) * dz + W_coeff[d][0];
+    }
+    for (int n0 = -2; n0 <= 2; ++n0) {
+      const int neighbor0 = get_index_within_mesh(para.K[0], ix + n0);
+      for (int n1 = -2; n1 <= 2; ++n1) {
+        const int neighbor1 = get_index_within_mesh(para.K[1], iy + n1);
+        for (int n2 = -2; n2 <= 2; ++n2) {
+          const int neighbor2 = get_index_within_mesh(para.K[2], iz + n2);
+          const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
+          const float W = Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2];
+          const float qW = q * W;
+          const float qdotW = qdot * W;
+          const double s0 = static_cast<double>(ix + n0) / para.K[0];
+          const double s1 = static_cast<double>(iy + n1) / para.K[1];
+          const double s2 = static_cast<double>(iz + n2) / para.K[2];
+          const double image_x = box.cpu_h[0] * s0 + box.cpu_h[1] * s1 + box.cpu_h[2] * s2;
+          const double image_y = box.cpu_h[3] * s0 + box.cpu_h[4] * s1 + box.cpu_h[5] * s2;
+          const double image_z = box.cpu_h[6] * s0 + box.cpu_h[7] * s1 + box.cpu_h[8] * s2;
+          atomicAdd(&g_Q[neighbor012].x, qW);
+          atomicAdd(&g_S[neighbor012].x, qdotW);
+          atomicAdd(&g_Ax[neighbor012].x, static_cast<float>(image_x - x) * qW);
+          atomicAdd(&g_Ay[neighbor012].x, static_cast<float>(image_y - y) * qW);
+          atomicAdd(&g_Az[neighbor012].x, static_cast<float>(image_z - z) * qW);
+          atomicAdd(&g_Bx[neighbor012].x, static_cast<float>(image_x - x) * qdotW);
+          atomicAdd(&g_By[neighbor012].x, static_cast<float>(image_y - y) * qdotW);
+          atomicAdd(&g_Bz[neighbor012].x, static_cast<float>(image_z - z) * qdotW);
+        }
+      }
+    }
+  }
+}
+
+__global__ void dynamic_i_d_times_s(
+  const PPPM::Para para,
+  const float* g_d_x,
+  const float* g_d_y,
+  const float* g_d_z,
+  const gpufftComplex* g_S,
+  gpufftComplex* g_L1S_x,
+  gpufftComplex* g_L1S_y,
+  gpufftComplex* g_L1S_z)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < para.K0K1K2) {
+    const gpufftComplex S = g_S[n];
+    g_L1S_x[n] = {-g_d_x[n] * S.y, g_d_x[n] * S.x};
+    g_L1S_y[n] = {-g_d_y[n] * S.y, g_d_y[n] * S.x};
+    g_L1S_z[n] = {-g_d_z[n] * S.y, g_d_z[n] * S.x};
   }
 }
 
@@ -1684,4 +1920,480 @@ void PPPM::find_force_batch(
       potential_per_atom.data());
     GPU_CHECK_KERNEL
   }
+}
+
+void PPPM::diagnose_dynamic_charge(
+  const int N,
+  const int N1,
+  const int N2,
+  const int bead_id,
+  const int step,
+  const double time_fs,
+  const Box& box,
+  const GPU_Vector<float>& charge,
+  const GPU_Vector<float>& charge_rate,
+  const GPU_Vector<double>& position,
+  const bool write_debug)
+{
+  if (N <= 0 || N1 < 0 || N2 > N || N1 >= N2) {
+    std::cerr << "PPPM dynamic-q diagnostic: invalid atom range." << std::endl;
+    return;
+  }
+  if (!box.is_orthogonal) {
+    std::cerr << "PPPM dynamic-q diagnostic: candidate_v1 requires an orthogonal cell."
+              << std::endl;
+    return;
+  }
+
+  const long long pppm_call_index = dynamic_call_index_++;
+  const bool emit_debug = write_debug && !dynamic_debug_written_;
+  find_para(N, box);
+  const int M = para.K0K1K2;
+  const int grid_size = (M - 1) / 64 + 1;
+  const gpufftComplex zero = {0.0f, 0.0f};
+
+  GPU_Vector<gpufftComplex> Q(M, zero);
+  GPU_Vector<gpufftComplex> S(M, zero);
+  GPU_Vector<gpufftComplex> Ax(M, zero);
+  GPU_Vector<gpufftComplex> Ay(M, zero);
+  GPU_Vector<gpufftComplex> Az(M, zero);
+  GPU_Vector<gpufftComplex> Bx(M, zero);
+  GPU_Vector<gpufftComplex> By(M, zero);
+  GPU_Vector<gpufftComplex> Bz(M, zero);
+  GPU_Vector<gpufftComplex> L1S_x(M, zero);
+  GPU_Vector<gpufftComplex> L1S_y(M, zero);
+  GPU_Vector<gpufftComplex> L1S_z(M, zero);
+  GPU_Vector<float> d_raw_x(M);
+  GPU_Vector<float> d_raw_y(M);
+  GPU_Vector<float> d_raw_z(M);
+  GPU_Vector<float> d_x(M);
+  GPU_Vector<float> d_y(M);
+  GPU_Vector<float> d_z(M);
+
+  find_k_and_G_opt<<<grid_size, 64>>>(para, kx.data(), ky.data(), kz.data(), G.data());
+  GPU_CHECK_KERNEL
+  find_dynamic_mesh<<<(N2 - N1 - 1) / 64 + 1, 64>>>(
+    N1,
+    N2,
+    para,
+    box,
+    charge.data(),
+    charge_rate.data(),
+    position.data(),
+    position.data() + N,
+    position.data() + 2 * N,
+    Q.data(),
+    S.data(),
+    Ax.data(),
+    Ay.data(),
+    Az.data(),
+    Bx.data(),
+    By.data(),
+    Bz.data());
+  GPU_CHECK_KERNEL
+
+  find_dynamic_d_raw<<<grid_size, 64>>>(
+    para,
+    box,
+    kx.data(),
+    ky.data(),
+    kz.data(),
+    G.data(),
+    d_raw_x.data(),
+    d_raw_y.data(),
+    d_raw_z.data());
+  GPU_CHECK_KERNEL
+  project_dynamic_d<<<grid_size, 64>>>(
+    para,
+    d_raw_x.data(),
+    d_raw_y.data(),
+    d_raw_z.data(),
+    d_x.data(),
+    d_y.data(),
+    d_z.data());
+  GPU_CHECK_KERNEL
+
+  std::vector<float> h_q(N), h_qdot(N);
+  charge.copy_to_host(h_q.data(), N);
+  charge_rate.copy_to_host(h_qdot.data(), N);
+  std::vector<gpufftComplex> h_Q(M), h_S(M);
+  std::vector<gpufftComplex> h_Ax(M), h_Ay(M), h_Az(M);
+  std::vector<gpufftComplex> h_Bx(M), h_By(M), h_Bz(M);
+  Q.copy_to_host(h_Q.data(), M);
+  S.copy_to_host(h_S.data(), M);
+  Ax.copy_to_host(h_Ax.data(), M);
+  Ay.copy_to_host(h_Ay.data(), M);
+  Az.copy_to_host(h_Az.data(), M);
+  Bx.copy_to_host(h_Bx.data(), M);
+  By.copy_to_host(h_By.data(), M);
+  Bz.copy_to_host(h_Bz.data(), M);
+
+  if (gpufftExecC2C(plan, Q.data(), Q.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q Q forward failed" << std::endl;
+    return;
+  }
+  if (gpufftExecC2C(plan, S.data(), S.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q S forward failed" << std::endl;
+    return;
+  }
+  std::vector<gpufftComplex> h_rho(M), h_s(M);
+  Q.copy_to_host(h_rho.data(), M);
+  S.copy_to_host(h_s.data(), M);
+
+  dynamic_i_d_times_s<<<grid_size, 64>>>(
+    para,
+    d_x.data(),
+    d_y.data(),
+    d_z.data(),
+    S.data(),
+    L1S_x.data(),
+    L1S_y.data(),
+    L1S_z.data());
+  GPU_CHECK_KERNEL
+
+  find_mesh_G<<<grid_size, 64>>>(para, G.data(), Q.data(), Q.data());
+  GPU_CHECK_KERNEL
+  find_mesh_G<<<grid_size, 64>>>(para, G.data(), S.data(), S.data());
+  GPU_CHECK_KERNEL
+  if (gpufftExecC2C(plan, Q.data(), Q.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q LQ inverse failed" << std::endl;
+    return;
+  }
+  if (gpufftExecC2C(plan, S.data(), S.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q LS inverse failed" << std::endl;
+    return;
+  }
+  if (gpufftExecC2C(plan, L1S_x.data(), L1S_x.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q L1S-x inverse failed" << std::endl;
+    return;
+  }
+  if (gpufftExecC2C(plan, L1S_y.data(), L1S_y.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q L1S-y inverse failed" << std::endl;
+    return;
+  }
+  if (gpufftExecC2C(plan, L1S_z.data(), L1S_z.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q L1S-z inverse failed" << std::endl;
+    return;
+  }
+  std::vector<gpufftComplex> h_LQ(M), h_LS(M), h_L1S_x(M), h_L1S_y(M), h_L1S_z(M);
+  Q.copy_to_host(h_LQ.data(), M);
+  S.copy_to_host(h_LS.data(), M);
+  L1S_x.copy_to_host(h_L1S_x.data(), M);
+  L1S_y.copy_to_host(h_L1S_y.data(), M);
+  L1S_z.copy_to_host(h_L1S_z.data(), M);
+
+  std::vector<float> h_d_x(M), h_d_y(M), h_d_z(M);
+  d_x.copy_to_host(h_d_x.data(), M);
+  d_y.copy_to_host(h_d_y.data(), M);
+  d_z.copy_to_host(h_d_z.data(), M);
+  std::vector<float> h_kx, h_ky, h_kz, h_G;
+  std::vector<float> h_d_raw_x, h_d_raw_y, h_d_raw_z;
+  if (emit_debug) {
+    h_kx.resize(M);
+    h_ky.resize(M);
+    h_kz.resize(M);
+    h_G.resize(M);
+    h_d_raw_x.resize(M);
+    h_d_raw_y.resize(M);
+    h_d_raw_z.resize(M);
+    kx.copy_to_host(h_kx.data(), M);
+    ky.copy_to_host(h_ky.data(), M);
+    kz.copy_to_host(h_kz.data(), M);
+    G.copy_to_host(h_G.data(), M);
+    d_raw_x.copy_to_host(h_d_raw_x.data(), M);
+    d_raw_y.copy_to_host(h_d_raw_y.data(), M);
+    d_raw_z.copy_to_host(h_d_raw_z.data(), M);
+  }
+
+  auto finite_complex = [](const std::vector<gpufftComplex>& values) {
+    for (const gpufftComplex& value : values) {
+      if (!std::isfinite(static_cast<double>(value.x)) ||
+          !std::isfinite(static_cast<double>(value.y))) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto finite_float = [](const std::vector<float>& values) {
+    for (const float value : values) {
+      if (!std::isfinite(static_cast<double>(value))) return false;
+    }
+    return true;
+  };
+  bool all_values_finite =
+    finite_float(h_q) && finite_float(h_qdot) && finite_float(h_d_x) && finite_float(h_d_y) &&
+    finite_float(h_d_z) && finite_complex(h_Q) && finite_complex(h_S) && finite_complex(h_Ax) &&
+    finite_complex(h_Ay) && finite_complex(h_Az) && finite_complex(h_Bx) && finite_complex(h_By) &&
+    finite_complex(h_Bz) && finite_complex(h_rho) && finite_complex(h_s) && finite_complex(h_LQ) &&
+    finite_complex(h_LS) && finite_complex(h_L1S_x) && finite_complex(h_L1S_y) &&
+    finite_complex(h_L1S_z);
+  if (emit_debug) {
+    all_values_finite = all_values_finite && finite_float(h_kx) && finite_float(h_ky) &&
+      finite_float(h_kz) && finite_float(h_G) && finite_float(h_d_raw_x) &&
+      finite_float(h_d_raw_y) && finite_float(h_d_raw_z);
+  }
+
+  double sum_q = 0.0;
+  double sum_qdot = 0.0;
+  double sum_q_assign = 0.0;
+  double sum_qdot_assign = 0.0;
+  for (int n = 0; n < N; ++n) {
+    sum_q += h_q[n];
+    sum_qdot += h_qdot[n];
+    if (n >= N1 && n < N2) {
+      sum_q_assign += h_q[n];
+      sum_qdot_assign += h_qdot[n];
+    }
+  }
+
+  double sum_Q = 0.0;
+  double sum_S = 0.0;
+  for (int n = 0; n < M; ++n) {
+    sum_Q += h_Q[n].x;
+    sum_S += h_S[n].x;
+  }
+
+  const double dynamic_relative_tolerance = 1.0e-5;
+  auto within_relative_tolerance = [dynamic_relative_tolerance](
+                                     const double error,
+                                     const double reference) {
+    if (!std::isfinite(error) || !std::isfinite(reference)) return false;
+    const double scale = std::fabs(reference) > 1.0 ? std::fabs(reference) : 1.0;
+    return std::fabs(error) <= dynamic_relative_tolerance * scale;
+  };
+  const double assignment_charge_sum_error = sum_Q - sum_q_assign;
+  const double assignment_qdot_sum_error = sum_S - sum_qdot_assign;
+
+  double J_ass_left[3] = {0.0, 0.0, 0.0};
+  double J_ass_right[3] = {0.0, 0.0, 0.0};
+  double J_mesh_fourier[3] = {0.0, 0.0, 0.0};
+  double J_mesh_realspace[3] = {0.0, 0.0, 0.0};
+  double max_odd_error[3] = {0.0, 0.0, 0.0};
+  double max_imag_L1S[3] = {0.0, 0.0, 0.0};
+  for (int n = 0; n < M; ++n) {
+    J_ass_left[0] -= double(K_C_SP) * double(h_Ax[n].x) * double(h_LS[n].x);
+    J_ass_left[1] -= double(K_C_SP) * double(h_Ay[n].x) * double(h_LS[n].x);
+    J_ass_left[2] -= double(K_C_SP) * double(h_Az[n].x) * double(h_LS[n].x);
+    J_ass_right[0] += double(K_C_SP) * double(h_LQ[n].x) * double(h_Bx[n].x);
+    J_ass_right[1] += double(K_C_SP) * double(h_LQ[n].x) * double(h_By[n].x);
+    J_ass_right[2] += double(K_C_SP) * double(h_LQ[n].x) * double(h_Bz[n].x);
+
+    const double im_conjugate_rho_s =
+      double(h_rho[n].x) * double(h_s[n].y) - double(h_rho[n].y) * double(h_s[n].x);
+    J_mesh_fourier[0] -= double(K_C_SP) / M * double(h_d_x[n]) * im_conjugate_rho_s;
+    J_mesh_fourier[1] -= double(K_C_SP) / M * double(h_d_y[n]) * im_conjugate_rho_s;
+    J_mesh_fourier[2] -= double(K_C_SP) / M * double(h_d_z[n]) * im_conjugate_rho_s;
+
+    J_mesh_realspace[0] += double(K_C_SP) * double(h_Q[n].x) * double(h_L1S_x[n].x) / M;
+    J_mesh_realspace[1] += double(K_C_SP) * double(h_Q[n].x) * double(h_L1S_y[n].x) / M;
+    J_mesh_realspace[2] += double(K_C_SP) * double(h_Q[n].x) * double(h_L1S_z[n].x) / M;
+
+    const int iz = n / para.K0K1;
+    const int iy = (n - iz * para.K0K1) / para.K[0];
+    const int ix = n % para.K[0];
+    const int ix_bar = (para.K[0] - ix) % para.K[0];
+    const int iy_bar = (para.K[1] - iy) % para.K[1];
+    const int iz_bar = (para.K[2] - iz) % para.K[2];
+    const int n_bar = ix_bar + para.K[0] * (iy_bar + para.K[1] * iz_bar);
+    const double odd_x = std::fabs(double(h_d_x[n_bar]) + double(h_d_x[n]));
+    const double odd_y = std::fabs(double(h_d_y[n_bar]) + double(h_d_y[n]));
+    const double odd_z = std::fabs(double(h_d_z[n_bar]) + double(h_d_z[n]));
+    if (odd_x > max_odd_error[0]) max_odd_error[0] = odd_x;
+    if (odd_y > max_odd_error[1]) max_odd_error[1] = odd_y;
+    if (odd_z > max_odd_error[2]) max_odd_error[2] = odd_z;
+    const double imag_x = std::fabs(double(h_L1S_x[n].y) / M);
+    const double imag_y = std::fabs(double(h_L1S_y[n].y) / M);
+    const double imag_z = std::fabs(double(h_L1S_z[n].y) / M);
+    if (imag_x > max_imag_L1S[0]) max_imag_L1S[0] = imag_x;
+    if (imag_y > max_imag_L1S[1]) max_imag_L1S[1] = imag_y;
+    if (imag_z > max_imag_L1S[2]) max_imag_L1S[2] = imag_z;
+  }
+
+  double mesh_path_error = 0.0;
+  double mesh_path_scale = 1.0;
+  for (int d = 0; d < 3; ++d) {
+    const double mesh_error = std::fabs(J_mesh_fourier[d] - J_mesh_realspace[d]);
+    if (mesh_error > mesh_path_error) mesh_path_error = mesh_error;
+    if (std::fabs(J_mesh_fourier[d]) > mesh_path_scale) {
+      mesh_path_scale = std::fabs(J_mesh_fourier[d]);
+    }
+    if (std::fabs(J_mesh_realspace[d]) > mesh_path_scale) {
+      mesh_path_scale = std::fabs(J_mesh_realspace[d]);
+    }
+  }
+  const bool assignment_sums_ok =
+    all_values_finite && within_relative_tolerance(assignment_charge_sum_error, sum_q_assign) &&
+    within_relative_tolerance(assignment_qdot_sum_error, sum_qdot_assign);
+  const bool mesh_path_ok =
+    all_values_finite && mesh_path_error <= dynamic_relative_tolerance * mesh_path_scale;
+
+  const double J_ass[3] = {
+    J_ass_left[0] + J_ass_right[0],
+    J_ass_left[1] + J_ass_right[1],
+    J_ass_left[2] + J_ass_right[2]};
+  const double J_mesh[3] = {J_mesh_fourier[0], J_mesh_fourier[1], J_mesh_fourier[2]};
+  const double DeltaJ[3] = {
+    J_ass[0] + J_mesh[0],
+    J_ass[1] + J_mesh[1],
+    J_ass[2] + J_mesh[2]};
+  const double inv_time = 1.0 / TIME_UNIT_CONVERSION;
+
+  auto write_dynamic_metadata = [](std::ofstream& file) {
+    file << "# source_signature = " << PPPM_DYNAMIC_SOURCE_SIGNATURE << "\n";
+    file << "# dynamic_formula_version = " << PPPM_DYNAMIC_FORMULA_VERSION << "\n";
+    file << "# q_source = nep_data.charge\n";
+    file << "# qdot_source = nep_data.charge_rate\n";
+    file << "# q_projection = zero_total_charge(0:N)\n";
+    file << "# qdot_projection = zero_total_charge(0:N)\n";
+    file << "# assignment_domain = N1:N2\n";
+    file << "# fft_forward = unnormalized\n";
+    file << "# fft_inverse = unnormalized\n";
+    file << "# phase_convention = forward exp(-i*2pi*n.j/K), inverse exp(+i*2pi*n.j/K)\n";
+    file << "# g_m = Gopt_m\n";
+    file << "# ell_m = Ng*Gopt_m\n";
+    file << "# L_prefactor = 1/Ng\n";
+    file << "# D_prefactor = 2*K_C_SP\n";
+    file << "# d_zero_mode = 0\n";
+    file << "# d_nyquist_component_plane = 0\n";
+    file << "# d_pair_projection = 0.5*(d_raw[m]-d_raw[mbar])\n";
+    file << "# d_odd_error = max_abs(d[mbar]+d[m])\n";
+    file << "# qdot_internal_unit = e/natural_time\n";
+    file << "# qdot_output_unit = e/fs\n";
+    file << "# sum_qdot_proj_0_N_unit = e/natural_time\n";
+    file << "# sum_qdot_assign_N1_N2_unit = e/natural_time\n";
+    file << "# sum_S_unit = e/natural_time\n";
+    file << "# s_zero_unit = e/natural_time\n";
+    file << "# J_unit = eV*Angstrom/fs\n";
+    file << "# J_conversion = divide_by_TIME_UNIT_CONVERSION\n";
+    file << "# geometry_restriction = fixed orthogonal cell, time_step=0\n";
+    file << "# nyquist_rule = Cartesian component plane zero (orthogonal-cell candidate_v1 only)\n";
+    file << "# diagnostic_relative_tolerance = 1e-5\n";
+    file << "# csv_frequency = every sampled diagnostic call\n";
+    file << "# detailed_debug_frequency = first diagnostic call only\n";
+  };
+  auto open_append = [](const char* filename, std::ofstream& file) {
+    std::ifstream probe(filename, std::ios::binary | std::ios::ate);
+    const bool empty = !probe || probe.tellg() == std::streampos(0);
+    file.open(filename, std::ios::app);
+    return std::pair<bool, bool>(static_cast<bool>(file), empty);
+  };
+
+  std::ofstream csv;
+  const std::pair<bool, bool> csv_state = open_append("pppm_dynamic_q_diag.csv", csv);
+  if (!csv_state.first) {
+    std::cerr << "PPPM dynamic-q diagnostic: cannot open pppm_dynamic_q_diag.csv." << std::endl;
+    return;
+  }
+  csv << std::scientific << std::setprecision(16);
+  if (csv_state.second) {
+    write_dynamic_metadata(csv);
+    csv << "source_signature,dynamic_formula_version,step,time_fs,pppm_call_index,bead_id,N,N1,N2,"
+           "mesh_x,mesh_y,mesh_z,Ng,alpha,K_C_SP,TIME_UNIT_CONVERSION,"
+           "sum_q_proj_0_N,sum_qdot_proj_0_N,sum_q_assign_N1_N2,sum_qdot_assign_N1_N2,"
+           "sum_Q,sum_S,rho_zero_real,rho_zero_imag,s_zero_real,s_zero_imag,"
+           "J_ass_left_x,J_ass_left_y,J_ass_left_z,J_ass_right_x,J_ass_right_y,J_ass_right_z,"
+           "J_ass_x,J_ass_y,J_ass_z,J_mesh_fourier_x,J_mesh_fourier_y,J_mesh_fourier_z,"
+           "J_mesh_realspace_x,J_mesh_realspace_y,J_mesh_realspace_z,J_mesh_x,J_mesh_y,J_mesh_z,"
+           "DeltaJ_pppm_x,DeltaJ_pppm_y,DeltaJ_pppm_z,max_odd_error_dx,max_odd_error_dy,"
+           "max_odd_error_dz,max_imag_L1S_x,max_imag_L1S_y,max_imag_L1S_z,"
+           "assignment_charge_sum_error,assignment_qdot_sum_error,max_abs_J_mesh_path,"
+           "assignment_sums_ok,mesh_path_ok,all_values_finite,"
+           "h00,h01,h02,h10,h11,h12,h20,h21,h22\n";
+  }
+  csv << PPPM_DYNAMIC_SOURCE_SIGNATURE << "," << PPPM_DYNAMIC_FORMULA_VERSION << "," << step << ","
+      << time_fs << "," << pppm_call_index << "," << bead_id << "," << N << "," << N1 << "," << N2
+      << "," << para.K[0] << "," << para.K[1] << "," << para.K[2] << "," << M << "," << para.alpha
+      << "," << K_C_SP << "," << TIME_UNIT_CONVERSION << "," << sum_q << "," << sum_qdot << ","
+      << sum_q_assign << "," << sum_qdot_assign << "," << sum_Q << "," << sum_S << "," << h_rho[0].x
+      << "," << h_rho[0].y << "," << h_s[0].x << "," << h_s[0].y;
+  for (int d = 0; d < 3; ++d) csv << "," << J_ass_left[d] * inv_time;
+  for (int d = 0; d < 3; ++d) csv << "," << J_ass_right[d] * inv_time;
+  for (int d = 0; d < 3; ++d) csv << "," << J_ass[d] * inv_time;
+  for (int d = 0; d < 3; ++d) csv << "," << J_mesh_fourier[d] * inv_time;
+  for (int d = 0; d < 3; ++d) csv << "," << J_mesh_realspace[d] * inv_time;
+  for (int d = 0; d < 3; ++d) csv << "," << J_mesh[d] * inv_time;
+  for (int d = 0; d < 3; ++d) csv << "," << DeltaJ[d] * inv_time;
+  for (int d = 0; d < 3; ++d) csv << "," << max_odd_error[d];
+  for (int d = 0; d < 3; ++d) csv << "," << max_imag_L1S[d];
+  csv << "," << assignment_charge_sum_error << "," << assignment_qdot_sum_error << ","
+      << mesh_path_error * inv_time << "," << (assignment_sums_ok ? 1 : 0) << ","
+      << (mesh_path_ok ? 1 : 0) << "," << (all_values_finite ? 1 : 0);
+  for (int i = 0; i < 9; ++i) csv << "," << box.cpu_h[i];
+  csv << "\n";
+  csv.close();
+
+  if (emit_debug) {
+    std::vector<double> h_position(3 * N);
+    position.copy_to_host(h_position.data(), 3 * N);
+
+    std::ofstream atom_file;
+    const std::pair<bool, bool> atom_state = open_append("pppm_dynamic_q_atom_debug.out", atom_file);
+    if (atom_state.first) {
+      atom_file << std::scientific << std::setprecision(16);
+      if (atom_state.second) {
+        write_dynamic_metadata(atom_file);
+        atom_file << "# columns atom_id x y z q qdot_internal qdot_e_per_fs\n";
+      }
+      atom_file << "# step " << step << " time_fs " << time_fs << " pppm_call_index "
+                << pppm_call_index << " bead_id " << bead_id << " N " << N << " N1 " << N1
+                << " N2 " << N2 << "\n";
+      for (int n = 0; n < N; ++n) {
+        atom_file << n << " " << h_position[n] << " " << h_position[N + n] << " "
+                  << h_position[2 * N + n] << " " << h_q[n] << " " << h_qdot[n] << " "
+                  << h_qdot[n] * inv_time << "\n";
+      }
+      atom_file.close();
+    } else {
+      std::cerr << "PPPM dynamic-q diagnostic: cannot open pppm_dynamic_q_atom_debug.out."
+                << std::endl;
+    }
+
+    std::ofstream kspace_file;
+    const std::pair<bool, bool> kspace_state =
+      open_append("pppm_dynamic_q_kspace_debug.out", kspace_file);
+    if (kspace_state.first) {
+      kspace_file << std::scientific << std::setprecision(16);
+      if (kspace_state.second) {
+        write_dynamic_metadata(kspace_file);
+        kspace_file << "# columns ix iy iz nx ny nz kx ky kz Gopt g ell "
+                       "d_raw_x d_raw_y d_raw_z d_x d_y d_z rho_real rho_imag s_real s_imag\n";
+      }
+      kspace_file << "# step " << step << " time_fs " << time_fs << " pppm_call_index "
+                  << pppm_call_index << " bead_id " << bead_id << " N " << N << " N1 " << N1
+                  << " N2 " << N2 << "\n";
+      for (int iz = 0; iz < para.K[2]; ++iz) {
+        for (int iy = 0; iy < para.K[1]; ++iy) {
+          for (int ix = 0; ix < para.K[0]; ++ix) {
+            const int n = ix + para.K[0] * (iy + para.K[1] * iz);
+            const int nx = ix >= para.K_half[0] ? ix - para.K[0] : ix;
+            const int ny = iy >= para.K_half[1] ? iy - para.K[1] : iy;
+            const int nz = iz >= para.K_half[2] ? iz - para.K[2] : iz;
+            kspace_file << ix << " " << iy << " " << iz << " " << nx << " " << ny << " " << nz
+                        << " " << h_kx[n] << " " << h_ky[n] << " " << h_kz[n] << " " << h_G[n]
+                        << " " << h_G[n] << " " << double(M) * h_G[n] << " " << h_d_raw_x[n]
+                        << " " << h_d_raw_y[n] << " " << h_d_raw_z[n] << " " << h_d_x[n] << " "
+                        << h_d_y[n] << " " << h_d_z[n] << " " << h_rho[n].x << " " << h_rho[n].y
+                        << " " << h_s[n].x << " " << h_s[n].y << "\n";
+          }
+        }
+      }
+      kspace_file.close();
+    } else {
+      std::cerr << "PPPM dynamic-q diagnostic: cannot open pppm_dynamic_q_kspace_debug.out."
+                << std::endl;
+    }
+    dynamic_debug_written_ = true;
+  }
+
+  std::cout << std::scientific << std::setprecision(16)
+            << "PPPM dynamic-q diagnostic step=" << step << " bead=" << bead_id
+            << " call=" << pppm_call_index << " max_abs_J_mesh_path="
+            << mesh_path_error * inv_time << " assignment_sum_error=("
+            << assignment_charge_sum_error << "," << assignment_qdot_sum_error
+            << ") assignment_sums_ok=" << (assignment_sums_ok ? 1 : 0)
+            << " mesh_path_ok=" << (mesh_path_ok ? 1 : 0)
+            << " all_values_finite=" << (all_values_finite ? 1 : 0) << " max_odd_error=("
+            << max_odd_error[0] << "," << max_odd_error[1] << "," << max_odd_error[2]
+            << ") max_imag_L1S=(" << max_imag_L1S[0] << "," << max_imag_L1S[1] << ","
+            << max_imag_L1S[2] << ")" << std::endl;
 }

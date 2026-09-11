@@ -184,6 +184,16 @@ public:
     const GPU_Vector<double>& position,
     const GPU_Vector<double>& velocity,
     GPU_Vector<double>* channel_per_atom = nullptr);
+  void diagnose_dynamic_charge(
+    const int N,
+    const int N1,
+    const int N2,
+    const int bead_id,
+    const int step,
+    const double time_fs,
+    const Box& box,
+    const GPU_Vector<double>& position,
+    const bool write_debug);
   void compute_charge_heat_channels(
     Box& box,
     const GPU_Vector<int>& type,
