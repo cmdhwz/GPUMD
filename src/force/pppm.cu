@@ -65,6 +65,10 @@ void write_dynamic_metadata(std::ostream& file)
   file << "# geometry_restriction = fixed orthogonal cell, post_force before compute2\n";
   file << "# nyquist_rule = Cartesian component plane zero (orthogonal-cell candidate_v1 only)\n";
   file << "# diagnostic_relative_tolerance = 1e-5\n";
+  file << "# mesh_path_scale_internal_unit = eV*Angstrom/natural_time\n";
+  file << "# mesh_path_threshold_internal = diagnostic_relative_tolerance * mesh_path_scale_internal\n";
+  file << "# mesh_path_scale_output_unit = eV*Angstrom/fs\n";
+  file << "# mesh_path_threshold_output_unit = eV*Angstrom/fs\n";
   file << "# csv_frequency = every sampled diagnostic call; file_write = post_run\n";
   file << "# detailed_debug_frequency = first diagnostic call only\n";
 }
@@ -1285,7 +1289,9 @@ void PPPM::flush_dynamic_charge_diagnostics()
        "max_odd_error_dz,max_imag_L1S_x,max_imag_L1S_y,max_imag_L1S_z,"
        "assignment_charge_sum_error,assignment_qdot_sum_error,max_abs_J_mesh_path,"
        "assignment_sums_ok,mesh_path_ok,all_values_finite,"
-       "h00,h01,h02,h10,h11,h12,h20,h21,h22\n";
+       "h00,h01,h02,h10,h11,h12,h20,h21,h22,"
+       "mesh_path_scale_internal,mesh_path_threshold_internal,"
+       "mesh_path_scale_eV_A_fs,mesh_path_threshold_eV_A_fs\n";
   if (!append_text_file("pppm_dynamic_q_diag.csv", csv_header.str(), csv_rows)) {
     std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_diag.csv." << std::endl;
   } else if (!csv_rows.empty()) {
@@ -2434,8 +2440,9 @@ bool PPPM::diagnose_dynamic_charge(
   const bool assignment_sums_ok =
     all_values_finite && within_relative_tolerance(assignment_charge_sum_error, sum_q_assign) &&
     within_relative_tolerance(assignment_qdot_sum_error, sum_qdot_assign);
+  const double mesh_path_threshold = dynamic_relative_tolerance * mesh_path_scale;
   const bool mesh_path_ok =
-    all_values_finite && mesh_path_error <= dynamic_relative_tolerance * mesh_path_scale;
+    all_values_finite && mesh_path_error <= mesh_path_threshold;
   const bool result_valid = all_values_finite && assignment_sums_ok && mesh_path_ok;
 
   const double J_ass[3] = {
@@ -2475,6 +2482,8 @@ bool PPPM::diagnose_dynamic_charge(
                       << mesh_path_error * inv_time << "," << (assignment_sums_ok ? 1 : 0) << ","
                       << (mesh_path_ok ? 1 : 0) << "," << (all_values_finite ? 1 : 0);
   for (int i = 0; i < 9; ++i) dynamic_csv_buffer_ << "," << box.cpu_h[i];
+  dynamic_csv_buffer_ << "," << mesh_path_scale << "," << mesh_path_threshold << ","
+                      << mesh_path_scale * inv_time << "," << mesh_path_threshold * inv_time;
   dynamic_csv_buffer_ << "\n";
 
   dynamic_check_buffer_ << std::scientific << std::setprecision(16) << step << " " << time_fs << " "
