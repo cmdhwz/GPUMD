@@ -311,7 +311,7 @@ void Run::perform_a_run()
     compute_force();
 
     atom.update_unwrapped_position(box);
-    measure.post_force(step, time_step, integrate, group, atom, box, force);
+    measure.post_force(step, time_step, global_time, integrate, group, atom, box, force);
     measure.process_dynamics(step + 1, box, atom);
 
     std::chrono::high_resolution_clock::time_point compute2_begin;

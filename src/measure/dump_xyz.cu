@@ -214,7 +214,7 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
 
 void Dump_XYZ::pre_run(
   const int number_of_steps,
-  const double time_step,
+  const double,
   Integrate& integrate,
   std::vector<Group>& group,
   Atom& atom,
@@ -289,10 +289,7 @@ void Dump_XYZ::pre_run(
     PRINT_INPUT_ERROR("pppm_dynamic_q requires kspace_method pppm.\n");
   }
   if (has_pppm_dynamic_q_) {
-    if (time_step != 0.0) {
-      PRINT_INPUT_ERROR(
-        "pppm_dynamic_q currently requires time_step 0 so charge/geometry remain in one frame.\n");
-    }
+    qnep_->reset_dynamic_charge_cache();
     // pre_run precedes the first Force::compute, so refresh this cached flag here.
     box.set_is_orthogonal();
     if (!box.is_orthogonal) {
@@ -473,6 +470,51 @@ void Dump_XYZ::pre_force(
   if (has_pppm_debug_ && (step + 1) % dump_interval_ == 0) {
     qnep_->request_pppm_debug_for_next_force(pppm_debug_prefix_.c_str(), step + 1);
   }
+  if (has_pppm_dynamic_q_debug_ && (step + 1) % dump_interval_ == 0) {
+    qnep_->request_dynamic_charge_debug(step + 1);
+  }
+}
+
+void Dump_XYZ::post_force(
+  const int step,
+  const double,
+  const double global_time,
+  Integrate&,
+  std::vector<Group>&,
+  Atom& atom,
+  Box& box,
+  Force&)
+{
+  if (!has_pppm_dynamic_q_ || (step + 1) % dump_interval_ != 0)
+    return;
+
+  if (has_pppm_dynamic_q_ && dynamic_cell_reference_set_) {
+    if (!box.is_orthogonal) {
+      PRINT_INPUT_ERROR("pppm_dynamic_q requires an orthogonal cell at every diagnostic frame.\n");
+    }
+    for (int d = 0; d < 9; ++d) {
+      const double reference = dynamic_cell_reference_[d];
+      const double scale = std::fabs(reference) > 1.0 ? std::fabs(reference) : 1.0;
+      if (std::fabs(box.cpu_h[d] - reference) > 1.0e-12 * scale) {
+        PRINT_INPUT_ERROR("pppm_dynamic_q requires a fixed cell; the box changed after pre_run.\n");
+      }
+    }
+  }
+
+  // Sample qdot and the PPPM dynamic correction before compute2() changes the
+  // velocity.  The CSV/debug row therefore belongs to this force evaluation.
+  qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
+  qnep_->diagnose_dynamic_charge(
+    atom.number_of_atoms,
+    0,
+    atom.number_of_atoms,
+    0,
+    step + 1,
+    global_time * TIME_UNIT_CONVERSION,
+    box,
+    atom.position_per_atom,
+    has_pppm_dynamic_q_debug_);
+  dynamic_q_post_force_step_ = step;
 }
 
 void Dump_XYZ::end_of_step(
@@ -544,24 +586,16 @@ void Dump_XYZ::end_of_step(
   if (has_charge_dudq_raw_)
     qnep_->get_raw_D_reference().copy_to_host(cpu_charge_dudq_raw_.data());
   if (has_charge_dudq_) qnep_->get_D_reference().copy_to_host(cpu_charge_dudq_.data());
-  if (has_raw_charge_rate_ || has_charge_rate_ || has_pppm_dynamic_q_) {
+  if (has_raw_charge_rate_ || has_charge_rate_) {
     qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
     if (has_raw_charge_rate_)
       qnep_->get_raw_charge_rate_reference().copy_to_host(cpu_charge_rate_raw_.data());
     if (has_charge_rate_)
       qnep_->get_charge_rate_reference().copy_to_host(cpu_charge_rate_.data());
   }
-  if (has_pppm_dynamic_q_) {
-    qnep_->diagnose_dynamic_charge(
-      atom.number_of_atoms,
-      0,
-      atom.number_of_atoms,
-      0,
-      step + 1,
-      global_time * TIME_UNIT_CONVERSION,
-      box,
-      atom.position_per_atom,
-      has_pppm_dynamic_q_debug_);
+  if (has_pppm_dynamic_q_ && dynamic_q_post_force_step_ != step) {
+    PRINT_INPUT_ERROR(
+      "pppm_dynamic_q requires a post_force sample before dump_xyz end_of_step.\n");
   }
   if (has_virial_nep_ || has_virial_electrostatic_fixed_ || has_virial_dynamic_charge_) {
     const bool need_virial_nep = has_virial_nep_ || has_virial_dynamic_charge_;

@@ -49,6 +49,16 @@ public:
     Box& box,
     Force& force) override;
 
+  void post_force(
+    const int step,
+    const double time_step,
+    const double global_time,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
+
   virtual void end_of_step(
     const int number_of_steps,
     int step,
@@ -103,6 +113,7 @@ private:
   bool has_pppm_debug_ = false;
   bool has_pppm_dynamic_q_ = false;
   bool has_pppm_dynamic_q_debug_ = false;
+  int dynamic_q_post_force_step_ = -1;
   bool dynamic_cell_reference_set_ = false;
   double dynamic_cell_reference_[9] = {0.0};
   std::string pppm_debug_prefix_;

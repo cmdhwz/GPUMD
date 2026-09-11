@@ -232,6 +232,7 @@ void PLUMED::setup_force(
 void PLUMED::post_force(
   const int step_input,
   const double time_step,
+  const double,
   Integrate& integrate,
   std::vector<Group>& group,
   Atom& atom,

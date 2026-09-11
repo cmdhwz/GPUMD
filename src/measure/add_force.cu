@@ -59,6 +59,7 @@ void Add_Force::setup_force(
 void Add_Force::post_force(
   const int step,
   const double,
+  const double,
   Integrate&,
   std::vector<Group>& group,
   Atom& atom,

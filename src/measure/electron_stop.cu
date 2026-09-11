@@ -205,6 +205,7 @@ void Electron_Stop::setup_force(
 void Electron_Stop::post_force(
   const int step,
   const double time_step,
+  const double,
   Integrate& integrate,
   std::vector<Group>& group,
   Atom& atom,

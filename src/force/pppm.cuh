@@ -59,6 +59,13 @@ public:
     debug_frame_ = frame;
   }
   void finish_debug_force_evaluation() { debug_requested_ = false; }
+  void reset_dynamic_charge_cache()
+  {
+    dynamic_cache_set_ = false;
+    dynamic_cache_result_valid_ = false;
+    dynamic_debug_requested_step_ = -1;
+  }
+  void request_dynamic_charge_debug(const int step) { dynamic_debug_requested_step_ = step; }
   void find_force(
     const int N,
     const int N1,
@@ -84,7 +91,7 @@ public:
     const GPU_Vector<double*>& potential_per_atom,
     const int number_of_beads,
     const bool request_peratom_virial = false);
-  void diagnose_dynamic_charge(
+  bool diagnose_dynamic_charge(
     const int N,
     const int N1,
     const int N2,
@@ -128,6 +135,15 @@ private:
   int debug_frame_ = 0;
   long long dynamic_call_index_ = 0;
   bool dynamic_debug_written_ = false;
+  bool dynamic_cache_set_ = false;
+  int dynamic_cache_step_ = -1;
+  int dynamic_cache_bead_ = -1;
+  int dynamic_cache_N1_ = -1;
+  int dynamic_cache_N2_ = -1;
+  double dynamic_cache_time_fs_ = 0.0;
+  bool dynamic_cache_result_valid_ = false;
+  double dynamic_cache_delta_j_[3] = {0.0, 0.0, 0.0};
+  int dynamic_debug_requested_step_ = -1;
   GPU_Vector<gpufftComplex> debug_mesh_charge_;
   GPU_Vector<gpufftComplex> debug_mesh_fourier_;
   GPU_Vector<PPPMAssignmentAtomDebug> debug_assignment_atoms_;

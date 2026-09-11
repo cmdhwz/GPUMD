@@ -1922,7 +1922,7 @@ void PPPM::find_force_batch(
   }
 }
 
-void PPPM::diagnose_dynamic_charge(
+bool PPPM::diagnose_dynamic_charge(
   const int N,
   const int N1,
   const int N2,
@@ -1941,18 +1941,29 @@ void PPPM::diagnose_dynamic_charge(
     delta_j_q_pppm[1] = 0.0;
     delta_j_q_pppm[2] = 0.0;
   }
+  if (
+    dynamic_cache_set_ && step == dynamic_cache_step_ && bead_id == dynamic_cache_bead_ &&
+    N1 == dynamic_cache_N1_ && N2 == dynamic_cache_N2_ && time_fs == dynamic_cache_time_fs_) {
+    if (delta_j_q_pppm != nullptr) {
+      delta_j_q_pppm[0] = dynamic_cache_delta_j_[0];
+      delta_j_q_pppm[1] = dynamic_cache_delta_j_[1];
+      delta_j_q_pppm[2] = dynamic_cache_delta_j_[2];
+    }
+    return dynamic_cache_result_valid_;
+  }
   if (N <= 0 || N1 < 0 || N2 > N || N1 >= N2) {
     std::cerr << "PPPM dynamic-q diagnostic: invalid atom range." << std::endl;
-    return;
+    return false;
   }
   if (!box.is_orthogonal) {
     std::cerr << "PPPM dynamic-q diagnostic: candidate_v1 requires an orthogonal cell."
               << std::endl;
-    return;
+    return false;
   }
 
   const long long pppm_call_index = dynamic_call_index_++;
-  const bool emit_debug = write_debug && !dynamic_debug_written_;
+  const bool emit_debug =
+    (write_debug || dynamic_debug_requested_step_ == step) && !dynamic_debug_written_;
   find_para(N, box);
   const int M = para.K0K1K2;
   const int grid_size = (M - 1) / 64 + 1;
@@ -2036,11 +2047,11 @@ void PPPM::diagnose_dynamic_charge(
 
   if (gpufftExecC2C(plan, Q.data(), Q.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q Q forward failed" << std::endl;
-    return;
+    return false;
   }
   if (gpufftExecC2C(plan, S.data(), S.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q S forward failed" << std::endl;
-    return;
+    return false;
   }
   std::vector<gpufftComplex> h_rho(M), h_s(M);
   Q.copy_to_host(h_rho.data(), M);
@@ -2063,23 +2074,23 @@ void PPPM::diagnose_dynamic_charge(
   GPU_CHECK_KERNEL
   if (gpufftExecC2C(plan, Q.data(), Q.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q LQ inverse failed" << std::endl;
-    return;
+    return false;
   }
   if (gpufftExecC2C(plan, S.data(), S.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q LS inverse failed" << std::endl;
-    return;
+    return false;
   }
   if (gpufftExecC2C(plan, L1S_x.data(), L1S_x.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q L1S-x inverse failed" << std::endl;
-    return;
+    return false;
   }
   if (gpufftExecC2C(plan, L1S_y.data(), L1S_y.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q L1S-y inverse failed" << std::endl;
-    return;
+    return false;
   }
   if (gpufftExecC2C(plan, L1S_z.data(), L1S_z.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q L1S-z inverse failed" << std::endl;
-    return;
+    return false;
   }
   std::vector<gpufftComplex> h_LQ(M), h_LS(M), h_L1S_x(M), h_L1S_y(M), h_L1S_z(M);
   Q.copy_to_host(h_LQ.data(), M);
@@ -2232,6 +2243,7 @@ void PPPM::diagnose_dynamic_charge(
     within_relative_tolerance(assignment_qdot_sum_error, sum_qdot_assign);
   const bool mesh_path_ok =
     all_values_finite && mesh_path_error <= dynamic_relative_tolerance * mesh_path_scale;
+  const bool result_valid = all_values_finite && assignment_sums_ok && mesh_path_ok;
 
   const double J_ass[3] = {
     J_ass_left[0] + J_ass_right[0],
@@ -2276,7 +2288,7 @@ void PPPM::diagnose_dynamic_charge(
     file << "# s_zero_unit = e/natural_time\n";
     file << "# J_unit = eV*Angstrom/fs\n";
     file << "# J_conversion = divide_by_TIME_UNIT_CONVERSION\n";
-    file << "# geometry_restriction = fixed orthogonal cell, time_step=0\n";
+    file << "# geometry_restriction = fixed orthogonal cell, post_force before compute2\n";
     file << "# nyquist_rule = Cartesian component plane zero (orthogonal-cell candidate_v1 only)\n";
     file << "# diagnostic_relative_tolerance = 1e-5\n";
     file << "# csv_frequency = every sampled diagnostic call\n";
@@ -2293,7 +2305,7 @@ void PPPM::diagnose_dynamic_charge(
   const std::pair<bool, bool> csv_state = open_append("pppm_dynamic_q_diag.csv", csv);
   if (!csv_state.first) {
     std::cerr << "PPPM dynamic-q diagnostic: cannot open pppm_dynamic_q_diag.csv." << std::endl;
-    return;
+    return false;
   }
   csv << std::scientific << std::setprecision(16);
   if (csv_state.second) {
@@ -2331,7 +2343,24 @@ void PPPM::diagnose_dynamic_charge(
       << (mesh_path_ok ? 1 : 0) << "," << (all_values_finite ? 1 : 0);
   for (int i = 0; i < 9; ++i) csv << "," << box.cpu_h[i];
   csv << "\n";
+  csv.flush();
+  const bool csv_ok = csv.good();
   csv.close();
+  if (!csv_ok || csv.fail()) {
+    std::cerr << "PPPM dynamic-q diagnostic: failed to write pppm_dynamic_q_diag.csv."
+              << std::endl;
+    return false;
+  }
+
+  dynamic_cache_set_ = true;
+  dynamic_cache_step_ = step;
+  dynamic_cache_bead_ = bead_id;
+  dynamic_cache_N1_ = N1;
+  dynamic_cache_N2_ = N2;
+  dynamic_cache_time_fs_ = time_fs;
+  dynamic_cache_result_valid_ = result_valid;
+  for (int d = 0; d < 3; ++d)
+    dynamic_cache_delta_j_[d] = DeltaJ[d] * inv_time;
 
   if (emit_debug) {
     std::vector<double> h_position(3 * N);
@@ -2407,4 +2436,5 @@ void PPPM::diagnose_dynamic_charge(
             << max_odd_error[0] << "," << max_odd_error[1] << "," << max_odd_error[2]
             << ") max_imag_L1S=(" << max_imag_L1S[0] << "," << max_imag_L1S[1] << ","
             << max_imag_L1S[2] << ")" << std::endl;
+  return result_valid;
 }

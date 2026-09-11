@@ -4491,7 +4491,7 @@ void NEP_Charge::compute_charge_heat_channels(
   compute_charge_rate(box, type, position, velocity, &channel_per_atom);
 }
 
-void NEP_Charge::diagnose_dynamic_charge(
+bool NEP_Charge::diagnose_dynamic_charge(
   const int N,
   const int N1,
   const int N2,
@@ -4503,7 +4503,7 @@ void NEP_Charge::diagnose_dynamic_charge(
   const bool write_debug,
   double* delta_j_q_pppm)
 {
-  pppm.diagnose_dynamic_charge(
+  return pppm.diagnose_dynamic_charge(
     N,
     N1,
     N2,
@@ -4555,15 +4555,16 @@ void NEP_Charge::compute_virial_components(
   const int virial_size = N * 9;
   GPU_Vector<double> potential;
   GPU_Vector<double> force;
+  GPU_Vector<float> charge_saved;
+  GPU_Vector<float> D_real_saved;
   if (need_nep || need_electrostatic_fixed) {
     potential.resize(N, 0.0);
     force.resize(N * 3, 0.0);
+    charge_saved.resize(N);
+    D_real_saved.resize(N);
+    charge_saved.copy_from_device(nep_data.charge.data());
+    D_real_saved.copy_from_device(nep_data.D_real.data());
   }
-  if (need_nep) {
-    virial_nep.fill(0.0);
-    compute_non_electro(box, type, position, potential, force, virial_nep);
-  }
-
   if (need_electrostatic_fixed) {
     potential.fill(0.0);
     force.fill(0.0);
@@ -4645,6 +4646,16 @@ void NEP_Charge::compute_virial_components(
     GPU_CHECK_KERNEL
   }
 
+  if (need_nep) {
+    potential.fill(0.0);
+    force.fill(0.0);
+    virial_nep.fill(0.0);
+    // compute_non_electro() intentionally neutralizes its shared charge
+    // output.  Run it after the fixed-charge component so that the latter
+    // uses the projected charge from the same qNEP force evaluation.
+    compute_non_electro(box, type, position, potential, force, virial_nep);
+  }
+
   if (need_dynamic_charge) {
     virial_dynamic_charge.fill(0.0);
     subtract_virial_components<<<(virial_size - 1) / 128 + 1, 128>>>(
@@ -4654,5 +4665,12 @@ void NEP_Charge::compute_virial_components(
       virial_electrostatic_fixed.data(),
       virial_dynamic_charge.data());
     GPU_CHECK_KERNEL
+  }
+
+  // This helper is diagnostic-only; do not leave shared qNEP outputs changed
+  // by its descriptor/electrostatic recomputation.
+  if (need_nep || need_electrostatic_fixed) {
+    nep_data.charge.copy_from_device(charge_saved.data());
+    nep_data.D_real.copy_from_device(D_real_saved.data());
   }
 }

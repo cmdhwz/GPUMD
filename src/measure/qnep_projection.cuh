@@ -44,6 +44,16 @@ public:
     Box& box,
     Force& force) override;
 
+  void post_force(
+    const int step,
+    const double time_step,
+    const double global_time,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
+
   void end_of_step(
     const int number_of_steps,
     int step,
@@ -84,7 +94,8 @@ private:
     const int step,
     const double global_time,
     Box& box,
-    Atom& atom);
+    Atom& atom,
+    const GPU_Vector<double>& velocity);
 
   int sample_interval_ = 1;
   bool g1_channel_ = false;
@@ -96,6 +107,10 @@ private:
   GPU_Vector<double> gpu_partial_;
   GPU_Vector<double> gpu_total_;
   GPU_Vector<double> gpu_current_total_;
+  GPU_Vector<double> gpu_velocity_sample_;
+  GPU_Vector<double> gpu_diagnostic_potential_;
+  GPU_Vector<double> gpu_diagnostic_force_;
+  GPU_Vector<double> gpu_diagnostic_virial_;
   std::vector<double> cpu_total_;
   GPU_Vector<double> gpu_channel_per_atom_;
   GPU_Vector<double> gpu_channel_total_;

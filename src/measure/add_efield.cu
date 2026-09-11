@@ -97,6 +97,7 @@ void Add_Efield::setup_force(
 void Add_Efield::post_force(
   const int step,
   const double,
+  const double,
   Integrate&,
   std::vector<Group>& group,
   Atom& atom,

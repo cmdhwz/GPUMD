@@ -106,6 +106,7 @@ public:
   void post_force(
     const int step,
     const double time_step,
+    const double global_time,
     Integrate& integrate,
     std::vector<Group>& group,
     Atom& atom,

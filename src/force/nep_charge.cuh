@@ -178,13 +178,15 @@ public:
   {
     pppm.request_debug_for_next_force(prefix, frame);
   }
+  void reset_dynamic_charge_cache() { pppm.reset_dynamic_charge_cache(); }
+  void request_dynamic_charge_debug(const int step) { pppm.request_dynamic_charge_debug(step); }
   void compute_charge_rate(
     Box& box,
     const GPU_Vector<int>& type,
     const GPU_Vector<double>& position,
     const GPU_Vector<double>& velocity,
     GPU_Vector<double>* channel_per_atom = nullptr);
-  void diagnose_dynamic_charge(
+  bool diagnose_dynamic_charge(
     const int N,
     const int N1,
     const int N2,

@@ -29,6 +29,7 @@ Classical qNEP projection diagnostic for heat-current derivation.
 #include "utilities/read_file.cuh"
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace {
 
@@ -268,23 +269,52 @@ void QNEP_Projection::pre_run(
 
   const int N = atom.number_of_atoms;
   if (complete_current_) {
-    if (time_step != 0.0) {
-      PRINT_INPUT_ERROR(
-        "compute_qnep_current_diag currently requires time_step 0 so charge/geometry remain in one frame.\n");
-    }
     if (!qnep_->uses_pppm()) {
       PRINT_INPUT_ERROR("compute_qnep_current_diag requires kspace_method pppm.\n");
     }
+    qnep_->reset_dynamic_charge_cache();
     box.set_is_orthogonal();
     if (!box.is_orthogonal) {
       PRINT_INPUT_ERROR(
         "compute_qnep_current_diag candidate_v1 currently requires an orthogonal cell.\n");
     }
 
-    fid_complete_current_ = my_fopen("qnep_complete_current_diag.csv", "a");
+    const char* complete_filename = "qnep_complete_current_diag.csv";
+    bool complete_file_has_content = false;
+    bool complete_file_has_version = false;
+    bool complete_file_has_stage = false;
+    FILE* complete_probe = fopen(complete_filename, "r");
+    if (complete_probe != nullptr) {
+      char line[512];
+      while (fgets(line, sizeof(line), complete_probe) != nullptr) {
+        complete_file_has_content = true;
+        if (strstr(line, "# format_version 3") != nullptr)
+          complete_file_has_version = true;
+        if (strstr(line, "# sampling_stage post_force_before_compute2") != nullptr)
+          complete_file_has_stage = true;
+      }
+      fclose(complete_probe);
+    }
+    if (complete_file_has_content && (!complete_file_has_version || !complete_file_has_stage)) {
+      PRINT_INPUT_ERROR(
+        "qnep_complete_current_diag.csv has an incompatible format or sampling stage; "
+        "remove or rename it before starting a new run.\n");
+    }
+
+    fid_complete_current_ = my_fopen(complete_filename, "a");
     fseek(fid_complete_current_, 0, SEEK_END);
     if (ftell(fid_complete_current_) == 0) {
       fprintf(fid_complete_current_, "# units eV*Angstrom/fs\n");
+      fprintf(fid_complete_current_, "# format_version 3\n");
+      fprintf(fid_complete_current_, "# sampling_stage post_force_before_compute2\n");
+      fprintf(fid_complete_current_, "# velocity_source post_force_snapshot_before_compute2\n");
+      fprintf(fid_complete_current_, "# energy_source diagnostic_full_qnep_per_atom\n");
+      fprintf(
+        fid_complete_current_,
+        "# pppm_dynamic_q_valid 1=valid; 0=invalid row with NaN correction/candidates\n");
+      fprintf(
+        fid_complete_current_,
+        "# qnep_virial_source diagnostic_full_qnep_per_atom_same_force_frame\n");
       fprintf(
         fid_complete_current_,
         "step,time_fs,J_conv_x,J_conv_y,J_conv_z,J_nep_x,J_nep_y,J_nep_z,"
@@ -293,14 +323,19 @@ void QNEP_Projection::pre_run(
         "J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
         "J_proj_D_x,J_proj_D_y,J_proj_D_z,J_cand_A_x,J_cand_A_y,J_cand_A_z,"
         "J_cand_B_x,J_cand_B_y,J_cand_B_z,J_cand_D_x,J_cand_D_y,J_cand_D_z,"
-        "virial_decomposition_error\n");
+        "virial_decomposition_error,pppm_dynamic_q_valid\n");
     }
+    fprintf(fid_complete_current_, "# segment_begin sampling_stage post_force_before_compute2\n");
 
     number_of_pair_blocks_ = (N + PAIR_THREADS - 1) / PAIR_THREADS;
     gpu_means_.resize(2);
     gpu_partial_.resize(number_of_pair_blocks_ * NUM_OUTPUTS);
     gpu_total_.resize(NUM_OUTPUTS);
     gpu_current_total_.resize(3);
+    gpu_velocity_sample_.resize(static_cast<size_t>(N) * 3);
+    gpu_diagnostic_potential_.resize(N);
+    gpu_diagnostic_force_.resize(static_cast<size_t>(N) * 3);
+    gpu_diagnostic_virial_.resize(static_cast<size_t>(N) * 9);
     cpu_total_.resize(NUM_OUTPUTS);
     gpu_virial_nep_.resize(static_cast<size_t>(N) * 9);
     gpu_virial_electrostatic_fixed_.resize(static_cast<size_t>(N) * 9);
@@ -469,12 +504,13 @@ void QNEP_Projection::write_complete_current(
   const int step,
   const double global_time,
   Box& box,
-  Atom& atom)
+  Atom& atom,
+  const GPU_Vector<double>& velocity)
 {
   const int N = atom.number_of_atoms;
   double delta_j_q_pppm[3] = {0.0, 0.0, 0.0};
-  qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
-  qnep_->diagnose_dynamic_charge(
+  qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, velocity);
+  const bool pppm_dynamic_q_valid = qnep_->diagnose_dynamic_charge(
     N,
     0,
     N,
@@ -485,8 +521,14 @@ void QNEP_Projection::write_complete_current(
     atom.position_per_atom,
     false,
     delta_j_q_pppm);
+  if (!pppm_dynamic_q_valid) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    delta_j_q_pppm[0] = nan;
+    delta_j_q_pppm[1] = nan;
+    delta_j_q_pppm[2] = nan;
+  }
 
-  // Capture the main-force qNEP projection buffers before diagnostic virial
+  // Reduce the main-force qNEP projection buffers before diagnostic virial
   // recomputation can refresh shared qNEP work arrays.
   const GPU_Vector<float>& D = qnep_->get_raw_D_reference();
   const GPU_Vector<float>& s = qnep_->get_raw_charge_rate_reference();
@@ -498,11 +540,26 @@ void QNEP_Projection::write_complete_current(
     D,
     s);
 
+  // Re-evaluate the complete qNEP result into diagnostic-only buffers.  This
+  // makes per-atom energy/virial allocation independent of HAC and other
+  // production requests for per-atom PPPM virials.
+  gpu_diagnostic_potential_.fill(0.0);
+  gpu_diagnostic_force_.fill(0.0);
+  gpu_diagnostic_virial_.fill(0.0);
+  qnep_->request_peratom_virial_for_next_force();
+  qnep_->compute(
+    box,
+    atom.type,
+    atom.position_per_atom,
+    gpu_diagnostic_potential_,
+    gpu_diagnostic_force_,
+    gpu_diagnostic_virial_);
+
   qnep_->compute_virial_components(
     box,
     atom.type,
     atom.position_per_atom,
-    atom.virial_per_atom,
+    gpu_diagnostic_virial_,
     true,
     true,
     true,
@@ -514,8 +571,8 @@ void QNEP_Projection::write_complete_current(
   gpu_sum_conventional_current<<<1, REDUCE_THREADS>>>(
     N,
     atom.mass.data(),
-    atom.potential_per_atom.data(),
-    atom.velocity_per_atom.data(),
+    gpu_diagnostic_potential_.data(),
+    velocity.data(),
     gpu_current_total_.data());
   GPU_CHECK_KERNEL
   gpu_current_total_.copy_to_host(j_conv);
@@ -524,11 +581,11 @@ void QNEP_Projection::write_complete_current(
   double j_elec_fixed[3] = {0.0, 0.0, 0.0};
   double j_dyn_local[3] = {0.0, 0.0, 0.0};
   double j_virial_total[3] = {0.0, 0.0, 0.0};
-  sum_virial_current(gpu_virial_nep_, atom.velocity_per_atom, j_nep);
+  sum_virial_current(gpu_virial_nep_, velocity, j_nep);
   sum_virial_current(
-    gpu_virial_electrostatic_fixed_, atom.velocity_per_atom, j_elec_fixed);
-  sum_virial_current(gpu_virial_dynamic_charge_, atom.velocity_per_atom, j_dyn_local);
-  sum_virial_current(atom.virial_per_atom, atom.velocity_per_atom, j_virial_total);
+    gpu_virial_electrostatic_fixed_, velocity, j_elec_fixed);
+  sum_virial_current(gpu_virial_dynamic_charge_, velocity, j_dyn_local);
+  sum_virial_current(gpu_diagnostic_virial_, velocity, j_virial_total);
 
   const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
   double j_base[3] = {0.0, 0.0, 0.0};
@@ -567,7 +624,12 @@ void QNEP_Projection::write_complete_current(
     for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_projection[x][d]);
   for (int x = 0; x < 3; ++x)
     for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_candidate[x][d]);
-  fprintf(fid_complete_current_, ",%.17g\n", virial_decomposition_error);
+  fprintf(
+    fid_complete_current_,
+    ",%.17g,%d\n",
+    virial_decomposition_error,
+    pppm_dynamic_q_valid ? 1 : 0);
+  fflush(fid_complete_current_);
 }
 
 void QNEP_Projection::pre_force(
@@ -582,8 +644,30 @@ void QNEP_Projection::pre_force(
   check_fixed_cell(box);
   if ((step + 1) % sample_interval_ == 0) {
     qnep_->request_charge_diagnostics_for_next_force();
+    // Keep the production PPPM virial path unchanged; the complete diagnostic
+    // recomputes its own per-atom energy/virial buffers below.
     if (g1_channel_) qnep_->request_peratom_virial_for_next_force();
   }
+}
+
+void QNEP_Projection::post_force(
+  const int step,
+  const double,
+  const double global_time,
+  Integrate&,
+  std::vector<Group>&,
+  Atom& atom,
+  Box& box,
+  Force&)
+{
+  if (!complete_current_ || (step + 1) % sample_interval_ != 0)
+    return;
+
+  // This hook is before Integrate::compute2().  Keep the complete sample on
+  // the same positions, velocity, and qdot force frame.
+  check_fixed_cell(box);
+  gpu_velocity_sample_.copy_from_device(atom.velocity_per_atom.data());
+  write_complete_current(step, global_time, box, atom, gpu_velocity_sample_);
 }
 
 void QNEP_Projection::end_of_step(
@@ -600,14 +684,12 @@ void QNEP_Projection::end_of_step(
   Atom& atom,
   Force&)
 {
+  if (complete_current_)
+    return;
   if ((step + 1) % sample_interval_ != 0)
     return;
 
   check_fixed_cell(box);
-  if (complete_current_) {
-    write_complete_current(step, global_time, box, atom);
-    return;
-  }
   qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, atom.velocity_per_atom);
   double sum_charge = 0.0;
   double sum_charge_rate = 0.0;

@@ -224,6 +224,7 @@ void Measure::pre_force(
 void Measure::post_force(
   const int step,
   const double time_step,
+  const double global_time,
   Integrate& integrate,
   std::vector<Group>& group,
   Atom& atom,
@@ -231,7 +232,7 @@ void Measure::post_force(
   Force& force)
 {
   for (auto& action : actions) {
-    action->post_force(step, time_step, integrate, group, atom, box, force);
+    action->post_force(step, time_step, global_time, integrate, group, atom, box, force);
   }
 }
 void Measure::process_dynamics(
