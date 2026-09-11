@@ -293,6 +293,8 @@ void Dump_XYZ::pre_run(
       PRINT_INPUT_ERROR(
         "pppm_dynamic_q currently requires time_step 0 so charge/geometry remain in one frame.\n");
     }
+    // pre_run precedes the first Force::compute, so refresh this cached flag here.
+    box.set_is_orthogonal();
     if (!box.is_orthogonal) {
       PRINT_INPUT_ERROR("pppm_dynamic_q candidate_v1 currently requires an orthogonal cell.\n");
     }
