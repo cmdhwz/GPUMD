@@ -17,6 +17,8 @@
 #include "action.cuh"
 #include "utilities/gpu_vector.cuh"
 #include <stdio.h>
+#include <sstream>
+#include <string>
 #include <vector>
 
 class NEP_Charge;
@@ -123,9 +125,9 @@ private:
   std::vector<double> cpu_channel_total_;
   std::vector<double> cpu_virial_heat_total_;
   std::vector<double> cpu_delta_j_q_k_;
-  FILE* fid_ = nullptr;
-  FILE* fid_channel_ = nullptr;
-  FILE* fid_delta_j_q_k_ = nullptr;
-  FILE* fid_projection_current_diag_ = nullptr;
-  FILE* fid_complete_current_ = nullptr;
+  std::ostringstream output_buffer_;
+  std::ostringstream channel_buffer_;
+  std::ostringstream delta_j_q_k_buffer_;
+  std::ostringstream projection_current_diag_buffer_;
+  std::ostringstream complete_current_buffer_;
 };

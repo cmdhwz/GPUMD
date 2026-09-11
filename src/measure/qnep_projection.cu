@@ -29,6 +29,7 @@ Classical qNEP projection diagnostic for heat-current derivation.
 #include "utilities/read_file.cuh"
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 
 namespace {
@@ -38,6 +39,24 @@ constexpr int PAIR_THREADS = 128;
 constexpr int NUM_OUTPUTS = 10;
 constexpr int NUM_CHANNEL_COMPONENTS = 6;
 constexpr int NUM_HEAT_COMPONENTS = 5;
+
+void append_output_buffer(
+  const char* filename,
+  const std::string& header,
+  const std::string& rows,
+  const bool header_if_empty,
+  const std::string& prefix = "")
+{
+  if (rows.empty()) return;
+  FILE* file = my_fopen(filename, "a");
+  fseek(file, 0, SEEK_END);
+  const bool empty = ftell(file) == 0;
+  if (!header_if_empty || empty) fwrite(header.data(), 1, header.size(), file);
+  if (!prefix.empty()) fwrite(prefix.data(), 1, prefix.size(), file);
+  fwrite(rows.data(), 1, rows.size(), file);
+  fflush(file);
+  fclose(file);
+}
 
 void __global__ gpu_reduce_means(
   const int N, const float* g_D, const float* g_s, double* g_means)
@@ -230,7 +249,7 @@ void __global__ gpu_sum_conventional_current(
 
 void QNEP_Projection::pre_run(
   const int,
-  const double time_step,
+  const double,
   Integrate& integrate,
   std::vector<Group>&,
   Atom& atom,
@@ -301,31 +320,8 @@ void QNEP_Projection::pre_run(
         "remove or rename it before starting a new run.\n");
     }
 
-    fid_complete_current_ = my_fopen(complete_filename, "a");
-    fseek(fid_complete_current_, 0, SEEK_END);
-    if (ftell(fid_complete_current_) == 0) {
-      fprintf(fid_complete_current_, "# units eV*Angstrom/fs\n");
-      fprintf(fid_complete_current_, "# format_version 3\n");
-      fprintf(fid_complete_current_, "# sampling_stage post_force_before_compute2\n");
-      fprintf(fid_complete_current_, "# velocity_source post_force_snapshot_before_compute2\n");
-      fprintf(fid_complete_current_, "# energy_source diagnostic_full_qnep_per_atom\n");
-      fprintf(
-        fid_complete_current_,
-        "# pppm_dynamic_q_valid 1=valid; 0=invalid row with NaN correction/candidates\n");
-      fprintf(
-        fid_complete_current_,
-        "# qnep_virial_source diagnostic_full_qnep_per_atom_same_force_frame\n");
-      fprintf(
-        fid_complete_current_,
-        "step,time_fs,J_conv_x,J_conv_y,J_conv_z,J_nep_x,J_nep_y,J_nep_z,"
-        "J_elec_fixed_x,J_elec_fixed_y,J_elec_fixed_z,J_dyn_local_x,J_dyn_local_y,J_dyn_local_z,"
-        "J_base_x,J_base_y,J_base_z,DeltaJ_q_pppm_x,DeltaJ_q_pppm_y,DeltaJ_q_pppm_z,"
-        "J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
-        "J_proj_D_x,J_proj_D_y,J_proj_D_z,J_cand_A_x,J_cand_A_y,J_cand_A_z,"
-        "J_cand_B_x,J_cand_B_y,J_cand_B_z,J_cand_D_x,J_cand_D_y,J_cand_D_z,"
-        "virial_decomposition_error,pppm_dynamic_q_valid\n");
-    }
-    fprintf(fid_complete_current_, "# segment_begin sampling_stage post_force_before_compute2\n");
+    complete_current_buffer_.str("");
+    complete_current_buffer_.clear();
 
     number_of_pair_blocks_ = (N + PAIR_THREADS - 1) / PAIR_THREADS;
     gpu_means_.resize(2);
@@ -346,59 +342,14 @@ void QNEP_Projection::pre_run(
     return;
   }
 
-  fid_delta_j_q_k_ = my_fopen("delta_j_q_k.out", "a");
-  fprintf(fid_delta_j_q_k_, "# compute_qnep_projection %d\n", sample_interval_);
-  fprintf(fid_delta_j_q_k_, "# observable delta_j_q_k\n");
-  fprintf(fid_delta_j_q_k_, "# format_version 1\n");
-  fprintf(fid_delta_j_q_k_, "# num_atoms %d\n", N);
-  fprintf(
-    fid_delta_j_q_k_,
-    "# cell %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
-    box.cpu_h[0], box.cpu_h[3], box.cpu_h[6],
-    box.cpu_h[1], box.cpu_h[4], box.cpu_h[7],
-    box.cpu_h[2], box.cpu_h[5], box.cpu_h[8]);
-  fprintf(fid_delta_j_q_k_, "# phase exp(+ikr)\n");
-  fprintf(fid_delta_j_q_k_, "# charge projected\n");
-  fprintf(fid_delta_j_q_k_, "# charge_rate projected\n");
-  fprintf(fid_delta_j_q_k_, "# k0 excluded\n");
-  fprintf(fid_delta_j_q_k_, "# kernel continuous_ewald_reference\n");
-  fprintf(fid_delta_j_q_k_, "# ewald_alpha %.17g 1/Angstrom\n", qnep_->get_ewald_alpha());
-  fprintf(fid_delta_j_q_k_, "# reciprocal_k_cutoff k_squared < (2*pi*alpha)^2\n");
-  fprintf(
-    fid_delta_j_q_k_,
-    "# reciprocal_k_convention n1>0 or n1=0,n2>0 or n1=n2=0,n3>0\n");
-  fprintf(fid_delta_j_q_k_, "# units sum_q=e sum_qdot=e/fs delta_j_q_k=eV Angstrom/fs\n");
-  fprintf(
-    fid_delta_j_q_k_,
-    "# columns step time_fs sum_q sum_qdot nk delta_j_q_k_x delta_j_q_k_y delta_j_q_k_z\n");
+  delta_j_q_k_buffer_.str("");
+  delta_j_q_k_buffer_.clear();
   gpu_delta_j_q_k_.resize(3);
   cpu_delta_j_q_k_.resize(3);
 
   if (g1_channel_) {
-    fid_channel_ = my_fopen("charge_heat_diagnostic.out", "a");
-    fprintf(fid_channel_, "# compute_qnep_projection %d g1_channel\n", sample_interval_);
-    fprintf(fid_channel_, "# format_version 1\n");
-    fprintf(fid_channel_, "# num_atoms %d\n", N);
-    fprintf(
-      fid_channel_,
-      "# cell %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
-      box.cpu_h[0], box.cpu_h[3], box.cpu_h[6],
-      box.cpu_h[1], box.cpu_h[4], box.cpu_h[7],
-      box.cpu_h[2], box.cpu_h[5], box.cpu_h[8]);
-    fprintf(
-      fid_channel_,
-      "# nominal_dt_output %.17g fs\n",
-      time_step * sample_interval_ * TIME_UNIT_CONVERSION);
-    fprintf(fid_channel_, "# units J_channel=J_virial=eV Angstrom/fs\n");
-    fprintf(fid_channel_, "# definitions r12=r_image-r_center; ell_G=-r12; D=D_projected\n");
-    fprintf(fid_channel_, "# J_channel=-sum_b,a,n D_b*r12_ban*(g_ban dot v_a)\n");
-    fprintf(fid_channel_, "# J_channel_total=J_channel_radial+J_channel_angular\n");
-    fprintf(
-      fid_channel_,
-      "# columns step time_fs J_channel_radial_x J_channel_radial_y J_channel_radial_z "
-      "J_channel_angular_x J_channel_angular_y J_channel_angular_z "
-      "J_channel_total_x J_channel_total_y J_channel_total_z "
-      "J_charge_virial_x J_charge_virial_y J_charge_virial_z\n");
+    channel_buffer_.str("");
+    channel_buffer_.clear();
 
     gpu_channel_per_atom_.resize(static_cast<size_t>(N) * NUM_CHANNEL_COMPONENTS);
     gpu_channel_total_.resize(NUM_CHANNEL_COMPONENTS);
@@ -410,32 +361,10 @@ void QNEP_Projection::pre_run(
     cpu_channel_total_.resize(NUM_CHANNEL_COMPONENTS);
     cpu_virial_heat_total_.resize(NUM_HEAT_COMPONENTS);
   } else {
-    fid_ = my_fopen("qnep_projection.out", "a");
-    fprintf(fid_, "# compute_qnep_projection %d\n", sample_interval_);
-    fprintf(fid_, "# format_version 1\n");
-    fprintf(fid_, "# num_atoms %d\n", N);
-    fprintf(
-      fid_,
-      "# cell %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
-      box.cpu_h[0], box.cpu_h[3], box.cpu_h[6],
-      box.cpu_h[1], box.cpu_h[4], box.cpu_h[7],
-      box.cpu_h[2], box.cpu_h[5], box.cpu_h[8]);
-    fprintf(fid_, "# nominal_dt_output %.17g fs\n", time_step * sample_interval_ * TIME_UNIT_CONVERSION);
-    fprintf(fid_, "# units JA JB JD=eV Angstrom/fs; sum_c=eV/fs\n");
-    fprintf(fid_, "# definitions D_i=D_raw_i, s_i=Qdot_raw_i, c_i=mean(D)*s_i-D_i*mean(s)\n");
-    fprintf(fid_, "# JA=sum_{a<b} d_ab*(c_b-c_a)/N; JB=sum_a R_unwrapped_a*c_a\n");
-    fprintf(fid_, "# JD=sum_{a<b} d_ab*(D_a*s_b-D_b*s_a)/N\n");
-    fprintf(fid_, "# columns step time_fs JA_x JA_y JA_z JB_x JB_y JB_z JD_x JD_y JD_z sum_c\n");
-
-    fid_projection_current_diag_ = my_fopen("projection_current_diag.csv", "a");
-    fseek(fid_projection_current_diag_, 0, SEEK_END);
-    if (ftell(fid_projection_current_diag_) == 0) {
-      fprintf(fid_projection_current_diag_, "# units eV*Angstrom/fs\n");
-      fprintf(
-        fid_projection_current_diag_,
-        "step,time_fs,J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
-        "J_proj_D_x,J_proj_D_y,J_proj_D_z\n");
-    }
+    output_buffer_.str("");
+    output_buffer_.clear();
+    projection_current_diag_buffer_.str("");
+    projection_current_diag_buffer_.clear();
 
     number_of_pair_blocks_ = (N + PAIR_THREADS - 1) / PAIR_THREADS;
     gpu_means_.resize(2);
@@ -607,29 +536,22 @@ void QNEP_Projection::write_complete_current(
     if (error > virial_decomposition_error) virial_decomposition_error = error;
   }
 
-  fprintf(
-    fid_complete_current_,
-    "%d,%.17g",
-    step + 1,
-    global_time * TIME_UNIT_CONVERSION);
-  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_conv[d] * inv_time_conversion);
-  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_nep[d] * inv_time_conversion);
+  complete_current_buffer_ << std::setprecision(17) << step + 1 << ","
+                           << global_time * TIME_UNIT_CONVERSION;
+  for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_conv[d] * inv_time_conversion;
+  for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_nep[d] * inv_time_conversion;
   for (int d = 0; d < 3; ++d)
-    fprintf(fid_complete_current_, ",%.17g", j_elec_fixed[d] * inv_time_conversion);
+    complete_current_buffer_ << "," << j_elec_fixed[d] * inv_time_conversion;
   for (int d = 0; d < 3; ++d)
-    fprintf(fid_complete_current_, ",%.17g", j_dyn_local[d] * inv_time_conversion);
-  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_base[d]);
-  for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", delta_j_q_pppm[d]);
+    complete_current_buffer_ << "," << j_dyn_local[d] * inv_time_conversion;
+  for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_base[d];
+  for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << delta_j_q_pppm[d];
   for (int x = 0; x < 3; ++x)
-    for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_projection[x][d]);
+    for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_projection[x][d];
   for (int x = 0; x < 3; ++x)
-    for (int d = 0; d < 3; ++d) fprintf(fid_complete_current_, ",%.17g", j_candidate[x][d]);
-  fprintf(
-    fid_complete_current_,
-    ",%.17g,%d\n",
-    virial_decomposition_error,
-    pppm_dynamic_q_valid ? 1 : 0);
-  fflush(fid_complete_current_);
+    for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_candidate[x][d];
+  complete_current_buffer_ << "," << virial_decomposition_error << ","
+                           << (pppm_dynamic_q_valid ? 1 : 0) << "\n";
 }
 
 void QNEP_Projection::pre_force(
@@ -701,17 +623,12 @@ void QNEP_Projection::end_of_step(
     sum_charge_rate);
   gpu_delta_j_q_k_.copy_to_host(cpu_delta_j_q_k_.data());
   const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
-  fprintf(
-    fid_delta_j_q_k_,
-    "%d %.17g %.17g %.17g %d %.17g %.17g %.17g\n",
-    step + 1,
-    global_time * TIME_UNIT_CONVERSION,
-    sum_charge,
-    sum_charge_rate * inv_time_conversion,
-    num_kpoints,
-    cpu_delta_j_q_k_[0] * inv_time_conversion,
-    cpu_delta_j_q_k_[1] * inv_time_conversion,
-    cpu_delta_j_q_k_[2] * inv_time_conversion);
+  delta_j_q_k_buffer_ << std::setprecision(17) << step + 1 << " "
+                      << global_time * TIME_UNIT_CONVERSION << " " << sum_charge << " "
+                      << sum_charge_rate * inv_time_conversion << " " << num_kpoints << " "
+                      << cpu_delta_j_q_k_[0] * inv_time_conversion << " "
+                      << cpu_delta_j_q_k_[1] * inv_time_conversion << " "
+                      << cpu_delta_j_q_k_[2] * inv_time_conversion << "\n";
 
   if (g1_channel_) {
     qnep_->compute_charge_heat_channels(
@@ -749,23 +666,14 @@ void QNEP_Projection::end_of_step(
     const double jy_virial =
       (cpu_virial_heat_total_[2] + cpu_virial_heat_total_[3]) * inv_time_conversion;
     const double jz_virial = cpu_virial_heat_total_[4] * inv_time_conversion;
-    fprintf(
-      fid_channel_,
-      "%d %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
-      step + 1,
-      global_time * TIME_UNIT_CONVERSION,
-      cpu_channel_total_[0] * inv_time_conversion,
-      cpu_channel_total_[1] * inv_time_conversion,
-      cpu_channel_total_[2] * inv_time_conversion,
-      cpu_channel_total_[3] * inv_time_conversion,
-      cpu_channel_total_[4] * inv_time_conversion,
-      cpu_channel_total_[5] * inv_time_conversion,
-      (cpu_channel_total_[0] + cpu_channel_total_[3]) * inv_time_conversion,
-      (cpu_channel_total_[1] + cpu_channel_total_[4]) * inv_time_conversion,
-      (cpu_channel_total_[2] + cpu_channel_total_[5]) * inv_time_conversion,
-      jx_virial,
-      jy_virial,
-      jz_virial);
+    channel_buffer_ << std::setprecision(17) << step + 1 << " "
+                    << global_time * TIME_UNIT_CONVERSION;
+    for (int d = 0; d < 6; ++d)
+      channel_buffer_ << " " << cpu_channel_total_[d] * inv_time_conversion;
+    channel_buffer_ << " " << (cpu_channel_total_[0] + cpu_channel_total_[3]) * inv_time_conversion
+                    << " " << (cpu_channel_total_[1] + cpu_channel_total_[4]) * inv_time_conversion
+                    << " " << (cpu_channel_total_[2] + cpu_channel_total_[5]) * inv_time_conversion
+                    << " " << jx_virial << " " << jy_virial << " " << jz_virial << "\n";
   }
 
   if (g1_channel_)
@@ -782,66 +690,130 @@ void QNEP_Projection::end_of_step(
     D,
     s);
 
-  fprintf(
-    fid_,
-    "%d %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
-    step + 1,
-    global_time * TIME_UNIT_CONVERSION,
-    cpu_total_[0] * inv_time_conversion,
-    cpu_total_[1] * inv_time_conversion,
-    cpu_total_[2] * inv_time_conversion,
-    cpu_total_[3] * inv_time_conversion,
-    cpu_total_[4] * inv_time_conversion,
-    cpu_total_[5] * inv_time_conversion,
-    cpu_total_[6] * inv_time_conversion,
-    cpu_total_[7] * inv_time_conversion,
-    cpu_total_[8] * inv_time_conversion,
-    cpu_total_[9] * inv_time_conversion);
+  output_buffer_ << std::setprecision(17) << step + 1 << " "
+                 << global_time * TIME_UNIT_CONVERSION;
+  for (int d = 0; d < NUM_OUTPUTS; ++d)
+    output_buffer_ << " " << cpu_total_[d] * inv_time_conversion;
+  output_buffer_ << "\n";
 
-  fprintf(
-    fid_projection_current_diag_,
-    "%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
-    step + 1,
-    global_time * TIME_UNIT_CONVERSION,
-    cpu_total_[0] * inv_time_conversion,
-    cpu_total_[1] * inv_time_conversion,
-    cpu_total_[2] * inv_time_conversion,
-    cpu_total_[3] * inv_time_conversion,
-    cpu_total_[4] * inv_time_conversion,
-    cpu_total_[5] * inv_time_conversion,
-    cpu_total_[6] * inv_time_conversion,
-    cpu_total_[7] * inv_time_conversion,
-    cpu_total_[8] * inv_time_conversion);
+  projection_current_diag_buffer_ << std::setprecision(17) << step + 1 << ","
+                                   << global_time * TIME_UNIT_CONVERSION;
+  for (int d = 0; d < 9; ++d)
+    projection_current_diag_buffer_ << "," << cpu_total_[d] * inv_time_conversion;
+  projection_current_diag_buffer_ << "\n";
 }
 
 void QNEP_Projection::post_run(
-  Atom&,
-  Box&,
+  Atom& atom,
+  Box& box,
   Integrate&,
   const int,
-  const double,
+  const double time_step,
   const double)
 {
-  if (fid_ != nullptr) {
-    fclose(fid_);
-    fid_ = nullptr;
+  const int N = atom.number_of_atoms;
+  if (complete_current_) {
+    std::ostringstream header;
+    header << "# units eV*Angstrom/fs\n"
+           << "# format_version 3\n"
+           << "# file_write post_run\n"
+           << "# sampling_stage post_force_before_compute2\n"
+           << "# velocity_source post_force_snapshot_before_compute2\n"
+           << "# energy_source diagnostic_full_qnep_per_atom\n"
+           << "# pppm_dynamic_q_valid 1=valid; 0=invalid row with NaN correction/candidates\n"
+           << "# qnep_virial_source diagnostic_full_qnep_per_atom_same_force_frame\n"
+           << "step,time_fs,J_conv_x,J_conv_y,J_conv_z,J_nep_x,J_nep_y,J_nep_z,"
+              "J_elec_fixed_x,J_elec_fixed_y,J_elec_fixed_z,J_dyn_local_x,J_dyn_local_y,J_dyn_local_z,"
+              "J_base_x,J_base_y,J_base_z,DeltaJ_q_pppm_x,DeltaJ_q_pppm_y,DeltaJ_q_pppm_z,"
+              "J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
+              "J_proj_D_x,J_proj_D_y,J_proj_D_z,J_cand_A_x,J_cand_A_y,J_cand_A_z,"
+              "J_cand_B_x,J_cand_B_y,J_cand_B_z,J_cand_D_x,J_cand_D_y,J_cand_D_z,"
+              "virial_decomposition_error,pppm_dynamic_q_valid\n";
+    append_output_buffer(
+      "qnep_complete_current_diag.csv",
+      header.str(),
+      complete_current_buffer_.str(),
+      true,
+      "# segment_begin sampling_stage post_force_before_compute2\n");
+  } else {
+    std::ostringstream delta_header;
+    delta_header << std::setprecision(17)
+                 << "# compute_qnep_projection " << sample_interval_ << "\n"
+                 << "# file_write post_run\n"
+                 << "# observable delta_j_q_k\n"
+                 << "# format_version 1\n"
+                 << "# num_atoms " << N << "\n"
+                 << "# cell " << box.cpu_h[0] << " " << box.cpu_h[3] << " " << box.cpu_h[6] << " "
+                 << box.cpu_h[1] << " " << box.cpu_h[4] << " " << box.cpu_h[7] << " " << box.cpu_h[2]
+                 << " " << box.cpu_h[5] << " " << box.cpu_h[8] << "\n"
+                 << "# phase exp(+ikr)\n"
+                 << "# charge projected\n"
+                 << "# charge_rate projected\n"
+                 << "# k0 excluded\n"
+                 << "# kernel continuous_ewald_reference\n"
+                 << "# ewald_alpha " << qnep_->get_ewald_alpha() << " 1/Angstrom\n"
+                 << "# reciprocal_k_cutoff k_squared < (2*pi*alpha)^2\n"
+                 << "# reciprocal_k_convention n1>0 or n1=0,n2>0 or n1=n2=0,n3>0\n"
+                 << "# units sum_q=e sum_qdot=e/fs delta_j_q_k=eV Angstrom/fs\n"
+                 << "# columns step time_fs sum_q sum_qdot nk delta_j_q_k_x delta_j_q_k_y delta_j_q_k_z\n";
+    append_output_buffer(
+      "delta_j_q_k.out", delta_header.str(), delta_j_q_k_buffer_.str(), false);
+
+    if (g1_channel_) {
+      std::ostringstream channel_header;
+      channel_header << std::setprecision(17)
+                     << "# compute_qnep_projection " << sample_interval_ << " g1_channel\n"
+                     << "# file_write post_run\n"
+                     << "# format_version 1\n"
+                     << "# num_atoms " << N << "\n"
+                     << "# cell " << box.cpu_h[0] << " " << box.cpu_h[3] << " " << box.cpu_h[6] << " "
+                     << box.cpu_h[1] << " " << box.cpu_h[4] << " " << box.cpu_h[7] << " " << box.cpu_h[2]
+                     << " " << box.cpu_h[5] << " " << box.cpu_h[8] << "\n"
+                     << "# nominal_dt_output "
+                     << time_step * sample_interval_ * TIME_UNIT_CONVERSION << " fs\n"
+                     << "# units J_channel=J_virial=eV Angstrom/fs\n"
+                     << "# definitions r12=r_image-r_center; ell_G=-r12; D=D_projected\n"
+                     << "# J_channel=-sum_b,a,n D_b*r12_ban*(g_ban dot v_a)\n"
+                     << "# J_channel_total=J_channel_radial+J_channel_angular\n"
+                     << "# columns step time_fs J_channel_radial_x J_channel_radial_y J_channel_radial_z "
+                        "J_channel_angular_x J_channel_angular_y J_channel_angular_z "
+                        "J_channel_total_x J_channel_total_y J_channel_total_z "
+                        "J_charge_virial_x J_charge_virial_y J_charge_virial_z\n";
+      append_output_buffer(
+        "charge_heat_diagnostic.out", channel_header.str(), channel_buffer_.str(), false);
+    } else {
+      std::ostringstream output_header;
+      output_header << std::setprecision(17)
+                    << "# compute_qnep_projection " << sample_interval_ << "\n"
+                    << "# file_write post_run\n"
+                    << "# format_version 1\n"
+                    << "# num_atoms " << N << "\n"
+                    << "# cell " << box.cpu_h[0] << " " << box.cpu_h[3] << " " << box.cpu_h[6] << " "
+                    << box.cpu_h[1] << " " << box.cpu_h[4] << " " << box.cpu_h[7] << " " << box.cpu_h[2]
+                    << " " << box.cpu_h[5] << " " << box.cpu_h[8] << "\n"
+                    << "# nominal_dt_output "
+                    << time_step * sample_interval_ * TIME_UNIT_CONVERSION << " fs\n"
+                    << "# units JA JB JD=eV Angstrom/fs; sum_c=eV/fs\n"
+                    << "# definitions D_i=D_raw_i, s_i=Qdot_raw_i, c_i=mean(D)*s_i-D_i*mean(s)\n"
+                    << "# JA=sum_{a<b} d_ab*(c_b-c_a)/N; JB=sum_a R_unwrapped_a*c_a\n"
+                    << "# JD=sum_{a<b} d_ab*(D_a*s_b-D_b*s_a)/N\n"
+                    << "# columns step time_fs JA_x JA_y JA_z JB_x JB_y JB_z JD_x JD_y JD_z sum_c\n";
+      append_output_buffer("qnep_projection.out", output_header.str(), output_buffer_.str(), false);
+
+      const std::string projection_header =
+        "# units eV*Angstrom/fs\n"
+        "# file_write post_run\n"
+        "step,time_fs,J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
+        "J_proj_D_x,J_proj_D_y,J_proj_D_z\n";
+      append_output_buffer(
+        "projection_current_diag.csv",
+        projection_header,
+        projection_current_diag_buffer_.str(),
+        true);
+    }
   }
-  if (fid_channel_ != nullptr) {
-    fclose(fid_channel_);
-    fid_channel_ = nullptr;
-  }
-  if (fid_delta_j_q_k_ != nullptr) {
-    fclose(fid_delta_j_q_k_);
-    fid_delta_j_q_k_ = nullptr;
-  }
-  if (fid_projection_current_diag_ != nullptr) {
-    fclose(fid_projection_current_diag_);
-    fid_projection_current_diag_ = nullptr;
-  }
-  if (fid_complete_current_ != nullptr) {
-    fclose(fid_complete_current_);
-    fid_complete_current_ = nullptr;
-  }
+
+  if (qnep_ != nullptr) qnep_->flush_dynamic_charge_diagnostics();
 }
 
 void QNEP_Projection::parse(const char** param, int num_param)

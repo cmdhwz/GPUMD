@@ -16,6 +16,7 @@
 #pragma once
 #include "utilities/gpu_vector.cuh"
 #include "model/box.cuh"
+#include <sstream>
 #include <string>
 #ifdef USE_HIP
   #include <hipfft/hipfft.h>
@@ -66,6 +67,7 @@ public:
     dynamic_debug_requested_step_ = -1;
   }
   void request_dynamic_charge_debug(const int step) { dynamic_debug_requested_step_ = step; }
+  void flush_dynamic_charge_diagnostics();
   void find_force(
     const int N,
     const int N1,
@@ -144,6 +146,10 @@ private:
   bool dynamic_cache_result_valid_ = false;
   double dynamic_cache_delta_j_[3] = {0.0, 0.0, 0.0};
   int dynamic_debug_requested_step_ = -1;
+  std::ostringstream dynamic_csv_buffer_;
+  std::ostringstream dynamic_check_buffer_;
+  std::string dynamic_atom_debug_buffer_;
+  std::string dynamic_kspace_debug_buffer_;
   GPU_Vector<gpufftComplex> debug_mesh_charge_;
   GPU_Vector<gpufftComplex> debug_mesh_fourier_;
   GPU_Vector<PPPMAssignmentAtomDebug> debug_assignment_atoms_;

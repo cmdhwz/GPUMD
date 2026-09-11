@@ -730,4 +730,5 @@ void Dump_XYZ::post_run(
   if (separated_ == 0) {
     fclose(fid_);
   }
+  if (has_pppm_dynamic_q_ && qnep_ != nullptr) qnep_->flush_dynamic_charge_diagnostics();
 }

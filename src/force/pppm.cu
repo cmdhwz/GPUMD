@@ -34,6 +34,55 @@ constexpr const char* PPPM_DEBUG_SOURCE_SIGNATURE = "PPPM_ASSIGN_DEBUG_20260910_
 constexpr const char* PPPM_DYNAMIC_SOURCE_SIGNATURE = "PPPM_DYNAMIC_Q_DIAG";
 constexpr const char* PPPM_DYNAMIC_FORMULA_VERSION = "candidate_v1";
 
+void write_dynamic_metadata(std::ostream& file)
+{
+  file << "# source_signature = " << PPPM_DYNAMIC_SOURCE_SIGNATURE << "\n";
+  file << "# dynamic_formula_version = " << PPPM_DYNAMIC_FORMULA_VERSION << "\n";
+  file << "# q_source = nep_data.charge\n";
+  file << "# qdot_source = nep_data.charge_rate\n";
+  file << "# q_projection = zero_total_charge(0:N)\n";
+  file << "# qdot_projection = zero_total_charge(0:N)\n";
+  file << "# assignment_domain = N1:N2\n";
+  file << "# fft_forward = unnormalized\n";
+  file << "# fft_inverse = unnormalized\n";
+  file << "# phase_convention = forward exp(-i*2pi*n.j/K), inverse exp(+i*2pi*n.j/K)\n";
+  file << "# g_m = Gopt_m\n";
+  file << "# ell_m = Ng*Gopt_m\n";
+  file << "# L_prefactor = 1/Ng\n";
+  file << "# D_prefactor = 2*K_C_SP\n";
+  file << "# d_zero_mode = 0\n";
+  file << "# d_nyquist_component_plane = 0\n";
+  file << "# d_pair_projection = 0.5*(d_raw[m]-d_raw[mbar])\n";
+  file << "# d_odd_error = max_abs(d[mbar]+d[m])\n";
+  file << "# qdot_internal_unit = e/natural_time\n";
+  file << "# qdot_output_unit = e/fs\n";
+  file << "# sum_qdot_proj_0_N_unit = e/natural_time\n";
+  file << "# sum_qdot_assign_N1_N2_unit = e/natural_time\n";
+  file << "# sum_S_unit = e/natural_time\n";
+  file << "# s_zero_unit = e/natural_time\n";
+  file << "# J_unit = eV*Angstrom/fs\n";
+  file << "# J_conversion = divide_by_TIME_UNIT_CONVERSION\n";
+  file << "# geometry_restriction = fixed orthogonal cell, post_force before compute2\n";
+  file << "# nyquist_rule = Cartesian component plane zero (orthogonal-cell candidate_v1 only)\n";
+  file << "# diagnostic_relative_tolerance = 1e-5\n";
+  file << "# csv_frequency = every sampled diagnostic call; file_write = post_run\n";
+  file << "# detailed_debug_frequency = first diagnostic call only\n";
+}
+
+bool append_text_file(const char* filename, const std::string& header, const std::string& rows)
+{
+  if (rows.empty()) return true;
+  std::ifstream probe(filename, std::ios::binary | std::ios::ate);
+  const bool empty = !probe || probe.tellg() == std::streampos(0);
+  probe.close();
+  std::ofstream file(filename, std::ios::app);
+  if (!file) return false;
+  if (empty) file << header;
+  file << rows;
+  file.flush();
+  return file.good();
+}
+
 int get_best_K(const int m)
 {
   int n = 16;
@@ -1201,6 +1250,7 @@ PPPM::PPPM()
 
 PPPM::~PPPM()
 {
+  flush_dynamic_charge_diagnostics();
   if (plan != 0) {
     gpufftDestroy(plan);
   }
@@ -1215,6 +1265,76 @@ PPPM::~PPPM()
   }
   if (plan_virial_batch != 0) {
     gpufftDestroy(plan_virial_batch);
+  }
+}
+
+void PPPM::flush_dynamic_charge_diagnostics()
+{
+  const std::string csv_rows = dynamic_csv_buffer_.str();
+  std::ostringstream csv_header;
+  write_dynamic_metadata(csv_header);
+  csv_header
+    << "source_signature,dynamic_formula_version,step,time_fs,pppm_call_index,bead_id,N,N1,N2,"
+       "mesh_x,mesh_y,mesh_z,Ng,alpha,K_C_SP,TIME_UNIT_CONVERSION,"
+       "sum_q_proj_0_N,sum_qdot_proj_0_N,sum_q_assign_N1_N2,sum_qdot_assign_N1_N2,"
+       "sum_Q,sum_S,rho_zero_real,rho_zero_imag,s_zero_real,s_zero_imag,"
+       "J_ass_left_x,J_ass_left_y,J_ass_left_z,J_ass_right_x,J_ass_right_y,J_ass_right_z,"
+       "J_ass_x,J_ass_y,J_ass_z,J_mesh_fourier_x,J_mesh_fourier_y,J_mesh_fourier_z,"
+       "J_mesh_realspace_x,J_mesh_realspace_y,J_mesh_realspace_z,J_mesh_x,J_mesh_y,J_mesh_z,"
+       "DeltaJ_pppm_x,DeltaJ_pppm_y,DeltaJ_pppm_z,max_odd_error_dx,max_odd_error_dy,"
+       "max_odd_error_dz,max_imag_L1S_x,max_imag_L1S_y,max_imag_L1S_z,"
+       "assignment_charge_sum_error,assignment_qdot_sum_error,max_abs_J_mesh_path,"
+       "assignment_sums_ok,mesh_path_ok,all_values_finite,"
+       "h00,h01,h02,h10,h11,h12,h20,h21,h22\n";
+  if (!append_text_file("pppm_dynamic_q_diag.csv", csv_header.str(), csv_rows)) {
+    std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_diag.csv." << std::endl;
+  } else if (!csv_rows.empty()) {
+    dynamic_csv_buffer_.str("");
+    dynamic_csv_buffer_.clear();
+  }
+
+  const std::string check_rows = dynamic_check_buffer_.str();
+  const std::string check_header =
+    "# PPPM dynamic-q runtime checks; written after the run\n"
+    "# source_signature = PPPM_DYNAMIC_Q_DIAG\n"
+    "# dynamic_formula_version = candidate_v1\n"
+    "# units: mesh_path=eV*Angstrom/fs; charge_sum=e; qdot_sum=e/natural_time\n"
+    "# columns: step time_fs bead_id pppm_call_index max_abs_J_mesh_path "
+    "assignment_charge_sum_error assignment_qdot_sum_error assignment_sums_ok "
+    "mesh_path_ok all_values_finite max_odd_error_dx max_odd_error_dy max_odd_error_dz "
+    "max_imag_L1S_x max_imag_L1S_y max_imag_L1S_z\n";
+  if (!append_text_file("pppm_dynamic_q_check.out", check_header, check_rows)) {
+    std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_check.out." << std::endl;
+  } else if (!check_rows.empty()) {
+    dynamic_check_buffer_.str("");
+    dynamic_check_buffer_.clear();
+  }
+
+  std::ostringstream atom_header;
+  write_dynamic_metadata(atom_header);
+  atom_header << "# columns atom_id x y z q qdot_internal qdot_e_per_fs\n";
+  if (!append_text_file(
+        "pppm_dynamic_q_atom_debug.out", atom_header.str(), dynamic_atom_debug_buffer_)) {
+    if (!dynamic_atom_debug_buffer_.empty()) {
+      std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_atom_debug.out."
+                << std::endl;
+    }
+  } else {
+    dynamic_atom_debug_buffer_.clear();
+  }
+
+  std::ostringstream kspace_header;
+  write_dynamic_metadata(kspace_header);
+  kspace_header << "# columns ix iy iz nx ny nz kx ky kz Gopt g ell "
+                   "d_raw_x d_raw_y d_raw_z d_x d_y d_z rho_real rho_imag s_real s_imag\n";
+  if (!append_text_file(
+        "pppm_dynamic_q_kspace_debug.out", kspace_header.str(), dynamic_kspace_debug_buffer_)) {
+    if (!dynamic_kspace_debug_buffer_.empty()) {
+      std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_kspace_debug.out."
+                << std::endl;
+    }
+  } else {
+    dynamic_kspace_debug_buffer_.clear();
   }
 }
 
@@ -2261,96 +2381,36 @@ bool PPPM::diagnose_dynamic_charge(
     delta_j_q_pppm[2] = DeltaJ[2] * inv_time;
   }
 
-  auto write_dynamic_metadata = [](std::ofstream& file) {
-    file << "# source_signature = " << PPPM_DYNAMIC_SOURCE_SIGNATURE << "\n";
-    file << "# dynamic_formula_version = " << PPPM_DYNAMIC_FORMULA_VERSION << "\n";
-    file << "# q_source = nep_data.charge\n";
-    file << "# qdot_source = nep_data.charge_rate\n";
-    file << "# q_projection = zero_total_charge(0:N)\n";
-    file << "# qdot_projection = zero_total_charge(0:N)\n";
-    file << "# assignment_domain = N1:N2\n";
-    file << "# fft_forward = unnormalized\n";
-    file << "# fft_inverse = unnormalized\n";
-    file << "# phase_convention = forward exp(-i*2pi*n.j/K), inverse exp(+i*2pi*n.j/K)\n";
-    file << "# g_m = Gopt_m\n";
-    file << "# ell_m = Ng*Gopt_m\n";
-    file << "# L_prefactor = 1/Ng\n";
-    file << "# D_prefactor = 2*K_C_SP\n";
-    file << "# d_zero_mode = 0\n";
-    file << "# d_nyquist_component_plane = 0\n";
-    file << "# d_pair_projection = 0.5*(d_raw[m]-d_raw[mbar])\n";
-    file << "# d_odd_error = max_abs(d[mbar]+d[m])\n";
-    file << "# qdot_internal_unit = e/natural_time\n";
-    file << "# qdot_output_unit = e/fs\n";
-    file << "# sum_qdot_proj_0_N_unit = e/natural_time\n";
-    file << "# sum_qdot_assign_N1_N2_unit = e/natural_time\n";
-    file << "# sum_S_unit = e/natural_time\n";
-    file << "# s_zero_unit = e/natural_time\n";
-    file << "# J_unit = eV*Angstrom/fs\n";
-    file << "# J_conversion = divide_by_TIME_UNIT_CONVERSION\n";
-    file << "# geometry_restriction = fixed orthogonal cell, post_force before compute2\n";
-    file << "# nyquist_rule = Cartesian component plane zero (orthogonal-cell candidate_v1 only)\n";
-    file << "# diagnostic_relative_tolerance = 1e-5\n";
-    file << "# csv_frequency = every sampled diagnostic call\n";
-    file << "# detailed_debug_frequency = first diagnostic call only\n";
-  };
-  auto open_append = [](const char* filename, std::ofstream& file) {
-    std::ifstream probe(filename, std::ios::binary | std::ios::ate);
-    const bool empty = !probe || probe.tellg() == std::streampos(0);
-    file.open(filename, std::ios::app);
-    return std::pair<bool, bool>(static_cast<bool>(file), empty);
-  };
+  dynamic_csv_buffer_ << std::scientific << std::setprecision(16)
+                      << PPPM_DYNAMIC_SOURCE_SIGNATURE << "," << PPPM_DYNAMIC_FORMULA_VERSION << ","
+                      << step << "," << time_fs << "," << pppm_call_index << "," << bead_id << ","
+                      << N << "," << N1 << "," << N2 << "," << para.K[0] << "," << para.K[1] << ","
+                      << para.K[2] << "," << M << "," << para.alpha << "," << K_C_SP << ","
+                      << TIME_UNIT_CONVERSION << "," << sum_q << "," << sum_qdot << "," << sum_q_assign
+                      << "," << sum_qdot_assign << "," << sum_Q << "," << sum_S << "," << h_rho[0].x
+                      << "," << h_rho[0].y << "," << h_s[0].x << "," << h_s[0].y;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << J_ass_left[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << J_ass_right[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << J_ass[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << J_mesh_fourier[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << J_mesh_realspace[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << J_mesh[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << DeltaJ[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << max_odd_error[d];
+  for (int d = 0; d < 3; ++d) dynamic_csv_buffer_ << "," << max_imag_L1S[d];
+  dynamic_csv_buffer_ << "," << assignment_charge_sum_error << "," << assignment_qdot_sum_error << ","
+                      << mesh_path_error * inv_time << "," << (assignment_sums_ok ? 1 : 0) << ","
+                      << (mesh_path_ok ? 1 : 0) << "," << (all_values_finite ? 1 : 0);
+  for (int i = 0; i < 9; ++i) dynamic_csv_buffer_ << "," << box.cpu_h[i];
+  dynamic_csv_buffer_ << "\n";
 
-  std::ofstream csv;
-  const std::pair<bool, bool> csv_state = open_append("pppm_dynamic_q_diag.csv", csv);
-  if (!csv_state.first) {
-    std::cerr << "PPPM dynamic-q diagnostic: cannot open pppm_dynamic_q_diag.csv." << std::endl;
-    return false;
-  }
-  csv << std::scientific << std::setprecision(16);
-  if (csv_state.second) {
-    write_dynamic_metadata(csv);
-    csv << "source_signature,dynamic_formula_version,step,time_fs,pppm_call_index,bead_id,N,N1,N2,"
-           "mesh_x,mesh_y,mesh_z,Ng,alpha,K_C_SP,TIME_UNIT_CONVERSION,"
-           "sum_q_proj_0_N,sum_qdot_proj_0_N,sum_q_assign_N1_N2,sum_qdot_assign_N1_N2,"
-           "sum_Q,sum_S,rho_zero_real,rho_zero_imag,s_zero_real,s_zero_imag,"
-           "J_ass_left_x,J_ass_left_y,J_ass_left_z,J_ass_right_x,J_ass_right_y,J_ass_right_z,"
-           "J_ass_x,J_ass_y,J_ass_z,J_mesh_fourier_x,J_mesh_fourier_y,J_mesh_fourier_z,"
-           "J_mesh_realspace_x,J_mesh_realspace_y,J_mesh_realspace_z,J_mesh_x,J_mesh_y,J_mesh_z,"
-           "DeltaJ_pppm_x,DeltaJ_pppm_y,DeltaJ_pppm_z,max_odd_error_dx,max_odd_error_dy,"
-           "max_odd_error_dz,max_imag_L1S_x,max_imag_L1S_y,max_imag_L1S_z,"
-           "assignment_charge_sum_error,assignment_qdot_sum_error,max_abs_J_mesh_path,"
-           "assignment_sums_ok,mesh_path_ok,all_values_finite,"
-           "h00,h01,h02,h10,h11,h12,h20,h21,h22\n";
-  }
-  csv << PPPM_DYNAMIC_SOURCE_SIGNATURE << "," << PPPM_DYNAMIC_FORMULA_VERSION << "," << step << ","
-      << time_fs << "," << pppm_call_index << "," << bead_id << "," << N << "," << N1 << "," << N2
-      << "," << para.K[0] << "," << para.K[1] << "," << para.K[2] << "," << M << "," << para.alpha
-      << "," << K_C_SP << "," << TIME_UNIT_CONVERSION << "," << sum_q << "," << sum_qdot << ","
-      << sum_q_assign << "," << sum_qdot_assign << "," << sum_Q << "," << sum_S << "," << h_rho[0].x
-      << "," << h_rho[0].y << "," << h_s[0].x << "," << h_s[0].y;
-  for (int d = 0; d < 3; ++d) csv << "," << J_ass_left[d] * inv_time;
-  for (int d = 0; d < 3; ++d) csv << "," << J_ass_right[d] * inv_time;
-  for (int d = 0; d < 3; ++d) csv << "," << J_ass[d] * inv_time;
-  for (int d = 0; d < 3; ++d) csv << "," << J_mesh_fourier[d] * inv_time;
-  for (int d = 0; d < 3; ++d) csv << "," << J_mesh_realspace[d] * inv_time;
-  for (int d = 0; d < 3; ++d) csv << "," << J_mesh[d] * inv_time;
-  for (int d = 0; d < 3; ++d) csv << "," << DeltaJ[d] * inv_time;
-  for (int d = 0; d < 3; ++d) csv << "," << max_odd_error[d];
-  for (int d = 0; d < 3; ++d) csv << "," << max_imag_L1S[d];
-  csv << "," << assignment_charge_sum_error << "," << assignment_qdot_sum_error << ","
-      << mesh_path_error * inv_time << "," << (assignment_sums_ok ? 1 : 0) << ","
-      << (mesh_path_ok ? 1 : 0) << "," << (all_values_finite ? 1 : 0);
-  for (int i = 0; i < 9; ++i) csv << "," << box.cpu_h[i];
-  csv << "\n";
-  csv.flush();
-  const bool csv_ok = csv.good();
-  csv.close();
-  if (!csv_ok || csv.fail()) {
-    std::cerr << "PPPM dynamic-q diagnostic: failed to write pppm_dynamic_q_diag.csv."
-              << std::endl;
-    return false;
-  }
+  dynamic_check_buffer_ << std::scientific << std::setprecision(16) << step << " " << time_fs << " "
+                        << bead_id << " " << pppm_call_index << " " << mesh_path_error * inv_time << " "
+                        << assignment_charge_sum_error << " " << assignment_qdot_sum_error << " "
+                        << (assignment_sums_ok ? 1 : 0) << " " << (mesh_path_ok ? 1 : 0) << " "
+                        << (all_values_finite ? 1 : 0) << " " << max_odd_error[0] << " "
+                        << max_odd_error[1] << " " << max_odd_error[2] << " " << max_imag_L1S[0] << " "
+                        << max_imag_L1S[1] << " " << max_imag_L1S[2] << "\n";
 
   dynamic_cache_set_ = true;
   dynamic_cache_step_ = step;
@@ -2366,75 +2426,42 @@ bool PPPM::diagnose_dynamic_charge(
     std::vector<double> h_position(3 * N);
     position.copy_to_host(h_position.data(), 3 * N);
 
-    std::ofstream atom_file;
-    const std::pair<bool, bool> atom_state = open_append("pppm_dynamic_q_atom_debug.out", atom_file);
-    if (atom_state.first) {
-      atom_file << std::scientific << std::setprecision(16);
-      if (atom_state.second) {
-        write_dynamic_metadata(atom_file);
-        atom_file << "# columns atom_id x y z q qdot_internal qdot_e_per_fs\n";
-      }
-      atom_file << "# step " << step << " time_fs " << time_fs << " pppm_call_index "
+    std::ostringstream atom_rows;
+    atom_rows << std::scientific << std::setprecision(16)
+              << "# step " << step << " time_fs " << time_fs << " pppm_call_index "
+              << pppm_call_index << " bead_id " << bead_id << " N " << N << " N1 " << N1
+              << " N2 " << N2 << "\n";
+    for (int n = 0; n < N; ++n) {
+      atom_rows << n << " " << h_position[n] << " " << h_position[N + n] << " "
+                << h_position[2 * N + n] << " " << h_q[n] << " " << h_qdot[n] << " "
+                << h_qdot[n] * inv_time << "\n";
+    }
+    dynamic_atom_debug_buffer_ = atom_rows.str();
+
+    std::ostringstream kspace_rows;
+    kspace_rows << std::scientific << std::setprecision(16)
+                << "# step " << step << " time_fs " << time_fs << " pppm_call_index "
                 << pppm_call_index << " bead_id " << bead_id << " N " << N << " N1 " << N1
                 << " N2 " << N2 << "\n";
-      for (int n = 0; n < N; ++n) {
-        atom_file << n << " " << h_position[n] << " " << h_position[N + n] << " "
-                  << h_position[2 * N + n] << " " << h_q[n] << " " << h_qdot[n] << " "
-                  << h_qdot[n] * inv_time << "\n";
-      }
-      atom_file.close();
-    } else {
-      std::cerr << "PPPM dynamic-q diagnostic: cannot open pppm_dynamic_q_atom_debug.out."
-                << std::endl;
-    }
-
-    std::ofstream kspace_file;
-    const std::pair<bool, bool> kspace_state =
-      open_append("pppm_dynamic_q_kspace_debug.out", kspace_file);
-    if (kspace_state.first) {
-      kspace_file << std::scientific << std::setprecision(16);
-      if (kspace_state.second) {
-        write_dynamic_metadata(kspace_file);
-        kspace_file << "# columns ix iy iz nx ny nz kx ky kz Gopt g ell "
-                       "d_raw_x d_raw_y d_raw_z d_x d_y d_z rho_real rho_imag s_real s_imag\n";
-      }
-      kspace_file << "# step " << step << " time_fs " << time_fs << " pppm_call_index "
-                  << pppm_call_index << " bead_id " << bead_id << " N " << N << " N1 " << N1
-                  << " N2 " << N2 << "\n";
-      for (int iz = 0; iz < para.K[2]; ++iz) {
-        for (int iy = 0; iy < para.K[1]; ++iy) {
-          for (int ix = 0; ix < para.K[0]; ++ix) {
-            const int n = ix + para.K[0] * (iy + para.K[1] * iz);
-            const int nx = ix >= para.K_half[0] ? ix - para.K[0] : ix;
-            const int ny = iy >= para.K_half[1] ? iy - para.K[1] : iy;
-            const int nz = iz >= para.K_half[2] ? iz - para.K[2] : iz;
-            kspace_file << ix << " " << iy << " " << iz << " " << nx << " " << ny << " " << nz
-                        << " " << h_kx[n] << " " << h_ky[n] << " " << h_kz[n] << " " << h_G[n]
-                        << " " << h_G[n] << " " << double(M) * h_G[n] << " " << h_d_raw_x[n]
-                        << " " << h_d_raw_y[n] << " " << h_d_raw_z[n] << " " << h_d_x[n] << " "
-                        << h_d_y[n] << " " << h_d_z[n] << " " << h_rho[n].x << " " << h_rho[n].y
-                        << " " << h_s[n].x << " " << h_s[n].y << "\n";
-          }
+    for (int iz = 0; iz < para.K[2]; ++iz) {
+      for (int iy = 0; iy < para.K[1]; ++iy) {
+        for (int ix = 0; ix < para.K[0]; ++ix) {
+          const int n = ix + para.K[0] * (iy + para.K[1] * iz);
+          const int nx = ix >= para.K_half[0] ? ix - para.K[0] : ix;
+          const int ny = iy >= para.K_half[1] ? iy - para.K[1] : iy;
+          const int nz = iz >= para.K_half[2] ? iz - para.K[2] : iz;
+          kspace_rows << ix << " " << iy << " " << iz << " " << nx << " " << ny << " " << nz
+                      << " " << h_kx[n] << " " << h_ky[n] << " " << h_kz[n] << " " << h_G[n]
+                      << " " << h_G[n] << " " << double(M) * h_G[n] << " " << h_d_raw_x[n]
+                      << " " << h_d_raw_y[n] << " " << h_d_raw_z[n] << " " << h_d_x[n] << " "
+                      << h_d_y[n] << " " << h_d_z[n] << " " << h_rho[n].x << " " << h_rho[n].y
+                      << " " << h_s[n].x << " " << h_s[n].y << "\n";
         }
       }
-      kspace_file.close();
-    } else {
-      std::cerr << "PPPM dynamic-q diagnostic: cannot open pppm_dynamic_q_kspace_debug.out."
-                << std::endl;
     }
+    dynamic_kspace_debug_buffer_ = kspace_rows.str();
     dynamic_debug_written_ = true;
   }
 
-  std::cout << std::scientific << std::setprecision(16)
-            << "PPPM dynamic-q diagnostic step=" << step << " bead=" << bead_id
-            << " call=" << pppm_call_index << " max_abs_J_mesh_path="
-            << mesh_path_error * inv_time << " assignment_sum_error=("
-            << assignment_charge_sum_error << "," << assignment_qdot_sum_error
-            << ") assignment_sums_ok=" << (assignment_sums_ok ? 1 : 0)
-            << " mesh_path_ok=" << (mesh_path_ok ? 1 : 0)
-            << " all_values_finite=" << (all_values_finite ? 1 : 0) << " max_odd_error=("
-            << max_odd_error[0] << "," << max_odd_error[1] << "," << max_odd_error[2]
-            << ") max_imag_L1S=(" << max_imag_L1S[0] << "," << max_imag_L1S[1] << ","
-            << max_imag_L1S[2] << ")" << std::endl;
   return result_valid;
 }

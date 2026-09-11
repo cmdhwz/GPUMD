@@ -180,6 +180,7 @@ public:
   }
   void reset_dynamic_charge_cache() { pppm.reset_dynamic_charge_cache(); }
   void request_dynamic_charge_debug(const int step) { pppm.request_dynamic_charge_debug(step); }
+  void flush_dynamic_charge_diagnostics() { pppm.flush_dynamic_charge_diagnostics(); }
   void compute_charge_rate(
     Box& box,
     const GPU_Vector<int>& type,
