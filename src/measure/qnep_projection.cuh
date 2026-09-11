@@ -93,4 +93,5 @@ private:
   FILE* fid_ = nullptr;
   FILE* fid_channel_ = nullptr;
   FILE* fid_delta_j_q_k_ = nullptr;
+  FILE* fid_projection_current_diag_ = nullptr;
 };

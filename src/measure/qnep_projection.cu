@@ -303,6 +303,16 @@ void QNEP_Projection::pre_run(
     fprintf(fid_, "# JD=sum_{a<b} d_ab*(D_a*s_b-D_b*s_a)/N\n");
     fprintf(fid_, "# columns step time_fs JA_x JA_y JA_z JB_x JB_y JB_z JD_x JD_y JD_z sum_c\n");
 
+    fid_projection_current_diag_ = my_fopen("projection_current_diag.csv", "a");
+    fseek(fid_projection_current_diag_, 0, SEEK_END);
+    if (ftell(fid_projection_current_diag_) == 0) {
+      fprintf(fid_projection_current_diag_, "# units eV*Angstrom/fs\n");
+      fprintf(
+        fid_projection_current_diag_,
+        "step,time_fs,J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
+        "J_proj_D_x,J_proj_D_y,J_proj_D_z\n");
+    }
+
     number_of_pair_blocks_ = (N + PAIR_THREADS - 1) / PAIR_THREADS;
     gpu_means_.resize(2);
     gpu_partial_.resize(number_of_pair_blocks_ * NUM_OUTPUTS);
@@ -472,6 +482,21 @@ void QNEP_Projection::end_of_step(
     cpu_total_[7] * inv_time_conversion,
     cpu_total_[8] * inv_time_conversion,
     cpu_total_[9] * inv_time_conversion);
+
+  fprintf(
+    fid_projection_current_diag_,
+    "%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
+    step + 1,
+    global_time * TIME_UNIT_CONVERSION,
+    cpu_total_[0] * inv_time_conversion,
+    cpu_total_[1] * inv_time_conversion,
+    cpu_total_[2] * inv_time_conversion,
+    cpu_total_[3] * inv_time_conversion,
+    cpu_total_[4] * inv_time_conversion,
+    cpu_total_[5] * inv_time_conversion,
+    cpu_total_[6] * inv_time_conversion,
+    cpu_total_[7] * inv_time_conversion,
+    cpu_total_[8] * inv_time_conversion);
 }
 
 void QNEP_Projection::post_run(
@@ -493,6 +518,10 @@ void QNEP_Projection::post_run(
   if (fid_delta_j_q_k_ != nullptr) {
     fclose(fid_delta_j_q_k_);
     fid_delta_j_q_k_ = nullptr;
+  }
+  if (fid_projection_current_diag_ != nullptr) {
+    fclose(fid_projection_current_diag_);
+    fid_projection_current_diag_ = nullptr;
   }
 }
 
