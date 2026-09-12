@@ -63,12 +63,11 @@ public:
   void finish_debug_force_evaluation() { debug_requested_ = false; }
   void reset_dynamic_charge_cache()
   {
-    dynamic_cache_set_ = false;
-    dynamic_cache_result_valid_ = false;
     dynamic_debug_requested_step_ = -1;
   }
   void request_dynamic_charge_debug(const int step) { dynamic_debug_requested_step_ = step; }
   void flush_dynamic_charge_diagnostics();
+  bool dynamic_charge_diagnostic_files_are_compatible(const bool check_debug_files) const;
   void find_force(
     const int N,
     const int N1,
@@ -106,7 +105,13 @@ public:
     const GPU_Vector<float>& charge_rate,
     const GPU_Vector<double>& position,
     const bool write_debug,
+    // The reciprocal correction is returned in eV*Angstrom/natural_time.
     double* delta_j_q_pppm = nullptr);
+  void finalize_dynamic_charge_diagnostic(
+    const double* delta_j_q_real,
+    const double* delta_j_q_total,
+    const bool dynamic_q_valid,
+    const int charge_mode);
   bool last_batch_used_peratom_virial() const { return last_batch_used_peratom_virial_; }
   struct Para {
     int K0K1K2;             // total number of mesh points
@@ -138,14 +143,8 @@ private:
   int debug_frame_ = 0;
   long long dynamic_call_index_ = 0;
   bool dynamic_debug_written_ = false;
-  bool dynamic_cache_set_ = false;
-  int dynamic_cache_step_ = -1;
-  int dynamic_cache_bead_ = -1;
-  int dynamic_cache_N1_ = -1;
-  int dynamic_cache_N2_ = -1;
-  double dynamic_cache_time_fs_ = 0.0;
-  bool dynamic_cache_result_valid_ = false;
-  double dynamic_cache_delta_j_[3] = {0.0, 0.0, 0.0};
+  bool dynamic_csv_row_pending_ = false;
+  std::string dynamic_csv_row_;
   int dynamic_debug_requested_step_ = -1;
   std::ostringstream dynamic_csv_buffer_;
   std::ostringstream dynamic_check_buffer_;

@@ -34,6 +34,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -2086,6 +2087,115 @@ static __global__ void find_force_charge_real_space(
     g_D_real[n1] += K_C_SP * D_real;
     g_pe[n1] += K_C_SP * s_pe;
   }
+}
+
+static __global__ void find_delta_j_q_real_space(
+  const int N,
+  const int N1,
+  const int N2,
+  const NEP_Charge::Charge_Para charge_para,
+  const Box box,
+  const int* g_NN,
+  const int* g_NL,
+  const float* g_charge,
+  const float* g_charge_rate,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  double* g_partial)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (n1 < N2) {
+    double moment_x = 0.0;
+    double moment_y = 0.0;
+    double moment_z = 0.0;
+    const double x1 = g_x[n1];
+    const double y1 = g_y[n1];
+    const double z1 = g_z[n1];
+    for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
+      const int n2 = g_NL[n1 + N * i1];
+      double x12 = g_x[n2] - x1;
+      double y12 = g_y[n2] - y1;
+      double z12 = g_z[n2] - z1;
+      apply_mic(box, x12, y12, z12);
+      const double r_square = x12 * x12 + y12 * y12 + z12 * z12;
+      if (r_square <= 0.0) continue;
+      const double r = sqrt(r_square);
+      const double weight = erfc(static_cast<double>(charge_para.alpha) * r) / r;
+      const double q_weight = static_cast<double>(g_charge[n2]) * weight;
+      moment_x += q_weight * x12;
+      moment_y += q_weight * y12;
+      moment_z += q_weight * z12;
+    }
+    const double prefactor = 0.5 * static_cast<double>(K_C_SP) * g_charge_rate[n1];
+    g_partial[n1] = prefactor * moment_x;
+    g_partial[n1 + N] = prefactor * moment_y;
+    g_partial[n1 + 2 * N] = prefactor * moment_z;
+  }
+}
+
+static __global__ void find_delta_j_q_real_space_small_box(
+  const int N,
+  const int N1,
+  const int N2,
+  const NEP_Charge::Charge_Para charge_para,
+  const int* g_NN,
+  const int* g_NL,
+  const float* g_charge,
+  const float* g_charge_rate,
+  const float* __restrict__ g_x12,
+  const float* __restrict__ g_y12,
+  const float* __restrict__ g_z12,
+  double* g_partial)
+{
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+  if (n1 < N2) {
+    double moment_x = 0.0;
+    double moment_y = 0.0;
+    double moment_z = 0.0;
+    for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
+      const int index = i1 * N + n1;
+      const double x12 = static_cast<double>(g_x12[index]);
+      const double y12 = static_cast<double>(g_y12[index]);
+      const double z12 = static_cast<double>(g_z12[index]);
+      const double r_square = x12 * x12 + y12 * y12 + z12 * z12;
+      if (r_square <= 0.0) continue;
+      const double r = sqrt(r_square);
+      const double weight = erfc(static_cast<double>(charge_para.alpha) * r) / r;
+      const double q_weight = static_cast<double>(g_charge[g_NL[index]]) * weight;
+      moment_x += q_weight * x12;
+      moment_y += q_weight * y12;
+      moment_z += q_weight * z12;
+    }
+    const double prefactor = 0.5 * static_cast<double>(K_C_SP) * g_charge_rate[n1];
+    g_partial[n1] = prefactor * moment_x;
+    g_partial[n1 + N] = prefactor * moment_y;
+    g_partial[n1 + 2 * N] = prefactor * moment_z;
+  }
+}
+
+static __global__ void reduce_delta_j_q_real_space(
+  const int N,
+  const int N1,
+  const int N2,
+  const double* g_partial,
+  double* g_total)
+{
+  const int component = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (component >= 3) return;
+  __shared__ double s_data[1024];
+  double sum = 0.0;
+  for (int n = N1 + tid; n < N2; n += 1024)
+    sum += g_partial[n + component * N];
+  s_data[tid] = sum;
+  __syncthreads();
+
+  for (int offset = 512; offset > 0; offset >>= 1) {
+    if (tid < offset) s_data[tid] += s_data[tid + offset];
+    __syncthreads();
+  }
+  if (tid == 0) g_total[component] = s_data[0];
 }
 
 static __global__ void find_force_charge_real_space_pimd_batch(
@@ -4356,6 +4466,21 @@ void NEP_Charge::enable_delta_j_q_k_diagnostics()
   ewald.initialize(charge_para.alpha);
 }
 
+void NEP_Charge::reset_dynamic_charge_cache()
+{
+  pppm.reset_dynamic_charge_cache();
+  dynamic_q_cache_set_ = false;
+  dynamic_q_cache_result_valid_ = false;
+  dynamic_q_cache_pppm_valid_ = false;
+  dynamic_q_cache_N_ = -1;
+  dynamic_q_cache_step_ = -1;
+  dynamic_q_cache_bead_ = -1;
+  dynamic_q_cache_N1_ = -1;
+  dynamic_q_cache_N2_ = -1;
+  dynamic_q_cache_time_fs_ = 0.0;
+  dynamic_q_last_pppm_valid_ = false;
+}
+
 void NEP_Charge::request_charge_diagnostics_for_next_force()
 {
   charge_diagnostics_requested_ = true;
@@ -4501,9 +4626,92 @@ bool NEP_Charge::diagnose_dynamic_charge(
   const Box& box,
   const GPU_Vector<double>& position,
   const bool write_debug,
-  double* delta_j_q_pppm)
+  double* delta_j_q_pppm,
+  double* delta_j_q_real,
+  double* delta_j_q_total)
 {
-  return pppm.diagnose_dynamic_charge(
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  dynamic_q_last_pppm_valid_ = false;
+  auto set_output_nan = [nan](double* output) {
+    if (output != nullptr) {
+      output[0] = nan;
+      output[1] = nan;
+      output[2] = nan;
+    }
+  };
+  set_output_nan(delta_j_q_pppm);
+  set_output_nan(delta_j_q_real);
+  set_output_nan(delta_j_q_total);
+
+  if (
+    N <= 0 || N != static_cast<int>(nep_data.charge.size()) || N1 != 0 || N2 != N || this->N1 != 0 ||
+    this->N2 != N) {
+    std::cerr << "NEP dynamic-q diagnostic: 4A requires the full atom range N1=0,N2=N."
+              << std::endl;
+    return false;
+  }
+  if (!use_pppm) {
+    std::cerr << "NEP dynamic-q diagnostic: 4A requires kspace_method pppm." << std::endl;
+    return false;
+  }
+  if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1 || !box.is_orthogonal) {
+    std::cerr << "NEP dynamic-q diagnostic: 4A requires a three-dimensional orthogonal periodic box."
+              << std::endl;
+    return false;
+  }
+  if (position.size() != static_cast<size_t>(3 * N) || nep_data.charge_rate.size() != static_cast<size_t>(N)) {
+    std::cerr << "NEP dynamic-q diagnostic: charge, charge-rate, and position sizes are inconsistent."
+              << std::endl;
+    return false;
+  }
+  if (paramb.charge_mode != 1 && paramb.charge_mode != 2) {
+    std::cerr << "NEP dynamic-q diagnostic: unsupported charge mode." << std::endl;
+    return false;
+  }
+
+  const bool cache_match =
+    dynamic_q_cache_set_ && N == dynamic_q_cache_N_ && step == dynamic_q_cache_step_ &&
+    bead_id == dynamic_q_cache_bead_ && N1 == dynamic_q_cache_N1_ && N2 == dynamic_q_cache_N2_ &&
+    time_fs == dynamic_q_cache_time_fs_;
+  if (cache_match) {
+    dynamic_q_last_pppm_valid_ = dynamic_q_cache_pppm_valid_;
+    if (dynamic_q_cache_pppm_valid_ && delta_j_q_pppm != nullptr) {
+      for (int d = 0; d < 3; ++d) delta_j_q_pppm[d] = dynamic_q_cache_delta_j_pppm_[d];
+    }
+    if (dynamic_q_cache_result_valid_) {
+      if (delta_j_q_real != nullptr) {
+        for (int d = 0; d < 3; ++d) delta_j_q_real[d] = dynamic_q_cache_delta_j_real_[d];
+      }
+      if (delta_j_q_total != nullptr) {
+        for (int d = 0; d < 3; ++d) delta_j_q_total[d] = dynamic_q_cache_delta_j_total_[d];
+      }
+    }
+    return dynamic_q_cache_result_valid_;
+  }
+
+  auto cache_result = [&](const bool result_valid,
+                          const bool pppm_valid,
+                          const double pppm_result[3],
+                          const double real_result[3],
+                          const double total_result[3]) {
+    dynamic_q_cache_set_ = true;
+    dynamic_q_cache_result_valid_ = result_valid;
+    dynamic_q_cache_pppm_valid_ = pppm_valid;
+    dynamic_q_cache_N_ = N;
+    dynamic_q_cache_step_ = step;
+    dynamic_q_cache_bead_ = bead_id;
+    dynamic_q_cache_N1_ = N1;
+    dynamic_q_cache_N2_ = N2;
+    dynamic_q_cache_time_fs_ = time_fs;
+    for (int d = 0; d < 3; ++d) {
+      dynamic_q_cache_delta_j_pppm_[d] = pppm_valid ? pppm_result[d] : nan;
+      dynamic_q_cache_delta_j_real_[d] = result_valid ? real_result[d] : nan;
+      dynamic_q_cache_delta_j_total_[d] = result_valid ? total_result[d] : nan;
+    }
+  };
+
+  double pppm_result[3] = {nan, nan, nan};
+  const bool pppm_valid = pppm.diagnose_dynamic_charge(
     N,
     N1,
     N2,
@@ -4515,7 +4723,112 @@ bool NEP_Charge::diagnose_dynamic_charge(
     nep_data.charge_rate,
     position,
     write_debug,
-    delta_j_q_pppm);
+    pppm_result);
+  dynamic_q_last_pppm_valid_ = pppm_valid;
+  if (pppm_valid && delta_j_q_pppm != nullptr) {
+    for (int d = 0; d < 3; ++d) delta_j_q_pppm[d] = pppm_result[d];
+  }
+
+  double real_result[3] = {nan, nan, nan};
+  double total_result[3] = {nan, nan, nan};
+  if (!pppm_valid) {
+    for (int d = 0; d < 3; ++d) pppm_result[d] = nan;
+    cache_result(false, false, pppm_result, real_result, total_result);
+    pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+    return false;
+  }
+
+  if (paramb.charge_mode == 2) {
+    real_result[0] = 0.0;
+    real_result[1] = 0.0;
+    real_result[2] = 0.0;
+  } else {
+    const int block_size = 64;
+    const int grid_size = (N2 - N1 - 1) / block_size + 1;
+    if (dynamic_q_real_per_atom_.size() != static_cast<size_t>(3 * N))
+      dynamic_q_real_per_atom_.resize(static_cast<size_t>(3 * N));
+    if (dynamic_q_real_total_.size() != 3) dynamic_q_real_total_.resize(3);
+
+    const bool is_small_box = get_expanded_box(paramb.rc_radial, box, ebox);
+    if (is_small_box) {
+      const size_t size_x12 = small_box_data.r12.size() / 6;
+      if (small_box_data.NN_radial.size() != static_cast<size_t>(N) ||
+          small_box_data.NL_radial.size() < size_x12 || size_x12 < static_cast<size_t>(N) ||
+          small_box_data.r12.size() < static_cast<size_t>(6 * N)) {
+        std::cerr << "NEP dynamic-q diagnostic: small-box radial neighbor data is unavailable."
+                  << std::endl;
+        cache_result(false, true, pppm_result, real_result, total_result);
+        pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+        return false;
+      }
+      find_delta_j_q_real_space_small_box<<<grid_size, block_size>>>(
+        N,
+        N1,
+        N2,
+        charge_para,
+        small_box_data.NN_radial.data(),
+        small_box_data.NL_radial.data(),
+        nep_data.charge.data(),
+        nep_data.charge_rate.data(),
+        small_box_data.r12.data(),
+        small_box_data.r12.data() + size_x12,
+        small_box_data.r12.data() + size_x12 * 2,
+        dynamic_q_real_per_atom_.data());
+    } else {
+      if (nep_data.NN_radial.size() != static_cast<size_t>(N) ||
+          nep_data.NL_radial.size() < static_cast<size_t>(N)) {
+        std::cerr << "NEP dynamic-q diagnostic: radial neighbor data is unavailable." << std::endl;
+        cache_result(false, true, pppm_result, real_result, total_result);
+        pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+        return false;
+      }
+      find_delta_j_q_real_space<<<grid_size, block_size>>>(
+        N,
+        N1,
+        N2,
+        charge_para,
+        box,
+        nep_data.NN_radial.data(),
+        nep_data.NL_radial.data(),
+        nep_data.charge.data(),
+        nep_data.charge_rate.data(),
+        position.data(),
+        position.data() + N,
+        position.data() + 2 * N,
+        dynamic_q_real_per_atom_.data());
+    }
+    GPU_CHECK_KERNEL
+    reduce_delta_j_q_real_space<<<3, 1024>>>(
+      N, N1, N2, dynamic_q_real_per_atom_.data(), dynamic_q_real_total_.data());
+    GPU_CHECK_KERNEL
+    dynamic_q_real_total_.copy_to_host(real_result);
+  }
+
+  bool real_valid = true;
+  for (int d = 0; d < 3; ++d) real_valid = real_valid && std::isfinite(real_result[d]);
+  if (!real_valid) {
+    cache_result(false, true, pppm_result, real_result, total_result);
+    pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+    return false;
+  }
+  for (int d = 0; d < 3; ++d) total_result[d] = pppm_result[d] + real_result[d];
+  bool total_valid = true;
+  for (int d = 0; d < 3; ++d) total_valid = total_valid && std::isfinite(total_result[d]);
+  if (!total_valid) {
+    cache_result(false, true, pppm_result, real_result, total_result);
+    pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+    return false;
+  }
+
+  cache_result(true, true, pppm_result, real_result, total_result);
+  pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, true, paramb.charge_mode);
+  if (delta_j_q_real != nullptr) {
+    for (int d = 0; d < 3; ++d) delta_j_q_real[d] = real_result[d];
+  }
+  if (delta_j_q_total != nullptr) {
+    for (int d = 0; d < 3; ++d) delta_j_q_total[d] = total_result[d];
+  }
+  return true;
 }
 
 int NEP_Charge::compute_delta_j_q_k(

@@ -109,10 +109,6 @@ private:
   GPU_Vector<double> gpu_partial_;
   GPU_Vector<double> gpu_total_;
   GPU_Vector<double> gpu_current_total_;
-  GPU_Vector<double> gpu_velocity_sample_;
-  GPU_Vector<double> gpu_diagnostic_potential_;
-  GPU_Vector<double> gpu_diagnostic_force_;
-  GPU_Vector<double> gpu_diagnostic_virial_;
   std::vector<double> cpu_total_;
   GPU_Vector<double> gpu_channel_per_atom_;
   GPU_Vector<double> gpu_channel_total_;

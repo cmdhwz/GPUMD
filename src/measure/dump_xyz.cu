@@ -289,11 +289,16 @@ void Dump_XYZ::pre_run(
     PRINT_INPUT_ERROR("pppm_dynamic_q requires kspace_method pppm.\n");
   }
   if (has_pppm_dynamic_q_) {
+    if (!qnep_->pppm_dynamic_q_diag_files_are_compatible(has_pppm_dynamic_q_debug_)) {
+      PRINT_INPUT_ERROR(
+        "PPPM dynamic-q diagnostic files have an incompatible schema; remove or rename them before starting a new run.\n");
+    }
     qnep_->reset_dynamic_charge_cache();
     // pre_run precedes the first Force::compute, so refresh this cached flag here.
     box.set_is_orthogonal();
     if (!box.is_orthogonal) {
-      PRINT_INPUT_ERROR("pppm_dynamic_q candidate_v1 currently requires an orthogonal cell.\n");
+      PRINT_INPUT_ERROR(
+        "pppm_dynamic_q candidate_v2_real_space currently requires an orthogonal cell.\n");
     }
     for (int d = 0; d < 9; ++d) dynamic_cell_reference_[d] = box.cpu_h[d];
     dynamic_cell_reference_set_ = true;

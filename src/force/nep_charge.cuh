@@ -178,7 +178,7 @@ public:
   {
     pppm.request_debug_for_next_force(prefix, frame);
   }
-  void reset_dynamic_charge_cache() { pppm.reset_dynamic_charge_cache(); }
+  void reset_dynamic_charge_cache();
   void request_dynamic_charge_debug(const int step) { pppm.request_dynamic_charge_debug(step); }
   void flush_dynamic_charge_diagnostics() { pppm.flush_dynamic_charge_diagnostics(); }
   void compute_charge_rate(
@@ -197,7 +197,10 @@ public:
     const Box& box,
     const GPU_Vector<double>& position,
     const bool write_debug,
-    double* delta_j_q_pppm = nullptr);
+    // Outputs are eV*Angstrom/natural_time; invalid components are NaN.
+    double* delta_j_q_pppm = nullptr,
+    double* delta_j_q_real = nullptr,
+    double* delta_j_q_total = nullptr);
   void compute_charge_heat_channels(
     Box& box,
     const GPU_Vector<int>& type,
@@ -228,6 +231,11 @@ public:
   GPU_Vector<float>& get_charge_rate_reference() { return nep_data.charge_rate; }
   int get_charge_mode() const { return paramb.charge_mode; }
   bool uses_pppm() const { return use_pppm; }
+  bool pppm_dynamic_q_diag_files_are_compatible(const bool check_debug_files) const
+  {
+    return pppm.dynamic_charge_diagnostic_files_are_compatible(check_debug_files);
+  }
+  bool get_last_pppm_dynamic_q_valid() const { return dynamic_q_last_pppm_valid_; }
   float get_ewald_alpha() const { return charge_para.alpha; }
   float get_realspace_cutoff() const { return paramb.rc_radial; }
   double get_pppm_mesh_spacing() const { return pppm.get_mesh_spacing(); }
@@ -344,6 +352,21 @@ private:
   bool charge_diagnostics_enabled_ = false;
   bool charge_diagnostics_requested_ = false;
   bool peratom_virial_requested_ = false;
+  GPU_Vector<double> dynamic_q_real_per_atom_;
+  GPU_Vector<double> dynamic_q_real_total_;
+  bool dynamic_q_cache_set_ = false;
+  bool dynamic_q_cache_result_valid_ = false;
+  bool dynamic_q_cache_pppm_valid_ = false;
+  int dynamic_q_cache_N_ = -1;
+  int dynamic_q_cache_step_ = -1;
+  int dynamic_q_cache_bead_ = -1;
+  int dynamic_q_cache_N1_ = -1;
+  int dynamic_q_cache_N2_ = -1;
+  double dynamic_q_cache_time_fs_ = 0.0;
+  double dynamic_q_cache_delta_j_pppm_[3] = {0.0, 0.0, 0.0};
+  double dynamic_q_cache_delta_j_real_[3] = {0.0, 0.0, 0.0};
+  double dynamic_q_cache_delta_j_total_[3] = {0.0, 0.0, 0.0};
+  bool dynamic_q_last_pppm_valid_ = false;
   PIMD_Batch_Timing pimd_batch_timing_;
   long long neighbor_large_box_calls_ = 0;
   long long neighbor_small_box_calls_ = 0;

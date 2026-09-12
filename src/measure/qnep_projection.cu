@@ -27,10 +27,12 @@ Classical qNEP projection diagnostic for heat-current derivation.
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
-#include <limits>
+#include <sys/stat.h>
 
 namespace {
 
@@ -39,6 +41,17 @@ constexpr int PAIR_THREADS = 128;
 constexpr int NUM_OUTPUTS = 10;
 constexpr int NUM_CHANNEL_COMPONENTS = 6;
 constexpr int NUM_HEAT_COMPONENTS = 5;
+constexpr const char* DYNAMIC_Q_FORMULA_VERSION = "candidate_v2_real_space";
+constexpr const char* COMPLETE_CURRENT_COLUMN_HEADER =
+  "step,time_fs,J_conv_x,J_conv_y,J_conv_z,J_nep_x,J_nep_y,J_nep_z,"
+  "J_elec_fixed_x,J_elec_fixed_y,J_elec_fixed_z,J_dyn_local_x,J_dyn_local_y,J_dyn_local_z,"
+  "J_base_x,J_base_y,J_base_z,DeltaJ_q_pppm_x,DeltaJ_q_pppm_y,DeltaJ_q_pppm_z,"
+  "J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
+  "J_proj_D_x,J_proj_D_y,J_proj_D_z,J_cand_A_x,J_cand_A_y,J_cand_A_z,"
+  "J_cand_B_x,J_cand_B_y,J_cand_B_z,J_cand_D_x,J_cand_D_y,J_cand_D_z,"
+  "virial_decomposition_error,pppm_dynamic_q_valid,"
+  "DeltaJ_q_real_x,DeltaJ_q_real_y,DeltaJ_q_real_z,"
+  "DeltaJ_q_total_x,DeltaJ_q_total_y,DeltaJ_q_total_z,dynamic_q_valid,charge_mode";
 
 void append_output_buffer(
   const char* filename,
@@ -56,6 +69,44 @@ void append_output_buffer(
   fwrite(rows.data(), 1, rows.size(), file);
   fflush(file);
   fclose(file);
+}
+
+bool existing_file_has_schema(
+  const char* filename, const std::vector<std::string>& required_lines)
+{
+  int stat_status = 0;
+#ifdef _WIN32
+  struct _stat file_info;
+  stat_status = _stat(filename, &file_info);
+#else
+  struct stat file_info;
+  stat_status = stat(filename, &file_info);
+#endif
+  if (stat_status != 0) {
+    const int stat_errno = errno;
+    return stat_errno == ENOENT;
+  }
+
+  std::ifstream probe(filename, std::ios::binary);
+  if (!probe) return false;
+
+  bool saw_line = false;
+  std::vector<bool> found(required_lines.size(), false);
+  std::string line;
+  while (std::getline(probe, line)) {
+    saw_line = true;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    for (size_t i = 0; i < required_lines.size(); ++i) {
+      if (line == required_lines[i]) found[i] = true;
+    }
+    if (!line.empty() && line.front() != '#') break;
+  }
+  if (probe.bad()) return false;
+  if (!saw_line) return true;
+  for (const bool line_found : found) {
+    if (!line_found) return false;
+  }
+  return true;
 }
 
 void __global__ gpu_reduce_means(
@@ -291,32 +342,27 @@ void QNEP_Projection::pre_run(
     if (!qnep_->uses_pppm()) {
       PRINT_INPUT_ERROR("compute_qnep_current_diag requires kspace_method pppm.\n");
     }
+    if (!qnep_->pppm_dynamic_q_diag_files_are_compatible(false)) {
+      PRINT_INPUT_ERROR(
+        "PPPM dynamic-q diagnostic files have an incompatible schema; remove or rename them before starting a new run.\n");
+    }
     qnep_->reset_dynamic_charge_cache();
     box.set_is_orthogonal();
     if (!box.is_orthogonal) {
       PRINT_INPUT_ERROR(
-        "compute_qnep_current_diag candidate_v1 currently requires an orthogonal cell.\n");
+        "compute_qnep_current_diag candidate_v2_real_space currently requires an orthogonal cell.\n");
     }
 
-    const char* complete_filename = "qnep_complete_current_diag.csv";
-    bool complete_file_has_content = false;
-    bool complete_file_has_version = false;
-    bool complete_file_has_stage = false;
-    FILE* complete_probe = fopen(complete_filename, "r");
-    if (complete_probe != nullptr) {
-      char line[512];
-      while (fgets(line, sizeof(line), complete_probe) != nullptr) {
-        complete_file_has_content = true;
-        if (strstr(line, "# format_version 3") != nullptr)
-          complete_file_has_version = true;
-        if (strstr(line, "# sampling_stage post_force_before_compute2") != nullptr)
-          complete_file_has_stage = true;
-      }
-      fclose(complete_probe);
-    }
-    if (complete_file_has_content && (!complete_file_has_version || !complete_file_has_stage)) {
+    const std::string expected_charge_mode =
+      "# charge_mode " + std::to_string(qnep_->get_charge_mode());
+    const std::string expected_formula_version =
+      "# dynamic_q_formula_version " + std::string(DYNAMIC_Q_FORMULA_VERSION);
+    if (!existing_file_has_schema(
+          "qnep_complete_current_diag.csv",
+          {"# format_version 6", "# sampling_stage post_force_before_compute2", expected_charge_mode,
+           expected_formula_version, COMPLETE_CURRENT_COLUMN_HEADER})) {
       PRINT_INPUT_ERROR(
-        "qnep_complete_current_diag.csv has an incompatible format or sampling stage; "
+        "qnep_complete_current_diag.csv has an incompatible format, sampling stage, charge mode, formula version, or column header; "
         "remove or rename it before starting a new run.\n");
     }
 
@@ -328,10 +374,6 @@ void QNEP_Projection::pre_run(
     gpu_partial_.resize(number_of_pair_blocks_ * NUM_OUTPUTS);
     gpu_total_.resize(NUM_OUTPUTS);
     gpu_current_total_.resize(3);
-    gpu_velocity_sample_.resize(static_cast<size_t>(N) * 3);
-    gpu_diagnostic_potential_.resize(N);
-    gpu_diagnostic_force_.resize(static_cast<size_t>(N) * 3);
-    gpu_diagnostic_virial_.resize(static_cast<size_t>(N) * 9);
     cpu_total_.resize(NUM_OUTPUTS);
     gpu_virial_nep_.resize(static_cast<size_t>(N) * 9);
     gpu_virial_electrostatic_fixed_.resize(static_cast<size_t>(N) * 9);
@@ -438,8 +480,10 @@ void QNEP_Projection::write_complete_current(
 {
   const int N = atom.number_of_atoms;
   double delta_j_q_pppm[3] = {0.0, 0.0, 0.0};
+  double delta_j_q_real[3] = {0.0, 0.0, 0.0};
+  double delta_j_q_total[3] = {0.0, 0.0, 0.0};
   qnep_->compute_charge_rate(box, atom.type, atom.position_per_atom, velocity);
-  const bool pppm_dynamic_q_valid = qnep_->diagnose_dynamic_charge(
+  const bool dynamic_q_valid = qnep_->diagnose_dynamic_charge(
     N,
     0,
     N,
@@ -449,16 +493,13 @@ void QNEP_Projection::write_complete_current(
     box,
     atom.position_per_atom,
     false,
-    delta_j_q_pppm);
-  if (!pppm_dynamic_q_valid) {
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-    delta_j_q_pppm[0] = nan;
-    delta_j_q_pppm[1] = nan;
-    delta_j_q_pppm[2] = nan;
-  }
+    delta_j_q_pppm,
+    delta_j_q_real,
+    delta_j_q_total);
+  const bool pppm_dynamic_q_valid = qnep_->get_last_pppm_dynamic_q_valid();
 
-  // Reduce the main-force qNEP projection buffers before diagnostic virial
-  // recomputation can refresh shared qNEP work arrays.
+  // Reduce the main-force qNEP projection buffers before component
+  // decomposition can refresh shared qNEP work arrays.
   const GPU_Vector<float>& D = qnep_->get_raw_D_reference();
   const GPU_Vector<float>& s = qnep_->get_raw_charge_rate_reference();
   compute_projection_currents(
@@ -469,26 +510,11 @@ void QNEP_Projection::write_complete_current(
     D,
     s);
 
-  // Re-evaluate the complete qNEP result into diagnostic-only buffers.  This
-  // makes per-atom energy/virial allocation independent of HAC and other
-  // production requests for per-atom PPPM virials.
-  gpu_diagnostic_potential_.fill(0.0);
-  gpu_diagnostic_force_.fill(0.0);
-  gpu_diagnostic_virial_.fill(0.0);
-  qnep_->request_peratom_virial_for_next_force();
-  qnep_->compute(
-    box,
-    atom.type,
-    atom.position_per_atom,
-    gpu_diagnostic_potential_,
-    gpu_diagnostic_force_,
-    gpu_diagnostic_virial_);
-
   qnep_->compute_virial_components(
     box,
     atom.type,
     atom.position_per_atom,
-    gpu_diagnostic_virial_,
+    atom.virial_per_atom,
     true,
     true,
     true,
@@ -500,7 +526,7 @@ void QNEP_Projection::write_complete_current(
   gpu_sum_conventional_current<<<1, REDUCE_THREADS>>>(
     N,
     atom.mass.data(),
-    gpu_diagnostic_potential_.data(),
+    atom.potential_per_atom.data(),
     velocity.data(),
     gpu_current_total_.data());
   GPU_CHECK_KERNEL
@@ -514,19 +540,20 @@ void QNEP_Projection::write_complete_current(
   sum_virial_current(
     gpu_virial_electrostatic_fixed_, velocity, j_elec_fixed);
   sum_virial_current(gpu_virial_dynamic_charge_, velocity, j_dyn_local);
-  sum_virial_current(gpu_diagnostic_virial_, velocity, j_virial_total);
+  sum_virial_current(atom.virial_per_atom, velocity, j_virial_total);
 
   const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
   double j_base[3] = {0.0, 0.0, 0.0};
   double j_projection[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
   double j_candidate[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
   for (int d = 0; d < 3; ++d) {
-    j_base[d] = (j_conv[d] + j_nep[d] + j_elec_fixed[d] + j_dyn_local[d]) * inv_time_conversion;
+    j_base[d] = (j_conv[d] + j_virial_total[d]) * inv_time_conversion;
     j_projection[0][d] = cpu_total_[d] * inv_time_conversion;
     j_projection[1][d] = cpu_total_[d + 3] * inv_time_conversion;
     j_projection[2][d] = cpu_total_[d + 6] * inv_time_conversion;
     for (int x = 0; x < 3; ++x)
-      j_candidate[x][d] = j_base[d] + delta_j_q_pppm[d] + j_projection[x][d];
+      j_candidate[x][d] =
+        j_base[d] + delta_j_q_total[d] * inv_time_conversion + j_projection[x][d];
   }
 
   double virial_decomposition_error = 0.0;
@@ -545,13 +572,20 @@ void QNEP_Projection::write_complete_current(
   for (int d = 0; d < 3; ++d)
     complete_current_buffer_ << "," << j_dyn_local[d] * inv_time_conversion;
   for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_base[d];
-  for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << delta_j_q_pppm[d];
+  for (int d = 0; d < 3; ++d)
+    complete_current_buffer_ << "," << delta_j_q_pppm[d] * inv_time_conversion;
   for (int x = 0; x < 3; ++x)
     for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_projection[x][d];
   for (int x = 0; x < 3; ++x)
     for (int d = 0; d < 3; ++d) complete_current_buffer_ << "," << j_candidate[x][d];
   complete_current_buffer_ << "," << virial_decomposition_error << ","
-                           << (pppm_dynamic_q_valid ? 1 : 0) << "\n";
+                           << (pppm_dynamic_q_valid ? 1 : 0);
+  for (int d = 0; d < 3; ++d)
+    complete_current_buffer_ << "," << delta_j_q_real[d] * inv_time_conversion;
+  for (int d = 0; d < 3; ++d)
+    complete_current_buffer_ << "," << delta_j_q_total[d] * inv_time_conversion;
+  complete_current_buffer_ << "," << (dynamic_q_valid ? 1 : 0) << ","
+                           << qnep_->get_charge_mode() << "\n";
 }
 
 void QNEP_Projection::pre_force(
@@ -566,9 +600,8 @@ void QNEP_Projection::pre_force(
   check_fixed_cell(box);
   if ((step + 1) % sample_interval_ == 0) {
     qnep_->request_charge_diagnostics_for_next_force();
-    // Keep the production PPPM virial path unchanged; the complete diagnostic
-    // recomputes its own per-atom energy/virial buffers below.
-    if (g1_channel_) qnep_->request_peratom_virial_for_next_force();
+    if (complete_current_ || g1_channel_)
+      qnep_->request_peratom_virial_for_next_force();
   }
 }
 
@@ -588,8 +621,7 @@ void QNEP_Projection::post_force(
   // This hook is before Integrate::compute2().  Keep the complete sample on
   // the same positions, velocity, and qdot force frame.
   check_fixed_cell(box);
-  gpu_velocity_sample_.copy_from_device(atom.velocity_per_atom.data());
-  write_complete_current(step, global_time, box, atom, gpu_velocity_sample_);
+  write_complete_current(step, global_time, box, atom, atom.velocity_per_atom);
 }
 
 void QNEP_Projection::end_of_step(
@@ -715,26 +747,33 @@ void QNEP_Projection::post_run(
   if (complete_current_) {
     std::ostringstream header;
     header << "# units eV*Angstrom/fs\n"
-           << "# format_version 3\n"
+           << "# format_version 6\n"
            << "# file_write post_run\n"
            << "# sampling_stage post_force_before_compute2\n"
-           << "# velocity_source post_force_snapshot_before_compute2\n"
-           << "# energy_source diagnostic_full_qnep_per_atom\n"
-           << "# pppm_dynamic_q_valid 1=valid; 0=invalid row with NaN correction/candidates\n"
-           << "# qnep_virial_source diagnostic_full_qnep_per_atom_same_force_frame\n"
-           << "step,time_fs,J_conv_x,J_conv_y,J_conv_z,J_nep_x,J_nep_y,J_nep_z,"
-              "J_elec_fixed_x,J_elec_fixed_y,J_elec_fixed_z,J_dyn_local_x,J_dyn_local_y,J_dyn_local_z,"
-              "J_base_x,J_base_y,J_base_z,DeltaJ_q_pppm_x,DeltaJ_q_pppm_y,DeltaJ_q_pppm_z,"
-              "J_proj_A_x,J_proj_A_y,J_proj_A_z,J_proj_B_x,J_proj_B_y,J_proj_B_z,"
-              "J_proj_D_x,J_proj_D_y,J_proj_D_z,J_cand_A_x,J_cand_A_y,J_cand_A_z,"
-              "J_cand_B_x,J_cand_B_y,J_cand_B_z,J_cand_D_x,J_cand_D_y,J_cand_D_z,"
-              "virial_decomposition_error,pppm_dynamic_q_valid\n";
+           << "# velocity_source post_force_velocity_before_compute2\n"
+           << "# energy_source main_force_qnep_per_atom_same_force_frame\n"
+           << "# dynamic_q_formula_version " << DYNAMIC_Q_FORMULA_VERSION << "\n"
+           << "# charge_mode " << qnep_->get_charge_mode() << "\n"
+           << "# dynamic_q_total mode1=DeltaJ_q_pppm+DeltaJ_q_real; mode2=DeltaJ_q_pppm\n"
+           << "# DeltaJ_q_pppm reciprocal_only; DeltaJ_q_real mode1_real_space_mode2_zero\n"
+           << "# dynamic_q_component_units DeltaJ_q_pppm=DeltaJ_q_real=DeltaJ_q_total=eV*Angstrom/fs\n"
+           << "# dynamic_q_candidate J_base + DeltaJ_q_total + J_proj_X\n"
+           << "# completion_candidates A,B,D; selected_completion A (J_cand_A)\n"
+           << "# pppm_dynamic_q_valid 1=reciprocal correction valid; 0=invalid reciprocal correction\n"
+           << "# dynamic_q_valid 1=required computational checks and finite outputs passed; not CPU/GPU formula validation\n"
+           << "# total_virial_source main_force_qnep_per_atom_same_force_frame\n"
+           << "# virial_component_source diagnostic_recomputed_same_force_frame\n"
+           << COMPLETE_CURRENT_COLUMN_HEADER << "\n";
+    std::ostringstream segment_prefix;
+    segment_prefix << "# segment_begin sampling_stage post_force_before_compute2 charge_mode "
+                   << qnep_->get_charge_mode() << " dynamic_q_formula_version "
+                   << DYNAMIC_Q_FORMULA_VERSION << "\n";
     append_output_buffer(
       "qnep_complete_current_diag.csv",
       header.str(),
       complete_current_buffer_.str(),
       true,
-      "# segment_begin sampling_stage post_force_before_compute2\n");
+      segment_prefix.str());
   } else {
     std::ostringstream delta_header;
     delta_header << std::setprecision(17)
