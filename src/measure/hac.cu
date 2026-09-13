@@ -39,6 +39,7 @@ Calculate the heat current autocorrelation (HAC) function.
 #define FILE_NAME_LENGTH 200
 #define DIM 3
 
+constexpr int REDUCE_THREADS = 1024;
 constexpr int NUM_CHARGE_HEAT_CHANNELS = 6;
 
 static bool qnep_sample_interval_matches(
