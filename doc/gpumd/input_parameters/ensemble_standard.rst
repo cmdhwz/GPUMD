@@ -14,9 +14,15 @@ Syntax
 :attr:`nve`
 ^^^^^^^^^^^
 If the first parameter is :attr:`nve`, it means that the ensemble for the current run is NVE (micro-canonical).
-There is no need to further specify any other parameters and the full command is simply::
+There is no need to further specify any other parameters for ordinary NVE or legacy HAC, and the full command is simply::
 
     ensemble nve
+
+For ``hac_current qnep_full_a``, an optional HAC normalization temperature can be specified::
+
+    ensemble nve <hac_normalization_temperature>
+
+This parameter is the fixed equilibrium temperature used for the Green--Kubo normalization :math:`1/(k_{\mathrm{B}}T^2V)`. It is used only by ``hac_current qnep_full_a``; it does not enable a thermostat, initialize or rescale velocities, or change the temperature input of a temperature-dependent potential. Ordinary NVE and legacy HAC do not require this parameter. When ``qnep_full_a`` is selected, the parameter must be a positive finite temperature.
 
 :attr:`nvt_ber`
 ^^^^^^^^^^^^^^^

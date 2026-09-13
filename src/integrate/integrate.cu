@@ -43,6 +43,7 @@ The driver class for the various integrators.
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <cmath>
 #include <cstring>
 
 void Integrate::initialize(
@@ -388,6 +389,7 @@ void Integrate::parse_ensemble(
 {
   qtb_f_max = 200.0;
   qtb_n_f = 100;
+  hac_normalization_temperature = 0.0;
   use_scr_barostat = false;
   for (int i = 0; i < 6; ++i) {
     target_pressure[i] = 0.0;
@@ -400,8 +402,16 @@ void Integrate::parse_ensemble(
   // 1. Determine the integration method
   if (strcmp(param[1], "nve") == 0) {
     type = 0;
-    if (num_param != 2) {
-      PRINT_INPUT_ERROR("ensemble nve should have 0 parameter.");
+    if (num_param != 2 && num_param != 3) {
+      PRINT_INPUT_ERROR("ensemble nve should have 0 or 1 parameter.");
+    }
+    // An explicit NVE temperature is used only for HAC normalization.
+    if (num_param == 3) {
+      if (!is_valid_real(param[2], &hac_normalization_temperature) ||
+          !std::isfinite(hac_normalization_temperature) ||
+          hac_normalization_temperature <= 0.0) {
+        PRINT_INPUT_ERROR("NVE HAC normalization temperature should be positive and finite.");
+      }
     }
   } else if (strcmp(param[1], "nvt_ber") == 0) {
     type = 1;
@@ -960,6 +970,9 @@ void Integrate::parse_ensemble(
   switch (type) {
     case 0:
       printf("Use NVE ensemble for this run.\n");
+      if (hac_normalization_temperature > 0.0) {
+        printf("    HAC normalization temperature is %g K.\n", hac_normalization_temperature);
+      }
       break;
     case 1:
       printf("Use NVT ensemble for this run.\n");

@@ -81,6 +81,7 @@ public:
   double temperature = 0.0;  // target temperature at a specific time
   double temperature1 = 0.0; // target initial temperature for a run
   double temperature2 = 0.0; // target final temperature for a run
+  double hac_normalization_temperature = 0.0; // explicit NVE temperature used only by HAC
   double delta_temperature;
   double target_pressure[6];
   double target_pressure_start[6];

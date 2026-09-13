@@ -148,5 +148,6 @@ private:
     Box& box,
     const int number_of_steps,
     const double time_step,
-    const double temperature);
+    const double temperature,
+    const char* temperature_source);
 };

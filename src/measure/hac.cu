@@ -104,11 +104,12 @@ void HAC::pre_run(
         PRINT_INPUT_ERROR(
           "hac_current qnep_full_a supports only NVE or fixed-cell equilibrium NVT.");
       }
-      if (
-        !std::isfinite(integrate.temperature1) || !std::isfinite(integrate.temperature2) ||
-        !(integrate.temperature2 > 0.0)) {
+      const double normalization_temperature =
+        integrate.type == 0 ? integrate.hac_normalization_temperature : integrate.temperature2;
+      if (!std::isfinite(normalization_temperature) || !(normalization_temperature > 0.0)) {
         PRINT_INPUT_ERROR(
-          "hac_current qnep_full_a requires a positive finite normalization temperature.");
+          "hac_current qnep_full_a requires a positive finite normalization temperature; "
+          "for NVE use ensemble nve <temperature>.\n");
       }
       if (integrate.type >= 1 && integrate.type <= 10) {
         const double temperature_scale =
@@ -145,7 +146,7 @@ void HAC::pre_run(
       if (!qnep_existing_file_has_schema(
             "heat_current_type_resolved_qnep_full_a.out",
             {"# component_schema_version 4",
-             "# segment_metadata_version 1",
+             "# segment_metadata_version 2",
              "# J_virial_existing = J_virial_remainder + J_dyn_local",
              "# J_dyn_local_source = projected_D_charge_gradient_channel"})) {
         PRINT_INPUT_ERROR(
@@ -154,14 +155,14 @@ void HAC::pre_run(
       }
       if (!qnep_existing_file_has_schema(
             "heat_current_qnep_full_a.out",
-            {"# segment_metadata_version 1", "# columns step time_fs Jx Jy Jz"})) {
+            {"# segment_metadata_version 2", "# columns step time_fs Jx Jy Jz"})) {
         PRINT_INPUT_ERROR(
           "heat_current_qnep_full_a.out has incompatible segment metadata; "
           "remove or rename it before starting a new run.\n");
       }
       if (!qnep_existing_file_has_schema(
             "hac_qnep_full_a.out",
-            {"# segment_metadata_version 1",
+            {"# segment_metadata_version 2",
              "# normalization 1/(k_B*T^2*V), trapezoid_running_integral",
              "# columns lag_index_first lag_time_ps HAC_x HAC_y HAC_z RTC_x RTC_y RTC_z"})) {
         PRINT_INPUT_ERROR(
@@ -1100,7 +1101,8 @@ void HAC::post_run_qnep_full_a_(
   Box& box,
   const int number_of_steps,
   const double time_step,
-  const double temperature)
+  const double temperature,
+  const char* temperature_source)
 {
   box.set_is_orthogonal();
   check_qnep_full_a_fixed_cell_(box);
@@ -1166,12 +1168,26 @@ void HAC::post_run_qnep_full_a_(
   gpu_find_hac_3<<<Nc, 128>>>(Nc, Nd, current_gpu.data(), hac_gpu.data());
   GPU_CHECK_KERNEL
   hac_gpu.copy_to_host(hac_cpu.data());
+  for (const double value : hac_cpu) {
+    if (!std::isfinite(value)) {
+      PRINT_INPUT_ERROR("qnep_full_a HAC contains non-finite values.");
+    }
+  }
 
   const double factor =
     dt_in_natural * 0.5 / (K_B * temperature * temperature * volume) *
     KAPPA_UNIT_CONVERSION;
+  if (!std::isfinite(factor) || !(factor > 0.0)) {
+    PRINT_INPUT_ERROR(
+      "qnep_full_a conductivity normalization factor must be positive and finite.");
+  }
   std::vector<double> rtc(static_cast<size_t>(3) * Nc, 0.0);
   find_rtc_components(Nc, 3, factor, hac_cpu.data(), rtc.data());
+  for (const double value : rtc) {
+    if (!std::isfinite(value)) {
+      PRINT_INPUT_ERROR("qnep_full_a running conductivity contains non-finite values.");
+    }
+  }
 
   const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
   const double hac_conversion = inv_time_conversion * inv_time_conversion;
@@ -1185,7 +1201,7 @@ void HAC::post_run_qnep_full_a_(
     std::to_string(qnep_full_a_sample_steps_.back()) + "_" + std::to_string(Nd) + "_" +
     std::to_string(sample_interval) + "_" + std::to_string(charge_mode);
   const auto write_segment_metadata = [&](FILE* file) {
-    fprintf(file, "# segment_metadata_version 1\n");
+    fprintf(file, "# segment_metadata_version 2\n");
     fprintf(file, "# segment_id %s\n", segment_id.c_str());
     fprintf(file, "# charge_mode %d\n", charge_mode);
     fprintf(
@@ -1193,6 +1209,7 @@ void HAC::post_run_qnep_full_a_(
       "# dynamic_q_formula_version %s\n",
       qnep_full_a_qnep_->get_dynamic_q_formula_version());
     fprintf(file, "# temperature_K %.17g\n", temperature);
+    fprintf(file, "# temperature_source %s\n", temperature_source);
     fprintf(file, "# volume_Angstrom3 %.17g\n", volume);
     fprintf(file, "# number_of_atoms %d\n", atom.number_of_atoms);
     fprintf(file, "# number_of_types %d\n", number_of_types);
@@ -1441,7 +1458,17 @@ void HAC::post_run(
   if (!compute)
     return;
   if (qnep_full_a_) {
-    post_run_qnep_full_a_(atom, box, number_of_steps, time_step, temperature);
+    const double normalization_temperature =
+      integrate.type == 0 ? integrate.hac_normalization_temperature : temperature;
+    const char* temperature_source =
+      integrate.type == 0 ? "explicit_nve_hac" : "fixed_nvt_target";
+    post_run_qnep_full_a_(
+      atom,
+      box,
+      number_of_steps,
+      time_step,
+      normalization_temperature,
+      temperature_source);
     compute = 0;
     return;
   }
