@@ -54,7 +54,11 @@ public:
     return "candidate_v2_real_space";
   }
   void initialize(const float alpha_input);
-  void set_mesh_spacing(const double value) { mesh_spacing = value; }
+  void set_mesh_spacing(const double value)
+  {
+    mesh_spacing = value;
+    current_force_mesh_valid_ = false;
+  }
   double get_mesh_spacing() const { return mesh_spacing; }
   const int* get_mesh() const { return para.K; }
   void request_debug_for_next_force(const char* prefix, const int frame)
@@ -70,7 +74,9 @@ public:
     dynamic_debug_requested_step_ = -1;
     dynamic_q_last_compute_valid_ = false;
     dynamic_q_last_diagnostic_checks_pass_ = false;
+    current_force_mesh_valid_ = false;
   }
+  void invalidate_current_force_mesh() { current_force_mesh_valid_ = false; }
   void request_dynamic_charge_debug(const int step) { dynamic_debug_requested_step_ = step; }
   void enable_dynamic_charge_diagnostics() { dynamic_diagnostics_enabled_ = true; }
   bool get_last_dynamic_q_diagnostic_checks_pass() const
@@ -90,7 +96,8 @@ public:
     GPU_Vector<double>& force_per_atom,
     GPU_Vector<double>& virial_per_atom,
     GPU_Vector<double>& potential_per_atom,
-    const bool request_peratom_virial = false);
+    const bool request_peratom_virial = false,
+    const unsigned long long force_evaluation_id = 0);
   void find_force_batch(
     const int N,
     const int N1,
@@ -127,7 +134,8 @@ public:
     const GPU_Vector<float>& charge_rate,
     const GPU_Vector<double>& position,
     // The reciprocal correction is returned in eV*Angstrom/natural_time.
-    double* delta_j_q_pppm = nullptr);
+    double* delta_j_q_pppm = nullptr,
+    const unsigned long long force_evaluation_id = 0);
   void finalize_dynamic_charge_diagnostic(
     const double* delta_j_q_real,
     const double* delta_j_q_total,
@@ -214,6 +222,15 @@ private:
   double debug_mesh_before_assignment_sum_real_ = 0.0;
   double debug_mesh_after_assignment_sum_real_ = 0.0;
   gpufftHandle plan = 0;
+  bool current_force_mesh_valid_ = false;
+  unsigned long long current_force_mesh_force_evaluation_id_ = 0;
+  int current_force_mesh_N_ = -1;
+  int current_force_mesh_N1_ = -1;
+  int current_force_mesh_N2_ = -1;
+  const void* current_force_mesh_charge_ = nullptr;
+  const void* current_force_mesh_position_ = nullptr;
+  int current_force_mesh_K_[3] = {-1, -1, -1};
+  double current_force_mesh_box_[18] = {0.0};
   GPU_Vector<gpufftComplex> mesh_batch;
   GPU_Vector<gpufftComplex> mesh_inverse_batch;
   gpufftHandle plan_batch = 0;
@@ -223,6 +240,14 @@ private:
   void allocate_virial_memory();
   void allocate_batch_memory(const int number_of_beads);
   void find_para(const int N, const Box& box);
+  bool current_force_mesh_matches(
+    const int N,
+    const int N1,
+    const int N2,
+    const Box& box,
+    const GPU_Vector<float>& charge,
+    const GPU_Vector<double>& position,
+    const unsigned long long force_evaluation_id) const;
   void resize_dynamic_charge_workspace(const int M, const bool diagnostic);
   void prepare_dynamic_operator(const int N, const Box& box, const int grid_size);
   void cache_dynamic_operator_on_host();

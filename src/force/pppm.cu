@@ -599,7 +599,7 @@ __global__ void find_dynamic_mesh(
           const double image_x = box.cpu_h[0] * s0 + box.cpu_h[1] * s1 + box.cpu_h[2] * s2;
           const double image_y = box.cpu_h[3] * s0 + box.cpu_h[4] * s1 + box.cpu_h[5] * s2;
           const double image_z = box.cpu_h[6] * s0 + box.cpu_h[7] * s1 + box.cpu_h[8] * s2;
-          atomicAdd(&g_Q[neighbor012].x, qW);
+          if (g_Q != nullptr) atomicAdd(&g_Q[neighbor012].x, qW);
           atomicAdd(&g_S[neighbor012].x, qdotW);
           atomicAdd(&g_Ax[neighbor012].x, static_cast<float>(image_x - x) * qW);
           atomicAdd(&g_Ay[neighbor012].x, static_cast<float>(image_y - y) * qW);
@@ -1894,6 +1894,7 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
 
 void PPPM::initialize(const float alpha_input)
 {
+  current_force_mesh_valid_ = false;
   dynamic_operator_cache_valid_ = false;
   dynamic_operator_host_cache_valid_ = false;
   need_peratom_virial = check_need_peratom_virial();
@@ -1923,6 +1924,7 @@ void PPPM::find_para(const int N, const Box& box)
   para.K0K1 = K[0] * K[1];
   para.K0K1K2 = para.K0K1 * K[2];
   if (K[0] != para.K[0] || K[1] != para.K[1] || K[2] != para.K[2]) {
+    current_force_mesh_valid_ = false;
     para.K[0] = K[0];
     para.K[1] = K[1];
     para.K[2] = K[2];
@@ -1934,6 +1936,34 @@ void PPPM::find_para(const int N, const Box& box)
     para.b[1][d] = two_pi * (float)box.cpu_h[12 + d];
     para.b[2][d] = two_pi * (float)box.cpu_h[15 + d];
   }
+}
+
+bool PPPM::current_force_mesh_matches(
+  const int N,
+  const int N1,
+  const int N2,
+  const Box& box,
+  const GPU_Vector<float>& charge,
+  const GPU_Vector<double>& position,
+  const unsigned long long force_evaluation_id) const
+{
+  if (
+    !current_force_mesh_valid_ || force_evaluation_id == 0 ||
+    current_force_mesh_force_evaluation_id_ != force_evaluation_id ||
+    N1 != 0 || N2 != N || current_force_mesh_N_ != N ||
+    current_force_mesh_N1_ != N1 || current_force_mesh_N2_ != N2 ||
+    current_force_mesh_charge_ != charge.data() || current_force_mesh_position_ != position.data() ||
+    !box.is_orthogonal || mesh.size() != static_cast<size_t>(para.K0K1K2) ||
+    mesh_G.size() != static_cast<size_t>(para.K0K1K2)) {
+    return false;
+  }
+  for (int d = 0; d < 3; ++d) {
+    if (current_force_mesh_K_[d] != para.K[d]) return false;
+  }
+  for (int i = 0; i < 18; ++i) {
+    if (current_force_mesh_box_[i] != box.cpu_h[i]) return false;
+  }
+  return true;
 }
 
 void PPPM::resize_dynamic_charge_workspace(const int M, const bool diagnostic)
@@ -2058,7 +2088,8 @@ bool PPPM::compute_dynamic_charge_correction(
   const GPU_Vector<float>& charge,
   const GPU_Vector<float>& charge_rate,
   const GPU_Vector<double>& position,
-  double* delta_j_q_pppm)
+  double* delta_j_q_pppm,
+  const unsigned long long force_evaluation_id)
 {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   dynamic_q_last_compute_valid_ = false;
@@ -2084,9 +2115,11 @@ bool PPPM::compute_dynamic_charge_correction(
   const int M = para.K0K1K2;
   const int mesh_grid_size = (M - 1) / 64 + 1;
   const int atom_grid_size = (N2 - N1 - 1) / 64 + 1;
+  const bool reuse_current_force_mesh = current_force_mesh_matches(
+    N, N1, N2, box, charge, position, force_evaluation_id);
   resize_dynamic_charge_workspace(M, false);
   const gpufftComplex zero = {0.0f, 0.0f};
-  dynamic_Q_.fill(zero);
+  if (!reuse_current_force_mesh) dynamic_Q_.fill(zero);
   dynamic_S_.fill(zero);
   dynamic_Ax_.fill(zero);
   dynamic_Ay_.fill(zero);
@@ -2106,7 +2139,7 @@ bool PPPM::compute_dynamic_charge_correction(
     position.data(),
     position.data() + N,
     position.data() + 2 * N,
-    dynamic_Q_.data(),
+    reuse_current_force_mesh ? nullptr : dynamic_Q_.data(),
     dynamic_S_.data(),
     dynamic_Ax_.data(),
     dynamic_Ay_.data(),
@@ -2116,9 +2149,11 @@ bool PPPM::compute_dynamic_charge_correction(
     dynamic_Bz_.data());
   GPU_CHECK_KERNEL
 
-  if (gpufftExecC2C(plan, dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
-    std::cerr << "GPUFFT error: dynamic-q current Q forward failed" << std::endl;
-    return false;
+  if (!reuse_current_force_mesh) {
+    if (gpufftExecC2C(plan, dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
+      std::cerr << "GPUFFT error: dynamic-q current Q forward failed" << std::endl;
+      return false;
+    }
   }
   if (gpufftExecC2C(plan, dynamic_S_.data(), dynamic_S_.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q current S forward failed" << std::endl;
@@ -2126,7 +2161,7 @@ bool PPPM::compute_dynamic_charge_correction(
   }
   reduce_dynamic_mesh_current<<<3, 1024>>>(
     M,
-    dynamic_Q_.data(),
+    reuse_current_force_mesh ? mesh.data() : dynamic_Q_.data(),
     dynamic_S_.data(),
     dynamic_d_x_.data(),
     dynamic_d_y_.data(),
@@ -2134,23 +2169,25 @@ bool PPPM::compute_dynamic_charge_correction(
     dynamic_current_total_.data());
   GPU_CHECK_KERNEL
 
-  find_mesh_G<<<mesh_grid_size, 64>>>(
-    para, G.data(), dynamic_Q_.data(), dynamic_Q_.data());
-  GPU_CHECK_KERNEL
+  if (!reuse_current_force_mesh) {
+    find_mesh_G<<<mesh_grid_size, 64>>>(
+      para, G.data(), dynamic_Q_.data(), dynamic_Q_.data());
+    GPU_CHECK_KERNEL
+    if (gpufftExecC2C(plan, dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+      std::cerr << "GPUFFT error: dynamic-q current LQ inverse failed" << std::endl;
+      return false;
+    }
+  }
   find_mesh_G<<<mesh_grid_size, 64>>>(
     para, G.data(), dynamic_S_.data(), dynamic_S_.data());
   GPU_CHECK_KERNEL
-  if (gpufftExecC2C(plan, dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
-    std::cerr << "GPUFFT error: dynamic-q current LQ inverse failed" << std::endl;
-    return false;
-  }
   if (gpufftExecC2C(plan, dynamic_S_.data(), dynamic_S_.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     std::cerr << "GPUFFT error: dynamic-q current LS inverse failed" << std::endl;
     return false;
   }
   reduce_dynamic_assignment_current<<<3, 1024>>>(
     M,
-    dynamic_Q_.data(),
+    reuse_current_force_mesh ? mesh_G.data() : dynamic_Q_.data(),
     dynamic_S_.data(),
     dynamic_Ax_.data(),
     dynamic_Ay_.data(),
@@ -2185,8 +2222,10 @@ void PPPM::find_force(
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom,
   GPU_Vector<double>& potential_per_atom,
-  const bool request_peratom_virial)
+  const bool request_peratom_virial,
+  const unsigned long long force_evaluation_id)
 {
+  current_force_mesh_valid_ = false;
   find_para(N, box);
   const int pppm_call_index = debug_requested_ ? debug_call_index_++ : -1;
   if (debug_requested_) {
@@ -2406,6 +2445,17 @@ void PPPM::find_force(
   if (debug_requested_) {
     write_debug(N, N1, N2, box, charge, position_per_atom, D_real, pppm_call_index);
   }
+  if (force_evaluation_id != 0) {
+    current_force_mesh_valid_ = true;
+    current_force_mesh_force_evaluation_id_ = force_evaluation_id;
+    current_force_mesh_N_ = N;
+    current_force_mesh_N1_ = N1;
+    current_force_mesh_N2_ = N2;
+    current_force_mesh_charge_ = charge.data();
+    current_force_mesh_position_ = position_per_atom.data();
+    for (int d = 0; d < 3; ++d) current_force_mesh_K_[d] = para.K[d];
+    for (int i = 0; i < 18; ++i) current_force_mesh_box_[i] = box.cpu_h[i];
+  }
 }
 
 void PPPM::find_force_batch(
@@ -2422,6 +2472,7 @@ void PPPM::find_force_batch(
   const int number_of_beads,
   const bool request_peratom_virial)
 {
+  current_force_mesh_valid_ = false;
   if (number_of_beads <= 0) {
     last_batch_used_peratom_virial_ = false;
     return;

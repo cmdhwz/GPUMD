@@ -2451,7 +2451,8 @@ void NEP_Charge::compute_large_box(
         force_per_atom,
         virial_per_atom,
         potential_per_atom,
-        peratom_virial_requested_);
+        peratom_virial_requested_,
+        force_evaluation_id_);
     } else {
       ewald.find_force(
         N,
@@ -2744,7 +2745,8 @@ void NEP_Charge::compute_small_box(
         force_per_atom,
         virial_per_atom,
         potential_per_atom,
-        peratom_virial_requested_);
+        peratom_virial_requested_,
+        force_evaluation_id_);
     } else {
       ewald.find_force(
         N,
@@ -2926,6 +2928,7 @@ static bool get_expanded_box(const double rc, const Box& box, NEP_Charge::Expand
 
 void NEP_Charge::invalidate_current_force_caches_()
 {
+  pppm.invalidate_current_force_mesh();
   charge_rate_cache_set_ = false;
   charge_heat_channel_cache_set_ = false;
   full_a_current_cache_set_ = false;
@@ -4960,7 +4963,8 @@ bool NEP_Charge::compute_dynamic_charge_correction_impl(
         nep_data.charge,
         nep_data.charge_rate,
         position,
-        pppm_result);
+        pppm_result,
+        force_evaluation_id_);
   dynamic_q_last_pppm_valid_ = pppm_valid;
   if (pppm_valid && delta_j_q_pppm != nullptr) {
     for (int d = 0; d < 3; ++d) delta_j_q_pppm[d] = pppm_result[d];
