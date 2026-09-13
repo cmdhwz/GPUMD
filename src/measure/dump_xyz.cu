@@ -289,6 +289,7 @@ void Dump_XYZ::pre_run(
     PRINT_INPUT_ERROR("pppm_dynamic_q requires kspace_method pppm.\n");
   }
   if (has_pppm_dynamic_q_) {
+    qnep_->enable_dynamic_charge_diagnostics();
     if (!qnep_->pppm_dynamic_q_diag_files_are_compatible(has_pppm_dynamic_q_debug_)) {
       PRINT_INPUT_ERROR(
         "PPPM dynamic-q diagnostic files have an incompatible schema; remove or rename them before starting a new run.\n");

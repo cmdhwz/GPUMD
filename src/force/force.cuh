@@ -108,6 +108,7 @@ public:
     double initial_temperature);
 
   void finalize();
+  void notify_velocity_update();
 
   int get_number_of_types(FILE* fid_potential);
   void set_hnemd_parameters(const double, const double, const double);

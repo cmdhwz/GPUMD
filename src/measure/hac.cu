@@ -19,6 +19,7 @@ Calculate the heat current autocorrelation (HAC) function.
 
 #include "compute_heat.cuh"
 #include "force/force.cuh"
+#include "force/nep_charge.cuh"
 #include "integrate/integrate.cuh"
 #include "hac.cuh"
 #include "utilities/common.cuh"
@@ -27,7 +28,9 @@ Calculate the heat current autocorrelation (HAC) function.
 #include "utilities/read_file.cuh"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -35,6 +38,28 @@ Calculate the heat current autocorrelation (HAC) function.
 #define NUM_OF_TYPE_HEAT_COMPONENTS 3
 #define FILE_NAME_LENGTH 200
 #define DIM 3
+
+constexpr int NUM_CHARGE_HEAT_CHANNELS = 6;
+
+static bool qnep_sample_interval_matches(
+  const double previous_time_fs,
+  const double current_time_fs,
+  const double reference_dt_fs)
+{
+  const double actual_dt_fs = current_time_fs - previous_time_fs;
+  const double time_scale = std::max(
+    1.0, std::max(std::fabs(previous_time_fs), std::fabs(current_time_fs)));
+  const double tolerance =
+    1.0e-10 * std::max(1.0, std::fabs(reference_dt_fs)) +
+    64.0 * std::numeric_limits<double>::epsilon() * time_scale;
+
+  return
+    std::isfinite(actual_dt_fs) &&
+    std::isfinite(reference_dt_fs) &&
+    actual_dt_fs > 0.0 &&
+    reference_dt_fs > 0.0 &&
+    std::fabs(actual_dt_fs - reference_dt_fs) <= tolerance;
+}
 
 // Allocate memory for recording heat current data
 void HAC::pre_run(
@@ -63,6 +88,120 @@ void HAC::pre_run(
     if (number_of_frames <= 0 || Nc > number_of_frames) {
       PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
     }
+
+    if (qnep_full_a_) {
+      if (use_centroid_heat_flux_ || split_qnep_heat_by_type_ || deferred_centroid_qnep_) {
+        PRINT_INPUT_ERROR(
+          "hac_current qnep_full_a supports only classical, non-centroid, non-split HAC.");
+      }
+      if (output_interval > Nc) {
+        PRINT_INPUT_ERROR("hac_current qnep_full_a requires output_interval not to exceed Nc.");
+      }
+      const bool supported_ensemble =
+        integrate.type == 0 || (integrate.type >= 1 && integrate.type <= 10);
+      if (!supported_ensemble) {
+        PRINT_INPUT_ERROR(
+          "hac_current qnep_full_a supports only NVE or fixed-cell equilibrium NVT.");
+      }
+      if (
+        !std::isfinite(integrate.temperature1) || !std::isfinite(integrate.temperature2) ||
+        !(integrate.temperature2 > 0.0)) {
+        PRINT_INPUT_ERROR(
+          "hac_current qnep_full_a requires a positive finite normalization temperature.");
+      }
+      if (integrate.type >= 1 && integrate.type <= 10) {
+        const double temperature_scale =
+          std::max(1.0, std::max(std::fabs(integrate.temperature1), std::fabs(integrate.temperature2)));
+        if (std::fabs(integrate.temperature1 - integrate.temperature2) >
+            1.0e-12 * temperature_scale) {
+          PRINT_INPUT_ERROR(
+            "hac_current qnep_full_a requires a constant target temperature during the HAC run.");
+        }
+      }
+      if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1) {
+        PRINT_INPUT_ERROR(
+          "hac_current qnep_full_a requires three-dimensional periodic boundary conditions.");
+      }
+      box.set_is_orthogonal();
+      if (!box.is_orthogonal) {
+        PRINT_INPUT_ERROR("hac_current qnep_full_a requires an orthogonal simulation cell.");
+      }
+      if (force.potentials.size() != 1) {
+        PRINT_INPUT_ERROR("hac_current qnep_full_a requires exactly one qNEP potential.");
+      }
+      qnep_full_a_qnep_ = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+      if (qnep_full_a_qnep_ == nullptr) {
+        PRINT_INPUT_ERROR("hac_current qnep_full_a requires an NEP-Charge potential.");
+      }
+      if (!qnep_full_a_qnep_->uses_pppm()) {
+        PRINT_INPUT_ERROR("hac_current qnep_full_a requires kspace_method pppm.");
+      }
+      if (
+        qnep_full_a_qnep_->get_charge_mode() != 1 &&
+        qnep_full_a_qnep_->get_charge_mode() != 2) {
+        PRINT_INPUT_ERROR("hac_current qnep_full_a supports qNEP charge mode 1 or mode 2 only.");
+      }
+      if (!qnep_existing_file_has_schema(
+            "heat_current_type_resolved_qnep_full_a.out",
+            {"# component_schema_version 4",
+             "# segment_metadata_version 1",
+             "# J_virial_existing = J_virial_remainder + J_dyn_local",
+             "# J_dyn_local_source = projected_D_charge_gradient_channel"})) {
+        PRINT_INPUT_ERROR(
+          "heat_current_type_resolved_qnep_full_a.out has an incompatible component schema; "
+          "remove or rename it before starting a new run.\n");
+      }
+      if (!qnep_existing_file_has_schema(
+            "heat_current_qnep_full_a.out",
+            {"# segment_metadata_version 1", "# columns step time_fs Jx Jy Jz"})) {
+        PRINT_INPUT_ERROR(
+          "heat_current_qnep_full_a.out has incompatible segment metadata; "
+          "remove or rename it before starting a new run.\n");
+      }
+      if (!qnep_existing_file_has_schema(
+            "hac_qnep_full_a.out",
+            {"# segment_metadata_version 1",
+             "# normalization 1/(k_B*T^2*V), trapezoid_running_integral",
+             "# columns lag_index_first lag_time_ps HAC_x HAC_y HAC_z RTC_x RTC_y RTC_z"})) {
+        PRINT_INPUT_ERROR(
+          "hac_qnep_full_a.out has incompatible segment metadata; "
+          "remove or rename it before starting a new run.\n");
+      }
+      for (int i = 0; i < 9; ++i) qnep_full_a_initial_cell_[i] = box.cpu_h[i];
+      qnep_full_a_qnep_->enable_charge_diagnostics();
+      qnep_full_a_qnep_->reset_dynamic_charge_cache();
+      qnep_full_a_local_channel_validation_done_ = false;
+      qnep_full_a_local_channel_validation_passed_ = false;
+      qnep_full_a_local_channel_validation_error_ = 0.0;
+      atom.enable_unwrapped_position();
+      qnep_full_a_workspace_.resize(atom.number_of_atoms);
+      qnep_full_a_dynamic_local_channel_per_atom_.resize(
+        static_cast<size_t>(atom.number_of_atoms) * NUM_CHARGE_HEAT_CHANNELS);
+      qnep_full_a_dynamic_local_channel_total_.resize(NUM_CHARGE_HEAT_CHANNELS);
+      const int number_of_types = static_cast<int>(atom.cpu_type_size.size());
+      atom.heat_per_atom.resize(static_cast<size_t>(atom.number_of_atoms) * 5);
+      qnep_full_a_base_by_type_current_.resize(static_cast<size_t>(number_of_types) * 3);
+      qnep_full_a_current_history_.assign(
+        static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_base_by_type_history_.assign(
+        static_cast<size_t>(number_of_types) * 3 * number_of_frames, 0.0);
+      qnep_full_a_j_conv_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_j_virial_existing_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_j_dyn_local_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_j_virial_remainder_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_j_reference_static_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_j_base_existing_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_j_added_dynamic_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_delta_j_q_pppm_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_delta_j_q_real_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_projection_a_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_closure_error_history_.assign(static_cast<size_t>(3) * number_of_frames, 0.0);
+      qnep_full_a_sample_times_fs_.assign(number_of_frames, 0.0);
+      qnep_full_a_sample_steps_.assign(number_of_frames, -1);
+      printf("    HAC current operator is qnep_full_a (A-route, full current).\n");
+      return;
+    }
+
     heat_all.resize(NUM_OF_HEAT_COMPONENTS * number_of_frames);
     heat_all_by_type_.resize(atom.cpu_type_size.size() * NUM_OF_TYPE_HEAT_COMPONENTS * number_of_frames);
     atom.heat_per_atom.resize(atom.number_of_atoms * 5);
@@ -139,7 +278,9 @@ static __global__ void gpu_sum_heat_by_type(
   const int* g_type,
   const double* g_heat,
   double* g_heat_all_by_type);
-static void compute_centroid_heat(
+static __global__ void gpu_sum_components(
+  const int N, const int number_of_components, const double* g_values, double* g_total);
+static void compute_full_heat_per_atom(
   const GPU_Vector<double>& mass,
   const GPU_Vector<double>& potential_per_atom,
   const GPU_Vector<double>& virial_per_atom,
@@ -221,7 +362,7 @@ void HAC::process_deferred_centroid_frames_(
     const auto heat_begin = std::chrono::high_resolution_clock::now();
     for (int frame = 0; frame < frames_in_chunk; ++frame) {
       const int nd = first_frame + frame;
-      compute_centroid_heat(
+      compute_full_heat_per_atom(
         atom.mass,
         deferred_potential_frames_gpu_[frame],
         deferred_virial_frames_gpu_[frame],
@@ -323,6 +464,27 @@ static __global__ void gpu_sum_heat_by_type(
   }
 }
 
+static __global__ void gpu_sum_components(
+  const int N, const int number_of_components, const double* g_values, double* g_total)
+{
+  const int component = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (component >= number_of_components) return;
+
+  __shared__ double s_data[REDUCE_THREADS];
+  double sum = 0.0;
+  for (int n = tid; n < N; n += REDUCE_THREADS)
+    sum += g_values[n + component * N];
+  s_data[tid] = sum;
+  __syncthreads();
+
+  for (int offset = REDUCE_THREADS >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) s_data[tid] += s_data[tid + offset];
+    __syncthreads();
+  }
+  if (tid == 0) g_total[component] = s_data[0];
+}
+
 static __global__ void gpu_subtract_array(
   const int size,
   const double* total,
@@ -335,7 +497,7 @@ static __global__ void gpu_subtract_array(
   }
 }
 
-static __global__ void gpu_compute_centroid_heat(
+static __global__ void gpu_compute_full_heat_per_atom(
   const int N,
   const double* mass,
   const double* potential,
@@ -375,7 +537,7 @@ static __global__ void gpu_compute_centroid_heat(
   }
 }
 
-static void compute_centroid_heat(
+static void compute_full_heat_per_atom(
   const GPU_Vector<double>& mass,
   const GPU_Vector<double>& potential_per_atom,
   const GPU_Vector<double>& virial_per_atom,
@@ -384,7 +546,7 @@ static void compute_centroid_heat(
   const bool include_kinetic = true)
 {
   const int N = velocity_per_atom.size() / 3;
-  gpu_compute_centroid_heat<<<(N - 1) / 128 + 1, 128>>>(
+  gpu_compute_full_heat_per_atom<<<(N - 1) / 128 + 1, 128>>>(
     N,
     mass.data(),
     potential_per_atom.data(),
@@ -409,6 +571,36 @@ static void compute_centroid_heat(
   GPU_CHECK_KERNEL
 }
 
+void HAC::check_qnep_full_a_fixed_cell_(const Box& box) const
+{
+  if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1 || !box.is_orthogonal) {
+    PRINT_INPUT_ERROR(
+      "hac_current qnep_full_a requires a three-dimensional orthogonal periodic box.");
+  }
+  for (int i = 0; i < 9; ++i) {
+    if (box.cpu_h[i] != qnep_full_a_initial_cell_[i]) {
+      PRINT_INPUT_ERROR(
+        "hac_current qnep_full_a requires a fixed simulation cell; the cell changed during the run.");
+    }
+  }
+}
+
+void HAC::pre_force(
+  const int step,
+  const double,
+  Integrate&,
+  std::vector<Group>&,
+  Atom&,
+  Box& box,
+  Force&)
+{
+  if (!compute || !qnep_full_a_ || (step + 1) % sample_interval != 0) return;
+  box.set_is_orthogonal();
+  check_qnep_full_a_fixed_cell_(box);
+  qnep_full_a_qnep_->request_charge_diagnostics_for_next_force();
+  qnep_full_a_qnep_->request_peratom_virial_for_next_force();
+}
+
 // sample heat current data for HAC calculations.
 void HAC::end_of_step(
   const int number_of_steps,
@@ -426,6 +618,246 @@ void HAC::end_of_step(
 {
   if (!compute)
     return;
+  if (qnep_full_a_) {
+    if ((step + 1) % sample_interval != 0) return;
+
+    box.set_is_orthogonal();
+    check_qnep_full_a_fixed_cell_(box);
+    const int Nd = static_cast<int>(qnep_full_a_sample_steps_.size());
+    const int nd = (step + 1) / sample_interval - 1;
+    if (nd < 0 || nd >= Nd || qnep_full_a_sample_steps_[nd] != -1) {
+      PRINT_INPUT_ERROR("qnep_full_a samples did not arrive in sequential frame order.");
+    }
+
+    const double sample_time_fs = global_time * TIME_UNIT_CONVERSION;
+    if (!std::isfinite(sample_time_fs)) {
+      PRINT_INPUT_ERROR("qnep_full_a requires finite sample times.");
+    }
+    if (nd >= 1) {
+      const double actual_dt_fs =
+        sample_time_fs - qnep_full_a_sample_times_fs_[nd - 1];
+      if (!std::isfinite(actual_dt_fs) || !(actual_dt_fs > 0.0)) {
+        PRINT_INPUT_ERROR(
+          "qnep_full_a requires positive finite sample-time intervals.");
+      }
+      if (
+        nd >= 2 &&
+        !qnep_sample_interval_matches(
+          qnep_full_a_sample_times_fs_[nd - 1],
+          sample_time_fs,
+          qnep_full_a_sample_times_fs_[1] - qnep_full_a_sample_times_fs_[0])) {
+        PRINT_INPUT_ERROR(
+          "qnep_full_a requires uniformly spaced sample times "
+          "for HAC correlation and integration.");
+      }
+    }
+
+    double delta_j_q_pppm[3] = {0.0, 0.0, 0.0};
+    double delta_j_q_real[3] = {0.0, 0.0, 0.0};
+    double delta_j_q_total[3] = {0.0, 0.0, 0.0};
+    qnep_full_a_qnep_->compute_charge_rate_for_current_force_frame(
+      box,
+      atom.type,
+      atom.position_per_atom,
+      atom.velocity_per_atom,
+      &qnep_full_a_dynamic_local_channel_per_atom_);
+    if (!qnep_full_a_qnep_->compute_dynamic_charge_correction(
+          atom.number_of_atoms,
+          0,
+          atom.number_of_atoms,
+          0,
+          step + 1,
+          sample_time_fs,
+          box,
+          atom.position_per_atom,
+          delta_j_q_pppm,
+          delta_j_q_real,
+          delta_j_q_total)) {
+      PRINT_INPUT_ERROR(
+        "hac_current qnep_full_a could not obtain a valid dynamic-q correction for the sampled frame.");
+    }
+
+    double j_conv[3] = {0.0, 0.0, 0.0};
+    double j_virial[3] = {0.0, 0.0, 0.0};
+    double j_base_existing[3] = {0.0, 0.0, 0.0};
+    double j_projection[3][3] = {
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, 0.0}};
+    double j_full_a[3] = {0.0, 0.0, 0.0};
+    if (!compute_qnep_full_a_current(
+          *qnep_full_a_qnep_,
+          atom.number_of_atoms,
+          box,
+          atom.position_per_atom,
+          atom.unwrapped_position,
+          atom.mass,
+          atom.potential_per_atom,
+          atom.virial_per_atom,
+          atom.velocity_per_atom,
+          delta_j_q_total,
+          false,
+          qnep_full_a_workspace_,
+          j_conv,
+          j_virial,
+          j_base_existing,
+          j_projection,
+          j_full_a)) {
+      PRINT_INPUT_ERROR("hac_current qnep_full_a could not assemble a finite full current.");
+    }
+
+    gpu_sum_components<<<NUM_CHARGE_HEAT_CHANNELS, REDUCE_THREADS>>>(
+      atom.number_of_atoms,
+      NUM_CHARGE_HEAT_CHANNELS,
+      qnep_full_a_dynamic_local_channel_per_atom_.data(),
+      qnep_full_a_dynamic_local_channel_total_.data());
+    GPU_CHECK_KERNEL
+    double dynamic_local_channel_total[NUM_CHARGE_HEAT_CHANNELS] =
+      {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    qnep_full_a_dynamic_local_channel_total_.copy_to_host(dynamic_local_channel_total);
+    double j_dyn_local[3] = {0.0, 0.0, 0.0};
+    double j_virial_remainder[3] = {0.0, 0.0, 0.0};
+    double j_reference_static[3] = {0.0, 0.0, 0.0};
+    double j_added_dynamic[3] = {0.0, 0.0, 0.0};
+    for (int d = 0; d < 3; ++d) {
+      j_dyn_local[d] = dynamic_local_channel_total[d] + dynamic_local_channel_total[3 + d];
+      j_virial_remainder[d] = j_virial[d] - j_dyn_local[d];
+      j_reference_static[d] = j_conv[d] + j_virial_remainder[d];
+      j_added_dynamic[d] =
+        j_dyn_local[d] + delta_j_q_pppm[d] + delta_j_q_real[d] + j_projection[0][d];
+    }
+
+    const int number_of_types = static_cast<int>(atom.cpu_type_size.size());
+    gpu_sum_heat_by_type<<<number_of_types * NUM_OF_TYPE_HEAT_COMPONENTS, 1024>>>(
+      atom.number_of_atoms,
+      1,
+      0,
+      number_of_types,
+      atom.type.data(),
+      qnep_full_a_workspace_.gpu_virial_heat_per_atom.data(),
+      qnep_full_a_base_by_type_current_.data());
+    GPU_CHECK_KERNEL
+
+    const size_t base_history_offset =
+      static_cast<size_t>(nd) * number_of_types * NUM_OF_TYPE_HEAT_COMPONENTS;
+    qnep_full_a_base_by_type_current_.copy_to_host(
+      qnep_full_a_base_by_type_history_.data() + base_history_offset);
+
+    double base_by_type_sum[3] = {0.0, 0.0, 0.0};
+    for (int type_index = 0; type_index < number_of_types; ++type_index) {
+      const size_t type_offset = base_history_offset + static_cast<size_t>(type_index) * 3;
+      for (int d = 0; d < 3; ++d) base_by_type_sum[d] +=
+      qnep_full_a_base_by_type_history_[type_offset + d];
+    }
+
+    const double closure_tolerance_floor = 1.0e-8 * TIME_UNIT_CONVERSION;
+    double local_channel_validation_error = qnep_full_a_local_channel_validation_error_;
+    bool local_channel_valid = qnep_full_a_local_channel_validation_passed_;
+    if (!qnep_full_a_local_channel_validation_done_) {
+      GPU_Vector<double> virial_nep;
+      GPU_Vector<double> virial_electrostatic_fixed;
+      GPU_Vector<double> virial_dynamic_charge;
+      const size_t virial_size = static_cast<size_t>(atom.number_of_atoms) * 9;
+      virial_nep.resize(virial_size);
+      virial_electrostatic_fixed.resize(virial_size);
+      virial_dynamic_charge.resize(virial_size);
+      qnep_full_a_qnep_->compute_virial_components(
+        box,
+        atom.type,
+        atom.position_per_atom,
+        atom.virial_per_atom,
+        true,
+        true,
+        true,
+        virial_nep,
+        virial_electrostatic_fixed,
+        virial_dynamic_charge);
+      compute_heat(
+        virial_dynamic_charge,
+        atom.velocity_per_atom,
+        qnep_full_a_workspace_.gpu_virial_heat_per_atom);
+      gpu_sum_components<<<NUM_OF_HEAT_COMPONENTS, REDUCE_THREADS>>>(
+        atom.number_of_atoms,
+        NUM_OF_HEAT_COMPONENTS,
+        qnep_full_a_workspace_.gpu_virial_heat_per_atom.data(),
+        qnep_full_a_workspace_.gpu_virial_heat_total.data());
+      GPU_CHECK_KERNEL
+      qnep_full_a_workspace_.gpu_virial_heat_total.copy_to_host(
+        qnep_full_a_workspace_.cpu_virial_heat_total.data());
+      double j_dyn_local_residual[3] = {0.0, 0.0, 0.0};
+      j_dyn_local_residual[0] =
+        qnep_full_a_workspace_.cpu_virial_heat_total[0] +
+        qnep_full_a_workspace_.cpu_virial_heat_total[1];
+      j_dyn_local_residual[1] =
+        qnep_full_a_workspace_.cpu_virial_heat_total[2] +
+        qnep_full_a_workspace_.cpu_virial_heat_total[3];
+      j_dyn_local_residual[2] = qnep_full_a_workspace_.cpu_virial_heat_total[4];
+
+      double local_channel_validation_error_squared = 0.0;
+      double channel_norm_squared = 0.0;
+      double residual_norm_squared = 0.0;
+      bool local_channel_finite = true;
+      for (int d = 0; d < 3; ++d) {
+        const double error = j_dyn_local[d] - j_dyn_local_residual[d];
+        if (!std::isfinite(error) || !std::isfinite(j_dyn_local[d]) ||
+            !std::isfinite(j_dyn_local_residual[d])) {
+          local_channel_finite = false;
+        } else {
+          local_channel_validation_error_squared += error * error;
+          channel_norm_squared += j_dyn_local[d] * j_dyn_local[d];
+          residual_norm_squared += j_dyn_local_residual[d] * j_dyn_local_residual[d];
+        }
+      }
+      local_channel_validation_error = local_channel_finite
+        ? std::sqrt(local_channel_validation_error_squared)
+        : std::numeric_limits<double>::quiet_NaN();
+      const double scale = local_channel_finite
+        ? std::max(std::sqrt(channel_norm_squared), std::sqrt(residual_norm_squared))
+        : std::numeric_limits<double>::quiet_NaN();
+      const double tolerance = closure_tolerance_floor + 1.0e-5 * scale;
+      local_channel_valid =
+        local_channel_finite && local_channel_validation_error <= tolerance;
+      qnep_full_a_local_channel_validation_done_ = true;
+      qnep_full_a_local_channel_validation_passed_ = local_channel_valid;
+      qnep_full_a_local_channel_validation_error_ = local_channel_validation_error;
+    }
+    if (!local_channel_valid) {
+      PRINT_INPUT_ERROR(
+        "hac_current qnep_full_a local dynamic-charge channel failed independent residual validation.");
+    }
+
+    for (int d = 0; d < 3; ++d) {
+      const double reconstructed =
+        base_by_type_sum[d] + delta_j_q_pppm[d] + delta_j_q_real[d] + j_projection[0][d];
+      const double closure_error = j_full_a[d] - reconstructed;
+      const double scale = std::max(std::fabs(j_full_a[d]), std::fabs(reconstructed));
+      const double closure_tolerance = closure_tolerance_floor + 1.0e-5 * scale;
+      if (
+        !std::isfinite(j_dyn_local[d]) || !std::isfinite(j_virial_remainder[d]) ||
+        !std::isfinite(j_added_dynamic[d]) ||
+        !std::isfinite(closure_error) || std::fabs(closure_error) > closure_tolerance) {
+        PRINT_INPUT_ERROR(
+          "hac_current qnep_full_a component currents do not close to the full current.");
+      }
+      qnep_full_a_j_conv_history_[nd + Nd * d] = j_conv[d];
+      qnep_full_a_j_virial_existing_history_[nd + Nd * d] = j_virial[d];
+      qnep_full_a_j_dyn_local_history_[nd + Nd * d] = j_dyn_local[d];
+      qnep_full_a_j_virial_remainder_history_[nd + Nd * d] = j_virial_remainder[d];
+      qnep_full_a_j_reference_static_history_[nd + Nd * d] = j_reference_static[d];
+      qnep_full_a_j_base_existing_history_[nd + Nd * d] = j_base_existing[d];
+      qnep_full_a_j_added_dynamic_history_[nd + Nd * d] = j_added_dynamic[d];
+      qnep_full_a_closure_error_history_[nd + Nd * d] = closure_error;
+      qnep_full_a_delta_j_q_pppm_history_[nd + Nd * d] = delta_j_q_pppm[d];
+      qnep_full_a_delta_j_q_real_history_[nd + Nd * d] = delta_j_q_real[d];
+      qnep_full_a_projection_a_history_[nd + Nd * d] = j_projection[0][d];
+    }
+    for (int d = 0; d < 3; ++d)
+      qnep_full_a_current_history_[nd + Nd * d] = j_full_a[d];
+
+    qnep_full_a_sample_steps_[nd] = step + 1;
+    qnep_full_a_sample_times_fs_[nd] = sample_time_fs;
+    return;
+  }
   if ((step + 1) % sample_interval != 0)
     return;
 
@@ -468,7 +900,7 @@ void HAC::end_of_step(
       atom.mass);
     centroid_potential_source = &centroid_potential_per_atom_;
     centroid_virial_source = &centroid_virial_per_atom_;
-    compute_centroid_heat(
+    compute_full_heat_per_atom(
       atom.mass,
       centroid_potential_per_atom_,
       centroid_virial_per_atom_,
@@ -500,7 +932,7 @@ void HAC::end_of_step(
           non_electro_virial_per_atom_.data(),
           electro_virial_per_atom_.data());
         GPU_CHECK_KERNEL
-        compute_centroid_heat(
+        compute_full_heat_per_atom(
           atom.mass,
           electro_potential_per_atom_,
           electro_virial_per_atom_,
@@ -605,15 +1037,394 @@ static __global__ void gpu_find_hac(const int Nc, const int Nd, const double* g_
   }
 }
 
-// Calculate the Running Thermal Conductivity (RTC) from the HAC
-static void find_rtc(const int Nc, const double factor, const double* hac, double* rtc)
+static __global__ void gpu_find_hac_3(const int Nc, const int Nd, const double* g_current, double* g_hac)
 {
-  for (int k = 0; k < NUM_OF_HEAT_COMPONENTS; k++) {
+  __shared__ double s_x[128];
+  __shared__ double s_y[128];
+  __shared__ double s_z[128];
+
+  const int tid = threadIdx.x;
+  const int bid = blockIdx.x;
+  const int number_of_patches = (Nd - 1) / 128 + 1;
+  const int number_of_data = Nd - bid;
+
+  s_x[tid] = 0.0;
+  s_y[tid] = 0.0;
+  s_z[tid] = 0.0;
+  for (int patch = 0; patch < number_of_patches; ++patch) {
+    const int index = tid + patch * 128;
+    if (index + bid < Nd) {
+      s_x[tid] += g_current[index] * g_current[index + bid];
+      s_y[tid] += g_current[index + Nd] * g_current[index + bid + Nd];
+      s_z[tid] += g_current[index + 2 * Nd] * g_current[index + bid + 2 * Nd];
+    }
+  }
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      s_x[tid] += s_x[tid + offset];
+      s_y[tid] += s_y[tid + offset];
+      s_z[tid] += s_z[tid + offset];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    g_hac[bid + Nc * 0] = s_x[0] / number_of_data;
+    g_hac[bid + Nc * 1] = s_y[0] / number_of_data;
+    g_hac[bid + Nc * 2] = s_z[0] / number_of_data;
+  }
+}
+
+// Calculate the Running Thermal Conductivity (RTC) from the HAC
+static void find_rtc_components(
+  const int Nc, const int number_of_components, const double factor, const double* hac, double* rtc)
+{
+  for (int k = 0; k < number_of_components; k++) {
     for (int nc = 1; nc < Nc; nc++) {
       const int index = Nc * k + nc;
       rtc[index] = rtc[index - 1] + (hac[index - 1] + hac[index]) * factor;
     }
   }
+}
+
+static void find_rtc(const int Nc, const double factor, const double* hac, double* rtc)
+{
+  find_rtc_components(Nc, NUM_OF_HEAT_COMPONENTS, factor, hac, rtc);
+}
+
+void HAC::post_run_qnep_full_a_(
+  Atom& atom,
+  Box& box,
+  const int number_of_steps,
+  const double time_step,
+  const double temperature)
+{
+  box.set_is_orthogonal();
+  check_qnep_full_a_fixed_cell_(box);
+  const int Nd = number_of_steps / sample_interval;
+  const int number_of_types = static_cast<int>(atom.cpu_type_size.size());
+  if (
+    Nd <= 0 || static_cast<int>(qnep_full_a_sample_steps_.size()) != Nd ||
+    static_cast<int>(qnep_full_a_sample_times_fs_.size()) != Nd ||
+    qnep_full_a_current_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_base_by_type_history_.size() !=
+      static_cast<size_t>(number_of_types) * 3 * Nd ||
+    qnep_full_a_j_conv_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_j_virial_existing_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_j_dyn_local_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_j_virial_remainder_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_j_reference_static_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_j_base_existing_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_j_added_dynamic_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_delta_j_q_pppm_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_delta_j_q_real_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_projection_a_history_.size() != static_cast<size_t>(3 * Nd) ||
+    qnep_full_a_closure_error_history_.size() != static_cast<size_t>(3 * Nd)) {
+    PRINT_INPUT_ERROR("qnep_full_a sample storage does not match the requested HAC frames.");
+  }
+  for (int nd = 0; nd < Nd; ++nd) {
+    if (qnep_full_a_sample_steps_[nd] < 0 || !std::isfinite(qnep_full_a_sample_times_fs_[nd])) {
+      PRINT_INPUT_ERROR("qnep_full_a did not produce every requested HAC sample.");
+    }
+  }
+
+  double dt_in_fs = time_step * sample_interval * TIME_UNIT_CONVERSION;
+  if (Nd > 1) {
+    dt_in_fs = qnep_full_a_sample_times_fs_[1] - qnep_full_a_sample_times_fs_[0];
+  }
+  if (!std::isfinite(dt_in_fs) || !(dt_in_fs > 0.0)) {
+    PRINT_INPUT_ERROR("qnep_full_a requires a positive finite sampling interval.");
+  }
+  for (int nd = 1; nd < Nd; ++nd) {
+    if (qnep_full_a_sample_steps_[nd] - qnep_full_a_sample_steps_[nd - 1] != sample_interval) {
+      PRINT_INPUT_ERROR(
+        "qnep_full_a requires a uniform sampling interval for HAC correlation and integration.");
+    }
+    if (!qnep_sample_interval_matches(
+          qnep_full_a_sample_times_fs_[nd - 1],
+          qnep_full_a_sample_times_fs_[nd],
+          dt_in_fs)) {
+      PRINT_INPUT_ERROR(
+        "qnep_full_a requires uniformly spaced sample times for HAC correlation and integration.");
+    }
+  }
+  const double dt_in_natural = dt_in_fs / TIME_UNIT_CONVERSION;
+  const double volume = box.get_volume();
+  if (
+    !(dt_in_natural > 0.0) || !std::isfinite(temperature) || !(temperature > 0.0) ||
+    !std::isfinite(volume) || !(volume > 0.0)) {
+    PRINT_INPUT_ERROR("qnep_full_a requires positive sampling time, temperature, and cell volume.");
+  }
+
+  GPU_Vector<double> current_gpu(static_cast<size_t>(3) * Nd);
+  current_gpu.copy_from_host(qnep_full_a_current_history_.data());
+  GPU_Vector<double> hac_gpu(static_cast<size_t>(3) * Nc);
+  std::vector<double> hac_cpu(static_cast<size_t>(3) * Nc);
+  gpu_find_hac_3<<<Nc, 128>>>(Nc, Nd, current_gpu.data(), hac_gpu.data());
+  GPU_CHECK_KERNEL
+  hac_gpu.copy_to_host(hac_cpu.data());
+
+  const double factor =
+    dt_in_natural * 0.5 / (K_B * temperature * temperature * volume) *
+    KAPPA_UNIT_CONVERSION;
+  std::vector<double> rtc(static_cast<size_t>(3) * Nc, 0.0);
+  find_rtc_components(Nc, 3, factor, hac_cpu.data(), rtc.data());
+
+  const double inv_time_conversion = 1.0 / TIME_UNIT_CONVERSION;
+  const double hac_conversion = inv_time_conversion * inv_time_conversion;
+  const double dt_in_ps = dt_in_fs / 1000.0;
+  const int charge_mode = qnep_full_a_qnep_->get_charge_mode();
+  const auto segment_stamp =
+    std::chrono::high_resolution_clock::now().time_since_epoch().count();
+  const std::string segment_id =
+    "qnep_full_a_" + std::to_string(segment_stamp) + "_" +
+    std::to_string(qnep_full_a_sample_steps_.front()) + "_" +
+    std::to_string(qnep_full_a_sample_steps_.back()) + "_" + std::to_string(Nd) + "_" +
+    std::to_string(sample_interval) + "_" + std::to_string(charge_mode);
+  const auto write_segment_metadata = [&](FILE* file) {
+    fprintf(file, "# segment_metadata_version 1\n");
+    fprintf(file, "# segment_id %s\n", segment_id.c_str());
+    fprintf(file, "# charge_mode %d\n", charge_mode);
+    fprintf(
+      file,
+      "# dynamic_q_formula_version %s\n",
+      qnep_full_a_qnep_->get_dynamic_q_formula_version());
+    fprintf(file, "# temperature_K %.17g\n", temperature);
+    fprintf(file, "# volume_Angstrom3 %.17g\n", volume);
+    fprintf(file, "# number_of_atoms %d\n", atom.number_of_atoms);
+    fprintf(file, "# number_of_types %d\n", number_of_types);
+    fprintf(file, "# cell_h0_h1_h2_h3_h4_h5_h6_h7_h8");
+    for (int i = 0; i < 9; ++i) fprintf(file, " %.17g", qnep_full_a_initial_cell_[i]);
+    fprintf(file, "\n");
+  };
+
+  FILE* fid_current = my_fopen("heat_current_qnep_full_a.out", "a");
+  fprintf(fid_current, "# segment_begin operator qnep_full_a projection_route A full_current 1\n");
+  write_segment_metadata(fid_current);
+  fprintf(fid_current, "# sampling_stage post_compute2_final_velocity\n");
+  fprintf(fid_current, "# sampled_frames %d\n", Nd);
+  fprintf(fid_current, "# sample_interval_md_steps %d\n", sample_interval);
+  fprintf(fid_current, "# sample_interval_fs %.17g\n", dt_in_fs);
+  fprintf(fid_current, "# current_internal_units eV*Angstrom/natural_time\n");
+  fprintf(fid_current, "# current_output_units eV*Angstrom/fs\n");
+  fprintf(fid_current, "# columns step time_fs Jx Jy Jz\n");
+  for (int nd = 0; nd < Nd; ++nd) {
+    fprintf(
+      fid_current,
+      "%d %25.15e %25.15e %25.15e %25.15e\n",
+      qnep_full_a_sample_steps_[nd],
+      qnep_full_a_sample_times_fs_[nd],
+      qnep_full_a_current_history_[nd + Nd * 0] * inv_time_conversion,
+      qnep_full_a_current_history_[nd + Nd * 1] * inv_time_conversion,
+      qnep_full_a_current_history_[nd + Nd * 2] * inv_time_conversion);
+  }
+  fflush(fid_current);
+  fclose(fid_current);
+
+  std::vector<std::string> type_symbols(number_of_types);
+  std::vector<int> type_symbol_found(number_of_types, 0);
+  for (int n = 0; n < atom.number_of_atoms; ++n) {
+    const int type_index = atom.cpu_type[n];
+    if (!type_symbol_found[type_index]) {
+      type_symbols[type_index] = atom.cpu_atom_symbol[n];
+      type_symbol_found[type_index] = 1;
+    }
+  }
+  for (int type_index = 0; type_index < number_of_types; ++type_index) {
+    if (!type_symbol_found[type_index]) {
+      type_symbols[type_index] = std::string("type") + std::to_string(type_index);
+    }
+  }
+
+  FILE* fid_type_resolved = my_fopen("heat_current_type_resolved_qnep_full_a.out", "a");
+  fprintf(fid_type_resolved, "# segment_begin operator qnep_full_a projection_route A full_current 1\n");
+  fprintf(fid_type_resolved, "# component_schema_version 4\n");
+  write_segment_metadata(fid_type_resolved);
+  fprintf(
+    fid_type_resolved,
+    "# local_channel_validation_frame %d\n",
+    qnep_full_a_sample_steps_.front());
+  fprintf(
+    fid_type_resolved,
+    "# local_channel_validation_error %.17g\n",
+    qnep_full_a_local_channel_validation_error_ * inv_time_conversion);
+  fprintf(
+    fid_type_resolved,
+    "# local_channel_valid %d\n",
+    qnep_full_a_local_channel_validation_passed_ ? 1 : 0);
+  fprintf(fid_type_resolved, "# sampling_stage post_compute2_final_velocity\n");
+  fprintf(fid_type_resolved, "# sampled_frames %d\n", Nd);
+  fprintf(fid_type_resolved, "# sample_interval_md_steps %d\n", sample_interval);
+  fprintf(fid_type_resolved, "# sample_interval_fs %.17g\n", dt_in_fs);
+  fprintf(fid_type_resolved, "# current_internal_units eV*Angstrom/natural_time\n");
+  fprintf(fid_type_resolved, "# current_output_units eV*Angstrom/fs\n");
+  fprintf(fid_type_resolved, "# J_virial_existing = J_virial_remainder + J_dyn_local\n");
+  fprintf(fid_type_resolved, "# J_reference_static = J_conv + J_virial_remainder\n");
+  fprintf(fid_type_resolved, "# J_base_existing = J_conv + J_virial_existing\n");
+  fprintf(fid_type_resolved, "# J_added_dynamic = J_dyn_local + DeltaJ_q_pppm + DeltaJ_q_real + J_A\n");
+  fprintf(fid_type_resolved, "# J_dyn_local_source = projected_D_charge_gradient_channel\n");
+  fprintf(fid_type_resolved, "# local_channel_validation = first_hac_sample_then_cached\n");
+  fprintf(
+    fid_type_resolved,
+    "# local_channel_validation_error_definition = l2_norm_channel_minus_residual\n");
+  fprintf(
+    fid_type_resolved,
+    "# local_channel_validation_tolerance = 1e-8 eV*Angstrom/fs + 1e-5*max(norm(channel),norm(residual))\n");
+  fprintf(fid_type_resolved, "# type_channels = base_current_only\n");
+  fprintf(fid_type_resolved, "# dynamic_corrections = global_unassigned\n");
+  fprintf(
+    fid_type_resolved,
+    "# sum_rule = J_reference_static + J_added_dynamic\n");
+  fprintf(
+    fid_type_resolved,
+    "# closure_tolerance = 1e-8 eV*Angstrom/fs + 1e-5*max(abs(reference),abs(reconstructed))\n");
+  fprintf(
+    fid_type_resolved,
+    "# columns step time_fs J_full_x J_full_y J_full_z"
+    " J_conv_x J_conv_y J_conv_z"
+    " J_virial_remainder_x J_virial_remainder_y J_virial_remainder_z"
+    " J_dyn_local_x J_dyn_local_y J_dyn_local_z"
+    " J_virial_existing_x J_virial_existing_y J_virial_existing_z"
+    " J_reference_static_x J_reference_static_y J_reference_static_z"
+    " J_base_existing_x J_base_existing_y J_base_existing_z"
+    " J_added_dynamic_x J_added_dynamic_y J_added_dynamic_z");
+  for (int type_index = 0; type_index < number_of_types; ++type_index) {
+    fprintf(
+      fid_type_resolved,
+      " type%d_%s_Jbase_existing_x type%d_%s_Jbase_existing_y type%d_%s_Jbase_existing_z",
+      type_index,
+      type_symbols[type_index].c_str(),
+      type_index,
+      type_symbols[type_index].c_str(),
+      type_index,
+      type_symbols[type_index].c_str());
+  }
+  fprintf(
+    fid_type_resolved,
+    " DeltaJ_q_pppm_x DeltaJ_q_pppm_y DeltaJ_q_pppm_z"
+    " DeltaJ_q_real_x DeltaJ_q_real_y DeltaJ_q_real_z"
+    " J_A_x J_A_y J_A_z DeltaJ_q_total_x DeltaJ_q_total_y DeltaJ_q_total_z"
+    " closure_error_x closure_error_y closure_error_z\n");
+  for (int nd = 0; nd < Nd; ++nd) {
+    fprintf(
+      fid_type_resolved,
+      "%d %25.15e %25.15e %25.15e %25.15e",
+      qnep_full_a_sample_steps_[nd],
+      qnep_full_a_sample_times_fs_[nd],
+      qnep_full_a_current_history_[nd + Nd * 0] * inv_time_conversion,
+      qnep_full_a_current_history_[nd + Nd * 1] * inv_time_conversion,
+      qnep_full_a_current_history_[nd + Nd * 2] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(fid_type_resolved, " %25.15e", qnep_full_a_j_conv_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(
+        fid_type_resolved,
+        " %25.15e",
+        qnep_full_a_j_virial_remainder_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(fid_type_resolved, " %25.15e", qnep_full_a_j_dyn_local_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(
+        fid_type_resolved,
+        " %25.15e",
+        qnep_full_a_j_virial_existing_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(
+        fid_type_resolved,
+        " %25.15e",
+        qnep_full_a_j_reference_static_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(
+        fid_type_resolved,
+        " %25.15e",
+        qnep_full_a_j_base_existing_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(
+        fid_type_resolved,
+        " %25.15e",
+        qnep_full_a_j_added_dynamic_history_[nd + Nd * d] * inv_time_conversion);
+    for (int type_index = 0; type_index < number_of_types; ++type_index) {
+      const size_t type_offset =
+        static_cast<size_t>(nd) * number_of_types * 3 + static_cast<size_t>(type_index) * 3;
+      fprintf(
+        fid_type_resolved,
+        " %25.15e %25.15e %25.15e",
+        qnep_full_a_base_by_type_history_[type_offset + 0] * inv_time_conversion,
+        qnep_full_a_base_by_type_history_[type_offset + 1] * inv_time_conversion,
+        qnep_full_a_base_by_type_history_[type_offset + 2] * inv_time_conversion);
+    }
+    for (int d = 0; d < 3; ++d)
+      fprintf(fid_type_resolved, " %25.15e", qnep_full_a_delta_j_q_pppm_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(fid_type_resolved, " %25.15e", qnep_full_a_delta_j_q_real_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d)
+      fprintf(fid_type_resolved, " %25.15e", qnep_full_a_projection_a_history_[nd + Nd * d] * inv_time_conversion);
+    for (int d = 0; d < 3; ++d) {
+      const double delta_total =
+        qnep_full_a_delta_j_q_pppm_history_[nd + Nd * d] +
+        qnep_full_a_delta_j_q_real_history_[nd + Nd * d];
+      fprintf(fid_type_resolved, " %25.15e", delta_total * inv_time_conversion);
+    }
+    for (int d = 0; d < 3; ++d)
+      fprintf(fid_type_resolved, " %25.15e", qnep_full_a_closure_error_history_[nd + Nd * d] * inv_time_conversion);
+    fprintf(fid_type_resolved, "\n");
+  }
+  fflush(fid_type_resolved);
+  fclose(fid_type_resolved);
+
+  FILE* fid_hac = my_fopen("hac_qnep_full_a.out", "a");
+  fprintf(fid_hac, "# segment_begin operator qnep_full_a projection_route A full_current 1\n");
+  write_segment_metadata(fid_hac);
+  fprintf(fid_hac, "# sampling_stage post_compute2_final_velocity\n");
+  fprintf(fid_hac, "# sampled_frames %d\n", Nd);
+  fprintf(fid_hac, "# correlation_points %d\n", Nc);
+  fprintf(fid_hac, "# sample_interval_md_steps %d\n", sample_interval);
+  fprintf(fid_hac, "# output_interval_lags %d\n", output_interval);
+  fprintf(fid_hac, "# sample_interval_fs %.17g\n", dt_in_fs);
+  fprintf(fid_hac, "# normalization 1/(k_B*T^2*V), trapezoid_running_integral\n");
+  fprintf(fid_hac, "# correlation_origins all_valid, denominator sampled_frames-lag, mean_subtraction none\n");
+  fprintf(fid_hac, "# current_output_units eV*Angstrom/fs\n");
+  fprintf(fid_hac, "# hac_output_units (eV*Angstrom/fs)^2\n");
+  fprintf(fid_hac, "# rtc_output_units W/m/K\n");
+  fprintf(fid_hac, "# rtc_internal_factor %.17g\n", factor);
+  fprintf(
+    fid_hac,
+    "# rtc_factor_from_output_hac %.17g\n",
+    dt_in_fs * 0.5 / (K_B * temperature * temperature * volume) *
+      KAPPA_UNIT_CONVERSION * TIME_UNIT_CONVERSION);
+  fprintf(fid_hac, "# columns lag_index_first lag_time_ps HAC_x HAC_y HAC_z RTC_x RTC_y RTC_z\n");
+  const int number_of_output_data = Nc / output_interval;
+  for (int nd = 0; nd < number_of_output_data; ++nd) {
+    const int nc = nd * output_interval;
+    double hac_ave[3] = {0.0, 0.0, 0.0};
+    double rtc_ave[3] = {0.0, 0.0, 0.0};
+    for (int k = 0; k < 3; ++k) {
+      for (int m = 0; m < output_interval; ++m) {
+        const int count = Nc * k + nc + m;
+        hac_ave[k] += hac_cpu[count] * hac_conversion;
+        rtc_ave[k] += rtc[count];
+      }
+      hac_ave[k] /= output_interval;
+      rtc_ave[k] /= output_interval;
+    }
+    fprintf(
+      fid_hac,
+      "%d %25.15e %25.15e %25.15e %25.15e %25.15e %25.15e %25.15e\n",
+      nc,
+      (nc + 0.5 * (output_interval - 1)) * dt_in_ps,
+      hac_ave[0],
+      hac_ave[1],
+      hac_ave[2],
+      rtc_ave[0],
+      rtc_ave[1],
+      rtc_ave[2]);
+  }
+  fflush(fid_hac);
+  fclose(fid_hac);
+
+  printf("qnep_full_a HAC and running thermal conductivity are calculated.\n");
 }
 
 // Calculate HAC (heat currant auto-correlation function)
@@ -628,6 +1439,11 @@ void HAC::post_run(
 {
   if (!compute)
     return;
+  if (qnep_full_a_) {
+    post_run_qnep_full_a_(atom, box, number_of_steps, time_step, temperature);
+    compute = 0;
+    return;
+  }
   print_line_1();
   printf("Start to calculate HAC and related quantities.\n");
 
@@ -925,7 +1741,8 @@ void HAC::parse(const char** param, int num_param)
   }
 }
 
-HAC::HAC(const char** param, int num_param)
+HAC::HAC(const char** param, int num_param, const bool qnep_full_a)
+  : qnep_full_a_(qnep_full_a)
 {
   parse(param, num_param);
   action_name = "compute_hac";

@@ -171,6 +171,7 @@ public:
   GPU_Vector<float>& get_bec_reference();
 
   void enable_charge_diagnostics();
+  void enable_dynamic_charge_diagnostics();
   void enable_delta_j_q_k_diagnostics();
   void request_charge_diagnostics_for_next_force();
   void request_peratom_virial_for_next_force();
@@ -186,7 +187,27 @@ public:
     const GPU_Vector<int>& type,
     const GPU_Vector<double>& position,
     const GPU_Vector<double>& velocity,
+    GPU_Vector<double>* channel_per_atom = nullptr,
+    const bool update_charge_rate = true);
+  void compute_charge_rate_for_current_force_frame(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& velocity,
     GPU_Vector<double>* channel_per_atom = nullptr);
+  void notify_velocity_update();
+  bool compute_dynamic_charge_correction(
+    const int N,
+    const int N1,
+    const int N2,
+    const int bead_id,
+    const int step,
+    const double time_fs,
+    const Box& box,
+    const GPU_Vector<double>& position,
+    double* delta_j_q_pppm = nullptr,
+    double* delta_j_q_real = nullptr,
+    double* delta_j_q_total = nullptr);
   bool diagnose_dynamic_charge(
     const int N,
     const int N1,
@@ -230,12 +251,45 @@ public:
   GPU_Vector<float>& get_raw_charge_rate_reference() { return nep_data.charge_rate_raw; }
   GPU_Vector<float>& get_charge_rate_reference() { return nep_data.charge_rate; }
   int get_charge_mode() const { return paramb.charge_mode; }
+  const char* get_dynamic_q_formula_version() const { return PPPM::dynamic_q_formula_version(); }
   bool uses_pppm() const { return use_pppm; }
   bool pppm_dynamic_q_diag_files_are_compatible(const bool check_debug_files) const
   {
     return pppm.dynamic_charge_diagnostic_files_are_compatible(check_debug_files);
   }
   bool get_last_pppm_dynamic_q_valid() const { return dynamic_q_last_pppm_valid_; }
+  bool get_last_pppm_dynamic_q_diagnostic_checks_pass() const
+  {
+    return dynamic_q_last_diagnostic_checks_pass_;
+  }
+  bool get_cached_full_a_current(
+    const int N,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& unwrapped_position,
+    const GPU_Vector<double>& mass,
+    const GPU_Vector<double>& potential,
+    const GPU_Vector<double>& virial,
+    const GPU_Vector<double>& velocity,
+    const double delta_j_q_total[3],
+    double j_conv[3],
+    double j_virial[3],
+    double j_base[3],
+    double j_projection[3][3],
+    double j_candidate_a[3]) const;
+  void cache_full_a_current(
+    const int N,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& unwrapped_position,
+    const GPU_Vector<double>& mass,
+    const GPU_Vector<double>& potential,
+    const GPU_Vector<double>& virial,
+    const GPU_Vector<double>& velocity,
+    const double delta_j_q_total[3],
+    const double j_conv[3],
+    const double j_virial[3],
+    const double j_base[3],
+    const double j_projection[3][3],
+    const double j_candidate_a[3]);
   float get_ewald_alpha() const { return charge_para.alpha; }
   float get_realspace_cutoff() const { return paramb.rc_radial; }
   double get_pppm_mesh_spacing() const { return pppm.get_mesh_spacing(); }
@@ -252,6 +306,21 @@ public:
   void reset_pimd_batch_timing() override { pimd_batch_timing_ = PIMD_Batch_Timing(); }
 
 private:
+  bool compute_dynamic_charge_correction_impl(
+    const int N,
+    const int N1,
+    const int N2,
+    const int bead_id,
+    const int step,
+    const double time_fs,
+    const Box& box,
+    const GPU_Vector<double>& position,
+    const bool record_diagnostic,
+    const bool write_debug,
+    double* delta_j_q_pppm,
+    double* delta_j_q_real,
+    double* delta_j_q_total);
+
   ParaMB paramb;
   ANN annmb;
   ZBL zbl;
@@ -350,6 +419,7 @@ private:
   bool pimd_batch_bec_enabled_ = true;
   bool pimd_batch_profile_enabled_ = false;
   bool charge_diagnostics_enabled_ = false;
+  bool dynamic_charge_diagnostics_enabled_ = false;
   bool charge_diagnostics_requested_ = false;
   bool peratom_virial_requested_ = false;
   GPU_Vector<double> dynamic_q_real_per_atom_;
@@ -357,12 +427,50 @@ private:
   bool dynamic_q_cache_set_ = false;
   bool dynamic_q_cache_result_valid_ = false;
   bool dynamic_q_cache_pppm_valid_ = false;
+  bool dynamic_q_cache_diagnostic_recorded_ = false;
+  bool dynamic_q_cache_diagnostic_checks_pass_ = false;
+  bool dynamic_q_last_diagnostic_checks_pass_ = false;
+  GPU_Vector<double> charge_heat_channel_cache_;
+  GPU_Vector<double> virial_diag_potential_;
+  GPU_Vector<double> virial_diag_force_;
+  GPU_Vector<float> virial_diag_charge_saved_;
+  GPU_Vector<float> virial_diag_D_real_saved_;
+  int virial_diag_N_ = -1;
+  bool charge_heat_channel_cache_set_ = false;
+  unsigned long long charge_heat_channel_cache_force_evaluation_id_ = 0;
+  const void* charge_heat_channel_cache_position_ = nullptr;
+  const void* charge_heat_channel_cache_velocity_ = nullptr;
+  unsigned long long force_evaluation_id_ = 0;
+  unsigned long long charge_rate_generation_ = 0;
+  bool charge_rate_cache_set_ = false;
+  unsigned long long charge_rate_cache_force_evaluation_id_ = 0;
+  const void* charge_rate_cache_position_ = nullptr;
+  const void* charge_rate_cache_velocity_ = nullptr;
+  bool full_a_current_cache_set_ = false;
+  int full_a_current_cache_N_ = -1;
+  unsigned long long full_a_current_cache_force_evaluation_id_ = 0;
+  unsigned long long full_a_current_cache_charge_rate_generation_ = 0;
+  const void* full_a_current_cache_position_ = nullptr;
+  const void* full_a_current_cache_unwrapped_position_ = nullptr;
+  const void* full_a_current_cache_mass_ = nullptr;
+  const void* full_a_current_cache_potential_ = nullptr;
+  const void* full_a_current_cache_virial_ = nullptr;
+  const void* full_a_current_cache_velocity_ = nullptr;
+  double full_a_current_cache_delta_j_q_total_[3] = {0.0, 0.0, 0.0};
+  double full_a_current_cache_j_conv_[3] = {0.0, 0.0, 0.0};
+  double full_a_current_cache_j_virial_[3] = {0.0, 0.0, 0.0};
+  double full_a_current_cache_j_base_[3] = {0.0, 0.0, 0.0};
+  double full_a_current_cache_j_projection_[9] = {0.0};
+  double full_a_current_cache_j_candidate_a_[3] = {0.0, 0.0, 0.0};
   int dynamic_q_cache_N_ = -1;
   int dynamic_q_cache_step_ = -1;
   int dynamic_q_cache_bead_ = -1;
   int dynamic_q_cache_N1_ = -1;
   int dynamic_q_cache_N2_ = -1;
   double dynamic_q_cache_time_fs_ = 0.0;
+  unsigned long long dynamic_q_cache_force_evaluation_id_ = 0;
+  unsigned long long dynamic_q_cache_charge_rate_generation_ = 0;
+  const void* dynamic_q_cache_position_ = nullptr;
   double dynamic_q_cache_delta_j_pppm_[3] = {0.0, 0.0, 0.0};
   double dynamic_q_cache_delta_j_real_[3] = {0.0, 0.0, 0.0};
   double dynamic_q_cache_delta_j_total_[3] = {0.0, 0.0, 0.0};

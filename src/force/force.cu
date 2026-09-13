@@ -1458,6 +1458,15 @@ void Force::finalize()
   refresh_pimd_bead_gpu_workers_();
 }
 
+void Force::notify_velocity_update()
+{
+  for (auto& potential : potentials) {
+    if (auto* qnep = dynamic_cast<NEP_Charge*>(potential.get())) {
+      qnep->notify_velocity_update();
+    }
+  }
+}
+
 void Force::set_hnemd_parameters(
   const double hnemd_fe_x, const double hnemd_fe_y, const double hnemd_fe_z)
 {

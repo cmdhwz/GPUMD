@@ -2928,6 +2928,13 @@ void NEP_Charge::compute(
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom)
 {
+  ++force_evaluation_id_;
+  charge_rate_cache_set_ = false;
+  charge_heat_channel_cache_set_ = false;
+  full_a_current_cache_set_ = false;
+  dynamic_q_cache_set_ = false;
+  dynamic_q_last_pppm_valid_ = false;
+  dynamic_q_last_diagnostic_checks_pass_ = false;
   if (!box.pbc_x || !box.pbc_y || !box.pbc_z) {
     PRINT_INPUT_ERROR("Cannot use non-periodic boundaries for qNEP models.");
   }
@@ -4461,6 +4468,12 @@ void NEP_Charge::enable_charge_diagnostics()
   nep_data.charge_rate.resize(N);
 }
 
+void NEP_Charge::enable_dynamic_charge_diagnostics()
+{
+  dynamic_charge_diagnostics_enabled_ = true;
+  pppm.enable_dynamic_charge_diagnostics();
+}
+
 void NEP_Charge::enable_delta_j_q_k_diagnostics()
 {
   ewald.initialize(charge_para.alpha);
@@ -4472,13 +4485,24 @@ void NEP_Charge::reset_dynamic_charge_cache()
   dynamic_q_cache_set_ = false;
   dynamic_q_cache_result_valid_ = false;
   dynamic_q_cache_pppm_valid_ = false;
+  dynamic_q_cache_diagnostic_recorded_ = false;
+  dynamic_q_cache_diagnostic_checks_pass_ = false;
+  dynamic_q_last_diagnostic_checks_pass_ = false;
   dynamic_q_cache_N_ = -1;
   dynamic_q_cache_step_ = -1;
   dynamic_q_cache_bead_ = -1;
   dynamic_q_cache_N1_ = -1;
   dynamic_q_cache_N2_ = -1;
   dynamic_q_cache_time_fs_ = 0.0;
+  dynamic_q_cache_force_evaluation_id_ = 0;
+  dynamic_q_cache_charge_rate_generation_ = 0;
+  dynamic_q_cache_position_ = nullptr;
   dynamic_q_last_pppm_valid_ = false;
+  charge_rate_cache_set_ = false;
+  charge_heat_channel_cache_set_ = false;
+  charge_heat_channel_cache_position_ = nullptr;
+  charge_heat_channel_cache_velocity_ = nullptr;
+  full_a_current_cache_set_ = false;
 }
 
 void NEP_Charge::request_charge_diagnostics_for_next_force()
@@ -4496,7 +4520,8 @@ void NEP_Charge::compute_charge_rate(
   const GPU_Vector<int>& type,
   const GPU_Vector<double>& position,
   const GPU_Vector<double>& velocity,
-  GPU_Vector<double>* channel_per_atom)
+  GPU_Vector<double>* channel_per_atom,
+  const bool update_charge_rate)
 {
   const int N = nep_data.charge.size();
   const int block_size = 64;
@@ -4504,15 +4529,33 @@ void NEP_Charge::compute_charge_rate(
   float* charge_rate = nullptr;
   const float* D_projected = nullptr;
   double* channel = nullptr;
-  if (channel_per_atom == nullptr) {
+  if (
+    !update_charge_rate && channel_per_atom != nullptr && charge_heat_channel_cache_set_ &&
+    charge_heat_channel_cache_force_evaluation_id_ == force_evaluation_id_ &&
+    charge_heat_channel_cache_position_ == position.data() &&
+    charge_heat_channel_cache_velocity_ == velocity.data() &&
+    charge_heat_channel_cache_.size() == static_cast<size_t>(N) * 6) {
+    if (channel_per_atom->size() != static_cast<size_t>(N) * 6)
+      channel_per_atom->resize(static_cast<size_t>(N) * 6);
+    channel_per_atom->copy_from_device(charge_heat_channel_cache_.data());
+    return;
+  }
+  if (update_charge_rate) {
+    charge_rate_cache_set_ = false;
+    dynamic_q_cache_set_ = false;
+    full_a_current_cache_set_ = false;
+    charge_heat_channel_cache_set_ = false;
     nep_data.charge_rate_raw.fill(0.0f);
     charge_rate = nep_data.charge_rate_raw.data();
-  } else {
+  }
+  if (channel_per_atom != nullptr) {
     if (channel_per_atom->size() != static_cast<size_t>(N) * 6)
       channel_per_atom->resize(static_cast<size_t>(N) * 6);
     channel_per_atom->fill(0.0);
     D_projected = nep_data.D_projected.data();
     channel = channel_per_atom->data();
+    if (charge_heat_channel_cache_.size() != static_cast<size_t>(N) * 6)
+      charge_heat_channel_cache_.resize(static_cast<size_t>(N) * 6);
   }
   if (get_expanded_box(paramb.rc_radial, box, ebox)) {
     const int size_x12 = small_box_data.r12.size() / 6;
@@ -4599,10 +4642,147 @@ void NEP_Charge::compute_charge_rate(
       channel);
   }
   GPU_CHECK_KERNEL
-  if (channel_per_atom == nullptr) {
+  if (channel_per_atom != nullptr) {
+    charge_heat_channel_cache_.copy_from_device(channel_per_atom->data());
+    charge_heat_channel_cache_set_ = true;
+    charge_heat_channel_cache_force_evaluation_id_ = force_evaluation_id_;
+    charge_heat_channel_cache_position_ = position.data();
+    charge_heat_channel_cache_velocity_ = velocity.data();
+  }
+  if (update_charge_rate) {
     nep_data.charge_rate.copy_from_device(nep_data.charge_rate_raw.data());
     zero_total_charge<<<1, 1024>>>(N, nep_data.charge_rate.data());
     GPU_CHECK_KERNEL
+    charge_rate_cache_set_ = true;
+    charge_rate_cache_force_evaluation_id_ = force_evaluation_id_;
+    charge_rate_cache_position_ = position.data();
+    charge_rate_cache_velocity_ = velocity.data();
+    ++charge_rate_generation_;
+    dynamic_q_cache_set_ = false;
+    full_a_current_cache_set_ = false;
+  }
+}
+
+void NEP_Charge::compute_charge_rate_for_current_force_frame(
+  Box& box,
+  const GPU_Vector<int>& type,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& velocity,
+  GPU_Vector<double>* channel_per_atom)
+{
+  const int N = nep_data.charge.size();
+  const bool charge_rate_cache_match =
+    charge_rate_cache_set_ && charge_rate_cache_force_evaluation_id_ == force_evaluation_id_ &&
+    charge_rate_cache_position_ == position.data() && charge_rate_cache_velocity_ == velocity.data() &&
+    nep_data.charge_rate_raw.size() == static_cast<size_t>(N);
+  const bool channel_cache_match =
+    charge_heat_channel_cache_set_ &&
+    charge_heat_channel_cache_force_evaluation_id_ == force_evaluation_id_ &&
+    charge_heat_channel_cache_position_ == position.data() &&
+    charge_heat_channel_cache_velocity_ == velocity.data() &&
+    charge_heat_channel_cache_.size() == static_cast<size_t>(N) * 6;
+  if (channel_per_atom == nullptr && charge_rate_cache_match) {
+    return;
+  }
+  if (channel_per_atom != nullptr && charge_rate_cache_match && channel_cache_match) {
+    if (channel_per_atom->size() != static_cast<size_t>(N) * 6)
+      channel_per_atom->resize(static_cast<size_t>(N) * 6);
+    channel_per_atom->copy_from_device(charge_heat_channel_cache_.data());
+    return;
+  }
+  if (channel_per_atom != nullptr && charge_rate_cache_match) {
+    compute_charge_rate(box, type, position, velocity, channel_per_atom, false);
+    return;
+  }
+  compute_charge_rate(box, type, position, velocity, channel_per_atom, true);
+}
+
+void NEP_Charge::notify_velocity_update()
+{
+  charge_rate_cache_set_ = false;
+  charge_heat_channel_cache_set_ = false;
+  charge_heat_channel_cache_position_ = nullptr;
+  charge_heat_channel_cache_velocity_ = nullptr;
+  dynamic_q_cache_set_ = false;
+  full_a_current_cache_set_ = false;
+  dynamic_q_last_pppm_valid_ = false;
+  dynamic_q_last_diagnostic_checks_pass_ = false;
+}
+
+bool NEP_Charge::get_cached_full_a_current(
+  const int N,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& unwrapped_position,
+  const GPU_Vector<double>& mass,
+  const GPU_Vector<double>& potential,
+  const GPU_Vector<double>& virial,
+  const GPU_Vector<double>& velocity,
+  const double delta_j_q_total[3],
+  double j_conv[3],
+  double j_virial[3],
+  double j_base[3],
+  double j_projection[3][3],
+  double j_candidate_a[3]) const
+{
+  const bool cache_match =
+    full_a_current_cache_set_ && N == full_a_current_cache_N_ &&
+    full_a_current_cache_force_evaluation_id_ == force_evaluation_id_ &&
+    full_a_current_cache_charge_rate_generation_ == charge_rate_generation_ &&
+    position.data() == full_a_current_cache_position_ &&
+    unwrapped_position.data() == full_a_current_cache_unwrapped_position_ &&
+    mass.data() == full_a_current_cache_mass_ &&
+    potential.data() == full_a_current_cache_potential_ &&
+    virial.data() == full_a_current_cache_virial_ &&
+    velocity.data() == full_a_current_cache_velocity_ &&
+    delta_j_q_total[0] == full_a_current_cache_delta_j_q_total_[0] &&
+    delta_j_q_total[1] == full_a_current_cache_delta_j_q_total_[1] &&
+    delta_j_q_total[2] == full_a_current_cache_delta_j_q_total_[2];
+  if (!cache_match) return false;
+
+  for (int d = 0; d < 3; ++d) {
+    j_conv[d] = full_a_current_cache_j_conv_[d];
+    j_virial[d] = full_a_current_cache_j_virial_[d];
+    j_base[d] = full_a_current_cache_j_base_[d];
+    j_candidate_a[d] = full_a_current_cache_j_candidate_a_[d];
+    for (int x = 0; x < 3; ++x)
+      j_projection[x][d] = full_a_current_cache_j_projection_[x * 3 + d];
+  }
+  return true;
+}
+
+void NEP_Charge::cache_full_a_current(
+  const int N,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& unwrapped_position,
+  const GPU_Vector<double>& mass,
+  const GPU_Vector<double>& potential,
+  const GPU_Vector<double>& virial,
+  const GPU_Vector<double>& velocity,
+  const double delta_j_q_total[3],
+  const double j_conv[3],
+  const double j_virial[3],
+  const double j_base[3],
+  const double j_projection[3][3],
+  const double j_candidate_a[3])
+{
+  full_a_current_cache_set_ = true;
+  full_a_current_cache_N_ = N;
+  full_a_current_cache_force_evaluation_id_ = force_evaluation_id_;
+  full_a_current_cache_charge_rate_generation_ = charge_rate_generation_;
+  full_a_current_cache_position_ = position.data();
+  full_a_current_cache_unwrapped_position_ = unwrapped_position.data();
+  full_a_current_cache_mass_ = mass.data();
+  full_a_current_cache_potential_ = potential.data();
+  full_a_current_cache_virial_ = virial.data();
+  full_a_current_cache_velocity_ = velocity.data();
+  for (int d = 0; d < 3; ++d) {
+    full_a_current_cache_delta_j_q_total_[d] = delta_j_q_total[d];
+    full_a_current_cache_j_conv_[d] = j_conv[d];
+    full_a_current_cache_j_virial_[d] = j_virial[d];
+    full_a_current_cache_j_base_[d] = j_base[d];
+    full_a_current_cache_j_candidate_a_[d] = j_candidate_a[d];
+    for (int x = 0; x < 3; ++x)
+      full_a_current_cache_j_projection_[x * 3 + d] = j_projection[x][d];
   }
 }
 
@@ -4613,10 +4793,10 @@ void NEP_Charge::compute_charge_heat_channels(
   const GPU_Vector<double>& velocity,
   GPU_Vector<double>& channel_per_atom)
 {
-  compute_charge_rate(box, type, position, velocity, &channel_per_atom);
+  compute_charge_rate(box, type, position, velocity, &channel_per_atom, false);
 }
 
-bool NEP_Charge::diagnose_dynamic_charge(
+bool NEP_Charge::compute_dynamic_charge_correction_impl(
   const int N,
   const int N1,
   const int N2,
@@ -4625,6 +4805,7 @@ bool NEP_Charge::diagnose_dynamic_charge(
   const double time_fs,
   const Box& box,
   const GPU_Vector<double>& position,
+  const bool record_diagnostic,
   const bool write_debug,
   double* delta_j_q_pppm,
   double* delta_j_q_real,
@@ -4632,6 +4813,7 @@ bool NEP_Charge::diagnose_dynamic_charge(
 {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   dynamic_q_last_pppm_valid_ = false;
+  dynamic_q_last_diagnostic_checks_pass_ = false;
   auto set_output_nan = [nan](double* output) {
     if (output != nullptr) {
       output[0] = nan;
@@ -4672,9 +4854,14 @@ bool NEP_Charge::diagnose_dynamic_charge(
   const bool cache_match =
     dynamic_q_cache_set_ && N == dynamic_q_cache_N_ && step == dynamic_q_cache_step_ &&
     bead_id == dynamic_q_cache_bead_ && N1 == dynamic_q_cache_N1_ && N2 == dynamic_q_cache_N2_ &&
-    time_fs == dynamic_q_cache_time_fs_;
+    time_fs == dynamic_q_cache_time_fs_ &&
+    dynamic_q_cache_force_evaluation_id_ == force_evaluation_id_ &&
+    dynamic_q_cache_charge_rate_generation_ == charge_rate_generation_ &&
+    position.data() == dynamic_q_cache_position_ &&
+    (!record_diagnostic || dynamic_q_cache_diagnostic_recorded_);
   if (cache_match) {
     dynamic_q_last_pppm_valid_ = dynamic_q_cache_pppm_valid_;
+    dynamic_q_last_diagnostic_checks_pass_ = dynamic_q_cache_diagnostic_checks_pass_;
     if (dynamic_q_cache_pppm_valid_ && delta_j_q_pppm != nullptr) {
       for (int d = 0; d < 3; ++d) delta_j_q_pppm[d] = dynamic_q_cache_delta_j_pppm_[d];
     }
@@ -4697,33 +4884,58 @@ bool NEP_Charge::diagnose_dynamic_charge(
     dynamic_q_cache_set_ = true;
     dynamic_q_cache_result_valid_ = result_valid;
     dynamic_q_cache_pppm_valid_ = pppm_valid;
+    dynamic_q_cache_diagnostic_recorded_ = record_diagnostic;
+    dynamic_q_cache_diagnostic_checks_pass_ =
+      record_diagnostic && pppm.get_last_dynamic_q_diagnostic_checks_pass();
+    dynamic_q_last_diagnostic_checks_pass_ = dynamic_q_cache_diagnostic_checks_pass_;
     dynamic_q_cache_N_ = N;
     dynamic_q_cache_step_ = step;
     dynamic_q_cache_bead_ = bead_id;
     dynamic_q_cache_N1_ = N1;
     dynamic_q_cache_N2_ = N2;
     dynamic_q_cache_time_fs_ = time_fs;
+    dynamic_q_cache_force_evaluation_id_ = force_evaluation_id_;
+    dynamic_q_cache_charge_rate_generation_ = charge_rate_generation_;
+    dynamic_q_cache_position_ = position.data();
     for (int d = 0; d < 3; ++d) {
       dynamic_q_cache_delta_j_pppm_[d] = pppm_valid ? pppm_result[d] : nan;
       dynamic_q_cache_delta_j_real_[d] = result_valid ? real_result[d] : nan;
       dynamic_q_cache_delta_j_total_[d] = result_valid ? total_result[d] : nan;
     }
   };
+  auto finalize_diagnostic = [&](const double* real_result,
+                                 const double* total_result,
+                                 const bool result_valid) {
+    if (record_diagnostic) {
+      pppm.finalize_dynamic_charge_diagnostic(
+        real_result, total_result, result_valid, paramb.charge_mode);
+    }
+  };
 
   double pppm_result[3] = {nan, nan, nan};
-  const bool pppm_valid = pppm.diagnose_dynamic_charge(
-    N,
-    N1,
-    N2,
-    bead_id,
-    step,
-    time_fs,
-    box,
-    nep_data.charge,
-    nep_data.charge_rate,
-    position,
-    write_debug,
-    pppm_result);
+  const bool pppm_valid = record_diagnostic
+    ? pppm.diagnose_dynamic_charge(
+        N,
+        N1,
+        N2,
+        bead_id,
+        step,
+        time_fs,
+        box,
+        nep_data.charge,
+        nep_data.charge_rate,
+        position,
+        write_debug,
+        pppm_result)
+    : pppm.compute_dynamic_charge_correction(
+        N,
+        N1,
+        N2,
+        box,
+        nep_data.charge,
+        nep_data.charge_rate,
+        position,
+        pppm_result);
   dynamic_q_last_pppm_valid_ = pppm_valid;
   if (pppm_valid && delta_j_q_pppm != nullptr) {
     for (int d = 0; d < 3; ++d) delta_j_q_pppm[d] = pppm_result[d];
@@ -4734,7 +4946,7 @@ bool NEP_Charge::diagnose_dynamic_charge(
   if (!pppm_valid) {
     for (int d = 0; d < 3; ++d) pppm_result[d] = nan;
     cache_result(false, false, pppm_result, real_result, total_result);
-    pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+    finalize_diagnostic(real_result, total_result, false);
     return false;
   }
 
@@ -4758,7 +4970,7 @@ bool NEP_Charge::diagnose_dynamic_charge(
         std::cerr << "NEP dynamic-q diagnostic: small-box radial neighbor data is unavailable."
                   << std::endl;
         cache_result(false, true, pppm_result, real_result, total_result);
-        pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+        finalize_diagnostic(real_result, total_result, false);
         return false;
       }
       find_delta_j_q_real_space_small_box<<<grid_size, block_size>>>(
@@ -4779,7 +4991,7 @@ bool NEP_Charge::diagnose_dynamic_charge(
           nep_data.NL_radial.size() < static_cast<size_t>(N)) {
         std::cerr << "NEP dynamic-q diagnostic: radial neighbor data is unavailable." << std::endl;
         cache_result(false, true, pppm_result, real_result, total_result);
-        pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+        finalize_diagnostic(real_result, total_result, false);
         return false;
       }
       find_delta_j_q_real_space<<<grid_size, block_size>>>(
@@ -4808,7 +5020,7 @@ bool NEP_Charge::diagnose_dynamic_charge(
   for (int d = 0; d < 3; ++d) real_valid = real_valid && std::isfinite(real_result[d]);
   if (!real_valid) {
     cache_result(false, true, pppm_result, real_result, total_result);
-    pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+    finalize_diagnostic(real_result, total_result, false);
     return false;
   }
   for (int d = 0; d < 3; ++d) total_result[d] = pppm_result[d] + real_result[d];
@@ -4816,12 +5028,12 @@ bool NEP_Charge::diagnose_dynamic_charge(
   for (int d = 0; d < 3; ++d) total_valid = total_valid && std::isfinite(total_result[d]);
   if (!total_valid) {
     cache_result(false, true, pppm_result, real_result, total_result);
-    pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, false, paramb.charge_mode);
+    finalize_diagnostic(real_result, total_result, false);
     return false;
   }
 
   cache_result(true, true, pppm_result, real_result, total_result);
-  pppm.finalize_dynamic_charge_diagnostic(real_result, total_result, true, paramb.charge_mode);
+  finalize_diagnostic(real_result, total_result, true);
   if (delta_j_q_real != nullptr) {
     for (int d = 0; d < 3; ++d) delta_j_q_real[d] = real_result[d];
   }
@@ -4829,6 +5041,66 @@ bool NEP_Charge::diagnose_dynamic_charge(
     for (int d = 0; d < 3; ++d) delta_j_q_total[d] = total_result[d];
   }
   return true;
+}
+
+bool NEP_Charge::compute_dynamic_charge_correction(
+  const int N,
+  const int N1,
+  const int N2,
+  const int bead_id,
+  const int step,
+  const double time_fs,
+  const Box& box,
+  const GPU_Vector<double>& position,
+  double* delta_j_q_pppm,
+  double* delta_j_q_real,
+  double* delta_j_q_total)
+{
+  return compute_dynamic_charge_correction_impl(
+    N,
+    N1,
+    N2,
+    bead_id,
+    step,
+    time_fs,
+    box,
+    position,
+    false,
+    false,
+    delta_j_q_pppm,
+    delta_j_q_real,
+    delta_j_q_total);
+}
+
+bool NEP_Charge::diagnose_dynamic_charge(
+  const int N,
+  const int N1,
+  const int N2,
+  const int bead_id,
+  const int step,
+  const double time_fs,
+  const Box& box,
+  const GPU_Vector<double>& position,
+  const bool write_debug,
+  double* delta_j_q_pppm,
+  double* delta_j_q_real,
+  double* delta_j_q_total)
+{
+  enable_dynamic_charge_diagnostics();
+  return compute_dynamic_charge_correction_impl(
+    N,
+    N1,
+    N2,
+    bead_id,
+    step,
+    time_fs,
+    box,
+    position,
+    dynamic_charge_diagnostics_enabled_,
+    write_debug,
+    delta_j_q_pppm,
+    delta_j_q_real,
+    delta_j_q_total);
 }
 
 int NEP_Charge::compute_delta_j_q_k(
@@ -4866,15 +5138,18 @@ void NEP_Charge::compute_virial_components(
 {
   const int N = type.size();
   const int virial_size = N * 9;
-  GPU_Vector<double> potential;
-  GPU_Vector<double> force;
-  GPU_Vector<float> charge_saved;
-  GPU_Vector<float> D_real_saved;
+  GPU_Vector<double>& potential = virial_diag_potential_;
+  GPU_Vector<double>& force = virial_diag_force_;
+  GPU_Vector<float>& charge_saved = virial_diag_charge_saved_;
+  GPU_Vector<float>& D_real_saved = virial_diag_D_real_saved_;
   if (need_nep || need_electrostatic_fixed) {
-    potential.resize(N, 0.0);
-    force.resize(N * 3, 0.0);
-    charge_saved.resize(N);
-    D_real_saved.resize(N);
+    if (virial_diag_N_ != N) {
+      potential.resize(N, 0.0);
+      force.resize(N * 3, 0.0);
+      charge_saved.resize(N);
+      D_real_saved.resize(N);
+      virial_diag_N_ = N;
+    }
     charge_saved.copy_from_device(nep_data.charge.data());
     D_real_saved.copy_from_device(nep_data.D_real.data());
   }

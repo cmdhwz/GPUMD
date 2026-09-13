@@ -15,12 +15,17 @@
 
 #pragma once
 #include "action.cuh"
+#include "qnep_projection.cuh"
 #include "utilities/gpu_vector.cuh"
+
+class NEP_Charge;
 
 class HAC : public Action
 {
 public:
-  HAC(const char**, int);
+  HAC(const char**, int, bool qnep_full_a = false);
+
+  void set_qnep_full_a(const bool enabled) { qnep_full_a_ = enabled; }
 
   int compute = 0;
   int sample_interval; // sample interval for heat current
@@ -49,6 +54,15 @@ public:
       GPU_Vector<double>& thermo,
       Atom& atom,
       Force& force);
+
+  void pre_force(
+    const int step,
+    const double time_step,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
 
   virtual void post_run(
     Atom& atom,
@@ -99,8 +113,40 @@ private:
   double deferred_qnep_wall_time_ = 0.0;
   double deferred_heat_wall_time_ = 0.0;
   double deferred_hac_wall_time_ = 0.0;
+  bool qnep_full_a_ = false;
+  NEP_Charge* qnep_full_a_qnep_ = nullptr;
+  QNEP_Full_A_Current_Workspace qnep_full_a_workspace_;
+  GPU_Vector<double> qnep_full_a_dynamic_local_channel_per_atom_;
+  GPU_Vector<double> qnep_full_a_dynamic_local_channel_total_;
+  std::vector<double> qnep_full_a_current_history_;
+  GPU_Vector<double> qnep_full_a_base_by_type_current_;
+  std::vector<double> qnep_full_a_base_by_type_history_;
+  std::vector<double> qnep_full_a_j_conv_history_;
+  std::vector<double> qnep_full_a_j_virial_existing_history_;
+  std::vector<double> qnep_full_a_j_dyn_local_history_;
+  std::vector<double> qnep_full_a_j_virial_remainder_history_;
+  std::vector<double> qnep_full_a_j_reference_static_history_;
+  std::vector<double> qnep_full_a_j_base_existing_history_;
+  std::vector<double> qnep_full_a_j_added_dynamic_history_;
+  std::vector<double> qnep_full_a_delta_j_q_pppm_history_;
+  std::vector<double> qnep_full_a_delta_j_q_real_history_;
+  std::vector<double> qnep_full_a_projection_a_history_;
+  std::vector<double> qnep_full_a_closure_error_history_;
+  std::vector<double> qnep_full_a_sample_times_fs_;
+  std::vector<int> qnep_full_a_sample_steps_;
+  double qnep_full_a_initial_cell_[9] = {0.0};
+  bool qnep_full_a_local_channel_validation_done_ = false;
+  bool qnep_full_a_local_channel_validation_passed_ = false;
+  double qnep_full_a_local_channel_validation_error_ = 0.0;
 
   void flush_deferred_centroid_chunk_();
   void process_deferred_centroid_frames_(
     Atom& atom, Box& box, const int number_of_frames, const int number_of_types, const int Nd);
+  void check_qnep_full_a_fixed_cell_(const Box& box) const;
+  void post_run_qnep_full_a_(
+    Atom& atom,
+    Box& box,
+    const int number_of_steps,
+    const double time_step,
+    const double temperature);
 };

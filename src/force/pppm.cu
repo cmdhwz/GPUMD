@@ -21,6 +21,7 @@ The k-space part of the PPPM method.
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -35,15 +36,13 @@ namespace{
 
 constexpr const char* PPPM_DEBUG_SOURCE_SIGNATURE = "PPPM_ASSIGN_DEBUG_20260910_V1";
 constexpr const char* PPPM_DYNAMIC_SOURCE_SIGNATURE = "PPPM_DYNAMIC_Q_DIAG";
-constexpr const char* PPPM_DYNAMIC_FORMULA_VERSION = "candidate_v2_real_space";
-constexpr const char* PPPM_DYNAMIC_DIAG_SCHEMA_MARKER = "# dynamic_q_diag_schema_version = 3";
-constexpr const char* PPPM_DYNAMIC_DIAG_FORMULA_MARKER =
-  "# dynamic_formula_version = candidate_v2_real_space";
+constexpr const char* PPPM_DYNAMIC_DIAG_SCHEMA_MARKER = "# dynamic_q_diag_schema_version = 4";
 constexpr const char* PPPM_DYNAMIC_CHECK_COLUMN_HEADER =
   "# columns: step time_fs bead_id pppm_call_index max_abs_J_mesh_path "
   "assignment_charge_sum_error assignment_qdot_sum_error assignment_sums_ok "
   "mesh_path_ok all_values_finite max_odd_error_dx max_odd_error_dy max_odd_error_dz "
-  "max_imag_L1S_x max_imag_L1S_y max_imag_L1S_z";
+  "max_imag_L1S_x max_imag_L1S_y max_imag_L1S_z compute_valid "
+  "diagnostic_checks_pass gpu_cpu_match max_abs_DeltaJ_pppm_gpu_cpu_error";
 constexpr const char* PPPM_DYNAMIC_ATOM_COLUMN_HEADER =
   "# columns atom_id x y z q qdot_internal qdot_e_per_fs";
 constexpr const char* PPPM_DYNAMIC_KSPACE_COLUMN_HEADER =
@@ -64,14 +63,24 @@ constexpr const char* PPPM_DYNAMIC_DIAG_COLUMN_HEADER =
   "h00,h01,h02,h10,h11,h12,h20,h21,h22,"
   "mesh_path_scale_internal,mesh_path_threshold_internal,"
   "mesh_path_scale_eV_A_fs,mesh_path_threshold_eV_A_fs,"
+  "DeltaJ_pppm_gpu_x,DeltaJ_pppm_gpu_y,DeltaJ_pppm_gpu_z,"
+  "DeltaJ_pppm_cpu_x,DeltaJ_pppm_cpu_y,DeltaJ_pppm_cpu_z,"
+  "DeltaJ_pppm_gpu_cpu_error_x,DeltaJ_pppm_gpu_cpu_error_y,"
+  "DeltaJ_pppm_gpu_cpu_error_z,compute_valid,diagnostic_checks_pass,gpu_cpu_match,"
   "DeltaJ_q_real_x,DeltaJ_q_real_y,DeltaJ_q_real_z,"
   "DeltaJ_q_total_x,DeltaJ_q_total_y,DeltaJ_q_total_z,dynamic_q_valid,charge_mode";
+
+std::string pppm_dynamic_formula_marker()
+{
+  return "# dynamic_formula_version = " +
+    std::string(PPPM::dynamic_q_formula_version());
+}
 
 void write_dynamic_metadata(std::ostream& file)
 {
   file << "# source_signature = " << PPPM_DYNAMIC_SOURCE_SIGNATURE << "\n";
   file << PPPM_DYNAMIC_DIAG_SCHEMA_MARKER << "\n";
-  file << "# dynamic_formula_version = " << PPPM_DYNAMIC_FORMULA_VERSION << "\n";
+  file << pppm_dynamic_formula_marker() << "\n";
   file << "# q_source = nep_data.charge\n";
   file << "# qdot_source = nep_data.charge_rate\n";
   file << "# q_projection = zero_total_charge(0:N)\n";
@@ -99,13 +108,19 @@ void write_dynamic_metadata(std::ostream& file)
   file << "# J_conversion = divide_by_TIME_UNIT_CONVERSION_at_CSV_write\n";
   file << "# dynamic_q_component_output_unit = DeltaJ_pppm,DeltaJ_q_real,DeltaJ_q_total = eV*Angstrom/fs\n";
   file << "# delta_j_q_pppm = reciprocal_only\n";
+  file << "# DeltaJ_pppm = GPU production reduction; DeltaJ_pppm_cpu = independent host reference\n";
+  file << "# DeltaJ_pppm_gpu_cpu_error = absolute output-unit difference; gpu_cpu_match uses mixed tolerance\n";
   file << "# delta_j_q_real = qNEP_real_space_mode1; mode2_zero\n";
   file << "# delta_j_q_real_formula = K_C_SP/2 * sum_a(qdot_a * sum_b(q_b*erfc(alpha*r_ab)/r_ab*d_ab))\n";
   file << "# delta_j_q_total = delta_j_q_pppm + mode1*delta_j_q_real; mode2=delta_j_q_pppm\n";
   file << "# charge_mode = per_row\n";
-  file << "# dynamic_q_valid = required computational checks and finite outputs passed; not CPU/GPU formula validation\n";
-  file << "# geometry_restriction = fixed orthogonal cell, post_force before compute2\n";
-  file << "# nyquist_rule = Cartesian component plane zero (orthogonal-cell candidate_v2_real_space only)\n";
+  file << "# compute_valid = finite production GPU reciprocal current was obtained\n";
+  file << "# diagnostic_checks_pass = independent diagnostic checks passed; does not gate HAC compute_valid\n";
+  file << "# dynamic_q_valid = combined reciprocal/real correction compute_valid\n";
+  file << "# gpu_cpu_match = production GPU reciprocal current matches independent CPU reference within mixed tolerance\n";
+  file << "# geometry_restriction = fixed orthogonal cell; diagnostic sampling stage is caller-defined\n";
+  file << "# nyquist_rule = Cartesian component plane zero (orthogonal-cell "
+       << PPPM::dynamic_q_formula_version() << " only)\n";
   file << "# diagnostic_relative_tolerance = 1e-5\n";
   file << "# mesh_path_scale_internal_unit = eV*Angstrom/natural_time\n";
   file << "# mesh_path_threshold_internal = diagnostic_relative_tolerance * mesh_path_scale_internal\n";
@@ -512,7 +527,7 @@ __global__ void project_dynamic_d(
       g_d_z[n] = 0.0f;
       return;
     }
-    // candidate_v2_real_space: Cartesian Nyquist-plane projection is valid only for orthogonal cells.
+    // Cartesian Nyquist-plane projection is valid only for orthogonal cells.
     g_d_x[n] = (para.K[0] % 2 == 0 && ix == para.K_half[0])
       ? 0.0f
       : 0.5f * (g_d_raw_x[n] - g_d_raw_x[n_bar]);
@@ -652,6 +667,73 @@ void __global__ find_mesh_G(
     const float G = g_G[n];
     gpufftComplex mesh = g_mesh[n];
     g_mesh_G[n] = {mesh.x * G, mesh.y * G};
+  }
+}
+
+__global__ void reduce_dynamic_mesh_current(
+  const int M,
+  const gpufftComplex* g_Q,
+  const gpufftComplex* g_S,
+  const float* g_d_x,
+  const float* g_d_y,
+  const float* g_d_z,
+  double* g_current)
+{
+  __shared__ double s_data[1024];
+  const int component = blockIdx.x;
+  const float* g_d = component == 0 ? g_d_x : (component == 1 ? g_d_y : g_d_z);
+  double sum = 0.0;
+  for (int n = threadIdx.x; n < M; n += blockDim.x) {
+    const gpufftComplex Q = g_Q[n];
+    const gpufftComplex S = g_S[n];
+    const double im_conjugate_QS = double(Q.x) * double(S.y) - double(Q.y) * double(S.x);
+    sum -= double(K_C_SP) / double(M) * double(g_d[n]) * im_conjugate_QS;
+  }
+  s_data[threadIdx.x] = sum;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) s_data[threadIdx.x] += s_data[threadIdx.x + offset];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) g_current[component] = s_data[0];
+}
+
+__global__ void reduce_dynamic_assignment_current(
+  const int M,
+  const gpufftComplex* g_Q,
+  const gpufftComplex* g_S,
+  const gpufftComplex* g_Ax,
+  const gpufftComplex* g_Ay,
+  const gpufftComplex* g_Az,
+  const gpufftComplex* g_Bx,
+  const gpufftComplex* g_By,
+  const gpufftComplex* g_Bz,
+  double* g_current)
+{
+  __shared__ double s_left[1024];
+  __shared__ double s_right[1024];
+  const int component = blockIdx.x;
+  const gpufftComplex* g_A = component == 0 ? g_Ax : (component == 1 ? g_Ay : g_Az);
+  const gpufftComplex* g_B = component == 0 ? g_Bx : (component == 1 ? g_By : g_Bz);
+  double left = 0.0;
+  double right = 0.0;
+  for (int n = threadIdx.x; n < M; n += blockDim.x) {
+    left -= double(K_C_SP) * double(g_A[n].x) * double(g_S[n].x);
+    right += double(K_C_SP) * double(g_Q[n].x) * double(g_B[n].x);
+  }
+  s_left[threadIdx.x] = left;
+  s_right[threadIdx.x] = right;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      s_left[threadIdx.x] += s_left[threadIdx.x + offset];
+      s_right[threadIdx.x] += s_right[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    g_current[3 + component] = s_left[0];
+    g_current[6 + component] = s_right[0];
   }
 }
 
@@ -1377,6 +1459,7 @@ PPPM::~PPPM()
 
 void PPPM::flush_dynamic_charge_diagnostics()
 {
+  if (!dynamic_diagnostics_enabled_) return;
   if (dynamic_csv_row_pending_) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double invalid[3] = {nan, nan, nan};
@@ -1391,7 +1474,7 @@ void PPPM::flush_dynamic_charge_diagnostics()
         csv_header.str(),
         csv_rows,
         {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-         PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+         pppm_dynamic_formula_marker(),
          PPPM_DYNAMIC_DIAG_COLUMN_HEADER})) {
     std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_diag.csv; "
                  "the existing file may have an incompatible schema."
@@ -1406,15 +1489,16 @@ void PPPM::flush_dynamic_charge_diagnostics()
   check_header << "# PPPM dynamic-q runtime checks; written after the run\n"
                << "# source_signature = " << PPPM_DYNAMIC_SOURCE_SIGNATURE << "\n"
                << PPPM_DYNAMIC_DIAG_SCHEMA_MARKER << "\n"
-               << "# dynamic_formula_version = " << PPPM_DYNAMIC_FORMULA_VERSION << "\n"
-               << "# units: mesh_path=eV*Angstrom/fs; charge_sum=e; qdot_sum=e/natural_time\n"
+               << pppm_dynamic_formula_marker() << "\n"
+               << "# units: mesh_path=eV*Angstrom/fs; DeltaJ_gpu_cpu_error=eV*Angstrom/fs; "
+                  "charge_sum=e; qdot_sum=e/natural_time\n"
                << PPPM_DYNAMIC_CHECK_COLUMN_HEADER << "\n";
   if (!append_text_file(
         "pppm_dynamic_q_check.out",
         check_header.str(),
         check_rows,
         {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-         PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+         pppm_dynamic_formula_marker(),
          PPPM_DYNAMIC_CHECK_COLUMN_HEADER})) {
     std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_check.out." << std::endl;
   } else if (!check_rows.empty()) {
@@ -1430,7 +1514,7 @@ void PPPM::flush_dynamic_charge_diagnostics()
         atom_header.str(),
         dynamic_atom_debug_buffer_,
         {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-         PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+         pppm_dynamic_formula_marker(),
          PPPM_DYNAMIC_ATOM_COLUMN_HEADER})) {
     if (!dynamic_atom_debug_buffer_.empty()) {
       std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_atom_debug.out."
@@ -1448,7 +1532,7 @@ void PPPM::flush_dynamic_charge_diagnostics()
         kspace_header.str(),
         dynamic_kspace_debug_buffer_,
         {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-         PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+         pppm_dynamic_formula_marker(),
          PPPM_DYNAMIC_KSPACE_COLUMN_HEADER})) {
     if (!dynamic_kspace_debug_buffer_.empty()) {
       std::cerr << "PPPM dynamic-q diagnostic: cannot write pppm_dynamic_q_kspace_debug.out."
@@ -1464,25 +1548,25 @@ bool PPPM::dynamic_charge_diagnostic_files_are_compatible(const bool check_debug
   if (!existing_file_has_schema(
         "pppm_dynamic_q_diag.csv",
         {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-         PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+         pppm_dynamic_formula_marker(),
          PPPM_DYNAMIC_DIAG_COLUMN_HEADER}))
     return false;
   if (!existing_file_has_schema(
         "pppm_dynamic_q_check.out",
         {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-         PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+         pppm_dynamic_formula_marker(),
          PPPM_DYNAMIC_CHECK_COLUMN_HEADER}))
     return false;
   if (check_debug_files &&
       (!existing_file_has_schema(
          "pppm_dynamic_q_atom_debug.out",
          {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-          PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+          pppm_dynamic_formula_marker(),
           PPPM_DYNAMIC_ATOM_COLUMN_HEADER}) ||
        !existing_file_has_schema(
          "pppm_dynamic_q_kspace_debug.out",
          {PPPM_DYNAMIC_DIAG_SCHEMA_MARKER,
-          PPPM_DYNAMIC_DIAG_FORMULA_MARKER,
+          pppm_dynamic_formula_marker(),
           PPPM_DYNAMIC_KSPACE_COLUMN_HEADER})))
     return false;
   return true;
@@ -1811,6 +1895,7 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
 void PPPM::initialize(const float alpha_input)
 {
   dynamic_operator_cache_valid_ = false;
+  dynamic_operator_host_cache_valid_ = false;
   need_peratom_virial = check_need_peratom_virial();
   need_peratom_virial_every_batch = check_need_peratom_virial_every_batch();
   para.alpha = alpha_input;
@@ -1849,6 +1934,244 @@ void PPPM::find_para(const int N, const Box& box)
     para.b[1][d] = two_pi * (float)box.cpu_h[12 + d];
     para.b[2][d] = two_pi * (float)box.cpu_h[15 + d];
   }
+}
+
+void PPPM::resize_dynamic_charge_workspace(const int M, const bool diagnostic)
+{
+  if (dynamic_Q_.size() != static_cast<size_t>(M)) {
+    dynamic_Q_.resize(M);
+    dynamic_S_.resize(M);
+    dynamic_Ax_.resize(M);
+    dynamic_Ay_.resize(M);
+    dynamic_Az_.resize(M);
+    dynamic_Bx_.resize(M);
+    dynamic_By_.resize(M);
+    dynamic_Bz_.resize(M);
+    dynamic_d_raw_x_.resize(M);
+    dynamic_d_raw_y_.resize(M);
+    dynamic_d_raw_z_.resize(M);
+    dynamic_d_x_.resize(M);
+    dynamic_d_y_.resize(M);
+    dynamic_d_z_.resize(M);
+    dynamic_operator_cache_valid_ = false;
+    dynamic_operator_host_cache_valid_ = false;
+  }
+  if (diagnostic && dynamic_L1S_x_.size() != static_cast<size_t>(M)) {
+    dynamic_L1S_x_.resize(M);
+    dynamic_L1S_y_.resize(M);
+    dynamic_L1S_z_.resize(M);
+    dynamic_h_d_x_.resize(M);
+    dynamic_h_d_y_.resize(M);
+    dynamic_h_d_z_.resize(M);
+    dynamic_operator_host_cache_valid_ = false;
+  }
+  if (dynamic_current_total_.size() != 9) dynamic_current_total_.resize(9);
+}
+
+void PPPM::prepare_dynamic_operator(const int N, const Box& box, const int grid_size)
+{
+  bool operator_cache_match = dynamic_operator_cache_valid_ && dynamic_operator_N_ == N &&
+    dynamic_operator_alpha_ == para.alpha;
+  for (int d = 0; d < 3; ++d) {
+    operator_cache_match = operator_cache_match && dynamic_operator_K_[d] == para.K[d];
+  }
+  for (int i = 0; i < 9; ++i) {
+    operator_cache_match = operator_cache_match && dynamic_operator_box_[i] == box.cpu_h[i];
+  }
+  if (operator_cache_match) return;
+
+  find_k_and_G_opt<<<grid_size, 64>>>(para, kx.data(), ky.data(), kz.data(), G.data());
+  GPU_CHECK_KERNEL
+  find_dynamic_d_raw<<<grid_size, 64>>>(
+    para,
+    box,
+    kx.data(),
+    ky.data(),
+    kz.data(),
+    G.data(),
+    dynamic_d_raw_x_.data(),
+    dynamic_d_raw_y_.data(),
+    dynamic_d_raw_z_.data());
+  GPU_CHECK_KERNEL
+  project_dynamic_d<<<grid_size, 64>>>(
+    para,
+    dynamic_d_raw_x_.data(),
+    dynamic_d_raw_y_.data(),
+    dynamic_d_raw_z_.data(),
+    dynamic_d_x_.data(),
+    dynamic_d_y_.data(),
+    dynamic_d_z_.data());
+  GPU_CHECK_KERNEL
+
+  dynamic_operator_N_ = N;
+  dynamic_operator_alpha_ = para.alpha;
+  for (int d = 0; d < 3; ++d) dynamic_operator_K_[d] = para.K[d];
+  for (int i = 0; i < 9; ++i) dynamic_operator_box_[i] = box.cpu_h[i];
+  dynamic_operator_cache_valid_ = true;
+  dynamic_operator_host_cache_valid_ = false;
+}
+
+void PPPM::cache_dynamic_operator_on_host()
+{
+  const int M = para.K0K1K2;
+  dynamic_d_x_.copy_to_host(dynamic_h_d_x_.data(), M);
+  dynamic_d_y_.copy_to_host(dynamic_h_d_y_.data(), M);
+  dynamic_d_z_.copy_to_host(dynamic_h_d_z_.data(), M);
+  dynamic_operator_finite_ = true;
+  dynamic_operator_max_odd_error_[0] = 0.0;
+  dynamic_operator_max_odd_error_[1] = 0.0;
+  dynamic_operator_max_odd_error_[2] = 0.0;
+  for (int n = 0; n < M; ++n) {
+    if (!std::isfinite(static_cast<double>(dynamic_h_d_x_[n])) ||
+        !std::isfinite(static_cast<double>(dynamic_h_d_y_[n])) ||
+        !std::isfinite(static_cast<double>(dynamic_h_d_z_[n]))) {
+      dynamic_operator_finite_ = false;
+    }
+    const int iz = n / para.K0K1;
+    const int iy = (n - iz * para.K0K1) / para.K[0];
+    const int ix = n % para.K[0];
+    const int ix_bar = (para.K[0] - ix) % para.K[0];
+    const int iy_bar = (para.K[1] - iy) % para.K[1];
+    const int iz_bar = (para.K[2] - iz) % para.K[2];
+    const int n_bar = ix_bar + para.K[0] * (iy_bar + para.K[1] * iz_bar);
+    const double odd_x =
+      std::fabs(double(dynamic_h_d_x_[n_bar]) + double(dynamic_h_d_x_[n]));
+    const double odd_y =
+      std::fabs(double(dynamic_h_d_y_[n_bar]) + double(dynamic_h_d_y_[n]));
+    const double odd_z =
+      std::fabs(double(dynamic_h_d_z_[n_bar]) + double(dynamic_h_d_z_[n]));
+    if (odd_x > dynamic_operator_max_odd_error_[0])
+      dynamic_operator_max_odd_error_[0] = odd_x;
+    if (odd_y > dynamic_operator_max_odd_error_[1])
+      dynamic_operator_max_odd_error_[1] = odd_y;
+    if (odd_z > dynamic_operator_max_odd_error_[2])
+      dynamic_operator_max_odd_error_[2] = odd_z;
+  }
+  dynamic_operator_host_cache_valid_ = true;
+}
+
+bool PPPM::compute_dynamic_charge_correction(
+  const int N,
+  const int N1,
+  const int N2,
+  const Box& box,
+  const GPU_Vector<float>& charge,
+  const GPU_Vector<float>& charge_rate,
+  const GPU_Vector<double>& position,
+  double* delta_j_q_pppm)
+{
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  dynamic_q_last_compute_valid_ = false;
+  dynamic_q_last_diagnostic_checks_pass_ = false;
+  if (delta_j_q_pppm != nullptr) {
+    delta_j_q_pppm[0] = nan;
+    delta_j_q_pppm[1] = nan;
+    delta_j_q_pppm[2] = nan;
+  }
+  if (
+    N <= 0 || N1 < 0 || N2 > N || N1 >= N2 || charge.size() < static_cast<size_t>(N) ||
+    charge_rate.size() < static_cast<size_t>(N) || position.size() < static_cast<size_t>(3 * N)) {
+    std::cerr << "PPPM dynamic-q current: invalid atom range or buffer sizes." << std::endl;
+    return false;
+  }
+  if (!box.is_orthogonal) {
+    std::cerr << "PPPM dynamic-q current requires an orthogonal cell."
+              << std::endl;
+    return false;
+  }
+
+  find_para(N, box);
+  const int M = para.K0K1K2;
+  const int mesh_grid_size = (M - 1) / 64 + 1;
+  const int atom_grid_size = (N2 - N1 - 1) / 64 + 1;
+  resize_dynamic_charge_workspace(M, false);
+  const gpufftComplex zero = {0.0f, 0.0f};
+  dynamic_Q_.fill(zero);
+  dynamic_S_.fill(zero);
+  dynamic_Ax_.fill(zero);
+  dynamic_Ay_.fill(zero);
+  dynamic_Az_.fill(zero);
+  dynamic_Bx_.fill(zero);
+  dynamic_By_.fill(zero);
+  dynamic_Bz_.fill(zero);
+  prepare_dynamic_operator(N, box, mesh_grid_size);
+
+  find_dynamic_mesh<<<atom_grid_size, 64>>>(
+    N1,
+    N2,
+    para,
+    box,
+    charge.data(),
+    charge_rate.data(),
+    position.data(),
+    position.data() + N,
+    position.data() + 2 * N,
+    dynamic_Q_.data(),
+    dynamic_S_.data(),
+    dynamic_Ax_.data(),
+    dynamic_Ay_.data(),
+    dynamic_Az_.data(),
+    dynamic_Bx_.data(),
+    dynamic_By_.data(),
+    dynamic_Bz_.data());
+  GPU_CHECK_KERNEL
+
+  if (gpufftExecC2C(plan, dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q current Q forward failed" << std::endl;
+    return false;
+  }
+  if (gpufftExecC2C(plan, dynamic_S_.data(), dynamic_S_.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q current S forward failed" << std::endl;
+    return false;
+  }
+  reduce_dynamic_mesh_current<<<3, 1024>>>(
+    M,
+    dynamic_Q_.data(),
+    dynamic_S_.data(),
+    dynamic_d_x_.data(),
+    dynamic_d_y_.data(),
+    dynamic_d_z_.data(),
+    dynamic_current_total_.data());
+  GPU_CHECK_KERNEL
+
+  find_mesh_G<<<mesh_grid_size, 64>>>(
+    para, G.data(), dynamic_Q_.data(), dynamic_Q_.data());
+  GPU_CHECK_KERNEL
+  find_mesh_G<<<mesh_grid_size, 64>>>(
+    para, G.data(), dynamic_S_.data(), dynamic_S_.data());
+  GPU_CHECK_KERNEL
+  if (gpufftExecC2C(plan, dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q current LQ inverse failed" << std::endl;
+    return false;
+  }
+  if (gpufftExecC2C(plan, dynamic_S_.data(), dynamic_S_.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
+    std::cerr << "GPUFFT error: dynamic-q current LS inverse failed" << std::endl;
+    return false;
+  }
+  reduce_dynamic_assignment_current<<<3, 1024>>>(
+    M,
+    dynamic_Q_.data(),
+    dynamic_S_.data(),
+    dynamic_Ax_.data(),
+    dynamic_Ay_.data(),
+    dynamic_Az_.data(),
+    dynamic_Bx_.data(),
+    dynamic_By_.data(),
+    dynamic_Bz_.data(),
+    dynamic_current_total_.data());
+  GPU_CHECK_KERNEL
+
+  double host_current[9] = {0.0};
+  dynamic_current_total_.copy_to_host(host_current);
+  bool valid = true;
+  for (int n = 0; n < 9; ++n) valid = valid && std::isfinite(host_current[n]);
+  for (int d = 0; d < 3; ++d) {
+    const double value = host_current[d] + host_current[3 + d] + host_current[6 + d];
+    valid = valid && std::isfinite(value);
+    if (delta_j_q_pppm != nullptr) delta_j_q_pppm[d] = value;
+  }
+  dynamic_q_last_compute_valid_ = valid;
+  return valid;
 }
 
 void PPPM::find_force(
@@ -2235,18 +2558,23 @@ bool PPPM::diagnose_dynamic_charge(
   const bool write_debug,
   double* delta_j_q_pppm)
 {
+  dynamic_diagnostics_enabled_ = true;
+  dynamic_q_last_compute_valid_ = false;
+  dynamic_q_last_diagnostic_checks_pass_ = false;
   if (delta_j_q_pppm != nullptr) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     delta_j_q_pppm[0] = nan;
     delta_j_q_pppm[1] = nan;
     delta_j_q_pppm[2] = nan;
   }
-  if (N <= 0 || N1 < 0 || N2 > N || N1 >= N2) {
-    std::cerr << "PPPM dynamic-q diagnostic: invalid atom range." << std::endl;
+  if (
+    N <= 0 || N1 < 0 || N2 > N || N1 >= N2 || charge.size() < static_cast<size_t>(N) ||
+    charge_rate.size() < static_cast<size_t>(N) || position.size() < static_cast<size_t>(3 * N)) {
+    std::cerr << "PPPM dynamic-q diagnostic: invalid atom range or buffer sizes." << std::endl;
     return false;
   }
   if (!box.is_orthogonal) {
-    std::cerr << "PPPM dynamic-q diagnostic: candidate_v2_real_space requires an orthogonal cell."
+    std::cerr << "PPPM dynamic-q diagnostic requires an orthogonal cell."
               << std::endl;
     return false;
   }
@@ -2277,29 +2605,7 @@ bool PPPM::diagnose_dynamic_charge(
   GPU_Vector<float>& d_y = dynamic_d_y_;
   GPU_Vector<float>& d_z = dynamic_d_z_;
 
-  if (Q.size() != static_cast<size_t>(M)) {
-    Q.resize(M);
-    S.resize(M);
-    Ax.resize(M);
-    Ay.resize(M);
-    Az.resize(M);
-    Bx.resize(M);
-    By.resize(M);
-    Bz.resize(M);
-    L1S_x.resize(M);
-    L1S_y.resize(M);
-    L1S_z.resize(M);
-    d_raw_x.resize(M);
-    d_raw_y.resize(M);
-    d_raw_z.resize(M);
-    d_x.resize(M);
-    d_y.resize(M);
-    d_z.resize(M);
-    dynamic_h_d_x_.resize(M);
-    dynamic_h_d_y_.resize(M);
-    dynamic_h_d_z_.resize(M);
-    dynamic_operator_cache_valid_ = false;
-  }
+  resize_dynamic_charge_workspace(M, true);
 
   Q.fill(zero);
   S.fill(zero);
@@ -2310,78 +2616,8 @@ bool PPPM::diagnose_dynamic_charge(
   By.fill(zero);
   Bz.fill(zero);
 
-  bool operator_cache_match = dynamic_operator_cache_valid_ && dynamic_operator_N_ == N &&
-    dynamic_operator_alpha_ == para.alpha;
-  for (int d = 0; d < 3; ++d) {
-    operator_cache_match = operator_cache_match && dynamic_operator_K_[d] == para.K[d];
-  }
-  for (int i = 0; i < 9; ++i) {
-    operator_cache_match = operator_cache_match && dynamic_operator_box_[i] == box.cpu_h[i];
-  }
-  if (!operator_cache_match) {
-    find_k_and_G_opt<<<grid_size, 64>>>(para, kx.data(), ky.data(), kz.data(), G.data());
-    GPU_CHECK_KERNEL
-
-    find_dynamic_d_raw<<<grid_size, 64>>>(
-      para,
-      box,
-      kx.data(),
-      ky.data(),
-      kz.data(),
-      G.data(),
-      d_raw_x.data(),
-      d_raw_y.data(),
-      d_raw_z.data());
-    GPU_CHECK_KERNEL
-    project_dynamic_d<<<grid_size, 64>>>(
-      para,
-      d_raw_x.data(),
-      d_raw_y.data(),
-      d_raw_z.data(),
-      d_x.data(),
-      d_y.data(),
-      d_z.data());
-    GPU_CHECK_KERNEL
-
-    d_x.copy_to_host(dynamic_h_d_x_.data(), M);
-    d_y.copy_to_host(dynamic_h_d_y_.data(), M);
-    d_z.copy_to_host(dynamic_h_d_z_.data(), M);
-    dynamic_operator_finite_ = true;
-    dynamic_operator_max_odd_error_[0] = 0.0;
-    dynamic_operator_max_odd_error_[1] = 0.0;
-    dynamic_operator_max_odd_error_[2] = 0.0;
-    for (int n = 0; n < M; ++n) {
-      if (!std::isfinite(static_cast<double>(dynamic_h_d_x_[n])) ||
-          !std::isfinite(static_cast<double>(dynamic_h_d_y_[n])) ||
-          !std::isfinite(static_cast<double>(dynamic_h_d_z_[n]))) {
-        dynamic_operator_finite_ = false;
-      }
-      const int iz = n / para.K0K1;
-      const int iy = (n - iz * para.K0K1) / para.K[0];
-      const int ix = n % para.K[0];
-      const int ix_bar = (para.K[0] - ix) % para.K[0];
-      const int iy_bar = (para.K[1] - iy) % para.K[1];
-      const int iz_bar = (para.K[2] - iz) % para.K[2];
-      const int n_bar = ix_bar + para.K[0] * (iy_bar + para.K[1] * iz_bar);
-      const double odd_x =
-        std::fabs(double(dynamic_h_d_x_[n_bar]) + double(dynamic_h_d_x_[n]));
-      const double odd_y =
-        std::fabs(double(dynamic_h_d_y_[n_bar]) + double(dynamic_h_d_y_[n]));
-      const double odd_z =
-        std::fabs(double(dynamic_h_d_z_[n_bar]) + double(dynamic_h_d_z_[n]));
-      if (odd_x > dynamic_operator_max_odd_error_[0])
-        dynamic_operator_max_odd_error_[0] = odd_x;
-      if (odd_y > dynamic_operator_max_odd_error_[1])
-        dynamic_operator_max_odd_error_[1] = odd_y;
-      if (odd_z > dynamic_operator_max_odd_error_[2])
-        dynamic_operator_max_odd_error_[2] = odd_z;
-    }
-    dynamic_operator_N_ = N;
-    dynamic_operator_alpha_ = para.alpha;
-    for (int d = 0; d < 3; ++d) dynamic_operator_K_[d] = para.K[d];
-    for (int i = 0; i < 9; ++i) dynamic_operator_box_[i] = box.cpu_h[i];
-    dynamic_operator_cache_valid_ = true;
-  }
+  prepare_dynamic_operator(N, box, grid_size);
+  if (!dynamic_operator_host_cache_valid_) cache_dynamic_operator_on_host();
 
   find_dynamic_mesh<<<(N2 - N1 - 1) / 64 + 1, 64>>>(
     N1,
@@ -2427,17 +2663,18 @@ bool PPPM::diagnose_dynamic_charge(
     }
     std::ostringstream row;
     row << std::scientific << std::setprecision(16) << PPPM_DYNAMIC_SOURCE_SIGNATURE << ","
-        << PPPM_DYNAMIC_FORMULA_VERSION << "," << step << "," << time_fs << ","
+        << PPPM::dynamic_q_formula_version() << "," << step << "," << time_fs << ","
         << pppm_call_index << "," << bead_id << "," << N << "," << N1 << "," << N2 << ","
         << para.K[0] << "," << para.K[1] << "," << para.K[2] << "," << M << "," << para.alpha
         << "," << K_C_SP << "," << TIME_UNIT_CONVERSION;
-    for (int column = 16; column < 72; ++column) row << "," << nan;
+    // Keep the deferred real/total correction fields for finalize_dynamic_charge_diagnostic.
+    for (int column = 16; column < 84; ++column) row << "," << nan;
     dynamic_csv_row_ = row.str();
     dynamic_csv_row_pending_ = true;
     dynamic_check_buffer_ << std::scientific << std::setprecision(16) << step << " " << time_fs
                           << " " << bead_id << " " << pppm_call_index << " " << nan << " " << nan
                           << " " << nan << " 0 0 0 " << nan << " " << nan << " " << nan << " "
-                          << nan << " " << nan << " " << nan << "\n";
+                          << nan << " " << nan << " " << nan << " 0 0 0 " << nan << "\n";
     return false;
   };
 
@@ -2447,6 +2684,15 @@ bool PPPM::diagnose_dynamic_charge(
   if (gpufftExecC2C(plan, S.data(), S.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS) {
     return stage_dynamic_fft_failure("S forward");
   }
+  reduce_dynamic_mesh_current<<<3, 1024>>>(
+    M,
+    Q.data(),
+    S.data(),
+    d_x.data(),
+    d_y.data(),
+    d_z.data(),
+    dynamic_current_total_.data());
+  GPU_CHECK_KERNEL
   std::vector<gpufftComplex> h_rho(M), h_s(M);
   Q.copy_to_host(h_rho.data(), M);
   S.copy_to_host(h_s.data(), M);
@@ -2472,14 +2718,75 @@ bool PPPM::diagnose_dynamic_charge(
   if (gpufftExecC2C(plan, S.data(), S.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
     return stage_dynamic_fft_failure("LS inverse");
   }
+  reduce_dynamic_assignment_current<<<3, 1024>>>(
+    M,
+    Q.data(),
+    S.data(),
+    Ax.data(),
+    Ay.data(),
+    Az.data(),
+    Bx.data(),
+    By.data(),
+    Bz.data(),
+    dynamic_current_total_.data());
+  GPU_CHECK_KERNEL
+  double h_gpu_current[9] = {0.0};
+  dynamic_current_total_.copy_to_host(h_gpu_current);
+  bool compute_valid = true;
+  for (int n = 0; n < 9; ++n) compute_valid = compute_valid && std::isfinite(h_gpu_current[n]);
+  double production_current[3] = {0.0, 0.0, 0.0};
+  for (int d = 0; d < 3; ++d) {
+    production_current[d] = h_gpu_current[d] + h_gpu_current[3 + d] + h_gpu_current[6 + d];
+    compute_valid = compute_valid && std::isfinite(production_current[d]);
+  }
+  dynamic_q_last_compute_valid_ = compute_valid;
+  if (delta_j_q_pppm != nullptr && compute_valid) {
+    for (int d = 0; d < 3; ++d) delta_j_q_pppm[d] = production_current[d];
+  }
+  auto stage_diagnostic_fft_failure = [&](const char* stage) {
+    std::cerr << "GPUFFT error: dynamic-q diagnostic " << stage << " failed" << std::endl;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    if (dynamic_csv_row_pending_) {
+      const double invalid[3] = {nan, nan, nan};
+      finalize_dynamic_charge_diagnostic(invalid, invalid, false, -1);
+    }
+    std::ostringstream row;
+    row << std::scientific << std::setprecision(16) << PPPM_DYNAMIC_SOURCE_SIGNATURE << ","
+        << PPPM::dynamic_q_formula_version() << "," << step << "," << time_fs << ","
+        << pppm_call_index << "," << bead_id << "," << N << "," << N1 << "," << N2 << ","
+        << para.K[0] << "," << para.K[1] << "," << para.K[2] << "," << M << "," << para.alpha
+        << "," << K_C_SP << "," << TIME_UNIT_CONVERSION;
+    for (int column = 16; column < 84; ++column) {
+      if (column >= 44 && column <= 46) {
+        row << "," << production_current[column - 44] / TIME_UNIT_CONVERSION;
+      } else if (column >= 72 && column <= 74) {
+        row << "," << production_current[column - 72] / TIME_UNIT_CONVERSION;
+      } else if (column == 81) {
+        row << "," << (compute_valid ? 1 : 0);
+      } else if (column == 82 || column == 83) {
+        row << ",0";
+      } else {
+        row << "," << nan;
+      }
+    }
+    dynamic_csv_row_ = row.str();
+    dynamic_csv_row_pending_ = true;
+    dynamic_check_buffer_ << std::scientific << std::setprecision(16) << step << " " << time_fs
+                          << " " << bead_id << " " << pppm_call_index << " " << nan << " " << nan
+                          << " " << nan << " 0 0 0 " << nan << " " << nan << " " << nan << " "
+                          << nan << " " << nan << " " << nan << " " << (compute_valid ? 1 : 0)
+                          << " 0 0 " << nan << "\n";
+    dynamic_q_last_diagnostic_checks_pass_ = false;
+    return compute_valid;
+  };
   if (gpufftExecC2C(plan, L1S_x.data(), L1S_x.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
-    return stage_dynamic_fft_failure("L1S-x inverse");
+    return stage_diagnostic_fft_failure("L1S-x inverse");
   }
   if (gpufftExecC2C(plan, L1S_y.data(), L1S_y.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
-    return stage_dynamic_fft_failure("L1S-y inverse");
+    return stage_diagnostic_fft_failure("L1S-y inverse");
   }
   if (gpufftExecC2C(plan, L1S_z.data(), L1S_z.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS) {
-    return stage_dynamic_fft_failure("L1S-z inverse");
+    return stage_diagnostic_fft_failure("L1S-z inverse");
   }
   std::vector<gpufftComplex> h_LQ(M), h_LS(M), h_L1S_x(M), h_L1S_y(M), h_L1S_z(M);
   Q.copy_to_host(h_LQ.data(), M);
@@ -2623,17 +2930,37 @@ bool PPPM::diagnose_dynamic_charge(
     J_ass_left[1] + J_ass_right[1],
     J_ass_left[2] + J_ass_right[2]};
   const double J_mesh[3] = {J_mesh_fourier[0], J_mesh_fourier[1], J_mesh_fourier[2]};
-  const double DeltaJ[3] = {
+  const double DeltaJ_cpu[3] = {
     J_ass[0] + J_mesh[0],
     J_ass[1] + J_mesh[1],
     J_ass[2] + J_mesh[2]};
+  const double inv_time = 1.0 / TIME_UNIT_CONVERSION;
+  double DeltaJ_gpu[3] = {0.0, 0.0, 0.0};
+  double DeltaJ_gpu_cpu_error[3] = {0.0, 0.0, 0.0};
+  bool gpu_cpu_match = true;
+  double max_abs_gpu_cpu_error = 0.0;
+  for (int d = 0; d < 3; ++d) {
+    DeltaJ_gpu[d] = production_current[d];
+    DeltaJ_gpu_cpu_error[d] = std::fabs((DeltaJ_gpu[d] - DeltaJ_cpu[d]) * inv_time);
+    const double scale = std::max(
+      std::fabs(DeltaJ_gpu[d] * inv_time), std::fabs(DeltaJ_cpu[d] * inv_time));
+    gpu_cpu_match = gpu_cpu_match &&
+      DeltaJ_gpu_cpu_error[d] <= 1.0e-8 + 1.0e-5 * scale;
+    if (!std::isfinite(DeltaJ_gpu_cpu_error[d])) {
+      max_abs_gpu_cpu_error = std::numeric_limits<double>::quiet_NaN();
+    } else if (std::isfinite(max_abs_gpu_cpu_error) &&
+               DeltaJ_gpu_cpu_error[d] > max_abs_gpu_cpu_error) {
+      max_abs_gpu_cpu_error = DeltaJ_gpu_cpu_error[d];
+    }
+  }
+  const double DeltaJ[3] = {DeltaJ_gpu[0], DeltaJ_gpu[1], DeltaJ_gpu[2]};
   bool derived_values_finite = std::isfinite(mesh_path_error) && std::isfinite(mesh_path_scale) &&
     std::isfinite(mesh_path_threshold);
   for (int d = 0; d < 3; ++d) {
     derived_values_finite = derived_values_finite && std::isfinite(J_ass_left[d]) &&
       std::isfinite(J_ass_right[d]) && std::isfinite(J_mesh_fourier[d]) &&
       std::isfinite(J_mesh_realspace[d]) && std::isfinite(J_ass[d]) && std::isfinite(J_mesh[d]) &&
-      std::isfinite(DeltaJ[d]);
+      std::isfinite(DeltaJ_cpu[d]) && std::isfinite(DeltaJ[d]);
   }
   all_values_finite = all_values_finite && derived_values_finite;
   const bool assignment_sums_ok =
@@ -2641,17 +2968,19 @@ bool PPPM::diagnose_dynamic_charge(
     within_relative_tolerance(assignment_qdot_sum_error, sum_qdot_assign);
   const bool mesh_path_ok =
     all_values_finite && mesh_path_error <= mesh_path_threshold;
-  const bool result_valid = all_values_finite && assignment_sums_ok && mesh_path_ok;
-  if (delta_j_q_pppm != nullptr && result_valid) {
+  const bool diagnostic_checks_pass =
+    compute_valid && all_values_finite && assignment_sums_ok && mesh_path_ok && gpu_cpu_match;
+  dynamic_q_last_compute_valid_ = compute_valid;
+  dynamic_q_last_diagnostic_checks_pass_ = diagnostic_checks_pass;
+  if (delta_j_q_pppm != nullptr && compute_valid) {
     delta_j_q_pppm[0] = DeltaJ[0];
     delta_j_q_pppm[1] = DeltaJ[1];
     delta_j_q_pppm[2] = DeltaJ[2];
   }
 
-  const double inv_time = 1.0 / TIME_UNIT_CONVERSION;
   std::ostringstream dynamic_csv_row;
   dynamic_csv_row << std::scientific << std::setprecision(16)
-                  << PPPM_DYNAMIC_SOURCE_SIGNATURE << "," << PPPM_DYNAMIC_FORMULA_VERSION << ","
+                  << PPPM_DYNAMIC_SOURCE_SIGNATURE << "," << PPPM::dynamic_q_formula_version() << ","
                   << step << "," << time_fs << "," << pppm_call_index << "," << bead_id << ","
                   << N << "," << N1 << "," << N2 << "," << para.K[0] << "," << para.K[1] << ","
                   << para.K[2] << "," << M << "," << para.alpha << "," << K_C_SP << ","
@@ -2673,6 +3002,11 @@ bool PPPM::diagnose_dynamic_charge(
   for (int i = 0; i < 9; ++i) dynamic_csv_row << "," << box.cpu_h[i];
   dynamic_csv_row << "," << mesh_path_scale << "," << mesh_path_threshold << ","
                   << mesh_path_scale * inv_time << "," << mesh_path_threshold * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_row << "," << DeltaJ_gpu[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_row << "," << DeltaJ_cpu[d] * inv_time;
+  for (int d = 0; d < 3; ++d) dynamic_csv_row << "," << DeltaJ_gpu_cpu_error[d];
+  dynamic_csv_row << "," << (compute_valid ? 1 : 0) << ","
+                  << (diagnostic_checks_pass ? 1 : 0) << "," << (gpu_cpu_match ? 1 : 0);
   if (dynamic_csv_row_pending_) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double invalid[3] = {nan, nan, nan};
@@ -2687,7 +3021,9 @@ bool PPPM::diagnose_dynamic_charge(
                         << (assignment_sums_ok ? 1 : 0) << " " << (mesh_path_ok ? 1 : 0) << " "
                         << (all_values_finite ? 1 : 0) << " " << max_odd_error[0] << " "
                         << max_odd_error[1] << " " << max_odd_error[2] << " " << max_imag_L1S[0] << " "
-                        << max_imag_L1S[1] << " " << max_imag_L1S[2] << "\n";
+                        << max_imag_L1S[1] << " " << max_imag_L1S[2] << " "
+                        << (compute_valid ? 1 : 0) << " " << (diagnostic_checks_pass ? 1 : 0) << " "
+                        << (gpu_cpu_match ? 1 : 0) << " " << max_abs_gpu_cpu_error << "\n";
 
   if (emit_debug) {
     std::vector<double> h_position(3 * N);
@@ -2730,5 +3066,5 @@ bool PPPM::diagnose_dynamic_charge(
     dynamic_debug_written_ = true;
   }
 
-  return result_valid;
+  return compute_valid;
 }

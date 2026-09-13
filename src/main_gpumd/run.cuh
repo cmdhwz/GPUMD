@@ -71,6 +71,8 @@ private:
   double initial_temperature; // initial temperature for velocity
   double time_step = 1.0 / TIME_UNIT_CONVERSION;
   double max_distance_per_step = -1.0;
+  bool hac_current_option_seen_ = false;
+  bool hac_current_qnep_full_a_ = false;
   Atom atom;
   GPU_Vector<double> thermo; // some thermodynamic quantities
   Velocity velocity;

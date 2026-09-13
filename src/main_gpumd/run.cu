@@ -319,6 +319,7 @@ void Run::perform_a_run()
       compute2_begin = std::chrono::high_resolution_clock::now();
     }
     integrate.compute2(time_step, double(step) / number_of_steps, group, box, atom, thermo, force);
+    force.notify_velocity_update();
     atom.update_unwrapped_position(box);
     if (profile_pimd_bead_parallel) {
       CHECK(gpuSetDevice(0));
@@ -602,9 +603,30 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     std::unique_ptr<Action> action;
     action.reset(new Compute_es(param, num_param));
     measure.actions.emplace_back(std::move(action));
+  } else if (strcmp(param[0], "hac_current") == 0) {
+    if (num_param != 2) {
+      PRINT_INPUT_ERROR("hac_current should have exactly one parameter: legacy or qnep_full_a.\n");
+    }
+    if (hac_current_option_seen_) {
+      PRINT_INPUT_ERROR("hac_current may appear only once in one run.\n");
+    }
+    if (strcmp(param[1], "legacy") == 0) {
+      hac_current_qnep_full_a_ = false;
+    } else if (strcmp(param[1], "qnep_full_a") == 0) {
+      hac_current_qnep_full_a_ = true;
+    } else {
+      PRINT_INPUT_ERROR("hac_current must be legacy or qnep_full_a.\n");
+    }
+    hac_current_option_seen_ = true;
+    for (auto& action : measure.actions) {
+      if (action->action_name == "compute_hac") {
+        auto* hac = dynamic_cast<HAC*>(action.get());
+        if (hac != nullptr) hac->set_qnep_full_a(hac_current_qnep_full_a_);
+      }
+    }
   } else if (strcmp(param[0], "compute_hac") == 0) {
     std::unique_ptr<Action> action;
-    action.reset(new HAC(param, num_param));
+    action.reset(new HAC(param, num_param, hac_current_qnep_full_a_));
     measure.actions.emplace_back(std::move(action));
   } else if (strcmp(param[0], "compute_proton_tunneling") == 0) {
     std::unique_ptr<Property> property;
@@ -1041,6 +1063,8 @@ void Run::parse_run(const char** param, int num_param)
   force.delta_T = (integrate.temperature2 - integrate.temperature1) / number_of_steps;
 
   perform_a_run();
+  hac_current_option_seen_ = false;
+  hac_current_qnep_full_a_ = false;
 }
 
 static __global__ void gpu_deform_atom(

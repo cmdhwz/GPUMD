@@ -49,6 +49,10 @@ class PPPM
 public:
   PPPM();
   ~PPPM();
+  static constexpr const char* dynamic_q_formula_version()
+  {
+    return "candidate_v2_real_space";
+  }
   void initialize(const float alpha_input);
   void set_mesh_spacing(const double value) { mesh_spacing = value; }
   double get_mesh_spacing() const { return mesh_spacing; }
@@ -64,8 +68,15 @@ public:
   void reset_dynamic_charge_cache()
   {
     dynamic_debug_requested_step_ = -1;
+    dynamic_q_last_compute_valid_ = false;
+    dynamic_q_last_diagnostic_checks_pass_ = false;
   }
   void request_dynamic_charge_debug(const int step) { dynamic_debug_requested_step_ = step; }
+  void enable_dynamic_charge_diagnostics() { dynamic_diagnostics_enabled_ = true; }
+  bool get_last_dynamic_q_diagnostic_checks_pass() const
+  {
+    return dynamic_q_last_diagnostic_checks_pass_;
+  }
   void flush_dynamic_charge_diagnostics();
   bool dynamic_charge_diagnostic_files_are_compatible(const bool check_debug_files) const;
   void find_force(
@@ -107,6 +118,16 @@ public:
     const bool write_debug,
     // The reciprocal correction is returned in eV*Angstrom/natural_time.
     double* delta_j_q_pppm = nullptr);
+  bool compute_dynamic_charge_correction(
+    const int N,
+    const int N1,
+    const int N2,
+    const Box& box,
+    const GPU_Vector<float>& charge,
+    const GPU_Vector<float>& charge_rate,
+    const GPU_Vector<double>& position,
+    // The reciprocal correction is returned in eV*Angstrom/natural_time.
+    double* delta_j_q_pppm = nullptr);
   void finalize_dynamic_charge_diagnostic(
     const double* delta_j_q_real,
     const double* delta_j_q_total,
@@ -142,6 +163,9 @@ private:
   std::string debug_prefix_;
   int debug_frame_ = 0;
   long long dynamic_call_index_ = 0;
+  bool dynamic_diagnostics_enabled_ = false;
+  bool dynamic_q_last_compute_valid_ = false;
+  bool dynamic_q_last_diagnostic_checks_pass_ = false;
   bool dynamic_debug_written_ = false;
   bool dynamic_csv_row_pending_ = false;
   std::string dynamic_csv_row_;
@@ -161,6 +185,7 @@ private:
   GPU_Vector<gpufftComplex> dynamic_L1S_x_;
   GPU_Vector<gpufftComplex> dynamic_L1S_y_;
   GPU_Vector<gpufftComplex> dynamic_L1S_z_;
+  GPU_Vector<double> dynamic_current_total_;
   GPU_Vector<float> dynamic_d_raw_x_;
   GPU_Vector<float> dynamic_d_raw_y_;
   GPU_Vector<float> dynamic_d_raw_z_;
@@ -173,6 +198,7 @@ private:
   float dynamic_operator_alpha_ = 0.0f;
   double dynamic_operator_box_[9] = {0.0};
   bool dynamic_operator_finite_ = false;
+  bool dynamic_operator_host_cache_valid_ = false;
   double dynamic_operator_max_odd_error_[3] = {0.0, 0.0, 0.0};
   std::vector<float> dynamic_h_d_x_;
   std::vector<float> dynamic_h_d_y_;
@@ -197,6 +223,9 @@ private:
   void allocate_virial_memory();
   void allocate_batch_memory(const int number_of_beads);
   void find_para(const int N, const Box& box);
+  void resize_dynamic_charge_workspace(const int M, const bool diagnostic);
+  void prepare_dynamic_operator(const int N, const Box& box, const int grid_size);
+  void cache_dynamic_operator_on_host();
   void find_k_and_G(const double* box);
   void write_debug(
     const int N,

@@ -23,6 +23,44 @@
 
 class NEP_Charge;
 
+struct QNEP_Full_A_Current_Workspace
+{
+  int number_of_pair_blocks = 0;
+  GPU_Vector<double> gpu_means;
+  GPU_Vector<double> gpu_c;
+  GPU_Vector<double> gpu_partial;
+  GPU_Vector<double> gpu_total;
+  GPU_Vector<double> gpu_current_total;
+  GPU_Vector<double> gpu_virial_heat_per_atom;
+  GPU_Vector<double> gpu_virial_heat_total;
+  std::vector<double> cpu_total;
+  std::vector<double> cpu_virial_heat_total;
+
+  void resize(const int number_of_atoms);
+};
+
+bool qnep_existing_file_has_schema(
+  const char* filename, const std::vector<std::string>& required_lines);
+
+bool compute_qnep_full_a_current(
+  NEP_Charge& qnep,
+  const int N,
+  const Box& box,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& unwrapped_position,
+  const GPU_Vector<double>& mass,
+  const GPU_Vector<double>& potential,
+  const GPU_Vector<double>& virial,
+  const GPU_Vector<double>& velocity,
+  const double delta_j_q_total[3],
+  const bool compute_all_projection_routes,
+  QNEP_Full_A_Current_Workspace& workspace,
+  double j_conv[3],
+  double j_virial[3],
+  double j_base[3],
+  double j_projection[3][3],
+  double j_candidate_a[3]);
+
 class QNEP_Projection : public Action
 {
 public:
@@ -40,16 +78,6 @@ public:
   void pre_force(
     const int step,
     const double time_step,
-    Integrate& integrate,
-    std::vector<Group>& group,
-    Atom& atom,
-    Box& box,
-    Force& force) override;
-
-  void post_force(
-    const int step,
-    const double time_step,
-    const double global_time,
     Integrate& integrate,
     std::vector<Group>& group,
     Atom& atom,
@@ -106,9 +134,9 @@ private:
   double initial_cell_[9] = {0.0};
   int number_of_pair_blocks_ = 0;
   GPU_Vector<double> gpu_means_;
+  GPU_Vector<double> gpu_c_;
   GPU_Vector<double> gpu_partial_;
   GPU_Vector<double> gpu_total_;
-  GPU_Vector<double> gpu_current_total_;
   std::vector<double> cpu_total_;
   GPU_Vector<double> gpu_channel_per_atom_;
   GPU_Vector<double> gpu_channel_total_;
@@ -117,6 +145,7 @@ private:
   GPU_Vector<double> gpu_virial_dynamic_charge_;
   GPU_Vector<double> gpu_virial_heat_per_atom_;
   GPU_Vector<double> gpu_virial_heat_total_;
+  QNEP_Full_A_Current_Workspace full_a_workspace_;
   GPU_Vector<double> gpu_delta_j_q_k_;
   std::vector<double> cpu_channel_total_;
   std::vector<double> cpu_virial_heat_total_;
