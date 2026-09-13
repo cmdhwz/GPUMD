@@ -59,5 +59,7 @@ public:
 
 private:
   bool dump_ = false;
+  bool backup_ = false;
   int dump_interval_ = 1;
+  std::string backup_directory_;
 };

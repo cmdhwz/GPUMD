@@ -175,6 +175,18 @@ public:
   void enable_delta_j_q_k_diagnostics();
   void request_charge_diagnostics_for_next_force();
   void request_peratom_virial_for_next_force();
+  void mark_single_frame_neighbor_reference_pending()
+  {
+    single_frame_neighbor_invalidation_pending_ = true;
+  }
+  void consume_single_frame_neighbor_reference_invalidation()
+  {
+    if (single_frame_neighbor_invalidation_pending_) {
+      neighbor.invalidate_reference_positions();
+      single_frame_neighbor_invalidation_pending_ = false;
+    }
+  }
+  void invalidate_current_force_caches();
   void request_pppm_debug_for_next_force(const char* prefix, const int frame)
   {
     pppm.request_debug_for_next_force(prefix, frame);
@@ -250,6 +262,11 @@ public:
   GPU_Vector<float>& get_D_reference() { return nep_data.D_projected; }
   GPU_Vector<float>& get_raw_charge_rate_reference() { return nep_data.charge_rate_raw; }
   GPU_Vector<float>& get_charge_rate_reference() { return nep_data.charge_rate; }
+  bool has_charge_diagnostics_for_current_force_frame() const
+  {
+    return charge_diagnostics_available_ &&
+      charge_diagnostics_force_evaluation_id_ == force_evaluation_id_;
+  }
   int get_charge_mode() const { return paramb.charge_mode; }
   const char* get_dynamic_q_formula_version() const { return PPPM::dynamic_q_formula_version(); }
   bool uses_pppm() const { return use_pppm; }
@@ -304,8 +321,12 @@ public:
   bool pimd_batch_profile_enabled() const override { return pimd_batch_profile_enabled_; }
   const PIMD_Batch_Timing& get_pimd_batch_timing() const override { return pimd_batch_timing_; }
   void reset_pimd_batch_timing() override { pimd_batch_timing_ = PIMD_Batch_Timing(); }
+  bool md_qnep_bec_enabled() const { return md_qnep_bec_enabled_; }
 
 private:
+  void begin_force_evaluation_();
+  void invalidate_current_force_caches_();
+
   bool compute_dynamic_charge_correction_impl(
     const int N,
     const int N1,
@@ -421,6 +442,9 @@ private:
   bool charge_diagnostics_enabled_ = false;
   bool dynamic_charge_diagnostics_enabled_ = false;
   bool charge_diagnostics_requested_ = false;
+  bool charge_diagnostics_available_ = false;
+  unsigned long long charge_diagnostics_force_evaluation_id_ = 0;
+  bool single_frame_neighbor_invalidation_pending_ = false;
   bool peratom_virial_requested_ = false;
   GPU_Vector<double> dynamic_q_real_per_atom_;
   GPU_Vector<double> dynamic_q_real_total_;

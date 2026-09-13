@@ -2496,6 +2496,8 @@ void NEP_Charge::compute_large_box(
     if (capture_charge_diagnostics) {
       nep_data.D_projected.copy_from_device(nep_data.D_real.data());
       charge_diagnostics_requested_ = false;
+      charge_diagnostics_available_ = true;
+      charge_diagnostics_force_evaluation_id_ = force_evaluation_id_;
     }
     peratom_virial_requested_ = false;
   } else {
@@ -2788,6 +2790,8 @@ void NEP_Charge::compute_small_box(
     if (capture_charge_diagnostics) {
       nep_data.D_projected.copy_from_device(nep_data.D_real.data());
       charge_diagnostics_requested_ = false;
+      charge_diagnostics_available_ = true;
+      charge_diagnostics_force_evaluation_id_ = force_evaluation_id_;
     }
     peratom_virial_requested_ = false;
   } else {
@@ -2920,6 +2924,28 @@ static bool get_expanded_box(const double rc, const Box& box, NEP_Charge::Expand
   return is_small_box;
 }
 
+void NEP_Charge::invalidate_current_force_caches_()
+{
+  charge_rate_cache_set_ = false;
+  charge_heat_channel_cache_set_ = false;
+  full_a_current_cache_set_ = false;
+  dynamic_q_cache_set_ = false;
+  dynamic_q_last_pppm_valid_ = false;
+  dynamic_q_last_diagnostic_checks_pass_ = false;
+  charge_diagnostics_available_ = false;
+}
+
+void NEP_Charge::begin_force_evaluation_()
+{
+  ++force_evaluation_id_;
+  invalidate_current_force_caches_();
+}
+
+void NEP_Charge::invalidate_current_force_caches()
+{
+  invalidate_current_force_caches_();
+}
+
 void NEP_Charge::compute(
   Box& box,
   const GPU_Vector<int>& type,
@@ -2928,13 +2954,7 @@ void NEP_Charge::compute(
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom)
 {
-  ++force_evaluation_id_;
-  charge_rate_cache_set_ = false;
-  charge_heat_channel_cache_set_ = false;
-  full_a_current_cache_set_ = false;
-  dynamic_q_cache_set_ = false;
-  dynamic_q_last_pppm_valid_ = false;
-  dynamic_q_last_diagnostic_checks_pass_ = false;
+  begin_force_evaluation_();
   if (!box.pbc_x || !box.pbc_y || !box.pbc_z) {
     PRINT_INPUT_ERROR("Cannot use non-periodic boundaries for qNEP models.");
   }
@@ -3349,6 +3369,7 @@ bool NEP_Charge::compute_pimd_batch(
     }
   }
 
+  begin_force_evaluation_();
   const bool is_small_box = get_expanded_box(paramb.rc_radial, box, ebox);
   const bool profile = pimd_batch_profile_enabled_;
   const auto total_begin = std::chrono::high_resolution_clock::now();
@@ -4481,6 +4502,8 @@ void NEP_Charge::enable_delta_j_q_k_diagnostics()
 
 void NEP_Charge::reset_dynamic_charge_cache()
 {
+  neighbor.invalidate_reference_positions();
+  single_frame_neighbor_invalidation_pending_ = false;
   pppm.reset_dynamic_charge_cache();
   dynamic_q_cache_set_ = false;
   dynamic_q_cache_result_valid_ = false;
@@ -4503,6 +4526,8 @@ void NEP_Charge::reset_dynamic_charge_cache()
   charge_heat_channel_cache_position_ = nullptr;
   charge_heat_channel_cache_velocity_ = nullptr;
   full_a_current_cache_set_ = false;
+  charge_diagnostics_available_ = false;
+  charge_diagnostics_force_evaluation_id_ = 0;
 }
 
 void NEP_Charge::request_charge_diagnostics_for_next_force()

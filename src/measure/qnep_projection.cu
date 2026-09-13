@@ -432,6 +432,23 @@ bool compute_qnep_full_a_current(
   double j_projection[3][3],
   double j_candidate_a[3])
 {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  for (int d = 0; d < 3; ++d) {
+    j_conv[d] = nan;
+    j_virial[d] = nan;
+    j_base[d] = nan;
+    j_candidate_a[d] = nan;
+    for (int x = 0; x < 3; ++x) j_projection[x][d] = nan;
+  }
+  if (
+    N <= 0 || position.size() != static_cast<size_t>(3 * N) ||
+    unwrapped_position.size() != static_cast<size_t>(3 * N) ||
+    mass.size() != static_cast<size_t>(N) || potential.size() != static_cast<size_t>(N) ||
+    virial.size() != static_cast<size_t>(9 * N) || velocity.size() != static_cast<size_t>(3 * N)) {
+    return false;
+  }
+  if (!qnep.has_charge_diagnostics_for_current_force_frame()) return false;
+
   if (qnep.get_cached_full_a_current(
         N,
         position,
@@ -455,22 +472,6 @@ bool compute_qnep_full_a_current(
       workspace.gpu_virial_heat_per_atom.data());
     GPU_CHECK_KERNEL
     return true;
-  }
-
-  const double nan = std::numeric_limits<double>::quiet_NaN();
-  for (int d = 0; d < 3; ++d) {
-    j_conv[d] = nan;
-    j_virial[d] = nan;
-    j_base[d] = nan;
-    j_candidate_a[d] = nan;
-    for (int x = 0; x < 3; ++x) j_projection[x][d] = nan;
-  }
-  if (
-    N <= 0 || position.size() != static_cast<size_t>(3 * N) ||
-    unwrapped_position.size() != static_cast<size_t>(3 * N) || mass.size() != static_cast<size_t>(N) ||
-    potential.size() != static_cast<size_t>(N) || virial.size() != static_cast<size_t>(9 * N) ||
-    velocity.size() != static_cast<size_t>(3 * N)) {
-    return false;
   }
 
   const GPU_Vector<float>& D = qnep.get_raw_D_reference();

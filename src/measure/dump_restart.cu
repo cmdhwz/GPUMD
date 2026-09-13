@@ -22,11 +22,56 @@ Dump a restart file
 #include "model/group.cuh"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
-#include "utilities/gpu_macro.cuh"
 #include "utilities/gpu_vector.cuh"
 #include "utilities/read_file.cuh"
+#include <cerrno>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #include <vector>
 #include <cstring>
+
+namespace
+{
+bool is_valid_backup_directory_name(const char* directory)
+{
+  if (directory[0] == '\0' || strcmp(directory, ".") == 0 || strcmp(directory, "..") == 0) {
+    return false;
+  }
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(directory); *p != '\0'; ++p) {
+    if (*p < 32 || *p == '/' || *p == '\\' || *p == ':') {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool make_restart_backup_directory(const std::string& directory)
+{
+#ifdef _WIN32
+  return _mkdir(directory.c_str()) == 0 || errno == EEXIST;
+#else
+  return mkdir(directory.c_str(), 0777) == 0 || errno == EEXIST;
+#endif
+}
+
+void copy_restart_file(const std::string& source, const std::string& destination)
+{
+  std::ifstream input(source, std::ios::binary);
+  std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+  if (!input || !output) {
+    PRINT_INPUT_ERROR("Failed to copy the restart backup to restart.xyz.");
+  }
+  output << input.rdbuf();
+  if (!output) {
+    PRINT_INPUT_ERROR("Failed while copying the restart backup.");
+  }
+}
+} // namespace
 
 Dump_Restart::Dump_Restart(const char** param, int num_param)
 {
@@ -36,8 +81,8 @@ Dump_Restart::Dump_Restart(const char** param, int num_param)
 
 void Dump_Restart::parse(const char** param, int num_param)
 {
-  if (num_param != 2) {
-    PRINT_INPUT_ERROR("dump_restart should have 1 parameter.");
+  if (num_param != 2 && num_param != 3) {
+    PRINT_INPUT_ERROR("dump_restart should have 1 or 2 parameters.");
   }
   if (!is_valid_int(param[1], &dump_interval_)) {
     PRINT_INPUT_ERROR("restart dump interval should be an integer.");
@@ -45,8 +90,19 @@ void Dump_Restart::parse(const char** param, int num_param)
   if (dump_interval_ <= 0) {
     PRINT_INPUT_ERROR("restart dump interval should > 0.");
   }
+  if (num_param == 3) {
+    if (!is_valid_backup_directory_name(param[2])) {
+      PRINT_INPUT_ERROR(
+        "The optional backup directory name should be a single directory name without '/', '\\', or ':'.");
+    }
+    backup_ = true;
+    backup_directory_ = param[2];
+  }
   dump_ = true;
   printf("Dump restart every %d steps.\n", dump_interval_);
+  if (backup_) {
+    printf("    Save backup files in %s.\n", backup_directory_.c_str());
+  }
 }
 
 void Dump_Restart::pre_run(
@@ -59,7 +115,9 @@ void Dump_Restart::pre_run(
   Force& force)
 {
   if (dump_) {
-    // nothing
+    if (backup_ && !make_restart_backup_directory(backup_directory_)) {
+      PRINT_INPUT_ERROR("Failed to create the restart backup directory.");
+    }
   }
 }
 
@@ -82,7 +140,15 @@ void Dump_Restart::end_of_step(
   if ((step + 1) % dump_interval_ != 0)
     return;
 
-  FILE* fid = my_fopen("restart.xyz", "w");
+  std::string filename = "restart.xyz";
+  if (backup_) {
+    std::ostringstream backup_filename;
+    backup_filename << backup_directory_ << "/restart_step_" << std::setw(10) << std::setfill('0')
+                    << (step + 1) << ".xyz";
+    filename = backup_filename.str();
+  }
+
+  FILE* fid = my_fopen(filename.c_str(), "w");
 
   const int number_of_atoms = atom.number_of_atoms;
 
@@ -136,6 +202,10 @@ void Dump_Restart::end_of_step(
 
   fflush(fid);
   fclose(fid);
+
+  if (backup_) {
+    copy_restart_file(filename, "restart.xyz");
+  }
 }
 
 void Dump_Restart::post_run(

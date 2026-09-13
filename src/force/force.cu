@@ -1008,6 +1008,11 @@ void Force::compute_pimd_beads(
       }
       warned_batch_once = true;
     }
+    if (potentials.size() == 1 && potentials[0]) {
+      if (auto* qnep = dynamic_cast<NEP_Charge*>(potentials[0].get())) {
+        qnep->consume_single_frame_neighbor_reference_invalidation();
+      }
+    }
     for (int k = 0; k < position_beads.size(); ++k) {
       compute(
         box,

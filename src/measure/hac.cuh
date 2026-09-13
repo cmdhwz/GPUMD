@@ -83,6 +83,9 @@ private:
   GPU_Vector<double> centroid_potential_per_atom_;
   GPU_Vector<double> centroid_force_per_atom_;
   GPU_Vector<double> centroid_virial_per_atom_;
+  GPU_Vector<double> centroid_position_work_;
+  GPU_Vector<float> centroid_charge_backup_;
+  GPU_Vector<float> centroid_bec_backup_;
   GPU_Vector<double> non_electro_potential_per_atom_;
   GPU_Vector<double> non_electro_force_per_atom_;
   GPU_Vector<double> non_electro_virial_per_atom_;

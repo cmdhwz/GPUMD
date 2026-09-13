@@ -971,10 +971,9 @@ void Neighbor::find_neighbor_global(
   const double* y = position_per_atom.data() + N;
   const double* z = position_per_atom.data() + N * 2;
 
-  bool is_first_time = false;
+  bool is_first_time = !reference_positions_valid;
 
   if (x0.size() == 0) {
-    is_first_time = true;
     x0.resize(N);
     y0.resize(N);
     z0.resize(N);
@@ -1003,6 +1002,7 @@ void Neighbor::find_neighbor_global(
       y0.data(), 
       z0.data());
     GPU_CHECK_KERNEL
+    reference_positions_valid = true;
   }
 }
 
@@ -1369,6 +1369,7 @@ void Neighbor::find_local_neighbor_from_global(
 
 void Neighbor::initialize(const double rc, const int num_atoms, const int num_neighbors)
 {
+  reference_positions_valid = false;
   const double rc_plus_skin = rc + skin;
   const int MN = num_neighbors * rc_plus_skin * rc_plus_skin * rc_plus_skin / (rc * rc * rc);
   NN.resize(num_atoms);

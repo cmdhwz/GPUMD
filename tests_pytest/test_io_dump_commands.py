@@ -142,6 +142,22 @@ def test_command_io(tmp_path, structure, model_path, model_type, gpumd_command, 
     run_and_check(tmp_path, structure, model_path, model_type, gpumd_command, case)
 
 
+def test_dump_restart_keeps_latest_root_and_versioned_backups(
+        tmp_path, structure, model_path, model_type, gpumd_command):
+    case = CommandIOCase(
+        name='dump_restart_backup',
+        run_in_lines=[('dump_restart', [1, 'restart_backups'])],
+        expected_output_files=[
+            'restart.xyz', 'restart_backups/restart_step_0000000001.xyz'],
+        parse_check=lambda p: _check_natoms_single_frame(p, len(structure)))
+    run_and_check(tmp_path, structure, model_path, model_type, gpumd_command, case)
+
+    backup_files = sorted((tmp_path / 'restart_backups').glob('restart_step_*.xyz'))
+    assert len(backup_files) == BASE_N_STEPS
+    assert backup_files[-1].name == 'restart_step_0000000005.xyz'
+    assert (tmp_path / 'restart.xyz').read_bytes() == backup_files[-1].read_bytes()
+
+
 def test_dump_xyz_comment_line_is_well_formed(
         tmp_path, structure, model_path, model_type, gpumd_command):
     """Lattice, virial, and stress go through Dump_XYZ::print_tensor, which loops over the nine

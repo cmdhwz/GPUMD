@@ -91,18 +91,36 @@ void HAC::pre_run(
     }
 
     if (qnep_full_a_) {
-      if (use_centroid_heat_flux_ || split_qnep_heat_by_type_ || deferred_centroid_qnep_) {
+      const bool centroid_qnep_full_a = use_centroid_heat_flux_ != 0;
+      const bool ring_polymer_run = integrate.type >= 31 && integrate.type <= 33;
+      if (split_qnep_heat_by_type_ != 0) {
+        PRINT_INPUT_ERROR("hac_current qnep_full_a does not support split HAC output.");
+      }
+      if (deferred_centroid_qnep_ != 0) {
         PRINT_INPUT_ERROR(
-          "hac_current qnep_full_a supports only classical, non-centroid, non-split HAC.");
+          "hac_current qnep_full_a + deferred centroid is not implemented in 4C-immediate; "
+          "use immediate centroid or legacy deferred centroid.");
+      }
+      if (centroid_qnep_full_a && !ring_polymer_run) {
+        PRINT_INPUT_ERROR(
+          "hac_current qnep_full_a centroid mode requires a PIMD/RPMD/TRPMD ensemble.");
+      }
+      if (
+        centroid_qnep_full_a &&
+        (integrate.deform_x != 0 || integrate.deform_y != 0 || integrate.deform_z != 0 ||
+         integrate.use_scr_barostat ||
+         (integrate.type == 33 && integrate.num_target_pressure_components != 0))) {
+        PRINT_INPUT_ERROR(
+          "hac_current qnep_full_a centroid mode requires a fixed-cell ring-polymer ensemble.");
       }
       if (output_interval > Nc) {
         PRINT_INPUT_ERROR("hac_current qnep_full_a requires output_interval not to exceed Nc.");
       }
       const bool supported_ensemble =
-        integrate.type == 0 || (integrate.type >= 1 && integrate.type <= 10);
+        centroid_qnep_full_a ? ring_polymer_run
+                             : (integrate.type == 0 || (integrate.type >= 1 && integrate.type <= 10));
       if (!supported_ensemble) {
-        PRINT_INPUT_ERROR(
-          "hac_current qnep_full_a supports only NVE or fixed-cell equilibrium NVT.");
+        PRINT_INPUT_ERROR("hac_current qnep_full_a uses an unsupported ensemble.");
       }
       const double normalization_temperature =
         integrate.type == 0 ? integrate.hac_normalization_temperature : integrate.temperature2;
@@ -111,7 +129,7 @@ void HAC::pre_run(
           "hac_current qnep_full_a requires a positive finite normalization temperature; "
           "for NVE use ensemble nve <temperature>.\n");
       }
-      if (integrate.type >= 1 && integrate.type <= 10) {
+      if (integrate.type != 0) {
         const double temperature_scale =
           std::max(1.0, std::max(std::fabs(integrate.temperature1), std::fabs(integrate.temperature2)));
         if (std::fabs(integrate.temperature1 - integrate.temperature2) >
@@ -182,6 +200,14 @@ void HAC::pre_run(
       qnep_full_a_dynamic_local_channel_total_.resize(NUM_CHARGE_HEAT_CHANNELS);
       const int number_of_types = static_cast<int>(atom.cpu_type_size.size());
       atom.heat_per_atom.resize(static_cast<size_t>(atom.number_of_atoms) * 5);
+      if (centroid_qnep_full_a) {
+        centroid_potential_per_atom_.resize(atom.number_of_atoms);
+        centroid_force_per_atom_.resize(static_cast<size_t>(atom.number_of_atoms) * 3);
+        centroid_virial_per_atom_.resize(static_cast<size_t>(atom.number_of_atoms) * 9);
+        centroid_position_work_.resize(static_cast<size_t>(atom.number_of_atoms) * 3);
+        centroid_charge_backup_.resize(atom.number_of_atoms);
+        centroid_bec_backup_.resize(static_cast<size_t>(atom.number_of_atoms) * 9);
+      }
       qnep_full_a_base_by_type_current_.resize(static_cast<size_t>(number_of_types) * 3);
       qnep_full_a_current_history_.assign(
         static_cast<size_t>(3) * number_of_frames, 0.0);
@@ -599,6 +625,7 @@ void HAC::pre_force(
   if (!compute || !qnep_full_a_ || (step + 1) % sample_interval != 0) return;
   box.set_is_orthogonal();
   check_qnep_full_a_fixed_cell_(box);
+  if (use_centroid_heat_flux_) return;
   qnep_full_a_qnep_->request_charge_diagnostics_for_next_force();
   qnep_full_a_qnep_->request_peratom_virial_for_next_force();
 }
@@ -654,14 +681,49 @@ void HAC::end_of_step(
       }
     }
 
+    const GPU_Vector<double>* current_position = &atom.position_per_atom;
+    const GPU_Vector<double>* current_unwrapped_position = &atom.unwrapped_position;
+    const GPU_Vector<double>* current_potential = &atom.potential_per_atom;
+    const GPU_Vector<double>* current_virial = &atom.virial_per_atom;
+    const GPU_Vector<double>* current_velocity = &atom.velocity_per_atom;
+    if (use_centroid_heat_flux_) {
+      ++centroid_sampled_frames_;
+      ++centroid_direct_evaluations_;
+      centroid_position_work_.copy_from_device(atom.position_per_atom.data());
+      centroid_charge_backup_.copy_from_device(
+        qnep_full_a_qnep_->get_charge_reference().data());
+      if (qnep_full_a_qnep_->md_qnep_bec_enabled()) {
+        centroid_bec_backup_.copy_from_device(qnep_full_a_qnep_->get_bec_reference().data());
+      }
+      qnep_full_a_qnep_->request_charge_diagnostics_for_next_force();
+      qnep_full_a_qnep_->request_peratom_virial_for_next_force();
+      force.compute(
+        box,
+        centroid_position_work_,
+        atom.type,
+        group,
+        centroid_potential_per_atom_,
+        centroid_force_per_atom_,
+        centroid_virial_per_atom_,
+        atom.velocity_per_atom,
+        atom.mass);
+      current_position = &centroid_position_work_;
+      current_potential = &centroid_potential_per_atom_;
+      current_virial = &centroid_virial_per_atom_;
+    }
+    if (!qnep_full_a_qnep_->has_charge_diagnostics_for_current_force_frame()) {
+      PRINT_INPUT_ERROR(
+        "hac_current qnep_full_a force did not capture diagnostics for its current frame.");
+    }
+
     double delta_j_q_pppm[3] = {0.0, 0.0, 0.0};
     double delta_j_q_real[3] = {0.0, 0.0, 0.0};
     double delta_j_q_total[3] = {0.0, 0.0, 0.0};
     qnep_full_a_qnep_->compute_charge_rate_for_current_force_frame(
       box,
       atom.type,
-      atom.position_per_atom,
-      atom.velocity_per_atom,
+      *current_position,
+      *current_velocity,
       &qnep_full_a_dynamic_local_channel_per_atom_);
     if (!qnep_full_a_qnep_->compute_dynamic_charge_correction(
           atom.number_of_atoms,
@@ -671,7 +733,7 @@ void HAC::end_of_step(
           step + 1,
           sample_time_fs,
           box,
-          atom.position_per_atom,
+          *current_position,
           delta_j_q_pppm,
           delta_j_q_real,
           delta_j_q_total)) {
@@ -691,12 +753,12 @@ void HAC::end_of_step(
           *qnep_full_a_qnep_,
           atom.number_of_atoms,
           box,
-          atom.position_per_atom,
-          atom.unwrapped_position,
+          *current_position,
+          *current_unwrapped_position,
           atom.mass,
-          atom.potential_per_atom,
-          atom.virial_per_atom,
-          atom.velocity_per_atom,
+          *current_potential,
+          *current_virial,
+          *current_velocity,
           delta_j_q_total,
           false,
           qnep_full_a_workspace_,
@@ -766,8 +828,8 @@ void HAC::end_of_step(
       qnep_full_a_qnep_->compute_virial_components(
         box,
         atom.type,
-        atom.position_per_atom,
-        atom.virial_per_atom,
+        *current_position,
+        *current_virial,
         true,
         true,
         true,
@@ -776,7 +838,7 @@ void HAC::end_of_step(
         virial_dynamic_charge);
       compute_heat(
         virial_dynamic_charge,
-        atom.velocity_per_atom,
+        *current_velocity,
         qnep_full_a_workspace_.gpu_virial_heat_per_atom);
       gpu_sum_components<<<NUM_OF_HEAT_COMPONENTS, REDUCE_THREADS>>>(
         atom.number_of_atoms,
@@ -856,6 +918,15 @@ void HAC::end_of_step(
     for (int d = 0; d < 3; ++d)
       qnep_full_a_current_history_[nd + Nd * d] = j_full_a[d];
 
+    if (use_centroid_heat_flux_) {
+      qnep_full_a_qnep_->get_charge_reference().copy_from_device(
+        centroid_charge_backup_.data());
+      if (qnep_full_a_qnep_->md_qnep_bec_enabled()) {
+        qnep_full_a_qnep_->get_bec_reference().copy_from_device(centroid_bec_backup_.data());
+      }
+      qnep_full_a_qnep_->invalidate_current_force_caches();
+      qnep_full_a_qnep_->mark_single_frame_neighbor_reference_pending();
+    }
     qnep_full_a_sample_steps_[nd] = step + 1;
     qnep_full_a_sample_times_fs_[nd] = sample_time_fs;
     return;
@@ -1193,6 +1264,13 @@ void HAC::post_run_qnep_full_a_(
   const double hac_conversion = inv_time_conversion * inv_time_conversion;
   const double dt_in_ps = dt_in_fs / 1000.0;
   const int charge_mode = qnep_full_a_qnep_->get_charge_mode();
+  const bool centroid_qnep_full_a = use_centroid_heat_flux_ != 0;
+  const char* current_configuration = centroid_qnep_full_a ? "centroid" : "classical";
+  const char* centroid_evaluation =
+    centroid_qnep_full_a ? "immediate_single_frame" : "not_applicable";
+  const char* sampling_stage = centroid_qnep_full_a
+    ? "post_compute2_centroid_force_final_velocity"
+    : "post_compute2_final_velocity";
   const auto segment_stamp =
     std::chrono::high_resolution_clock::now().time_since_epoch().count();
   const std::string segment_id =
@@ -1208,6 +1286,8 @@ void HAC::post_run_qnep_full_a_(
       file,
       "# dynamic_q_formula_version %s\n",
       qnep_full_a_qnep_->get_dynamic_q_formula_version());
+    fprintf(file, "# current_configuration %s\n", current_configuration);
+    fprintf(file, "# centroid_evaluation %s\n", centroid_evaluation);
     fprintf(file, "# temperature_K %.17g\n", temperature);
     fprintf(file, "# temperature_source %s\n", temperature_source);
     fprintf(file, "# volume_Angstrom3 %.17g\n", volume);
@@ -1221,7 +1301,7 @@ void HAC::post_run_qnep_full_a_(
   FILE* fid_current = my_fopen("heat_current_qnep_full_a.out", "a");
   fprintf(fid_current, "# segment_begin operator qnep_full_a projection_route A full_current 1\n");
   write_segment_metadata(fid_current);
-  fprintf(fid_current, "# sampling_stage post_compute2_final_velocity\n");
+  fprintf(fid_current, "# sampling_stage %s\n", sampling_stage);
   fprintf(fid_current, "# sampled_frames %d\n", Nd);
   fprintf(fid_current, "# sample_interval_md_steps %d\n", sample_interval);
   fprintf(fid_current, "# sample_interval_fs %.17g\n", dt_in_fs);
@@ -1272,7 +1352,7 @@ void HAC::post_run_qnep_full_a_(
     fid_type_resolved,
     "# local_channel_valid %d\n",
     qnep_full_a_local_channel_validation_passed_ ? 1 : 0);
-  fprintf(fid_type_resolved, "# sampling_stage post_compute2_final_velocity\n");
+  fprintf(fid_type_resolved, "# sampling_stage %s\n", sampling_stage);
   fprintf(fid_type_resolved, "# sampled_frames %d\n", Nd);
   fprintf(fid_type_resolved, "# sample_interval_md_steps %d\n", sample_interval);
   fprintf(fid_type_resolved, "# sample_interval_fs %.17g\n", dt_in_fs);
@@ -1395,7 +1475,7 @@ void HAC::post_run_qnep_full_a_(
   FILE* fid_hac = my_fopen("hac_qnep_full_a.out", "a");
   fprintf(fid_hac, "# segment_begin operator qnep_full_a projection_route A full_current 1\n");
   write_segment_metadata(fid_hac);
-  fprintf(fid_hac, "# sampling_stage post_compute2_final_velocity\n");
+  fprintf(fid_hac, "# sampling_stage %s\n", sampling_stage);
   fprintf(fid_hac, "# sampled_frames %d\n", Nd);
   fprintf(fid_hac, "# correlation_points %d\n", Nc);
   fprintf(fid_hac, "# sample_interval_md_steps %d\n", sample_interval);
@@ -1461,7 +1541,9 @@ void HAC::post_run(
     const double normalization_temperature =
       integrate.type == 0 ? integrate.hac_normalization_temperature : temperature;
     const char* temperature_source =
-      integrate.type == 0 ? "explicit_nve_hac" : "fixed_nvt_target";
+      integrate.type == 0
+      ? "explicit_nve_hac"
+      : (use_centroid_heat_flux_ ? "ring_polymer_target" : "fixed_nvt_target");
     post_run_qnep_full_a_(
       atom,
       box,
