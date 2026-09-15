@@ -49,10 +49,18 @@ Simulation setup
      - Brief description
      - Exec.
      - Prop.
+   * - :ref:`replicate <kw_replicate>`
+     - Replicate the simulation model
+     - Yes
+     - N/A
    * - :ref:`velocity <kw_velocity>`
      - Set the initial velocities
      - Yes
      - N/A
+   * - :ref:`correct_velocity <kw_correct_velocity>`
+     - Remove linear and angular momenta at regular intervals
+     - No
+     - No
    * - :ref:`potential <kw_potential>`
      - Set up the interaction model
      - Yes
@@ -61,6 +69,14 @@ Simulation setup
      - Add the DFT-D3 dispersion correction to the NEP model
      - Yes
      - N/A
+   * - :ref:`kspace <kw_kspace>`
+     - Specify the reciprocal-space method used by the interaction model
+     - Yes
+     - N/A
+   * - :ref:`compute_extrapolation <kw_compute_extrapolation>`
+     - Monitor the NEP extrapolation grade during an :term:`MD` run
+     - No
+     - No
    * - :ref:`change_box <kw_change_box>`
      - Change the box
      - Yes
@@ -69,16 +85,49 @@ Simulation setup
      - Deform the simulation box
      - No
      - No
+   * - :ref:`time_step <kw_time_step>`
+     - Specify the integration time step
+     - No
+     - Yes
    * - :ref:`ensemble <kw_ensemble>`
      - Specify the integrator for a :term:`MD` run
+     - No
+     - No
+   * - :ref:`add_force <kw_add_force>`
+     - Add external forces to selected atoms
+     - No
+     - No
+   * - :ref:`add_efield <kw_add_efield>`
+     - Apply an electric field to selected atoms
+     - No
+     - No
+   * - :ref:`add_spring <kw_add_spring>`
+     - Add spring interactions to selected atom groups
+     - No
+     - No
+   * - :ref:`deposit <kw_deposit>`
+     - Add atoms periodically during a deposition run
+     - No
+     - No
+   * - :ref:`electron_stop <kw_electron_stop>`
+     - Apply electronic stopping forces to high-energy atoms
      - No
      - No
    * - :ref:`fix <kw_fix>`
      - Fix (freeze) atoms
      - No
      - No
-   * - :ref:`time_step <kw_time_step>`
-     - Specify the integration time step
+   * - :ref:`move <kw_move>`
+     - Move selected atoms with a constant velocity
+     - No
+     - No
+   * - :ref:`mc <kw_mc>`
+     - Carry out Monte Carlo trial steps during an :term:`MD` run
+     - No
+     - No
+   * - :ref:`plumed <kw_plumed>`
+     - Invoke the PLUMED plugin during an :term:`MD` run
+     - No
      - No
      - Yes
    * - :ref:`read_pimd_restart <kw_read_pimd_restart>`
@@ -108,6 +157,18 @@ Actions
      - Compute some time and space-averaged quantities
      - No
      - No
+   * - :ref:`compute_chunk <kw_compute_chunk>`
+     - Compute time-averaged quantities in dynamic spatial bins
+     - No
+     - No
+   * - :ref:`compute_adf <kw_compute_adf>`
+     - Compute the angular distribution function (:term:`ADF`)
+     - No
+     - No
+   * - :ref:`compute_angular_rdf <kw_compute_angular_rdf>`
+     - Compute the angular-dependent radial distribution function (:term:`ARDF`)
+     - No
+     - No
    * - :ref:`compute_cohesive <kw_compute_cohesive>`
      - Compute the cohesive energy curve
      - Yes
@@ -120,12 +181,20 @@ Actions
      - Compute the phonon density of states (:term:`PDOS`)
      - No
      - No
+   * - :ref:`compute_dpdt <kw_compute_dpdt>`
+     - Compute the time derivative of the polarization
+     - No
+     - No
    * - :ref:`compute_gkma <kw_compute_gkma>`
      - Compute the modal heat current using the :term:`GKMA` method
      - No
      - No
    * - :ref:`compute_hac <kw_compute_hac>`
      - Compute the thermal conductivity using the :term:`EMD` method
+     - No
+     - No
+   * - :ref:`compute_ic <kw_compute_ic>`
+     - Compute the ionic conductivity (:term:`IC`)
      - No
      - No
    * - :ref:`compute_hnema <kw_compute_hnema>`
@@ -140,6 +209,10 @@ Actions
      - Compute the multicomponent system thermal conductivity using the :term:`HNEMDEC` method
      - No
      - No
+   * - :ref:`compute_orientorder <kw_compute_orientorder>`
+     - Compute Steinhardt bond-orientational order parameters
+     - No
+     - No
    * - :ref:`compute_phonon <kw_compute_phonon>`
      - Compute the phonon dispersion
      - Yes
@@ -152,8 +225,20 @@ Actions
      - Compute the mean-square displacement (:term:`MSD`)
      - No
      - No
+   * - :ref:`compute_rdf <kw_compute_rdf>`
+     - Compute the radial distribution function (:term:`RDF`)
+     - No
+     - No
    * - :ref:`compute_shc <kw_compute_shc>`
      - Compute the spectral heat current (:term:`SHC`)
+     - No
+     - No
+   * - :ref:`compute_viscosity <kw_compute_viscosity>`
+     - Compute the stress autocorrelation function and viscosity
+     - No
+     - No
+   * - :ref:`compute_lsqt <kw_compute_lsqt>`
+     - Compute electronic transport properties using the :term:`LSQT` method
      - No
      - No
 
@@ -177,6 +262,12 @@ Output
      - No
    * - :ref:`dump_pimd_restart <kw_dump_pimd_restart>`
      - Write a centroid and bead-resolved PIMD restart state
+   * - :ref:`dump_beads <kw_dump_beads>`
+     - Write bead-resolved positions and optional velocities and forces for :term:`PIMD`-related runs
+     - No
+     - No
+   * - :ref:`dump_dipole <kw_dump_dipole>`
+     - Write dipoles predicted by a separate tensorial NEP model
      - No
      - No
    * - :ref:`dump_observer <kw_dump_observer>`
@@ -189,6 +280,8 @@ Output
      - No
    * - :ref:`dump_position <kw_dump_position>`
      - Write the atomic positions
+   * - :ref:`dump_polarizability <kw_dump_polarizability>`
+     - Write polarizabilities predicted by a separate tensorial NEP model
      - No
      - No
    * - :ref:`dump_netcdf <kw_dump_netcdf>`
@@ -197,6 +290,10 @@ Output
      - No
    * - :ref:`dump_restart <kw_dump_restart>`
      - Write a restart file
+     - No
+     - No
+   * - :ref:`dump_shock_nemd <kw_dump_shock_nemd>`
+     - Write spatial thermodynamic profiles for shock-wave NEMD simulations
      - No
      - No
    * - :ref:`dump_thermo <kw_dump_thermo>`

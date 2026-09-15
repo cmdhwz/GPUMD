@@ -83,6 +83,9 @@ public:
   double temperature2 = 0.0; // target final temperature for a run
   double hac_normalization_temperature = 0.0; // explicit NVE temperature used only by HAC
   double delta_temperature;
+  bool use_heat_lan_region = false;
+  double heat_source_region[6];
+  double heat_sink_region[6];
   double target_pressure[6];
   double target_pressure_start[6];
   double target_pressure_stop[6];
@@ -108,7 +111,9 @@ public:
 
   // PIMD
   int number_of_beads = 0;
+  bool use_eco_pimd = false;
   bool use_scr_barostat = false;
+  double eco_omega_max_cm1 = 0.0;
   // The exact normal-mode propagator is the default, matching i-PI.  Cayley
   // remains available for runs that need its larger-step stability.
   bool pimd_use_exact_propagator = true;

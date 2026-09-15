@@ -46,7 +46,9 @@ public:
     bool use_exact_propagator,
     double pile_scale,
     bool fix_com,
-    bool reseed_from_centroid = false);
+    bool reseed_from_centroid = false,
+    bool use_eco_pimd = false,
+    double eco_omega_max_cm1 = 0.0);
 
   Ensemble_PIMD(
     int number_of_atoms_input,
@@ -56,7 +58,9 @@ public:
     bool use_exact_propagator,
     double pile_scale,
     bool fix_com,
-    bool reseed_from_centroid = false);
+    bool reseed_from_centroid = false,
+    bool use_eco_pimd = false,
+    double eco_omega_max_cm1 = 0.0);
 
   Ensemble_PIMD(
     int number_of_atoms_input,
@@ -70,7 +74,9 @@ public:
     double pile_scale,
     bool fix_com,
     bool use_scr_barostat,
-    bool reseed_from_centroid = false);
+    bool reseed_from_centroid = false,
+    bool use_eco_pimd = false,
+    double eco_omega_max_cm1 = 0.0);
 
   virtual ~Ensemble_PIMD(void);
 
@@ -106,6 +112,10 @@ protected:
   bool fix_com_ = true;
   bool use_scr_barostat_ = false;
   bool reseed_from_centroid_ = false;
+  bool use_eco_pimd_ = false;
+  bool eco_frequencies_reported_ = false;
+  double eco_omega_max_cm1_ = 0.0;
+  double eco_last_temperature_ = -1.0;
   double omega_n;
   GPU_Vector<gpurandState> curand_states;
   GPU_Vector<double*> position_beads;
@@ -117,6 +127,8 @@ protected:
   GPU_Vector<double> free_ring_polymer_frequency;
   GPU_Vector<double> free_ring_polymer_cosine;
   GPU_Vector<double> free_ring_polymer_sine;
+  GPU_Vector<double> eco_mode_factors;
+  std::vector<double> eco_independent_frequencies;
   bool free_ring_polymer_propagator_initialized_ = false;
   double free_ring_polymer_cached_omega_n_ = 0.0;
   double free_ring_polymer_cached_time_step_ = 0.0;
@@ -127,6 +139,7 @@ protected:
 
   void initialize(Atom& atom);
   void update_free_ring_polymer_propagator_(const double time_step);
+  void update_eco_modes_();
   void langevin(const double time_step, Atom& atom);
   void compute1_local_(
     const double time_step,

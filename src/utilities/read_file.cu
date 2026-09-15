@@ -116,7 +116,7 @@ static void scan_need_peratom_virial(bool& need_anywhere, bool& need_every_batch
   }
   std::string line;
   while (std::getline(input_run, line)) {
-    std::vector<std::string> tokens = get_tokens(line);
+    std::vector<std::string> tokens = get_tokens_without_comments(line);
     if (tokens.size() != 0) {
       if (tokens[0] == "compute_hac") {
         need_anywhere = true;

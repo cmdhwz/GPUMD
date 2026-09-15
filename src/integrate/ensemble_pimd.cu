@@ -23,14 +23,18 @@ References for implementation:
     Roman Korol et al., J. Chem Phys. 151, 124103 (2019).
 ------------------------------------------------------------------------------*/
 
+#include "eco_pimd.cuh"
 #include "ensemble_pimd.cuh"
 #include "langevin_utilities.cuh"
 #include "svr_utilities.cuh"
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace
 {
@@ -154,7 +158,9 @@ Ensemble_PIMD::Ensemble_PIMD(
   bool use_exact_propagator_input,
   double pile_scale_input,
   bool fix_com_input,
-  bool reseed_from_centroid_input)
+  bool reseed_from_centroid_input,
+  bool use_eco_pimd_input,
+  double eco_omega_max_cm1_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -165,6 +171,8 @@ Ensemble_PIMD::Ensemble_PIMD(
   pile_scale_ = pile_scale_input;
   fix_com_ = fix_com_input;
   reseed_from_centroid_ = reseed_from_centroid_input;
+  use_eco_pimd_ = use_eco_pimd_input;
+  eco_omega_max_cm1_ = eco_omega_max_cm1_input;
   initialize(atom);
 }
 
@@ -176,7 +184,9 @@ Ensemble_PIMD::Ensemble_PIMD(
   bool use_exact_propagator_input,
   double pile_scale_input,
   bool fix_com_input,
-  bool reseed_from_centroid_input)
+  bool reseed_from_centroid_input,
+  bool use_eco_pimd_input,
+  double eco_omega_max_cm1_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -188,6 +198,8 @@ Ensemble_PIMD::Ensemble_PIMD(
   pile_scale_ = pile_scale_input;
   fix_com_ = fix_com_input;
   reseed_from_centroid_ = reseed_from_centroid_input;
+  use_eco_pimd_ = use_eco_pimd_input;
+  eco_omega_max_cm1_ = eco_omega_max_cm1_input;
   initialize(atom);
 }
 
@@ -203,7 +215,9 @@ Ensemble_PIMD::Ensemble_PIMD(
   double pile_scale_input,
   bool fix_com_input,
   bool use_scr_barostat_input,
-  bool reseed_from_centroid_input)
+  bool reseed_from_centroid_input,
+  bool use_eco_pimd_input,
+  double eco_omega_max_cm1_input)
 {
   number_of_atoms = number_of_atoms_input;
   number_of_beads = number_of_beads_input;
@@ -220,6 +234,8 @@ Ensemble_PIMD::Ensemble_PIMD(
   fix_com_ = fix_com_input;
   use_scr_barostat_ = use_scr_barostat_input;
   reseed_from_centroid_ = reseed_from_centroid_input;
+  use_eco_pimd_ = use_eco_pimd_input;
+  eco_omega_max_cm1_ = eco_omega_max_cm1_input;
   initialize(atom);
   initialize_rng();
 }
@@ -326,6 +342,9 @@ void Ensemble_PIMD::initialize(Atom& atom)
   free_ring_polymer_frequency.resize(number_of_beads);
   free_ring_polymer_cosine.resize(number_of_beads);
   free_ring_polymer_sine.resize(number_of_beads);
+  if (use_eco_pimd_) {
+    eco_mode_factors.resize(number_of_beads);
+  }
 
   curand_states.resize(number_of_atoms);
   int grid_size = (number_of_atoms - 1) / 128 + 1;
@@ -365,6 +384,42 @@ void Ensemble_PIMD::reset_nonham_work()
   nonham_work_per_atom_.resize(number_of_atoms, 0.0);
 }
 
+void Ensemble_PIMD::update_eco_modes_()
+{
+  if (!use_eco_pimd_) {
+    return;
+  }
+  if (!(temperature > 0.0) || !std::isfinite(temperature)) {
+    PRINT_INPUT_ERROR("Eco-PIMD requires a positive finite temperature.");
+  }
+
+  const double temperature_tolerance =
+    1.0e-12 * std::max(1.0, std::fabs(temperature));
+  if (std::fabs(temperature - eco_last_temperature_) <= temperature_tolerance) {
+    return;
+  }
+
+  const double cm_to_kelvin = 1.4387768775039338;
+  const double x_max = cm_to_kelvin * eco_omega_max_cm1_ / temperature;
+  Eco_PIMD_Result result =
+    find_eco_pimd_frequencies(number_of_beads, x_max, eco_independent_frequencies);
+  eco_mode_factors.copy_from_host(result.mode_factors.data());
+  eco_independent_frequencies = std::move(result.independent_frequencies);
+  eco_last_temperature_ = temperature;
+
+  if (!eco_frequencies_reported_) {
+    printf(
+      "    Eco-PIMD frequencies: T=%g K, x_max=%g, RMSE(Trotter)=%g, "
+      "RMSE(Eco)=%g, Newton iterations=%d.\n",
+      temperature,
+      x_max,
+      result.rmse_trotter,
+      result.rmse_eco,
+      result.number_of_iterations);
+    eco_frequencies_reported_ = true;
+  }
+}
+
 void Ensemble_PIMD::update_free_ring_polymer_propagator_(const double time_step)
 {
   if (
@@ -378,7 +433,9 @@ void Ensemble_PIMD::update_free_ring_polymer_propagator_(const double time_step)
   std::vector<double> cosine(number_of_beads, 1.0);
   std::vector<double> sine(number_of_beads, 0.0);
   for (int k = 1; k < number_of_beads; ++k) {
-    const double omega_k = 2.0 * omega_n * sin(k * PI / number_of_beads);
+    const double omega_k = use_eco_pimd_
+      ? omega_n * eco_mode_factors[k]
+      : 2.0 * omega_n * sin(k * PI / number_of_beads);
     frequency[k] = omega_k;
     if (use_exact_propagator_) {
       cosine[k] = cos(omega_k * time_step);
@@ -494,7 +551,10 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
         replica->atom,
         use_exact_propagator_,
         pile_scale_,
-        fix_com_));
+        fix_com_,
+        false,
+        use_eco_pimd_,
+        eco_omega_max_cm1_));
     } else {
       replica->ensemble.reset(new Ensemble_PIMD(
         number_of_atoms,
@@ -507,7 +567,10 @@ void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<d
         use_exact_propagator_,
         pile_scale_,
         fix_com_,
-        use_scr_barostat_));
+        use_scr_barostat_,
+        false,
+        use_eco_pimd_,
+        eco_omega_max_cm1_));
     }
     replica->ensemble->temperature = temperature;
     copy_gpu_vector_between_devices_(
@@ -1253,6 +1316,7 @@ void Ensemble_PIMD::compute1_local_(
   GPU_Vector<double>& thermo)
 {
   omega_n = number_of_beads * K_B * temperature / HBAR;
+  update_eco_modes_();
   update_free_ring_polymer_propagator_(time_step);
 
   langevin(time_step, atom);
@@ -1285,6 +1349,7 @@ void Ensemble_PIMD::compute2_local_pre_pressure_(
   GPU_Vector<double>& thermo)
 {
   omega_n = number_of_beads * K_B * temperature / HBAR;
+  update_eco_modes_();
   update_free_ring_polymer_propagator_(time_step);
 
   gpu_nve_2<<<(number_of_atoms - 1) / 64 + 1, 64>>>(

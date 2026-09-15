@@ -28,6 +28,7 @@ The driver class for the various integrators.
 #include "ensemble_nphug.cuh"
 #include "ensemble_npt_scr.cuh"
 #include "ensemble_nve.cuh"
+#include "ensemble_heat_hybrid.cuh"
 #include "ensemble_pimd.cuh"
 #include "ensemble_qtb.cuh"
 #include "ensemble_ti.cuh"
@@ -178,29 +179,64 @@ void Integrate::initialize(
         sink,
         group[0].cpu_size[source],
         group[0].cpu_size[sink],
+        group[0].number,
         temperature,
         temperature_coupling,
         delta_temperature,
         time_step));
       break;
     case 22: // heat-Langevin
-      ensemble.reset(new Ensemble_LAN(
+      if (use_heat_lan_region) {
+        ensemble.reset(new Ensemble_LAN(
+          type,
+          move_group,
+          move_velocity,
+          number_of_atoms,
+          heat_source_region,
+          heat_sink_region,
+          temperature,
+          temperature_coupling,
+          delta_temperature));
+      } else {
+        ensemble.reset(new Ensemble_LAN(
+          type,
+          move_group,
+          move_velocity,
+          source,
+          sink,
+          group[0].cpu_size[source],
+          group[0].cpu_size[sink],
+          group[0].cpu_size_sum[source],
+          group[0].cpu_size_sum[sink],
+          group[0].number,
+          temperature,
+          temperature_coupling,
+          delta_temperature));
+      }
+      break;
+    case 23: // heat-BDP
+      ensemble.reset(
+        new Ensemble_BDP(
+          type,
+          source,
+          sink,
+          group[0].number,
+          temperature,
+          temperature_coupling,
+          delta_temperature));
+      break;
+    case 27: // heat with constant power
+      ensemble.reset(new Ensemble_NHC(
         type,
-        move_group, 
-        move_velocity,
         source,
         sink,
         group[0].cpu_size[source],
         group[0].cpu_size[sink],
-        group[0].cpu_size_sum[source],
-        group[0].cpu_size_sum[sink],
+        group[0].number,
         temperature,
         temperature_coupling,
-        delta_temperature));
-      break;
-    case 23: // heat-BDP
-      ensemble.reset(
-        new Ensemble_BDP(type, source, sink, temperature, temperature_coupling, delta_temperature));
+        delta_temperature,
+        time_step));
       break;
     case 24: // heat-TTM
       ensemble.reset(new Ensemble_TTM(
@@ -211,6 +247,7 @@ void Integrate::initialize(
         group[0].cpu_size[sink],
         group[0].cpu_size_sum[source],
         group[0].cpu_size_sum[sink],
+        group[0].number,
         group[ttm_parameters.grouping_method].cpu_size[ttm_parameters.group_id],
         group[ttm_parameters.grouping_method].cpu_size_sum[ttm_parameters.group_id],
         temperature,
@@ -227,6 +264,27 @@ void Integrate::initialize(
         ttm_parameters,
         box));
       break;
+    case 26: { // Heat-hybrid facilitates the use of both Langevin and Nose-Hoover thermostats
+      // Use vectors from the class (heat_labels, heat_thermostat, heat_coupling)
+      std::vector<int> sizes(heat_labels.size());
+      std::vector<int> offsets(heat_labels.size());
+      for (size_t i = 0; i < heat_labels.size(); i++) {
+        sizes[i] = group[0].cpu_size[heat_labels[i]];
+        offsets[i] = group[0].cpu_size_sum[heat_labels[i]];
+      }
+      ensemble.reset(new Ensemble_Heat_Hybrid(
+        type,
+        heat_thermostat, // Now a vector
+        heat_labels,     // Now a vector
+        sizes,
+        offsets,
+        group[0].number,
+        temperature,
+        heat_coupling, // Now a vector
+        delta_temperature,
+        time_step));
+      break;
+    }
     case 31: // RPMD
       ensemble.reset(new Ensemble_PIMD(
         number_of_atoms,
@@ -258,7 +316,9 @@ void Integrate::initialize(
             pimd_use_exact_propagator,
             pimd_pile_scale,
             pimd_fix_com,
-            pimd_reseed_from_centroid));
+            pimd_reseed_from_centroid,
+            use_eco_pimd,
+            eco_omega_max_cm1));
       } else {
         ensemble.reset(new Ensemble_PIMD(
           number_of_atoms,
@@ -272,7 +332,9 @@ void Integrate::initialize(
           pimd_pile_scale,
           pimd_fix_com,
           use_scr_barostat,
-          pimd_reseed_from_centroid));
+          pimd_reseed_from_centroid,
+          use_eco_pimd,
+          eco_omega_max_cm1));
       }
       break;
     default:
@@ -389,8 +451,22 @@ void Integrate::parse_ensemble(
 {
   qtb_f_max = 200.0;
   qtb_n_f = 100;
+  use_eco_pimd = false;
   hac_normalization_temperature = 0.0;
   use_scr_barostat = false;
+  eco_omega_max_cm1 = 0.0;
+  use_heat_lan_region = false;
+  int pimd_num_param = num_param;
+  if ((strcmp(param[1], "pimd") == 0 || strcmp(param[1], "pimd_scr") == 0) &&
+      num_param >= 8 &&
+      strcmp(param[num_param - 2], "eco") == 0) {
+    use_eco_pimd = true;
+    pimd_num_param = num_param - 2;
+    if (!is_valid_real(param[num_param - 1], &eco_omega_max_cm1) ||
+        eco_omega_max_cm1 <= 0.0) {
+      PRINT_INPUT_ERROR("Eco-PIMD omega_max should be a positive number in cm^-1.");
+    }
+  }
   for (int i = 0; i < 6; ++i) {
     target_pressure[i] = 0.0;
     target_pressure_start[i] = 0.0;
@@ -475,13 +551,19 @@ void Integrate::parse_ensemble(
     }
   } else if (strcmp(param[1], "heat_lan") == 0) {
     type = 22;
-    if (num_param != 7) {
-      PRINT_INPUT_ERROR("ensemble heat_lan should have 5 parameters.");
+    if (num_param != 7 && num_param != 17) {
+      PRINT_INPUT_ERROR("ensemble heat_lan should have 5 or 15 parameters.");
     }
+    use_heat_lan_region = num_param == 17;
   } else if (strcmp(param[1], "heat_bdp") == 0) {
     type = 23;
     if (num_param != 7) {
       PRINT_INPUT_ERROR("ensemble heat_bdp should have 5 parameters.");
+    }
+  } else if (strcmp(param[1], "heat_nhc_power") == 0) {
+    type = 27;
+    if (num_param != 7) {
+      PRINT_INPUT_ERROR("ensemble heat_nhc_power should have 5 parameters.");
     }
   } else if (strcmp(param[1], "heat_ttm") == 0) {
     type = 24;
@@ -497,6 +579,11 @@ void Integrate::parse_ensemble(
       PRINT_INPUT_ERROR(
         "ensemble ttm should have 12 required parameters plus optional key-value pairs.");
     }
+  } else if (strcmp(param[1], "heat_hybrid") == 0) {
+    type = 26;
+    if (num_param < 9) {
+      PRINT_INPUT_ERROR("ensemble heat_hybrid needs at least 7 parameters.");
+    }
   } else if (strcmp(param[1], "rpmd") == 0) {
     type = 31;
     if (num_param != 3 && num_param != 4) {
@@ -510,8 +597,9 @@ void Integrate::parse_ensemble(
   } else if (strcmp(param[1], "pimd") == 0) {
     type = 33;
     if (
-      num_param != 6 && num_param != 9 && num_param != 10 && num_param != 13 &&
-      num_param != 16 && num_param != 19 && num_param != 25) {
+      pimd_num_param != 6 && pimd_num_param != 9 && pimd_num_param != 10 &&
+      pimd_num_param != 13 && pimd_num_param != 16 && pimd_num_param != 19 &&
+      pimd_num_param != 25) {
       PRINT_INPUT_ERROR(
         "ensemble pimd should have 4, 7, 8, 11, 14, 17, or 23 parameters.");
     }
@@ -519,8 +607,8 @@ void Integrate::parse_ensemble(
     type = 33;
     use_scr_barostat = true;
     if (
-      num_param != 9 && num_param != 10 && num_param != 13 && num_param != 16 &&
-      num_param != 19 && num_param != 25) {
+      pimd_num_param != 9 && pimd_num_param != 10 && pimd_num_param != 13 &&
+      pimd_num_param != 16 && pimd_num_param != 19 && pimd_num_param != 25) {
       PRINT_INPUT_ERROR(
         "ensemble pimd_scr should have 7, 8, 11, 14, 17, or 23 parameters.");
     }
@@ -732,30 +820,85 @@ void Integrate::parse_ensemble(
       PRINT_INPUT_ERROR("|Temperature difference| is too large.");
     }
 
-    // group labels of heat source and sink
-    if (!is_valid_int(param[5], &source)) {
-      PRINT_INPUT_ERROR("Group ID for heat source should be an integer.");
+    if (type == 22 && use_heat_lan_region) {
+      for (int i = 0; i < 6; ++i) {
+        if (!is_valid_real(param[5 + i], &heat_source_region[i])) {
+          PRINT_INPUT_ERROR("Heat source region bounds should be numbers.");
+        }
+        if (!is_valid_real(param[11 + i], &heat_sink_region[i])) {
+          PRINT_INPUT_ERROR("Heat sink region bounds should be numbers.");
+        }
+      }
+      for (int d = 0; d < 3; ++d) {
+        const int i = 2 * d;
+        if (!(heat_source_region[i] >= 0.0 && heat_source_region[i] <= 1.0 &&
+              heat_source_region[i + 1] >= 0.0 && heat_source_region[i + 1] <= 1.0)) {
+          PRINT_INPUT_ERROR("Heat source region bounds should be in [0, 1].");
+        }
+        if (!(heat_sink_region[i] >= 0.0 && heat_sink_region[i] <= 1.0 &&
+              heat_sink_region[i + 1] >= 0.0 && heat_sink_region[i + 1] <= 1.0)) {
+          PRINT_INPUT_ERROR("Heat sink region bounds should be in [0, 1].");
+        }
+        if (heat_source_region[i] >= heat_source_region[i + 1]) {
+          PRINT_INPUT_ERROR("Heat source region minimum should be smaller than maximum.");
+        }
+        if (heat_sink_region[i] >= heat_sink_region[i + 1]) {
+          PRINT_INPUT_ERROR("Heat sink region minimum should be smaller than maximum.");
+        }
+      }
+      if (
+        heat_source_region[0] < heat_sink_region[1] &&
+        heat_sink_region[0] < heat_source_region[1] &&
+        heat_source_region[2] < heat_sink_region[3] &&
+        heat_sink_region[2] < heat_source_region[3] &&
+        heat_source_region[4] < heat_sink_region[5] &&
+        heat_sink_region[4] < heat_source_region[5]) {
+        PRINT_INPUT_ERROR("Heat source and sink regions cannot overlap.");
+      }
+    } else {
+      if (!is_valid_int(param[5], &source)) {
+        PRINT_INPUT_ERROR("Group ID for heat source should be an integer.");
+      }
+      if (!is_valid_int(param[6], &sink)) {
+        PRINT_INPUT_ERROR("Group ID for heat sink should be an integer.");
+      }
+      if (group.size() < 1) {
+        PRINT_INPUT_ERROR("Cannot heat/cold without grouping method.");
+      }
+      if (source == sink) {
+        PRINT_INPUT_ERROR("Source and sink cannot be the same group.");
+      }
+      if (source < 0) {
+        PRINT_INPUT_ERROR("Group ID for heat source should >= 0.");
+      }
+      if (source >= group[0].number) {
+        PRINT_INPUT_ERROR("Group ID for heat source should < #groups.");
+      }
+      if (sink < 0) {
+        PRINT_INPUT_ERROR("Group ID for heat sink should >= 0.");
+      }
+      if (sink >= group[0].number) {
+        PRINT_INPUT_ERROR("Group ID for heat sink should < #groups.");
+      }
     }
-    if (!is_valid_int(param[6], &sink)) {
-      PRINT_INPUT_ERROR("Group ID for heat sink should be an integer.");
+  }
+
+  if (type == 27) {
+    if (!is_valid_real(param[2], &temperature) || temperature <= 0.0) {
+      PRINT_INPUT_ERROR("Temperature should be a positive number.");
     }
-    if (group.size() < 1) {
-      PRINT_INPUT_ERROR("Cannot heat/cold without grouping method.");
+    if (!is_valid_real(param[3], &temperature_coupling) || temperature_coupling < 1.0) {
+      PRINT_INPUT_ERROR("Temperature coupling should be a number >= 1.");
     }
-    if (source == sink) {
-      PRINT_INPUT_ERROR("Source and sink cannot be the same group.");
+    if (!is_valid_real(param[4], &delta_temperature) || delta_temperature <= 0.0) {
+      PRINT_INPUT_ERROR("Heating power should be a positive number.");
     }
-    if (source < 0) {
-      PRINT_INPUT_ERROR("Group ID for heat source should >= 0.");
+    if (!is_valid_int(param[5], &source) || !is_valid_int(param[6], &sink)) {
+      PRINT_INPUT_ERROR("Heat source and sink group IDs should be integers.");
     }
-    if (source >= group[0].number) {
-      PRINT_INPUT_ERROR("Group ID for heat source should < #groups.");
-    }
-    if (sink < 0) {
-      PRINT_INPUT_ERROR("Group ID for heat sink should >= 0.");
-    }
-    if (sink >= group[0].number) {
-      PRINT_INPUT_ERROR("Group ID for heat sink should < #groups.");
+    if (group.size() < 1 || source == sink || source < 0 || sink < 0 ||
+        source >= group[0].number || sink >= group[0].number) {
+      PRINT_INPUT_ERROR("Invalid heat source or sink group.");
     }
   }
 
@@ -767,6 +910,66 @@ void Integrate::parse_ensemble(
 
   if (type == 24 || type == 25) {
     parse_ttm_parameters(type, param, num_param, atom, box, group, source, sink, ttm_parameters);
+  }
+
+  if (type == 26) {
+    heat_thermostat.clear();
+    heat_coupling.clear();
+    heat_labels.clear();
+
+    int num_thermostats = 0;
+    while (num_thermostats + 2 < num_param) {
+      if (strcmp(param[2 + num_thermostats], "nhc") == 0) {
+        heat_thermostat.push_back(0);
+      } else if (strcmp(param[2 + num_thermostats], "lan") == 0) {
+        heat_thermostat.push_back(1);
+      } else {
+        break;
+      }
+      ++num_thermostats;
+    }
+    if (num_thermostats < 2) {
+      PRINT_INPUT_ERROR("Heat-hybrid needs at least 2 thermostats.");
+    }
+
+    int index = 2 + num_thermostats;
+    if (index >= num_param || !is_valid_real(param[index], &temperature) || temperature <= 0.0) {
+      PRINT_INPUT_ERROR("Heat-hybrid temperature should be positive.");
+    }
+    ++index;
+    heat_coupling.resize(num_thermostats);
+    for (int n = 0; n < num_thermostats; ++n, ++index) {
+      if (index >= num_param || !is_valid_real(param[index], &heat_coupling[n]) ||
+          heat_coupling[n] < 1.0) {
+        PRINT_INPUT_ERROR("Heat-hybrid damping parameter should be a number >= 1.");
+      }
+    }
+    temperature_coupling = heat_coupling[0];
+    if (index >= num_param || !is_valid_real(param[index], &delta_temperature) ||
+        delta_temperature >= temperature || delta_temperature <= -temperature) {
+      PRINT_INPUT_ERROR("Heat-hybrid temperature difference is invalid.");
+    }
+    ++index;
+    heat_labels.resize(num_thermostats);
+    for (int n = 0; n < num_thermostats; ++n, ++index) {
+      if (index >= num_param || !is_valid_int(param[index], &heat_labels[n])) {
+        PRINT_INPUT_ERROR("Heat-hybrid group ID should be an integer.");
+      }
+    }
+    if (group.size() < 1) {
+      PRINT_INPUT_ERROR("Cannot heat/cold without grouping method.");
+    }
+    for (int n = 0; n < num_thermostats; ++n) {
+      if (heat_labels[n] < 0 || heat_labels[n] >= group[0].number ||
+          group[0].cpu_size[heat_labels[n]] <= 0) {
+        PRINT_INPUT_ERROR("Heat-hybrid group is invalid or empty.");
+      }
+      for (int m = 0; m < n; ++m) {
+        if (heat_labels[m] == heat_labels[n]) {
+          PRINT_INPUT_ERROR("Heat-hybrid thermostats must use different groups.");
+        }
+      }
+    }
   }
 
   // 5. PIMD related
@@ -819,12 +1022,12 @@ void Integrate::parse_ensemble(
       num_target_pressure_components = 0;
 
       // pressures:
-      if (num_param >= 9) {
-        if (num_param == 9 || num_param == 10) { // isotropic, fixed or ramped
+      if (pimd_num_param >= 9) {
+        if (pimd_num_param == 9 || pimd_num_param == 10) { // isotropic, fixed or ramped
           if (!is_valid_real(param[6], &target_pressure_start[0])) {
             PRINT_INPUT_ERROR("Initial pressure should be a number.");
           }
-          if (num_param == 10) {
+          if (pimd_num_param == 10) {
             if (!is_valid_real(param[7], &target_pressure_stop[0])) {
               PRINT_INPUT_ERROR("Final pressure should be a number.");
             }
@@ -850,13 +1053,13 @@ void Integrate::parse_ensemble(
             PRINT_INPUT_ERROR(
               "Cannot use isotropic pressure with non-periodic boundary in any direction.");
           }
-        } else if (num_param == 13 || num_param == 16) { // orthogonal, fixed or ramped
+        } else if (pimd_num_param == 13 || pimd_num_param == 16) { // orthogonal, fixed or ramped
           for (int i = 0; i < 3; i++) {
             if (!is_valid_real(param[6 + i], &target_pressure_start[i])) {
               PRINT_INPUT_ERROR("Initial pressure should be a number.");
             }
           }
-          if (num_param == 16) {
+          if (pimd_num_param == 16) {
             for (int i = 0; i < 3; i++) {
               if (!is_valid_real(param[9 + i], &target_pressure_stop[i])) {
                 PRINT_INPUT_ERROR("Final pressure should be a number.");
@@ -886,13 +1089,13 @@ void Integrate::parse_ensemble(
             box.cpu_h[6] != 0 || box.cpu_h[7] != 0) {
             PRINT_INPUT_ERROR("Cannot use triclinic box with only 3 target pressure components.");
           }
-        } else if (num_param == 19 || num_param == 25) { // triclinic, fixed or ramped
+        } else if (pimd_num_param == 19 || pimd_num_param == 25) { // triclinic, fixed or ramped
           for (int i = 0; i < 6; i++) {
             if (!is_valid_real(param[6 + i], &target_pressure_start[i])) {
               PRINT_INPUT_ERROR("Initial pressure should be a number.");
             }
           }
-          if (num_param == 25) {
+          if (pimd_num_param == 25) {
             for (int i = 0; i < 6; i++) {
               if (!is_valid_real(param[12 + i], &target_pressure_stop[i])) {
                 PRINT_INPUT_ERROR("Final pressure should be a number.");
@@ -932,7 +1135,7 @@ void Integrate::parse_ensemble(
 
         // pressure_coupling:
         int index_pressure_coupling = 6 + num_target_pressure_components * 2;
-        if (num_param == 10 || num_param == 16 || num_param == 25) {
+        if (pimd_num_param == 10 || pimd_num_param == 16 || pimd_num_param == 25) {
           index_pressure_coupling += num_target_pressure_components;
         }
         if (!is_valid_real(param[index_pressure_coupling], &tau_p)) {
@@ -1144,8 +1347,17 @@ void Integrate::parse_ensemble(
       printf("    delta_T is %g K.\n", delta_temperature);
       printf("    T_hot is %g K.\n", temperature + delta_temperature);
       printf("    T_cold is %g K.\n", temperature - delta_temperature);
-      printf("    heat source is group %d in grouping method 0.\n", source);
-      printf("    heat sink is group %d in grouping method 0.\n", sink);
+      if (use_heat_lan_region) {
+        printf("    heat source fractional region is [%g, %g) [%g, %g) [%g, %g).\n",
+          heat_source_region[0], heat_source_region[1], heat_source_region[2],
+          heat_source_region[3], heat_source_region[4], heat_source_region[5]);
+        printf("    heat sink fractional region is [%g, %g) [%g, %g) [%g, %g).\n",
+          heat_sink_region[0], heat_sink_region[1], heat_sink_region[2],
+          heat_sink_region[3], heat_sink_region[4], heat_sink_region[5]);
+      } else {
+        printf("    heat source is group %d in grouping method 0.\n", source);
+        printf("    heat sink is group %d in grouping method 0.\n", sink);
+      }
       break;
     case 23:
       printf("Integrate with heating and cooling for this run.\n");
@@ -1174,6 +1386,16 @@ void Integrate::parse_ensemble(
       printf("Integrate with pure Two-Temperature Model (TTM) for this run.\n");
       print_ttm_settings(ttm_parameters);
       break;
+    case 26:
+      printf("Integrate with hybrid heating and cooling for this run.\n");
+      printf("    Number of thermostats: %zu\n", heat_thermostat.size());
+      break;
+    case 27:
+      printf("Integrate with constant-power heating and cooling for this run.\n");
+      printf("    heating power is %g eV/fs.\n", delta_temperature);
+      printf("    heat source is group %d in grouping method 0.\n", source);
+      printf("    heat sink is group %d in grouping method 0.\n", sink);
+      break;
     case 31:
       printf("Use ring-polymer MD (RPMD) for this run.\n");
       printf("    number of beads is %d.\n", number_of_beads);
@@ -1191,7 +1413,7 @@ void Integrate::parse_ensemble(
       printf("    global ring-polymer COM correction is %s.\n", pimd_fix_com ? "on" : "off");
       break;
     case 33:
-      if (num_param >= 9) {
+      if (pimd_num_param >= 9) {
         if (use_scr_barostat) {
           printf("Use NPT-PIMD with stochastic cell rescaling for this run.\n");
         } else {
@@ -1208,7 +1430,7 @@ void Integrate::parse_ensemble(
              pimd_use_exact_propagator ? "exact" : "Cayley");
       printf("    internal-mode Langevin scale is %g.\n", pimd_pile_scale);
       printf("    global ring-polymer COM correction is %s.\n", pimd_fix_com ? "on" : "off");
-      if (num_param >= 9) {
+      if (pimd_num_param >= 9) {
         if (num_target_pressure_components == 1) {
           printf("    initial isotropic pressure is %g GPa.\n", target_pressure_start[0]);
           printf("    final isotropic pressure is %g GPa.\n", target_pressure_stop[0]);
@@ -1257,6 +1479,11 @@ void Integrate::parse_ensemble(
     default:
       PRINT_INPUT_ERROR("Invalid ensemble type.");
       break;
+  }
+
+  if (type == 33 && use_eco_pimd) {
+    printf("    use Eco-PIMD internal-mode frequencies.\n");
+    printf("    Eco-PIMD omega_max is %g cm^-1.\n", eco_omega_max_cm1);
   }
 }
 
