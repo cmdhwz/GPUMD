@@ -28,6 +28,29 @@ This software is distributed under the GNU General Public License (GPL) version 
   * `path/to/gpumd`
   * `path/to/nep`
 
+For independent NVE trajectories stored as `sample_1`, `sample_2`, and so on, put the shared
+`run.in` in the parent directory and run, for example:
+
+```text
+path/to/gpumd_batch sample_ 1 100 25
+path/to/gpumd_batch sample_ 1 100 25 COMPLETED1
+```
+
+On Linux/POSIX, build the optional launcher explicitly with `make gpumd_batch` or
+`cmake --build <build-directory> --target gpumd_batch`; it is not part of the default `make`
+or CMake build. The existing GPUMD Windows build remains unchanged.
+
+Each sample directory must contain its own `model.xyz`. The optional final argument is the empty
+completion-marker filename and defaults to `COMPLETED`; completed samples are skipped and the
+marker is created only after a successful child `gpumd` run. Marker names `run.in` and `model.xyz`
+are rejected; an existing marker must be a zero-byte regular file. If a sample already has
+`run.in`, it must be byte-identical to the parent input; otherwise the batch launcher refuses to
+overwrite it. A file created at the marker path by the child is never overwritten.
+Paths to shared input files in `run.in` should be absolute because the child process runs from its
+sample directory.
+The batch entry point currently accepts only `ensemble nve` (or the default NVE when no ensemble
+keyword is present).
+
 ## Tutorials
 * We provide a [Colab Tutorial](https://colab.research.google.com/drive/1QnXAveZgzwut4Mvldsw-r2I0EWIsj1KA?usp=sharing) to show the workflow of the construction of a NEP model and its application in large-scale atomistic simulations for PbTe system. This will run entirely on Google's cloud virtual machine.
 * We also provide many tutorials and examples in the [GPUMD-Tutorials repository](https://github.com/brucefan1983/GPUMD-Tutorials).

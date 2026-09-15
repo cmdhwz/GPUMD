@@ -31,6 +31,12 @@ add_executable(gpumd ${GPUMD_SOURCES})
 target_include_directories(gpumd PRIVATE src)
 target_link_libraries(gpumd PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft)
 
+# --- gpumd_batch (Linux/POSIX, explicit target) ---
+if(NOT WIN32)
+    add_executable(gpumd_batch EXCLUDE_FROM_ALL src/main_gpumd_batch/main.cpp)
+    target_link_libraries(gpumd_batch PRIVATE Threads::Threads)
+endif()
+
 # --- nep ---
 file(GLOB NEP_SOURCES
     src/main_nep/*.cu

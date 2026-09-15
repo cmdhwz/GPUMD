@@ -15,6 +15,10 @@
 # some flags
 ###########################################################
 CC = nvcc
+ifndef OS
+BATCH_CXX ?= g++
+BATCH_CXXFLAGS ?= -std=c++14 -O3
+endif
 CUDA_ARCH=-arch=sm_89
 # Enable dump_netcdf for Linux builds. Set NETCDF_ROOT when NetCDF is
 # installed outside the compiler's default include/library search paths.
@@ -78,6 +82,9 @@ SOURCES_NEP =                     \
 SOURCES_GNEP =                     \
 	$(wildcard main_gnep/*.cu)     \
 	$(wildcard utilities/*.cu)
+ifndef OS
+SOURCES_BATCH = main_gpumd_batch/main.cpp
+endif
 
 
 ###########################################################
@@ -91,6 +98,7 @@ else
 OBJ_GPUMD = $(SOURCES_GPUMD:.cu=.o)
 OBJ_NEP = $(SOURCES_NEP:.cu=.o)
 OBJ_GNEP = $(SOURCES_GNEP:.cu=.o)
+OBJ_BATCH = $(SOURCES_BATCH:.cpp=.o)
 endif
 
 
@@ -114,7 +122,7 @@ HEADERS =                         \
 ###########################################################
 # executables
 ###########################################################
-all: gpumd nep 
+all: gpumd nep
 gpumd: $(OBJ_GPUMD)
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 	@echo =================================================
@@ -130,6 +138,13 @@ gnep: $(OBJ_GNEP)
 	@echo =================================================
 	@echo The gnep executable is successfully compiled!
 	@echo =================================================
+ifndef OS
+gpumd_batch: $(OBJ_BATCH)
+	$(BATCH_CXX) $(LDFLAGS) $^ -o $@ $(GNEP_LIBS)
+	@echo =================================================
+	@echo The gpumd_batch executable is successfully compiled!
+	@echo =================================================
+endif
 
 
 ###########################################################
@@ -181,6 +196,8 @@ main_nep/%.o: main_nep/%.cu $(HEADERS)
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
 main_gnep/%.o: main_gnep/%.cu $(HEADERS)
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
+main_gpumd_batch/%.o: main_gpumd_batch/%.cpp
+	$(BATCH_CXX) $(BATCH_CXXFLAGS) $(INC) -c $< -o $@
 endif
 
 
@@ -191,5 +208,5 @@ clean:
 ifdef OS
 	del /s *.obj *.exp *.lib *.exe
 else
-	rm -f */*.o gpumd nep gnep
+	rm -f */*.o gpumd nep gnep gpumd_batch
 endif
