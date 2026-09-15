@@ -129,7 +129,6 @@ Simulation setup
      - Invoke the PLUMED plugin during an :term:`MD` run
      - No
      - No
-     - Yes
    * - :ref:`read_pimd_restart <kw_read_pimd_restart>`
      - Read a centroid and bead-resolved PIMD restart state
      - Yes
@@ -262,6 +261,8 @@ Output
      - No
    * - :ref:`dump_pimd_restart <kw_dump_pimd_restart>`
      - Write a centroid and bead-resolved PIMD restart state
+     - No
+     - No
    * - :ref:`dump_beads <kw_dump_beads>`
      - Write bead-resolved positions and optional velocities and forces for :term:`PIMD`-related runs
      - No
@@ -280,6 +281,8 @@ Output
      - No
    * - :ref:`dump_position <kw_dump_position>`
      - Write the atomic positions
+     - No
+     - No
    * - :ref:`dump_polarizability <kw_dump_polarizability>`
      - Write polarizabilities predicted by a separate tensorial NEP model
      - No
@@ -302,5 +305,9 @@ Output
      - No
    * - :ref:`dump_velocity <kw_dump_velocity>`
      - Write the atomic velocities
+     - No
+     - No
+   * - :ref:`dump_xyz <kw_dump_xyz>`
+     - Write positions and other per-atom quantities in `extended XYZ format <https://github.com/libAtoms/extxyz>`_
      - No
      - No
