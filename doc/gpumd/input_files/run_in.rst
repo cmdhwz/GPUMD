@@ -192,6 +192,10 @@ Actions
      - Compute the thermal conductivity using the :term:`EMD` method
      - No
      - No
+   * - :ref:`centroid_force_diagnostic <kw_centroid_force_diagnostic>`
+     - Diagnose the mismatch between bead-average and centroid forces in PIMD/RPMD/TRPMD
+     - No
+     - No
    * - :ref:`compute_ic <kw_compute_ic>`
      - Compute the ionic conductivity (:term:`IC`)
      - No

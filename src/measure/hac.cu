@@ -85,6 +85,7 @@ void HAC::pre_run(
     deferred_hac_wall_time_ = 0.0;
     centroid_sampled_frames_ = 0;
     centroid_direct_evaluations_ = 0;
+    centroid_force_step_ = -1;
     int number_of_frames = number_of_steps / sample_interval;
     if (number_of_frames <= 0 || Nc > number_of_frames) {
       PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
@@ -926,6 +927,7 @@ void HAC::end_of_step(
       }
       qnep_full_a_qnep_->invalidate_current_force_caches();
       qnep_full_a_qnep_->mark_single_frame_neighbor_reference_pending();
+      centroid_force_step_ = step + 1;
     }
     qnep_full_a_sample_steps_[nd] = step + 1;
     qnep_full_a_sample_times_fs_[nd] = sample_time_fs;
@@ -971,6 +973,7 @@ void HAC::end_of_step(
       centroid_virial_per_atom_,
       atom.velocity_per_atom,
       atom.mass);
+    centroid_force_step_ = step + 1;
     centroid_potential_source = &centroid_potential_per_atom_;
     centroid_virial_source = &centroid_virial_per_atom_;
     compute_full_heat_per_atom(

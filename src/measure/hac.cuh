@@ -27,6 +27,26 @@ public:
 
   void set_qnep_full_a(const bool enabled) { qnep_full_a_ = enabled; }
 
+  bool centroid_force_source_is_immediate() const
+  {
+    return compute != 0 && use_centroid_heat_flux_ != 0 && !deferred_centroid_enabled_;
+  }
+
+  bool centroid_force_ready(const int step) const
+  {
+    return centroid_force_source_is_immediate() && centroid_force_step_ == step;
+  }
+
+  const GPU_Vector<double>& centroid_force_per_atom() const
+  {
+    return centroid_force_per_atom_;
+  }
+
+  const GPU_Vector<double>& centroid_potential_per_atom() const
+  {
+    return centroid_potential_per_atom_;
+  }
+
   int compute = 0;
   int sample_interval; // sample interval for heat current
   int Nc;              // number of correlation points
@@ -96,6 +116,7 @@ private:
   int split_qnep_heat_by_type_ = 0;
   int deferred_centroid_qnep_ = 0;
   bool deferred_centroid_enabled_ = false;
+  int centroid_force_step_ = -1;
   Force* force_ = nullptr;
   int centroid_frame_size_ = 0;
   int centroid_frame_count_ = 0;

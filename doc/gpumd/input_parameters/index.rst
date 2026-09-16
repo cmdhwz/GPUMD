@@ -64,6 +64,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    compute_elastic
    compute_gkma
    compute_hac
+   centroid_force_diagnostic
    compute_proton_tunneling
    compute_hnema
    compute_hnemd

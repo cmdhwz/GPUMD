@@ -33,6 +33,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/compute_chunk.cuh"
 #include "measure/compute_dpdt.cuh"
 #include "measure/compute_es.cuh"
+#include "measure/centroid_force_diagnostic.cuh"
 #include "measure/qnep_projection.cuh"
 #include "measure/dos.cuh"
 #include "measure/deform.cuh"
@@ -243,6 +244,34 @@ void Run::compute_force()
 
 void Run::perform_a_run()
 {
+  HAC* centroid_force_hac = nullptr;
+  Centroid_Force_Diagnostic* centroid_force_diagnostic = nullptr;
+  for (const auto& action : measure.actions) {
+    if (action->action_name == "compute_hac") {
+      centroid_force_hac = dynamic_cast<HAC*>(action.get());
+      break;
+    }
+  }
+  for (const auto& property : measure.properties) {
+    if (property->property_name == "centroid_force_diagnostic") {
+      centroid_force_diagnostic =
+        dynamic_cast<Centroid_Force_Diagnostic*>(property.get());
+      break;
+    }
+  }
+  if (centroid_force_diagnostic != nullptr) {
+    centroid_force_diagnostic->set_hac(centroid_force_hac);
+    for (const auto& action : measure.actions) {
+      if (
+        action->action_name == "compute_es" || action->action_name == "active" ||
+        action->action_name == "dump_observer" || action->action_name == "plumed") {
+        PRINT_INPUT_ERROR(
+          "centroid_force_diagnostic cannot be combined with actions that rewrite "
+          "atom.force_per_atom at end_of_step.\n");
+      }
+    }
+  }
+
   integrate.initialize(time_step, atom, box, group, thermo, number_of_steps);
   measure.pre_run(number_of_steps, time_step, integrate, group, atom, box, force);
 
@@ -620,6 +649,10 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     std::unique_ptr<Action> action;
     action.reset(new HAC(param, num_param, hac_current_qnep_full_a_));
     measure.actions.emplace_back(std::move(action));
+  } else if (strcmp(param[0], "centroid_force_diagnostic") == 0) {
+    std::unique_ptr<Property> property;
+    property.reset(new Centroid_Force_Diagnostic(param, num_param));
+    measure.properties.emplace_back(std::move(property));
   } else if (strcmp(param[0], "compute_proton_tunneling") == 0) {
     std::unique_ptr<Property> property;
     property.reset(new Proton_Tunneling(param, num_param, atom));
