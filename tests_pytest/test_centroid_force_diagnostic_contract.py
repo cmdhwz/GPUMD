@@ -85,3 +85,10 @@ def test_centroid_force_diagnostic_rejects_force_buffer_overwriters():
     for action_name in ("compute_es", "active", "dump_observer", "plumed"):
         assert action_name in run_source
     assert "centroid_force_diagnostic cannot be combined" in run_source
+
+
+def test_rpmd_parse_resets_pressure_control_state():
+    source = (ROOT / "src/integrate/integrate.cu").read_text(encoding="utf-8")
+    parse_start = source.index("void Integrate::parse_ensemble")
+    setup_end = source.index("  // 1. Determine the integration method", parse_start)
+    assert "num_target_pressure_components = 0;" in source[parse_start:setup_end]

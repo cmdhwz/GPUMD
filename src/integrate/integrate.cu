@@ -456,6 +456,7 @@ void Integrate::parse_ensemble(
   use_scr_barostat = false;
   eco_omega_max_cm1 = 0.0;
   use_heat_lan_region = false;
+  num_target_pressure_components = 0;
   int pimd_num_param = num_param;
   if ((strcmp(param[1], "pimd") == 0 || strcmp(param[1], "pimd_scr") == 0) &&
       num_param >= 8 &&
