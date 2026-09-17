@@ -32,16 +32,17 @@ Output
 The data are appended to ``centroid_force_diagnostic.out``. The first line of
 each run segment is a column header with units. Force values are in
 ``eV/Angstrom``, time is in ``fs``, centroid energy is in ``eV``, and
-``P_delta`` is in ``eV/fs``. The internal centroid velocity used in the power
-calculation is in ``Angstrom/natural_time``.
+``P_delta``, ``P_Fbar``, and ``P_Fc`` are in ``eV/fs``. The internal centroid
+velocity used in the power calculation is in ``Angstrom/natural_time``.
 
-The global force and power columns are ``deltaF_rms``, ``deltaF_mean_abs``,
-``deltaF_max``, ``Fbar_rms``, ``Fc_rms``, ``relative_deltaF_rms``, and
-``P_delta``. Fixed H, O, Na, and Cl column groups follow these global columns.
-Each group contains ``N_type`` and the same force and power statistics. A
-missing species has ``N_type = 0`` and ``nan`` for its floating-point
-statistics. The final columns are ``K_centroid``, ``U_centroid``, and
-``E_centroid``.
+The initial global force and power columns end with ``P_delta``: they are
+``deltaF_rms``, ``deltaF_mean_abs``, ``deltaF_max``, ``Fbar_rms``, ``Fc_rms``,
+``relative_deltaF_rms``, and ``P_delta``. Fixed H, O, Na, and Cl column groups
+follow these columns. Each group contains ``N_type``, the force statistics,
+and its own ``P_delta``; the groups do not contain ``P_Fbar`` or ``P_Fc``.
+A missing species has ``N_type = 0`` and ``nan`` for its floating-point
+statistics. The final five columns are ``K_centroid``, ``U_centroid``,
+``E_centroid``, global ``P_Fbar``, and global ``P_Fc``.
 
 Example
 -------

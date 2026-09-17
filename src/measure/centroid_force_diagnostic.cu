@@ -38,7 +38,9 @@ constexpr int DIAGNOSTIC_FC_SQUARED = 5;
 constexpr int DIAGNOSTIC_POWER = 6;
 constexpr int DIAGNOSTIC_KINETIC = 7;
 constexpr int DIAGNOSTIC_POTENTIAL = 8;
-constexpr int DIAGNOSTIC_STATISTICS = 9;
+constexpr int DIAGNOSTIC_POWER_FBAR = 9;
+constexpr int DIAGNOSTIC_POWER_FC = 10;
+constexpr int DIAGNOSTIC_STATISTICS = 11;
 constexpr int DIAGNOSTIC_SPECIES = 4;
 constexpr int DIAGNOSTIC_BLOCKS = DIAGNOSTIC_SPECIES + 1;
 constexpr int DIAGNOSTIC_THREADS = 128;
@@ -88,6 +90,8 @@ static __global__ void gpu_reduce_centroid_force_diagnostic(
     const double fbar_squared = fbar_x * fbar_x + fbar_y * fbar_y + fbar_z * fbar_z;
     const double fc_squared = fc_x * fc_x + fc_y * fc_y + fc_z * fc_z;
     const double power = vc_x * delta_x + vc_y * delta_y + vc_z * delta_z;
+    const double power_fbar = vc_x * fbar_x + vc_y * fbar_y + vc_z * fbar_z;
+    const double power_fc = vc_x * fc_x + vc_y * fc_y + vc_z * fc_z;
     const double kinetic = 0.5 * g_mass[n] * (vc_x * vc_x + vc_y * vc_y + vc_z * vc_z);
 
     s_statistics[DIAGNOSTIC_COUNT][tid] += 1.0;
@@ -99,6 +103,8 @@ static __global__ void gpu_reduce_centroid_force_diagnostic(
     s_statistics[DIAGNOSTIC_FBAR_SQUARED][tid] += fbar_squared;
     s_statistics[DIAGNOSTIC_FC_SQUARED][tid] += fc_squared;
     s_statistics[DIAGNOSTIC_POWER][tid] += power;
+    s_statistics[DIAGNOSTIC_POWER_FBAR][tid] += power_fbar;
+    s_statistics[DIAGNOSTIC_POWER_FC][tid] += power_fc;
     s_statistics[DIAGNOSTIC_KINETIC][tid] += kinetic;
     s_statistics[DIAGNOSTIC_POTENTIAL][tid] += g_potential[n];
   }
@@ -249,7 +255,9 @@ void Centroid_Force_Diagnostic::write_header_()
       DIAGNOSTIC_SPECIES_NAMES[species],
       DIAGNOSTIC_SPECIES_NAMES[species]);
   }
-  fprintf(fid_, " K_centroid[eV] U_centroid[eV] E_centroid[eV]\n");
+  fprintf(
+    fid_,
+    " K_centroid[eV] U_centroid[eV] E_centroid[eV] P_Fbar[eV/fs] P_Fc[eV/fs]\n");
   fprintf(fid_, "# velocity_internal_unit Angstrom/natural_time\n");
   fprintf(fid_, "# P_delta_is_power_diagnostic_not_heat_current\n");
   fflush(fid_);
@@ -357,10 +365,12 @@ void Centroid_Force_Diagnostic::write_row_(const int step, const double global_t
   const double centroid_potential = global[DIAGNOSTIC_POTENTIAL];
   fprintf(
     fid_,
-    " %.15e %.15e %.15e\n",
+    " %.15e %.15e %.15e %.15e %.15e\n",
     centroid_kinetic,
     centroid_potential,
-    centroid_kinetic + centroid_potential);
+    centroid_kinetic + centroid_potential,
+    global[DIAGNOSTIC_POWER_FBAR] / TIME_UNIT_CONVERSION,
+    global[DIAGNOSTIC_POWER_FC] / TIME_UNIT_CONVERSION);
   fflush(fid_);
 }
 
