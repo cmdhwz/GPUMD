@@ -29,11 +29,20 @@ buffer after the bead-force average has been produced.
 Output
 ------
 
-The data are appended to ``centroid_force_diagnostic.out``. The first line of
-each run segment is a column header with units. Force values are in
+The data are held in memory during the run and appended to
+``centroid_force_diagnostic.out`` after the run completes. No diagnostic rows
+are written during dynamics. The first line of each run segment is a column
+header with units. Force values are in
 ``eV/Angstrom``, time is in ``fs``, centroid energy is in ``eV``, and
 ``P_delta``, ``P_Fbar``, and ``P_Fc`` are in ``eV/fs``. The internal centroid
 velocity used in the power calculation is in ``Angstrom/natural_time``.
+
+The cache payload is approximately
+``(55 * sizeof(double) + sizeof(double) + sizeof(int)) *
+floor(number_of_steps / sample_interval)`` bytes, or about 452 bytes per
+sampled frame, excluding allocator overhead. The estimate is printed before
+dynamics. If a run terminates before postprocessing completes, cached
+diagnostic samples from that run are not written and cannot be recovered.
 
 The initial global force and power columns end with ``P_delta``: they are
 ``deltaF_rms``, ``deltaF_mean_abs``, ``deltaF_max``, ``Fbar_rms``, ``Fc_rms``,

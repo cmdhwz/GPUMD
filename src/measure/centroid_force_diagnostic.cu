@@ -167,7 +167,7 @@ Centroid_Force_Diagnostic::Centroid_Force_Diagnostic(const char** param, const i
 }
 
 void Centroid_Force_Diagnostic::preprocess(
-  const int,
+  const int number_of_steps,
   const double,
   Integrate& integrate,
   std::vector<Group>&,
@@ -228,9 +228,23 @@ void Centroid_Force_Diagnostic::preprocess(
   species_by_type_.copy_from_host(species_by_type_cpu.data());
   gpu_statistics_.resize(DIAGNOSTIC_BLOCKS * DIAGNOSTIC_STATISTICS);
   cpu_statistics_.resize(DIAGNOSTIC_BLOCKS * DIAGNOSTIC_STATISTICS);
-
-  fid_ = my_fopen("centroid_force_diagnostic.out", "a");
-  write_header_();
+  sampled_steps_.clear();
+  sample_times_.clear();
+  statistics_history_.clear();
+  const size_t number_of_samples = static_cast<size_t>(number_of_steps / sample_interval_);
+  const size_t statistics_per_sample =
+    static_cast<size_t>(DIAGNOSTIC_BLOCKS) * DIAGNOSTIC_STATISTICS;
+  const size_t estimated_cache_bytes = number_of_samples *
+    (statistics_per_sample * sizeof(double) + sizeof(double) + sizeof(int));
+  printf(
+    "    centroid force diagnostic cache estimate: %zu frames, %zu bytes (%.3f MiB, %.3f GiB).\n",
+    number_of_samples,
+    estimated_cache_bytes,
+    static_cast<double>(estimated_cache_bytes) / (1024.0 * 1024.0),
+    static_cast<double>(estimated_cache_bytes) / (1024.0 * 1024.0 * 1024.0));
+  sampled_steps_.reserve(number_of_samples);
+  sample_times_.reserve(number_of_samples);
+  statistics_history_.reserve(number_of_samples * statistics_per_sample);
 }
 
 void Centroid_Force_Diagnostic::write_header_()
@@ -260,7 +274,6 @@ void Centroid_Force_Diagnostic::write_header_()
     " K_centroid[eV] U_centroid[eV] E_centroid[eV] P_Fbar[eV/fs] P_Fc[eV/fs]\n");
   fprintf(fid_, "# velocity_internal_unit Angstrom/natural_time\n");
   fprintf(fid_, "# P_delta_is_power_diagnostic_not_heat_current\n");
-  fflush(fid_);
 }
 
 void Centroid_Force_Diagnostic::process(
@@ -301,12 +314,16 @@ void Centroid_Force_Diagnostic::process(
     gpu_statistics_.data());
   GPU_CHECK_KERNEL
   gpu_statistics_.copy_to_host(cpu_statistics_.data());
-  write_row_(sampled_step, global_time);
+  sampled_steps_.push_back(sampled_step);
+  sample_times_.push_back(global_time);
+  statistics_history_.insert(
+    statistics_history_.end(), cpu_statistics_.begin(), cpu_statistics_.end());
 }
 
-void Centroid_Force_Diagnostic::write_row_(const int step, const double global_time)
+void Centroid_Force_Diagnostic::write_row_(
+  const int step, const double global_time, const double* frame_statistics)
 {
-  const double* global = cpu_statistics_.data();
+  const double* global = frame_statistics;
   const double global_count = global[DIAGNOSTIC_COUNT];
   const double delta_rms = rms_from_statistics(
     global, global_count, DIAGNOSTIC_DELTA_SQUARED);
@@ -332,7 +349,7 @@ void Centroid_Force_Diagnostic::write_row_(const int step, const double global_t
 
   for (int species = 0; species < DIAGNOSTIC_SPECIES; ++species) {
     const double* statistics =
-      cpu_statistics_.data() + (species + 1) * DIAGNOSTIC_STATISTICS;
+      frame_statistics + (species + 1) * DIAGNOSTIC_STATISTICS;
     const double count = statistics[DIAGNOSTIC_COUNT];
     const double delta_species_rms = rms_from_statistics(
       statistics, count, DIAGNOSTIC_DELTA_SQUARED);
@@ -371,7 +388,6 @@ void Centroid_Force_Diagnostic::write_row_(const int step, const double global_t
     centroid_kinetic + centroid_potential,
     global[DIAGNOSTIC_POWER_FBAR] / TIME_UNIT_CONVERSION,
     global[DIAGNOSTIC_POWER_FC] / TIME_UNIT_CONVERSION);
-  fflush(fid_);
 }
 
 void Centroid_Force_Diagnostic::postprocess(
@@ -382,8 +398,18 @@ void Centroid_Force_Diagnostic::postprocess(
   const double,
   const double)
 {
+  fid_ = my_fopen("centroid_force_diagnostic.out", "a");
+  write_header_();
+  const size_t statistics_per_sample =
+    static_cast<size_t>(DIAGNOSTIC_BLOCKS) * DIAGNOSTIC_STATISTICS;
+  for (size_t frame = 0; frame < sampled_steps_.size(); ++frame) {
+    write_row_(
+      sampled_steps_[frame],
+      sample_times_[frame],
+      statistics_history_.data() + frame * statistics_per_sample);
+  }
+  fflush(fid_);
   if (fid_ != nullptr) {
-    fflush(fid_);
     fclose(fid_);
     fid_ = nullptr;
   }

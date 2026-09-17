@@ -67,8 +67,11 @@ private:
   GPU_Vector<int> species_by_type_;
   GPU_Vector<double> gpu_statistics_;
   std::vector<double> cpu_statistics_;
+  std::vector<int> sampled_steps_;
+  std::vector<double> sample_times_;
+  std::vector<double> statistics_history_;
   FILE* fid_ = nullptr;
 
   void write_header_();
-  void write_row_(const int step, const double global_time);
+  void write_row_(const int step, const double global_time, const double* statistics);
 };

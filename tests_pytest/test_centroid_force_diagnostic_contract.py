@@ -182,6 +182,59 @@ def test_centroid_force_diagnostic_reports_force_power_components():
     assert rms_error < 1.0e-15
 
 
+def test_centroid_force_diagnostic_writes_only_after_postprocess():
+    header = (ROOT / "src/measure/centroid_force_diagnostic.cuh").read_text(
+        encoding="utf-8"
+    )
+    source = (ROOT / "src/measure/centroid_force_diagnostic.cu").read_text(
+        encoding="utf-8"
+    )
+
+    assert "std::vector<int> sampled_steps_;" in header
+    assert "std::vector<double> sample_times_;" in header
+    assert "std::vector<double> statistics_history_;" in header
+
+    preprocess_source = source[
+        source.index("void Centroid_Force_Diagnostic::preprocess") : source.index(
+            "void Centroid_Force_Diagnostic::write_header_"
+        )
+    ]
+    process_source = source[
+        source.index("void Centroid_Force_Diagnostic::process") : source.index(
+            "void Centroid_Force_Diagnostic::write_row_"
+        )
+    ]
+    postprocess_source = source[
+        source.index("void Centroid_Force_Diagnostic::postprocess") :
+    ]
+    assert "fid_ = my_fopen" not in preprocess_source
+    assert "write_header_();" not in preprocess_source
+    assert "statistics_history_.insert" in process_source
+    assert "write_row_(sampled_step, global_time)" not in process_source
+    assert "fprintf" not in process_source
+    assert "fflush" not in process_source
+    assert 'fid_ = my_fopen("centroid_force_diagnostic.out", "a");' in postprocess_source
+    assert "write_header_();" in postprocess_source
+    assert (
+        "write_row_(\n"
+        "      sampled_steps_[frame],\n"
+        "      sample_times_[frame],\n"
+        "      statistics_history_.data() + frame * statistics_per_sample);"
+        in postprocess_source
+    )
+
+    row_source = source[
+        source.index("void Centroid_Force_Diagnostic::write_row_") : source.index(
+            "void Centroid_Force_Diagnostic::postprocess"
+        )
+    ]
+    assert "frame_statistics + (species + 1) * DIAGNOSTIC_STATISTICS" in row_source
+    assert (
+        "cpu_statistics_.data() + (species + 1) * DIAGNOSTIC_STATISTICS"
+        not in row_source
+    )
+
+
 def test_rpmd_parse_resets_pressure_control_state():
     source = (ROOT / "src/integrate/integrate.cu").read_text(encoding="utf-8")
     parse_start = source.index("void Integrate::parse_ensemble")
