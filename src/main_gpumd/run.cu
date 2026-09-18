@@ -34,6 +34,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/compute_dpdt.cuh"
 #include "measure/compute_es.cuh"
 #include "measure/centroid_force_diagnostic.cuh"
+#include "measure/centroid_deltaF_O.cuh"
 #include "measure/qnep_projection.cuh"
 #include "measure/dos.cuh"
 #include "measure/deform.cuh"
@@ -246,6 +247,9 @@ void Run::perform_a_run()
 {
   HAC* centroid_force_hac = nullptr;
   Centroid_Force_Diagnostic* centroid_force_diagnostic = nullptr;
+#ifdef USE_NETCDF
+  Centroid_DeltaF_O* centroid_deltaF_O = nullptr;
+#endif
   for (const auto& action : measure.actions) {
     if (action->action_name == "compute_hac") {
       centroid_force_hac = dynamic_cast<HAC*>(action.get());
@@ -256,11 +260,35 @@ void Run::perform_a_run()
     if (property->property_name == "centroid_force_diagnostic") {
       centroid_force_diagnostic =
         dynamic_cast<Centroid_Force_Diagnostic*>(property.get());
-      break;
+#ifdef USE_NETCDF
+    } else if (property->property_name == "centroid_deltaF_O") {
+      centroid_deltaF_O = dynamic_cast<Centroid_DeltaF_O*>(property.get());
+#endif
     }
   }
+#ifdef USE_NETCDF
+  if (centroid_deltaF_O != nullptr) {
+    if (centroid_force_diagnostic == nullptr) {
+      PRINT_INPUT_ERROR(
+        "centroid_deltaF_O requires centroid_force_diagnostic in the same run.\n");
+    }
+    if (centroid_deltaF_O->sample_interval() != centroid_force_diagnostic->sample_interval()) {
+      PRINT_INPUT_ERROR(
+        "centroid_deltaF_O sample interval must match centroid_force_diagnostic.\n");
+    }
+    if (number_of_steps < centroid_deltaF_O->sample_interval()) {
+      PRINT_INPUT_ERROR(
+        "centroid_deltaF_O requires at least one diagnostic sampling frame.\n");
+    }
+  }
+#endif
   if (centroid_force_diagnostic != nullptr) {
     centroid_force_diagnostic->set_hac(centroid_force_hac);
+#ifdef USE_NETCDF
+    if (centroid_deltaF_O != nullptr) {
+      centroid_deltaF_O->set_hac(centroid_force_hac);
+    }
+#endif
     for (const auto& action : measure.actions) {
       if (
         action->action_name == "compute_es" || action->action_name == "active" ||
@@ -653,6 +681,14 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     std::unique_ptr<Property> property;
     property.reset(new Centroid_Force_Diagnostic(param, num_param));
     measure.properties.emplace_back(std::move(property));
+  } else if (strcmp(param[0], "centroid_deltaF_O") == 0) {
+#ifdef USE_NETCDF
+    std::unique_ptr<Property> property;
+    property.reset(new Centroid_DeltaF_O(param, num_param));
+    measure.properties.emplace_back(std::move(property));
+#else
+    PRINT_INPUT_ERROR("centroid_deltaF_O requires a GPUMD build with NetCDF support.\n");
+#endif
   } else if (strcmp(param[0], "compute_proton_tunneling") == 0) {
     std::unique_ptr<Property> property;
     property.reset(new Proton_Tunneling(param, num_param, atom));

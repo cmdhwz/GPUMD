@@ -196,6 +196,10 @@ Actions
      - Diagnose the mismatch between bead-average and centroid forces in PIMD/RPMD/TRPMD
      - No
      - No
+   * - :ref:`centroid_deltaF_O <kw_centroid_deltaF_O>`
+     - Write per-oxygen-atom centroid-force mismatch data in NetCDF format
+     - No
+     - No
    * - :ref:`compute_ic <kw_compute_ic>`
      - Compute the ionic conductivity (:term:`IC`)
      - No
