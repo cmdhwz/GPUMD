@@ -3407,22 +3407,28 @@ bool NEP_Charge::compute_pimd_batch(
     if (box_changed || neighbor_always_rebuild_) {
       std::fill(initial_flags.begin(), initial_flags.end(), 1);
     } else if (active_lanes_added) {
-      for (int bead_id = previous_active_number_of_beads; bead_id < number_of_beads; ++bead_id) {
-        initial_flags[bead_id] = 1;
-      }
+      std::fill(
+        initial_flags.begin() + previous_active_number_of_beads,
+        initial_flags.begin() + number_of_beads,
+        1);
     }
     batch.small_box_rebuild_flags.copy_from_host(initial_flags.data());
-    if (!box_changed && !neighbor_always_rebuild_ && !active_lanes_added) {
-      Neighbor::check_atom_distance_batch(
-        box,
-        N,
-        1.0,
-        batch.small_box_x0_ptrs,
-        batch.small_box_y0_ptrs,
-        batch.small_box_z0_ptrs,
-        batch.position_ptrs,
-        batch.small_box_rebuild_flags,
-        number_of_beads);
+    if (!box_changed && !neighbor_always_rebuild_) {
+      const int lanes_to_check = active_lanes_added
+                                   ? previous_active_number_of_beads
+                                   : number_of_beads;
+      if (lanes_to_check > 0) {
+        Neighbor::check_atom_distance_batch(
+          box,
+          N,
+          1.0,
+          batch.small_box_x0_ptrs,
+          batch.small_box_y0_ptrs,
+          batch.small_box_z0_ptrs,
+          batch.position_ptrs,
+          batch.small_box_rebuild_flags,
+          lanes_to_check);
+      }
     }
 
     const int block_size = 64;

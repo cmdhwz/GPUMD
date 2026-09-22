@@ -50,6 +50,12 @@ DP::DP(const char* filename_dp, int num_atoms)
   dp_neighbor.initialize(rc, num_atoms, MAX_NEIGH_NUM_DP);
   dp_NN_local.resize(num_atoms);
   dp_NL_local.resize(dp_neighbor.NL.size());
+  dp_edge_offset.resize(num_atoms);
+  dp_position_gpu.resize(static_cast<size_t>(num_atoms) + 1);
+  dp_position_gpu_trans.resize(static_cast<size_t>(num_atoms) * 3);
+  dp_atom_energy_gpu.resize(num_atoms);
+  dp_force_rowmajor.resize(static_cast<size_t>(num_atoms) * 3);
+  dp_atom_virial_gpu.resize(static_cast<size_t>(num_atoms) * 9);
   type_cpu.resize(num_atoms);
   e_f_v_gpu.resize(num_atoms * (1 + 3 + 9));    // energy: 1; force: 3; virial: 9
 
@@ -65,6 +71,36 @@ DP::DP(const char* filename_dp, int num_atoms)
   ghost_count.resize(num_atoms);
   ghost_sum.resize(num_atoms);
   danger_flag.resize(num_atoms);
+}
+
+void DP::set_neighbor_rebuild(const bool value)
+{
+  neighbor_always_rebuild_ = value;
+  dp_neighbor.set_always_rebuild(value);
+  if (pimd_batch_data_) {
+    for (auto& bead : pimd_batch_data_->beads) {
+      bead->neighbor->set_always_rebuild(value);
+    }
+  }
+}
+
+bool DP::can_compute_pimd_batch(
+  Box& box, const int number_of_atoms, const int number_of_beads) const
+{
+  if (
+    !deep_pot.uses_canonical_graph_inference() || number_of_atoms <= 0 ||
+    number_of_beads < 2) {
+    return false;
+  }
+
+  const double neighbor_rc = rc + 1.0;
+  const double volume = box.get_volume();
+  const double thickness_x = volume / box.get_area(0);
+  const double thickness_y = volume / box.get_area(1);
+  const double thickness_z = volume / box.get_area(2);
+  return (box.pbc_x == 0 || thickness_x > 2.0 * neighbor_rc) &&
+         (box.pbc_y == 0 || thickness_y > 2.0 * neighbor_rc) &&
+         (box.pbc_z == 0 || thickness_z > 2.0 * neighbor_rc);
 }
 
 void DP::initialize_dp(const char* filename_dp)
@@ -557,6 +593,18 @@ static __global__ void dp_compact_duplicate_neighbors(
   }
 }
 
+static __global__ void dp_store_edge_count(
+  const int N,
+  const int* NN,
+  const int* edge_offset,
+  int* edge_counts,
+  const int bead)
+{
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    edge_counts[bead] = edge_offset[N - 1] + NN[N - 1];
+  }
+}
+
 // Materialize the compact edge schema from GPUMD's neighbor list (NN, NL).
 // For each local atom n1 and each of its NN[n1] neighbors n2 (a local index),
 // emit one edge (src = n2, dst = n1) with the minimum-image bond vector
@@ -612,6 +660,8 @@ static __global__ void dp_fill_canonical_edges(
   const double* __restrict__ y,
   const double* __restrict__ z,
   const Box box,
+  const int node_base,
+  const int edge_base,
   int* source,
   float* edge_vec,
   int* source_count)
@@ -629,12 +679,12 @@ static __global__ void dp_fill_canonical_edges(
       double y12 = y[n2] - y1;
       double z12 = z[n2] - z1;
       apply_mic(box, x12, y12, z12);
-      const int edge = base + c;
-      source[edge] = n2;
+      const int edge = edge_base + base + c;
+      source[edge] = n2 + node_base;
       edge_vec[edge * 3] = static_cast<float>(x12);
       edge_vec[edge * 3 + 1] = static_cast<float>(y12);
       edge_vec[edge * 3 + 2] = static_cast<float>(z12);
-      atomicAdd(source_count + n2, 1);
+      atomicAdd(source_count + node_base + n2, 1);
     }
   }
 }
@@ -642,6 +692,8 @@ static __global__ void dp_fill_canonical_edges(
 static __global__ void dp_prepare_canonical_nodes(
   const int N,
   const int nedge,
+  const int node_base,
+  const int edge_base,
   const int* __restrict__ type,
   const int* __restrict__ destination_offset,
   std::int64_t* model_type,
@@ -649,43 +701,50 @@ static __global__ void dp_prepare_canonical_nodes(
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
   if (n1 < N) {
-    model_type[n1] = static_cast<std::int64_t>(type[n1]);
-    destination_row_ptr[n1] =
-      static_cast<std::int64_t>(destination_offset[n1]);
+    model_type[node_base + n1] = static_cast<std::int64_t>(type[n1]);
+    destination_row_ptr[node_base + n1] =
+      static_cast<std::int64_t>(edge_base + destination_offset[n1]);
   }
   if (n1 == N - 1) {
-    destination_row_ptr[N] = static_cast<std::int64_t>(nedge);
+    destination_row_ptr[node_base + N] =
+      static_cast<std::int64_t>(edge_base + nedge);
   }
 }
 
 static __global__ void dp_prepare_canonical_source_rows(
   const int N,
   const int nedge,
+  const int node_base,
+  const int edge_base,
   const int* __restrict__ source_offset,
   std::int64_t* source_row_ptr,
   int* source_cursor)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
   if (n1 < N) {
-    const int offset = source_offset[n1];
-    source_row_ptr[n1] = static_cast<std::int64_t>(offset);
-    source_cursor[n1] = offset;
+    const int offset = source_offset[node_base + n1];
+    source_row_ptr[node_base + n1] =
+      static_cast<std::int64_t>(edge_base + offset);
+    source_cursor[node_base + n1] = edge_base + offset;
   }
   if (n1 == N - 1) {
-    source_row_ptr[N] = static_cast<std::int64_t>(nedge);
+    source_row_ptr[node_base + N] =
+      static_cast<std::int64_t>(edge_base + nedge);
   }
 }
 
 static __global__ void dp_build_canonical_source_order(
   const int nedge,
+  const int edge_base,
   const int* __restrict__ source,
   int* source_cursor,
   int* source_order)
 {
   const int edge = blockIdx.x * blockDim.x + threadIdx.x;
   if (edge < nedge) {
-    const int position = atomicAdd(source_cursor + source[edge], 1);
-    source_order[position] = edge;
+    const int global_edge = edge_base + edge;
+    const int position = atomicAdd(source_cursor + source[global_edge], 1);
+    source_order[position] = global_edge;
   }
 }
 
@@ -703,6 +762,19 @@ static __global__ void dp_fill_canonical_guards(
     edge_vec[edge * 3 + 1] = 0.0f;
     edge_vec[edge * 3 + 2] = 0.0f;
     source_order[edge] = edge;
+  }
+}
+
+static __global__ void dp_fill_canonical_batch_meta(
+  const int number_of_beads,
+  const int number_of_atoms,
+  std::int64_t* n_node,
+  std::int64_t* n_local)
+{
+  const int bead = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bead < number_of_beads) {
+    n_node[bead] = static_cast<std::int64_t>(number_of_atoms);
+    n_local[bead] = static_cast<std::int64_t>(number_of_atoms);
   }
 }
 
@@ -757,6 +829,31 @@ void DP::compute_gpu_edges(
 {
   const int N = type.size();
   const int grid_size = (N - 1) / BLOCK_SIZE_FORCE + 1;
+  const size_t atom_storage = static_cast<size_t>(N);
+
+  // These buffers are sized once for the fixed atom count in the constructor.
+  // Keep the guards for callers that provide a larger atom count.
+  if (dp_edge_offset.size() < atom_storage) {
+    dp_edge_offset.resize(atom_storage);
+  }
+  if (dp_atom_energy_gpu.size() < atom_storage) {
+    dp_atom_energy_gpu.resize(atom_storage);
+  }
+  if (dp_force_rowmajor.size() < atom_storage * 3) {
+    dp_force_rowmajor.resize(atom_storage * 3);
+  }
+  if (dp_atom_virial_gpu.size() < atom_storage * 9) {
+    dp_atom_virial_gpu.resize(atom_storage * 9);
+  }
+  if (dp_position_gpu_trans.size() < atom_storage * 3) {
+    dp_position_gpu_trans.resize(atom_storage * 3);
+  }
+  if (ghost_count.size() < atom_storage) {
+    ghost_count.resize(atom_storage);
+  }
+  if (ghost_sum.size() < atom_storage) {
+    ghost_sum.resize(atom_storage);
+  }
 
   // The global list is (re)built at rc + skin only when an atom has drifted
   // more than skin/2, then filtered to the true cutoff rc for this step's
@@ -784,7 +881,6 @@ void DP::compute_gpu_edges(
 
   // Exclusive scan of the per-atom neighbor counts gives each atom's edge
   // offset; the total edge count is the reduction of the counts.
-  dp_edge_offset.resize(N);
   thrust::exclusive_scan(
     thrust::device, dp_NN_local.data(), dp_NN_local.data() + N,
     dp_edge_offset.data());
@@ -792,40 +888,44 @@ void DP::compute_gpu_edges(
     thrust::device, dp_NN_local.data(), dp_NN_local.data() + N, 0,
     thrust::plus<int>());
 
-  dp_atom_energy_gpu.resize(N);
-  dp_force_rowmajor.resize(N * 3);
-  dp_atom_virial_gpu.resize(N * 9);
-
   if (deep_pot.uses_canonical_graph_inference()) {
     // Reuse existing DP scratch buffers for the additional canonical ABI
     // arrays. Their element widths match the required int64/uint32 storage,
     // so no class-layout or neighbor implementation change is needed.
+    if (dp_position_gpu.size() < atom_storage + 1) {
+      dp_position_gpu.resize(atom_storage + 1);
+    }
+    if (e_f_v_gpu.size() < atom_storage + 1) {
+      e_f_v_gpu.resize(atom_storage + 1);
+    }
     const int edge_storage = nedge < 2 ? 2 : nedge;
-    if (dp_edge_index.size() < static_cast<size_t>(2 * edge_storage)) {
-      dp_edge_index.resize(2 * edge_storage);
+    // CUDA allocations are well aligned, but the second int array starts at
+    // an edge-count-dependent offset.  Keep source_order 16-byte aligned for
+    // the AOTInductor canonical-graph input ABI (4 ints = 16 bytes).
+    constexpr size_t aot_alignment_ints = 16 / sizeof(int);
+    static_assert(16 % sizeof(int) == 0, "AOT alignment must be an integer number of ints");
+    const size_t source_order_offset =
+      ((static_cast<size_t>(edge_storage) + aot_alignment_ints - 1) /
+       aot_alignment_ints) * aot_alignment_ints;
+    const size_t canonical_index_storage =
+      source_order_offset + static_cast<size_t>(edge_storage);
+    if (dp_edge_index.size() < canonical_index_storage) {
+      dp_edge_index.resize(canonical_index_storage);
     }
     if (dp_edge_vec.size() < static_cast<size_t>(3 * edge_storage)) {
       dp_edge_vec.resize(3 * edge_storage);
     }
-    dp_position_gpu_trans.resize(N);  // int64 model type
-    dp_position_gpu.resize(N + 1);    // int64 destination row pointer
-    if (e_f_v_gpu.size() < static_cast<size_t>(N + 1)) {
-      e_f_v_gpu.resize(N + 1);        // int64 source row pointer
-    }
-    ghost_count.resize(N);            // uint32 source counts
-    ghost_sum.resize(N);              // uint32 source cursors
-
     auto* model_type =
       reinterpret_cast<std::int64_t*>(dp_position_gpu_trans.data());
     auto* destination_row_ptr =
       reinterpret_cast<std::int64_t*>(dp_position_gpu.data());
     auto* source_row_ptr = reinterpret_cast<std::int64_t*>(e_f_v_gpu.data());
     int* source = dp_edge_index.data();
-    int* source_order = dp_edge_index.data() + edge_storage;
+    int* source_order = dp_edge_index.data() + source_order_offset;
     float* edge_vec = reinterpret_cast<float*>(dp_edge_vec.data());
 
     dp_prepare_canonical_nodes<<<grid_size, BLOCK_SIZE_FORCE>>>(
-      N, nedge, type.data(), dp_edge_offset.data(), model_type,
+      N, nedge, 0, 0, type.data(), dp_edge_offset.data(), model_type,
       destination_row_ptr);
     GPU_CHECK_KERNEL
     CHECK(gpuMemset(ghost_count.data(), 0, sizeof(int) * N));
@@ -833,7 +933,7 @@ void DP::compute_gpu_edges(
       dp_fill_canonical_edges<<<grid_size, BLOCK_SIZE_FORCE>>>(
         N, dp_NN_local.data(), dp_NL_local.data(), dp_edge_offset.data(),
         position_per_atom.data(), position_per_atom.data() + N,
-        position_per_atom.data() + N * 2, box, source, edge_vec,
+        position_per_atom.data() + N * 2, box, 0, 0, source, edge_vec,
         ghost_count.data());
       GPU_CHECK_KERNEL
     }
@@ -841,12 +941,12 @@ void DP::compute_gpu_edges(
       thrust::device, ghost_count.data(), ghost_count.data() + N,
       dp_edge_offset.data());
     dp_prepare_canonical_source_rows<<<grid_size, BLOCK_SIZE_FORCE>>>(
-      N, nedge, dp_edge_offset.data(), source_row_ptr, ghost_sum.data());
+      N, nedge, 0, 0, dp_edge_offset.data(), source_row_ptr, ghost_sum.data());
     GPU_CHECK_KERNEL
     if (nedge > 0) {
       const int edge_grid = (nedge - 1) / BLOCK_SIZE_FORCE + 1;
       dp_build_canonical_source_order<<<edge_grid, BLOCK_SIZE_FORCE>>>(
-        nedge, source, ghost_sum.data(), source_order);
+        nedge, 0, source, ghost_sum.data(), source_order);
       GPU_CHECK_KERNEL
     }
     if (edge_storage > nedge) {
@@ -867,7 +967,6 @@ void DP::compute_gpu_edges(
   } else {
     // Transpose positions from GPUMD SoA (x1..xN, y1..yN, z1..zN) to the
     // row-major (x1, y1, z1, ...) layout the edge model consumes.
-    dp_position_gpu_trans.resize(N * 3);
     dp_position_transpose<<<grid_size, BLOCK_SIZE_FORCE>>>(
       position_per_atom.data(), dp_position_gpu_trans.data(), N);
     GPU_CHECK_KERNEL
@@ -898,6 +997,284 @@ void DP::compute_gpu_edges(
     virial_unit_cvt_factor, potential_per_atom.data(), force_per_atom.data(),
     virial_per_atom.data());
   GPU_CHECK_KERNEL
+}
+
+bool DP::compute_pimd_batch(
+  Box& box,
+  const GPU_Vector<int>& type,
+  const std::vector<GPU_Vector<double>*>& position_beads,
+  const std::vector<GPU_Vector<double>*>& potential_beads,
+  const std::vector<GPU_Vector<double>*>& force_beads,
+  const std::vector<GPU_Vector<double>*>& virial_beads)
+{
+  const int number_of_atoms = type.size();
+  const int number_of_beads = static_cast<int>(position_beads.size());
+  if (
+    potential_beads.size() != position_beads.size() ||
+    force_beads.size() != position_beads.size() ||
+    virial_beads.size() != position_beads.size()) {
+    return false;
+  }
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    if (
+      position_beads[bead] == nullptr || potential_beads[bead] == nullptr ||
+      force_beads[bead] == nullptr || virial_beads[bead] == nullptr ||
+      position_beads[bead]->size() != static_cast<size_t>(number_of_atoms) * 3 ||
+      potential_beads[bead]->size() != static_cast<size_t>(number_of_atoms) ||
+      force_beads[bead]->size() != static_cast<size_t>(number_of_atoms) * 3 ||
+      virial_beads[bead]->size() != static_cast<size_t>(number_of_atoms) * 9) {
+      return false;
+    }
+  }
+  if (!can_compute_pimd_batch(box, number_of_atoms, number_of_beads)) {
+    return false;
+  }
+
+  if (
+    !pimd_batch_data_ || pimd_batch_data_->number_of_atoms != number_of_atoms ||
+    pimd_batch_data_->number_of_beads != number_of_beads) {
+    auto data = std::make_unique<PIMD_Batch_Data>();
+    data->number_of_atoms = number_of_atoms;
+    data->number_of_beads = number_of_beads;
+    data->beads.resize(number_of_beads);
+    data->edge_bases.resize(number_of_beads);
+    data->edge_counts.resize(number_of_beads);
+    data->edge_counts_device.resize(number_of_beads);
+    data->neighbor_ptrs.reserve(number_of_beads);
+    data->position_ptrs_host.resize(number_of_beads);
+    data->position_ptrs.resize(number_of_beads);
+    data->NN_global_ptrs.resize(number_of_beads);
+    data->NL_global_ptrs.resize(number_of_beads);
+    data->x0_ptrs.resize(number_of_beads);
+    data->y0_ptrs.resize(number_of_beads);
+    data->z0_ptrs.resize(number_of_beads);
+    data->rebuild_flags.resize(number_of_beads);
+    data->any_rebuild.resize(1);
+    data->active_bead_ids.resize(number_of_beads);
+    data->x0_ptrs_host.resize(number_of_beads);
+    data->y0_ptrs_host.resize(number_of_beads);
+    data->z0_ptrs_host.resize(number_of_beads);
+    std::vector<int*> nn_global_ptrs(number_of_beads);
+    std::vector<int*> nl_global_ptrs(number_of_beads);
+    for (int bead = 0; bead < number_of_beads; ++bead) {
+      data->beads[bead] = std::make_unique<PIMD_Bead_Data>();
+      data->beads[bead]->neighbor = std::make_unique<Neighbor>();
+      data->beads[bead]->neighbor->initialize(
+        rc, number_of_atoms, MAX_NEIGH_NUM_DP);
+      data->beads[bead]->neighbor->set_always_rebuild(
+        neighbor_always_rebuild_);
+      nn_global_ptrs[bead] = data->beads[bead]->neighbor->NN.data();
+      nl_global_ptrs[bead] = data->beads[bead]->neighbor->NL.data();
+      data->neighbor_ptrs.push_back(data->beads[bead]->neighbor.get());
+      data->beads[bead]->NN_local.resize(number_of_atoms);
+      data->beads[bead]->NL_local.resize(
+        data->beads[bead]->neighbor->NL.size());
+      data->beads[bead]->edge_offset.resize(number_of_atoms);
+    }
+    data->NN_global_ptrs.copy_from_host(nn_global_ptrs.data());
+    data->NL_global_ptrs.copy_from_host(nl_global_ptrs.data());
+    pimd_batch_data_ = std::move(data);
+  }
+  PIMD_Batch_Data& data = *pimd_batch_data_;
+
+  int num_bins[3];
+  box.get_num_bins(0.5 * neighbor_rc, num_bins);
+  const bool wrapped_cells_alias =
+    (box.pbc_x && num_bins[0] < 5) || (box.pbc_y && num_bins[1] < 5) ||
+    (box.pbc_z && num_bins[2] < 5);
+  const int atom_grid = (number_of_atoms - 1) / BLOCK_SIZE_FORCE + 1;
+
+  std::vector<double*> position_ptrs_host(number_of_beads);
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    position_ptrs_host[bead] = position_beads[bead]->data();
+  }
+  if (position_ptrs_host != data.position_ptrs_host) {
+    data.position_ptrs.copy_from_host(position_ptrs_host.data());
+    data.position_ptrs_host = position_ptrs_host;
+  }
+  Neighbor::find_neighbor_global_batch(
+    rc,
+    box,
+    type,
+    0,
+    number_of_atoms,
+    position_beads,
+    data.neighbor_ptrs,
+    data.position_ptrs,
+    data.NN_global_ptrs,
+    data.NL_global_ptrs,
+    data.x0_ptrs,
+    data.y0_ptrs,
+    data.z0_ptrs,
+    data.rebuild_flags,
+    data.any_rebuild,
+    data.x0_ptrs_host,
+    data.y0_ptrs_host,
+    data.z0_ptrs_host,
+    data.pointer_arrays_initialized,
+    data.active_bead_ids,
+    data.cell_count_batch,
+    data.cell_count_sum_batch,
+    data.cell_contents_batch,
+    data.cell_keys_batch,
+    data.cell_stride);
+
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    PIMD_Bead_Data& bead_data = *data.beads[bead];
+    bead_data.neighbor->find_local_neighbor_from_global(
+      rc, box, *position_beads[bead], bead_data.NN_local,
+      bead_data.NL_local);
+    if (wrapped_cells_alias) {
+      dp_compact_duplicate_neighbors<<<atom_grid, BLOCK_SIZE_FORCE>>>(
+        number_of_atoms, number_of_atoms, bead_data.NN_local.data(),
+        bead_data.NL_local.data());
+      GPU_CHECK_KERNEL
+    }
+    thrust::exclusive_scan(
+      thrust::device, bead_data.NN_local.data(),
+      bead_data.NN_local.data() + number_of_atoms,
+      bead_data.edge_offset.data());
+    dp_store_edge_count<<<1, 1>>>(
+      number_of_atoms,
+      bead_data.NN_local.data(),
+      bead_data.edge_offset.data(),
+      data.edge_counts_device.data(),
+      bead);
+    GPU_CHECK_KERNEL
+  }
+  data.edge_counts_device.copy_to_host(data.edge_counts.data());
+
+  int total_edges = 0;
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    data.edge_bases[bead] = total_edges;
+    total_edges += data.edge_counts[bead];
+  }
+
+  const int total_nodes = number_of_atoms * number_of_beads;
+  const int edge_storage = total_edges < 2 ? 2 : total_edges;
+  constexpr size_t aot_alignment_ints = 16 / sizeof(int);
+  static_assert(16 % sizeof(int) == 0, "AOT alignment must be an integer number of ints");
+  const size_t source_order_offset =
+    ((static_cast<size_t>(edge_storage) + aot_alignment_ints - 1) /
+     aot_alignment_ints) * aot_alignment_ints;
+  const size_t source_storage = source_order_offset +
+                                static_cast<size_t>(edge_storage);
+  if (data.model_type.size() < static_cast<size_t>(total_nodes)) {
+    data.model_type.resize(total_nodes);
+  }
+  if (data.n_node.size() < static_cast<size_t>(number_of_beads)) {
+    data.n_node.resize(number_of_beads);
+  }
+  if (data.n_local.size() < static_cast<size_t>(number_of_beads)) {
+    data.n_local.resize(number_of_beads);
+  }
+  if (data.destination_row_ptr.size() < static_cast<size_t>(total_nodes + 1)) {
+    data.destination_row_ptr.resize(total_nodes + 1);
+  }
+  if (data.source_row_ptr.size() < static_cast<size_t>(total_nodes + 1)) {
+    data.source_row_ptr.resize(total_nodes + 1);
+  }
+  if (data.source_count.size() < static_cast<size_t>(total_nodes)) {
+    data.source_count.resize(total_nodes);
+  }
+  if (data.source_cursor.size() < static_cast<size_t>(total_nodes)) {
+    data.source_cursor.resize(total_nodes);
+  }
+  if (data.source_storage.size() < source_storage) {
+    data.source_storage.resize(source_storage);
+  }
+  if (data.edge_vec.size() < static_cast<size_t>(3 * edge_storage)) {
+    data.edge_vec.resize(static_cast<size_t>(3 * edge_storage));
+  }
+  if (data.atom_energy.size() < static_cast<size_t>(total_nodes)) {
+    data.atom_energy.resize(total_nodes);
+  }
+  if (data.force_rowmajor.size() < static_cast<size_t>(total_nodes) * 3) {
+    data.force_rowmajor.resize(static_cast<size_t>(total_nodes) * 3);
+  }
+  if (data.atom_virial.size() < static_cast<size_t>(total_nodes) * 9) {
+    data.atom_virial.resize(static_cast<size_t>(total_nodes) * 9);
+  }
+
+  dp_fill_canonical_batch_meta<<<(number_of_beads - 1) / BLOCK_SIZE_FORCE + 1,
+                                 BLOCK_SIZE_FORCE>>>(
+    number_of_beads, number_of_atoms,
+    reinterpret_cast<std::int64_t*>(data.n_node.data()),
+    reinterpret_cast<std::int64_t*>(data.n_local.data()));
+  GPU_CHECK_KERNEL
+  CHECK(gpuMemset(
+    data.source_count.data(), 0, sizeof(int) * static_cast<size_t>(total_nodes)));
+
+  int* source = data.source_storage.data();
+  int* source_order = source + source_order_offset;
+  float* edge_vec = reinterpret_cast<float*>(data.edge_vec.data());
+  auto* model_type = reinterpret_cast<std::int64_t*>(data.model_type.data());
+  auto* destination_row_ptr =
+    reinterpret_cast<std::int64_t*>(data.destination_row_ptr.data());
+  auto* source_row_ptr =
+    reinterpret_cast<std::int64_t*>(data.source_row_ptr.data());
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    const int node_base = bead * number_of_atoms;
+    const int edge_base = data.edge_bases[bead];
+    const int nedge = data.edge_counts[bead];
+    PIMD_Bead_Data& bead_data = *data.beads[bead];
+    dp_prepare_canonical_nodes<<<atom_grid, BLOCK_SIZE_FORCE>>>(
+      number_of_atoms, nedge, node_base, edge_base, type.data(),
+      bead_data.edge_offset.data(), model_type, destination_row_ptr);
+    GPU_CHECK_KERNEL
+    if (nedge > 0) {
+      dp_fill_canonical_edges<<<atom_grid, BLOCK_SIZE_FORCE>>>(
+        number_of_atoms, bead_data.NN_local.data(), bead_data.NL_local.data(),
+        bead_data.edge_offset.data(), position_beads[bead]->data(),
+        position_beads[bead]->data() + number_of_atoms,
+        position_beads[bead]->data() + number_of_atoms * 2, box, node_base,
+        edge_base, source, edge_vec, data.source_count.data());
+      GPU_CHECK_KERNEL
+    }
+    thrust::exclusive_scan(
+      thrust::device, data.source_count.data() + node_base,
+      data.source_count.data() + node_base + number_of_atoms,
+      data.source_count.data() + node_base);
+    dp_prepare_canonical_source_rows<<<atom_grid, BLOCK_SIZE_FORCE>>>(
+      number_of_atoms, nedge, node_base, edge_base, data.source_count.data(),
+      source_row_ptr, data.source_cursor.data());
+    GPU_CHECK_KERNEL
+    if (nedge > 0) {
+      const int edge_grid = (nedge - 1) / BLOCK_SIZE_FORCE + 1;
+      dp_build_canonical_source_order<<<edge_grid, BLOCK_SIZE_FORCE>>>(
+        nedge, edge_base, source, data.source_cursor.data(), source_order);
+      GPU_CHECK_KERNEL
+    }
+  }
+  if (edge_storage > total_edges) {
+    const int guard_grid = (edge_storage - total_edges - 1) / BLOCK_SIZE_FORCE + 1;
+    dp_fill_canonical_guards<<<guard_grid, BLOCK_SIZE_FORCE>>>(
+      total_edges, edge_storage, source, edge_vec, source_order);
+    GPU_CHECK_KERNEL
+  }
+
+  deep_pot.compute_canonical_graph_gpu_batch(
+    data.atom_energy.data(), data.force_rowmajor.data(), data.atom_virial.data(),
+    model_type, reinterpret_cast<std::uint32_t*>(source), edge_vec,
+    destination_row_ptr, source_row_ptr,
+    reinterpret_cast<std::uint32_t*>(source_order),
+    reinterpret_cast<std::int64_t*>(data.n_node.data()),
+    reinterpret_cast<std::int64_t*>(data.n_local.data()), number_of_beads,
+    total_nodes, static_cast<std::int64_t>(edge_storage));
+
+  const int output_grid = atom_grid;
+  for (int bead = 0; bead < number_of_beads; ++bead) {
+    const int node_base = bead * number_of_atoms;
+    dp_scatter_outputs<<<output_grid, BLOCK_SIZE_FORCE>>>(
+      number_of_atoms, data.atom_energy.data() + node_base,
+      data.force_rowmajor.data() + node_base * 3,
+      data.atom_virial.data() + node_base * 9, ener_unit_cvt_factor,
+      force_unit_cvt_factor, virial_unit_cvt_factor,
+      potential_beads[bead]->data(), force_beads[bead]->data(),
+      virial_beads[bead]->data());
+    GPU_CHECK_KERNEL
+  }
+  return true;
 }
 
 void DP::compute(
@@ -954,7 +1331,9 @@ void DP::compute(
   {
     // Transpose positions from GPUMD layout (x1..xN, y1..yN, z1..zN) to
     // row-major (x1,y1,z1, x2,y2,z2, ...)
-    dp_position_gpu_trans.resize(number_of_atoms * 3);
+    if (dp_position_gpu_trans.size() < static_cast<size_t>(number_of_atoms) * 3) {
+      dp_position_gpu_trans.resize(static_cast<size_t>(number_of_atoms) * 3);
+    }
     dp_position_transpose<<<grid_size, BLOCK_SIZE_FORCE>>>(
       position_per_atom.data(), dp_position_gpu_trans.data(), number_of_atoms);
     GPU_CHECK_KERNEL

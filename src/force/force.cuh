@@ -210,6 +210,7 @@ private:
   bool can_use_pimd_bead_gpu_parallel_() const;
   bool can_use_pimd_qnep_batch_() const;
   bool can_use_pimd_nep_batch_() const;
+  bool can_use_pimd_dp_batch_() const;
   void compute_pimd_centroid_position_(
     Box& box, std::vector<GPU_Vector<double>>& position_beads);
   void apply_pimd_qnep_batch_bec_setting_();
@@ -222,6 +223,13 @@ private:
     std::vector<GPU_Vector<double>>& force_beads,
     std::vector<GPU_Vector<double>>& virial_beads);
   bool try_compute_pimd_nep_batch_(
+    Box& box,
+    GPU_Vector<int>& type,
+    std::vector<GPU_Vector<double>>& position_beads,
+    std::vector<GPU_Vector<double>>& potential_beads,
+    std::vector<GPU_Vector<double>>& force_beads,
+    std::vector<GPU_Vector<double>>& virial_beads);
+  bool try_compute_pimd_dp_batch_(
     Box& box,
     GPU_Vector<int>& type,
     std::vector<GPU_Vector<double>>& position_beads,

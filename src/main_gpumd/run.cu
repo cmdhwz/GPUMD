@@ -959,10 +959,10 @@ void Run::parse_pimd_bead_neighbor_rebuild(const char** param, int num_param)
   }
   if (strcmp(param[1], "auto") == 0) {
     force.set_pimd_bead_neighbor_rebuild(false);
-    printf("PIMD bead GPU workers will rebuild neighbor lists based on the skin distance.\n");
+    printf("PIMD bead neighbor lists will rebuild based on the skin distance.\n");
   } else if (strcmp(param[1], "always") == 0) {
     force.set_pimd_bead_neighbor_rebuild(true);
-    printf("PIMD bead GPU workers will rebuild neighbor lists for every bead.\n");
+    printf("PIMD bead neighbor lists will rebuild on every force call.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_bead_neighbor_rebuild should be auto or always.\n");
   }
@@ -994,10 +994,10 @@ void Run::parse_pimd_bead_batch(const char** param, int num_param)
   }
   if (strcmp(param[1], "on") == 0) {
     force.set_pimd_bead_batch(true);
-    printf("Requested automatic NEP/qNEP ring-polymer bead-batched kernels.\n");
+    printf("Requested automatic DP/NEP/qNEP ring-polymer bead-batched kernels.\n");
   } else if (strcmp(param[1], "off") == 0) {
     force.set_pimd_bead_batch(false);
-    printf("Disabled automatic NEP/qNEP ring-polymer bead-batched kernels.\n");
+    printf("Disabled automatic DP/NEP/qNEP ring-polymer bead-batched kernels.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_bead_batch should be on or off.\n");
   }

@@ -18,6 +18,7 @@
 #include "DeepPot.h"
 #include "neighbor.cuh"
 #include "potential.cuh"
+#include <memory>
 #include <stdio.h>
 #include <vector>
 #include <cstddef>
@@ -56,6 +57,16 @@ public:
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial);
+  void set_neighbor_rebuild(const bool value) override;
+  bool can_compute_pimd_batch(
+    Box& box, int number_of_atoms, int number_of_beads) const;
+  bool compute_pimd_batch(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const std::vector<GPU_Vector<double>*>& position_beads,
+    const std::vector<GPU_Vector<double>*>& potential_beads,
+    const std::vector<GPU_Vector<double>*>& force_beads,
+    const std::vector<GPU_Vector<double>*>& virial_beads);
   void initialize_dp(const char* filename_dp);
 
 protected:
@@ -85,6 +96,7 @@ protected:
   // reused across steps until an atom drifts more than skin/2, then filtered
   // to the true cutoff rc each step.
   Neighbor dp_neighbor;
+  bool neighbor_always_rebuild_ = false;
   GPU_Vector<int> dp_NN_local;   // per-step neighbor counts within rc
   GPU_Vector<int> dp_NL_local;   // per-step neighbor list within rc (stride N)
   DP_NL dp_nl;
@@ -117,12 +129,67 @@ protected:
   // the compact edge schema on the GPU, run the exported model on those device
   // tensors, and scatter the device outputs back into GPUMD arrays.  No host
   // neighbor-list build and no per-step host-device coordinate/result copies.
-  GPU_Vector<int> dp_edge_index;     // [2 * nedge]: row 0 = src, row 1 = dst
+  // Non-canonical: [source, destination] pairs; canonical: source followed
+  // by a padded source_order array.
+  GPU_Vector<int> dp_edge_index;
   GPU_Vector<double> dp_edge_vec;    // [nedge * 3] minimum-image bond vectors
   GPU_Vector<int> dp_edge_offset;    // [nloc] exclusive scan of NN
   GPU_Vector<double> dp_atom_energy_gpu;  // [nloc]
   GPU_Vector<double> dp_force_rowmajor;   // [nloc * 3] row-major model force
   GPU_Vector<double> dp_atom_virial_gpu;  // [nloc * 9] row-major model virial
+
+  struct PIMD_Bead_Data
+  {
+    std::unique_ptr<Neighbor> neighbor;
+    GPU_Vector<int> NN_local;
+    GPU_Vector<int> NL_local;
+    GPU_Vector<int> edge_offset;
+  };
+
+  struct PIMD_Batch_Data
+  {
+    int number_of_atoms = 0;
+    int number_of_beads = 0;
+    std::vector<std::unique_ptr<PIMD_Bead_Data>> beads;
+    std::vector<Neighbor*> neighbor_ptrs;
+    std::vector<double*> position_ptrs_host;
+    GPU_Vector<double*> position_ptrs;
+    GPU_Vector<int*> NN_global_ptrs;
+    GPU_Vector<int*> NL_global_ptrs;
+    GPU_Vector<double*> x0_ptrs;
+    GPU_Vector<double*> y0_ptrs;
+    GPU_Vector<double*> z0_ptrs;
+    GPU_Vector<int> rebuild_flags;
+    GPU_Vector<int> any_rebuild;
+    GPU_Vector<int> active_bead_ids;
+    GPU_Vector<int> cell_count_batch;
+    GPU_Vector<int> cell_count_sum_batch;
+    GPU_Vector<int> cell_contents_batch;
+    GPU_Vector<int> cell_keys_batch;
+    std::vector<double*> x0_ptrs_host;
+    std::vector<double*> y0_ptrs_host;
+    std::vector<double*> z0_ptrs_host;
+    bool pointer_arrays_initialized = false;
+    int cell_stride = 0;
+    std::vector<int> edge_bases;
+    std::vector<int> edge_counts;
+    GPU_Vector<int> edge_counts_device;
+    GPU_Vector<double> model_type;
+    GPU_Vector<double> n_node;
+    GPU_Vector<double> n_local;
+    GPU_Vector<double> destination_row_ptr;
+    GPU_Vector<double> source_row_ptr;
+    GPU_Vector<int> source_count;
+    GPU_Vector<int> source_cursor;
+    GPU_Vector<int> source_storage;
+    GPU_Vector<double> edge_vec;
+    GPU_Vector<double> atom_energy;
+    GPU_Vector<double> force_rowmajor;
+    GPU_Vector<double> atom_virial;
+  };
+
+  std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
+
   void compute_gpu_edges(
     Box& box,
     const GPU_Vector<int>& type,

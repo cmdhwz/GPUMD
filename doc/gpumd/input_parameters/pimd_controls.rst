@@ -72,8 +72,26 @@ Syntax::
 
 This enables or disables the batched force kernels for PIMD, RPMD, and TRPMD
 runs. The active potential is detected automatically: standard NEP models use
-the NEP bead-batch path, while qNEP models use the qNEP bead-batch path. The
-default is ``off``. The command must appear before the corresponding ``run``.
+the NEP bead-batch path, qNEP models use the qNEP bead-batch path, and DP uses
+the DP path when built with DeePMD support and loaded from a compact canonical
+graph ``.pt2`` model. DP batching also requires the large-box minimum-image
+condition: every periodic box thickness must exceed twice the sum of the DP
+cutoff and skin distance. Otherwise the force calculation falls back to serial
+bead evaluation.
+The default is ``off``. The command must appear before the corresponding
+``run``.
+
+PIMD bead neighbor-list rebuilding
+----------------------------------
+
+Syntax::
+
+    pimd_bead_neighbor_rebuild auto|always
+
+``always`` is the default and rebuilds every bead's neighbor list on each force
+call; use it for variable-box runs. ``auto`` reuses lists until atoms move more
+than half the skin distance and is intended for fixed-box performance tests,
+because box changes alone do not invalidate the cached list.
 
 The older ``pimd_nep_bead_batch`` and ``pimd_qnep_bead_batch`` keywords remain
 accepted as compatibility aliases, but new input files should use

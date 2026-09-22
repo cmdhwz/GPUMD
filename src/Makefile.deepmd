@@ -1,0 +1,22 @@
+# Standalone DeePMD-enabled build file.
+# Run from this directory with:
+#   conda activate dpmd
+#   make -f Makefile.deepmd gpumd -j
+
+.DEFAULT_GOAL := gpumd
+
+DEEPMD_ROOT ?= $(shell python -c "import sys; print(sys.prefix)")
+TORCH_LIB ?= $(shell python -c "import torch; print(torch.__path__[0] + '/lib')")
+
+include makefile
+
+CFLAGS += -DUSE_DEEPMD
+
+INC += -I$(DEEPMD_ROOT)/include/deepmd
+
+LDFLAGS += -L$(DEEPMD_ROOT)/lib
+LDFLAGS += -L$(TORCH_LIB)
+
+LIBS += -ldeepmd_cc -ldeepmd_c
+LIBS += -ltorch -ltorch_cpu -lc10
+LIBS += -ltorch_cuda -lc10_cuda

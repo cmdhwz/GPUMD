@@ -23,7 +23,27 @@ neighbor list.
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+
+static void check_neighbor_list_capacity(
+  const int max_neighbor_count,
+  const int capacity,
+  const double cutoff)
+{
+  if (max_neighbor_count > capacity) {
+    char message[256];
+    std::snprintf(
+      message,
+      sizeof(message),
+      "Neighbor-list overflow: observed maximum %d neighbors per atom, "
+      "capacity %d, search cutoff %.6f.",
+      max_neighbor_count,
+      capacity,
+      cutoff);
+    PRINT_INPUT_ERROR(message);
+  }
+}
 
 static __device__ void find_cell_id(
   const Box& box,
@@ -94,6 +114,8 @@ static __global__ void gpu_find_neighbor_ON1(
   const int* __restrict__ cell_contents,
   int* NN,
   int* NL,
+  const int max_neighbors,
+  int* max_neighbor_count,
   const double* __restrict__ x,
   const double* __restrict__ y,
   const double* __restrict__ z,
@@ -151,7 +173,10 @@ static __global__ void gpu_find_neighbor_ON1(
               const float d2 = x12 * x12 + y12 * y12 + z12 * z12;
 
               if (d2 < cutoff_square) {
-                NL[static_cast<size_t>(N) * count++ + n1] = n2;
+                if (count < max_neighbors) {
+                  NL[static_cast<size_t>(N) * count + n1] = n2;
+                }
+                ++count;
               }
             }
           }
@@ -159,6 +184,9 @@ static __global__ void gpu_find_neighbor_ON1(
       }
     }
     NN[n1] = count;
+    if (count > max_neighbors) {
+      atomicMax(max_neighbor_count, count);
+    }
   }
 }
 
@@ -321,6 +349,8 @@ static __global__ void gpu_find_neighbor_ON1_batch(
   const int* cell_contents_batch,
   int* const* NN_global_ptrs,
   int* const* NL_global_ptrs,
+  const int max_neighbors,
+  int* max_neighbor_count,
   const int nx,
   const int ny,
   const int nz,
@@ -384,7 +414,10 @@ static __global__ void gpu_find_neighbor_ON1_batch(
             apply_mic(box, x12, y12, z12);
             const float d2 = x12 * x12 + y12 * y12 + z12 * z12;
             if (d2 < cutoff_square) {
-              NL[static_cast<size_t>(N) * count++ + n1] = n2;
+              if (count < max_neighbors) {
+                NL[static_cast<size_t>(N) * count + n1] = n2;
+              }
+              ++count;
             }
           }
         }
@@ -393,6 +426,9 @@ static __global__ void gpu_find_neighbor_ON1_batch(
   }
   (void)type;
   NN[n1] = count;
+  if (count > max_neighbors) {
+    atomicMax(max_neighbor_count, count);
+  }
 }
 
 static __global__ void gpu_sort_neighbor_list_batch(
@@ -408,21 +444,21 @@ static __global__ void gpu_sort_neighbor_list_batch(
   const int* NN = NN_global_ptrs[bead];
   int* NL = NL_global_ptrs[bead];
   const int neighbor_number = NN[bid];
-  int atom_index;
   extern __shared__ int atom_index_copy[];
 
-  if (tid < neighbor_number) {
-    atom_index = NL[static_cast<size_t>(N) * tid + bid];
-    atom_index_copy[tid] = atom_index;
+  for (int i = tid; i < neighbor_number; i += blockDim.x) {
+    atom_index_copy[i] = NL[static_cast<size_t>(N) * i + bid];
   }
-  int count = 0;
   __syncthreads();
-  for (int j = 0; j < neighbor_number; ++j) {
-    if (atom_index > atom_index_copy[j]) {
-      count++;
+
+  for (int i = tid; i < neighbor_number; i += blockDim.x) {
+    const int atom_index = atom_index_copy[i];
+    int count = 0;
+    for (int j = 0; j < neighbor_number; ++j) {
+      if (atom_index > atom_index_copy[j]) {
+        ++count;
+      }
     }
-  }
-  if (tid < neighbor_number) {
     NL[static_cast<size_t>(N) * count + bid] = atom_index;
   }
 }
@@ -443,6 +479,13 @@ void find_neighbor(
   const int N = NN.size();
   const int block_size = 256;
   const int grid_size = (N2 - N1 - 1) / block_size + 1;
+  const int max_neighbors = NL.size() / N;
+  if (max_neighbors <= 0) {
+    PRINT_INPUT_ERROR("Neighbor list has zero per-atom capacity.");
+  }
+  if (cell_contents.size() < static_cast<size_t>(N) + 1) {
+    cell_contents.resize(static_cast<size_t>(N) + 1);
+  }
   const double* x = position_per_atom.data();
   const double* y = position_per_atom.data() + N;
   const double* z = position_per_atom.data() + N * 2;
@@ -454,6 +497,8 @@ void find_neighbor(
 
   find_cell_list(
     rc_cell_list, num_bins, box, position_per_atom, cell_count, cell_count_sum, cell_contents);
+  int* max_neighbor_count = cell_contents.data() + N;
+  CHECK(gpuMemset(max_neighbor_count, 0, sizeof(int)));
 
   gpu_find_neighbor_ON1<<<grid_size, block_size>>>(
     box,
@@ -466,6 +511,8 @@ void find_neighbor(
     cell_contents.data(),
     NN.data(),
     NL.data(),
+    max_neighbors,
+    max_neighbor_count,
     x,
     y,
     z,
@@ -476,7 +523,15 @@ void find_neighbor(
     rc * rc);
   GPU_CHECK_KERNEL
 
-  const int MN = NL.size() / NN.size();
+  int observed_max_neighbors = 0;
+  CHECK(gpuMemcpy(
+    &observed_max_neighbors,
+    max_neighbor_count,
+    sizeof(int),
+    gpuMemcpyDeviceToHost));
+  check_neighbor_list_capacity(observed_max_neighbors, max_neighbors, rc);
+
+  const int MN = max_neighbors;
   gpu_sort_neighbor_list<<<N, min(1024, MN), MN * sizeof(int)>>>(N, NN.data(), NL.data());
   GPU_CHECK_KERNEL
 }
@@ -1056,6 +1111,10 @@ void Neighbor::find_neighbor_global_batch(
     z0_ptrs_host.size() != static_cast<size_t>(capacity_number_of_beads)) {
     return;
   }
+  const int MN = neighbors[0]->NL.size() / neighbors[0]->NN.size();
+  if (MN <= 0) {
+    PRINT_INPUT_ERROR("Batched neighbor list has zero per-atom capacity.");
+  }
 
   using Clock = std::chrono::high_resolution_clock;
   const auto pointer_begin = Clock::now();
@@ -1091,6 +1150,12 @@ void Neighbor::find_neighbor_global_batch(
       any_rebuild_host = true;
       break;
     }
+  }
+  if (any_rebuild_host && need_distance_check) {
+    for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+      initial_flags[bead_id] = 1;
+    }
+    need_distance_check = false;
   }
   if (any_rebuild_host) {
     rebuild_flags.copy_from_host(initial_flags.data());
@@ -1137,11 +1202,15 @@ void Neighbor::find_neighbor_global_batch(
     return;
   }
 
-  std::vector<int> host_flags(number_of_beads, 0);
-  const auto flag_copy_begin = Clock::now();
-  rebuild_flags.copy_to_host(host_flags.data());
-  if (timing) {
-    timing->flag_transfer += std::chrono::duration<double>(Clock::now() - flag_copy_begin).count();
+  std::vector<int> host_flags(
+    initial_flags.begin(), initial_flags.begin() + number_of_beads);
+  if (!any_rebuild_host) {
+    const auto flag_copy_begin = Clock::now();
+    rebuild_flags.copy_to_host(host_flags.data());
+    if (timing) {
+      timing->flag_transfer +=
+        std::chrono::duration<double>(Clock::now() - flag_copy_begin).count();
+    }
   }
   const auto rebuild_begin = Clock::now();
   std::vector<int> active_bead_ids_host;
@@ -1170,8 +1239,8 @@ void Neighbor::find_neighbor_global_batch(
     cell_keys_batch.resize(cell_batch_size);
   }
   const size_t contents_batch_size = static_cast<size_t>(capacity_number_of_beads) * N;
-  if (cell_contents_batch.size() < contents_batch_size) {
-    cell_contents_batch.resize(contents_batch_size);
+  if (cell_contents_batch.size() < contents_batch_size + 1) {
+    cell_contents_batch.resize(contents_batch_size + 1);
   }
 
   const int cell_count_active_size = active_count * number_of_cells;
@@ -1226,6 +1295,9 @@ void Neighbor::find_neighbor_global_batch(
     2.0 / (rc + neighbors[active_bead_ids_host[0]]->skin));
   GPU_CHECK_KERNEL
 
+  int* max_neighbor_count = cell_contents_batch.data() + contents_batch_size;
+  CHECK(gpuMemset(max_neighbor_count, 0, sizeof(int)));
+
   const int neighbor_grid_size = (N2 - N1 - 1) / 256 + 1;
   gpu_find_neighbor_ON1_batch<<<
     dim3(neighbor_grid_size, active_count),
@@ -1244,6 +1316,8 @@ void Neighbor::find_neighbor_global_batch(
     cell_contents_batch.data(),
     NN_global_ptrs.data(),
     NL_global_ptrs.data(),
+    MN,
+    max_neighbor_count,
     num_bins[0],
     num_bins[1],
     num_bins[2],
@@ -1252,10 +1326,20 @@ void Neighbor::find_neighbor_global_batch(
                        (rc + neighbors[active_bead_ids_host[0]]->skin)));
   GPU_CHECK_KERNEL
 
-  const int MN = neighbors[0]->NL.size() / neighbors[0]->NN.size();
+  int observed_max_neighbors = 0;
+  CHECK(gpuMemcpy(
+    &observed_max_neighbors,
+    max_neighbor_count,
+    sizeof(int),
+    gpuMemcpyDeviceToHost));
+  check_neighbor_list_capacity(
+    observed_max_neighbors,
+    MN,
+    rc + neighbors[active_bead_ids_host[0]]->skin);
+
   gpu_sort_neighbor_list_batch<<<
     dim3(N, active_count),
-    MN,
+    min(1024, MN),
     MN * sizeof(int)>>>(N, active_bead_ids.data(), NN_global_ptrs.data(), NL_global_ptrs.data());
   GPU_CHECK_KERNEL
 
