@@ -1077,6 +1077,7 @@ bool DP::compute_pimd_batch(
   }
   PIMD_Batch_Data& data = *pimd_batch_data_;
 
+  const double neighbor_rc = rc + 1.0;
   int num_bins[3];
   box.get_num_bins(0.5 * neighbor_rc, num_bins);
   const bool wrapped_cells_alias =
