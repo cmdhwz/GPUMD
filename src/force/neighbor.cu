@@ -842,7 +842,8 @@ __global__ void gpu_check_atom_distance(
   const double* x_new,
   const double* y_new,
   const double* z_new,
-  int* g_sum)
+  const unsigned int generation,
+  unsigned int* g_last_rebuild_generation)
 {
   int tid = threadIdx.x;
   int bid = blockIdx.x;
@@ -867,8 +868,8 @@ __global__ void gpu_check_atom_distance(
     __syncthreads();
   }
 
-  if (tid == 0) {
-    atomicAdd(g_sum, s_sum[0]);
+  if (tid == 0 && s_sum[0] != 0) {
+    atomicMax(g_last_rebuild_generation, generation);
   }
 }
 
@@ -925,8 +926,6 @@ __global__ void gpu_check_atom_distance_batch(
     }
   }
 }
-
-__device__ int static_s2[1];
 
 __global__ void
 gpu_update_xyz0(int N, const double* x, const double* y, const double* z, double* x0, double* y0, double* z0)
@@ -1004,15 +1003,31 @@ int Neighbor::check_atom_distance(Box& box, const double* x, const double* y, co
 {
   const int N = NN.size();
   double d2 = skin * skin * 0.25;
-  int* gpu_s2;
-  CHECK(gpuGetSymbolAddress((void**)&gpu_s2, static_s2));
-  int cpu_s2[1] = {0};
-  CHECK(gpuMemcpy(gpu_s2, cpu_s2, sizeof(int), gpuMemcpyHostToDevice));
+  if (last_rebuild_generation.size() == 0) {
+    last_rebuild_generation.resize(1);
+    last_rebuild_generation.fill(0);
+  }
+  if (++check_generation == 0) {
+    last_rebuild_generation.fill(0);
+    ++check_generation;
+  }
+  const unsigned int generation = check_generation;
   gpu_check_atom_distance<<<(N - 1) / 128 + 1, 128>>>(
-    box, N, d2, x0.data(), y0.data(), z0.data(), x, y, z, gpu_s2);
+    box,
+    N,
+    d2,
+    x0.data(),
+    y0.data(),
+    z0.data(),
+    x,
+    y,
+    z,
+    generation,
+    last_rebuild_generation.data());
   GPU_CHECK_KERNEL
-  CHECK(gpuMemcpy(cpu_s2, gpu_s2, sizeof(int), gpuMemcpyDeviceToHost));
-  return cpu_s2[0];
+  unsigned int last_generation = 0;
+  last_rebuild_generation.copy_to_host(&last_generation, 1);
+  return last_generation == generation;
 }
 
 void Neighbor::find_neighbor_global(
@@ -1454,6 +1469,10 @@ void Neighbor::find_local_neighbor_from_global(
 void Neighbor::initialize(const double rc, const int num_atoms, const int num_neighbors)
 {
   reference_positions_valid = false;
+  check_generation = 0;
+  if (last_rebuild_generation.size() > 0) {
+    last_rebuild_generation.fill(0);
+  }
   const double rc_plus_skin = rc + skin;
   const int MN = num_neighbors * rc_plus_skin * rc_plus_skin * rc_plus_skin / (rc * rc * rc);
   NN.resize(num_atoms);

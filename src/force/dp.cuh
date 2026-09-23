@@ -133,7 +133,7 @@ protected:
   // by a padded source_order array.
   GPU_Vector<int> dp_edge_index;
   GPU_Vector<double> dp_edge_vec;    // [nedge * 3] minimum-image bond vectors
-  GPU_Vector<int> dp_edge_offset;    // [nloc] exclusive scan of NN
+  GPU_Vector<int> dp_edge_offset;    // [nloc + 1] exclusive scan plus total edge count
   GPU_Vector<double> dp_atom_energy_gpu;  // [nloc]
   GPU_Vector<double> dp_force_rowmajor;   // [nloc * 3] row-major model force
   GPU_Vector<double> dp_atom_virial_gpu;  // [nloc * 9] row-major model virial

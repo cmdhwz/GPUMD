@@ -1690,53 +1690,91 @@ void Force::set_hnemdec_parameters(
   refresh_pimd_bead_gpu_workers_();
 }
 
+static __device__ void apply_pbc_to_atom(
+  const int N,
+  const Box& box,
+  const int n,
+  double* g_x,
+  double* g_y,
+  double* g_z,
+  int* g_position_image)
+{
+  double x = g_x[n];
+  double y = g_y[n];
+  double z = g_z[n];
+  double sx = box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z;
+  double sy = box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z;
+  double sz = box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z;
+  if (box.pbc_x == 1) {
+    if (sx < 0.0) {
+      sx += 1.0;
+      if (g_position_image != nullptr)
+        g_position_image[n]--;
+    } else if (sx > 1.0) {
+      sx -= 1.0;
+      if (g_position_image != nullptr)
+        g_position_image[n]++;
+    }
+  }
+  if (box.pbc_y == 1) {
+    if (sy < 0.0) {
+      sy += 1.0;
+      if (g_position_image != nullptr)
+        g_position_image[n + N]--;
+    } else if (sy > 1.0) {
+      sy -= 1.0;
+      if (g_position_image != nullptr)
+        g_position_image[n + N]++;
+    }
+  }
+  if (box.pbc_z == 1) {
+    if (sz < 0.0) {
+      sz += 1.0;
+      if (g_position_image != nullptr)
+        g_position_image[n + N * 2]--;
+    } else if (sz > 1.0) {
+      sz -= 1.0;
+      if (g_position_image != nullptr)
+        g_position_image[n + N * 2]++;
+    }
+  }
+  g_x[n] = box.cpu_h[0] * sx + box.cpu_h[1] * sy + box.cpu_h[2] * sz;
+  g_y[n] = box.cpu_h[3] * sx + box.cpu_h[4] * sy + box.cpu_h[5] * sz;
+  g_z[n] = box.cpu_h[6] * sx + box.cpu_h[7] * sy + box.cpu_h[8] * sz;
+}
+
 static __global__ void gpu_apply_pbc(
   int N, Box box, double* g_x, double* g_y, double* g_z, int* g_position_image)
 {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (n < N) {
-    double x = g_x[n];
-    double y = g_y[n];
-    double z = g_z[n];
-    double sx = box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z;
-    double sy = box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z;
-    double sz = box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z;
-    if (box.pbc_x == 1) {
-      if (sx < 0.0) {
-        sx += 1.0;
-        if (g_position_image != nullptr)
-          g_position_image[n]--;
-      } else if (sx > 1.0) {
-        sx -= 1.0;
-        if (g_position_image != nullptr)
-          g_position_image[n]++;
-      }
+    apply_pbc_to_atom(N, box, n, g_x, g_y, g_z, g_position_image);
+  }
+}
+
+static __global__ void gpu_apply_pbc_and_initialize_properties(
+  int N,
+  Box box,
+  double* g_x,
+  double* g_y,
+  double* g_z,
+  int* g_position_image,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_pe,
+  double* g_virial)
+{
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < N) {
+    apply_pbc_to_atom(N, box, n, g_x, g_y, g_z, g_position_image);
+    g_fx[n] = 0.0;
+    g_fy[n] = 0.0;
+    g_fz[n] = 0.0;
+    g_pe[n] = 0.0;
+    for (int component = 0; component < 9; ++component) {
+      g_virial[n + component * N] = 0.0;
     }
-    if (box.pbc_y == 1) {
-      if (sy < 0.0) {
-        sy += 1.0;
-        if (g_position_image != nullptr)
-          g_position_image[n + N]--;
-      } else if (sy > 1.0) {
-        sy -= 1.0;
-        if (g_position_image != nullptr)
-          g_position_image[n + N]++;
-      }
-    }
-    if (box.pbc_z == 1) {
-      if (sz < 0.0) {
-        sz += 1.0;
-        if (g_position_image != nullptr)
-          g_position_image[n + N * 2]--;
-      } else if (sz > 1.0) {
-        sz -= 1.0;
-        if (g_position_image != nullptr)
-          g_position_image[n + N * 2]++;
-      }
-    }
-    g_x[n] = box.cpu_h[0] * sx + box.cpu_h[1] * sy + box.cpu_h[2] * sz;
-    g_y[n] = box.cpu_h[3] * sx + box.cpu_h[4] * sy + box.cpu_h[5] * sz;
-    g_z[n] = box.cpu_h[6] * sx + box.cpu_h[7] * sy + box.cpu_h[8] * sz;
   }
 }
 
@@ -2147,22 +2185,27 @@ void Force::compute(
 
   const int number_of_atoms = type.size();
   if (!is_fcp) {
-    gpu_apply_pbc<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    gpu_apply_pbc_and_initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
       number_of_atoms,
       box,
       position_per_atom.data(),
       position_per_atom.data() + number_of_atoms,
       position_per_atom.data() + number_of_atoms * 2,
-      position_image);
+      position_image,
+      force_per_atom.data(),
+      force_per_atom.data() + number_of_atoms,
+      force_per_atom.data() + number_of_atoms * 2,
+      potential_per_atom.data(),
+      virial_per_atom.data());
+  } else {
+    initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      force_per_atom.data(),
+      force_per_atom.data() + number_of_atoms,
+      force_per_atom.data() + number_of_atoms * 2,
+      potential_per_atom.data(),
+      virial_per_atom.data());
   }
-
-  initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-    number_of_atoms,
-    force_per_atom.data(),
-    force_per_atom.data() + number_of_atoms,
-    force_per_atom.data() + number_of_atoms * 2,
-    potential_per_atom.data(),
-    virial_per_atom.data());
   GPU_CHECK_KERNEL
 
   if (multiple_potentials_mode_.compare("observe") == 0) {

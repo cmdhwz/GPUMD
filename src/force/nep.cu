@@ -855,7 +855,7 @@ static __global__ void find_partial_force_angular(
     double x1 = g_x[n1];
     double y1 = g_y[n1];
     double z1 = g_z[n1];
-    for (int i1 = 0; i1 < g_NN_angular[n1]; ++i1) {
+    for (int i1 = blockIdx.z; i1 < g_NN_angular[n1]; i1 += gridDim.z) {
       int index = i1 * N + n1;
       int n2 = g_NL_angular[n1 + N * i1];
       float x12 = g_x[n2] - x1;
@@ -1676,7 +1676,10 @@ void NEP::compute_large_box(
     virial_per_atom.data());
   GPU_CHECK_KERNEL
 
-  find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+  const int angular_force_shards =
+    grid_size >= 128 ? 1 : (grid_size >= 64 ? 2 : 4);
+  const dim3 angular_grid(grid_size, 1, angular_force_shards);
+  find_partial_force_angular<<<angular_grid, BLOCK_SIZE>>>(
     paramb,
     annmb,
     N,
@@ -2671,7 +2674,10 @@ void NEP::compute_large_box(
     virial_per_atom.data());
   GPU_CHECK_KERNEL
 
-  find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+  const int angular_force_shards =
+    grid_size >= 128 ? 1 : (grid_size >= 64 ? 2 : 4);
+  const dim3 angular_grid(grid_size, 1, angular_force_shards);
+  find_partial_force_angular<<<angular_grid, BLOCK_SIZE>>>(
     paramb,
     annmb,
     N,

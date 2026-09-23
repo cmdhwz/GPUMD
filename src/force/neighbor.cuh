@@ -229,5 +229,7 @@ private:
   GPU_Vector<int> cell_count_sum; // for cell list
   GPU_Vector<int> cell_contents;  // for cell list
   GPU_Vector<double> x0, y0, z0;  // for checking atom distance
+  GPU_Vector<unsigned int> last_rebuild_generation;
+  unsigned int check_generation = 0;
   int check_atom_distance(Box& box, const double* x, const double* y, const double* z);
 };

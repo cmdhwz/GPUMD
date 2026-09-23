@@ -24,8 +24,11 @@ The class dealing with the Deep Potential(DP).
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <thrust/execution_policy.h>
-#include <thrust/reduce.h>
 #include <thrust/scan.h>
+#ifndef USE_HIP
+#include <thrust/system/cuda/execution_policy.h>
+#include <thrust/version.h>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <sstream>
@@ -50,7 +53,7 @@ DP::DP(const char* filename_dp, int num_atoms)
   dp_neighbor.initialize(rc, num_atoms, MAX_NEIGH_NUM_DP);
   dp_NN_local.resize(num_atoms);
   dp_NL_local.resize(dp_neighbor.NL.size());
-  dp_edge_offset.resize(num_atoms);
+  dp_edge_offset.resize(static_cast<size_t>(num_atoms) + 1);
   dp_position_gpu.resize(static_cast<size_t>(num_atoms) + 1);
   dp_position_gpu_trans.resize(static_cast<size_t>(num_atoms) * 3);
   dp_atom_energy_gpu.resize(num_atoms);
@@ -833,8 +836,8 @@ void DP::compute_gpu_edges(
 
   // These buffers are sized once for the fixed atom count in the constructor.
   // Keep the guards for callers that provide a larger atom count.
-  if (dp_edge_offset.size() < atom_storage) {
-    dp_edge_offset.resize(atom_storage);
+  if (dp_edge_offset.size() < atom_storage + 1) {
+    dp_edge_offset.resize(atom_storage + 1);
   }
   if (dp_atom_energy_gpu.size() < atom_storage) {
     dp_atom_energy_gpu.resize(atom_storage);
@@ -879,14 +882,21 @@ void DP::compute_gpu_edges(
     GPU_CHECK_KERNEL
   }
 
-  // Exclusive scan of the per-atom neighbor counts gives each atom's edge
-  // offset; the total edge count is the reduction of the counts.
+  // Exclusive scan gives per-atom offsets; the final offset and count give
+  // the total edge count.
   thrust::exclusive_scan(
     thrust::device, dp_NN_local.data(), dp_NN_local.data() + N,
     dp_edge_offset.data());
-  const int nedge = thrust::reduce(
-    thrust::device, dp_NN_local.data(), dp_NN_local.data() + N, 0,
-    thrust::plus<int>());
+  dp_store_edge_count<<<1, 1>>>(
+    N,
+    dp_NN_local.data(),
+    dp_edge_offset.data(),
+    dp_edge_offset.data() + N,
+    0);
+  GPU_CHECK_KERNEL
+  int nedge = 0;
+  CHECK(gpuMemcpy(
+    &nedge, dp_edge_offset.data() + N, sizeof(int), gpuMemcpyDeviceToHost));
 
   if (deep_pot.uses_canonical_graph_inference()) {
     // Reuse existing DP scratch buffers for the additional canonical ABI
@@ -1131,10 +1141,17 @@ bool DP::compute_pimd_batch(
         bead_data.NL_local.data());
       GPU_CHECK_KERNEL
     }
+#if !defined(USE_HIP) && THRUST_VERSION >= 101600
+    thrust::exclusive_scan(
+      thrust::cuda::par_nosync, bead_data.NN_local.data(),
+      bead_data.NN_local.data() + number_of_atoms,
+      bead_data.edge_offset.data());
+#else
     thrust::exclusive_scan(
       thrust::device, bead_data.NN_local.data(),
       bead_data.NN_local.data() + number_of_atoms,
       bead_data.edge_offset.data());
+#endif
     dp_store_edge_count<<<1, 1>>>(
       number_of_atoms,
       bead_data.NN_local.data(),
