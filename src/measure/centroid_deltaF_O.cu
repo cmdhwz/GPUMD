@@ -285,9 +285,24 @@ void Centroid_DeltaF_O::write_netcdf_()
   check_netcdf(nc_put_var_int(ncid, oxygen_id_var, oxygen_atom_ids_.data()));
   check_netcdf(nc_put_var_double(ncid, reference_position_var, reference_positions_.data()));
 
-  check_netcdf(nc_put_var_double(ncid, time_var, sample_times_fs_.data()));
-  check_netcdf(nc_put_var_longlong(ncid, step_var, sampled_steps_.data()));
-  check_netcdf(nc_put_var_float(ncid, delta_force_var, delta_force_history_.data()));
+  const size_t frame_count = sampled_steps_.size();
+  for (size_t frame = 0; frame < frame_count; ++frame) {
+    printf(
+      "deltaF_O write attempt: step=%lld, frame=%zu\n",
+      sampled_steps_[frame],
+      frame);
+  }
+  const size_t frame_start[1] = {0};
+  const size_t frame_count_1d[1] = {frame_count};
+  const size_t delta_start[3] = {0, 0, 0};
+  const size_t delta_count[3] = {
+    frame_count, static_cast<size_t>(number_of_oxygen_), 3};
+  check_netcdf(nc_put_vara_double(
+    ncid, time_var, frame_start, frame_count_1d, sample_times_fs_.data()));
+  check_netcdf(nc_put_vara_longlong(
+    ncid, step_var, frame_start, frame_count_1d, sampled_steps_.data()));
+  check_netcdf(nc_put_vara_float(
+    ncid, delta_force_var, delta_start, delta_count, delta_force_history_.data()));
   check_netcdf(nc_close(ncid));
 }
 
