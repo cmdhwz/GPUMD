@@ -51,6 +51,8 @@ private:
   void parse_pimd_qnep_batch_bec(const char** param, int num_param);
   void parse_pimd_nep_bead_batch(const char** param, int num_param);
   void parse_pimd_nep_batch_profile(const char** param, int num_param);
+  void parse_pimd_dp_batch_source_count(const char** param, int num_param);
+  void parse_pimd_dp_batch_edge_fill_4_threads(const char** param, int num_param);
   void parse_pimd_nep_batch_geometry_cache(const char** param, int num_param);
   void parse_pimd_propagator(const char** param, int num_param);
   void parse_pimd_pile_scale(const char** param, int num_param);

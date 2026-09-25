@@ -517,6 +517,10 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     strcmp(param[0], "pimd_nep_batch_profile") == 0 ||
     strcmp(param[0], "pimd_dp_batch_profile") == 0) {
     parse_pimd_nep_batch_profile(param, num_param);
+  } else if (strcmp(param[0], "pimd_dp_batch_source_count") == 0) {
+    parse_pimd_dp_batch_source_count(param, num_param);
+  } else if (strcmp(param[0], "pimd_dp_batch_edge_fill_4_threads") == 0) {
+    parse_pimd_dp_batch_edge_fill_4_threads(param, num_param);
   } else if (strcmp(param[0], "pimd_nep_batch_geometry_cache") == 0) {
     parse_pimd_nep_batch_geometry_cache(param, num_param);
   } else if (strcmp(param[0], "read_pimd_restart") == 0) {
@@ -1069,6 +1073,45 @@ void Run::parse_pimd_nep_batch_profile(const char** param, int num_param)
     } else {
       PRINT_INPUT_ERROR("pimd_nep_batch_profile should be on or off.\n");
     }
+  }
+}
+
+void Run::parse_pimd_dp_batch_source_count(const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_dp_batch_source_count should have 1 parameter.");
+  }
+  if (strcmp(param[1], "off") == 0) {
+    force.set_pimd_dp_batch_source_count_mode(PIMD_DP_Source_Count_Mode::Atomic);
+    printf("DP PIMD batch source counting uses the existing atomic path.\n");
+  } else if (strcmp(param[1], "check") == 0) {
+    force.set_pimd_dp_batch_source_count_mode(PIMD_DP_Source_Count_Mode::Check);
+    printf(
+      "DP PIMD batch source-count validation is on; it compares every batch call and synchronizes to the host, so do not use this mode for timing.\n");
+  } else if (strcmp(param[1], "on") == 0) {
+    force.set_pimd_dp_batch_source_count_mode(
+      PIMD_DP_Source_Count_Mode::NeighborCounts);
+    printf(
+      "DP PIMD batch source counts will use NN_local; enable only after source-count check passes for the tested trajectory.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_dp_batch_source_count should be off, check, or on.");
+  }
+}
+
+void Run::parse_pimd_dp_batch_edge_fill_4_threads(
+  const char** param, int num_param)
+{
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("pimd_dp_batch_edge_fill_4_threads should have 1 parameter.");
+  }
+  if (strcmp(param[1], "on") == 0) {
+    force.set_pimd_dp_batch_edge_fill_4_threads(true);
+    printf("DP PIMD batch edge-fill uses 4 threads per atom.\n");
+  } else if (strcmp(param[1], "off") == 0) {
+    force.set_pimd_dp_batch_edge_fill_4_threads(false);
+    printf("DP PIMD batch edge-fill uses 1 thread per atom.\n");
+  } else {
+    PRINT_INPUT_ERROR("pimd_dp_batch_edge_fill_4_threads should be on or off.");
   }
 }
 

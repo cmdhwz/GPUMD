@@ -68,6 +68,9 @@ public:
     const std::vector<GPU_Vector<double>*>& force_beads,
     const std::vector<GPU_Vector<double>*>& virial_beads);
   void set_pimd_batch_profile(const bool enabled) override;
+  void set_pimd_batch_source_count_options(
+    const bool use_neighbor_counts, const bool validate_counts);
+  void set_pimd_batch_edge_fill_4_threads(const bool enabled);
   void reset_pimd_batch_timing() override;
   void print_pimd_batch_timing() const;
   void initialize_dp(const char* filename_dp);
@@ -212,6 +215,7 @@ protected:
     GPU_Vector<int> source_count;
     GPU_Vector<int> source_cursor;
     GPU_Vector<int> source_storage;
+    GPU_Vector<int> source_count_mismatches;
     GPU_Vector<float> edge_vec;
     GPU_Vector<double> atom_energy;
     GPU_Vector<double> force_rowmajor;
@@ -219,6 +223,9 @@ protected:
   };
 
   bool pimd_batch_profile_enabled_ = false;
+  bool pimd_batch_use_neighbor_source_counts_ = false;
+  bool pimd_batch_validate_source_counts_ = false;
+  bool pimd_batch_edge_fill_4_threads_ = false;
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
 
   void compute_gpu_edges(

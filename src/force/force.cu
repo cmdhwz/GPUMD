@@ -505,6 +505,33 @@ void Force::set_pimd_dp_batch_profile(const bool enabled)
 #endif
 }
 
+void Force::set_pimd_dp_batch_source_count_mode(
+  const PIMD_DP_Source_Count_Mode mode)
+{
+  pimd_dp_source_count_mode_ = mode;
+#ifdef USE_DEEPMD
+  for (auto& potential : potentials) {
+    if (auto* dp = dynamic_cast<DP*>(potential.get())) {
+      dp->set_pimd_batch_source_count_options(
+        mode == PIMD_DP_Source_Count_Mode::NeighborCounts,
+        mode == PIMD_DP_Source_Count_Mode::Check);
+    }
+  }
+#endif
+}
+
+void Force::set_pimd_dp_batch_edge_fill_4_threads(const bool enabled)
+{
+  pimd_dp_batch_edge_fill_4_threads_ = enabled;
+#ifdef USE_DEEPMD
+  for (auto& potential : potentials) {
+    if (auto* dp = dynamic_cast<DP*>(potential.get())) {
+      dp->set_pimd_batch_edge_fill_4_threads(enabled);
+    }
+  }
+#endif
+}
+
 void Force::reset_pimd_nep_batch_profile()
 {
   for (auto& potential : potentials) {
@@ -1028,8 +1055,13 @@ void Force::refresh_pimd_bead_gpu_workers_()
 #endif
     bool primary_batch_profile = pimd_nep_batch_profile_enabled_;
 #ifdef USE_DEEPMD
-    if (dynamic_cast<DP*>(potentials[0].get())) {
+    if (auto* dp = dynamic_cast<DP*>(potentials[0].get())) {
       primary_batch_profile = pimd_dp_batch_profile_enabled_;
+      dp->set_pimd_batch_source_count_options(
+        pimd_dp_source_count_mode_ == PIMD_DP_Source_Count_Mode::NeighborCounts,
+        pimd_dp_source_count_mode_ == PIMD_DP_Source_Count_Mode::Check);
+      dp->set_pimd_batch_edge_fill_4_threads(
+        pimd_dp_batch_edge_fill_4_threads_);
     }
 #endif
     potentials[0]->set_neighbor_rebuild(

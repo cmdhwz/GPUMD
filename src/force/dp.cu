@@ -92,6 +92,18 @@ void DP::set_pimd_batch_profile(const bool enabled)
   pimd_batch_profile_enabled_ = enabled;
 }
 
+void DP::set_pimd_batch_source_count_options(
+  const bool use_neighbor_counts, const bool validate_counts)
+{
+  pimd_batch_use_neighbor_source_counts_ = use_neighbor_counts;
+  pimd_batch_validate_source_counts_ = validate_counts;
+}
+
+void DP::set_pimd_batch_edge_fill_4_threads(const bool enabled)
+{
+  pimd_batch_edge_fill_4_threads_ = enabled;
+}
+
 void DP::reset_pimd_batch_timing()
 {
   if (pimd_batch_data_) {
@@ -748,9 +760,12 @@ static __global__ void dp_fill_edges(
 // The neighbor list is already destination-major (one contiguous row per
 // center), so its exclusive offsets are the destination CSR.  This kernel
 // writes the uint32 source row, float32 bond vectors, and per-source counts.
+template<bool CountSources>
 static __device__ __forceinline__ void dp_fill_canonical_edges_for_atom(
   const int N,
   const int n1,
+  const int first_neighbor,
+  const int neighbor_stride,
   const int* __restrict__ NN,
   const int* __restrict__ NL,
   const int* __restrict__ edge_offset,
@@ -769,7 +784,7 @@ static __device__ __forceinline__ void dp_fill_canonical_edges_for_atom(
   const double x1 = x[n1];
   const double y1 = y[n1];
   const double z1 = z[n1];
-  for (int c = 0; c < count; ++c) {
+  for (int c = first_neighbor; c < count; c += neighbor_stride) {
     const int n2 = NL[static_cast<size_t>(c) * N + n1];
     double x12 = x[n2] - x1;
     double y12 = y[n2] - y1;
@@ -780,7 +795,9 @@ static __device__ __forceinline__ void dp_fill_canonical_edges_for_atom(
     edge_vec[edge * 3] = static_cast<float>(x12);
     edge_vec[edge * 3 + 1] = static_cast<float>(y12);
     edge_vec[edge * 3 + 2] = static_cast<float>(z12);
-    atomicAdd(source_count + node_base + n2, 1);
+    if (CountSources) {
+      atomicAdd(source_count + node_base + n2, 1);
+    }
   }
 }
 
@@ -801,12 +818,13 @@ static __global__ void dp_fill_canonical_edges(
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
   if (n1 < N) {
-    dp_fill_canonical_edges_for_atom(
-      N, n1, NN, NL, edge_offset, x, y, z, box, node_base, edge_base,
+    dp_fill_canonical_edges_for_atom<true>(
+      N, n1, 0, 1, NN, NL, edge_offset, x, y, z, box, node_base, edge_base,
       source, edge_vec, source_count);
   }
 }
 
+template<int LanesPerAtom, bool CountSources>
 static __global__ void dp_fill_canonical_edges_batch(
   const int N,
   const int number_of_beads,
@@ -823,16 +841,40 @@ static __global__ void dp_fill_canonical_edges_batch(
   int* source_count)
 {
   const int bead = blockIdx.y;
-  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  int n1 = 0;
+  int first_neighbor = 0;
+  if (LanesPerAtom == 4) {
+    constexpr int atoms_per_warp = 32 / LanesPerAtom;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    n1 = blockIdx.x * (blockDim.x / LanesPerAtom) + warp * atoms_per_warp +
+         lane % atoms_per_warp;
+    first_neighbor = lane / atoms_per_warp;
+  } else {
+    n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  }
   if (bead < number_of_beads && n1 < N && edge_counts[bead] > 0) {
     const int node_base = bead * N;
     const size_t neighbor_base =
       static_cast<size_t>(node_base) * local_neighbor_capacity;
     double* position = position_ptrs[bead];
-    dp_fill_canonical_edges_for_atom(
-      N, n1, NN_local + node_base, NL_local + neighbor_base,
+    dp_fill_canonical_edges_for_atom<CountSources>(
+      N, n1, first_neighbor, LanesPerAtom,
+      NN_local + node_base, NL_local + neighbor_base,
       edge_offset + node_base, position, position + N, position + 2 * N, box,
       node_base, edge_bases[bead], source, edge_vec, source_count);
+  }
+}
+
+static __global__ void dp_check_canonical_source_counts(
+  const int total_nodes,
+  const int* __restrict__ source_count,
+  const int* __restrict__ neighbor_counts,
+  int* mismatch_count)
+{
+  const int node = blockIdx.x * blockDim.x + threadIdx.x;
+  if (node < total_nodes && source_count[node] != neighbor_counts[node]) {
+    atomicAdd(mismatch_count, 1);
   }
 }
 
@@ -1246,6 +1288,7 @@ bool DP::compute_pimd_batch(
     data->rebuild_flags.resize(number_of_beads);
     data->any_rebuild.resize(1);
     data->active_bead_ids.resize(number_of_beads);
+    data->source_count_mismatches.resize(1);
     data->x0_ptrs_host.resize(number_of_beads);
     data->y0_ptrs_host.resize(number_of_beads);
     data->z0_ptrs_host.resize(number_of_beads);
@@ -1488,8 +1531,10 @@ bool DP::compute_pimd_batch(
     reinterpret_cast<std::int64_t*>(data.n_node.data()),
     reinterpret_cast<std::int64_t*>(data.n_local.data()));
   GPU_CHECK_KERNEL
-  CHECK(gpuMemset(
-    data.source_count.data(), 0, sizeof(int) * static_cast<size_t>(total_nodes)));
+  if (!pimd_batch_use_neighbor_source_counts_) {
+    CHECK(gpuMemset(
+      data.source_count.data(), 0, sizeof(int) * static_cast<size_t>(total_nodes)));
+  }
 
   int* source = data.source_storage.data();
   int* source_order = source + source_order_offset;
@@ -1506,19 +1551,74 @@ bool DP::compute_pimd_batch(
     data.edge_counts_device.data(), model_type, destination_row_ptr);
   GPU_CHECK_KERNEL
   finish_graph_stage(stage_timing.canonical_graph_buffer_meta_nodes);
-  dp_fill_canonical_edges_batch<<<batch_grid, BLOCK_SIZE_FORCE>>>(
-    number_of_atoms, number_of_beads, data.local_neighbor_capacity,
-    data.NN_local_all.data(), data.NL_local_all.data(),
-    data.edge_offset_all.data(), data.position_ptrs.data(),
-    data.edge_bases_device.data(), data.edge_counts_device.data(), box, source,
-    edge_vec, data.source_count.data());
+  if (pimd_batch_edge_fill_4_threads_) {
+    const dim3 edge_fill_grid(
+      (number_of_atoms - 1) / (BLOCK_SIZE_FORCE / 4) + 1, number_of_beads);
+    if (pimd_batch_use_neighbor_source_counts_) {
+      dp_fill_canonical_edges_batch<4, false><<<edge_fill_grid, BLOCK_SIZE_FORCE>>>(
+          number_of_atoms, number_of_beads, data.local_neighbor_capacity,
+          data.NN_local_all.data(), data.NL_local_all.data(),
+          data.edge_offset_all.data(), data.position_ptrs.data(),
+          data.edge_bases_device.data(), data.edge_counts_device.data(), box,
+          source, edge_vec, data.source_count.data());
+    } else {
+      dp_fill_canonical_edges_batch<4, true><<<edge_fill_grid, BLOCK_SIZE_FORCE>>>(
+          number_of_atoms, number_of_beads, data.local_neighbor_capacity,
+          data.NN_local_all.data(), data.NL_local_all.data(),
+          data.edge_offset_all.data(), data.position_ptrs.data(),
+          data.edge_bases_device.data(), data.edge_counts_device.data(), box,
+          source, edge_vec, data.source_count.data());
+    }
+  } else {
+    if (pimd_batch_use_neighbor_source_counts_) {
+      dp_fill_canonical_edges_batch<1, false><<<batch_grid, BLOCK_SIZE_FORCE>>>(
+        number_of_atoms, number_of_beads, data.local_neighbor_capacity,
+        data.NN_local_all.data(), data.NL_local_all.data(),
+        data.edge_offset_all.data(), data.position_ptrs.data(),
+        data.edge_bases_device.data(), data.edge_counts_device.data(), box,
+        source, edge_vec, data.source_count.data());
+    } else {
+      dp_fill_canonical_edges_batch<1, true><<<batch_grid, BLOCK_SIZE_FORCE>>>(
+        number_of_atoms, number_of_beads, data.local_neighbor_capacity,
+        data.NN_local_all.data(), data.NL_local_all.data(),
+        data.edge_offset_all.data(), data.position_ptrs.data(),
+        data.edge_bases_device.data(), data.edge_counts_device.data(), box,
+        source, edge_vec, data.source_count.data());
+    }
+  }
   GPU_CHECK_KERNEL
   finish_graph_stage(stage_timing.canonical_graph_edge_fill);
+  if (pimd_batch_validate_source_counts_) {
+    CHECK(gpuMemset(data.source_count_mismatches.data(), 0, sizeof(int)));
+    dp_check_canonical_source_counts<<<
+      (total_nodes - 1) / BLOCK_SIZE_FORCE + 1, BLOCK_SIZE_FORCE>>>(
+      total_nodes,
+      data.source_count.data(),
+      data.NN_local_all.data(),
+      data.source_count_mismatches.data());
+    GPU_CHECK_KERNEL
+    int mismatch_count = 0;
+    data.source_count_mismatches.copy_to_host(&mismatch_count);
+    if (mismatch_count != 0) {
+      printf(
+        "DP PIMD source-count validation failed: %d of %d nodes differ between incoming edges and NN_local.\n",
+        mismatch_count,
+        total_nodes);
+      PRINT_INPUT_ERROR(
+        "pimd_dp_batch_source_count check found an incoming-edge count mismatch.");
+    }
+    if (profile_timing) {
+      stage_begin = Clock::now();
+    }
+  }
+  const int* source_count_scan_input = pimd_batch_use_neighbor_source_counts_
+    ? data.NN_local_all.data()
+    : data.source_count.data();
   thrust::exclusive_scan_by_key(
     thrust::device,
     bead_keys_begin,
     bead_keys_end,
-    data.source_count.data(),
+    source_count_scan_input,
     data.source_count.data());
   dp_prepare_canonical_source_rows_batch<<<batch_grid, BLOCK_SIZE_FORCE>>>(
     number_of_atoms, number_of_beads, data.source_count.data(),

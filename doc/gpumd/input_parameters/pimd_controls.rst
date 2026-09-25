@@ -81,6 +81,32 @@ bead evaluation.
 The default is ``off``. The command must appear before the corresponding
 ``run``.
 
+DP batch edge-fill experiments
+------------------------------
+
+These controls apply only to the batched DP canonical-graph path. Both
+optimizations are default-off and can be tested independently.
+
+Syntax::
+
+    pimd_dp_batch_source_count off|check|on
+    pimd_dp_batch_edge_fill_4_threads on|off
+
+``pimd_dp_batch_source_count off`` keeps the existing per-edge atomic source
+count. Use ``check`` first: GPUMD compares the atomic incoming-edge count with
+``NN_local`` on every batch force call and stops if any node differs. This mode
+copies the mismatch count back to the host each call, so use it only to check a
+short trajectory that includes periodic crossings and neighbor-list reuse; do
+not use its timing. After the check passes for the tested trajectory,
+``pimd_dp_batch_source_count on`` removes the edge-fill atomics and uses
+``NN_local`` as the source-count scan input.
+
+``pimd_dp_batch_edge_fill_4_threads on`` assigns four threads to each atom's
+batch edge-fill work; ``off`` retains one thread per atom. It does not change
+single-frame DP calculations. Compare each option separately with the same
+restart, and check energy, per-atom forces, and all nine virial components
+before comparing timings with ``pimd_dp_batch_profile on``.
+
 PIMD bead neighbor-list rebuilding
 ----------------------------------
 
