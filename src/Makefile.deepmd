@@ -1,22 +1,22 @@
-# Standalone DeePMD-enabled build file.
-# Run from this directory with:
-#   conda activate dpmd
-#   make -f Makefile.deepmd gpumd -j
+# DeePMD-enabled GPUMD
 
 .DEFAULT_GOAL := gpumd
 
-DEEPMD_ROOT ?= $(shell python -c "import sys; print(sys.prefix)")
-TORCH_LIB ?= $(shell python -c "import torch; print(torch.__path__[0] + '/lib')")
+DEEPMD_ROOT ?= /root/data/conda_data/envs/dpmd2
 
 include makefile
 
+# Enable DeePMD interface
 CFLAGS += -DUSE_DEEPMD
 
+# DeepPot.h is located at:
+# $(DEEPMD_ROOT)/include/deepmd/DeepPot.h
 INC += -I$(DEEPMD_ROOT)/include/deepmd
 
-LDFLAGS += -L$(DEEPMD_ROOT)/lib
-LDFLAGS += -L$(TORCH_LIB)
+# DeePMD C/C++ libraries
+LIBS += $(DEEPMD_ROOT)/lib/libdeepmd_cc.so
+LIBS += $(DEEPMD_ROOT)/lib/libdeepmd_c.so
 
-LIBS += -ldeepmd_cc -ldeepmd_c
-LIBS += -ltorch -ltorch_cpu -lc10
-LIBS += -ltorch_cuda -lc10_cuda
+# GPUMD is finally linked by nvcc, so use -Xlinker
+# to embed DeePMD runtime path.
+LIBS += -Xlinker=-rpath -Xlinker=$(DEEPMD_ROOT)/lib

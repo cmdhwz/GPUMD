@@ -148,8 +148,16 @@ protected:
     double local_filter = 0.0;
     double edge_count = 0.0;
     double canonical_graph = 0.0;
+    double canonical_graph_buffer_meta_nodes = 0.0;
+    double canonical_graph_edge_fill = 0.0;
+    double canonical_graph_source_scan_rows = 0.0;
+    double canonical_graph_source_order_guard = 0.0;
     double deepmd_inference = 0.0;
+    double deepmd_api_call = 0.0;
+    double deepmd_post_return_gpu_wait = 0.0;
     double scatter = 0.0;
+    long long total_edges_sum = 0;
+    int total_edges_max = 0;
     double neighbor_pointer_setup = 0.0;
     double neighbor_distance_check = 0.0;
     double neighbor_flag_transfer = 0.0;

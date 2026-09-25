@@ -102,7 +102,7 @@ void DP::reset_pimd_batch_timing()
 void DP::print_pimd_batch_timing() const
 {
   printf(
-    "DP PIMD batch stage timing (synchronized wall time; profiling adds GPU synchronization):\n");
+    "DP PIMD batch stage timing (synchronized wall time; fine graph breakdown adds GPU synchronization):\n");
   if (!pimd_batch_data_) {
     printf("    no batch force calls.\n");
     return;
@@ -119,8 +119,34 @@ void DP::print_pimd_batch_timing() const
   print_stage("local filter", timing.local_filter, timing.calls);
   print_stage("edge count and host return", timing.edge_count, timing.calls);
   print_stage("canonical graph construction", timing.canonical_graph, timing.calls);
+  printf("        canonical graph breakdown (included above):\n");
+  print_stage(
+    "buffer growth, metadata, clear, and nodes",
+    timing.canonical_graph_buffer_meta_nodes,
+    timing.calls);
+  print_stage("edge fill", timing.canonical_graph_edge_fill, timing.calls);
+  print_stage(
+    "source scan and rows",
+    timing.canonical_graph_source_scan_rows,
+    timing.calls);
+  print_stage(
+    "source order and guard",
+    timing.canonical_graph_source_order_guard,
+    timing.calls);
   print_stage("DeePMD inference", timing.deepmd_inference, timing.calls);
+  printf("        DeePMD inference breakdown (included above):\n");
+  print_stage("API call wall time", timing.deepmd_api_call, timing.calls);
+  print_stage(
+    "post-return GPU wait",
+    timing.deepmd_post_return_gpu_wait,
+    timing.calls);
   print_stage("output scatter", timing.scatter, timing.calls);
+  const double average_edges =
+    timing.calls > 0 ? static_cast<double>(timing.total_edges_sum) / timing.calls : 0.0;
+  printf(
+    "    canonical graph edges: average = %g, maximum = %d per force call.\n",
+    average_edges,
+    timing.total_edges_max);
   printf("        global neighbor subtotals (included above):\n");
   print_stage("pointer setup", timing.neighbor_pointer_setup, timing.calls);
   print_stage("distance check", timing.neighbor_distance_check, timing.calls);
@@ -1258,6 +1284,16 @@ bool DP::compute_pimd_batch(
       stage_begin = Clock::now();
     }
   };
+  const auto finish_graph_stage = [&](double& elapsed) {
+    if (profile_timing) {
+      CHECK(gpuDeviceSynchronize());
+      const double stage_seconds =
+        std::chrono::duration<double>(Clock::now() - stage_begin).count();
+      elapsed += stage_seconds;
+      stage_timing.canonical_graph += stage_seconds;
+      stage_begin = Clock::now();
+    }
+  };
 
   const double neighbor_rc = rc + 1.0;
   int num_bins[3];
@@ -1393,6 +1429,12 @@ bool DP::compute_pimd_batch(
   for (int bead = 0; bead < number_of_beads; ++bead) {
     total_edges += data.edge_counts[bead];
   }
+  if (profile_timing) {
+    stage_timing.total_edges_sum += total_edges;
+    if (total_edges > stage_timing.total_edges_max) {
+      stage_timing.total_edges_max = total_edges;
+    }
+  }
   finish_stage(stage_timing.edge_count);
 
   const int edge_storage = total_edges < 2 ? 2 : total_edges;
@@ -1463,6 +1505,7 @@ bool DP::compute_pimd_batch(
     data.edge_offset_all.data(), data.edge_bases_device.data(),
     data.edge_counts_device.data(), model_type, destination_row_ptr);
   GPU_CHECK_KERNEL
+  finish_graph_stage(stage_timing.canonical_graph_buffer_meta_nodes);
   dp_fill_canonical_edges_batch<<<batch_grid, BLOCK_SIZE_FORCE>>>(
     number_of_atoms, number_of_beads, data.local_neighbor_capacity,
     data.NN_local_all.data(), data.NL_local_all.data(),
@@ -1470,6 +1513,7 @@ bool DP::compute_pimd_batch(
     data.edge_bases_device.data(), data.edge_counts_device.data(), box, source,
     edge_vec, data.source_count.data());
   GPU_CHECK_KERNEL
+  finish_graph_stage(stage_timing.canonical_graph_edge_fill);
   thrust::exclusive_scan_by_key(
     thrust::device,
     bead_keys_begin,
@@ -1481,6 +1525,7 @@ bool DP::compute_pimd_batch(
     data.edge_bases_device.data(), data.edge_counts_device.data(),
     source_row_ptr, data.source_cursor.data());
   GPU_CHECK_KERNEL
+  finish_graph_stage(stage_timing.canonical_graph_source_scan_rows);
   if (total_edges > 0) {
     const int edge_grid = (total_edges - 1) / BLOCK_SIZE_FORCE + 1;
     dp_build_canonical_source_order<<<edge_grid, BLOCK_SIZE_FORCE>>>(
@@ -1493,8 +1538,12 @@ bool DP::compute_pimd_batch(
       total_edges, edge_storage, source, edge_vec, source_order);
     GPU_CHECK_KERNEL
   }
-  finish_stage(stage_timing.canonical_graph);
+  finish_graph_stage(stage_timing.canonical_graph_source_order_guard);
 
+  Clock::time_point deepmd_api_begin{};
+  if (profile_timing) {
+    deepmd_api_begin = Clock::now();
+  }
   deep_pot.compute_canonical_graph_gpu_batch(
     data.atom_energy.data(), data.force_rowmajor.data(), data.atom_virial.data(),
     model_type, reinterpret_cast<std::uint32_t*>(source), edge_vec,
@@ -1503,7 +1552,19 @@ bool DP::compute_pimd_batch(
     reinterpret_cast<std::int64_t*>(data.n_node.data()),
     reinterpret_cast<std::int64_t*>(data.n_local.data()), number_of_beads,
     total_nodes, static_cast<std::int64_t>(edge_storage));
-  finish_stage(stage_timing.deepmd_inference);
+  if (profile_timing) {
+    const auto api_return = Clock::now();
+    const double api_call_seconds =
+      std::chrono::duration<double>(api_return - deepmd_api_begin).count();
+    CHECK(gpuDeviceSynchronize());
+    const auto sync_complete = Clock::now();
+    const double post_return_wait_seconds =
+      std::chrono::duration<double>(sync_complete - api_return).count();
+    stage_timing.deepmd_api_call += api_call_seconds;
+    stage_timing.deepmd_post_return_gpu_wait += post_return_wait_seconds;
+    stage_timing.deepmd_inference += api_call_seconds + post_return_wait_seconds;
+    stage_begin = sync_complete;
+  }
 
   const int output_grid = atom_grid;
   for (int bead = 0; bead < number_of_beads; ++bead) {
