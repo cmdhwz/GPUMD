@@ -318,13 +318,14 @@ void Run::perform_a_run()
   const bool profile_pimd_bead_parallel =
     integrate.type >= 31 && integrate.type <= 33 &&
     force.pimd_bead_gpu_parallel_available();
-  const bool profile_pimd_nep_batch = force.pimd_nep_batch_profile_enabled();
+  const bool profile_pimd_batch = force.pimd_nep_batch_profile_enabled() ||
+    force.pimd_dp_batch_profile_enabled();
   double pimd_compute1_time = 0.0;
   double pimd_compute2_time = 0.0;
   if (profile_pimd_bead_parallel) {
     force.reset_pimd_bead_timing();
   }
-  if (profile_pimd_nep_batch) {
+  if (profile_pimd_batch) {
     force.reset_pimd_nep_batch_profile();
   }
 
@@ -425,7 +426,7 @@ void Run::perform_a_run()
     printf("    compute2/integrator = %g s (%g%%).\n", pimd_compute2_time, percentage(pimd_compute2_time));
     printf("    other run work = %g s (%g%%).\n", other, percentage(other));
   }
-  if (profile_pimd_nep_batch) {
+  if (profile_pimd_batch) {
     force.print_pimd_nep_batch_profile();
   }
   print_line_2();
@@ -512,7 +513,9 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     parse_pimd_qnep_batch_bec(param, num_param);
   } else if (strcmp(param[0], "pimd_nep_bead_batch") == 0) {
     parse_pimd_nep_bead_batch(param, num_param);
-  } else if (strcmp(param[0], "pimd_nep_batch_profile") == 0) {
+  } else if (
+    strcmp(param[0], "pimd_nep_batch_profile") == 0 ||
+    strcmp(param[0], "pimd_dp_batch_profile") == 0) {
     parse_pimd_nep_batch_profile(param, num_param);
   } else if (strcmp(param[0], "pimd_nep_batch_geometry_cache") == 0) {
     parse_pimd_nep_batch_geometry_cache(param, num_param);
@@ -1036,17 +1039,36 @@ void Run::parse_pimd_qnep_batch_bec(const char** param, int num_param)
 
 void Run::parse_pimd_nep_batch_profile(const char** param, int num_param)
 {
+  const bool dp_profile = strcmp(param[0], "pimd_dp_batch_profile") == 0;
   if (num_param != 2) {
-    PRINT_INPUT_ERROR("pimd_nep_batch_profile should have 1 parameter.\n");
+    if (dp_profile) {
+      PRINT_INPUT_ERROR("pimd_dp_batch_profile should have 1 parameter.\n");
+    } else {
+      PRINT_INPUT_ERROR("pimd_nep_batch_profile should have 1 parameter.\n");
+    }
   }
   if (strcmp(param[1], "on") == 0) {
-    force.set_pimd_nep_batch_profile(true);
-    printf("Enabled PIMD NEP/qNEP batch stage profiling.\n");
+    if (dp_profile) {
+      force.set_pimd_dp_batch_profile(true);
+      printf("Enabled DP PIMD batch stage profiling.\n");
+    } else {
+      force.set_pimd_nep_batch_profile(true);
+      printf("Enabled PIMD NEP/qNEP batch stage profiling.\n");
+    }
   } else if (strcmp(param[1], "off") == 0) {
-    force.set_pimd_nep_batch_profile(false);
-    printf("Disabled PIMD NEP/qNEP batch stage profiling.\n");
+    if (dp_profile) {
+      force.set_pimd_dp_batch_profile(false);
+      printf("Disabled DP PIMD batch stage profiling.\n");
+    } else {
+      force.set_pimd_nep_batch_profile(false);
+      printf("Disabled PIMD NEP/qNEP batch stage profiling.\n");
+    }
   } else {
-    PRINT_INPUT_ERROR("pimd_nep_batch_profile should be on or off.\n");
+    if (dp_profile) {
+      PRINT_INPUT_ERROR("pimd_dp_batch_profile should be on or off.\n");
+    } else {
+      PRINT_INPUT_ERROR("pimd_nep_batch_profile should be on or off.\n");
+    }
   }
 }
 

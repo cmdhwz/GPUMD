@@ -67,6 +67,9 @@ public:
     const std::vector<GPU_Vector<double>*>& potential_beads,
     const std::vector<GPU_Vector<double>*>& force_beads,
     const std::vector<GPU_Vector<double>*>& virial_beads);
+  void set_pimd_batch_profile(const bool enabled) override;
+  void reset_pimd_batch_timing() override;
+  void print_pimd_batch_timing() const;
   void initialize_dp(const char* filename_dp);
 
 protected:
@@ -138,6 +141,22 @@ protected:
   GPU_Vector<double> dp_force_rowmajor;   // [nloc * 3] row-major model force
   GPU_Vector<double> dp_atom_virial_gpu;  // [nloc * 9] row-major model virial
 
+  struct PIMD_Batch_Stage_Timing
+  {
+    long long calls = 0;
+    double neighbor_global = 0.0;
+    double local_filter = 0.0;
+    double edge_count = 0.0;
+    double canonical_graph = 0.0;
+    double deepmd_inference = 0.0;
+    double scatter = 0.0;
+    double neighbor_pointer_setup = 0.0;
+    double neighbor_distance_check = 0.0;
+    double neighbor_flag_transfer = 0.0;
+    double neighbor_rebuild = 0.0;
+    long long neighbor_rebuild_beads = 0;
+  };
+
   struct PIMD_Batch_Data
   {
     int number_of_atoms = 0;
@@ -170,6 +189,23 @@ protected:
     std::vector<int> edge_counts;
     GPU_Vector<int> edge_bases_device;
     GPU_Vector<int> edge_counts_device;
+    bool neighbor_box_snapshot_valid = false;
+    double neighbor_box_h[9] = {};
+    int neighbor_pbc_x = 0;
+    int neighbor_pbc_y = 0;
+    int neighbor_pbc_z = 0;
+    bool neighbor_rebuild_diagnostic_reported = false;
+    bool ignore_neighbor_image_shift = false;
+    int neighbor_diagnostic_auto_checks = 0;
+    long long neighbor_rebuild_displacement_only = 0;
+    long long neighbor_rebuild_image_shift_only = 0;
+    long long neighbor_rebuild_both = 0;
+    long long neighbor_rebuild_first_call_beads = 0;
+    long long neighbor_rebuild_always_beads = 0;
+    long long neighbor_rebuild_box_change_beads = 0;
+    std::vector<int> neighbor_diagnostic_flags_host;
+    PIMD_Batch_Stage_Timing timing_before_image_shift_ignored;
+    PIMD_Batch_Stage_Timing timing_after_image_shift_ignored;
     GPU_Vector<double> model_type;
     GPU_Vector<double> n_node;
     GPU_Vector<double> n_local;
@@ -184,6 +220,7 @@ protected:
     GPU_Vector<double> atom_virial;
   };
 
+  bool pimd_batch_profile_enabled_ = false;
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
 
   void compute_gpu_edges(

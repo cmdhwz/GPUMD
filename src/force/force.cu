@@ -478,6 +478,11 @@ void Force::set_pimd_nep_batch_profile(const bool enabled)
 {
   pimd_nep_batch_profile_enabled_ = enabled;
   for (auto& potential : potentials) {
+#ifdef USE_DEEPMD
+    if (dynamic_cast<DP*>(potential.get())) {
+      continue;
+    }
+#endif
     potential->set_pimd_batch_profile(enabled);
   }
   for (auto& worker : pimd_bead_gpu_workers_) {
@@ -486,6 +491,18 @@ void Force::set_pimd_nep_batch_profile(const bool enabled)
   if (pimd_nep_single_gpu_batch_potential_) {
     pimd_nep_single_gpu_batch_potential_->set_pimd_batch_profile(enabled);
   }
+}
+
+void Force::set_pimd_dp_batch_profile(const bool enabled)
+{
+  pimd_dp_batch_profile_enabled_ = enabled;
+#ifdef USE_DEEPMD
+  for (auto& potential : potentials) {
+    if (auto* dp = dynamic_cast<DP*>(potential.get())) {
+      dp->set_pimd_batch_profile(enabled);
+    }
+  }
+#endif
 }
 
 void Force::reset_pimd_nep_batch_profile()
@@ -503,13 +520,38 @@ void Force::reset_pimd_nep_batch_profile()
 
 void Force::print_pimd_nep_batch_profile() const
 {
+  if (!pimd_nep_batch_profile_enabled_ && !pimd_dp_batch_profile_enabled_) {
+    return;
+  }
+
+  if (pimd_dp_batch_profile_enabled_) {
+#ifdef USE_DEEPMD
+    if (potentials.size() == 1) {
+      if (auto* dp = dynamic_cast<DP*>(potentials[0].get())) {
+        dp->print_pimd_batch_timing();
+      } else {
+        printf("DP PIMD batch stage timing unavailable: no single DP potential is selected.\n");
+      }
+    } else {
+      printf("DP PIMD batch stage timing unavailable: no single DP potential is selected.\n");
+    }
+#else
+    printf("DP PIMD batch stage timing unavailable: DeePMD support is not enabled.\n");
+#endif
+  }
+
   if (!pimd_nep_batch_profile_enabled_) {
     return;
   }
 
-  auto print_timing = [](const char* label, const PIMD_Batch_Timing& timing) {
+  bool printed_nep_batch_timing = false;
+  auto print_timing = [&](const char* label, const PIMD_Batch_Timing& timing) {
     if (timing.calls == 0) {
       return;
+    }
+    if (!printed_nep_batch_timing) {
+      printf("PIMD NEP/qNEP batch stage timing:\n");
+      printed_nep_batch_timing = true;
     }
     printf("    %s (%lld force calls):\n", label, timing.calls);
     printf("        setup = %g s.\n", timing.setup);
@@ -540,7 +582,6 @@ void Force::print_pimd_nep_batch_profile() const
       timing.pppm_global_virial_batch_calls);
   };
 
-  printf("PIMD NEP/qNEP batch stage timing:\n");
   for (size_t potential_id = 0; potential_id < potentials.size(); ++potential_id) {
     char label[64];
     snprintf(label, sizeof(label), "GPU 0 potential %zu", potential_id);
@@ -985,13 +1026,19 @@ void Force::refresh_pimd_bead_gpu_workers_()
 #else
     const bool use_primary_dp_neighbor_setting = false;
 #endif
+    bool primary_batch_profile = pimd_nep_batch_profile_enabled_;
+#ifdef USE_DEEPMD
+    if (dynamic_cast<DP*>(potentials[0].get())) {
+      primary_batch_profile = pimd_dp_batch_profile_enabled_;
+    }
+#endif
     potentials[0]->set_neighbor_rebuild(
       (use_primary_batch_neighbor_setting || use_primary_dp_neighbor_setting)
         ? pimd_bead_neighbor_always_rebuild_
         : false);
     potentials[0]->set_pppm_mesh_spacing(pppm_mesh_spacing_);
     potentials[0]->set_pimd_batch_bec(pimd_qnep_batch_bec_enabled_());
-    potentials[0]->set_pimd_batch_profile(pimd_nep_batch_profile_enabled_);
+    potentials[0]->set_pimd_batch_profile(primary_batch_profile);
   }
   if (pimd_bead_gpu_parallel_devices_ <= 1 || primary_nep_model_path_.empty() ||
       number_of_atoms_ <= 0) {

@@ -50,6 +50,12 @@ struct Neighbor_Batch_Timing
   int rebuild_beads = 0;
 };
 
+enum Neighbor_Rebuild_Reason
+{
+  NEIGHBOR_REBUILD_REASON_DISPLACEMENT = 1,
+  NEIGHBOR_REBUILD_REASON_IMAGE_SHIFT = 2
+};
+
 // For ILP
 void find_neighbor_ilp(
   const int N1,
@@ -182,7 +188,11 @@ public:
     GPU_Vector<int>& cell_keys_batch,
     int& cell_stride,
     Neighbor_Batch_Timing* timing = nullptr,
-    const int active_number_of_beads = -1);
+    const int active_number_of_beads = -1,
+    const bool force_rebuild_all = false,
+    const bool ignore_image_shift = false,
+    const bool record_rebuild_reasons = false,
+    std::vector<int>* diagnostic_rebuild_flags = nullptr);
   static void check_atom_distance_batch(
     const Box& box,
     const int number_of_atoms,

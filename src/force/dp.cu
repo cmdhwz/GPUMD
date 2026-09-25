@@ -28,6 +28,7 @@ The class dealing with the Deep Potential(DP).
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <sstream>
@@ -84,6 +85,57 @@ void DP::set_neighbor_rebuild(const bool value)
       bead->set_always_rebuild(value);
     }
   }
+}
+
+void DP::set_pimd_batch_profile(const bool enabled)
+{
+  pimd_batch_profile_enabled_ = enabled;
+}
+
+void DP::reset_pimd_batch_timing()
+{
+  if (pimd_batch_data_) {
+    pimd_batch_data_->timing_before_image_shift_ignored = {};
+    pimd_batch_data_->timing_after_image_shift_ignored = {};
+  }
+}
+
+void DP::print_pimd_batch_timing() const
+{
+  printf(
+    "DP PIMD batch stage timing (synchronized wall time; profiling adds GPU synchronization):\n");
+  if (!pimd_batch_data_) {
+    printf("    no batch force calls.\n");
+    return;
+  }
+
+  const auto print_stage = [](const char* name, const double seconds, const long long calls) {
+    const double milliseconds_per_call =
+      calls > 0 ? 1000.0 * seconds / calls : 0.0;
+    printf("        %s = %g s (%g ms/force call).\n", name, seconds, milliseconds_per_call);
+  };
+  const auto print_policy = [&](const char* name, const PIMD_Batch_Stage_Timing& timing) {
+    printf("    %s (%lld force calls):\n", name, timing.calls);
+    print_stage("global neighbor check/rebuild", timing.neighbor_global, timing.calls);
+    print_stage("local filter", timing.local_filter, timing.calls);
+    print_stage("edge count and host return", timing.edge_count, timing.calls);
+    print_stage("canonical graph construction", timing.canonical_graph, timing.calls);
+    print_stage("DeePMD inference", timing.deepmd_inference, timing.calls);
+    print_stage("output scatter", timing.scatter, timing.calls);
+    printf("        global neighbor subtotals (included above):\n");
+    print_stage("pointer setup", timing.neighbor_pointer_setup, timing.calls);
+    print_stage("distance check", timing.neighbor_distance_check, timing.calls);
+    print_stage("flag transfer", timing.neighbor_flag_transfer, timing.calls);
+    print_stage("rebuild/update", timing.neighbor_rebuild, timing.calls);
+    printf("            bead rebuilds = %lld.\n", timing.neighbor_rebuild_beads);
+  };
+
+  print_policy(
+    "before image-shift policy switch",
+    pimd_batch_data_->timing_before_image_shift_ignored);
+  print_policy(
+    "after image-shift policy switch",
+    pimd_batch_data_->timing_after_image_shift_ignored);
 }
 
 bool DP::can_compute_pimd_batch(
@@ -1177,6 +1229,7 @@ bool DP::compute_pimd_batch(
     data->rebuild_flags.resize(number_of_beads);
     data->any_rebuild.resize(1);
     data->active_bead_ids.resize(number_of_beads);
+    data->neighbor_diagnostic_flags_host.resize(number_of_beads);
     data->x0_ptrs_host.resize(number_of_beads);
     data->y0_ptrs_host.resize(number_of_beads);
     data->z0_ptrs_host.resize(number_of_beads);
@@ -1204,6 +1257,20 @@ bool DP::compute_pimd_batch(
     pimd_batch_data_ = std::move(data);
   }
   PIMD_Batch_Data& data = *pimd_batch_data_;
+  const bool profile_timing = pimd_batch_profile_enabled_;
+  const bool image_shift_ignored_this_call = data.ignore_neighbor_image_shift;
+  PIMD_Batch_Stage_Timing& stage_timing = image_shift_ignored_this_call
+    ? data.timing_after_image_shift_ignored
+    : data.timing_before_image_shift_ignored;
+  using Clock = std::chrono::high_resolution_clock;
+  Clock::time_point stage_begin{};
+  const auto finish_stage = [&](double& elapsed) {
+    if (profile_timing) {
+      CHECK(gpuDeviceSynchronize());
+      elapsed += std::chrono::duration<double>(Clock::now() - stage_begin).count();
+      stage_begin = Clock::now();
+    }
+  };
 
   const double neighbor_rc = rc + 1.0;
   int num_bins[3];
@@ -1213,6 +1280,24 @@ bool DP::compute_pimd_batch(
     (box.pbc_z && num_bins[2] < 5);
   const int atom_grid = (number_of_atoms - 1) / BLOCK_SIZE_FORCE + 1;
 
+  const bool first_neighbor_call = !data.neighbor_box_snapshot_valid;
+  bool neighbor_box_changed = first_neighbor_call;
+  for (int component = 0; component < 9 && !neighbor_box_changed; ++component) {
+    neighbor_box_changed = data.neighbor_box_h[component] != box.cpu_h[component];
+  }
+  neighbor_box_changed = neighbor_box_changed ||
+    data.neighbor_pbc_x != box.pbc_x || data.neighbor_pbc_y != box.pbc_y ||
+    data.neighbor_pbc_z != box.pbc_z;
+  const bool record_neighbor_rebuild_reasons =
+    !data.neighbor_rebuild_diagnostic_reported && !neighbor_always_rebuild_ &&
+    !first_neighbor_call && !neighbor_box_changed;
+
+  if (profile_timing) {
+    CHECK(gpuDeviceSynchronize());
+    ++stage_timing.calls;
+    stage_begin = Clock::now();
+  }
+  Neighbor_Batch_Timing neighbor_timing;
   std::vector<double*> position_ptrs_host(number_of_beads);
   for (int bead = 0; bead < number_of_beads; ++bead) {
     position_ptrs_host[bead] = position_beads[bead]->data();
@@ -1246,7 +1331,79 @@ bool DP::compute_pimd_batch(
     data.cell_count_sum_batch,
     data.cell_contents_batch,
     data.cell_keys_batch,
-    data.cell_stride);
+    data.cell_stride,
+    profile_timing ? &neighbor_timing : nullptr,
+    -1,
+    neighbor_box_changed,
+    data.ignore_neighbor_image_shift,
+    record_neighbor_rebuild_reasons,
+    record_neighbor_rebuild_reasons ? &data.neighbor_diagnostic_flags_host : nullptr);
+
+  if (!data.neighbor_rebuild_diagnostic_reported) {
+    if (first_neighbor_call) {
+      data.neighbor_rebuild_first_call_beads += number_of_beads;
+    } else if (neighbor_always_rebuild_) {
+      data.neighbor_rebuild_always_beads += number_of_beads;
+    } else if (neighbor_box_changed) {
+      data.neighbor_rebuild_box_change_beads += number_of_beads;
+    }
+    if (record_neighbor_rebuild_reasons) {
+      ++data.neighbor_diagnostic_auto_checks;
+      for (const int reason : data.neighbor_diagnostic_flags_host) {
+        const bool displacement =
+          (reason & NEIGHBOR_REBUILD_REASON_DISPLACEMENT) != 0;
+        const bool image_shift =
+          (reason & NEIGHBOR_REBUILD_REASON_IMAGE_SHIFT) != 0;
+        if (displacement && image_shift) {
+          ++data.neighbor_rebuild_both;
+        } else if (displacement) {
+          ++data.neighbor_rebuild_displacement_only;
+        } else if (image_shift) {
+          ++data.neighbor_rebuild_image_shift_only;
+        }
+      }
+      if (data.neighbor_diagnostic_auto_checks == 1000) {
+        printf("DP PIMD neighbor rebuild diagnosis after 1000 auto distance checks:\n");
+        printf(
+          "    auto distance checks = %d; bead rebuild causes: displacement-only = %lld, image-shift-only = %lld, both = %lld.\n",
+          data.neighbor_diagnostic_auto_checks,
+          data.neighbor_rebuild_displacement_only,
+          data.neighbor_rebuild_image_shift_only,
+          data.neighbor_rebuild_both);
+        printf(
+          "    forced rebuild beads: first call = %lld, always = %lld, box change = %lld.\n",
+          data.neighbor_rebuild_first_call_beads,
+          data.neighbor_rebuild_always_beads,
+          data.neighbor_rebuild_box_change_beads);
+        const long long other_rebuild_causes =
+          data.neighbor_rebuild_displacement_only + data.neighbor_rebuild_both;
+        if (data.neighbor_rebuild_image_shift_only > other_rebuild_causes) {
+          data.ignore_neighbor_image_shift = true;
+          printf(
+            "    DP auto policy: image-shift-only will not rebuild the global candidate list; MIC displacement threshold remains skin/2.\n");
+        } else {
+          printf(
+            "    DP auto policy: retain image-shift rebuilds; image-shift-only was not the majority cause.\n");
+        }
+        data.neighbor_rebuild_diagnostic_reported = true;
+      }
+    }
+  }
+  for (int component = 0; component < 9; ++component) {
+    data.neighbor_box_h[component] = box.cpu_h[component];
+  }
+  data.neighbor_pbc_x = box.pbc_x;
+  data.neighbor_pbc_y = box.pbc_y;
+  data.neighbor_pbc_z = box.pbc_z;
+  data.neighbor_box_snapshot_valid = true;
+  if (profile_timing) {
+    stage_timing.neighbor_pointer_setup += neighbor_timing.pointer_setup;
+    stage_timing.neighbor_distance_check += neighbor_timing.distance_check;
+    stage_timing.neighbor_flag_transfer += neighbor_timing.flag_transfer;
+    stage_timing.neighbor_rebuild += neighbor_timing.rebuild;
+    stage_timing.neighbor_rebuild_beads += neighbor_timing.rebuild_beads;
+  }
+  finish_stage(stage_timing.neighbor_global);
 
   Neighbor::find_local_neighbor_from_global_batch(
     rc,
@@ -1271,6 +1428,8 @@ bool DP::compute_pimd_batch(
       GPU_CHECK_KERNEL
     }
   }
+  finish_stage(stage_timing.local_filter);
+
   const int total_nodes = number_of_atoms * number_of_beads;
   const auto bead_keys_begin = thrust::make_transform_iterator(
     thrust::make_counting_iterator(0), PIMD_Bead_Key{number_of_atoms});
@@ -1298,6 +1457,7 @@ bool DP::compute_pimd_batch(
   for (int bead = 0; bead < number_of_beads; ++bead) {
     total_edges += data.edge_counts[bead];
   }
+  finish_stage(stage_timing.edge_count);
 
   const int edge_storage = total_edges < 2 ? 2 : total_edges;
   constexpr size_t aot_alignment_ints = 16 / sizeof(int);
@@ -1397,6 +1557,7 @@ bool DP::compute_pimd_batch(
       total_edges, edge_storage, source, edge_vec, source_order);
     GPU_CHECK_KERNEL
   }
+  finish_stage(stage_timing.canonical_graph);
 
   deep_pot.compute_canonical_graph_gpu_batch(
     data.atom_energy.data(), data.force_rowmajor.data(), data.atom_virial.data(),
@@ -1406,6 +1567,7 @@ bool DP::compute_pimd_batch(
     reinterpret_cast<std::int64_t*>(data.n_node.data()),
     reinterpret_cast<std::int64_t*>(data.n_local.data()), number_of_beads,
     total_nodes, static_cast<std::int64_t>(edge_storage));
+  finish_stage(stage_timing.deepmd_inference);
 
   const int output_grid = atom_grid;
   for (int bead = 0; bead < number_of_beads; ++bead) {
@@ -1419,6 +1581,7 @@ bool DP::compute_pimd_batch(
       virial_beads[bead]->data());
     GPU_CHECK_KERNEL
   }
+  finish_stage(stage_timing.scatter);
   return true;
 }
 
