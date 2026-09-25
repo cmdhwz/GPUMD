@@ -958,6 +958,37 @@ __global__ void gpu_update_xyz0_batch_if_rebuild(
   z0_batch[bead][n] = position[n + N * 2];
 }
 
+__device__ int find_local_neighbors_for_atom(
+  const int N,
+  const Box box,
+  const float rc_square,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  const int* __restrict__ g_NN_global,
+  const int* __restrict__ g_NL_global,
+  const int n1,
+  int* g_NL_local)
+{
+  const double x1 = g_x[n1];
+  const double y1 = g_y[n1];
+  const double z1 = g_z[n1];
+  int count_local = 0;
+  for (int i1 = 0; i1 < g_NN_global[n1]; ++i1) {
+    const int n2 = g_NL_global[static_cast<size_t>(N) * i1 + n1];
+    float x12 = g_x[n2] - x1;
+    float y12 = g_y[n2] - y1;
+    float z12 = g_z[n2] - z1;
+    apply_mic(box, x12, y12, z12);
+    const float d12_square = x12 * x12 + y12 * y12 + z12 * z12;
+    if (d12_square >= rc_square) {
+      continue;
+    }
+    g_NL_local[static_cast<size_t>(N) * count_local++ + n1] = n2;
+  }
+  return count_local;
+}
+
 __global__ void gpu_find_local_neighbor_from_global(
   const int N,
   const Box box,
@@ -970,32 +1001,46 @@ __global__ void gpu_find_local_neighbor_from_global(
   int* g_NN_local,
   int* g_NL_local)
 {
-  int n1 = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n1 >= N) {
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n1 < N) {
+    g_NN_local[n1] = find_local_neighbors_for_atom(
+      N, box, rc_square, g_x, g_y, g_z, g_NN_global, g_NL_global, n1, g_NL_local);
+  }
+}
+
+__global__ void gpu_find_local_neighbor_from_global_batch(
+  const int N,
+  const int number_of_beads,
+  const int local_neighbor_capacity,
+  const Box box,
+  const float rc_square,
+  double* const* position_batch,
+  int* const* NN_global_batch,
+  int* const* NL_global_batch,
+  int* NN_local_batch,
+  int* NL_local_batch)
+{
+  const int bead = blockIdx.y;
+  const int n1 = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bead >= number_of_beads || n1 >= N) {
     return;
   }
 
-  double x1 = g_x[n1];
-  double y1 = g_y[n1];
-  double z1 = g_z[n1];
-
-  int count_local = 0;
-
-  for (int i1 = 0; i1 < g_NN_global[n1]; ++i1) {
-    int n2 = g_NL_global[static_cast<size_t>(N) * i1 + n1];
-    float x12 = g_x[n2] - x1;
-    float y12 = g_y[n2] - y1;
-    float z12 = g_z[n2] - z1;
-    apply_mic(box, x12, y12, z12);
-    float d12_square = x12 * x12 + y12 * y12 + z12 * z12;
-
-    if (d12_square >= rc_square) {
-      continue;
-    }
-    g_NL_local[static_cast<size_t>(N) * count_local++ + n1] = n2;
-  }
-
-  g_NN_local[n1] = count_local;
+  const double* position = position_batch[bead];
+  const size_t node_base = static_cast<size_t>(bead) * N;
+  int* NL_local = NL_local_batch +
+                  static_cast<size_t>(bead) * N * local_neighbor_capacity;
+  NN_local_batch[node_base + n1] = find_local_neighbors_for_atom(
+    N,
+    box,
+    rc_square,
+    position,
+    position + N,
+    position + static_cast<size_t>(N) * 2,
+    NN_global_batch[bead],
+    NL_global_batch[bead],
+    n1,
+    NL_local);
 }
 
 }
@@ -1448,6 +1493,33 @@ void Neighbor::find_local_neighbor_from_global(
     NL.data(),
     NN_local.data(),
     NL_local.data());
+  GPU_CHECK_KERNEL
+}
+
+void Neighbor::find_local_neighbor_from_global_batch(
+  const double rc,
+  Box& box,
+  const int number_of_atoms,
+  const int number_of_beads,
+  const GPU_Vector<double*>& position_batch,
+  const GPU_Vector<int*>& NN_global_batch,
+  const GPU_Vector<int*>& NL_global_batch,
+  const int local_neighbor_capacity,
+  GPU_Vector<int>& NN_local_batch,
+  GPU_Vector<int>& NL_local_batch)
+{
+  const dim3 grid((number_of_atoms - 1) / 128 + 1, number_of_beads);
+  gpu_find_local_neighbor_from_global_batch<<<grid, 128>>>(
+    number_of_atoms,
+    number_of_beads,
+    local_neighbor_capacity,
+    box,
+    rc * rc,
+    position_batch.data(),
+    NN_global_batch.data(),
+    NL_global_batch.data(),
+    NN_local_batch.data(),
+    NL_local_batch.data());
   GPU_CHECK_KERNEL
 }
 

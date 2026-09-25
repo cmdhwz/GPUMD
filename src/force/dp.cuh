@@ -138,20 +138,16 @@ protected:
   GPU_Vector<double> dp_force_rowmajor;   // [nloc * 3] row-major model force
   GPU_Vector<double> dp_atom_virial_gpu;  // [nloc * 9] row-major model virial
 
-  struct PIMD_Bead_Data
-  {
-    std::unique_ptr<Neighbor> neighbor;
-    GPU_Vector<int> NN_local;
-    GPU_Vector<int> NL_local;
-    GPU_Vector<int> edge_offset;
-  };
-
   struct PIMD_Batch_Data
   {
     int number_of_atoms = 0;
     int number_of_beads = 0;
-    std::vector<std::unique_ptr<PIMD_Bead_Data>> beads;
+    int local_neighbor_capacity = 0;
+    std::vector<std::unique_ptr<Neighbor>> beads;
     std::vector<Neighbor*> neighbor_ptrs;
+    GPU_Vector<int> NN_local_all;
+    GPU_Vector<int> NL_local_all;
+    GPU_Vector<int> edge_offset_all;
     std::vector<double*> position_ptrs_host;
     GPU_Vector<double*> position_ptrs;
     GPU_Vector<int*> NN_global_ptrs;
@@ -171,8 +167,8 @@ protected:
     std::vector<double*> z0_ptrs_host;
     bool pointer_arrays_initialized = false;
     int cell_stride = 0;
-    std::vector<int> edge_bases;
     std::vector<int> edge_counts;
+    GPU_Vector<int> edge_bases_device;
     GPU_Vector<int> edge_counts_device;
     GPU_Vector<double> model_type;
     GPU_Vector<double> n_node;
@@ -182,7 +178,7 @@ protected:
     GPU_Vector<int> source_count;
     GPU_Vector<int> source_cursor;
     GPU_Vector<int> source_storage;
-    GPU_Vector<double> edge_vec;
+    GPU_Vector<float> edge_vec;
     GPU_Vector<double> atom_energy;
     GPU_Vector<double> force_rowmajor;
     GPU_Vector<double> atom_virial;

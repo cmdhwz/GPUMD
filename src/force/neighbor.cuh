@@ -220,6 +220,17 @@ public:
     const GPU_Vector<double>& position_per_atom,
     GPU_Vector<int>& NN_local,
     GPU_Vector<int>& NL_local);
+  static void find_local_neighbor_from_global_batch(
+    const double rc,
+    Box& box,
+    const int number_of_atoms,
+    const int number_of_beads,
+    const GPU_Vector<double*>& position_batch,
+    const GPU_Vector<int*>& NN_global_batch,
+    const GPU_Vector<int*>& NL_global_batch,
+    const int local_neighbor_capacity,
+    GPU_Vector<int>& NN_local_batch,
+    GPU_Vector<int>& NL_local_batch);
 
 private:
   double skin = 1.0;              // skin distance
