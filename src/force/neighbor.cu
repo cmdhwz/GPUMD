@@ -882,16 +882,13 @@ __global__ void gpu_check_atom_distance_batch(
   double* const* position_batch,
   int* rebuild_flags,
   int* any_rebuild,
-  const bool ignore_image_shift,
-  const bool record_rebuild_reasons)
+  const bool ignore_image_shift)
 {
   const int bead = blockIdx.y;
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ int rebuild_block;
-  __shared__ int rebuild_reasons_block;
   if (threadIdx.x == 0) {
     rebuild_block = 0;
-    rebuild_reasons_block = 0;
   }
   __syncthreads();
 
@@ -916,29 +913,16 @@ __global__ void gpu_check_atom_distance_batch(
     const bool image_shift_changed =
       image_shift_x != 0 || image_shift_y != 0 || image_shift_z != 0;
     const bool displacement_exceeded =
-      (record_rebuild_reasons || ignore_image_shift || !image_shift_changed) &&
+      (ignore_image_shift || !image_shift_changed) &&
       (dx * dx + dy * dy + dz * dz) > d2;
-    if (record_rebuild_reasons) {
-      const int reason =
-        (displacement_exceeded ? NEIGHBOR_REBUILD_REASON_DISPLACEMENT : 0) |
-        (image_shift_changed ? NEIGHBOR_REBUILD_REASON_IMAGE_SHIFT : 0);
-      if (reason != 0) {
-        atomicOr(&rebuild_reasons_block, reason);
-      }
-    }
     if (displacement_exceeded || (image_shift_changed && !ignore_image_shift)) {
       atomicExch(&rebuild_block, 1);
     }
   }
 
   __syncthreads();
-  if (threadIdx.x == 0 && record_rebuild_reasons && rebuild_reasons_block != 0) {
-    atomicOr(&rebuild_flags[bead], rebuild_reasons_block);
-  }
   if (threadIdx.x == 0 && rebuild_block != 0) {
-    if (!record_rebuild_reasons) {
-      atomicExch(&rebuild_flags[bead], 1);
-    }
+    atomicExch(&rebuild_flags[bead], 1);
     if (any_rebuild != nullptr) {
       atomicExch(any_rebuild, 1);
     }
@@ -1154,9 +1138,7 @@ void Neighbor::find_neighbor_global_batch(
   Neighbor_Batch_Timing* timing,
   const int active_number_of_beads,
   const bool force_rebuild_all,
-  const bool ignore_image_shift,
-  const bool record_rebuild_reasons,
-  std::vector<int>* diagnostic_rebuild_flags)
+  const bool ignore_image_shift)
 {
   const int capacity_number_of_beads = static_cast<int>(neighbors.size());
   const int number_of_beads =
@@ -1178,9 +1160,6 @@ void Neighbor::find_neighbor_global_batch(
     y0_ptrs_host.size() != static_cast<size_t>(capacity_number_of_beads) ||
     z0_ptrs_host.size() != static_cast<size_t>(capacity_number_of_beads)) {
     return;
-  }
-  if (diagnostic_rebuild_flags != nullptr) {
-    diagnostic_rebuild_flags->assign(number_of_beads, 0);
   }
   const int MN = neighbors[0]->NL.size() / neighbors[0]->NN.size();
   if (MN <= 0) {
@@ -1254,8 +1233,7 @@ void Neighbor::find_neighbor_global_batch(
       position_ptrs.data(),
       rebuild_flags.data(),
       any_rebuild.data(),
-      ignore_image_shift,
-      record_rebuild_reasons);
+      ignore_image_shift);
     GPU_CHECK_KERNEL
   }
   if (timing && need_distance_check && !any_rebuild_host) {
@@ -1284,9 +1262,6 @@ void Neighbor::find_neighbor_global_batch(
       timing->flag_transfer +=
         std::chrono::duration<double>(Clock::now() - flag_copy_begin).count();
     }
-  }
-  if (diagnostic_rebuild_flags != nullptr) {
-    *diagnostic_rebuild_flags = host_flags;
   }
   const auto rebuild_begin = Clock::now();
   std::vector<int> active_bead_ids_host;
@@ -1471,7 +1446,6 @@ void Neighbor::check_atom_distance_batch(
     position_batch.data(),
     rebuild_flags.data(),
     nullptr,
-    false,
     false);
   GPU_CHECK_KERNEL
 }
