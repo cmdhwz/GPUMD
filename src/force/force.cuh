@@ -175,6 +175,7 @@ public:
   double delta_T;
   GPU_Vector<double> coefficient;
   std::vector<std::unique_ptr<Potential>> potentials;
+  const std::string& primary_nep_model_path() const { return primary_nep_model_path_; }
 
 private:
   int number_of_atoms_ = -1;

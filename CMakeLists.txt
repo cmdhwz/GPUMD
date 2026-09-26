@@ -30,6 +30,57 @@ file(GLOB GPUMD_SOURCES
 add_executable(gpumd ${GPUMD_SOURCES})
 target_include_directories(gpumd PRIVATE src)
 target_link_libraries(gpumd PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft)
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE GPUMD_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT GPUMD_GIT_COMMIT)
+    set(GPUMD_GIT_COMMIT "unknown")
+endif()
+execute_process(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE GPUMD_GIT_COMMIT_FULL
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT GPUMD_GIT_COMMIT_FULL)
+    set(GPUMD_GIT_COMMIT_FULL "unknown")
+endif()
+execute_process(
+    COMMAND git describe --always --tags
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE GPUMD_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT GPUMD_GIT_DESCRIBE)
+    set(GPUMD_GIT_DESCRIBE "unknown")
+endif()
+execute_process(
+    COMMAND git status --porcelain --untracked-files=normal
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE GPUMD_GIT_STATUS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(GPUMD_GIT_STATUS)
+    set(GPUMD_GIT_DIRTY "yes")
+else()
+    set(GPUMD_GIT_DIRTY "no")
+endif()
+target_compile_definitions(gpumd PRIVATE
+    GPUMD_GIT_COMMIT="${GPUMD_GIT_COMMIT}"
+    GPUMD_GIT_COMMIT_FULL="${GPUMD_GIT_COMMIT_FULL}"
+    GPUMD_GIT_DESCRIBE="${GPUMD_GIT_DESCRIBE}"
+    GPUMD_GIT_DIRTY="${GPUMD_GIT_DIRTY}")
+
+option(BUILD_TESTING "Build GPUMD tests" OFF)
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(quantum_heat_moments_cpu_test tests/quantum_heat_moments_cpu_test.cpp)
+    target_include_directories(quantum_heat_moments_cpu_test PRIVATE src)
+    add_test(NAME quantum_heat_moments_cpu_test COMMAND quantum_heat_moments_cpu_test)
+endif()
 
 # --- nep ---
 file(GLOB NEP_SOURCES

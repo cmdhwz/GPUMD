@@ -476,6 +476,9 @@ static __device__ void find_force_radial_small_box_impl(
   double* g_fy,
   double* g_fz,
   double* g_virial,
+  float* g_edge_x,
+  float* g_edge_y,
+  float* g_edge_z,
   const int n1)
 {
   if (n1 < N2) {
@@ -506,6 +509,11 @@ static __device__ void find_force_radial_small_box_impl(
         for (int d = 0; d < 3; ++d) {
           f12[d] += tmp12 * r12[d];
         }
+      }
+      if (g_edge_x != nullptr) {
+        g_edge_x[index] = f12[0];
+        g_edge_y[index] = f12[1];
+        g_edge_z[index] = f12[2];
       }
       double s_sxx = 0.0;
       double s_sxy = 0.0;
@@ -565,7 +573,10 @@ static __global__ void find_force_radial_small_box(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial,
+  float* g_edge_x,
+  float* g_edge_y,
+  float* g_edge_z)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   find_force_radial_small_box_impl(
@@ -585,6 +596,9 @@ static __global__ void find_force_radial_small_box(
     g_fy,
     g_fz,
     g_virial,
+    g_edge_x,
+    g_edge_y,
+    g_edge_z,
     n1);
 }
 
@@ -631,6 +645,9 @@ static __global__ void find_force_radial_small_box_pimd_batch(
     force + N,
     force + N * 2,
     g_virial[bead],
+    nullptr,
+    nullptr,
+    nullptr,
     n1);
 }
 
@@ -652,6 +669,9 @@ static __device__ void find_force_angular_small_box_impl(
   double* g_fy,
   double* g_fz,
   double* g_virial,
+  float* g_edge_x,
+  float* g_edge_y,
+  float* g_edge_z,
   const int n1)
 {
   if (n1 < N2) {
@@ -712,6 +732,11 @@ static __device__ void find_force_angular_small_box_impl(
           sum_fxyz,
           f12);
       }
+      if (g_edge_x != nullptr) {
+        g_edge_x[index] = f12[0];
+        g_edge_y[index] = f12[1];
+        g_edge_z[index] = f12[2];
+      }
       double s_sxx = 0.0;
       double s_sxy = 0.0;
       double s_sxz = 0.0;
@@ -771,7 +796,10 @@ static __global__ void find_force_angular_small_box(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial,
+  float* g_edge_x,
+  float* g_edge_y,
+  float* g_edge_z)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   find_force_angular_small_box_impl(
@@ -792,6 +820,9 @@ static __global__ void find_force_angular_small_box(
     g_fy,
     g_fz,
     g_virial,
+    g_edge_x,
+    g_edge_y,
+    g_edge_z,
     n1);
 }
 
@@ -842,6 +873,9 @@ static __global__ void find_force_angular_small_box_pimd_batch(
     force + N,
     force + N * 2,
     g_virial[bead],
+    nullptr,
+    nullptr,
+    nullptr,
     n1);
 }
 

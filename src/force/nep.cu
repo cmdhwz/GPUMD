@@ -34,7 +34,10 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include <fstream>
 #include <iostream>
 #include <cstddef>
+#include <map>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 const std::string ELEMENTS[NUM_ELEMENTS] = {
@@ -728,7 +731,10 @@ static __global__ void find_force_radial(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial,
+  float* g_edge_x,
+  float* g_edge_y,
+  float* g_edge_z)
 {
   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
@@ -784,6 +790,12 @@ static __global__ void find_force_radial(
           f12[d] += tmp12 * r12[d];
           f21[d] -= tmp21 * r12[d];
         }
+      }
+      if (g_edge_x != nullptr) {
+        const int edge = i1 * N + n1;
+        g_edge_x[edge] = f12[0];
+        g_edge_y[edge] = f12[1];
+        g_edge_z[edge] = f12[2];
       }
       s_fx += f12[0] - f21[0];
       s_fy += f12[1] - f21[1];
@@ -1614,7 +1626,7 @@ void NEP::compute_large_box(
   GPU_CHECK_KERNEL
 
   static int num_calls = 0;
-  if (num_calls++ % 1000 == 0) {
+  if (neighbor_log_enabled_ && num_calls++ % 1000 == 0) {
     nep_data.NN_radial.copy_to_host(nep_data.cpu_NN_radial.data());
     nep_data.NN_angular.copy_to_host(nep_data.cpu_NN_angular.data());
     int radial_actual = 0;
@@ -1673,7 +1685,10 @@ void NEP::compute_large_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(),
+    local_edge_derivatives_enabled_ ? nep_data.edge_radial_x.data() : nullptr,
+    local_edge_derivatives_enabled_ ? nep_data.edge_radial_y.data() : nullptr,
+    local_edge_derivatives_enabled_ ? nep_data.edge_radial_z.data() : nullptr);
   GPU_CHECK_KERNEL
 
   find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
@@ -1771,7 +1786,7 @@ void NEP::compute_small_box(
   GPU_CHECK_KERNEL
 
   static int num_calls = 0;
-  if (num_calls++ % 1000 == 0) {
+  if (neighbor_log_enabled_ && num_calls++ % 1000 == 0) {
     std::vector<int> cpu_NN_radial(type.size());
     std::vector<int> cpu_NN_angular(type.size());
     small_box_data.NN_radial.copy_to_host(cpu_NN_radial.data());
@@ -1833,7 +1848,10 @@ void NEP::compute_small_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(),
+    local_edge_derivatives_enabled_ ? small_box_data.edge_radial_x.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_radial_y.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_radial_z.data() : nullptr);
   GPU_CHECK_KERNEL
 
   find_force_angular_small_box<<<grid_size, BLOCK_SIZE>>>(
@@ -1853,7 +1871,10 @@ void NEP::compute_small_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(),
+    local_edge_derivatives_enabled_ ? small_box_data.edge_angular_x.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_angular_y.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_angular_z.data() : nullptr);
   GPU_CHECK_KERNEL
 
   if (zbl.enabled) {
@@ -1948,18 +1969,25 @@ void NEP::compute(
   GPU_Vector<double>& virial_per_atom)
 {
   const bool is_small_box = get_expanded_box(paramb.rc_radial_max, box, ebox);
+  last_compute_small_box_ = is_small_box;
   if (is_small_box) {
     // update small_box_data
     const int current_num_atoms = type.size();
+    const int size_x12 = current_num_atoms * 2000;
     if (small_box_data.NN_radial.size() != current_num_atoms) {
-        const int big_neighbor_size = 2000;
-        const int size_x12 = current_num_atoms * big_neighbor_size;
-
         small_box_data.NN_radial.resize(current_num_atoms);
         small_box_data.NL_radial.resize(size_x12);
         small_box_data.NN_angular.resize(current_num_atoms);
         small_box_data.NL_angular.resize(size_x12);
         small_box_data.r12.resize(size_x12 * 6);
+    }
+    if (local_edge_derivatives_enabled_ && small_box_data.edge_radial_x.size() != size_x12) {
+      small_box_data.edge_radial_x.resize(size_x12);
+      small_box_data.edge_radial_y.resize(size_x12);
+      small_box_data.edge_radial_z.resize(size_x12);
+      small_box_data.edge_angular_x.resize(size_x12);
+      small_box_data.edge_angular_y.resize(size_x12);
+      small_box_data.edge_angular_z.resize(size_x12);
     }
 
     compute_small_box(
@@ -2668,7 +2696,10 @@ void NEP::compute_large_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(),
+    local_edge_derivatives_enabled_ ? nep_data.edge_radial_x.data() : nullptr,
+    local_edge_derivatives_enabled_ ? nep_data.edge_radial_y.data() : nullptr,
+    local_edge_derivatives_enabled_ ? nep_data.edge_radial_z.data() : nullptr);
   GPU_CHECK_KERNEL
 
   find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
@@ -2830,7 +2861,10 @@ void NEP::compute_small_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(),
+    local_edge_derivatives_enabled_ ? small_box_data.edge_radial_x.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_radial_y.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_radial_z.data() : nullptr);
   GPU_CHECK_KERNEL
 
   find_force_angular_small_box<<<grid_size, BLOCK_SIZE>>>(
@@ -2850,7 +2884,10 @@ void NEP::compute_small_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(),
+    local_edge_derivatives_enabled_ ? small_box_data.edge_angular_x.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_angular_y.data() : nullptr,
+    local_edge_derivatives_enabled_ ? small_box_data.edge_angular_z.data() : nullptr);
   GPU_CHECK_KERNEL
 
   if (zbl.enabled) {
@@ -2885,19 +2922,26 @@ void NEP::compute(
   GPU_Vector<double>& virial_per_atom)
 {
   const bool is_small_box = get_expanded_box(paramb.rc_radial_max, box, ebox);
+  last_compute_small_box_ = is_small_box;
 
   if (is_small_box) {
     // update small_box_data
     const int current_num_atoms = type.size();
+    const int size_x12 = current_num_atoms * 2000;
     if (small_box_data.NN_radial.size() != current_num_atoms) {
-        const int big_neighbor_size = 2000;
-        const int size_x12 = current_num_atoms * big_neighbor_size;
-
         small_box_data.NN_radial.resize(current_num_atoms);
         small_box_data.NL_radial.resize(size_x12);
         small_box_data.NN_angular.resize(current_num_atoms);
         small_box_data.NL_angular.resize(size_x12);
         small_box_data.r12.resize(size_x12 * 6);
+    }
+    if (local_edge_derivatives_enabled_ && small_box_data.edge_radial_x.size() != size_x12) {
+      small_box_data.edge_radial_x.resize(size_x12);
+      small_box_data.edge_radial_y.resize(size_x12);
+      small_box_data.edge_radial_z.resize(size_x12);
+      small_box_data.edge_angular_x.resize(size_x12);
+      small_box_data.edge_angular_y.resize(size_x12);
+      small_box_data.edge_angular_z.resize(size_x12);
     }
 
     compute_small_box(
@@ -2928,3 +2972,139 @@ void NEP::compute(
 const GPU_Vector<int>& NEP::get_NN_radial_ptr() { return nep_data.NN_radial; }
 
 const GPU_Vector<int>& NEP::get_NL_radial_ptr() { return nep_data.NL_radial; }
+
+void NEP::enable_local_edge_derivatives()
+{
+  local_edge_derivatives_enabled_ = true;
+  const size_t N = nep_data.NN_radial.size();
+  const size_t capacity = N * static_cast<size_t>(paramb.MN_radial);
+  nep_data.edge_radial_x.resize(capacity);
+  nep_data.edge_radial_y.resize(capacity);
+  nep_data.edge_radial_z.resize(capacity);
+}
+
+void NEP::copy_local_energy_edges(
+  const Box& box,
+  const std::vector<double>& position,
+  std::vector<NEP_Local_Edge>& edges) const
+{
+  const int N = static_cast<int>(nep_data.NN_radial.size());
+  if (!local_edge_derivatives_enabled_ || position.size() != static_cast<size_t>(N) * 3) {
+    throw std::invalid_argument("NEP local edge derivative buffers are not enabled");
+  }
+  const GPU_Vector<int>& radial_count_gpu =
+    last_compute_small_box_ ? small_box_data.NN_radial : nep_data.NN_radial;
+  const GPU_Vector<int>& radial_list_gpu =
+    last_compute_small_box_ ? small_box_data.NL_radial : nep_data.NL_radial;
+  const GPU_Vector<int>& angular_count_gpu =
+    last_compute_small_box_ ? small_box_data.NN_angular : nep_data.NN_angular;
+  const GPU_Vector<int>& angular_list_gpu =
+    last_compute_small_box_ ? small_box_data.NL_angular : nep_data.NL_angular;
+  const GPU_Vector<float>& radial_x_gpu =
+    last_compute_small_box_ ? small_box_data.edge_radial_x : nep_data.edge_radial_x;
+  const GPU_Vector<float>& radial_y_gpu =
+    last_compute_small_box_ ? small_box_data.edge_radial_y : nep_data.edge_radial_y;
+  const GPU_Vector<float>& radial_z_gpu =
+    last_compute_small_box_ ? small_box_data.edge_radial_z : nep_data.edge_radial_z;
+  const GPU_Vector<float>& angular_x_gpu =
+    last_compute_small_box_ ? small_box_data.edge_angular_x : nep_data.f12x;
+  const GPU_Vector<float>& angular_y_gpu =
+    last_compute_small_box_ ? small_box_data.edge_angular_y : nep_data.f12y;
+  const GPU_Vector<float>& angular_z_gpu =
+    last_compute_small_box_ ? small_box_data.edge_angular_z : nep_data.f12z;
+  std::vector<int> radial_count(N), angular_count(N);
+  radial_count_gpu.copy_to_host(radial_count.data());
+  angular_count_gpu.copy_to_host(angular_count.data());
+  const int max_radial_count = *std::max_element(radial_count.begin(), radial_count.end());
+  const int max_angular_count = *std::max_element(angular_count.begin(), angular_count.end());
+  const size_t radial_size = static_cast<size_t>(N) * max_radial_count;
+  const size_t angular_size = static_cast<size_t>(N) * max_angular_count;
+  std::vector<int> radial_list(radial_size), angular_list(angular_size);
+  std::vector<float> radial_x(radial_size), radial_y(radial_size), radial_z(radial_size);
+  std::vector<float> angular_x(angular_size), angular_y(angular_size), angular_z(angular_size);
+  if (radial_size != 0) {
+    radial_list_gpu.copy_to_host(radial_list.data(), radial_size);
+    radial_x_gpu.copy_to_host(radial_x.data(), radial_size);
+    radial_y_gpu.copy_to_host(radial_y.data(), radial_size);
+    radial_z_gpu.copy_to_host(radial_z.data(), radial_size);
+  }
+  if (angular_size != 0) {
+    angular_list_gpu.copy_to_host(angular_list.data(), angular_size);
+    angular_x_gpu.copy_to_host(angular_x.data(), angular_size);
+    angular_y_gpu.copy_to_host(angular_y.data(), angular_size);
+    angular_z_gpu.copy_to_host(angular_z.data(), angular_size);
+  }
+
+  const size_t small_stride = std::max(radial_size, angular_size);
+  std::vector<float> small_displacement(last_compute_small_box_ ? 6 * small_stride : 0);
+  if (last_compute_small_box_ && small_stride != 0) {
+    const size_t source_stride = small_box_data.r12.size() / 6;
+    for (int component = 0; component < 6; ++component) {
+      const size_t size = component < 3 ? radial_size : angular_size;
+      if (size != 0) {
+        small_box_data.r12.copy_to_host(
+          small_displacement.data() + component * small_stride,
+          size,
+          static_cast<int>(component * source_stride));
+      }
+    }
+  }
+  std::map<std::tuple<int, int, int, int, int>, NEP_Local_Edge> by_image;
+  const auto add_edges = [&](
+    const std::vector<int>& counts,
+    const std::vector<int>& neighbors,
+    const std::vector<float>& derivative_x,
+    const std::vector<float>& derivative_y,
+    const std::vector<float>& derivative_z,
+    const int displacement_component,
+    const bool angular) {
+    for (int i = 0; i < N; ++i) {
+      for (int slot = 0; slot < counts[i]; ++slot) {
+        const size_t index = static_cast<size_t>(slot) * N + i;
+        const int j = neighbors[index];
+        const double raw[3] = {
+          position[j] - position[i],
+          position[j + N] - position[i + N],
+          position[j + 2 * N] - position[i + 2 * N]};
+        double u[3];
+        if (last_compute_small_box_) {
+          u[0] = small_displacement[displacement_component * small_stride + index];
+          u[1] = small_displacement[(displacement_component + 1) * small_stride + index];
+          u[2] = small_displacement[(displacement_component + 2) * small_stride + index];
+        } else {
+          u[0] = raw[0];
+          u[1] = raw[1];
+          u[2] = raw[2];
+          apply_mic(box, u[0], u[1], u[2]);
+        }
+        const double image_fractional[3] = {
+          box.cpu_h[9] * (u[0] - raw[0]) + box.cpu_h[10] * (u[1] - raw[1]) + box.cpu_h[11] * (u[2] - raw[2]),
+          box.cpu_h[12] * (u[0] - raw[0]) + box.cpu_h[13] * (u[1] - raw[1]) + box.cpu_h[14] * (u[2] - raw[2]),
+          box.cpu_h[15] * (u[0] - raw[0]) + box.cpu_h[16] * (u[1] - raw[1]) + box.cpu_h[17] * (u[2] - raw[2])};
+        const int image[3] = {
+          static_cast<int>(std::nearbyint(image_fractional[0])),
+          static_cast<int>(std::nearbyint(image_fractional[1])),
+          static_cast<int>(std::nearbyint(image_fractional[2]))};
+        const auto key = std::make_tuple(i, j, image[0], image[1], image[2]);
+        NEP_Local_Edge& edge = by_image[key];
+        edge.center = i;
+        edge.neighbor = j;
+        for (int d = 0; d < 3; ++d) {
+          edge.image[d] = image[d];
+          edge.displacement[d] = u[d];
+        }
+        edge.derivative[0] += derivative_x[index];
+        edge.derivative[1] += derivative_y[index];
+        edge.derivative[2] += derivative_z[index];
+        if (angular) edge.has_angular = true;
+        else edge.has_radial = true;
+      }
+    }
+  };
+  add_edges(radial_count, radial_list, radial_x, radial_y, radial_z, 0, false);
+  add_edges(angular_count, angular_list, angular_x, angular_y, angular_z,
+    last_compute_small_box_ ? 3 : 0, true);
+  edges.clear();
+  edges.reserve(by_image.size());
+  for (const auto& entry : by_image) edges.push_back(entry.second);
+}

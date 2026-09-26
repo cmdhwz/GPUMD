@@ -20,11 +20,26 @@
 #include "utilities/common.cuh"
 #include "utilities/gpu_vector.cuh"
 #include <memory>
+#include <vector>
+
+struct NEP_Local_Edge
+{
+  int center = -1;
+  int neighbor = -1;
+  int image[3] = {0, 0, 0};
+  double displacement[3] = {0.0, 0.0, 0.0};
+  double derivative[3] = {0.0, 0.0, 0.0};
+  bool has_radial = false;
+  bool has_angular = false;
+};
 
 struct NEP_Data {
   GPU_Vector<float> f12x; // 3-body or manybody partial forces
   GPU_Vector<float> f12y; // 3-body or manybody partial forces
   GPU_Vector<float> f12z; // 3-body or manybody partial forces
+  GPU_Vector<float> edge_radial_x;
+  GPU_Vector<float> edge_radial_y;
+  GPU_Vector<float> edge_radial_z;
   GPU_Vector<float> Fp;
   GPU_Vector<float> sum_fxyz;
   GPU_Vector<float> descriptor_parameters_type_pair;
@@ -104,6 +119,12 @@ public:
         GPU_Vector<int> NN_angular;
         GPU_Vector<int> NL_angular;
         GPU_Vector<float> r12;
+        GPU_Vector<float> edge_radial_x;
+        GPU_Vector<float> edge_radial_y;
+        GPU_Vector<float> edge_radial_z;
+        GPU_Vector<float> edge_angular_x;
+        GPU_Vector<float> edge_angular_y;
+        GPU_Vector<float> edge_angular_z;
     } small_box_data;
 
   NEP(const char* file_potential, const int num_atoms);
@@ -138,6 +159,21 @@ public:
   const GPU_Vector<int>& get_NL_radial_ptr();
 
   virtual void set_neighbor_rebuild(const bool value);
+  void set_neighbor_log_enabled(const bool enabled) { neighbor_log_enabled_ = enabled; }
+  void enable_local_edge_derivatives();
+  void set_local_edge_derivatives_enabled(const bool enabled) { local_edge_derivatives_enabled_ = enabled; }
+  bool supports_local_edge_derivatives() const
+  {
+    return paramb.model_type == 0 && !has_dftd3 && !zbl.enabled;
+  }
+  void copy_local_energy_edges(
+    const Box& box,
+    const std::vector<double>& position,
+    std::vector<NEP_Local_Edge>& edges) const;
+  float get_pair_radial_cutoff(const int type1, const int type2) const
+  {
+    return 0.5f * (paramb.rc_radial[type1] + paramb.rc_radial[type2]);
+  }
   void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }
   bool pimd_batch_profile_enabled() const override { return pimd_batch_profile_enabled_; }
   const PIMD_Batch_Timing& get_pimd_batch_timing() const override { return pimd_batch_timing_; }
@@ -226,6 +262,9 @@ private:
 
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
   bool neighbor_always_rebuild_ = false;
+  bool neighbor_log_enabled_ = true;
+  bool local_edge_derivatives_enabled_ = false;
+  bool last_compute_small_box_ = false;
   bool pimd_batch_profile_enabled_ = false;
   PIMD_Batch_Timing pimd_batch_timing_;
 

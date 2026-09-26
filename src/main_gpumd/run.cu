@@ -55,6 +55,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/dump_cg.cuh"
 #include "measure/extrapolation.cuh"
 #include "measure/hac.cuh"
+#include "measure/quantum_heat_moments.cuh"
 #include "measure/hnemd_kappa.cuh"
 #include "measure/hnemdec_kappa.cuh"
 #include "measure/lsqt.cuh"
@@ -246,14 +247,30 @@ void Run::compute_force()
 void Run::perform_a_run()
 {
   HAC* centroid_force_hac = nullptr;
+  QuantumHeatMoments* quantum_heat_moments = nullptr;
   Centroid_Force_Diagnostic* centroid_force_diagnostic = nullptr;
 #ifdef USE_NETCDF
   Centroid_DeltaF_O* centroid_deltaF_O = nullptr;
 #endif
   for (const auto& action : measure.actions) {
-    if (action->action_name == "compute_hac") {
+    if (action->action_name == "compute_hac" && centroid_force_hac == nullptr) {
       centroid_force_hac = dynamic_cast<HAC*>(action.get());
-      break;
+    } else if (action->action_name == "compute_quantum_heat_moments") {
+      quantum_heat_moments = dynamic_cast<QuantumHeatMoments*>(action.get());
+    }
+  }
+  if (quantum_heat_moments != nullptr) {
+    quantum_heat_moments->set_hac(centroid_force_hac);
+    auto quantum_it = std::find_if(measure.actions.begin(), measure.actions.end(),
+      [quantum_heat_moments](const std::unique_ptr<Action>& action) {
+        return action.get() == quantum_heat_moments;
+      });
+    auto hac_it = std::find_if(measure.actions.begin(), measure.actions.end(),
+      [centroid_force_hac](const std::unique_ptr<Action>& action) {
+        return action.get() == centroid_force_hac;
+      });
+    if (hac_it != measure.actions.end() && quantum_it < hac_it) {
+      std::rotate(quantum_it, quantum_it + 1, hac_it + 1);
     }
   }
   for (const auto& property : measure.properties) {
@@ -683,6 +700,14 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
   } else if (strcmp(param[0], "compute_hac") == 0) {
     std::unique_ptr<Action> action;
     action.reset(new HAC(param, num_param, hac_current_qnep_full_a_));
+    measure.actions.emplace_back(std::move(action));
+  } else if (strcmp(param[0], "compute_quantum_heat_moments") == 0) {
+    for (const auto& action : measure.actions) {
+      if (action->action_name == "compute_quantum_heat_moments")
+        PRINT_INPUT_ERROR("Only one compute_quantum_heat_moments action is allowed.");
+    }
+    std::unique_ptr<Action> action;
+    action.reset(new QuantumHeatMoments(param, num_param));
     measure.actions.emplace_back(std::move(action));
   } else if (strcmp(param[0], "centroid_force_diagnostic") == 0) {
     std::unique_ptr<Property> property;

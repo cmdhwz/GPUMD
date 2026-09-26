@@ -52,6 +52,8 @@ public:
   int Nc;              // number of correlation points
   int output_interval; // only output Nc/output_interval data
 
+  bool get_current_for_step(int step, double current[3]) const;
+
   virtual void pre_run(
     const int number_of_steps,
     const double time_step,

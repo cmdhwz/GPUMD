@@ -34,6 +34,22 @@ Calculate the heat current autocorrelation (HAC) function.
 #include <string>
 #include <vector>
 
+bool HAC::get_current_for_step(const int step, double current[3]) const
+{
+  if (!centroid_force_source_is_immediate() || step <= 0 || step % sample_interval != 0) return false;
+  const int frame = step / sample_interval - 1;
+  const int number_of_frames = static_cast<int>(heat_all.size() / 5);
+  if (frame < 0 || frame >= number_of_frames) return false;
+  double components[5] = {};
+  for (int component = 0; component < 5; ++component) {
+    heat_all.copy_to_host(&components[component], 1, frame + number_of_frames * component);
+  }
+  current[0] = components[0] + components[1];
+  current[1] = components[2] + components[3];
+  current[2] = components[4];
+  return std::isfinite(current[0]) && std::isfinite(current[1]) && std::isfinite(current[2]);
+}
+
 #define NUM_OF_HEAT_COMPONENTS 5
 #define NUM_OF_TYPE_HEAT_COMPONENTS 3
 #define FILE_NAME_LENGTH 200

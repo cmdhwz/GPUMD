@@ -1,0 +1,6 @@
+potential ../../../potentials/nep/Si_2022_NEP4_5body.txt
+velocity 300
+time_step 1.0
+ensemble rpmd 4 300
+compute_quantum_heat_moments sample_interval 1 validate_edge_derivatives yes validate_fd_smoothness yes validate_link_images yes
+run 1
