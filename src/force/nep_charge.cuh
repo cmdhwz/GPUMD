@@ -184,7 +184,7 @@ public:
   void consume_single_frame_neighbor_reference_invalidation()
   {
     if (single_frame_neighbor_invalidation_pending_) {
-      neighbor.invalidate_reference_positions();
+      neighbor_manager.invalidate_reference_positions();
       single_frame_neighbor_invalidation_pending_ = false;
     }
   }

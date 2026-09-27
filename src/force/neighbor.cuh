@@ -282,6 +282,7 @@ public:
   const GPU_Vector<int>& get_candidate_NL() const;
   void set_candidate_capacity(const int capacity);
   void set_always_rebuild(const bool value) { neighbor.set_always_rebuild(value); }
+  void invalidate_reference_positions() { neighbor.invalidate_reference_positions(); }
   void find_local_neighbor(
     const double rc,
     Box& box,

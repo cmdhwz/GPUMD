@@ -4592,7 +4592,7 @@ void NEP_Charge::enable_delta_j_q_k_diagnostics()
 
 void NEP_Charge::reset_dynamic_charge_cache()
 {
-  neighbor.invalidate_reference_positions();
+  neighbor_manager.invalidate_reference_positions();
   single_frame_neighbor_invalidation_pending_ = false;
   pppm.reset_dynamic_charge_cache();
   dynamic_q_cache_set_ = false;

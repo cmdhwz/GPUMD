@@ -1661,8 +1661,6 @@ void Force::notify_velocity_update()
   }
 }
 
-}
-
 static __global__ void gpu_apply_pbc(
   int N, Box box, double* g_x, double* g_y, double* g_z, int* g_position_image)
 {
