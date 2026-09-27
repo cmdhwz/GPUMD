@@ -1915,7 +1915,7 @@ void QuantumHeatMoments::end_of_step(
       for (int d = 0; d < 3 * N; ++d) {
         const Complex p(mass_by_dof_[d] * bead_velocity_host_[bead][d], 0.0);
         bead_momentum[bead][d] = p;
-        centroid_momentum[d] += p / P;
+        centroid_momentum[d] += p / static_cast<double>(P);
       }
     }
   }
@@ -2227,14 +2227,14 @@ void QuantumHeatMoments::end_of_step(
           }
           for (int order = 0; order <= weyl_max_order_ / 2; ++order) {
             const Complex value = quantum_heat_moments::evaluate_Ar(
-              order, path.wrapped[bead], momentum, mass_by_dof_, settings, moyal, *this).value / P;
+              order, path.wrapped[bead], momentum, mass_by_dof_, settings, moyal, *this).value / static_cast<double>(P);
             if (a0_only) {
               a0_by_probe[probe] += value;
             } else {
               candidate_by_order[order] += value;
               candidate_by_order_h2[order] += order == 0 ? value :
                 quantum_heat_moments::evaluate_Ar(
-                  order, path.wrapped[bead], momentum, mass_by_dof_, settings_h2, moyal, *this).value / P;
+                  order, path.wrapped[bead], momentum, mass_by_dof_, settings_h2, moyal, *this).value / static_cast<double>(P);
             }
           }
         }
@@ -2320,7 +2320,7 @@ void QuantumHeatMoments::end_of_step(
                 const Complex right = order == 0 ? gamma0_richardson[alpha][other] :
                   order == 1 ? Complex(gamma_richardson[alpha][other], 0.0) :
                     gamma2_richardson[alpha][other];
-                correlation += left * right / P;
+                correlation += left * right / static_cast<double>(P);
               }
               if (!imaginary_stats_[order][alpha][lag].add_if_finite(correlation))
                 std::fprintf(stderr,
