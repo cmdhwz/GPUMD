@@ -53,12 +53,13 @@ void Dump_Position::parse(const char** param, int num_param, const std::vector<G
   }
 
   printf("    every %d steps.\n", dump_interval_);
+  const std::vector<std::string> tokens(param, param + num_param);
 
   for (int k = 2; k < num_param; k++) {
     if (strcmp(param[k], "group") == 0) {
-      parse_group(param, num_param, false, groups, k, grouping_method_, group_id_);
+      parse_group(tokens, false, groups, k, grouping_method_, group_id_);
     } else if (strcmp(param[k], "precision") == 0) {
-      parse_precision(param, num_param, k, precision_);
+      parse_precision(tokens, k, precision_);
     } else {
       PRINT_INPUT_ERROR("Unrecognized argument in dump_position.\n");
     }

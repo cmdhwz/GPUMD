@@ -49,10 +49,11 @@ void Dump_Force::parse(const char** param, int num_param, const std::vector<Grou
   }
 
   printf("    every %d steps.\n", dump_interval_);
+  const std::vector<std::string> tokens(param, param + num_param);
 
   for (int k = 2; k < num_param; k++) {
     if (strcmp(param[k], "group") == 0) {
-      parse_group(param, num_param, false, groups, k, grouping_method_, group_id_);
+      parse_group(tokens, false, groups, k, grouping_method_, group_id_);
     } else {
       PRINT_INPUT_ERROR("Unrecognized argument in dump_force.\n");
     }
