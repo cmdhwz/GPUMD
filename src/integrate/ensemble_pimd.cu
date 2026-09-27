@@ -473,6 +473,7 @@ void Ensemble_PIMD::initialize(Atom& atom)
 }
 
 void Ensemble_PIMD::get_ring_polymer_energy(
+  const GPU_Vector<double>& mass,
   double& kinetic,
   double& spring,
   double& nonham_work)
@@ -485,7 +486,7 @@ void Ensemble_PIMD::get_ring_polymer_energy(
     number_of_atoms,
     number_of_beads,
     omega_n,
-    atom->mass.data(),
+    mass.data(),
     position_beads.data(),
     velocity_beads.data(),
     g_nonham_work,
@@ -916,7 +917,7 @@ static __global__ void gpu_apply_pbc(
   }
 }
 
-static __global__ void constexpr int PIMD_ATOM_TILE = 8;
+constexpr int PIMD_ATOM_TILE = 8;
 
 static __global__ void gpu_average(
   const int number_of_atoms,

@@ -157,7 +157,7 @@ void Dump_Thermo::end_of_step(
   double h_conserved = 0.0;
   double d_h_conserved = 0.0;
   if (rp_energy_) {
-    rp_ensemble_->get_ring_polymer_energy(ke_rp, e_spring, w_nonham);
+    rp_ensemble_->get_ring_polymer_energy(atom.mass, ke_rp, e_spring, w_nonham);
     pe_rp = thermo[1];
     h_rp = ke_rp + pe_rp + e_spring;
     h_conserved = h_rp - w_nonham;

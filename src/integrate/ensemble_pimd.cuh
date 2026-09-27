@@ -83,7 +83,8 @@ public:
   void set_restart_temperature(const double value);
   bool uses_scr_barostat() const { return use_scr_barostat; }
   bool uses_eco_pimd() const { return use_eco_pimd; }
-  void get_ring_polymer_energy(double& kinetic, double& spring, double& nonham_work);
+  void get_ring_polymer_energy(
+    const GPU_Vector<double>& mass, double& kinetic, double& spring, double& nonham_work);
   void reset_nonham_work();
 
 protected:
