@@ -396,6 +396,7 @@ void NEP::initialize_pimd_batch_(
     batch.y0_ptrs.resize(number_of_beads);
     batch.z0_ptrs.resize(number_of_beads);
     batch.rebuild_flags.resize(number_of_beads);
+    batch.rebuild_reason_flags.resize(number_of_beads);
     batch.any_rebuild.resize(1);
     batch.active_bead_ids.resize(number_of_beads);
     batch.x0_ptrs_host.resize(number_of_beads);
@@ -2037,6 +2038,11 @@ bool NEP::compute_pimd_batch(
       std::chrono::high_resolution_clock::now() - setup_begin).count();
   }
   auto& batch = *pimd_batch_data_;
+  const bool box_mode_switched =
+    batch.box_mode_initialized && (batch.last_box_was_small != is_small_box);
+  if (profile && box_mode_switched) {
+    ++pimd_batch_timing_.neighbor_box_mode_switches;
+  }
 
   if (is_small_box) {
     // The cached list includes the skin, so explicit images must cover it too.
@@ -2044,11 +2050,32 @@ bool NEP::compute_pimd_batch(
     get_expanded_box(paramb.rc_radial_max + 1.0, box, ebox);
     const int small_box_neighbor_size = 2000;
     std::vector<int> initial_flags(number_of_beads, 0);
-    bool box_changed = !batch.small_box_initialized;
-    for (int component = 0; component < 9 && !box_changed; ++component) {
-      if (batch.small_box_h[component] != box.cpu_h[component]) {
-        box_changed = true;
+    std::vector<int> host_reason_flags;
+    const bool first_small_box_build = !batch.small_box_initialized;
+    bool box_or_pbc_changed = false;
+    if (batch.small_box_initialized) {
+      for (int component = 0; component < 9 && !box_or_pbc_changed; ++component) {
+        if (batch.small_box_h[component] != box.cpu_h[component]) {
+          box_or_pbc_changed = true;
+        }
       }
+      box_or_pbc_changed =
+        box_or_pbc_changed || batch.small_box_pbc[0] != box.pbc_x ||
+        batch.small_box_pbc[1] != box.pbc_y || batch.small_box_pbc[2] != box.pbc_z;
+    }
+    const bool box_changed = first_small_box_build || box_or_pbc_changed;
+    if (profile) {
+      host_reason_flags.resize(number_of_beads, 0);
+      batch.rebuild_reason_flags.fill(0);
+      const int host_reason =
+        box_or_pbc_changed
+          ? NEIGHBOR_BATCH_REBUILD_BOX_OR_PBC
+          : (first_small_box_build
+               ? (batch.box_mode_initialized
+                    ? NEIGHBOR_BATCH_REBUILD_FORCED
+                    : NEIGHBOR_BATCH_REBUILD_FIRST_BUILD)
+               : (neighbor_always_rebuild_ ? NEIGHBOR_BATCH_REBUILD_FORCED : 0));
+      std::fill(host_reason_flags.begin(), host_reason_flags.end(), host_reason);
     }
     if (box_changed || neighbor_always_rebuild_) {
       std::fill(initial_flags.begin(), initial_flags.end(), 1);
@@ -2063,7 +2090,9 @@ bool NEP::compute_pimd_batch(
         batch.small_box_y0_ptrs,
         batch.small_box_z0_ptrs,
         batch.position_ptrs,
-        batch.small_box_rebuild_flags);
+        batch.small_box_rebuild_flags,
+        -1,
+        profile ? &batch.rebuild_reason_flags : nullptr);
     }
 
     const int block_size = 64;
@@ -2252,6 +2281,28 @@ bool NEP::compute_pimd_batch(
     for (int component = 0; component < 9; ++component) {
       batch.small_box_h[component] = box.cpu_h[component];
     }
+    batch.small_box_pbc[0] = box.pbc_x;
+    batch.small_box_pbc[1] = box.pbc_y;
+    batch.small_box_pbc[2] = box.pbc_z;
+    batch.box_mode_initialized = true;
+    batch.last_box_was_small = true;
+    if (profile) {
+      std::vector<int> device_reason_flags(number_of_beads, 0);
+      batch.rebuild_reason_flags.copy_to_host(device_reason_flags.data());
+      for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+        host_reason_flags[bead_id] |= device_reason_flags[bead_id];
+      }
+      Neighbor_Batch_Timing reason_timing;
+      Neighbor::accumulate_batch_rebuild_reasons(
+        reason_timing, host_reason_flags, number_of_beads);
+      Neighbor::accumulate_batch_rebuild_diagnostics(pimd_batch_timing_, reason_timing);
+      std::vector<int> device_rebuild_flags(number_of_beads, 0);
+      batch.small_box_rebuild_flags.copy_to_host(device_rebuild_flags.data());
+      for (const int rebuild : device_rebuild_flags) {
+        pimd_batch_timing_.neighbor_rebuild_beads += rebuild != 0;
+        pimd_batch_timing_.neighbor_small_box_rebuild_beads += rebuild != 0;
+      }
+    }
     if (profile) {
       CHECK(gpuDeviceSynchronize());
       pimd_batch_timing_.total += std::chrono::duration<double>(
@@ -2263,6 +2314,19 @@ bool NEP::compute_pimd_batch(
 
   const auto neighbor_begin = std::chrono::high_resolution_clock::now();
   batch.small_box_initialized = false;
+  bool box_or_pbc_changed = false;
+  if (batch.large_box_initialized) {
+    for (int component = 0; component < 9 && !box_or_pbc_changed; ++component) {
+      if (batch.large_box_h[component] != box.cpu_h[component]) {
+        box_or_pbc_changed = true;
+      }
+    }
+    box_or_pbc_changed =
+      box_or_pbc_changed || batch.large_box_pbc[0] != box.pbc_x ||
+      batch.large_box_pbc[1] != box.pbc_y || batch.large_box_pbc[2] != box.pbc_z;
+  }
+  const bool force_rebuild_all =
+    !batch.large_box_initialized || box_or_pbc_changed || box_mode_switched;
   Neighbor_Batch_Timing neighbor_timing;
   Neighbor::find_neighbor_global_batch(
     rc,
@@ -2290,7 +2354,12 @@ bool NEP::compute_pimd_batch(
     batch.cell_contents_batch,
     batch.cell_keys_batch,
     batch.cell_stride,
-    profile ? &neighbor_timing : nullptr);
+    profile ? &neighbor_timing : nullptr,
+    number_of_beads,
+    force_rebuild_all,
+    true,
+    profile ? &batch.rebuild_reason_flags : nullptr,
+    box_or_pbc_changed);
   if (profile) {
     CHECK(gpuDeviceSynchronize());
     const double neighbor_time = std::chrono::duration<double>(
@@ -2301,8 +2370,17 @@ bool NEP::compute_pimd_batch(
     pimd_batch_timing_.neighbor_check += neighbor_timing.distance_check;
     pimd_batch_timing_.neighbor_flags += neighbor_timing.flag_transfer;
     pimd_batch_timing_.neighbor_rebuild += neighbor_timing.rebuild;
-    pimd_batch_timing_.neighbor_rebuild_beads += neighbor_timing.rebuild_beads;
+    Neighbor::accumulate_batch_rebuild_diagnostics(pimd_batch_timing_, neighbor_timing);
   }
+  batch.large_box_initialized = true;
+  for (int component = 0; component < 9; ++component) {
+    batch.large_box_h[component] = box.cpu_h[component];
+  }
+  batch.large_box_pbc[0] = box.pbc_x;
+  batch.large_box_pbc[1] = box.pbc_y;
+  batch.large_box_pbc[2] = box.pbc_z;
+  batch.box_mode_initialized = true;
+  batch.last_box_was_small = false;
 
   const int block_size = 64;
   const int grid_size = (N2 - N1 - 1) / block_size + 1;

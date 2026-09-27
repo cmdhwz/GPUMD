@@ -48,6 +48,25 @@ struct Neighbor_Batch_Timing
   double flag_transfer = 0.0;
   double rebuild = 0.0;
   int rebuild_beads = 0;
+  long long displacement_only_beads = 0;
+  long long image_shift_only_beads = 0;
+  long long image_shift_only_skipped_beads = 0;
+  long long displacement_and_image_shift_beads = 0;
+  long long box_or_pbc_change_beads = 0;
+  long long forced_rebuild_beads = 0;
+  long long no_rebuild_beads = 0;
+  long long first_build_beads = 0;
+};
+
+struct PIMD_Batch_Timing;
+
+enum Neighbor_Batch_Rebuild_Reason
+{
+  NEIGHBOR_BATCH_REBUILD_DISPLACEMENT = 1 << 0,
+  NEIGHBOR_BATCH_REBUILD_IMAGE_SHIFT = 1 << 1,
+  NEIGHBOR_BATCH_REBUILD_BOX_OR_PBC = 1 << 2,
+  NEIGHBOR_BATCH_REBUILD_FORCED = 1 << 3,
+  NEIGHBOR_BATCH_REBUILD_FIRST_BUILD = 1 << 4
 };
 
 // For ILP
@@ -200,7 +219,17 @@ public:
     Neighbor_Batch_Timing* timing = nullptr,
     const int active_number_of_beads = -1,
     const bool force_rebuild_all = false,
+    const bool ignore_image_shift = false,
+    GPU_Vector<int>* rebuild_reason_flags = nullptr,
+    const bool box_or_pbc_changed = false);
+  static void accumulate_batch_rebuild_reasons(
+    Neighbor_Batch_Timing& timing,
+    const std::vector<int>& reason_flags,
+    const int active_number_of_beads,
     const bool ignore_image_shift = false);
+  static void accumulate_batch_rebuild_diagnostics(
+    PIMD_Batch_Timing& total,
+    const Neighbor_Batch_Timing& timing);
   static void check_atom_distance_batch(
     const Box& box,
     const int number_of_atoms,
@@ -210,7 +239,8 @@ public:
     const GPU_Vector<double*>& z0_batch,
     const GPU_Vector<double*>& position_batch,
     GPU_Vector<int>& rebuild_flags,
-    const int active_number_of_beads = -1);
+    const int active_number_of_beads = -1,
+    GPU_Vector<int>* rebuild_reason_flags = nullptr);
   static void update_reference_positions_batch(
     const int number_of_atoms,
     const GPU_Vector<double*>& position_batch,

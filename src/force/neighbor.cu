@@ -18,6 +18,7 @@ neighbor list.
 ------------------------------------------------------------------------------*/
 
 #include "neighbor.cuh"
+#include "potential.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <thrust/execution_policy.h>
@@ -891,13 +892,16 @@ __global__ void gpu_check_atom_distance_batch(
   double* const* position_batch,
   int* rebuild_flags,
   int* any_rebuild,
-  const bool ignore_image_shift)
+  const bool ignore_image_shift,
+  int* rebuild_reason_flags)
 {
   const int bead = blockIdx.y;
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ int rebuild_block;
+  __shared__ int rebuild_reason_block;
   if (threadIdx.x == 0) {
     rebuild_block = 0;
+    rebuild_reason_block = 0;
   }
   __syncthreads();
 
@@ -921,15 +925,27 @@ __global__ void gpu_check_atom_distance_batch(
     apply_mic(box, dx, dy, dz);
     const bool image_shift_changed =
       image_shift_x != 0 || image_shift_y != 0 || image_shift_z != 0;
-    const bool displacement_exceeded =
-      (ignore_image_shift || !image_shift_changed) &&
-      (dx * dx + dy * dy + dz * dz) > d2;
+    bool displacement_exceeded = false;
+    if (rebuild_reason_flags != nullptr || ignore_image_shift || !image_shift_changed) {
+      displacement_exceeded = (dx * dx + dy * dy + dz * dz) > d2;
+    }
+    if (rebuild_reason_flags != nullptr) {
+      const int reason =
+        (displacement_exceeded ? NEIGHBOR_BATCH_REBUILD_DISPLACEMENT : 0) |
+        (image_shift_changed ? NEIGHBOR_BATCH_REBUILD_IMAGE_SHIFT : 0);
+      if (reason != 0) {
+        atomicOr(&rebuild_reason_block, reason);
+      }
+    }
     if (displacement_exceeded || (image_shift_changed && !ignore_image_shift)) {
       atomicExch(&rebuild_block, 1);
     }
   }
 
   __syncthreads();
+  if (threadIdx.x == 0 && rebuild_reason_block != 0 && rebuild_reason_flags != nullptr) {
+    atomicOr(&rebuild_reason_flags[bead], rebuild_reason_block);
+  }
   if (threadIdx.x == 0 && rebuild_block != 0) {
     atomicExch(&rebuild_flags[bead], 1);
     if (any_rebuild != nullptr) {
@@ -1147,7 +1163,9 @@ void Neighbor::find_neighbor_global_batch(
   Neighbor_Batch_Timing* timing,
   const int active_number_of_beads,
   const bool force_rebuild_all,
-  const bool ignore_image_shift)
+  const bool ignore_image_shift,
+  GPU_Vector<int>* rebuild_reason_flags,
+  const bool box_or_pbc_changed)
 {
   const int capacity_number_of_beads = static_cast<int>(neighbors.size());
   const int number_of_beads =
@@ -1163,6 +1181,8 @@ void Neighbor::find_neighbor_global_batch(
     y0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
     z0_batch.size() != static_cast<size_t>(capacity_number_of_beads) ||
     rebuild_flags.size() != static_cast<size_t>(capacity_number_of_beads) ||
+    (rebuild_reason_flags != nullptr &&
+     rebuild_reason_flags->size() != static_cast<size_t>(capacity_number_of_beads)) ||
     any_rebuild.size() != 1 ||
     active_bead_ids.size() != static_cast<size_t>(capacity_number_of_beads) ||
     x0_ptrs_host.size() != static_cast<size_t>(capacity_number_of_beads) ||
@@ -1178,6 +1198,11 @@ void Neighbor::find_neighbor_global_batch(
   using Clock = std::chrono::high_resolution_clock;
   const auto pointer_begin = Clock::now();
   std::vector<int> initial_flags(capacity_number_of_beads, 0);
+  const bool collect_rebuild_reasons = timing != nullptr && rebuild_reason_flags != nullptr;
+  std::vector<int> host_reason_flags;
+  if (collect_rebuild_reasons) {
+    host_reason_flags.resize(number_of_beads, 0);
+  }
   bool need_distance_check = false;
   for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
     Neighbor* neighbor = neighbors[bead_id];
@@ -1185,11 +1210,20 @@ void Neighbor::find_neighbor_global_batch(
     x0_ptrs_host[bead_id] = neighbor->reference_x_data();
     y0_ptrs_host[bead_id] = neighbor->reference_y_data();
     z0_ptrs_host[bead_id] = neighbor->reference_z_data();
-    if (first || neighbor->always_rebuild || force_rebuild_all) {
+    if (box_or_pbc_changed || first || neighbor->always_rebuild || force_rebuild_all) {
       initial_flags[bead_id] = 1;
+      if (collect_rebuild_reasons) {
+        host_reason_flags[bead_id] = box_or_pbc_changed
+                                       ? NEIGHBOR_BATCH_REBUILD_BOX_OR_PBC
+                                       : (first ? NEIGHBOR_BATCH_REBUILD_FIRST_BUILD
+                                                : NEIGHBOR_BATCH_REBUILD_FORCED);
+      }
     } else {
       need_distance_check = true;
     }
+  }
+  if (rebuild_reason_flags != nullptr) {
+    rebuild_reason_flags->fill(0);
   }
   if (!pointer_arrays_initialized) {
     x0_batch.copy_from_host(x0_ptrs_host.data());
@@ -1213,6 +1247,9 @@ void Neighbor::find_neighbor_global_batch(
   if (any_rebuild_host && need_distance_check) {
     for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
       initial_flags[bead_id] = 1;
+      if (collect_rebuild_reasons && host_reason_flags[bead_id] == 0) {
+        host_reason_flags[bead_id] = NEIGHBOR_BATCH_REBUILD_FORCED;
+      }
     }
     need_distance_check = false;
   }
@@ -1242,7 +1279,8 @@ void Neighbor::find_neighbor_global_batch(
       position_ptrs.data(),
       rebuild_flags.data(),
       any_rebuild.data(),
-      ignore_image_shift);
+      ignore_image_shift,
+      rebuild_reason_flags == nullptr ? nullptr : rebuild_reason_flags->data());
     GPU_CHECK_KERNEL
   }
   if (timing && need_distance_check && !any_rebuild_host) {
@@ -1259,6 +1297,15 @@ void Neighbor::find_neighbor_global_batch(
     }
   }
   if (any_rebuild_value == 0) {
+    if (collect_rebuild_reasons) {
+      std::vector<int> device_reason_flags(capacity_number_of_beads, 0);
+      rebuild_reason_flags->copy_to_host(device_reason_flags.data());
+      for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+        host_reason_flags[bead_id] |= device_reason_flags[bead_id];
+      }
+      Neighbor::accumulate_batch_rebuild_reasons(
+        *timing, host_reason_flags, number_of_beads, ignore_image_shift);
+    }
     return;
   }
 
@@ -1420,6 +1467,67 @@ void Neighbor::find_neighbor_global_batch(
     timing->rebuild_beads += active_count;
     timing->rebuild += std::chrono::duration<double>(Clock::now() - rebuild_begin).count();
   }
+  if (collect_rebuild_reasons) {
+    std::vector<int> device_reason_flags(capacity_number_of_beads, 0);
+    rebuild_reason_flags->copy_to_host(device_reason_flags.data());
+    for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+      host_reason_flags[bead_id] |= device_reason_flags[bead_id];
+    }
+    Neighbor::accumulate_batch_rebuild_reasons(
+      *timing, host_reason_flags, number_of_beads, ignore_image_shift);
+  }
+}
+
+void Neighbor::accumulate_batch_rebuild_reasons(
+  Neighbor_Batch_Timing& timing,
+  const std::vector<int>& reason_flags,
+  const int active_number_of_beads,
+  const bool ignore_image_shift)
+{
+  const int reason_capacity = static_cast<int>(reason_flags.size());
+  const int number_of_beads =
+    active_number_of_beads < reason_capacity ? active_number_of_beads : reason_capacity;
+  for (int bead_id = 0; bead_id < number_of_beads; ++bead_id) {
+    const int reason = reason_flags[bead_id];
+    if (reason & NEIGHBOR_BATCH_REBUILD_FIRST_BUILD) {
+      ++timing.first_build_beads;
+    } else if (reason & NEIGHBOR_BATCH_REBUILD_BOX_OR_PBC) {
+      ++timing.box_or_pbc_change_beads;
+    } else if (reason & NEIGHBOR_BATCH_REBUILD_FORCED) {
+      ++timing.forced_rebuild_beads;
+    } else {
+      const bool displacement = reason & NEIGHBOR_BATCH_REBUILD_DISPLACEMENT;
+      const bool image_shift = reason & NEIGHBOR_BATCH_REBUILD_IMAGE_SHIFT;
+      if (displacement && image_shift) {
+        ++timing.displacement_and_image_shift_beads;
+      } else if (displacement) {
+        ++timing.displacement_only_beads;
+      } else if (image_shift) {
+        ++timing.image_shift_only_beads;
+        if (ignore_image_shift) {
+          ++timing.image_shift_only_skipped_beads;
+        }
+      } else {
+        ++timing.no_rebuild_beads;
+      }
+    }
+  }
+}
+
+void Neighbor::accumulate_batch_rebuild_diagnostics(
+  PIMD_Batch_Timing& total,
+  const Neighbor_Batch_Timing& timing)
+{
+  total.neighbor_rebuild_beads += timing.rebuild_beads;
+  total.neighbor_displacement_only_beads += timing.displacement_only_beads;
+  total.neighbor_image_shift_only_beads += timing.image_shift_only_beads;
+  total.neighbor_image_shift_only_skipped_beads += timing.image_shift_only_skipped_beads;
+  total.neighbor_displacement_and_image_shift_beads +=
+    timing.displacement_and_image_shift_beads;
+  total.neighbor_box_or_pbc_change_beads += timing.box_or_pbc_change_beads;
+  total.neighbor_forced_rebuild_beads += timing.forced_rebuild_beads;
+  total.neighbor_no_rebuild_beads += timing.no_rebuild_beads;
+  total.neighbor_first_build_beads += timing.first_build_beads;
 }
 
 void Neighbor::check_atom_distance_batch(
@@ -1431,7 +1539,8 @@ void Neighbor::check_atom_distance_batch(
   const GPU_Vector<double*>& z0_batch,
   const GPU_Vector<double*>& position_batch,
   GPU_Vector<int>& rebuild_flags,
-  const int active_number_of_beads)
+  const int active_number_of_beads,
+  GPU_Vector<int>* rebuild_reason_flags)
 {
   const int capacity_number_of_beads = static_cast<int>(position_batch.size());
   const int number_of_beads =
@@ -1444,6 +1553,14 @@ void Neighbor::check_atom_distance_batch(
     rebuild_flags.size() != static_cast<size_t>(capacity_number_of_beads)) {
     return;
   }
+  if (
+    rebuild_reason_flags != nullptr &&
+    rebuild_reason_flags->size() != static_cast<size_t>(capacity_number_of_beads)) {
+    return;
+  }
+  if (rebuild_reason_flags != nullptr) {
+    rebuild_reason_flags->fill(0);
+  }
   gpu_check_atom_distance_batch<<<
     dim3((number_of_atoms - 1) / 128 + 1, number_of_beads), 128>>>(
     box,
@@ -1455,7 +1572,8 @@ void Neighbor::check_atom_distance_batch(
     position_batch.data(),
     rebuild_flags.data(),
     nullptr,
-    false);
+    false,
+    rebuild_reason_flags == nullptr ? nullptr : rebuild_reason_flags->data());
   GPU_CHECK_KERNEL
 }
 

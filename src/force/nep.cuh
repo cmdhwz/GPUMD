@@ -216,6 +216,7 @@ private:
     GPU_Vector<double*> y0_ptrs;
     GPU_Vector<double*> z0_ptrs;
     GPU_Vector<int> rebuild_flags;
+    GPU_Vector<int> rebuild_reason_flags;
     GPU_Vector<int> any_rebuild;
     GPU_Vector<int> active_bead_ids;
     GPU_Vector<int> cell_count_batch;
@@ -260,6 +261,12 @@ private:
     bool small_box_data_allocated = false;
     bool small_box_initialized = false;
     double small_box_h[9] = {0.0};
+    int small_box_pbc[3] = {0, 0, 0};
+    bool large_box_initialized = false;
+    double large_box_h[9] = {0.0};
+    int large_box_pbc[3] = {0, 0, 0};
+    bool box_mode_initialized = false;
+    bool last_box_was_small = false;
   };
 
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;

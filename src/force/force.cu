@@ -661,9 +661,28 @@ void Force::print_pimd_nep_batch_profile() const
     printf("                distance check = %g s.\n", timing.neighbor_check);
     printf("                flag transfer = %g s.\n", timing.neighbor_flags);
     printf(
-      "                rebuild/update = %g s (%lld bead rebuilds).\n",
+      "                global rebuild/update = %g s (%lld large-box bead rebuilds).\n",
       timing.neighbor_rebuild,
+      timing.neighbor_rebuild_beads - timing.neighbor_small_box_rebuild_beads);
+    printf(
+      "                small-box bead rebuilds = %lld; total bead rebuilds = %lld.\n",
+      timing.neighbor_small_box_rebuild_beads,
       timing.neighbor_rebuild_beads);
+    printf(
+      "                rebuild causes (bead calls): displacement-only=%lld, "
+      "image-shift-only=%lld (%lld skipped in large-box), both=%lld, "
+      "box/PBC-change=%lld, forced=%lld, no-trigger=%lld.\n",
+      timing.neighbor_displacement_only_beads,
+      timing.neighbor_image_shift_only_beads,
+      timing.neighbor_image_shift_only_skipped_beads,
+      timing.neighbor_displacement_and_image_shift_beads,
+      timing.neighbor_box_or_pbc_change_beads,
+      timing.neighbor_forced_rebuild_beads,
+      timing.neighbor_no_rebuild_beads);
+    printf(
+      "                first builds = %lld bead calls; small/large switches = %lld.\n",
+      timing.neighbor_first_build_beads,
+      timing.neighbor_box_mode_switches);
     printf("            compact filter/geometry = %g s.\n", timing.neighbor_filter);
     printf("        initialize = %g s.\n", timing.initialize);
     printf("        descriptor/ANN = %g s.\n", timing.descriptor);

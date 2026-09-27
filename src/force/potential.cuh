@@ -39,6 +39,16 @@ struct PIMD_Batch_Timing
   double total = 0.0;
   long long calls = 0;
   long long neighbor_rebuild_beads = 0;
+  long long neighbor_small_box_rebuild_beads = 0;
+  long long neighbor_displacement_only_beads = 0;
+  long long neighbor_image_shift_only_beads = 0;
+  long long neighbor_image_shift_only_skipped_beads = 0;
+  long long neighbor_displacement_and_image_shift_beads = 0;
+  long long neighbor_box_or_pbc_change_beads = 0;
+  long long neighbor_forced_rebuild_beads = 0;
+  long long neighbor_no_rebuild_beads = 0;
+  long long neighbor_first_build_beads = 0;
+  long long neighbor_box_mode_switches = 0;
   long long pppm_full_peratom_virial_batch_calls = 0;
   long long pppm_global_virial_batch_calls = 0;
 };
