@@ -567,13 +567,14 @@ void QNEP_Projection::pre_run(
   Box& box,
   Force& force)
 {
-  if (integrate.type >= 31 && integrate.type <= 33) {
+  const EnsembleType integrate_type = integrate.get_type();
+  if (is_pimd(integrate_type)) {
     PRINT_INPUT_ERROR("compute_qnep_projection currently supports classical MD only.\n");
   }
   if (
-    (integrate.type >= 11 && integrate.type <= 20) || integrate.type == -1 ||
-    integrate.type == -3 || integrate.type == -4 || integrate.type == -5 ||
-    integrate.type == -12) {
+    is_standard_npt(integrate_type) || integrate_type == EnsembleType::NPT_QTB ||
+    integrate_type == EnsembleType::MSST || integrate_type == EnsembleType::MTTK ||
+    integrate_type == EnsembleType::WALL_PISTON || integrate_type == EnsembleType::NPHUG) {
     PRINT_INPUT_ERROR(
       "compute_qnep_projection requires a fixed simulation cell; NPT, MSST, MTTK, "
       "piston, NPHug, and NPT-QTB integrators are unsupported.\n");

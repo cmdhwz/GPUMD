@@ -21,86 +21,70 @@
 #else
   #include <curand_kernel.h>
 #endif
-#include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 class Ensemble_PIMD : public Ensemble
 {
 public:
-  struct DistributedReplica
+  Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& box);
+
+  void initialize_run(
+    const double time_step,
+    Atom& atom,
+    Box& box,
+    const std::vector<Group>& group) override;
+
+  int get_number_of_beads() const
   {
-    int device_id = 0;
-    int bead_begin = 0;
-    int bead_end = 0;
-    Atom atom;
-    GPU_Vector<double> thermo;
-    std::unique_ptr<Ensemble_PIMD> ensemble;
-  };
+    return number_of_beads;
+  }
 
-  Ensemble_PIMD(
-    int number_of_atoms_input,
-    int number_of_beads_input,
-    bool thermostat_internal,
-    Atom& atom,
-    bool use_exact_propagator,
-    double pile_scale,
-    bool fix_com,
-    bool reseed_from_centroid = false,
-    bool use_eco_pimd = false,
-    double eco_omega_max_cm1 = 0.0);
+  double get_temperature1() const
+  {
+    return temperature1_;
+  }
 
-  Ensemble_PIMD(
-    int number_of_atoms_input,
-    int number_of_beads_input,
-    double temperature_coupling,
-    Atom& atom,
-    bool use_exact_propagator,
-    double pile_scale,
-    bool fix_com,
-    bool reseed_from_centroid = false,
-    bool use_eco_pimd = false,
-    double eco_omega_max_cm1 = 0.0);
+  double get_temperature2() const
+  {
+    return temperature2_;
+  }
 
-  Ensemble_PIMD(
-    int number_of_atoms_input,
-    int number_of_beads_input,
-    double temperature_coupling,
-    int num_target_pressure_components,
-    double target_pressure[6],
-    double pressure_coupling[6],
-    Atom& atom,
-    bool use_exact_propagator,
-    double pile_scale,
-    bool fix_com,
-    bool use_scr_barostat,
-    bool reseed_from_centroid = false,
-    bool use_eco_pimd = false,
-    double eco_omega_max_cm1 = 0.0);
+  int get_num_target_pressure_components() const
+  {
+    return num_target_pressure_components;
+  }
 
-  virtual ~Ensemble_PIMD(void);
-
-  virtual void compute1(
+  void compute1(
     const double time_step,
+    const int step,
+    const int number_of_steps,
     const std::vector<Group>& group,
     Box& box,
     Atom& atom,
-    GPU_Vector<double>& thermo);
+    GPU_Vector<double>& thermo) override;
 
-  virtual void compute2(
+  void compute2(
     const double time_step,
+    const int step,
+    const int number_of_steps,
     const std::vector<Group>& group,
     Box& box,
     Atom& atom,
-    GPU_Vector<double>& thermo);
-  void get_ring_polymer_energy(
-    double& kinetic,
-    double& spring,
-    double& nonham_work);
+    GPU_Vector<double>& thermo,
+    Force& force) override;
+
+  void set_local_options(
+    const bool use_exact_propagator,
+    const double pile_scale,
+    const bool fix_com,
+    const bool reseed_from_centroid);
+  void set_restart_temperature(const double value);
+  bool uses_scr_barostat() const { return use_scr_barostat; }
+  bool uses_eco_pimd() const { return use_eco_pimd; }
+  void get_ring_polymer_energy(double& kinetic, double& spring, double& nonham_work);
   void reset_nonham_work();
-  void enable_distributed(int num_devices, Atom& atom, GPU_Vector<double>& thermo);
-  bool distributed_enabled() const { return distributed_enabled_; }
-  void compute_force_distributed(Force& force, Box& box, std::vector<Group>& group, Atom& atom);
 
 protected:
   int number_of_atoms = 0;
@@ -110,13 +94,17 @@ protected:
   bool use_exact_propagator_ = true;
   double pile_scale_ = 2.0;
   bool fix_com_ = true;
-  bool use_scr_barostat_ = false;
   bool reseed_from_centroid_ = false;
-  bool use_eco_pimd_ = false;
-  bool eco_frequencies_reported_ = false;
-  double eco_omega_max_cm1_ = 0.0;
-  double eco_last_temperature_ = -1.0;
   double omega_n;
+  bool use_eco_pimd = false;
+  bool use_scr_barostat = false;
+  bool eco_frequencies_reported = false;
+  double eco_omega_max_cm1 = 0.0;
+  double eco_last_temperature = -1.0;
+  double temperature1_ = 0.0;
+  double temperature2_ = 0.0;
+  double elastic_modulus_[6] = {0.0};
+  double tau_p_ = 0.0;
   GPU_Vector<gpurandState> curand_states;
   GPU_Vector<double*> position_beads;
   GPU_Vector<double*> velocity_beads;
@@ -127,6 +115,8 @@ protected:
   GPU_Vector<double> free_ring_polymer_frequency;
   GPU_Vector<double> free_ring_polymer_cosine;
   GPU_Vector<double> free_ring_polymer_sine;
+  GPU_Vector<double> position_normal;
+  GPU_Vector<double> velocity_normal;
   GPU_Vector<double> eco_mode_factors;
   std::vector<double> eco_independent_frequencies;
   bool free_ring_polymer_propagator_initialized_ = false;
@@ -139,26 +129,8 @@ protected:
 
   void initialize(Atom& atom);
   void update_free_ring_polymer_propagator_(const double time_step);
-  void update_eco_modes_();
+  void update_eco_modes();
   void langevin(const double time_step, Atom& atom);
-  void compute1_local_(
-    const double time_step,
-    const std::vector<Group>& group,
-    Box& box,
-    Atom& atom,
-    GPU_Vector<double>& thermo);
-  void compute2_local_pre_pressure_(
-    const double time_step,
-    const std::vector<Group>& group,
-    Box& box,
-    Atom& atom,
-    GPU_Vector<double>& thermo);
-  void apply_pressure_local_orthogonal_(Atom& atom, double scale_factor[3]);
-  void apply_pressure_local_isotropic_(Atom& atom, double scale_factor);
-  void apply_pressure_local_triclinic_(Atom& atom, double mu[9]);
-  void clone_atom_to_current_device_(const Atom& source, Atom& destination, int source_device, int destination_device);
   std::mt19937 rng;
   void initialize_rng();
-  bool distributed_enabled_ = false;
-  std::vector<std::unique_ptr<DistributedReplica>> distributed_replicas_;
 };

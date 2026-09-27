@@ -28,25 +28,26 @@ Dump thermo data to a file at a given interval.
 #include "utilities/read_file.cuh"
 #include <cstring>
 
-Dump_Thermo::Dump_Thermo(const char** param, int num_param) 
+Dump_Thermo::Dump_Thermo(const std::vector<std::string>& tokens)
 {
-  parse(param, num_param);
+  parse(tokens);
   action_name = "dump_thermo";
 }
 
-void Dump_Thermo::parse(const char** param, int num_param)
+void Dump_Thermo::parse(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
   if (num_param != 2 && num_param != 3) {
     PRINT_INPUT_ERROR("dump_thermo should have 1 or 2 parameters.");
   }
-  if (!is_valid_int(param[1], &dump_interval_)) {
+  if (!is_valid_int(tokens[1], &dump_interval_)) {
     PRINT_INPUT_ERROR("thermo dump interval should be an integer.");
   }
   if (dump_interval_ <= 0) {
     PRINT_INPUT_ERROR("thermo dump interval should > 0.");
   }
   if (num_param == 3) {
-    if (strcmp(param[2], "rp_energy") != 0) {
+    if (tokens[2] != "rp_energy") {
       PRINT_INPUT_ERROR("Unknown dump_thermo option.");
     }
     rp_energy_ = true;
@@ -66,24 +67,26 @@ void Dump_Thermo::pre_run(
   conserved_reference_set_ = false;
   rp_ensemble_ = nullptr;
   if (rp_energy_) {
-    if (integrate.type != 31 && integrate.type != 33) {
+    const EnsembleType type = integrate.get_type();
+    if (type != EnsembleType::RPMD && type != EnsembleType::PIMD) {
       PRINT_INPUT_ERROR(
         "dump_thermo rp_energy supports fixed-cell RPMD and NVT-PIMD only.");
     }
-    rp_ensemble_ = dynamic_cast<Ensemble_PIMD*>(integrate.ensemble.get());
+    rp_ensemble_ = dynamic_cast<Ensemble_PIMD*>(integrate.get_ensemble());
     if (rp_ensemble_ == nullptr) {
       PRINT_INPUT_ERROR("dump_thermo rp_energy requires an initialized ring-polymer ensemble.");
     }
     if (
-      (integrate.type == 33 &&
-       (integrate.temperature1 != integrate.temperature2 ||
-        integrate.num_target_pressure_components != 0)) ||
-      integrate.deform_x != 0 || integrate.deform_y != 0 || integrate.deform_z != 0 ||
-      integrate.deform_xy != 0 || integrate.deform_xz != 0 || integrate.deform_yz != 0) {
+      (type == EnsembleType::PIMD &&
+       (integrate.get_temperature1() != integrate.get_temperature2() ||
+        integrate.get_num_target_pressure_components() != 0)) ||
+      integrate.get_deform_x() != 0 || integrate.get_deform_y() != 0 ||
+      integrate.get_deform_z() != 0 || integrate.get_deform_xy() != 0 ||
+      integrate.get_deform_xz() != 0 || integrate.get_deform_yz() != 0) {
       PRINT_INPUT_ERROR(
         "dump_thermo rp_energy supports fixed-cell RPMD and fixed-temperature NVT-PIMD only.");
     }
-    if (integrate.type == 33) {
+    if (type == EnsembleType::PIMD) {
       rp_ensemble_->reset_nonham_work();
     }
   }
@@ -97,7 +100,7 @@ void Dump_Thermo::pre_run(
     fprintf(fid_, "# rp_energy_normalization per_bead\n");
     fprintf(fid_, "# nonham_work_sign positive_into_ring_polymer\n");
     fprintf(fid_, "# conserved_energy_reference first_dumped_frame\n");
-    if (integrate.type == 31) {
+    if (integrate.get_type() == EnsembleType::RPMD) {
       fprintf(fid_, "# conserved_quantity H_rp_avg # RPMD\n");
     } else {
       fprintf(fid_, "# conserved_quantity H_conserved_avg # NVT-PIMD\n");
@@ -106,7 +109,7 @@ void Dump_Thermo::pre_run(
   fprintf(
     fid_,
     "# columns %s PE sxx syy szz syz sxz sxy ax ay az bx by bz cx cy cz%s\n",
-    integrate.type >= 31 ? "T_target KE_quantum" : "T KE",
+    is_pimd(integrate.get_type()) ? "T_target KE_quantum" : "T KE",
     rp_energy_
       ? " KE_rp_avg PE_rp_avg E_spring_avg H_rp_avg W_nonham_avg H_conserved_avg dH_conserved_meV_per_atom"
       : "");
@@ -130,12 +133,14 @@ void Dump_Thermo::end_of_step(
     return;
 
   int number_of_atoms_fixed =
-    (fixed_group < 0) ? 0 : group[integrate.fixed_grouping_method].cpu_size[fixed_group];
+    (fixed_group < 0)
+      ? 0
+      : group[integrate.get_fixed_grouping_method()].cpu_size[fixed_group];
 
   double thermo[8];
   gpu_thermo.copy_to_host(thermo, 8);
   double energy_kin, temperature;
-  if (integrate.type >= 31) {
+  if (is_pimd(integrate.get_type())) {
     energy_kin = thermo[0];
     temperature = temperature_target;
   } else {

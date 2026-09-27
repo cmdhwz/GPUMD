@@ -23,7 +23,7 @@ class NEP_Charge;
 class HAC : public Action
 {
 public:
-  HAC(const char**, int, bool qnep_full_a = false);
+  HAC(const std::vector<std::string>& tokens);
 
   void set_qnep_full_a(const bool enabled) { qnep_full_a_ = enabled; }
 
@@ -94,7 +94,7 @@ public:
     const double time_step,
     const double temperature);
 
-  void parse(const char**, int);
+  void parse(const std::vector<std::string>& tokens);
 
 private:
   static constexpr int deferred_centroid_chunk_size_ = 32;

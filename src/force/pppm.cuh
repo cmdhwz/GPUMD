@@ -53,7 +53,10 @@ public:
   {
     return "candidate_v2_real_space";
   }
-  void initialize(const float alpha_input);
+  void initialize(
+    const float alpha_input,
+    const bool need_peratom_virial_input,
+    const bool need_peratom_virial_every_batch_input);
   void set_mesh_spacing(const double value)
   {
     mesh_spacing = value;

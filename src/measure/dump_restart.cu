@@ -73,30 +73,31 @@ void copy_restart_file(const std::string& source, const std::string& destination
 }
 } // namespace
 
-Dump_Restart::Dump_Restart(const char** param, int num_param)
+Dump_Restart::Dump_Restart(const std::vector<std::string>& tokens)
 {
-  parse(param, num_param);
+  parse(tokens);
   action_name = "dump_restart";
 }
 
-void Dump_Restart::parse(const char** param, int num_param)
+void Dump_Restart::parse(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
   if (num_param != 2 && num_param != 3) {
     PRINT_INPUT_ERROR("dump_restart should have 1 or 2 parameters.");
   }
-  if (!is_valid_int(param[1], &dump_interval_)) {
+  if (!is_valid_int(tokens[1], &dump_interval_)) {
     PRINT_INPUT_ERROR("restart dump interval should be an integer.");
   }
   if (dump_interval_ <= 0) {
     PRINT_INPUT_ERROR("restart dump interval should > 0.");
   }
   if (num_param == 3) {
-    if (!is_valid_backup_directory_name(param[2])) {
+    if (!is_valid_backup_directory_name(tokens[2].c_str())) {
       PRINT_INPUT_ERROR(
         "The optional backup directory name should be a single directory name without '/', '\\', or ':'.");
     }
     backup_ = true;
-    backup_directory_ = param[2];
+    backup_directory_ = tokens[2];
   }
   dump_ = true;
   printf("Dump restart every %d steps.\n", dump_interval_);

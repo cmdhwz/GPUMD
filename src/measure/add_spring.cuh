@@ -16,12 +16,17 @@
 #include "action.cuh"
 #include "utilities/gpu_vector.cuh"
 #include <cstdio>
+#include <string>
 #include <vector>
 
 class Add_Spring : public Action
 {
 public:
-  Add_Spring(const char** param, int num_param, const std::vector<Group>& groups, Atom& atom);
+  Add_Spring(
+    const std::vector<std::string>& tokens,
+    const std::vector<Group>& groups,
+    Atom& atom);
+  bool modifies_force() const override { return true; }
   ~Add_Spring() override;
 
   void setup_force(

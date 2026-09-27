@@ -24,10 +24,13 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include "nep_charge.cuh"
 #include "nep_charge_small_box.cuh"
 #include "utilities/common.cuh"
+#include "utilities/compact_nep.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/nep_parameters.cuh"
 #include "utilities/nep_utilities.cuh"
+#include "utilities/read_file.cuh"
+#include "utilities/run_input.cuh"
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -46,70 +49,144 @@ const std::string ELEMENTS[NUM_ELEMENTS] = {
   "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta", "W",  "Re", "Os", "Ir", "Pt", "Au", "Hg",
   "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U",  "Np", "Pu"};
 
-void NEP_Charge::check_ewald_pppm()
+void NEP_Charge::check_ewald_pppm(const RunInput& run_input)
 {
-  std::ifstream input_run("run.in");
-  if (!input_run.is_open()) {
-    PRINT_INPUT_ERROR("Cannot open run.in.");
-  }
-
   use_pppm = true;
-  std::string line;
-  while (std::getline(input_run, line)) {
-    std::vector<std::string> tokens = get_tokens_without_comments(line);
-    if (tokens.size() != 0) {
-      if (tokens[0] == "kspace") {
-        if (tokens.size() != 2) {
-          std::cout << "kspace must have 1 parameter\n";
-          exit(1);
-        }
-        std::string kspace_method = tokens[1];
-        if (kspace_method == "ewald") {
-          use_pppm = false;
-        } else if (kspace_method == "pppm") {
-          use_pppm = true;
-        } else {
-          std::cout << "kspace method can only be ewald or pppm\n";
-          exit(1);
-        }
+  for (const auto& line : run_input.lines()) {
+    const std::vector<std::string>& tokens = line.tokens;
+    if (!tokens.empty() && tokens[0] == "kspace") {
+      if (tokens.size() != 2) {
+        std::cout << "kspace must have 1 parameter\n";
+        exit(1);
+      }
+      std::string kspace_method = tokens[1];
+      if (kspace_method == "ewald") {
+        use_pppm = false;
+      } else if (kspace_method == "pppm") {
+        use_pppm = true;
+      } else {
+        std::cout << "kspace method can only be ewald or pppm\n";
+        exit(1);
       }
     }
   }
-
-  input_run.close();
 }
 
-void NEP_Charge::initialize_dftd3()
+void NEP_Charge::check_need_bec(const RunInput& run_input)
 {
-  std::ifstream input_run("run.in");
-  if (!input_run.is_open()) {
-    PRINT_INPUT_ERROR("Cannot open run.in.");
-  }
-
-  has_dftd3 = false;
-  std::string line;
-  while (std::getline(input_run, line)) {
-    std::vector<std::string> tokens = get_tokens_without_comments(line);
-    if (tokens.size() != 0) {
-      if (tokens[0] == "dftd3") {
-        has_dftd3 = true;
-        if (tokens.size() != 4) {
-          std::cout << "dftd3 must have 3 parameters\n";
-          exit(1);
-        }
-        std::string xc_functional = tokens[1];
-        float rc_potential = get_double_from_token(tokens[2], __FILE__, __LINE__);
-        float rc_coordination_number = get_double_from_token(tokens[3], __FILE__, __LINE__);
-        dftd3.initialize(xc_functional, rc_potential, rc_coordination_number);
+  need_bec = false;
+  for (const auto& line : run_input.lines()) {
+    const std::vector<std::string>& tokens = line.tokens;
+    if (!tokens.empty()) {
+      if (tokens[0] == "compute_dpdt") {
+        need_bec = true;
         break;
       }
+
+      if (tokens[0] == "dump_xyz" || tokens[0] == "dump_netcdf") {
+        for (int n = 3; n < tokens.size(); ++n) {
+          if (tokens[n] == "bec") {
+            need_bec = true;
+            break;
+          }
+        }
+        if (need_bec) {
+          break;
+        }
+      }
+
+      if (tokens[0] == "add_efield") {
+        if (
+          tokens.size() == 4 || tokens.size() == 6 ||
+          ((tokens.size() == 5 || tokens.size() == 7) && tokens.back() == "bec")) {
+          need_bec = true;
+          break;
+        }
+      }
     }
   }
-
-  input_run.close();
 }
 
-NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
+struct PerAtomVirialRequirements
+{
+  bool anywhere = false;
+  bool every_batch = false;
+};
+
+static PerAtomVirialRequirements get_peratom_virial_requirements(const RunInput& run_input)
+{
+  PerAtomVirialRequirements requirements;
+  for (const auto& line : run_input.lines()) {
+    const std::vector<std::string>& tokens = line.tokens;
+    if (tokens.empty()) {
+      continue;
+    }
+    if (tokens[0] == "compute_hac") {
+      requirements.anywhere = true;
+      int centroid_flag = 0;
+      if (
+        tokens.size() < 5 || !is_valid_int(tokens[4].c_str(), &centroid_flag) ||
+        centroid_flag == 0) {
+        requirements.every_batch = true;
+      }
+    } else if (
+      tokens[0] == "compute_hnemd" || tokens[0] == "compute_hnemdec" ||
+      tokens[0] == "compute_shc" || tokens[0] == "compute_gkma" ||
+      tokens[0] == "compute_hnema") {
+      requirements.anywhere = true;
+      requirements.every_batch = true;
+    }
+    if (tokens[0] == "compute") {
+      for (const auto& token : tokens) {
+        if (token == "virial" || token == "jp") {
+          requirements.anywhere = true;
+          requirements.every_batch = true;
+          break;
+        }
+      }
+    }
+    if (tokens[0] == "dump_xyz" || tokens[0] == "dump_netcdf") {
+      for (const auto& token : tokens) {
+        if (token == "virial") {
+          requirements.anywhere = true;
+          requirements.every_batch = true;
+          break;
+        }
+      }
+    }
+    if (requirements.every_batch) {
+      break;
+    }
+  }
+  return requirements;
+}
+
+void NEP_Charge::initialize_dftd3(const RunInput& run_input)
+{
+  has_dftd3 = false;
+  for (const auto& line : run_input.lines()) {
+    const std::vector<std::string>& tokens = line.tokens;
+    if (!tokens.empty() && tokens[0] == "dftd3") {
+      has_dftd3 = true;
+      if (tokens.size() != 4) {
+        std::cout << "dftd3 must have 3 parameters\n";
+        exit(1);
+      }
+      std::string xc_functional = tokens[1];
+      float rc_potential = get_double_from_token(tokens[2], __FILE__, __LINE__);
+      float rc_coordination_number = get_double_from_token(tokens[3], __FILE__, __LINE__);
+      dftd3.initialize(
+        xc_functional,
+        rc_potential,
+        rc_coordination_number,
+        get_first_potential_filename(run_input));
+      break;
+    }
+  }
+}
+
+NEP_Charge::NEP_Charge(
+  const char* file_potential, const int num_atoms, const RunInput& run_input)
 {
   std::ifstream input(file_potential);
   if (!input.is_open()) {
@@ -356,9 +433,14 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
 
   // charge related parameters and data
   charge_para.alpha = float(PI) / paramb.rc_radial; // a good value
-  check_ewald_pppm();
+  check_ewald_pppm(run_input);
+  check_need_bec(run_input);
   if (use_pppm) {
-    pppm.initialize(charge_para.alpha);
+    const PerAtomVirialRequirements virial_requirements = get_peratom_virial_requirements(run_input);
+    pppm.initialize(
+      charge_para.alpha,
+      virial_requirements.anywhere,
+      virial_requirements.every_batch);
   } else {
     ewald.initialize(charge_para.alpha);
   }
@@ -383,9 +465,9 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
     num_atoms * (paramb.n_max_angular + 1) * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1));
   nep_data.cpu_NN_radial.resize(num_atoms);
   nep_data.cpu_NN_angular.resize(num_atoms);
-  neighbor.initialize(rc, num_atoms, paramb.MN_radial);
+  neighbor_manager.initialize(rc, num_atoms, paramb.MN_radial);
 
-  initialize_dftd3();
+  initialize_dftd3(run_input);
 }
 
 NEP_Charge::~NEP_Charge(void)
@@ -396,7 +478,7 @@ NEP_Charge::~NEP_Charge(void)
 void NEP_Charge::set_neighbor_rebuild(const bool value)
 {
   neighbor_always_rebuild_ = value;
-  neighbor.set_always_rebuild(value);
+  neighbor_manager.set_always_rebuild(value);
   if (pimd_batch_data_) {
     for (auto& bead : pimd_batch_data_->beads) {
       bead->neighbor->set_always_rebuild(value);
@@ -2310,8 +2392,7 @@ void NEP_Charge::compute_large_box(
   const int grid_size = (N2 - N1 - 1) / BLOCK_SIZE + 1;
   const bool capture_charge_diagnostics = charge_diagnostics_requested_;
 
-  neighbor.find_neighbor_global(
-    rc,
+  neighbor_manager.update(
     box, 
     type, 
     position_per_atom);
@@ -2326,8 +2407,8 @@ void NEP_Charge::compute_large_box(
     position_per_atom.data(),
     position_per_atom.data() + N,
     position_per_atom.data() + N * 2,
-    neighbor.NN.data(),
-    neighbor.NL.data(),
+    neighbor_manager.get_candidate_NN().data(),
+    neighbor_manager.get_candidate_NL().data(),
     nep_data.NN_radial.data(),
     nep_data.NL_radial.data(),
     nep_data.NN_angular.data(),

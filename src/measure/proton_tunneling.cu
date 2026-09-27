@@ -1243,14 +1243,15 @@ void Proton_Tunneling::preprocess(
   (void)group;
   (void)force;
 
-  if (local_influence_enabled_ && integrate.type != 33) {
+  const EnsembleType integrate_type = integrate.get_type();
+  if (local_influence_enabled_ && integrate_type != EnsembleType::PIMD) {
     PRINT_INPUT_ERROR("local_influence is currently supported only for ensemble pimd.");
   }
 
   number_of_atoms_ = atom.number_of_atoms;
   number_of_beads_ = atom.number_of_beads;
-  ensemble_type_ = integrate.type;
-  if (static_edge_distribution_enabled_ && ensemble_type_ != 33)
+  ensemble_type_ = integrate_type;
+  if (static_edge_distribution_enabled_ && ensemble_type_ != EnsembleType::PIMD)
     PRINT_INPUT_ERROR("static_edge_distribution is supported only for ensemble pimd.");
   if (static_edge_distribution_enabled_) {
     FILE* existing_output = std::fopen(output_filename_.c_str(), "rb");
@@ -2902,14 +2903,52 @@ const char* Proton_Tunneling::outcome_name(const AttemptOutcome outcome) const
 const char* Proton_Tunneling::ensemble_name() const
 {
   switch (ensemble_type_) {
-  case 31:
+  case EnsembleType::RPMD:
     return "rpmd";
-  case 32:
+  case EnsembleType::TRPMD:
     return "trpmd";
-  case 33:
+  case EnsembleType::PIMD:
     return "pimd";
   default:
     return "classical_or_other";
+  }
+}
+
+int Proton_Tunneling::legacy_ensemble_type_code() const
+{
+  switch (ensemble_type_) {
+  case EnsembleType::NVE: return 0;
+  case EnsembleType::NVT_BER: return 1;
+  case EnsembleType::NVT_NHC: return 2;
+  case EnsembleType::NVT_LAN: return 3;
+  case EnsembleType::NVT_BDP: return 4;
+  case EnsembleType::NVT_BAO: return 5;
+  case EnsembleType::NVT_QTB: return 6;
+  case EnsembleType::NPT_BER: return 11;
+  case EnsembleType::NPT_SCR: return 12;
+  case EnsembleType::MTTK: return -3;
+  case EnsembleType::NPT_QTB: return -12;
+  case EnsembleType::HEAT_NHC: return 21;
+  case EnsembleType::HEAT_LAN: return 22;
+  case EnsembleType::HEAT_BDP: return 23;
+  case EnsembleType::HEAT_TTM: return 24;
+  case EnsembleType::TTM: return 25;
+  case EnsembleType::HEAT_HYBRID: return 26;
+  case EnsembleType::HEAT_NHC_POWER: return 27;
+  case EnsembleType::RPMD: return 31;
+  case EnsembleType::TRPMD: return 32;
+  case EnsembleType::PIMD: return 33;
+  case EnsembleType::MSST: return -1;
+  case EnsembleType::TI_SPRING: return -2;
+  case EnsembleType::WALL_PISTON: return -4;
+  case EnsembleType::NPHUG: return -5;
+  case EnsembleType::TI: return -6;
+  case EnsembleType::WALL_MIRROR: return -7;
+  case EnsembleType::TI_RS: return -8;
+  case EnsembleType::TI_AS: return -9;
+  case EnsembleType::WALL_HARMONIC: return -10;
+  case EnsembleType::TI_LIQUID: return -11;
+  default: return 0;
   }
 }
 
@@ -5356,8 +5395,9 @@ void Proton_Tunneling::write_netcdf_output_file()
   netcdf_check(nc_put_att_double(ncid, NC_GLOBAL, "bead_centroid_max", NC_DOUBLE, 1,
     &bead_centroid_max_), "nc_put_att_double");
   netcdf_text_attribute(ncid, NC_GLOBAL, "ensemble_type", ensemble_name());
+  const int ensemble_type_code = legacy_ensemble_type_code();
   netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "ensemble_type_code", NC_INT, 1,
-    &ensemble_type_), "nc_put_att_int");
+    &ensemble_type_code), "nc_put_att_int");
   netcdf_check(nc_put_att_int(ncid, NC_GLOBAL, "number_of_beads", NC_INT, 1,
     &number_of_beads_), "nc_put_att_int");
   const double time_step_fs = time_step_ * TIME_UNIT_CONVERSION;

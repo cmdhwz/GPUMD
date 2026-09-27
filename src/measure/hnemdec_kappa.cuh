@@ -22,6 +22,7 @@ class HNEMDEC : public Action
 public:
   int compute = -1; // 0 for heat flow algorithm, i(0<i<number_of_types+1) means producing (i-1)th
                     // element's mass flow as dissipation flux in color conductivity algorithm
+  bool modifies_force() const override { return compute != -1; }
   int output_interval; // average the data every so many time steps
 
   // the driving force vector
@@ -30,11 +31,11 @@ public:
   double fe_z = 0.0;
   double fe = 0.0; // magnitude of the driving force vector
 
-  int number_of_types;
-  int NUM_OF_DIFFUSION_COMPONENTS;
+  int number_of_types = 0;
+  int NUM_OF_DIFFUSION_COMPONENTS = 0;
   std::vector<double> cpu_mass_type; // atom types' mass
   GPU_Vector<double> mass_type;
-  double FACTOR;
+  double FACTOR = 0.0;
 
   GPU_Vector<double> heat_all;
   GPU_Vector<double> diffusion_all;
@@ -47,6 +48,16 @@ public:
     Atom& atom,
     Box& box,
     Force& force);
+
+  void post_force(
+    const int step,
+    const double time_step,
+    const double global_time,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
 
   virtual void end_of_step(
       const int number_of_steps,
@@ -70,6 +81,11 @@ public:
     const double time_step,
     const double temperature);
 
-  HNEMDEC(const char** param, int num_param, Force& force, Atom& atom, double temperature);
-  void parse(const char** param, int num_param);
+  HNEMDEC(const std::vector<std::string>& tokens);
+  void parse(const std::vector<std::string>& tokens);
+
+private:
+  GPU_Vector<double> coefficient_;
+  GPU_Vector<double> tensor_per_atom_;
+  GPU_Vector<double> tensor_sum_;
 };

@@ -89,6 +89,7 @@ void HAC::pre_run(
   Force& force)
 {
   if (compute) {
+    const EnsembleType integrate_type = integrate.get_type();
     force_ = &force;
     deferred_centroid_enabled_ = false;
     centroid_frame_size_ = 0;
@@ -109,7 +110,7 @@ void HAC::pre_run(
 
     if (qnep_full_a_) {
       const bool centroid_qnep_full_a = use_centroid_heat_flux_ != 0;
-      const bool ring_polymer_run = integrate.type >= 31 && integrate.type <= 33;
+      const bool ring_polymer_run = is_pimd(integrate_type);
       if (split_qnep_heat_by_type_ != 0) {
         PRINT_INPUT_ERROR("hac_current qnep_full_a does not support split HAC output.");
       }
@@ -124,9 +125,10 @@ void HAC::pre_run(
       }
       if (
         centroid_qnep_full_a &&
-        (integrate.deform_x != 0 || integrate.deform_y != 0 || integrate.deform_z != 0 ||
-         integrate.use_scr_barostat ||
-         (integrate.type == 33 && integrate.num_target_pressure_components != 0))) {
+        (integrate.get_deform_x() != 0 || integrate.get_deform_y() != 0 ||
+         integrate.get_deform_z() != 0 || integrate.get_use_scr_barostat() ||
+         (integrate_type == EnsembleType::PIMD &&
+          integrate.get_num_target_pressure_components() != 0))) {
         PRINT_INPUT_ERROR(
           "hac_current qnep_full_a centroid mode requires a fixed-cell ring-polymer ensemble.");
       }
@@ -135,21 +137,24 @@ void HAC::pre_run(
       }
       const bool supported_ensemble =
         centroid_qnep_full_a ? ring_polymer_run
-                             : (integrate.type == 0 || (integrate.type >= 1 && integrate.type <= 10));
+                             : (integrate_type == EnsembleType::NVE || is_standard_nvt(integrate_type));
       if (!supported_ensemble) {
         PRINT_INPUT_ERROR("hac_current qnep_full_a uses an unsupported ensemble.");
       }
       const double normalization_temperature =
-        integrate.type == 0 ? integrate.hac_normalization_temperature : integrate.temperature2;
+        integrate_type == EnsembleType::NVE ? integrate.get_hac_normalization_temperature()
+                                            : integrate.get_temperature2();
       if (!std::isfinite(normalization_temperature) || !(normalization_temperature > 0.0)) {
         PRINT_INPUT_ERROR(
           "hac_current qnep_full_a requires a positive finite normalization temperature; "
           "for NVE use ensemble nve <temperature>.\n");
       }
-      if (integrate.type != 0) {
+      if (integrate_type != EnsembleType::NVE) {
         const double temperature_scale =
-          std::max(1.0, std::max(std::fabs(integrate.temperature1), std::fabs(integrate.temperature2)));
-        if (std::fabs(integrate.temperature1 - integrate.temperature2) >
+          std::max(
+            1.0,
+            std::max(std::fabs(integrate.get_temperature1()), std::fabs(integrate.get_temperature2())));
+        if (std::fabs(integrate.get_temperature1() - integrate.get_temperature2()) >
             1.0e-12 * temperature_scale) {
           PRINT_INPUT_ERROR(
             "hac_current qnep_full_a requires a constant target temperature during the HAC run.");
@@ -255,11 +260,12 @@ void HAC::pre_run(
       centroid_force_per_atom_.resize(atom.number_of_atoms * 3);
       centroid_virial_per_atom_.resize(atom.number_of_atoms * 9);
 
-      const bool is_ring_polymer_run = integrate.type >= 31 && integrate.type <= 33;
+      const bool is_ring_polymer_run = is_pimd(integrate_type);
       const bool fixed_box =
-        is_ring_polymer_run && integrate.deform_x == 0 && integrate.deform_y == 0 &&
-        integrate.deform_z == 0 && !integrate.use_scr_barostat &&
-        (integrate.type != 33 || integrate.num_target_pressure_components == 0);
+        is_ring_polymer_run && integrate.get_deform_x() == 0 && integrate.get_deform_y() == 0 &&
+        integrate.get_deform_z() == 0 && !integrate.get_use_scr_barostat() &&
+        (integrate_type != EnsembleType::PIMD ||
+         integrate.get_num_target_pressure_components() == 0);
       const bool deferred_supported =
         deferred_centroid_qnep_ != 0 && !split_qnep_heat_by_type_ && fixed_box &&
         atom.number_of_beads > 1 && force.pimd_qnep_batch_available();
@@ -1557,10 +1563,11 @@ void HAC::post_run(
   if (!compute)
     return;
   if (qnep_full_a_) {
+    const EnsembleType integrate_type = integrate.get_type();
     const double normalization_temperature =
-      integrate.type == 0 ? integrate.hac_normalization_temperature : temperature;
+      integrate_type == EnsembleType::NVE ? integrate.get_hac_normalization_temperature() : temperature;
     const char* temperature_source =
-      integrate.type == 0
+      integrate_type == EnsembleType::NVE
       ? "explicit_nve_hac"
       : (use_centroid_heat_flux_ ? "ring_polymer_target" : "fixed_nvt_target");
     post_run_qnep_full_a_(
@@ -1810,8 +1817,9 @@ void HAC::post_run(
   compute = 0;
 }
 
-void HAC::parse(const char** param, int num_param)
+void HAC::parse(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
   compute = 1;
 
   printf("Compute HAC.\n");
@@ -1820,7 +1828,7 @@ void HAC::parse(const char** param, int num_param)
     PRINT_INPUT_ERROR("compute_hac should have 3, 4, 5, or 6 parameters.\n");
   }
 
-  if (!is_valid_int(param[1], &sample_interval)) {
+  if (!is_valid_int(tokens[1], &sample_interval)) {
     PRINT_INPUT_ERROR("sample interval for HAC should be an integer number.\n");
   }
   if (sample_interval <= 0) {
@@ -1828,7 +1836,7 @@ void HAC::parse(const char** param, int num_param)
   }
   printf("    sample interval is %d.\n", sample_interval);
 
-  if (!is_valid_int(param[2], &Nc)) {
+  if (!is_valid_int(tokens[2], &Nc)) {
     PRINT_INPUT_ERROR("Nc for HAC should be an integer number.\n");
   }
   if (Nc <= 0) {
@@ -1836,7 +1844,7 @@ void HAC::parse(const char** param, int num_param)
   }
   printf("    Nc is %d\n", Nc);
 
-  if (!is_valid_int(param[3], &output_interval)) {
+  if (!is_valid_int(tokens[3], &output_interval)) {
     PRINT_INPUT_ERROR("output_interval for HAC should be an integer number.\n");
   }
   if (output_interval <= 0) {
@@ -1844,7 +1852,7 @@ void HAC::parse(const char** param, int num_param)
   }
   printf("    output_interval is %d\n", output_interval);
   if (num_param >= 5) {
-    if (!is_valid_int(param[4], &use_centroid_heat_flux_)) {
+    if (!is_valid_int(tokens[4], &use_centroid_heat_flux_)) {
       PRINT_INPUT_ERROR("centroid heat flux flag for HAC should be an integer.\n");
     }
     if (use_centroid_heat_flux_ != 0) {
@@ -1852,7 +1860,7 @@ void HAC::parse(const char** param, int num_param)
     }
   }
   if (num_param >= 6) {
-    if (!is_valid_int(param[5], &split_qnep_heat_by_type_)) {
+    if (!is_valid_int(tokens[5], &split_qnep_heat_by_type_)) {
       PRINT_INPUT_ERROR("qNEP electrostatic split flag for HAC should be an integer.\n");
     }
     if (split_qnep_heat_by_type_ != 0) {
@@ -1860,7 +1868,7 @@ void HAC::parse(const char** param, int num_param)
     }
   }
   if (num_param == 7) {
-    if (!is_valid_int(param[6], &deferred_centroid_qnep_)) {
+    if (!is_valid_int(tokens[6], &deferred_centroid_qnep_)) {
       PRINT_INPUT_ERROR("deferred centroid qNEP flag for HAC should be an integer.\n");
     }
     if (deferred_centroid_qnep_ != 0) {
@@ -1870,9 +1878,8 @@ void HAC::parse(const char** param, int num_param)
   }
 }
 
-HAC::HAC(const char** param, int num_param, const bool qnep_full_a)
-  : qnep_full_a_(qnep_full_a)
+HAC::HAC(const std::vector<std::string>& tokens)
 {
-  parse(param, num_param);
+  parse(tokens);
   action_name = "compute_hac";
 }

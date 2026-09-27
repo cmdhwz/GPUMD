@@ -175,18 +175,15 @@ void Centroid_Force_Diagnostic::preprocess(
   Box&,
   Force& force)
 {
-  if (integrate.type < 31 || integrate.type > 33) {
+  if (!is_pimd(integrate.get_type())) {
     PRINT_INPUT_ERROR(
       "centroid_force_diagnostic requires a PIMD/RPMD/TRPMD ensemble.\n");
   }
-  if (force.compute_hnemd_ || force.compute_hnemdec_ >= 0) {
-    PRINT_INPUT_ERROR(
-      "centroid_force_diagnostic requires physical forces without HNEMD/HNEMDEC driving.\n");
-  }
   if (
-    integrate.num_target_pressure_components != 0 || integrate.use_scr_barostat ||
-    integrate.deform_x != 0 || integrate.deform_y != 0 || integrate.deform_z != 0 ||
-    integrate.deform_xy != 0 || integrate.deform_xz != 0 || integrate.deform_yz != 0) {
+    integrate.get_num_target_pressure_components() != 0 || integrate.get_use_scr_barostat() ||
+    integrate.get_deform_x() != 0 || integrate.get_deform_y() != 0 ||
+    integrate.get_deform_z() != 0 || integrate.get_deform_xy() != 0 ||
+    integrate.get_deform_xz() != 0 || integrate.get_deform_yz() != 0) {
     PRINT_INPUT_ERROR(
       "centroid_force_diagnostic requires a fixed-cell ring-polymer ensemble.\n");
   }

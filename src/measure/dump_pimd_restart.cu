@@ -190,8 +190,8 @@ void Dump_PIMD_Restart::process(
   const int number_of_atoms = atom.number_of_atoms;
   const int number_of_beads = atom.number_of_beads;
   const double natural_to_A_per_fs = 1.0 / TIME_UNIT_CONVERSION;
-  const double restart_temperature =
-    integrate.ensemble != nullptr ? integrate.ensemble->temperature : temperature;
+  const Ensemble* ensemble = integrate.get_ensemble();
+  const double restart_temperature = ensemble != nullptr ? ensemble->temperature : temperature;
 
   // The centroid frame is written first so restart readers can reuse the averaged state directly.
   atom.position_per_atom.copy_to_host(cpu_position_.data());

@@ -20,7 +20,6 @@ The k-space part of the PPPM method.
 #include "pppm.cuh"
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
-#include "utilities/read_file.cuh"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -1892,13 +1891,16 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
   }
 }
 
-void PPPM::initialize(const float alpha_input)
+void PPPM::initialize(
+  const float alpha_input,
+  const bool need_peratom_virial_input,
+  const bool need_peratom_virial_every_batch_input)
 {
   current_force_mesh_valid_ = false;
   dynamic_operator_cache_valid_ = false;
   dynamic_operator_host_cache_valid_ = false;
-  need_peratom_virial = check_need_peratom_virial();
-  need_peratom_virial_every_batch = check_need_peratom_virial_every_batch();
+  need_peratom_virial = need_peratom_virial_input;
+  need_peratom_virial_every_batch = need_peratom_virial_every_batch_input;
   para.alpha = alpha_input;
   para.alpha_factor = 0.25f / (para.alpha * para.alpha);
   para.K[0] = 16;

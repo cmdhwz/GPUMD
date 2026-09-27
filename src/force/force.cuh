@@ -18,9 +18,13 @@
 #include "model/box.cuh"
 #include "model/group.cuh"
 #include "potential.cuh"
+#ifdef GPUMD_WPE_ENABLED
+#include "wpe_stage.cuh"
+#endif
 #include "utilities/common.cuh"
 #include <memory>
 #include <stdio.h>
+#include <string>
 #include <vector>
 
 enum class PIMD_DP_Source_Count_Mode
@@ -29,6 +33,7 @@ enum class PIMD_DP_Source_Count_Mode
   Check,
   NeighborCounts
 };
+class RunInput;
 
 class Force
 {
@@ -57,14 +62,17 @@ public:
 
   Force(void);
 
-  void
-  parse_potential(const char** param, int num_param, const Box& box, const int number_of_atoms);
+  void parse_potential(
+    const std::vector<std::string>& tokens,
+    const Box& box,
+    const int number_of_atoms,
+    const RunInput& run_input);
 
   void compute(
     Box& box,
     GPU_Vector<double>& position_per_atom,
     GPU_Vector<int>& type,
-    std::vector<Group>& group,
+    const std::vector<Group>& group,
     GPU_Vector<double>& potential_per_atom,
     GPU_Vector<double>& force_per_atom,
     GPU_Vector<double>& virial_per_atom);
@@ -73,7 +81,7 @@ public:
     Box& box,
     GPU_Vector<double>& position_per_atom,
     GPU_Vector<int>& type,
-    std::vector<Group>& group,
+    const std::vector<Group>& group,
     GPU_Vector<double>& potential_per_atom,
     GPU_Vector<double>& force_per_atom,
     GPU_Vector<double>& virial_per_atom,
@@ -114,20 +122,16 @@ public:
     int bead_end,
     double initial_temperature);
 
+#ifdef GPUMD_WPE_ENABLED
+  void wpe_process_command(
+    const std::vector<std::string>& tokens,
+    int current_number_of_atoms);
+#endif
+
   void finalize();
   void notify_velocity_update();
 
   int get_number_of_types(FILE* fid_potential);
-  void set_hnemd_parameters(const double, const double, const double);
-  void set_hnemdec_parameters(
-    const int compute_hnemdec,
-    const double hnemd_fe_x,
-    const double hnemd_fe_y,
-    const double hnemd_fe_z,
-    const std::vector<double>& mass,
-    const std::vector<int>& type,
-    const std::vector<int>& type_size,
-    const double T);
   void set_multiple_potentials_mode(std::string mode);
   void set_pimd_bead_gpu_parallel(const int num_devices);
   void set_pimd_bead_neighbor_rebuild(const bool always_rebuild);
@@ -167,26 +171,37 @@ public:
   bool pimd_bead_gpu_parallel_available() const { return can_use_pimd_bead_gpu_parallel_(); }
   void reset_pimd_bead_timing();
   const PIMD_Bead_Timing& get_pimd_bead_timing() const { return pimd_bead_timing_; }
-
-  bool compute_hnemd_ = false;
-  int compute_hnemdec_ = -1;
-  double hnemd_fe_[3];
   double temperature = 0;
   double delta_T;
-  GPU_Vector<double> coefficient;
   std::vector<std::unique_ptr<Potential>> potentials;
   const std::string& primary_nep_model_path() const { return primary_nep_model_path_; }
 
+  void set_temperature_range(
+    const double temperature1, const double temperature2, const int number_of_steps);
+  void advance_temperature();
+  int get_number_of_potentials() const;
+  Potential& get_potential(const int index);
+  const RunInput& get_run_input() const;
+
 private:
+#ifdef GPUMD_WPE_ENABLED
+  WpeGpumdStageState wpe_stage_state_;
+#endif
+  std::unique_ptr<Potential> create_potential(
+    const std::vector<std::string>& tokens,
+    FILE* fid_potential,
+    char* potential_name,
+    const int num_types,
+    const Box& box,
+    const int number_of_atoms,
+    const RunInput& run_input,
+    bool& is_nep);
+
   int number_of_atoms_ = -1;
   bool is_fcp = false;
   bool has_non_nep = false;
-  // Workspace reused by the HNEMD total-force correction.
-  GPU_Vector<double> hnemd_force_sum_;
-  // Workspaces reused by the HNEMDEC heat-flow driving force.
-  GPU_Vector<double> hnemdec_tensor_per_atom_;
-  GPU_Vector<double> hnemdec_tensor_sum_;
   std::string multiple_potentials_mode_ = "observe"; // "observe" or "average"
+  const RunInput* run_input_ = nullptr;
   int pimd_bead_gpu_parallel_devices_ = 1;
   bool pimd_bead_neighbor_always_rebuild_ = true;
   double pppm_mesh_spacing_ = 1.0;
@@ -221,7 +236,7 @@ private:
   std::vector<std::unique_ptr<PIMD_Bead_GPU_Worker>> pimd_bead_gpu_workers_;
   PIMD_Bead_Timing pimd_bead_timing_;
 
-  void check_types(const char* file_potential);
+  void check_types(const std::string& file_potential);
   void apply_md_qnep_bec_setting_();
   bool can_use_pimd_bead_gpu_parallel_() const;
   bool can_use_pimd_qnep_batch_() const;
@@ -259,4 +274,31 @@ private:
     return pimd_qnep_batch_bec_mode_ == 1 ||
            (pimd_qnep_batch_bec_mode_ == 0 && pimd_qnep_batch_bec_required_);
   }
+
+  void prepare_compute(
+    const int number_of_atoms,
+    Box& box,
+    GPU_Vector<double>& position_per_atom,
+    GPU_Vector<double>& potential_per_atom,
+    GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& virial_per_atom,
+    int* position_image);
+  void compute_potentials(
+    const int number_of_atoms,
+    Box& box,
+    GPU_Vector<double>& position_per_atom,
+    GPU_Vector<int>& type,
+    const std::vector<Group>& group,
+    GPU_Vector<double>& potential_per_atom,
+    GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& virial_per_atom);
+  void compute_single_potential(
+    Potential& potential,
+    Box& box,
+    GPU_Vector<double>& position_per_atom,
+    GPU_Vector<int>& type,
+    const std::vector<Group>& group,
+    GPU_Vector<double>& potential_per_atom,
+    GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& virial_per_atom);
 };

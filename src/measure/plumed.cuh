@@ -21,6 +21,7 @@
 #include "force/potential.cuh"
 #include <plumed/wrapper/Plumed.h>
 #include <stdio.h>
+#include <string>
 #include <vector>
 
 class PLUMED : public Action
@@ -30,9 +31,10 @@ public:
   int interval = 1;
   int use_plumed = 0;
 
-  PLUMED(const char** param, int num_param);
+  PLUMED(const std::vector<std::string>& tokens);
+  bool modifies_force() const override { return use_plumed != 0; }
   
-  void parse(const char** param, int num_param);
+  void parse(const std::vector<std::string>& tokens);
   void init(const double ts, const double T);
 
   virtual void pre_run(
@@ -52,7 +54,7 @@ public:
     Box& box,
     Force& force);
 
-  virtual void post_force(
+  void post_force(
     const int step,
     const double time_step,
     const double global_time,
@@ -60,7 +62,7 @@ public:
     std::vector<Group>& group,
     Atom& atom,
     Box& box,
-    Force& force);
+    Force& force) override;
 
   virtual void end_of_step(
       const int number_of_steps,
@@ -90,9 +92,8 @@ protected:
   int stop_flag;
   double time_step;
   double bias_energy;
-  double total_energy;
-  char input_file[1024];
-  char output_file[1024];
+  std::string input_file;
+  std::string output_file;
   std::vector<double> cpu_m_vector; // Mass
   std::vector<double> cpu_b_vector; // Box
   std::vector<double> cpu_f_vector; // Forces

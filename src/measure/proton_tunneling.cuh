@@ -14,6 +14,7 @@
 */
 
 #pragma once
+#include "integrate/ensemble.cuh"
 #include "property.cuh"
 #include <array>
 #include <cstdio>
@@ -915,6 +916,7 @@ private:
   const char* chain_class_name(const ChainClass chain_class) const;
   const char* outcome_name(const AttemptOutcome outcome) const;
   const char* ensemble_name() const;
+  int legacy_ensemble_type_code() const;
   void observe_frame(const double time_fs, const Box& box, Atom& atom);
   void write_window(const double time_fs);
   void write_edge_window(const double time_start_fs, const double time_end_fs);
@@ -941,7 +943,7 @@ private:
   int window_sample_count_ = 0;
   int number_of_atoms_ = 0;
   int number_of_beads_ = 0;
-  int ensemble_type_ = 0;
+  EnsembleType ensemble_type_ = EnsembleType::UNKNOWN;
   long long window_id_ = 0;
   long long next_attempt_id_ = 1;
   long long window_flip_count_ = 0;

@@ -28,50 +28,17 @@ References for implementation:
 #include "langevin_utilities.cuh"
 #include "svr_utilities.cuh"
 #include "utilities/common.cuh"
+#include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
+#include "utilities/read_file.cuh"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <utility>
 
 namespace
 {
-
-template <typename T>
-void copy_gpu_buffer_between_devices_(
-  const int destination_device,
-  T* destination,
-  const int source_device,
-  const T* source,
-  const size_t count)
-{
-  if (count == 0) {
-    return;
-  }
-  const size_t bytes = sizeof(T) * count;
-  if (destination_device == source_device) {
-    CHECK(gpuSetDevice(destination_device));
-    CHECK(gpuMemcpy(destination, source, bytes, gpuMemcpyDeviceToDevice));
-    return;
-  }
-  CHECK(gpuMemcpyPeer(destination, destination_device, source, source_device, bytes));
-}
-
-template <typename T>
-void copy_gpu_vector_between_devices_(
-  const int destination_device,
-  GPU_Vector<T>& destination,
-  const int source_device,
-  const GPU_Vector<T>& source)
-{
-  if (destination.size() != source.size()) {
-    PRINT_INPUT_ERROR("Cannot copy between GPU vectors with inconsistent sizes.\n");
-  }
-  copy_gpu_buffer_between_devices_(
-    destination_device, destination.data(), source_device, source.data(), destination.size());
-}
 
 static __global__ void gpu_find_ring_polymer_energy(
   const int number_of_atoms,
@@ -150,94 +117,243 @@ void Ensemble_PIMD::initialize_rng()
 #endif
 };
 
-Ensemble_PIMD::Ensemble_PIMD(
-  int number_of_atoms_input,
-  int number_of_beads_input,
-  bool thermostat_internal_input,
-  Atom& atom,
-  bool use_exact_propagator_input,
-  double pile_scale_input,
-  bool fix_com_input,
-  bool reseed_from_centroid_input,
-  bool use_eco_pimd_input,
-  double eco_omega_max_cm1_input)
+Ensemble_PIMD::Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& box)
 {
-  number_of_atoms = number_of_atoms_input;
-  number_of_beads = number_of_beads_input;
-  num_target_pressure_components = 0;
-  thermostat_internal = thermostat_internal_input;
-  thermostat_centroid = false;
-  use_exact_propagator_ = use_exact_propagator_input;
-  pile_scale_ = pile_scale_input;
-  fix_com_ = fix_com_input;
-  reseed_from_centroid_ = reseed_from_centroid_input;
-  use_eco_pimd_ = use_eco_pimd_input;
-  eco_omega_max_cm1_ = eco_omega_max_cm1_input;
-  initialize(atom);
-}
+  const int num_param = tokens.size();
+  int pimd_num_param = num_param;
 
-Ensemble_PIMD::Ensemble_PIMD(
-  int number_of_atoms_input,
-  int number_of_beads_input,
-  double temperature_coupling_input,
-  Atom& atom,
-  bool use_exact_propagator_input,
-  double pile_scale_input,
-  bool fix_com_input,
-  bool reseed_from_centroid_input,
-  bool use_eco_pimd_input,
-  double eco_omega_max_cm1_input)
-{
-  number_of_atoms = number_of_atoms_input;
-  number_of_beads = number_of_beads_input;
-  num_target_pressure_components = 0;
-  temperature_coupling = temperature_coupling_input;
-  thermostat_internal = true;
-  thermostat_centroid = true;
-  use_exact_propagator_ = use_exact_propagator_input;
-  pile_scale_ = pile_scale_input;
-  fix_com_ = fix_com_input;
-  reseed_from_centroid_ = reseed_from_centroid_input;
-  use_eco_pimd_ = use_eco_pimd_input;
-  eco_omega_max_cm1_ = eco_omega_max_cm1_input;
-  initialize(atom);
-}
+  if (tokens[1] == "rpmd") {
+    type = EnsembleType::RPMD;
+    thermostat_internal = false;
+    thermostat_centroid = false;
+    if (num_param != 3) {
+      PRINT_INPUT_ERROR("ensemble rpmd should have 1 parameter.");
+    }
+  } else if (tokens[1] == "trpmd") {
+    type = EnsembleType::TRPMD;
+    thermostat_internal = true;
+    thermostat_centroid = false;
+    if (num_param != 3) {
+      PRINT_INPUT_ERROR("ensemble trpmd should have 1 parameter.");
+    }
+  } else {
+    type = EnsembleType::PIMD;
+    thermostat_internal = true;
+    thermostat_centroid = true;
+    use_scr_barostat = tokens[1] == "pimd_scr";
 
-Ensemble_PIMD::Ensemble_PIMD(
-  int number_of_atoms_input,
-  int number_of_beads_input,
-  double temperature_coupling_input,
-  int num_target_pressure_components_input,
-  double target_pressure_input[6],
-  double pressure_coupling_input[6],
-  Atom& atom,
-  bool use_exact_propagator_input,
-  double pile_scale_input,
-  bool fix_com_input,
-  bool use_scr_barostat_input,
-  bool reseed_from_centroid_input,
-  bool use_eco_pimd_input,
-  double eco_omega_max_cm1_input)
-{
-  number_of_atoms = number_of_atoms_input;
-  number_of_beads = number_of_beads_input;
-  temperature_coupling = temperature_coupling_input;
-  num_target_pressure_components = num_target_pressure_components_input;
-  for (int i = 0; i < 6; i++) {
-    target_pressure[i] = target_pressure_input[i];
-    pressure_coupling[i] = pressure_coupling_input[i];
+    // Optional Eco frequencies are selected by appending
+    // "eco omega_max_cm1" to an existing PIMD command.
+    if (num_param >= 8 && tokens[num_param - 2] == "eco") {
+      use_eco_pimd = true;
+      pimd_num_param = num_param - 2;
+      if (!is_valid_real(tokens[num_param - 1], &eco_omega_max_cm1)) {
+        PRINT_INPUT_ERROR("Eco-PIMD omega_max should be a number in cm^-1.");
+      }
+    }
+    if (use_scr_barostat) {
+      if (pimd_num_param != 9 && pimd_num_param != 13 && pimd_num_param != 19) {
+        PRINT_INPUT_ERROR(
+          "ensemble pimd_scr should have 7, 11, or 17 parameters, optionally followed by "
+          "eco omega_max_cm1.");
+      }
+    } else {
+      if (
+        pimd_num_param != 6 && pimd_num_param != 9 && pimd_num_param != 13 &&
+        pimd_num_param != 19) {
+        PRINT_INPUT_ERROR(
+          "ensemble pimd should have 4, 7, 11, or 17 parameters, optionally followed by "
+          "eco omega_max_cm1.");
+      }
+    }
+    if (use_eco_pimd && eco_omega_max_cm1 <= 0.0) {
+      PRINT_INPUT_ERROR("Eco-PIMD omega_max should > 0.");
+    }
   }
-  thermostat_internal = true;
-  thermostat_centroid = true;
-  use_exact_propagator_ = use_exact_propagator_input;
-  pile_scale_ = pile_scale_input;
-  fix_com_ = fix_com_input;
-  use_scr_barostat_ = use_scr_barostat_input;
-  reseed_from_centroid_ = reseed_from_centroid_input;
-  use_eco_pimd_ = use_eco_pimd_input;
-  eco_omega_max_cm1_ = eco_omega_max_cm1_input;
+
+  if (!is_valid_int(tokens[2], &number_of_beads)) {
+    PRINT_INPUT_ERROR("number of beads should be an integer.");
+  }
+  if (number_of_beads < 2) {
+    PRINT_INPUT_ERROR("number of beads should >= 2.");
+  }
+  if (number_of_beads > MAX_NUM_BEADS) {
+    PRINT_INPUT_ERROR("number of beads should <= 128.");
+  }
+  if (number_of_beads % 2 != 0) {
+    PRINT_INPUT_ERROR("number of beads should be an even number.");
+  }
+
+  num_target_pressure_components = 0;
+  if (type == EnsembleType::PIMD) {
+    if (!is_valid_real(tokens[3], &temperature1_)) {
+      PRINT_INPUT_ERROR("Initial temperature should be a number.");
+    }
+    if (temperature1_ <= 0.0) {
+      PRINT_INPUT_ERROR("Initial temperature should > 0.");
+    }
+    temperature = temperature1_;
+
+    if (!is_valid_real(tokens[4], &temperature2_)) {
+      PRINT_INPUT_ERROR("Final temperature should be a number.");
+    }
+    if (temperature2_ <= 0.0) {
+      PRINT_INPUT_ERROR("Final temperature should > 0.");
+    }
+
+    if (!is_valid_real(tokens[5], &temperature_coupling)) {
+      PRINT_INPUT_ERROR("Temperature coupling should be a number.");
+    }
+    if (temperature_coupling < 1.0) {
+      PRINT_INPUT_ERROR("Temperature coupling should >= 1.");
+    }
+
+    if (pimd_num_param >= 9) {
+      if (pimd_num_param == 13) {
+        for (int i = 0; i < 3; i++) {
+          if (!is_valid_real(tokens[6 + i], &target_pressure[i])) {
+            PRINT_INPUT_ERROR("Pressure should be a number.");
+          }
+        }
+        for (int i = 0; i < 3; i++) {
+          if (!is_valid_real(tokens[9 + i], &elastic_modulus_[i])) {
+            PRINT_INPUT_ERROR("elastic modulus should be a number.");
+          }
+          if (elastic_modulus_[i] <= 0) {
+            PRINT_INPUT_ERROR("elastic modulus should > 0.");
+          }
+        }
+        num_target_pressure_components = 3;
+        if (
+          box.cpu_h[1] != 0 || box.cpu_h[2] != 0 || box.cpu_h[3] != 0 || box.cpu_h[5] != 0 ||
+          box.cpu_h[6] != 0 || box.cpu_h[7] != 0) {
+          PRINT_INPUT_ERROR("Cannot use triclinic box with only 3 target pressure components.");
+        }
+      } else if (pimd_num_param == 9) {
+        if (!is_valid_real(tokens[6], &target_pressure[0])) {
+          PRINT_INPUT_ERROR("Pressure should be a number.");
+        }
+        if (!is_valid_real(tokens[7], &elastic_modulus_[0])) {
+          PRINT_INPUT_ERROR("elastic modulus should be a number.");
+        }
+        if (elastic_modulus_[0] <= 0) {
+          PRINT_INPUT_ERROR("elastic modulus should > 0.");
+        }
+        num_target_pressure_components = 1;
+        if (
+          box.cpu_h[1] != 0 || box.cpu_h[2] != 0 || box.cpu_h[3] != 0 || box.cpu_h[5] != 0 ||
+          box.cpu_h[6] != 0 || box.cpu_h[7] != 0) {
+          PRINT_INPUT_ERROR("Cannot use triclinic box with only 1 target pressure component.");
+        }
+        if (box.pbc_x == 0 || box.pbc_y == 0 || box.pbc_z == 0) {
+          PRINT_INPUT_ERROR(
+            "Cannot use isotropic pressure with non-periodic boundary in any direction.");
+        }
+      } else {
+        for (int i = 0; i < 6; i++) {
+          if (!is_valid_real(tokens[6 + i], &target_pressure[i])) {
+            PRINT_INPUT_ERROR("Pressure should be a number.");
+          }
+        }
+        for (int i = 0; i < 6; i++) {
+          if (!is_valid_real(tokens[12 + i], &elastic_modulus_[i])) {
+            PRINT_INPUT_ERROR("elastic modulus should be a number.");
+          }
+          if (elastic_modulus_[i] <= 0) {
+            PRINT_INPUT_ERROR("elastic modulus should > 0.");
+          }
+        }
+        num_target_pressure_components = 6;
+        if (box.pbc_x == 0 || box.pbc_y == 0 || box.pbc_z == 0) {
+          PRINT_INPUT_ERROR(
+            "Cannot use 6 pressure components with non-periodic boundary in any direction.");
+        }
+      }
+
+      int index_pressure_coupling = num_target_pressure_components * 2 + 6;
+      if (!is_valid_real(tokens[index_pressure_coupling], &tau_p_)) {
+        PRINT_INPUT_ERROR("Pressure coupling should be a number.");
+      }
+      if (tau_p_ < 1) {
+        PRINT_INPUT_ERROR("Pressure coupling should >= 1.");
+      }
+      for (int i = 0; i < num_target_pressure_components; i++) {
+        pressure_coupling[i] = 1.0 / (tau_p_ * 3.0 * elastic_modulus_[i]);
+        if (elastic_modulus_[i] > 2.0e3) {
+          pressure_coupling[i] = 0.0;
+        }
+      }
+    }
+  }
+
+  if (type == EnsembleType::RPMD) {
+    printf("Use ring-polymer MD (RPMD) for this run.\n");
+    printf("    number of beads is %d.\n", number_of_beads);
+  } else if (type == EnsembleType::TRPMD) {
+    printf("Use thermostatted ring-polyer MD (TRPMD) for this run.\n");
+    printf("    number of beads is %d.\n", number_of_beads);
+  } else {
+    if (pimd_num_param >= 9) {
+      if (use_scr_barostat) {
+        printf("Use NPT-PIMD with stochastic cell rescaling for this run.\n");
+      } else {
+        printf("Use NPT-PIMD for this run.\n");
+      }
+    } else {
+      printf("Use NVT-PIMD for this run.\n");
+    }
+    printf("    number of beads is %d.\n", number_of_beads);
+    printf("    initial temperature is %g K.\n", temperature1_);
+    printf("    final temperature is %g K.\n", temperature2_);
+    printf("    tau_T is %g time_step.\n", temperature_coupling);
+    if (pimd_num_param >= 9) {
+      if (num_target_pressure_components == 1) {
+        printf("    isotropic pressure is %g GPa.\n", target_pressure[0]);
+        printf("    bulk modulus is %g GPa.\n", elastic_modulus_[0]);
+      } else if (num_target_pressure_components == 3) {
+        printf("    pressure_xx is %g GPa.\n", target_pressure[0]);
+        printf("    pressure_yy is %g GPa.\n", target_pressure[1]);
+        printf("    pressure_zz is %g GPa.\n", target_pressure[2]);
+        printf("    modulus_xx is %g GPa.\n", elastic_modulus_[0]);
+        printf("    modulus_yy is %g GPa.\n", elastic_modulus_[1]);
+        printf("    modulus_zz is %g GPa.\n", elastic_modulus_[2]);
+      } else if (num_target_pressure_components == 6) {
+        printf("    pressure_xx is %g GPa.\n", target_pressure[0]);
+        printf("    pressure_yy is %g GPa.\n", target_pressure[1]);
+        printf("    pressure_zz is %g GPa.\n", target_pressure[2]);
+        printf("    pressure_yz is %g GPa.\n", target_pressure[3]);
+        printf("    pressure_xz is %g GPa.\n", target_pressure[4]);
+        printf("    pressure_xy is %g GPa.\n", target_pressure[5]);
+        printf("    modulus_xx is %g GPa.\n", elastic_modulus_[0]);
+        printf("    modulus_yy is %g GPa.\n", elastic_modulus_[1]);
+        printf("    modulus_zz is %g GPa.\n", elastic_modulus_[2]);
+        printf("    modulus_yz is %g GPa.\n", elastic_modulus_[3]);
+        printf("    modulus_xz is %g GPa.\n", elastic_modulus_[4]);
+        printf("    modulus_xy is %g GPa.\n", elastic_modulus_[5]);
+      }
+      printf("    tau_p is %g time_step.\n", tau_p_);
+
+      for (int i = 0; i < num_target_pressure_components; i++) {
+        target_pressure[i] /= PRESSURE_UNIT_CONVERSION;
+        pressure_coupling[i] *= PRESSURE_UNIT_CONVERSION;
+      }
+    }
+
+    if (use_eco_pimd) {
+      printf("    use Eco-PIMD internal-mode frequencies.\n");
+      printf("    Eco-PIMD omega_max is %g cm^-1.\n", eco_omega_max_cm1);
+    }
+  }
+}
+
+void Ensemble_PIMD::initialize_run(
+  const double, Atom& atom, Box&, const std::vector<Group>&)
+{
+  number_of_atoms = atom.number_of_atoms;
   initialize(atom);
-  initialize_rng();
+  if (num_target_pressure_components > 0) {
+    initialize_rng();
+  }
 }
 
 void Ensemble_PIMD::initialize(Atom& atom)
@@ -342,14 +458,18 @@ void Ensemble_PIMD::initialize(Atom& atom)
   free_ring_polymer_frequency.resize(number_of_beads);
   free_ring_polymer_cosine.resize(number_of_beads);
   free_ring_polymer_sine.resize(number_of_beads);
-  if (use_eco_pimd_) {
+  if (use_eco_pimd) {
     eco_mode_factors.resize(number_of_beads);
   }
+
+  position_normal.resize(number_of_atoms * number_of_beads * 3);
+  velocity_normal.resize(number_of_atoms * number_of_beads * 3);
 
   curand_states.resize(number_of_atoms);
   int grid_size = (number_of_atoms - 1) / 128 + 1;
   initialize_curand_states<<<grid_size, 128>>>(curand_states.data(), number_of_atoms, rand());
   GPU_CHECK_KERNEL
+  free_ring_polymer_propagator_initialized_ = false;
 }
 
 void Ensemble_PIMD::get_ring_polymer_energy(
@@ -384,9 +504,9 @@ void Ensemble_PIMD::reset_nonham_work()
   nonham_work_per_atom_.resize(number_of_atoms, 0.0);
 }
 
-void Ensemble_PIMD::update_eco_modes_()
+void Ensemble_PIMD::update_eco_modes()
 {
-  if (!use_eco_pimd_) {
+  if (!use_eco_pimd) {
     return;
   }
   if (!(temperature > 0.0) || !std::isfinite(temperature)) {
@@ -395,19 +515,19 @@ void Ensemble_PIMD::update_eco_modes_()
 
   const double temperature_tolerance =
     1.0e-12 * std::max(1.0, std::fabs(temperature));
-  if (std::fabs(temperature - eco_last_temperature_) <= temperature_tolerance) {
+  if (std::fabs(temperature - eco_last_temperature) <= temperature_tolerance) {
     return;
   }
 
   const double cm_to_kelvin = 1.4387768775039338;
-  const double x_max = cm_to_kelvin * eco_omega_max_cm1_ / temperature;
+  const double x_max = cm_to_kelvin * eco_omega_max_cm1 / temperature;
   Eco_PIMD_Result result =
     find_eco_pimd_frequencies(number_of_beads, x_max, eco_independent_frequencies);
   eco_mode_factors.copy_from_host(result.mode_factors.data());
   eco_independent_frequencies = std::move(result.independent_frequencies);
-  eco_last_temperature_ = temperature;
+  eco_last_temperature = temperature;
 
-  if (!eco_frequencies_reported_) {
+  if (!eco_frequencies_reported) {
     printf(
       "    Eco-PIMD frequencies: T=%g K, x_max=%g, RMSE(Trotter)=%g, "
       "RMSE(Eco)=%g, Newton iterations=%d.\n",
@@ -416,7 +536,7 @@ void Ensemble_PIMD::update_eco_modes_()
       result.rmse_trotter,
       result.rmse_eco,
       result.number_of_iterations);
-    eco_frequencies_reported_ = true;
+    eco_frequencies_reported = true;
   }
 }
 
@@ -433,7 +553,7 @@ void Ensemble_PIMD::update_free_ring_polymer_propagator_(const double time_step)
   std::vector<double> cosine(number_of_beads, 1.0);
   std::vector<double> sine(number_of_beads, 0.0);
   for (int k = 1; k < number_of_beads; ++k) {
-    const double omega_k = use_eco_pimd_
+    const double omega_k = use_eco_pimd
       ? omega_n * eco_mode_factors[k]
       : 2.0 * omega_n * sin(k * PI / number_of_beads);
     frequency[k] = omega_k;
@@ -452,136 +572,26 @@ void Ensemble_PIMD::update_free_ring_polymer_propagator_(const double time_step)
   free_ring_polymer_propagator_initialized_ = true;
 }
 
-Ensemble_PIMD::~Ensemble_PIMD(void)
+static __global__ void gpu_half_kick(
+  const int number_of_atoms,
+  const int number_of_beads,
+  const double time_step,
+  const double* g_mass,
+  double** force,
+  double** velocity)
 {
-  // nothing
-}
-
-void Ensemble_PIMD::clone_atom_to_current_device_(
-  const Atom& source, Atom& destination, const int source_device, const int destination_device)
-{
-  destination.number_of_atoms = source.number_of_atoms;
-  destination.number_of_beads = source.number_of_beads;
-  destination.type.resize(source.type.size());
-  destination.mass.resize(source.mass.size());
-  destination.charge.resize(source.charge.size());
-  destination.position_per_atom.resize(source.position_per_atom.size());
-  destination.velocity_per_atom.resize(source.velocity_per_atom.size());
-  destination.force_per_atom.resize(source.force_per_atom.size());
-  destination.potential_per_atom.resize(source.potential_per_atom.size());
-  destination.virial_per_atom.resize(source.virial_per_atom.size());
-  copy_gpu_vector_between_devices_(destination_device, destination.type, source_device, source.type);
-  copy_gpu_vector_between_devices_(destination_device, destination.mass, source_device, source.mass);
-  copy_gpu_vector_between_devices_(
-    destination_device, destination.charge, source_device, source.charge);
-  copy_gpu_vector_between_devices_(
-    destination_device,
-    destination.position_per_atom,
-    source_device,
-    source.position_per_atom);
-  copy_gpu_vector_between_devices_(
-    destination_device,
-    destination.velocity_per_atom,
-    source_device,
-    source.velocity_per_atom);
-  copy_gpu_vector_between_devices_(
-    destination_device,
-    destination.force_per_atom,
-    source_device,
-    source.force_per_atom);
-  copy_gpu_vector_between_devices_(
-    destination_device,
-    destination.potential_per_atom,
-    source_device,
-    source.potential_per_atom);
-  copy_gpu_vector_between_devices_(
-    destination_device,
-    destination.virial_per_atom,
-    source_device,
-    source.virial_per_atom);
-
-  destination.position_beads.resize(source.number_of_beads);
-  destination.velocity_beads.resize(source.number_of_beads);
-  destination.force_beads.resize(source.number_of_beads);
-  destination.potential_beads.resize(source.number_of_beads);
-  destination.virial_beads.resize(source.number_of_beads);
-  for (int k = 0; k < source.number_of_beads; ++k) {
-    destination.position_beads[k].resize(source.position_beads[k].size());
-    destination.velocity_beads[k].resize(source.velocity_beads[k].size());
-    destination.force_beads[k].resize(source.force_beads[k].size());
-    destination.potential_beads[k].resize(source.potential_beads[k].size());
-    destination.virial_beads[k].resize(source.virial_beads[k].size());
-    copy_gpu_vector_between_devices_(
-      destination_device, destination.position_beads[k], source_device, source.position_beads[k]);
-    copy_gpu_vector_between_devices_(
-      destination_device, destination.velocity_beads[k], source_device, source.velocity_beads[k]);
-    copy_gpu_vector_between_devices_(
-      destination_device, destination.force_beads[k], source_device, source.force_beads[k]);
-    copy_gpu_vector_between_devices_(
-      destination_device,
-      destination.potential_beads[k],
-      source_device,
-      source.potential_beads[k]);
-    copy_gpu_vector_between_devices_(
-      destination_device, destination.virial_beads[k], source_device, source.virial_beads[k]);
-  }
-}
-
-void Ensemble_PIMD::enable_distributed(int num_devices, Atom& atom, GPU_Vector<double>& thermo)
-{
-  if (distributed_enabled_ || num_devices <= 1) {
-    return;
-  }
-
-  distributed_replicas_.clear();
-  for (int device_id = 1; device_id < num_devices; ++device_id) {
-    CHECK(gpuSetDevice(device_id));
-    std::unique_ptr<DistributedReplica> replica(new DistributedReplica());
-    replica->device_id = device_id;
-    replica->bead_begin = device_id * number_of_beads / num_devices;
-    replica->bead_end = (device_id + 1) * number_of_beads / num_devices;
-    clone_atom_to_current_device_(atom, replica->atom, 0, device_id);
-    replica->thermo.resize(thermo.size());
-    copy_gpu_vector_between_devices_(device_id, replica->thermo, 0, thermo);
-    if (num_target_pressure_components == 0) {
-      replica->ensemble.reset(new Ensemble_PIMD(
-        number_of_atoms,
-        number_of_beads,
-        temperature_coupling,
-        replica->atom,
-        use_exact_propagator_,
-        pile_scale_,
-        fix_com_,
-        false,
-        use_eco_pimd_,
-        eco_omega_max_cm1_));
-    } else {
-      replica->ensemble.reset(new Ensemble_PIMD(
-        number_of_atoms,
-        number_of_beads,
-        temperature_coupling,
-        num_target_pressure_components,
-        target_pressure,
-        pressure_coupling,
-        replica->atom,
-        use_exact_propagator_,
-        pile_scale_,
-        fix_com_,
-        use_scr_barostat_,
-        false,
-        use_eco_pimd_,
-        eco_omega_max_cm1_));
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  const int k = blockIdx.y;
+  if (n < number_of_atoms && k < number_of_beads) {
+    const double factor = (time_step * 0.5) / g_mass[n];
+    for (int d = 0; d < 3; ++d) {
+      const int index_dn = d * number_of_atoms + n;
+      velocity[k][index_dn] += factor * force[k][index_dn];
     }
-    replica->ensemble->temperature = temperature;
-    copy_gpu_vector_between_devices_(
-      device_id, replica->ensemble->curand_states, 0, curand_states);
-    distributed_replicas_.push_back(std::move(replica));
   }
-  CHECK(gpuSetDevice(0));
-  distributed_enabled_ = !distributed_replicas_.empty();
 }
 
-static __global__ void gpu_nve_1(
+static __global__ void gpu_nve_forward(
   const int number_of_atoms,
   const int number_of_beads,
   const double time_step,
@@ -590,104 +600,105 @@ static __global__ void gpu_nve_1(
   const double* free_ring_polymer_frequency,
   const double* free_ring_polymer_cosine,
   const double* free_ring_polymer_sine,
-  const double* g_mass,
-  double** force,
   double** position,
-  double** velocity)
+  double** velocity,
+  double* position_normal,
+  double* velocity_normal)
 {
-  int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n < number_of_atoms) {
-    const double half_time_step = time_step * 0.5;
-    double factor = half_time_step / g_mass[n];
-    for (int k = 0; k < number_of_beads; ++k) {
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  const int k = blockIdx.y;
+  if (n < number_of_atoms && k < number_of_beads) {
+    double temp_velocity[3] = {0.0};
+    double temp_position[3] = {0.0};
+    for (int j = 0; j < number_of_beads; ++j) {
+      const int index_jk = j * number_of_beads + k;
       for (int d = 0; d < 3; ++d) {
-        int index_dn = d * number_of_atoms + n;
-        velocity[k][index_dn] += factor * force[k][index_dn];
+        const int index_dn = d * number_of_atoms + n;
+        temp_velocity[d] += velocity[j][index_dn] * transformation_matrix[index_jk];
+        temp_position[d] += position[j][index_dn] * transformation_matrix[index_jk];
       }
     }
 
-    double velocity_normal[MAX_NUM_BEADS * 3];
-    double position_normal[MAX_NUM_BEADS * 3];
-    for (int k = 0; k < number_of_beads; ++k) {
+    if (k == 0) {
       for (int d = 0; d < 3; ++d) {
-        double temp_velocity = 0.0;
-        double temp_position = 0.0;
-        for (int j = 0; j < number_of_beads; ++j) {
-          int index_dn = d * number_of_atoms + n;
-          int index_jk = j * number_of_beads + k;
-          temp_velocity += velocity[j][index_dn] * transformation_matrix[index_jk];
-          temp_position += position[j][index_dn] * transformation_matrix[index_jk];
-        }
-        int index_kd = k * 3 + d;
-        velocity_normal[index_kd] = temp_velocity;
-        position_normal[index_kd] = temp_position;
+        temp_position[d] += temp_velocity[d] * time_step;
       }
-    }
-
-    for (int d = 0; d < 3; ++d) {
-      position_normal[d] += velocity_normal[d] * time_step; // special case of k=0
-    }
-
-    for (int k = 1; k < number_of_beads; ++k) {
-      double omega_k = free_ring_polymer_frequency[k];
+    } else {
+      const double omega_k = free_ring_polymer_frequency[k];
       double cos_factor;
       double sin_factor;
       if (use_exact_propagator) {
         cos_factor = free_ring_polymer_cosine[k];
         sin_factor = free_ring_polymer_sine[k];
       } else {
-        // Cayley is a stable rational approximation to the exact rotation.
-        double cayley = 1.0 / (1 + (omega_k * half_time_step) * (omega_k * half_time_step));
-        cos_factor =
-          cayley * (1 - (omega_k * half_time_step) * (omega_k * half_time_step));
+        const double omega_half_time_step = omega_k * time_step * 0.5;
+        const double cayley = 1.0 / (1.0 + omega_half_time_step * omega_half_time_step);
+        cos_factor = cayley * (1.0 - omega_half_time_step * omega_half_time_step);
         sin_factor = cayley * omega_k * time_step;
       }
-      double sin_factor_times_omega = sin_factor * omega_k;
-      double sin_factor_over_omega = sin_factor / omega_k;
+      const double sin_factor_times_omega = sin_factor * omega_k;
+      const double sin_factor_over_omega = sin_factor / omega_k;
       for (int d = 0; d < 3; ++d) {
-        int index_kd = k * 3 + d;
-        double vel = velocity_normal[index_kd];
-        double pos = position_normal[index_kd];
-        velocity_normal[index_kd] = cos_factor * vel - sin_factor_times_omega * pos;
-        position_normal[index_kd] = sin_factor_over_omega * vel + cos_factor * pos;
+        const double old_velocity = temp_velocity[d];
+        const double old_position = temp_position[d];
+        temp_velocity[d] = cos_factor * old_velocity - sin_factor_times_omega * old_position;
+        temp_position[d] = sin_factor_over_omega * old_velocity + cos_factor * old_position;
       }
     }
 
-    for (int j = 0; j < number_of_beads; ++j) {
-      for (int d = 0; d < 3; ++d) {
-        double temp_velocity = 0.0;
-        double temp_position = 0.0;
-        for (int k = 0; k < number_of_beads; ++k) {
-          int index_jk = j * number_of_beads + k;
-          int index_kd = k * 3 + d;
-          temp_velocity += velocity_normal[index_kd] * transformation_matrix[index_jk];
-          temp_position += position_normal[index_kd] * transformation_matrix[index_jk];
-        }
-        int index_dn = d * number_of_atoms + n;
-        velocity[j][index_dn] = temp_velocity;
-        position[j][index_dn] = temp_position;
-      }
+    for (int d = 0; d < 3; ++d) {
+      const size_t index_kdn = (static_cast<size_t>(k) * 3 + d) * number_of_atoms + n;
+      velocity_normal[index_kdn] = temp_velocity[d];
+      position_normal[index_kdn] = temp_position[d];
     }
   }
 }
 
-static __global__ void gpu_nve_2(
+void Ensemble_PIMD::set_local_options(
+  const bool use_exact_propagator,
+  const double pile_scale,
+  const bool fix_com,
+  const bool reseed_from_centroid)
+{
+  use_exact_propagator_ = use_exact_propagator;
+  pile_scale_ = pile_scale;
+  fix_com_ = fix_com;
+  reseed_from_centroid_ = reseed_from_centroid;
+  free_ring_polymer_propagator_initialized_ = false;
+}
+
+void Ensemble_PIMD::set_restart_temperature(const double value)
+{
+  temperature = value;
+  temperature1_ = value;
+  temperature2_ = value;
+}
+static __global__ void gpu_nve_inverse(
   const int number_of_atoms,
   const int number_of_beads,
-  const double time_step,
-  const double* g_mass,
-  double** force,
+  const double* transformation_matrix,
+  const double* position_normal,
+  const double* velocity_normal,
+  double** position,
   double** velocity)
 {
-  int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n < number_of_atoms) {
-    const double half_time_step = time_step * 0.5;
-    double factor = half_time_step / g_mass[n];
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  const int j = blockIdx.y;
+  if (n < number_of_atoms && j < number_of_beads) {
+    double temp_velocity[3] = {0.0};
+    double temp_position[3] = {0.0};
     for (int k = 0; k < number_of_beads; ++k) {
+      int index_jk = j * number_of_beads + k;
       for (int d = 0; d < 3; ++d) {
-        int index_dn = d * number_of_atoms + n;
-        velocity[k][index_dn] += factor * force[k][index_dn];
+        size_t index_kdn = (static_cast<size_t>(k) * 3 + d) * number_of_atoms + n;
+        temp_velocity[d] += velocity_normal[index_kdn] * transformation_matrix[index_jk];
+        temp_position[d] += position_normal[index_kdn] * transformation_matrix[index_jk];
       }
+    }
+    for (int d = 0; d < 3; ++d) {
+      int index_dn = d * number_of_atoms + n;
+      velocity[j][index_dn] = temp_velocity[d];
+      position[j][index_dn] = temp_position[d];
     }
   }
 }
@@ -905,6 +916,8 @@ static __global__ void gpu_apply_pbc(
   }
 }
 
+static __global__ void constexpr int PIMD_ATOM_TILE = 8;
+
 static __global__ void gpu_average(
   const int number_of_atoms,
   const int number_of_beads,
@@ -919,38 +932,70 @@ static __global__ void gpu_average(
   double* force_averaged,
   double* virial_averaged)
 {
-  int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n < number_of_atoms) {
-    double pos_ave[3] = {0.0}, vel_ave[3] = {0.0}, pot_ave = 0.0, for_ave[3] = {0.0},
-           vir_ave[9] = {0.0};
-    for (int k = 0; k < number_of_beads; ++k) {
-      for (int d = 0; d < 3; ++d) {
-        int index_dn = d * number_of_atoms + n;
-        pos_ave[d] += position[k][index_dn];
-        vel_ave[d] += velocity[k][index_dn];
-        for_ave[d] += force[k][index_dn];
+  __shared__ double s_value[3][MAX_NUM_BEADS][PIMD_ATOM_TILE];
+  int local_atom = threadIdx.x;
+  int k = threadIdx.y;
+  int n = blockIdx.x * PIMD_ATOM_TILE + local_atom;
+  bool valid = n < number_of_atoms;
+  double number_of_beads_inverse = 1.0 / number_of_beads;
+
+  for (int d = 0; d < 3; ++d) {
+    int index_dn = d * number_of_atoms + n;
+    s_value[0][k][local_atom] = valid ? position[k][index_dn] : 0.0;
+    s_value[1][k][local_atom] = valid ? velocity[k][index_dn] : 0.0;
+    s_value[2][k][local_atom] = valid ? force[k][index_dn] : 0.0;
+    __syncthreads();
+    if (k == 0 && valid) {
+      double pos_ave = 0.0;
+      double vel_ave = 0.0;
+      double for_ave = 0.0;
+      for (int bead = 0; bead < number_of_beads; ++bead) {
+        pos_ave += s_value[0][bead][local_atom];
+        vel_ave += s_value[1][bead][local_atom];
+        for_ave += s_value[2][bead][local_atom];
       }
-      pot_ave += potential[k][n];
-      for (int d = 0; d < 9; ++d) {
-        vir_ave[d] += virial[k][d * number_of_atoms + n];
-      }
+      position_averaged[index_dn] = pos_ave * number_of_beads_inverse;
+      velocity_averaged[index_dn] = vel_ave * number_of_beads_inverse;
+      force_averaged[index_dn] = for_ave * number_of_beads_inverse;
     }
-    double number_of_beads_inverse = 1.0 / number_of_beads;
-    for (int d = 0; d < 3; ++d) {
-      int index_dn = d * number_of_atoms + n;
-      position_averaged[index_dn] = pos_ave[d] * number_of_beads_inverse;
-      velocity_averaged[index_dn] = vel_ave[d] * number_of_beads_inverse;
-      force_averaged[index_dn] = for_ave[d] * number_of_beads_inverse;
+    __syncthreads();
+  }
+
+  s_value[0][k][local_atom] = valid ? potential[k][n] : 0.0;
+  __syncthreads();
+  if (k == 0 && valid) {
+    double pot_ave = 0.0;
+    for (int bead = 0; bead < number_of_beads; ++bead) {
+      pot_ave += s_value[0][bead][local_atom];
     }
     potential_averaged[n] = pot_ave * number_of_beads_inverse;
-    for (int d = 0; d < 9; ++d) {
-      virial_averaged[d * number_of_atoms + n] = vir_ave[d] * number_of_beads_inverse;
+  }
+  __syncthreads();
+
+  for (int group = 0; group < 3; ++group) {
+    for (int lane = 0; lane < 3; ++lane) {
+      int d = group * 3 + lane;
+      int index_dn = d * number_of_atoms + n;
+      s_value[lane][k][local_atom] = valid ? virial[k][index_dn] : 0.0;
     }
+    __syncthreads();
+    if (k == 0 && valid) {
+      for (int lane = 0; lane < 3; ++lane) {
+        int d = group * 3 + lane;
+        double vir_ave = 0.0;
+        for (int bead = 0; bead < number_of_beads; ++bead) {
+          vir_ave += s_value[lane][bead][local_atom];
+        }
+        virial_averaged[d * number_of_atoms + n] = vir_ave * number_of_beads_inverse;
+      }
+    }
+    __syncthreads();
   }
 }
 
+constexpr int PIMD_VIRIAL_ATOM_TILE = 8;
+
 static __global__ void gpu_find_kinetic_energy_virial_part(
-  const Box box,
   const int number_of_atoms,
   const int number_of_beads,
   double** position,
@@ -959,33 +1004,60 @@ static __global__ void gpu_find_kinetic_energy_virial_part(
   double* kinetic_energy_virial_part,
   double* virial_averaged)
 {
-  int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n < number_of_atoms) {
-    double temp_sum[9] = {0.0};
-    for (int k = 0; k < number_of_beads; ++k) {
-      int index_x = 0 * number_of_atoms + n;
-      int index_y = 1 * number_of_atoms + n;
-      int index_z = 2 * number_of_atoms + n;
-      // the virial tensor:
-      // xx xy xz    0 3 4
-      // yx yy yz    6 1 5
-      // zx zy zz    7 8 2
-      temp_sum[0] -= (position[k][index_x] - position_averaged[index_x]) * force[k][index_x];
-      temp_sum[1] -= (position[k][index_y] - position_averaged[index_y]) * force[k][index_y];
-      temp_sum[2] -= (position[k][index_z] - position_averaged[index_z]) * force[k][index_z];
-      temp_sum[3] -= (position[k][index_x] - position_averaged[index_x]) * force[k][index_y];
-      temp_sum[4] -= (position[k][index_x] - position_averaged[index_x]) * force[k][index_z];
-      temp_sum[5] -= (position[k][index_y] - position_averaged[index_y]) * force[k][index_z];
-      temp_sum[6] -= (position[k][index_y] - position_averaged[index_y]) * force[k][index_x];
-      temp_sum[7] -= (position[k][index_z] - position_averaged[index_z]) * force[k][index_x];
-      temp_sum[8] -= (position[k][index_z] - position_averaged[index_z]) * force[k][index_y];
+  __shared__ double s_value[3][MAX_NUM_BEADS][PIMD_VIRIAL_ATOM_TILE];
+  int local_atom = threadIdx.x;
+  int k = threadIdx.y;
+  int n = blockIdx.x * PIMD_VIRIAL_ATOM_TILE + local_atom;
+  bool valid = n < number_of_atoms;
+  double number_of_beads_inverse = 1.0 / number_of_beads;
+  double diagonal_sum = 0.0;
+
+  double contribution[9] = {0.0};
+  if (valid) {
+    int index_x = n;
+    int index_y = number_of_atoms + n;
+    int index_z = 2 * number_of_atoms + n;
+    double dx = position[k][index_x] - position_averaged[index_x];
+    double dy = position[k][index_y] - position_averaged[index_y];
+    double dz = position[k][index_z] - position_averaged[index_z];
+    double fx = force[k][index_x];
+    double fy = force[k][index_y];
+    double fz = force[k][index_z];
+    contribution[0] = -dx * fx;
+    contribution[1] = -dy * fy;
+    contribution[2] = -dz * fz;
+    contribution[3] = -dx * fy;
+    contribution[4] = -dx * fz;
+    contribution[5] = -dy * fz;
+    contribution[6] = -dy * fx;
+    contribution[7] = -dz * fx;
+    contribution[8] = -dz * fy;
+  }
+
+  for (int group = 0; group < 3; ++group) {
+    for (int lane = 0; lane < 3; ++lane) {
+      s_value[lane][k][local_atom] = contribution[group * 3 + lane];
     }
-    double number_of_beads_inverse = 1.0 / number_of_beads;
-    for (int d = 0; d < 9; ++d) {
-      virial_averaged[d * number_of_atoms + n] += temp_sum[d] * number_of_beads_inverse;
+    __syncthreads();
+    if (k == 0 && valid) {
+      for (int lane = 0; lane < 3; ++lane) {
+        int d = group * 3 + lane;
+        double sum = 0.0;
+        for (int bead = 0; bead < number_of_beads; ++bead) {
+          sum += s_value[lane][bead][local_atom];
+        }
+        virial_averaged[d * number_of_atoms + n] += sum * number_of_beads_inverse;
+        if (group == 0) {
+          diagonal_sum += sum;
+        }
+      }
     }
+    __syncthreads();
+  }
+
+  if (k == 0 && valid) {
     kinetic_energy_virial_part[n] =
-      0.5f * (temp_sum[0] + temp_sum[1] + temp_sum[2]) * number_of_beads_inverse;
+      0.5f * diagonal_sum * number_of_beads_inverse;
   }
 }
 
@@ -1308,15 +1380,17 @@ void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
   }
 }
 
-void Ensemble_PIMD::compute1_local_(
+void Ensemble_PIMD::compute1(
   const double time_step,
+  const int step,
+  const int number_of_steps,
   const std::vector<Group>& group,
   Box& box,
   Atom& atom,
   GPU_Vector<double>& thermo)
 {
   omega_n = number_of_beads * K_B * temperature / HBAR;
-  update_eco_modes_();
+  update_eco_modes();
   update_free_ring_polymer_propagator_(time_step);
 
   langevin(time_step, atom);
@@ -1325,7 +1399,17 @@ void Ensemble_PIMD::compute1_local_(
     box, number_of_atoms, number_of_beads, position_beads.data());
   GPU_CHECK_KERNEL
 
-  gpu_nve_1<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
+  const dim3 grid((number_of_atoms - 1) / 64 + 1, number_of_beads);
+  gpu_half_kick<<<grid, 64>>>(
+    number_of_atoms,
+    number_of_beads,
+    time_step,
+    atom.mass.data(),
+    force_beads.data(),
+    velocity_beads.data());
+  GPU_CHECK_KERNEL
+
+  gpu_nve_forward<<<grid, 64>>>(
     number_of_atoms,
     number_of_beads,
     time_step,
@@ -1334,25 +1418,39 @@ void Ensemble_PIMD::compute1_local_(
     free_ring_polymer_frequency.data(),
     free_ring_polymer_cosine.data(),
     free_ring_polymer_sine.data(),
-    atom.mass.data(),
-    force_beads.data(),
+    position_beads.data(),
+    velocity_beads.data(),
+    position_normal.data(),
+    velocity_normal.data());
+  GPU_CHECK_KERNEL
+
+  gpu_nve_inverse<<<grid, 64>>>(
+    number_of_atoms,
+    number_of_beads,
+    transformation_matrix.data(),
+    position_normal.data(),
+    velocity_normal.data(),
     position_beads.data(),
     velocity_beads.data());
   GPU_CHECK_KERNEL
 }
 
-void Ensemble_PIMD::compute2_local_pre_pressure_(
+void Ensemble_PIMD::compute2(
   const double time_step,
+  const int step,
+  const int number_of_steps,
   const std::vector<Group>& group,
   Box& box,
   Atom& atom,
-  GPU_Vector<double>& thermo)
+  GPU_Vector<double>& thermo,
+  Force& force)
 {
   omega_n = number_of_beads * K_B * temperature / HBAR;
-  update_eco_modes_();
+  update_eco_modes();
   update_free_ring_polymer_propagator_(time_step);
 
-  gpu_nve_2<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
+  const dim3 grid((number_of_atoms - 1) / 64 + 1, number_of_beads);
+  gpu_half_kick<<<grid, 64>>>(
     number_of_atoms,
     number_of_beads,
     time_step,
@@ -1367,7 +1465,9 @@ void Ensemble_PIMD::compute2_local_pre_pressure_(
     box, number_of_atoms, number_of_beads, position_beads.data());
   GPU_CHECK_KERNEL
 
-  gpu_average<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
+  const dim3 average_block(PIMD_ATOM_TILE, number_of_beads);
+  const dim3 average_grid((number_of_atoms - 1) / PIMD_ATOM_TILE + 1);
+  gpu_average<<<average_grid, average_block>>>(
     number_of_atoms,
     number_of_beads,
     position_beads.data(),
@@ -1382,8 +1482,9 @@ void Ensemble_PIMD::compute2_local_pre_pressure_(
     atom.virial_per_atom.data());
   GPU_CHECK_KERNEL
 
-  gpu_find_kinetic_energy_virial_part<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
-    box,
+  const dim3 virial_block(PIMD_VIRIAL_ATOM_TILE, number_of_beads);
+  const dim3 virial_grid((number_of_atoms - 1) / PIMD_VIRIAL_ATOM_TILE + 1);
+  gpu_find_kinetic_energy_virial_part<<<virial_grid, virial_block>>>(
     number_of_atoms,
     number_of_beads,
     position_beads.data(),
@@ -1404,326 +1505,70 @@ void Ensemble_PIMD::compute2_local_pre_pressure_(
   gpu_find_thermo<<<8, 1024>>>(
     box.get_volume(), number_of_atoms * K_B * temperature, sum_1024.data(), thermo.data());
   GPU_CHECK_KERNEL
-}
-
-void Ensemble_PIMD::apply_pressure_local_isotropic_(Atom& atom, const double scale_factor)
-{
-  gpu_pressure_isotropic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-    number_of_atoms,
-    number_of_beads,
-    scale_factor,
-    position_beads.data(),
-    atom.position_per_atom.data());
-  GPU_CHECK_KERNEL
-}
-
-void Ensemble_PIMD::apply_pressure_local_orthogonal_(Atom& atom, double scale_factor[3])
-{
-  gpu_pressure_orthogonal<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-    number_of_atoms,
-    number_of_beads,
-    scale_factor[0],
-    scale_factor[1],
-    scale_factor[2],
-    position_beads.data(),
-    atom.position_per_atom.data());
-  GPU_CHECK_KERNEL
-}
-
-void Ensemble_PIMD::apply_pressure_local_triclinic_(Atom& atom, double mu[9])
-{
-  gpu_pressure_triclinic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
-    number_of_atoms,
-    number_of_beads,
-    mu[0],
-    mu[1],
-    mu[2],
-    mu[3],
-    mu[4],
-    mu[5],
-    mu[6],
-    mu[7],
-    mu[8],
-    position_beads.data(),
-    atom.position_per_atom.data());
-  GPU_CHECK_KERNEL
-}
-
-void Ensemble_PIMD::compute1(
-  const double time_step,
-  const std::vector<Group>& group,
-  Box& box,
-  Atom& atom,
-  GPU_Vector<double>& thermo)
-{
-  compute1_local_(time_step, group, box, atom, thermo);
-  if (!distributed_enabled_) {
-    return;
-  }
-  for (auto& replica_ptr : distributed_replicas_) {
-    auto& replica = *replica_ptr;
-    CHECK(gpuSetDevice(replica.device_id));
-    replica.ensemble->temperature = temperature;
-    replica.ensemble->compute1_local_(time_step, group, box, replica.atom, replica.thermo);
-  }
-  CHECK(gpuSetDevice(0));
-}
-
-void Ensemble_PIMD::compute2(
-  const double time_step,
-  const std::vector<Group>& group,
-  Box& box,
-  Atom& atom,
-  GPU_Vector<double>& thermo)
-{
-  if (!distributed_enabled_) {
-    compute2_local_pre_pressure_(time_step, group, box, atom, thermo);
-    if (num_target_pressure_components == 1) {
-      double scale_factor;
-      cpu_pressure_isotropic(
-        rng,
-        use_scr_barostat_,
-        box,
-        temperature,
-        target_pressure,
-        pressure_coupling,
-        thermo.data(),
-        scale_factor);
-      apply_pressure_local_isotropic_(atom, scale_factor);
-    } else if (num_target_pressure_components == 3) {
-      double scale_factor[3];
-      cpu_pressure_orthogonal(
-        rng,
-        use_scr_barostat_,
-        box,
-        temperature,
-        target_pressure,
-        pressure_coupling,
-        thermo.data(),
-        scale_factor);
-      apply_pressure_local_orthogonal_(atom, scale_factor);
-    } else if (num_target_pressure_components == 6) {
-      double mu[9];
-      cpu_pressure_triclinic(
-        rng,
-        use_scr_barostat_,
-        box,
-        temperature,
-        target_pressure,
-        pressure_coupling,
-        thermo.data(),
-        mu);
-      apply_pressure_local_triclinic_(atom, mu);
-    }
-    return;
-  }
-
-  Box box_before = box;
-  compute2_local_pre_pressure_(time_step, group, box_before, atom, thermo);
-  for (auto& replica_ptr : distributed_replicas_) {
-    auto& replica = *replica_ptr;
-    CHECK(gpuSetDevice(replica.device_id));
-    replica.ensemble->temperature = temperature;
-    replica.ensemble->compute2_local_pre_pressure_(
-      time_step, group, box_before, replica.atom, replica.thermo);
-  }
 
   if (num_target_pressure_components == 1) {
     double scale_factor;
     cpu_pressure_isotropic(
       rng,
-      use_scr_barostat_,
+      use_scr_barostat,
       box,
       temperature,
       target_pressure,
       pressure_coupling,
       thermo.data(),
       scale_factor);
-    apply_pressure_local_isotropic_(atom, scale_factor);
-    for (auto& replica_ptr : distributed_replicas_) {
-      CHECK(gpuSetDevice(replica_ptr->device_id));
-      replica_ptr->ensemble->apply_pressure_local_isotropic_(replica_ptr->atom, scale_factor);
-    }
+    gpu_pressure_isotropic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      number_of_beads,
+      scale_factor,
+      position_beads.data(),
+      atom.position_per_atom.data());
+    GPU_CHECK_KERNEL
   } else if (num_target_pressure_components == 3) {
     double scale_factor[3];
     cpu_pressure_orthogonal(
       rng,
-      use_scr_barostat_,
+      use_scr_barostat,
       box,
       temperature,
       target_pressure,
       pressure_coupling,
       thermo.data(),
       scale_factor);
-    apply_pressure_local_orthogonal_(atom, scale_factor);
-    for (auto& replica_ptr : distributed_replicas_) {
-      CHECK(gpuSetDevice(replica_ptr->device_id));
-      replica_ptr->ensemble->apply_pressure_local_orthogonal_(replica_ptr->atom, scale_factor);
-    }
+    gpu_pressure_orthogonal<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      number_of_beads,
+      scale_factor[0],
+      scale_factor[1],
+      scale_factor[2],
+      position_beads.data(),
+      atom.position_per_atom.data());
+    GPU_CHECK_KERNEL
   } else if (num_target_pressure_components == 6) {
     double mu[9];
     cpu_pressure_triclinic(
       rng,
-      use_scr_barostat_,
+      use_scr_barostat,
       box,
       temperature,
       target_pressure,
       pressure_coupling,
       thermo.data(),
       mu);
-    apply_pressure_local_triclinic_(atom, mu);
-    for (auto& replica_ptr : distributed_replicas_) {
-      CHECK(gpuSetDevice(replica_ptr->device_id));
-      replica_ptr->ensemble->apply_pressure_local_triclinic_(replica_ptr->atom, mu);
-    }
+    gpu_pressure_triclinic<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+      number_of_atoms,
+      number_of_beads,
+      mu[0],
+      mu[1],
+      mu[2],
+      mu[3],
+      mu[4],
+      mu[5],
+      mu[6],
+      mu[7],
+      mu[8],
+      position_beads.data(),
+      atom.position_per_atom.data());
+    GPU_CHECK_KERNEL
   }
-  CHECK(gpuSetDevice(0));
-}
-
-void Ensemble_PIMD::compute_force_distributed(
-  Force& force, Box& box, std::vector<Group>& group, Atom& atom)
-{
-  if (!distributed_enabled_) {
-    force.compute_pimd_beads(
-      box,
-      atom.type,
-      group,
-      atom.position_beads,
-      atom.potential_beads,
-      atom.force_beads,
-      atom.virial_beads,
-      atom.velocity_beads,
-      atom.mass);
-    return;
-  }
-
-  const int num_devices = int(distributed_replicas_.size()) + 1;
-  const int owner0_begin = 0;
-  const int owner0_end = number_of_beads / num_devices;
-  const double initial_temperature = force.temperature;
-
-  force.compute_pimd_bead_range_on_device(
-    0,
-    box,
-    atom.type,
-    group,
-    atom.position_beads,
-    atom.potential_beads,
-    atom.force_beads,
-    atom.virial_beads,
-    atom.velocity_beads,
-    atom.mass,
-    owner0_begin,
-    owner0_end,
-    initial_temperature);
-
-  for (auto& replica_ptr : distributed_replicas_) {
-    auto& replica = *replica_ptr;
-    force.compute_pimd_bead_range_on_device(
-      replica.device_id,
-      box,
-      replica.atom.type,
-      group,
-      replica.atom.position_beads,
-      replica.atom.potential_beads,
-      replica.atom.force_beads,
-      replica.atom.virial_beads,
-      replica.atom.velocity_beads,
-      replica.atom.mass,
-      replica.bead_begin,
-      replica.bead_end,
-      initial_temperature);
-  }
-
-  CHECK(gpuSetDevice(0));
-  CHECK(gpuDeviceSynchronize());
-  for (auto& replica_ptr : distributed_replicas_) {
-    CHECK(gpuSetDevice(replica_ptr->device_id));
-    CHECK(gpuDeviceSynchronize());
-  }
-
-  auto sync_bead =
-    [&](const int destination_device,
-        const int source_device,
-        const std::vector<GPU_Vector<double>>& src_position_beads,
-        const std::vector<GPU_Vector<double>>& src_potential_beads,
-        const std::vector<GPU_Vector<double>>& src_force_beads,
-        const std::vector<GPU_Vector<double>>& src_virial_beads,
-        Atom& destination,
-        const int bead_begin,
-        const int bead_end) {
-      for (int bead_id = bead_begin; bead_id < bead_end; ++bead_id) {
-        copy_gpu_buffer_between_devices_(
-          destination_device,
-          destination.position_beads[bead_id].data(),
-          source_device,
-          src_position_beads[bead_id].data(),
-          number_of_atoms * 3);
-        copy_gpu_buffer_between_devices_(
-          destination_device,
-          destination.potential_beads[bead_id].data(),
-          source_device,
-          src_potential_beads[bead_id].data(),
-          number_of_atoms);
-        copy_gpu_buffer_between_devices_(
-          destination_device,
-          destination.force_beads[bead_id].data(),
-          source_device,
-          src_force_beads[bead_id].data(),
-          number_of_atoms * 3);
-        copy_gpu_buffer_between_devices_(
-          destination_device,
-          destination.virial_beads[bead_id].data(),
-          source_device,
-          src_virial_beads[bead_id].data(),
-          number_of_atoms * 9);
-      }
-    };
-
-  for (auto& replica_ptr : distributed_replicas_) {
-    auto& replica = *replica_ptr;
-    sync_bead(
-      0,
-      replica.device_id,
-      replica.atom.position_beads,
-      replica.atom.potential_beads,
-      replica.atom.force_beads,
-      replica.atom.virial_beads,
-      atom,
-      replica.bead_begin,
-      replica.bead_end);
-  }
-
-  for (auto& replica_ptr : distributed_replicas_) {
-    auto& replica = *replica_ptr;
-    sync_bead(
-      replica.device_id,
-      0,
-      atom.position_beads,
-      atom.potential_beads,
-      atom.force_beads,
-      atom.virial_beads,
-      replica.atom,
-      owner0_begin,
-      owner0_end);
-    for (auto& other_ptr : distributed_replicas_) {
-      auto& other = *other_ptr;
-      if (other.device_id == replica.device_id) {
-        continue;
-      }
-      sync_bead(
-        replica.device_id,
-        other.device_id,
-        other.atom.position_beads,
-        other.atom.potential_beads,
-        other.atom.force_beads,
-        other.atom.virial_beads,
-        replica.atom,
-        other.bead_begin,
-        other.bead_end);
-    }
-  }
-
-  force.temperature = initial_temperature + number_of_beads * force.delta_T;
-  CHECK(gpuSetDevice(0));
 }

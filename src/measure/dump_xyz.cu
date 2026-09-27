@@ -55,11 +55,15 @@ static __global__ void gpu_sum(const int N, const double* g_data, double* g_data
   }
 }
 
-Dump_XYZ::Dump_XYZ(const char** param, int num_param, const std::vector<Group>& groups, Atom& atom)
+Dump_XYZ::Dump_XYZ(
+  const std::vector<std::string>& tokens,
+  const std::vector<Group>& groups,
+  Atom& atom,
+  bool is_nep_charge_input)
 {
-  is_nep_charge = check_is_nep_charge();
+  is_nep_charge = is_nep_charge_input;
 
-  parse(param, num_param, groups);
+  parse(tokens, groups);
 
   if (quantities.has_unwrapped_position_) {
     atom.enable_unwrapped_position();
@@ -68,26 +72,30 @@ Dump_XYZ::Dump_XYZ(const char** param, int num_param, const std::vector<Group>& 
   action_name = "dump_xyz";
 }
 
-void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>& groups)
+void Dump_XYZ::parse(
+  const std::vector<std::string>& tokens, const std::vector<Group>& groups)
 {
+  const int num_param = tokens.size();
   printf("Dump extended XYZ.\n");
 
   if (num_param < 3) {
     PRINT_INPUT_ERROR("dump_xyz should have at least 2 parameters.\n");
   }
 
-  // The old syntax started with <grouping_method> <group_id> <interval>, so param[2] and param[3]
-  // were both integers. In the current syntax param[2] is the file name and param[3] is an option
-  // or a quantity keyword, neither of which is an integer.
+  // The old syntax started with <grouping_method> <group_id> <interval>, so tokens[2] and
+  // tokens[3] were both integers. In the current syntax tokens[2] is the file name and tokens[3]
+  // is an option or a quantity keyword, neither of which is an integer.
   int scratch;
-  if (num_param >= 4 && is_valid_int(param[2], &scratch) && is_valid_int(param[3], &scratch)) {
+  if (
+    num_param >= 4 && is_valid_int(tokens[2], &scratch) &&
+    is_valid_int(tokens[3], &scratch)) {
     PRINT_INPUT_ERROR(
       "dump_xyz no longer takes <grouping_method> <group_id> as its first two "
       "parameters. Use dump_xyz <interval> <filename> [group <grouping_method> "
       "<group_id>] instead.");
   }
 
-  if (!is_valid_int(param[1], &dump_interval_)) {
+  if (!is_valid_int(tokens[1], &dump_interval_)) {
     PRINT_INPUT_ERROR("dump interval should be an integer.");
   }
   if (dump_interval_ <= 0) {
@@ -97,7 +105,7 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
   }
 
   // filename
-  std::string filename_temp = param[2];
+  std::string filename_temp = tokens[2];
   printf("    into file %s.\n", filename_temp.c_str());
   if (filename_temp.back() == '*') {
     separated_ = 1;
@@ -122,7 +130,7 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
   };
 
   for (int m = 3; m < num_param; ++m) {
-    if (strcmp(param[m], "group") == 0) {
+    if (tokens[m] == "group") {
       if (group_seen) {
         PRINT_INPUT_ERROR("Option 'group' is specified more than once in dump_xyz.\n");
       }
@@ -130,25 +138,25 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
       // what it is called now rather than only complaining about the missing arguments.
       int probe;
       if (
-        m + 2 >= num_param || !is_valid_int(param[m + 1], &probe) ||
-        !is_valid_int(param[m + 2], &probe)) {
+        m + 2 >= num_param || !is_valid_int(tokens[m + 1], &probe) ||
+        !is_valid_int(tokens[m + 2], &probe)) {
         PRINT_INPUT_ERROR(
           "Option 'group' should be followed by a grouping method and a group ID. The quantity "
           "that writes group labels as a column is now called 'group_labels'.");
       }
-      parse_group(param, num_param, false, groups, m, grouping_method_, group_id_);
+      parse_group(tokens, false, groups, m, grouping_method_, group_id_);
       group_seen = true;
       continue;
     }
-    if (strcmp(param[m], "precision") == 0) {
+    if (tokens[m] == "precision") {
       if (precision_seen) {
         PRINT_INPUT_ERROR("Option 'precision' is specified more than once in dump_xyz.\n");
       }
-      parse_precision(param, num_param, m, precision_);
+      parse_precision(tokens, m, precision_);
       precision_seen = true;
       continue;
     }
-    if (strcmp(param[m], "pppm_debug") == 0) {
+    if (tokens[m] == "pppm_debug") {
       if (!is_nep_charge) {
         PRINT_INPUT_ERROR("pppm_debug requires an NEP-charge model.\n");
       }
@@ -156,11 +164,11 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
         PRINT_INPUT_ERROR("pppm_debug should be followed by one output prefix.\n");
       }
       has_pppm_debug_ = true;
-      pppm_debug_prefix_ = param[++m];
+      pppm_debug_prefix_ = tokens[++m];
       printf("    PPPM debug output prefix: %s.\n", pppm_debug_prefix_.c_str());
       continue;
     }
-    if (strcmp(param[m], "pppm_dynamic_q") == 0 || strcmp(param[m], "pppm_dynamic_q_debug") == 0) {
+    if (tokens[m] == "pppm_dynamic_q" || tokens[m] == "pppm_dynamic_q_debug") {
       if (!is_nep_charge) {
         PRINT_INPUT_ERROR("pppm_dynamic_q requires an NEP-charge model.\n");
       }
@@ -168,45 +176,45 @@ void Dump_XYZ::parse(const char** param, int num_param, const std::vector<Group>
         PRINT_INPUT_ERROR("pppm_dynamic_q is specified more than once in dump_xyz.\n");
       }
       has_pppm_dynamic_q_ = true;
-      has_pppm_dynamic_q_debug_ = strcmp(param[m], "pppm_dynamic_q_debug") == 0;
+      has_pppm_dynamic_q_debug_ = tokens[m] == "pppm_dynamic_q_debug";
       printf(
         "    PPPM dynamic-q diagnostic%s.\n",
         has_pppm_dynamic_q_debug_ ? " with atom/k-space debug" : "");
       continue;
     }
-    if (strcmp(param[m], "raw_charge") == 0) {
-      set_qnep_quantity(has_raw_charge_, param[m]);
+    if (tokens[m] == "raw_charge") {
+      set_qnep_quantity(has_raw_charge_, tokens[m].c_str());
       continue;
     }
-    if (strcmp(param[m], "charge_dudq_raw") == 0) {
-      set_qnep_quantity(has_charge_dudq_raw_, param[m]);
+    if (tokens[m] == "charge_dudq_raw") {
+      set_qnep_quantity(has_charge_dudq_raw_, tokens[m].c_str());
       continue;
     }
-    if (strcmp(param[m], "charge_dudq") == 0) {
-      set_qnep_quantity(has_charge_dudq_, param[m]);
+    if (tokens[m] == "charge_dudq") {
+      set_qnep_quantity(has_charge_dudq_, tokens[m].c_str());
       continue;
     }
-    if (strcmp(param[m], "raw_charge_rate") == 0) {
-      set_qnep_quantity(has_raw_charge_rate_, param[m]);
+    if (tokens[m] == "raw_charge_rate") {
+      set_qnep_quantity(has_raw_charge_rate_, tokens[m].c_str());
       continue;
     }
-    if (strcmp(param[m], "charge_rate") == 0) {
-      set_qnep_quantity(has_charge_rate_, param[m]);
+    if (tokens[m] == "charge_rate") {
+      set_qnep_quantity(has_charge_rate_, tokens[m].c_str());
       continue;
     }
-    if (strcmp(param[m], "virial_nep") == 0) {
-      set_qnep_quantity(has_virial_nep_, param[m]);
+    if (tokens[m] == "virial_nep") {
+      set_qnep_quantity(has_virial_nep_, tokens[m].c_str());
       continue;
     }
-    if (strcmp(param[m], "virial_electrostatic_fixed") == 0) {
-      set_qnep_quantity(has_virial_electrostatic_fixed_, param[m]);
+    if (tokens[m] == "virial_electrostatic_fixed") {
+      set_qnep_quantity(has_virial_electrostatic_fixed_, tokens[m].c_str());
       continue;
     }
-    if (strcmp(param[m], "virial_dynamic_charge") == 0) {
-      set_qnep_quantity(has_virial_dynamic_charge_, param[m]);
+    if (tokens[m] == "virial_dynamic_charge") {
+      set_qnep_quantity(has_virial_dynamic_charge_, tokens[m].c_str());
       continue;
     }
-    if (!parse_dump_quantity(param[m], quantities, is_nep_charge, groups, "dump_xyz")) {
+    if (!parse_dump_quantity(tokens[m], quantities, is_nep_charge, groups, "dump_xyz")) {
       PRINT_INPUT_ERROR("Unrecognized argument in dump_xyz.\n");
     }
   }
@@ -269,7 +277,7 @@ void Dump_XYZ::pre_run(
   }
   if (has_charge_diagnostics()) {
     // ponytail: dynamic-q currently stays classical-only; add a batch qdot path before enabling PIMD.
-    if (integrate.type >= 31 && integrate.type <= 33) {
+    if (is_pimd(integrate.get_type())) {
       PRINT_INPUT_ERROR("qNEP charge diagnostics in dump_xyz currently support classical MD only.\n");
     }
     if (force.potentials.size() != 1) {
@@ -279,7 +287,7 @@ void Dump_XYZ::pre_run(
     qnep_->enable_charge_diagnostics();
   }
   if (has_pppm_debug_) {
-    if (integrate.type >= 31 && integrate.type <= 33) {
+    if (is_pimd(integrate.get_type())) {
       PRINT_INPUT_ERROR("pppm_debug currently supports classical MD only.\n");
     }
     if (force.potentials.size() != 1 || !qnep_) {

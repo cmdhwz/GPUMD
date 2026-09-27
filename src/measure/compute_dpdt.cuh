@@ -20,8 +20,9 @@
 class Compute_dpdt : public Action
 {
 public:
-  Compute_dpdt(const char**, int);
+  Compute_dpdt(const std::vector<std::string>& tokens, bool is_nep_charge);
   bool requires_bec() const override { return true; }
+  bool has_undefined_ring_polymer_charge_bec_output() const override { return true; }
 
   int sample_interval;
 
@@ -56,7 +57,7 @@ public:
     const double time_step,
     const double temperature);
 
-  void parse(const char**, int);
+  void parse(const std::vector<std::string>& tokens, bool is_nep_charge);
 
 private:
   GPU_Vector<float> gpu_dpdt_per_atom;

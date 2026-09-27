@@ -22,7 +22,6 @@ Calculate the electrostatic energy and forces
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
-#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -411,7 +410,10 @@ void Compute_es::pre_run(
   Box& box,
   Force& force)
 {
-  // nothing
+  const size_t number_of_atoms = static_cast<size_t>(atom.number_of_atoms);
+  electrostatic_force_per_atom_.resize(number_of_atoms * 3);
+  electrostatic_virial_per_atom_.resize(number_of_atoms * 9);
+  electrostatic_potential_per_atom_.resize(number_of_atoms);
 }
 
 void Compute_es::end_of_step(
@@ -429,8 +431,18 @@ void Compute_es::end_of_step(
   Force& force)
 {
   const int N = atom.number_of_atoms;
+  const size_t number_of_atoms = static_cast<size_t>(N);
 
   initialize();
+  if (electrostatic_force_per_atom_.size() != number_of_atoms * 3) {
+    electrostatic_force_per_atom_.resize(number_of_atoms * 3);
+  }
+  if (electrostatic_virial_per_atom_.size() != number_of_atoms * 9) {
+    electrostatic_virial_per_atom_.resize(number_of_atoms * 9);
+  }
+  if (electrostatic_potential_per_atom_.size() != number_of_atoms) {
+    electrostatic_potential_per_atom_.resize(number_of_atoms);
+  }
 
   find_force(
     N,
@@ -439,14 +451,14 @@ void Compute_es::end_of_step(
     box,
     atom.charge,
     atom.position_per_atom,
-    atom.force_per_atom,
-    atom.virial_per_atom,
-    atom.potential_per_atom);
+    electrostatic_force_per_atom_,
+    electrostatic_virial_per_atom_,
+    electrostatic_potential_per_atom_);
 
   std::vector<double> potential_cpu(N);
   std::vector<double> force_cpu(N * 3);
-  atom.potential_per_atom.copy_to_host(potential_cpu.data());
-  atom.force_per_atom.copy_to_host(force_cpu.data());
+  electrostatic_potential_per_atom_.copy_to_host(potential_cpu.data());
+  electrostatic_force_per_atom_.copy_to_host(force_cpu.data());
 
   FILE* fid_force = fopen("elactrostatic_force.out", "a");
   FILE* fid_energy = fopen("elactrostatic_energy.out", "a");
@@ -471,15 +483,16 @@ void Compute_es::post_run(
   // nothing
 }
 
-void Compute_es::parse(const char** param, int num_param)
+void Compute_es::parse(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
   printf("Compute electrostatic energy and force.\n");
 
   if (num_param != 2) {
     PRINT_INPUT_ERROR("compute_dpdt should have 1 parameter.\n");
   }
 
-  if (!is_valid_int(param[1], &sample_interval)) {
+  if (!is_valid_int(tokens[1], &sample_interval)) {
     PRINT_INPUT_ERROR("sample interval for compute_es should be an integer number.\n");
   }
   if (sample_interval != 1) {
@@ -488,8 +501,8 @@ void Compute_es::parse(const char** param, int num_param)
   printf("    sample interval is %d.\n", sample_interval);
 }
 
-Compute_es::Compute_es(const char** param, int num_param)
+Compute_es::Compute_es(const std::vector<std::string>& tokens)
 {
-  parse(param, num_param);
+  parse(tokens);
   action_name = "compute_es";
 }

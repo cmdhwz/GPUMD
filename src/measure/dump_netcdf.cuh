@@ -28,8 +28,18 @@ class Group;
 class DUMP_NETCDF : public Action
 {
 public:
-  DUMP_NETCDF(const char** param, int num_param, const std::vector<Group>& groups, Atom& atom);
-  void parse(const char** param, int num_param, const std::vector<Group>& groups);
+  DUMP_NETCDF(
+    const std::vector<std::string>& tokens,
+    const std::vector<Group>& groups,
+    Atom& atom,
+    bool is_nep_charge);
+  void parse(
+    const std::vector<std::string>& tokens, const std::vector<Group>& groups);
+  bool requires_bec() const override { return quantities_.has_bec_; }
+  bool has_undefined_ring_polymer_charge_bec_output() const override
+  {
+    return is_nep_charge_ && (quantities_.has_charge_ || quantities_.has_bec_);
+  }
   virtual void pre_run(
     const int number_of_steps,
     const double time_step,

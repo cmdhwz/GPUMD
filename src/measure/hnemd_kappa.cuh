@@ -21,6 +21,7 @@ class HNEMD : public Action
 {
 public:
   int compute = 0;
+  bool modifies_force() const override { return compute != 0; }
   int output_interval; // average the data every so many time steps
 
   // the driving "force" vector (in units of 1/A)
@@ -39,6 +40,16 @@ public:
     Atom& atom,
     Box& box,
     Force& force);
+
+  void post_force(
+    const int step,
+    const double time_step,
+    const double global_time,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force) override;
 
   virtual void end_of_step(
       const int number_of_steps,
@@ -62,6 +73,9 @@ public:
     const double time_step,
     const double temperature);
 
-  void parse(const char** param, int num_param);
-  HNEMD(const char** param, int num_param, Force& force);
+  void parse(const std::vector<std::string>& tokens);
+  HNEMD(const std::vector<std::string>& tokens);
+
+private:
+  GPU_Vector<double> force_sum_;
 };

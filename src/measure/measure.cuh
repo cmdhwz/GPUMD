@@ -18,6 +18,7 @@
 #include "property.cuh"
 #include "utilities/gpu_vector.cuh"
 #include <memory>
+#include <string>
 #include <vector>
 
 class Atom;
@@ -29,6 +30,16 @@ class Ensemble;
 class Measure
 {
 public:
+  bool parse_action(
+    const std::vector<std::string>& tokens,
+    const int number_of_types,
+    Integrate& integrate,
+    std::vector<Group>& group,
+    Atom& atom,
+    Box& box,
+    Force& force,
+    const std::string& first_potential_filename);
+
   void pre_run(
     const int number_of_steps,
     const double time_step,
@@ -81,7 +92,7 @@ public:
 
   bool requires_bec() const
   {
-    for (const auto& action : actions) {
+    for (const auto& action : actions_) {
       if (action->requires_bec()) {
         return true;
       }
@@ -113,9 +124,12 @@ public:
     Box& box,
     Force& force);
 
-
-  std::vector<std::unique_ptr<Action>> actions;
-
-  // Legacy Property observers retained for branch-local diagnostics.
+  std::vector<std::unique_ptr<Action>>& get_actions() { return actions_; }
+  const std::vector<std::unique_ptr<Action>>& get_actions() const { return actions_; }
+  void set_hac_current(const bool qnep_full_a);
   void process_dynamics(const int md_step, Box& box, Atom& atom);
+
+private:
+  std::vector<std::unique_ptr<Action>> actions_;
+  bool hac_current_qnep_full_a_ = false;
 };

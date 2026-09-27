@@ -17,16 +17,17 @@
 
 #include "action.cuh"
 #include "utilities/gpu_vector.cuh"
+#include <string>
 #include <vector>
 
 class Electron_Stop : public Action
 {
 public:
   Electron_Stop(
-    const char** param,
-    int num_param,
+    const std::vector<std::string>& tokens,
     const int num_atoms,
     const int num_types);
+  bool modifies_force() const override { return true; }
 
   void setup_force(
     const double time_step,

@@ -37,6 +37,12 @@ public:
   // Actions may request BEC data before the first force evaluation.
   virtual bool requires_bec() const { return false; }
 
+  // True when an action changes the force used by the integrator.
+  virtual bool modifies_force() const { return false; }
+  virtual bool supports_ring_polymer_force() const { return false; }
+
+  virtual bool has_undefined_ring_polymer_charge_bec_output() const { return false; }
+
   virtual void pre_run(
     const int number_of_steps,
     const double time_step,

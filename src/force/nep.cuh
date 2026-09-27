@@ -33,6 +33,8 @@ struct NEP_Local_Edge
   bool has_angular = false;
 };
 
+class RunInput;
+
 struct NEP_Data {
   GPU_Vector<float> f12x; // 3-body or manybody partial forces
   GPU_Vector<float> f12y; // 3-body or manybody partial forces
@@ -127,7 +129,7 @@ public:
         GPU_Vector<float> edge_angular_z;
     } small_box_data;
 
-  NEP(const char* file_potential, const int num_atoms);
+  NEP(const char* file_potential, const int num_atoms, const RunInput& run_input);
   virtual ~NEP(void);
   virtual void compute(
     Box& box,
@@ -185,7 +187,7 @@ private:
   ZBL zbl;
   ExpandedBox ebox;
   DFTD3 dftd3;
-  Neighbor neighbor;
+  NeighborManager neighbor_manager;
 
   struct PIMD_Bead_Data
   {
@@ -313,5 +315,5 @@ private:
     GPU_Vector<double>& virial);
 
   bool has_dftd3 = false;
-  void initialize_dftd3();
+  void initialize_dftd3(const RunInput& run_input);
 };

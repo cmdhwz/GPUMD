@@ -17,12 +17,11 @@
 Run simulation according to the inputs in the run.in file.
 ------------------------------------------------------------------------------*/
 
-#include "measure/add_random_force.cuh"
 #include "cohesive.cuh"
-#include "measure/electron_stop.cuh"
 #include "force/force.cuh"
 #include "integrate/ensemble.cuh"
 #include "integrate/integrate.cuh"
+
 #include "measure/active.cuh"
 #include "measure/add_efield.cuh"
 #include "measure/add_force.cuh"
@@ -72,6 +71,8 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/shc.cuh"
 #include "measure/viscosity.cuh"
 #include "mc/mc.cuh"
+
+#include "measure/measure.cuh"
 #include "minimize/minimize.cuh"
 #include "model/box.cuh"
 #include "model/read_xyz.cuh"
@@ -83,9 +84,11 @@ Run simulation according to the inputs in the run.in file.
 #include "utilities/compact_nep.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include "utilities/run_input.cuh"
 #include "velocity.cuh"
 #include <algorithm>
 #include <chrono>
+
 #include <cmath>
 #include <cstring>
 
@@ -157,55 +160,93 @@ static void calculate_time_step(
   }
 }
 
-Run::Run()
+static bool parse_initial_replicate(
+  const RunInput& run_input, int replicate_size[3])
+{
+  for (const auto& line : run_input.lines()) {
+    if (line.tokens.empty()) {
+      continue;
+    }
+    if (line.tokens[0] != "replicate") {
+      return false;
+    }
+    parse_replicate(line.tokens, replicate_size);
+    return true;
+  }
+  return false;
+}
+
+Run::Run(const RunInput& run_input)
 {
   print_line_1();
   printf("Started initializing positions and related parameters.\n");
   fflush(stdout);
   print_line_2();
 
-  initialize_position(has_velocity_in_xyz, number_of_types, box, group, atom);
+  has_replicate_ = parse_initial_replicate(run_input, replicate_size_);
 
-  allocate_memory_gpu(group, atom, thermo);
-
-  velocity.initialize(
+  initialize_position(
+    run_input,
     has_velocity_in_xyz,
-    300,
-    atom,
-    false,
-    123);
+    number_of_types,
+    box,
+    group,
+    atom);
+  first_potential_filename_ = get_first_potential_filename(run_input);
+
+  if (has_replicate_) {
+    Replicate(replicate_size_, box, atom, group);
+  }
+
+  if (atom.number_of_atoms < 2) {
+    PRINT_INPUT_ERROR("Number of atoms should >= 2.");
+  }
+
+  velocity.initialize_cpu(
+    has_velocity_in_xyz, 300, atom, false, 123);
+
   if (has_velocity_in_xyz) {
     printf("Initialized velocities with data in model.xyz.\n");
   } else {
     printf("Initialized velocities with default T = 300 K.\n");
   }
 
+  allocate_memory_gpu(group, atom, thermo);
+
   print_line_1();
   printf("Finished initializing positions and related parameters.\n");
   fflush(stdout);
   print_line_2();
 
-  execute_run_in();
+  execute_run_in(run_input);
 }
 
-void Run::execute_run_in()
+void Run::execute_run_in(const RunInput& run_input)
 {
   print_line_1();
   printf("Started executing the commands in run.in.\n");
   fflush(stdout);
   print_line_2();
 
-  std::ifstream input("run.in");
-  if (!input.is_open()) {
-    std::cout << "Failed to open run.in." << std::endl;
-    exit(1);
+  bool first_effective_command = true;
+  for (const auto& line : run_input.lines()) {
+    if (!line.tokens.empty()) {
+      std::vector<std::string> tokens = line.tokens;
+      if (tokens.size() >= 2 && tokens[0] == "potential") {
+        tokens[1] = get_compact_nep_filename(tokens[1]);
+      }
+      if (has_replicate_ && first_effective_command &&
+          tokens[0] == "replicate") {
+        first_effective_command = false;
+        continue;
+      }
+      first_effective_command = false;
+      parse_one_keyword(tokens, run_input);
+    }
   }
 
-  while (input.peek() != EOF) {
-    std::vector<std::string> tokens = get_tokens_without_comments(input);
-    if (tokens.size() > 0) {
-      parse_one_keyword(tokens);
-    }
+  if (integrate.has_ensemble()) {
+    PRINT_INPUT_ERROR("The last ensemble is not followed by a run.");
   }
 
   print_line_1();
@@ -213,12 +254,11 @@ void Run::execute_run_in()
   fflush(stdout);
   print_line_2();
 
-  input.close();
 }
 
 void Run::compute_force()
 {
-  if (integrate.type >= 31 && integrate.type <= 33) { // RPMD/TRPMD/PIMD
+  if (is_pimd(integrate.get_type())) {
     force.compute_pimd_beads(
       box,
       atom.type,
@@ -244,32 +284,56 @@ void Run::compute_force()
   }
 }
 
-void Run::perform_a_run()
+void Run::perform_a_run(const int number_of_steps)
 {
+
   HAC* centroid_force_hac = nullptr;
   QuantumHeatMoments* quantum_heat_moments = nullptr;
   Centroid_Force_Diagnostic* centroid_force_diagnostic = nullptr;
 #ifdef USE_NETCDF
   Centroid_DeltaF_O* centroid_deltaF_O = nullptr;
 #endif
-  for (const auto& action : measure.actions) {
+  auto& actions = measure.get_actions();
+  if (is_pimd(integrate.get_type())) {
+    for (const auto& action : actions) {
+      if (action->modifies_force() && !action->supports_ring_polymer_force()) {
+        const std::string error =
+          action->action_name +
+          " is not currently supported with ring-polymer dynamics because its force modification is not applied to force_beads.";
+        PRINT_INPUT_ERROR(error.c_str());
+      }
+      if (action->has_undefined_ring_polymer_charge_bec_output()) {
+        PRINT_INPUT_ERROR(
+          "qNEP charge/BEC outputs (dump_xyz, dump_netcdf, compute_dpdt) currently do not "
+          "support ring-polymer dynamics.\n");
+      }
+    }
+  }
+  for (const auto& action : actions) {
     if (action->action_name == "compute_hac" && centroid_force_hac == nullptr) {
       centroid_force_hac = dynamic_cast<HAC*>(action.get());
     } else if (action->action_name == "compute_quantum_heat_moments") {
       quantum_heat_moments = dynamic_cast<QuantumHeatMoments*>(action.get());
     }
   }
+  const bool has_hnemd_driving = std::any_of(
+    actions.begin(), actions.end(), [](const std::unique_ptr<Action>& action) {
+      return action->action_name == "compute_hnemd" || action->action_name == "compute_hnemdec";
+    });
+  if (quantum_heat_moments != nullptr && has_hnemd_driving) {
+    PRINT_INPUT_ERROR("compute_quantum_heat_moments does not support HNEMD or HNEMDEC driven sampling.");
+  }
   if (quantum_heat_moments != nullptr) {
     quantum_heat_moments->set_hac(centroid_force_hac);
-    auto quantum_it = std::find_if(measure.actions.begin(), measure.actions.end(),
+    auto quantum_it = std::find_if(actions.begin(), actions.end(),
       [quantum_heat_moments](const std::unique_ptr<Action>& action) {
         return action.get() == quantum_heat_moments;
       });
-    auto hac_it = std::find_if(measure.actions.begin(), measure.actions.end(),
+    auto hac_it = std::find_if(actions.begin(), actions.end(),
       [centroid_force_hac](const std::unique_ptr<Action>& action) {
         return action.get() == centroid_force_hac;
       });
-    if (hac_it != measure.actions.end() && quantum_it < hac_it) {
+    if (hac_it != actions.end() && quantum_it < hac_it) {
       std::rotate(quantum_it, quantum_it + 1, hac_it + 1);
     }
   }
@@ -300,13 +364,17 @@ void Run::perform_a_run()
   }
 #endif
   if (centroid_force_diagnostic != nullptr) {
+    if (has_hnemd_driving) {
+      PRINT_INPUT_ERROR(
+        "centroid_force_diagnostic requires physical forces without HNEMD/HNEMDEC driving.\n");
+    }
     centroid_force_diagnostic->set_hac(centroid_force_hac);
 #ifdef USE_NETCDF
     if (centroid_deltaF_O != nullptr) {
       centroid_deltaF_O->set_hac(centroid_force_hac);
     }
 #endif
-    for (const auto& action : measure.actions) {
+    for (const auto& action : actions) {
       if (
         action->action_name == "compute_es" || action->action_name == "active" ||
         action->action_name == "dump_observer" || action->action_name == "plumed") {
@@ -317,13 +385,13 @@ void Run::perform_a_run()
     }
   }
 
-  integrate.initialize(time_step, atom, box, group, thermo, number_of_steps);
+  integrate.initialize(time_step, atom, box, group);
   measure.pre_run(number_of_steps, time_step, integrate, group, atom, box, force);
 
   const bool requires_bec = measure.requires_bec();
-  const bool classical_md = integrate.type < 31;
+  const bool classical_md = !is_pimd(integrate.get_type());
   force.set_md_qnep_bec_required(classical_md && requires_bec);
-  force.set_pimd_qnep_batch_bec_required(requires_bec);
+  force.set_pimd_qnep_batch_bec_required(!classical_md && requires_bec);
 
   // setup force for the first integrate step
   compute_force();
@@ -333,7 +401,7 @@ void Run::perform_a_run()
 
   double initial_time_step = time_step;
   const bool profile_pimd_bead_parallel =
-    integrate.type >= 31 && integrate.type <= 33 &&
+    is_pimd(integrate.get_type()) &&
     force.pimd_bead_gpu_parallel_available();
   const bool profile_pimd_batch = force.pimd_nep_batch_profile_enabled() ||
     force.pimd_dp_batch_profile_enabled();
@@ -356,12 +424,11 @@ void Run::perform_a_run()
       max_distance_per_step, atom.velocity_per_atom, initial_time_step, time_step);
     global_time += time_step;
 
-    integrate.current_step = step;
     std::chrono::high_resolution_clock::time_point compute1_begin;
     if (profile_pimd_bead_parallel) {
       compute1_begin = std::chrono::high_resolution_clock::now();
     }
-    integrate.compute1(time_step, double(step) / number_of_steps, group, box, atom, thermo);
+    integrate.compute1(time_step, step, number_of_steps, group, box, atom, thermo);
     if (profile_pimd_bead_parallel) {
       CHECK(gpuSetDevice(0));
       CHECK(gpuDeviceSynchronize());
@@ -372,7 +439,7 @@ void Run::perform_a_run()
 
     measure.post_integrate1(step, time_step, integrate, group, atom, box, force);
 
-    force.temperature += force.delta_T;
+    force.advance_temperature();
 
     measure.pre_force(step, time_step, integrate, group, atom, box, force);
     compute_force();
@@ -385,7 +452,7 @@ void Run::perform_a_run()
     if (profile_pimd_bead_parallel) {
       compute2_begin = std::chrono::high_resolution_clock::now();
     }
-    integrate.compute2(time_step, double(step) / number_of_steps, group, box, atom, thermo, force);
+    integrate.compute2(time_step, step, number_of_steps, group, box, atom, thermo, force);
     force.notify_velocity_update();
     atom.update_unwrapped_position(box);
     if (profile_pimd_bead_parallel) {
@@ -399,10 +466,10 @@ void Run::perform_a_run()
     measure.end_of_step(
       number_of_steps,
       step,
-      integrate.fixed_group,
-      integrate.move_group,
+      integrate.get_fixed_group(),
+      integrate.get_move_group(),
       global_time,
-      integrate.temperature2,
+      integrate.get_temperature2(),
       integrate,
       box,
       group,
@@ -448,9 +515,10 @@ void Run::perform_a_run()
   }
   print_line_2();
 
-  measure.post_run(atom, box, integrate, number_of_steps, time_step, integrate.temperature2);
+  measure.post_run(
+    atom, box, integrate, number_of_steps, time_step, integrate.get_temperature2());
 
-  integrate.finalize();
+  integrate.finalize(atom, box);
   velocity.finalize();
   force.finalize();
   const auto total_finish = std::chrono::high_resolution_clock::now();
@@ -460,422 +528,191 @@ void Run::perform_a_run()
   max_distance_per_step = 0.0;
 }
 
-void Run::parse_one_keyword(std::vector<std::string>& tokens)
+void Run::parse_one_keyword(
+  const std::vector<std::string>& tokens, const RunInput& run_input)
 {
-  if (tokens.size() >= 2 && tokens[0] == "potential") {
-    tokens[1] = get_compact_nep_filename(tokens[1]);
+  if (tokens.empty()) return;
+  if (tokens[0] == "replicate") {
+    PRINT_INPUT_ERROR("replicate must be the first effective command.");
   }
-  int num_param = tokens.size();
+  const int num_param = static_cast<int>(tokens.size());
   const int max_num_param = 64;
-  if (num_param > max_num_param)
+  if (num_param > max_num_param) {
     PRINT_INPUT_ERROR("The number of parameters should be less than 64.\n");
-  const char* param[max_num_param];
-  for (int n = 0; n < num_param; ++n) {
-    param[n] = tokens[n].c_str();
   }
+  const char* param[max_num_param];
+  for (int n = 0; n < num_param; ++n) param[n] = tokens[n].c_str();
 
-  if (strcmp(param[0], "potential") == 0) {
-    force.parse_potential(param, num_param, box, atom.type.size());
-  } else if (strcmp(param[0], "replicate") == 0) {
-    Replicate(param, num_param, box, atom, group);
-    allocate_memory_gpu(group, atom, thermo);
-  } else if (strcmp(param[0], "minimize") == 0) {
+#ifdef GPUMD_WPE_ENABLED
+  force.wpe_process_command(tokens, atom.number_of_atoms);
+#endif
+
+  if (tokens[0] == "potential") {
+    force.parse_potential(tokens, box, atom.type.size(), run_input);
+  } else if (tokens[0] == "minimize") {
     Minimize minimize;
     minimize.parse_minimize(
-      param,
-      num_param,
-      integrate.fixed_group,
-      integrate.fixed_grouping_method,
-      force,
-      box,
-      atom,
-      group);
-  } else if (strcmp(param[0], "compute_phonon") == 0) {
+      tokens, integrate.get_fixed_group(), integrate.get_fixed_grouping_method(),
+      force, box, atom, group);
+  } else if (tokens[0] == "compute_phonon") {
     Hessian hessian;
-    hessian.parse(param, num_param);
-    hessian.compute(force, box, atom, group);
-  } else if (strcmp(param[0], "compute_cohesive") == 0) {
+    hessian.parse(tokens);
+    if (!has_replicate_) PRINT_INPUT_ERROR("replicate keyword not found in run.in file.");
+    hessian.compute(force, box, atom, group, replicate_size_);
+  } else if (tokens[0] == "compute_cohesive") {
     Cohesive cohesive;
-    cohesive.parse(param, num_param, 0);
+    cohesive.parse(tokens, 0);
     cohesive.compute(box, atom, group, force);
-  } else if (strcmp(param[0], "compute_elastic") == 0) {
+  } else if (tokens[0] == "compute_elastic") {
     Cohesive cohesive;
-    cohesive.parse(param, num_param, 1);
+    cohesive.parse(tokens, 1);
     cohesive.compute(box, atom, group, force);
-  } else if (strcmp(param[0], "change_box") == 0) {
-    parse_change_box(param, num_param);
-  } else if (strcmp(param[0], "velocity") == 0) {
-    parse_velocity(param, num_param);
-  } else if (strcmp(param[0], "ensemble") == 0) {
-    integrate.parse_ensemble(param, num_param, time_step, atom, box, group, thermo);
-  } else if (strcmp(param[0], "pimd_propagator") == 0) {
+  } else if (tokens[0] == "change_box") {
+    parse_change_box(tokens);
+  } else if (tokens[0] == "velocity") {
+    parse_velocity(tokens);
+  } else if (tokens[0] == "ensemble") {
+    integrate.parse_ensemble(tokens, atom, box, group);
+  } else if (tokens[0] == "pimd_propagator") {
     parse_pimd_propagator(param, num_param);
-  } else if (strcmp(param[0], "pimd_pile_scale") == 0) {
+  } else if (tokens[0] == "pimd_pile_scale") {
     parse_pimd_pile_scale(param, num_param);
-  } else if (strcmp(param[0], "pimd_fix_com") == 0) {
+  } else if (tokens[0] == "pimd_fix_com") {
     parse_pimd_fix_com(param, num_param);
-  } else if (strcmp(param[0], "pimd_reseed_from_centroid") == 0) {
+  } else if (tokens[0] == "pimd_reseed_from_centroid") {
     parse_pimd_reseed_from_centroid(param, num_param);
-  } else if (strcmp(param[0], "pimd_bead_gpu_parallel") == 0) {
+  } else if (tokens[0] == "pimd_bead_gpu_parallel") {
     parse_pimd_bead_gpu_parallel(param, num_param);
-  } else if (strcmp(param[0], "pimd_bead_neighbor_rebuild") == 0) {
+  } else if (tokens[0] == "pimd_bead_neighbor_rebuild") {
     parse_pimd_bead_neighbor_rebuild(param, num_param);
-  } else if (strcmp(param[0], "md_qnep_bec") == 0) {
+  } else if (tokens[0] == "md_qnep_bec") {
     parse_md_qnep_bec(param, num_param);
-  } else if (strcmp(param[0], "pimd_bead_batch") == 0) {
+  } else if (tokens[0] == "pimd_bead_batch") {
     parse_pimd_bead_batch(param, num_param);
-  } else if (strcmp(param[0], "pimd_qnep_bead_batch") == 0) {
+  } else if (tokens[0] == "pimd_qnep_bead_batch") {
     parse_pimd_qnep_bead_batch(param, num_param);
-  } else if (strcmp(param[0], "pimd_qnep_batch_bec") == 0) {
+  } else if (tokens[0] == "pimd_qnep_batch_bec") {
     parse_pimd_qnep_batch_bec(param, num_param);
-  } else if (strcmp(param[0], "pimd_nep_bead_batch") == 0) {
+  } else if (tokens[0] == "pimd_nep_bead_batch") {
     parse_pimd_nep_bead_batch(param, num_param);
-  } else if (
-    strcmp(param[0], "pimd_nep_batch_profile") == 0 ||
-    strcmp(param[0], "pimd_dp_batch_profile") == 0) {
+  } else if (tokens[0] == "pimd_nep_batch_profile" || tokens[0] == "pimd_dp_batch_profile") {
     parse_pimd_nep_batch_profile(param, num_param);
-  } else if (strcmp(param[0], "pimd_dp_batch_source_count") == 0) {
+  } else if (tokens[0] == "pimd_dp_batch_source_count") {
     parse_pimd_dp_batch_source_count(param, num_param);
-  } else if (strcmp(param[0], "pimd_dp_batch_edge_fill_4_threads") == 0) {
+  } else if (tokens[0] == "pimd_dp_batch_edge_fill_4_threads") {
     parse_pimd_dp_batch_edge_fill_4_threads(param, num_param);
-  } else if (strcmp(param[0], "pimd_nep_batch_geometry_cache") == 0) {
+  } else if (tokens[0] == "pimd_nep_batch_geometry_cache") {
     parse_pimd_nep_batch_geometry_cache(param, num_param);
-  } else if (strcmp(param[0], "read_pimd_restart") == 0) {
+  } else if (tokens[0] == "pppm_mesh_spacing") {
+    parse_pppm_mesh_spacing(param, num_param);
+  } else if (tokens[0] == "read_pimd_restart") {
     parse_read_pimd_restart(param, num_param);
-  } else if (strcmp(param[0], "time_step") == 0) {
-    parse_time_step(param, num_param);
-  } else if (strcmp(param[0], "correct_velocity") == 0) {
-    parse_correct_velocity(param, num_param, group);
-  } else if (strcmp(param[0], "dump_thermo") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_Thermo(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_position") == 0) {
-    std::unique_ptr<Property> property;
-    property.reset(new Dump_Position(param, num_param, group));
-    measure.properties.emplace_back(std::move(property));
-  } else if (strcmp(param[0], "dump_netcdf") == 0) {
-#ifdef USE_NETCDF
-    std::unique_ptr<Action> action;
-    action.reset(new DUMP_NETCDF(param, num_param, group, atom));
-    measure.actions.emplace_back(std::move(action));
-#else
-    PRINT_INPUT_ERROR("dump_netcdf is available only when USE_NETCDF flag is set.\n");
-#endif
-  } else if (strcmp(param[0], "plumed") == 0) {
-#ifdef USE_PLUMED
-    std::unique_ptr<Action> action;
-    action.reset(new PLUMED(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-#else
-    PRINT_INPUT_ERROR("plumed is available only when USE_PLUMED flag is set.\n");
-#endif
-  } else if (strcmp(param[0], "dump_restart") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_Restart(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_pimd_restart") == 0) {
-    std::unique_ptr<Property> property;
-    property.reset(new Dump_PIMD_Restart(param, num_param));
-    measure.properties.emplace_back(std::move(property));
-  } else if (strcmp(param[0], "dump_velocity") == 0) {
-    std::unique_ptr<Property> property;
-    property.reset(new Dump_Velocity(param, num_param, group));
-    measure.properties.emplace_back(std::move(property));
-  } else if (strcmp(param[0], "dump_force") == 0) {
-    std::unique_ptr<Property> property;
-    property.reset(new Dump_Force(param, num_param, group));
-    measure.properties.emplace_back(std::move(property));
-  } else if (strcmp(param[0], "dump_exyz") == 0) {
-    std::unique_ptr<Property> property;
-    property.reset(new Dump_EXYZ(param, num_param));
-    measure.properties.emplace_back(std::move(property));
-  } else if (strcmp(param[0], "dump_xyz") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_XYZ(param, num_param, group, atom));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_cg") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_CG(param, num_param, group));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_beads") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_Beads(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_observer") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_Observer(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_shock_nemd") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_Shock_NEMD(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_dipole") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_Dipole(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "dump_polarizability") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Dump_Polarizability(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "active") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Active(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_extrapolation") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Extrapolation(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_dos") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new DOS(param, num_param, group));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_sdc") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new SDC(param, num_param, group));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_msd") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new MSD(param, num_param, group, atom));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_ic") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new IC(param, num_param, atom));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_rdf") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new RDF(param, num_param, box, atom.cpu_type_size));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_adf") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new ADF(param, num_param, box, number_of_types));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_orientorder") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new OrientOrder(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_angular_rdf") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new AngularRDF(param, num_param, box, number_of_types));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_dpdt") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Compute_dpdt(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_qnep_projection") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new QNEP_Projection(param, num_param));
-    // Run before other actions so their qNEP recomputations cannot overwrite
-    // the diagnostics captured by the main force evaluation.
-    measure.actions.insert(measure.actions.begin(), std::move(action));
-  } else if (strcmp(param[0], "compute_qnep_current_diag") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new QNEP_Projection(param, num_param, true));
-    measure.actions.insert(measure.actions.begin(), std::move(action));
-  } else if (strcmp(param[0], "compute_es") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Compute_es(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "hac_current") == 0) {
+  } else if (tokens[0] == "time_step") {
+    parse_time_step(tokens);
+  } else if (tokens[0] == "correct_velocity") {
+    parse_correct_velocity(tokens, group);
+  } else if (tokens[0] == "fix") {
+    integrate.parse_fix(tokens, group);
+  } else if (tokens[0] == "move") {
+    integrate.parse_move(tokens, group);
+  } else if (tokens[0] == "kspace") {
+    if (has_seen_kspace_command) PRINT_INPUT_ERROR("kspace can only appear once.");
+    has_seen_kspace_command = true;
+  } else if (tokens[0] == "dftd3") {
+    if (has_seen_dftd3_command) PRINT_INPUT_ERROR("dftd3 can only appear once.");
+    has_seen_dftd3_command = true;
+  } else if (tokens[0] == "hac_current") {
     if (num_param != 2) {
       PRINT_INPUT_ERROR("hac_current should have exactly one parameter: legacy or qnep_full_a.\n");
     }
-    if (hac_current_option_seen_) {
-      PRINT_INPUT_ERROR("hac_current may appear only once in one run.\n");
-    }
-    if (strcmp(param[1], "legacy") == 0) {
+    if (hac_current_option_seen_) PRINT_INPUT_ERROR("hac_current may appear only once in one run.\n");
+    if (tokens[1] == "legacy") {
       hac_current_qnep_full_a_ = false;
-    } else if (strcmp(param[1], "qnep_full_a") == 0) {
+    } else if (tokens[1] == "qnep_full_a") {
       hac_current_qnep_full_a_ = true;
     } else {
       PRINT_INPUT_ERROR("hac_current must be legacy or qnep_full_a.\n");
     }
     hac_current_option_seen_ = true;
-    for (auto& action : measure.actions) {
-      if (action->action_name == "compute_hac") {
-        auto* hac = dynamic_cast<HAC*>(action.get());
-        if (hac != nullptr) hac->set_qnep_full_a(hac_current_qnep_full_a_);
-      }
-    }
-  } else if (strcmp(param[0], "compute_hac") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new HAC(param, num_param, hac_current_qnep_full_a_));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_quantum_heat_moments") == 0) {
-    for (const auto& action : measure.actions) {
-      if (action->action_name == "compute_quantum_heat_moments")
-        PRINT_INPUT_ERROR("Only one compute_quantum_heat_moments action is allowed.");
-    }
-    std::unique_ptr<Action> action;
-    action.reset(new QuantumHeatMoments(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "centroid_force_diagnostic") == 0) {
-    std::unique_ptr<Property> property;
-    property.reset(new Centroid_Force_Diagnostic(param, num_param));
-    measure.properties.emplace_back(std::move(property));
-  } else if (strcmp(param[0], "centroid_deltaF_O") == 0) {
-#ifdef USE_NETCDF
-    std::unique_ptr<Property> property;
-    property.reset(new Centroid_DeltaF_O(param, num_param));
-    measure.properties.emplace_back(std::move(property));
-#else
-    PRINT_INPUT_ERROR("centroid_deltaF_O requires a GPUMD build with NetCDF support.\n");
-#endif
-  } else if (strcmp(param[0], "compute_proton_tunneling") == 0) {
-    std::unique_ptr<Property> property;
-    property.reset(new Proton_Tunneling(param, num_param, atom));
-    measure.properties.emplace_back(std::move(property));
-  } else if (strcmp(param[0], "compute_viscosity") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Viscosity(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_hnemd") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new HNEMD(param, num_param, force));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_hnemdec") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new HNEMDEC(param, num_param, force, atom, integrate.temperature1));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_shc") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new SHC(param, num_param, group));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_gkma") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new MODAL_ANALYSIS(param, num_param, number_of_types, 0, force));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_hnema") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new MODAL_ANALYSIS(param, num_param, number_of_types, 1, force));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "deform") == 0) {
-    Deform* deform = new Deform(param, num_param);
-    integrate.deform_x = deform->get_deform_x();
-    integrate.deform_y = deform->get_deform_y();
-    integrate.deform_z = deform->get_deform_z();
-    integrate.deform_xy = deform->get_deform_xy();
-    integrate.deform_xz = deform->get_deform_xz();
-    integrate.deform_yz = deform->get_deform_yz();
-    std::unique_ptr<Action> action;
-    action.reset(deform);
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute_chunk") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new ComputeChunk(param, num_param, box));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "compute") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Compute(param, num_param, group));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "fix") == 0) {
-    integrate.parse_fix(param, num_param, group);
-  } else if (strcmp(param[0], "move") == 0) {
-    integrate.parse_move(param, num_param, group);
-  } else if (strcmp(param[0], "electron_stop") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Electron_Stop(param, num_param, atom.number_of_atoms, number_of_types));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "add_random_force") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Add_Random_Force(param, num_param, atom.number_of_atoms));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "add_force") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Add_Force(param, num_param, group));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "add_spring") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Add_Spring(param, num_param, group, atom));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "add_efield") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new Add_Efield(param, num_param, group));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "mc") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new MC(param, num_param, group, atom));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "kspace") == 0) {
-    // nothing here; will be handled elsewhere
-  } else if (strcmp(param[0], "pppm_mesh_spacing") == 0) {
-    parse_pppm_mesh_spacing(param, num_param);
-  } else if (strcmp(param[0], "dftd3") == 0) {
-    // nothing here; will be handled elsewhere
-  } else if (strcmp(param[0], "compute_lsqt") == 0) {
-    std::unique_ptr<Action> action;
-    action.reset(new LSQT(param, num_param));
-    measure.actions.emplace_back(std::move(action));
-  } else if (strcmp(param[0], "run") == 0) {
-    parse_run(param, num_param);
-  } else {
-    PRINT_KEYWORD_ERROR(param[0]);
+    measure.set_hac_current(hac_current_qnep_full_a_);
+  } else if (tokens[0] == "run") {
+    parse_run(tokens);
+    hac_current_option_seen_ = false;
+    hac_current_qnep_full_a_ = false;
+    measure.set_hac_current(false);
+  } else if (!measure.parse_action(
+               tokens, number_of_types, integrate, group, atom, box, force,
+               first_potential_filename_)) {
+    PRINT_KEYWORD_ERROR(tokens[0].c_str());
   }
 }
-
-void Run::parse_velocity(const char** param, int num_param)
+void Run::parse_velocity(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
+  double initial_temperature;
   int seed = 0;
   bool use_seed = false;
   if (!(num_param == 2 || num_param == 4)) {
-    PRINT_INPUT_ERROR("velocity should have 1 or 2 parameters.\n");
-  } else if (num_param == 4) {
-    // See https://github.com/brucefan1983/GPUMD/pull/768
-    // for the reason for putting this branch here.
-    use_seed = true;
-    if (!is_valid_int(param[3], &seed)) {
-      PRINT_INPUT_ERROR("seed should be a positive integer.\n");
-    }
+    PRINT_INPUT_ERROR("velocity should have 1 or 3 parameters.\n");
   }
 
-  if (!is_valid_real(param[1], &initial_temperature)) {
+  if (!is_valid_real(tokens[1], &initial_temperature)) {
     PRINT_INPUT_ERROR("initial temperature should be a real number.\n");
   }
   if (initial_temperature <= 0.0) {
     PRINT_INPUT_ERROR("initial temperature should be a positive number.\n");
   }
 
-  velocity.initialize(
+  if (num_param == 4) {
+    if (tokens[2] != "seed") {
+      PRINT_INPUT_ERROR("The second parameter for velocity should be 'seed'.\n");
+    }
+    use_seed = true;
+    if (!is_valid_int(tokens[3], &seed) || seed <= 0) {
+      PRINT_INPUT_ERROR("seed should be a positive integer.\n");
+    }
+  }
+
+  velocity.initialize_cpu(
     has_velocity_in_xyz,
     initial_temperature,
     atom,
     use_seed,
     seed);
+  atom.velocity_per_atom.copy_from_host(atom.cpu_velocity_per_atom.data());
   if (!has_velocity_in_xyz) {
     printf("Initialized velocities with input T = %g K.\n", initial_temperature);
   }
 }
+
 
 void Run::parse_read_pimd_restart(const char** param, int num_param)
 {
   if (num_param != 2) {
     PRINT_INPUT_ERROR("read_pimd_restart should have 1 parameter.\n");
   }
-  if (integrate.type < 31 || integrate.number_of_beads < 2) {
+  if (!is_pimd(integrate.get_type()) || integrate.get_number_of_beads() < 2) {
     PRINT_INPUT_ERROR("read_pimd_restart should be used after a PIMD-related ensemble keyword.\n");
   }
-  if (integrate.pimd_reseed_from_centroid) {
+  if (integrate.pimd_reseed_from_centroid()) {
     PRINT_INPUT_ERROR(
       "read_pimd_restart cannot be combined with pimd_reseed_from_centroid in the same run.");
   }
 
   PIMD_Restart_Metadata restart_metadata;
-  read_pimd_restart(param[1], integrate.number_of_beads, box, atom, &restart_metadata);
-  integrate.pimd_restart_read_this_run = true;
+  read_pimd_restart(param[1], integrate.get_number_of_beads(), box, atom, &restart_metadata);
+  integrate.mark_pimd_restart_read();
   if (restart_metadata.has_temperature) {
-    if (integrate.ring_polymer_temperature_is_explicit) {
+    if (integrate.ring_polymer_temperature_is_explicit()) {
       const double temperature_tolerance =
-        1.0e-8 * std::max(1.0, std::abs(integrate.temperature2));
-      if (std::abs(integrate.temperature2 - restart_metadata.temperature) > temperature_tolerance) {
+        1.0e-8 * std::max(1.0, std::abs(integrate.get_temperature2()));
+      if (std::abs(integrate.get_temperature2() - restart_metadata.temperature) > temperature_tolerance) {
         PRINT_INPUT_ERROR(
           "The explicit RPMD temperature does not match restart_beads.xyz temperature.");
       }
     }
-    integrate.temperature = restart_metadata.temperature;
-    integrate.temperature1 = restart_metadata.temperature;
-    integrate.temperature2 = restart_metadata.temperature;
-    integrate.ring_polymer_temperature_is_set = true;
-  } else if (!integrate.ring_polymer_temperature_is_set) {
+    integrate.restore_pimd_restart_temperature(restart_metadata.temperature);
+  } else if (!integrate.ring_polymer_temperature_is_set()) {
     PRINT_INPUT_ERROR(
       "restart_beads.xyz has no temperature. Use ensemble rpmd/trpmd <beads> <temperature>, "
       "or precede read_pimd_restart with an ensemble pimd declaration.");
@@ -891,11 +728,11 @@ void Run::parse_pimd_reseed_from_centroid(const char** param, int num_param)
   if (num_param != 1) {
     PRINT_INPUT_ERROR("pimd_reseed_from_centroid should have no parameters.\n");
   }
-  if (integrate.type != 33 || integrate.number_of_beads < 2) {
+  if (integrate.get_type() != EnsembleType::PIMD || integrate.get_number_of_beads() < 2) {
     PRINT_INPUT_ERROR(
       "pimd_reseed_from_centroid should be used after an ensemble pimd keyword.\n");
   }
-  if (integrate.pimd_restart_read_this_run) {
+  if (integrate.pimd_restart_read_this_run()) {
     PRINT_INPUT_ERROR(
       "pimd_reseed_from_centroid cannot be combined with read_pimd_restart in the same run.\n");
   }
@@ -903,15 +740,15 @@ void Run::parse_pimd_reseed_from_centroid(const char** param, int num_param)
     PRINT_INPUT_ERROR(
       "pimd_reseed_from_centroid requires an already initialized PIMD ring polymer.\n");
   }
-  if (!integrate.pimd_previous_run_was_pimd) {
+  if (!integrate.pimd_previous_run_was_pimd()) {
     PRINT_INPUT_ERROR(
       "pimd_reseed_from_centroid requires the immediately preceding run to be PIMD.");
   }
-  if (atom.number_of_beads == integrate.number_of_beads) {
+  if (atom.number_of_beads == integrate.get_number_of_beads()) {
     PRINT_INPUT_ERROR(
       "pimd_reseed_from_centroid requires a different target bead count.\n");
   }
-  integrate.pimd_reseed_from_centroid = true;
+  integrate.arm_pimd_reseed_from_centroid();
   printf("The next PIMD run will reseed all beads from the current centroid.\n");
 }
 
@@ -942,10 +779,10 @@ void Run::parse_pimd_propagator(const char** param, int num_param)
     PRINT_INPUT_ERROR("pimd_propagator should have 1 parameter.");
   }
   if (strcmp(param[1], "exact") == 0) {
-    integrate.pimd_use_exact_propagator = true;
+    integrate.set_pimd_use_exact_propagator(true);
     printf("PIMD free ring-polymer propagator is exact.\n");
   } else if (strcmp(param[1], "cayley") == 0) {
-    integrate.pimd_use_exact_propagator = false;
+    integrate.set_pimd_use_exact_propagator(false);
     printf("PIMD free ring-polymer propagator is Cayley.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_propagator should be exact or cayley.");
@@ -964,7 +801,7 @@ void Run::parse_pimd_pile_scale(const char** param, int num_param)
   if (pile_scale <= 0.0) {
     PRINT_INPUT_ERROR("pimd_pile_scale should be > 0.");
   }
-  integrate.pimd_pile_scale = pile_scale;
+  integrate.set_pimd_pile_scale(pile_scale);
   printf("PIMD internal-mode Langevin scale is %g.\n", pile_scale);
 }
 
@@ -974,10 +811,10 @@ void Run::parse_pimd_fix_com(const char** param, int num_param)
     PRINT_INPUT_ERROR("pimd_fix_com should have 1 parameter.");
   }
   if (strcmp(param[1], "on") == 0) {
-    integrate.pimd_fix_com = true;
+    integrate.set_pimd_fix_com(true);
     printf("PIMD global ring-polymer center-of-mass momentum correction is on.\n");
   } else if (strcmp(param[1], "off") == 0) {
-    integrate.pimd_fix_com = false;
+    integrate.set_pimd_fix_com(false);
     printf("PIMD global ring-polymer center-of-mass momentum correction is off.\n");
   } else {
     PRINT_INPUT_ERROR("pimd_fix_com should be on or off.");
@@ -1140,14 +977,18 @@ void Run::parse_pimd_dp_batch_edge_fill_4_threads(
   }
 }
 
-void Run::parse_correct_velocity(const char** param, int num_param, const std::vector<Group>& group)
+
+
+void Run::parse_correct_velocity(
+  const std::vector<std::string>& tokens, const std::vector<Group>& group)
 {
+  const int num_param = tokens.size();
   printf("Correct linear and angular momenta.\n");
 
   if (num_param != 2 && num_param != 3) {
     PRINT_INPUT_ERROR("correct_velocity should have 1 or 2 parameters.\n");
   }
-  if (!is_valid_int(param[1], &velocity.velocity_correction_interval)) {
+  if (!is_valid_int(tokens[1], &velocity.velocity_correction_interval)) {
     PRINT_INPUT_ERROR("velocity correction interval should be an integer.\n");
   }
   if (velocity.velocity_correction_interval < 10) {
@@ -1157,7 +998,7 @@ void Run::parse_correct_velocity(const char** param, int num_param, const std::v
   printf("    every %d steps.\n", velocity.velocity_correction_interval);
 
   if (num_param == 3) {
-    if (!is_valid_int(param[2], &velocity.velocity_correction_group_method)) {
+    if (!is_valid_int(tokens[2], &velocity.velocity_correction_group_method)) {
       PRINT_INPUT_ERROR("velocity correction group method should be an integer.\n");
     }
     if (velocity.velocity_correction_group_method < 0) {
@@ -1178,18 +1019,19 @@ void Run::parse_correct_velocity(const char** param, int num_param, const std::v
   velocity.do_velocity_correction = true;
 }
 
-void Run::parse_time_step(const char** param, int num_param)
+void Run::parse_time_step(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
   if (num_param != 2 && num_param != 3) {
     PRINT_INPUT_ERROR("time_step should have 1 or 2 parameters.\n");
   }
-  if (!is_valid_real(param[1], &time_step)) {
+  if (!is_valid_real(tokens[1], &time_step)) {
     PRINT_INPUT_ERROR("time_step should be a real number.\n");
   }
   printf("Time step for this run is %g fs.\n", time_step);
   time_step /= TIME_UNIT_CONVERSION;
   if (num_param == 3) {
-    if (!is_valid_real(param[2], &max_distance_per_step)) {
+    if (!is_valid_real(tokens[2], &max_distance_per_step)) {
       PRINT_INPUT_ERROR("max distance per step should be a real number.\n");
     }
     if (max_distance_per_step <= 0.0) {
@@ -1199,26 +1041,30 @@ void Run::parse_time_step(const char** param, int num_param)
   }
 }
 
-void Run::parse_run(const char** param, int num_param)
+void Run::parse_run(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
+  int number_of_steps;
   if (num_param != 2) {
     PRINT_INPUT_ERROR("run should have 1 parameter.\n");
   }
-  if (!is_valid_int(param[1], &number_of_steps)) {
+  if (!is_valid_int(tokens[1], &number_of_steps)) {
     PRINT_INPUT_ERROR("number of steps should be an integer.\n");
   }
   if (number_of_steps <= 0) {
     PRINT_INPUT_ERROR("number of steps should be positive.\n");
   }
+  if (!integrate.has_ensemble()) {
+    PRINT_INPUT_ERROR("An ensemble must be specified before each run.");
+  }
   printf("Run %d steps.\n", number_of_steps);
 
   // set target temperature for temperature-dependent NEP
-  force.temperature = integrate.temperature1;
-  force.delta_T = (integrate.temperature2 - integrate.temperature1) / number_of_steps;
+  force.set_temperature_range(
+    integrate.get_temperature1(), integrate.get_temperature2(), number_of_steps);
 
-  perform_a_run();
-  hac_current_option_seen_ = false;
-  hac_current_qnep_full_a_ = false;
+
+  perform_a_run(number_of_steps);
 }
 
 static __global__ void gpu_deform_atom(
@@ -1247,36 +1093,37 @@ static __global__ void gpu_deform_atom(
   }
 }
 
-void Run::parse_change_box(const char** param, int num_param)
+void Run::parse_change_box(const std::vector<std::string>& tokens)
 {
+  const int num_param = tokens.size();
   if (num_param != 2 && num_param != 4 && num_param != 7) {
     PRINT_INPUT_ERROR("change_box can only have 1 or 3 or 6 parameters\n.");
   }
 
   double deformation_matrix[3][3] = {0.0};
 
-  if (!is_valid_real(param[1], &deformation_matrix[0][0])) {
+  if (!is_valid_real(tokens[1], &deformation_matrix[0][0])) {
     PRINT_INPUT_ERROR("box change parameter in xx should be a number.");
   }
   deformation_matrix[1][1] = deformation_matrix[2][2] = deformation_matrix[0][0];
 
   if (num_param >= 4) {
-    if (!is_valid_real(param[2], &deformation_matrix[1][1])) {
+    if (!is_valid_real(tokens[2], &deformation_matrix[1][1])) {
       PRINT_INPUT_ERROR("box change parameter in yy should be a number.");
     }
-    if (!is_valid_real(param[3], &deformation_matrix[2][2])) {
+    if (!is_valid_real(tokens[3], &deformation_matrix[2][2])) {
       PRINT_INPUT_ERROR("box change parameter in zz should be a number.");
     }
   }
 
   if (num_param == 7) {
-    if (!is_valid_real(param[4], &deformation_matrix[1][2])) {
+    if (!is_valid_real(tokens[4], &deformation_matrix[1][2])) {
       PRINT_INPUT_ERROR("box change parameter in yz should be a number.");
     }
-    if (!is_valid_real(param[5], &deformation_matrix[0][2])) {
+    if (!is_valid_real(tokens[5], &deformation_matrix[0][2])) {
       PRINT_INPUT_ERROR("box change parameter in xz should be a number.");
     }
-    if (!is_valid_real(param[6], &deformation_matrix[0][1])) {
+    if (!is_valid_real(tokens[6], &deformation_matrix[0][1])) {
       PRINT_INPUT_ERROR("box change parameter in xy should be a number.");
     }
     deformation_matrix[1][0] = deformation_matrix[0][1];

@@ -72,7 +72,7 @@ bool existing_segmented_output(const char* filename, const std::string& expected
   if (read_error) PRINT_INPUT_ERROR("Could not inspect an existing QHM output file.");
   if (nonempty) {
     if (!has_contract || std::strncmp(first_line, "# segment_begin id ", 19) != 0 ||
-        std::strncmp(version_line, "# qhm_segment_metadata_version 2", 32) != 0) {
+        std::strncmp(version_line, "# qhm_segment_metadata_version 3", 32) != 0) {
       std::fprintf(stderr, "Existing QHM output has no compatible segment contract: %s\n", filename);
       PRINT_INPUT_ERROR("Move or rename legacy QHM outputs before appending a new segment.");
     }
@@ -309,8 +309,8 @@ FILE* QuantumHeatMoments::open_segment_file(const char* filename)
 {
   FILE* file = my_fopen(filename, "a");
   std::fprintf(file,
-    "# segment_begin id %s\n# qhm_segment_metadata_version 2\n# qhm_append_contract %s\n"
-    "# qhm_append_contract_fields model_fnv1a64 N P mu0 mu2 mu4 complex_pi weyl_order dynamic a0_only T_start T_end dt fd_r fd_p integrate_type sample_interval static_interval dynamic_interval candidate_interval n_moyal n_trace n_aux\n"
+    "# segment_begin id %s\n# qhm_segment_metadata_version 3\n# qhm_append_contract %s\n"
+    "# qhm_append_contract_fields model_fnv1a64 N P mu0 mu2 mu4 complex_pi weyl_order dynamic a0_only T_start T_end dt fd_r fd_p integrate_mode sample_interval static_interval dynamic_interval candidate_interval n_moyal n_trace n_aux\n"
     "# analysis_rule group_numeric_rows_by_segment_id\n"
     "# force_model_filename %s\n# force_model_fnv1a64 %016llx\n"
     "# N %d\n# P %d\n# exact_mu0 %d\n# exact_mu2 %d\n# exact_mu4 %d\n# weyl_max_order %d\n",
@@ -329,10 +329,11 @@ void QuantumHeatMoments::pre_run(
   Box& box,
   Force& force)
 {
-  if (integrate.type != 31 && integrate.type != 33)
+  const EnsembleType integrate_type = integrate.get_type();
+  if (integrate_type != EnsembleType::RPMD && integrate_type != EnsembleType::PIMD)
     PRINT_INPUT_ERROR("compute_quantum_heat_moments supports RPMD NVE or PIMD only.");
-  dynamic_enabled_ = integrate.type == 31;
-  pimd_a0_only_enabled_ = integrate.type == 33 &&
+  dynamic_enabled_ = integrate_type == EnsembleType::RPMD;
+  pimd_a0_only_enabled_ = integrate_type == EnsembleType::PIMD &&
     !(exact_mu0_enabled_ || exact_mu2_enabled_ || exact_mu4_enabled_);
   int active_interval = std::numeric_limits<int>::max();
   if (exact_mu0_enabled_ || exact_mu2_enabled_ || exact_mu4_enabled_)
@@ -361,8 +362,6 @@ void QuantumHeatMoments::pre_run(
   if (force.potentials.size() != 1 || dynamic_cast<NEP*>(force.potentials[0].get()) == nullptr) {
     PRINT_INPUT_ERROR("compute_quantum_heat_moments requires one pure NEP potential; qNEP is rejected by default.");
   }
-  if (force.compute_hnemd_ || force.compute_hnemdec_ != -1)
-    PRINT_INPUT_ERROR("compute_quantum_heat_moments does not support HNEMD or HNEMDEC driven sampling.");
   number_of_atoms_ = atom.number_of_atoms;
   number_of_beads_ = atom.number_of_beads;
   number_of_steps_ = number_of_steps;
@@ -388,24 +387,25 @@ void QuantumHeatMoments::pre_run(
   static_profile_geometry_eval_executed_ = 0;
   winding_sample_count_ = 0;
   closest_winding_violation_total_ = 0;
-  temperature_start_ = integrate.type == 33 ? integrate.temperature1 : integrate.temperature2;
-  temperature_end_ = integrate.temperature2;
+  temperature_start_ = integrate_type == EnsembleType::PIMD ?
+    integrate.get_temperature1() : integrate.get_temperature2();
+  temperature_end_ = integrate.get_temperature2();
   if (!(temperature_start_ > 0.0) || !std::isfinite(temperature_start_) ||
       !(temperature_end_ > 0.0) || !std::isfinite(temperature_end_))
     PRINT_INPUT_ERROR("compute_quantum_heat_moments requires a positive ring-polymer temperature.");
-  const bool constant_temperature = integrate.temperature1 == integrate.temperature2;
-  const bool has_pressure_control = integrate.num_target_pressure_components > 0;
+  const bool constant_temperature = integrate.get_temperature1() == integrate.get_temperature2();
+  const bool has_pressure_control = integrate.get_num_target_pressure_components() > 0;
   const bool canonical_primitive_pimd = quantum_heat_moments::is_canonical_primitive_pimd(
-    integrate.type == 33, constant_temperature, has_pressure_control,
-    integrate.use_scr_barostat, integrate.use_eco_pimd);
+    integrate_type == EnsembleType::PIMD, constant_temperature, has_pressure_control,
+    integrate.get_use_scr_barostat(), integrate.get_use_eco_pimd());
   diagnostic_noncanonical_ = !canonical_primitive_pimd;
   if (dynamic_enabled_) {
     pimd_action_scheme_ = "not_applicable_RPMD";
-  } else if (integrate.use_scr_barostat) {
-    pimd_action_scheme_ = integrate.use_eco_pimd ? "pimd_scr_eco" : "pimd_scr";
+  } else if (integrate.get_use_scr_barostat()) {
+    pimd_action_scheme_ = integrate.get_use_eco_pimd() ? "pimd_scr_eco" : "pimd_scr";
   } else if (has_pressure_control) {
-    pimd_action_scheme_ = integrate.use_eco_pimd ? "pimd_npt_eco" : "pimd_npt";
-  } else if (integrate.use_eco_pimd) {
+    pimd_action_scheme_ = integrate.get_use_eco_pimd() ? "pimd_npt_eco" : "pimd_npt";
+  } else if (integrate.get_use_eco_pimd()) {
     pimd_action_scheme_ = "pimd_eco";
   } else {
     pimd_action_scheme_ = constant_temperature ? "primitive_symmetric" :
@@ -415,7 +415,8 @@ void QuantumHeatMoments::pre_run(
       !canonical_primitive_pimd)
     PRINT_INPUT_ERROR(
       "exact static estimators require constant-temperature NVT primitive-frequency PIMD without SCR or Eco-PIMD.");
-  if ((exact_mu0_enabled_ || exact_mu2_enabled_ || exact_mu4_enabled_) && integrate.type != 33)
+  if ((exact_mu0_enabled_ || exact_mu2_enabled_ || exact_mu4_enabled_) &&
+      integrate_type != EnsembleType::PIMD)
     PRINT_INPUT_ERROR("exact static moments are available only for canonical primitive PIMD.");
   if (output_level_ == 2 && number_of_atoms_ > 128 && !force_debug_large_)
     PRINT_INPUT_ERROR("debug output for N>128 requires force_debug_large yes.");
@@ -436,12 +437,13 @@ void QuantumHeatMoments::pre_run(
   std::snprintf(numeric_contract, sizeof(numeric_contract), " %.17g %.17g %.17g %.17g %.17g",
     temperature_start_, temperature_end_, time_step_, fd_step_r_, fd_step_p_);
   append_contract_ += numeric_contract;
-  append_contract_ += " " + std::to_string(integrate.type) + " " + std::to_string(sample_interval_) +
+  append_contract_ += " " + std::string(
+    integrate_type == EnsembleType::RPMD ? "rpmd" : "pimd") + " " + std::to_string(sample_interval_) +
     " " + std::to_string(static_sample_interval_) + " " + std::to_string(dynamic_sample_interval_) +
     " " + std::to_string(candidate_sample_interval_) + " " + std::to_string(n_moyal_probe_) +
     " " + std::to_string(n_static_trace_probe_) + " " + std::to_string(n_aux_probe_);
   cutoff_ = active_nep->rc;
-  nep_sr_.reset(new NEP(model_path_storage_.c_str(), number_of_atoms_));
+  nep_sr_.reset(new NEP(model_path_storage_.c_str(), number_of_atoms_, force.get_run_input()));
   if (!nep_sr_->supports_local_edge_derivatives())
     PRINT_INPUT_ERROR("diagnostic NEP model includes a non-edge-resolved correction.");
   nep_sr_->enable_local_edge_derivatives();
@@ -1277,8 +1279,8 @@ void QuantumHeatMoments::write_meta(const Box& box, const double temperature)
   const double beta = 1.0 / (K_B * temperature);
   const bool hac_available = hac_ != nullptr && hac_->centroid_force_source_is_immediate();
   std::fprintf(meta_file_,
-    "# segment_begin id %s\n# qhm_segment_metadata_version 2\n# qhm_append_contract %s\n"
-    "# qhm_append_contract_fields model_fnv1a64 N P mu0 mu2 mu4 complex_pi weyl_order dynamic a0_only T_start T_end dt fd_r fd_p integrate_type sample_interval static_interval dynamic_interval candidate_interval n_moyal n_trace n_aux\n"
+    "# segment_begin id %s\n# qhm_segment_metadata_version 3\n# qhm_append_contract %s\n"
+    "# qhm_append_contract_fields model_fnv1a64 N P mu0 mu2 mu4 complex_pi weyl_order dynamic a0_only T_start T_end dt fd_r fd_p integrate_mode sample_interval static_interval dynamic_interval candidate_interval n_moyal n_trace n_aux\n"
     "# analysis_rule group_numeric_rows_by_segment_id\n"
     "# force_model_fnv1a64 %016llx\n# GPUMD_version 5.8\n# git_commit %s\n# git_commit_full %s\n"
     "# git_describe %s\n# git_dirty %s\n# git_tree_dirty_at_configure %s\n"
@@ -1799,9 +1801,9 @@ void QuantumHeatMoments::end_of_step(
     return;
   const auto sample_begin = std::chrono::steady_clock::now();
   const auto static_begin = std::chrono::steady_clock::now();
-  const double sample_temperature = integrate.type == 33 ?
+  const double sample_temperature = integrate.get_type() == EnsembleType::PIMD ?
     quantum_heat_moments::temperature_at_step(
-      integrate.temperature1, integrate.temperature2, step, number_of_steps_) : temperature;
+      integrate.get_temperature1(), integrate.get_temperature2(), step, number_of_steps_) : temperature;
   if (!(sample_temperature > 0.0) || !std::isfinite(sample_temperature))
     PRINT_INPUT_ERROR("compute_quantum_heat_moments encountered invalid sampled temperature.");
   box.get_inverse();

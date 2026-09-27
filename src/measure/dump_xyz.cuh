@@ -28,9 +28,17 @@ class Potential;
 class Dump_XYZ : public Action
 {
 public:
-  Dump_XYZ(const char** param, int num_param, const std::vector<Group>& groups, Atom& atom);
+  Dump_XYZ(
+    const std::vector<std::string>& tokens,
+    const std::vector<Group>& groups,
+    Atom& atom,
+    bool is_nep_charge);
   bool requires_bec() const override { return quantities.has_bec_; }
-  void parse(const char** param, int num_param, const std::vector<Group>& groups);
+  bool has_undefined_ring_polymer_charge_bec_output() const override
+  {
+    return is_nep_charge && (quantities.has_charge_ || quantities.has_bec_);
+  }
+  void parse(const std::vector<std::string>& tokens, const std::vector<Group>& groups);
   virtual void pre_run(
     const int number_of_steps,
     const double time_step,
