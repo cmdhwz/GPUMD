@@ -270,6 +270,7 @@ private:
   };
 
   std::unique_ptr<PIMD_Batch_Data> pimd_batch_data_;
+  GPU_Vector<int> small_box_max_neighbor_count_;
   bool neighbor_always_rebuild_ = false;
   bool neighbor_log_enabled_ = true;
   bool local_edge_derivatives_enabled_ = false;

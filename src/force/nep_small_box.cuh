@@ -58,6 +58,8 @@ static __global__ void find_neighbor_list_small_box(
   const int N,
   const int N1,
   const int N2,
+  const int max_neighbors,
+  int* max_neighbor_count,
   const Box box,
   const NEP::ExpandedBox ebox,
   const int* g_type,
@@ -109,25 +111,31 @@ static __global__ void find_neighbor_list_small_box(
             float rc_angular = (paramb.rc_angular[t1] + paramb.rc_angular[t2]) * 0.5f;
 
             if (distance_square < rc_radial * rc_radial) {
-              g_NL_radial[count_radial * N + n1] = n2;
-              g_x12_radial[count_radial * N + n1] = x12;
-              g_y12_radial[count_radial * N + n1] = y12;
-              g_z12_radial[count_radial * N + n1] = z12;
+              if (count_radial < max_neighbors) {
+                g_NL_radial[count_radial * N + n1] = n2;
+                g_x12_radial[count_radial * N + n1] = x12;
+                g_y12_radial[count_radial * N + n1] = y12;
+                g_z12_radial[count_radial * N + n1] = z12;
+              }
               count_radial++;
             }
             if (distance_square < rc_angular * rc_angular) {
-              g_NL_angular[count_angular * N + n1] = n2;
-              g_x12_angular[count_angular * N + n1] = x12;
-              g_y12_angular[count_angular * N + n1] = y12;
-              g_z12_angular[count_angular * N + n1] = z12;
+              if (count_angular < max_neighbors) {
+                g_NL_angular[count_angular * N + n1] = n2;
+                g_x12_angular[count_angular * N + n1] = x12;
+                g_y12_angular[count_angular * N + n1] = y12;
+                g_z12_angular[count_angular * N + n1] = z12;
+              }
               count_angular++;
             }
           }
         }
       }
     }
-    g_NN_radial[n1] = count_radial;
-    g_NN_angular[n1] = count_angular;
+    g_NN_radial[n1] = min(count_radial, max_neighbors);
+    g_NN_angular[n1] = min(count_angular, max_neighbors);
+    if (max_neighbor_count != nullptr && max(count_radial, count_angular) > max_neighbors)
+      atomicMax(max_neighbor_count, max(count_radial, count_angular));
   }
 }
 
@@ -1001,6 +1009,7 @@ static __global__ void find_neighbor_list_small_box_pimd_batch(
   const int N2,
   const int number_of_beads,
   const int small_neighbor_size,
+  int* max_neighbor_count,
   const float skin,
   const Box box,
   const NEP::ExpandedBox ebox,
@@ -1113,6 +1122,8 @@ static __global__ void find_neighbor_list_small_box_pimd_batch(
     }
     g_NN_radial[n1] = min(count_radial, small_neighbor_size);
     g_NN_angular[n1] = min(count_angular, small_neighbor_size);
+    if (max_neighbor_count != nullptr && max(count_radial, count_angular) > small_neighbor_size)
+      atomicMax(max_neighbor_count, max(count_radial, count_angular));
   } else {
     for (int i1 = 0; i1 < g_NN_radial[n1]; ++i1) {
       const int index = i1 * N + n1;

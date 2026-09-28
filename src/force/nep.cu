@@ -1742,6 +1742,31 @@ void NEP::compute_large_box(
   }
 }
 
+static int* prepare_small_box_neighbor_capacity_check(
+  const int number_of_atoms,
+  const NEP::ExpandedBox& ebox,
+  const int capacity,
+  GPU_Vector<int>& observed_max)
+{
+  const size_t possible_neighbors = static_cast<size_t>(number_of_atoms) *
+    ebox.num_cells[0] * ebox.num_cells[1] * ebox.num_cells[2];
+  if (possible_neighbors <= static_cast<size_t>(capacity)) return nullptr;
+  if (observed_max.size() != 1) observed_max.resize(1);
+  observed_max.fill(0);
+  return observed_max.data();
+}
+
+static void check_small_box_neighbor_capacity(const GPU_Vector<int>& observed_max, const int capacity)
+{
+  int observed = 0;
+  observed_max.copy_to_host(&observed);
+  if (observed > capacity) {
+    const std::string message = "NEP small-box neighbor-list overflow: observed maximum " +
+      std::to_string(observed) + ", capacity " + std::to_string(capacity) + ".";
+    PRINT_INPUT_ERROR(message.c_str());
+  }
+}
+
 // small box possibly used for active learning:
 void NEP::compute_small_box(
   Box& box,
@@ -1757,12 +1782,16 @@ void NEP::compute_small_box(
 
   const int big_neighbor_size = 2000;
   const int size_x12 = type.size() * big_neighbor_size;
+  int* max_neighbor_count = prepare_small_box_neighbor_capacity_check(
+    N2 - N1, ebox, big_neighbor_size, small_box_max_neighbor_count_);
 
   find_neighbor_list_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
     N,
     N1,
     N2,
+    big_neighbor_size,
+    max_neighbor_count,
     box,
     ebox,
     type.data(),
@@ -1780,6 +1809,8 @@ void NEP::compute_small_box(
     small_box_data.r12.data() + size_x12 * 4,
     small_box_data.r12.data() + size_x12 * 5);
   GPU_CHECK_KERNEL
+  if (max_neighbor_count != nullptr)
+    check_small_box_neighbor_capacity(small_box_max_neighbor_count_, big_neighbor_size);
 
   static int num_calls = 0;
   if (neighbor_log_enabled_ && num_calls++ % 1000 == 0) {
@@ -2098,6 +2129,8 @@ bool NEP::compute_pimd_batch(
     const int block_size = 64;
     const int grid_size = (N2 - N1 - 1) / block_size + 1;
     const dim3 grid(grid_size, number_of_beads);
+    int* max_neighbor_count = prepare_small_box_neighbor_capacity_check(
+      N2 - N1, ebox, small_box_neighbor_size, small_box_max_neighbor_count_);
     initialize_nep_pimd_batch_properties<<<
       dim3((N - 1) / 128 + 1, number_of_beads), 128>>>(
       N,
@@ -2114,6 +2147,7 @@ bool NEP::compute_pimd_batch(
       N2,
       number_of_beads,
       small_box_neighbor_size,
+      max_neighbor_count,
       1.0f,
       box,
       ebox,
@@ -2137,6 +2171,8 @@ bool NEP::compute_pimd_batch(
       batch.small_image_y_angular.data(),
       batch.small_image_z_angular.data());
     GPU_CHECK_KERNEL
+    if (max_neighbor_count != nullptr)
+      check_small_box_neighbor_capacity(small_box_max_neighbor_count_, small_box_neighbor_size);
     if (profile) {
       CHECK(gpuDeviceSynchronize());
       pimd_batch_timing_.neighbor_filter += std::chrono::duration<double>(
@@ -2845,12 +2881,16 @@ void NEP::compute_small_box(
 
   const int big_neighbor_size = 2000;
   const int size_x12 = type.size() * big_neighbor_size;
+  int* max_neighbor_count = prepare_small_box_neighbor_capacity_check(
+    N2 - N1, ebox, big_neighbor_size, small_box_max_neighbor_count_);
 
   find_neighbor_list_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
     N,
     N1,
     N2,
+    big_neighbor_size,
+    max_neighbor_count,
     box,
     ebox,
     type.data(),
@@ -2868,6 +2908,8 @@ void NEP::compute_small_box(
     small_box_data.r12.data() + size_x12 * 4,
     small_box_data.r12.data() + size_x12 * 5);
   GPU_CHECK_KERNEL
+  if (max_neighbor_count != nullptr)
+    check_small_box_neighbor_capacity(small_box_max_neighbor_count_, big_neighbor_size);
 
   static int num_calls = 0;
   if (num_calls++ % 1000 == 0) {
