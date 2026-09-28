@@ -59,6 +59,38 @@ endif
 endif
 
 
+# Match the GPUMD Git metadata definitions used by CMake. Failed queries fall back to unknown.
+GPUMD_GIT_COMMIT ?= $(shell git -C .. rev-parse --short HEAD)
+GPUMD_GIT_COMMIT_FULL ?= $(shell git -C .. rev-parse HEAD)
+GPUMD_GIT_DESCRIBE ?= $(shell git -C .. describe --always --tags)
+ifeq ($(strip $(GPUMD_GIT_COMMIT)),)
+GPUMD_GIT_COMMIT := unknown
+endif
+ifeq ($(strip $(GPUMD_GIT_COMMIT_FULL)),)
+GPUMD_GIT_COMMIT_FULL := unknown
+endif
+ifeq ($(strip $(GPUMD_GIT_DESCRIBE)),)
+GPUMD_GIT_DESCRIBE := unknown
+endif
+ifndef GPUMD_GIT_DIRTY
+GPUMD_GIT_STATUS_RESULT := $(shell git -C .. status --porcelain --untracked-files=normal && echo __GPUMD_GIT_STATUS_OK__)
+ifeq ($(findstring __GPUMD_GIT_STATUS_OK__,$(GPUMD_GIT_STATUS_RESULT)),)
+GPUMD_GIT_DIRTY := unknown
+else
+GPUMD_GIT_STATUS := $(subst __GPUMD_GIT_STATUS_OK__,,$(GPUMD_GIT_STATUS_RESULT))
+ifneq ($(strip $(GPUMD_GIT_STATUS)),)
+GPUMD_GIT_DIRTY := yes
+else
+GPUMD_GIT_DIRTY := no
+endif
+endif
+endif
+GPUMD_GIT_DEFINES = \
+	-DGPUMD_GIT_COMMIT=\"$(GPUMD_GIT_COMMIT)\" \
+	-DGPUMD_GIT_COMMIT_FULL=\"$(GPUMD_GIT_COMMIT_FULL)\" \
+	-DGPUMD_GIT_DESCRIBE=\"$(GPUMD_GIT_DESCRIBE)\" \
+	-DGPUMD_GIT_DIRTY=\"$(GPUMD_GIT_DIRTY)\"
+
 ###########################################################
 # source files
 ###########################################################
@@ -152,7 +184,7 @@ minimize/%.obj: minimize/%.cu $(HEADERS)
 force/%.obj: force/%.cu $(HEADERS)
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
 measure/%.obj: measure/%.cu $(HEADERS)
-	$(CC) $(CFLAGS) $(INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(GPUMD_GIT_DEFINES) $(INC) -c $< -o $@
 main_gpumd/%.obj: main_gpumd/%.cu $(HEADERS)
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
 utilities/%.obj: utilities/%.cu $(HEADERS)
@@ -175,7 +207,7 @@ minimize/%.o: minimize/%.cu $(HEADERS)
 force/%.o: force/%.cu $(HEADERS)
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
 measure/%.o: measure/%.cu $(HEADERS)
-	$(CC) $(CFLAGS) $(INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(GPUMD_GIT_DEFINES) $(INC) -c $< -o $@
 main_gpumd/%.o: main_gpumd/%.cu $(HEADERS)
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
 utilities/%.o: utilities/%.cu $(HEADERS)

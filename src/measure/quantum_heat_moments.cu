@@ -72,7 +72,7 @@ bool existing_segmented_output(const char* filename, const std::string& expected
   if (read_error) PRINT_INPUT_ERROR("Could not inspect an existing QHM output file.");
   if (nonempty) {
     if (!has_contract || std::strncmp(first_line, "# segment_begin id ", 19) != 0 ||
-        std::strncmp(version_line, "# qhm_segment_metadata_version 3", 32) != 0) {
+        std::strncmp(version_line, "# qhm_segment_metadata_version 4", 32) != 0) {
       std::fprintf(stderr, "Existing QHM output has no compatible segment contract: %s\n", filename);
       PRINT_INPUT_ERROR("Move or rename legacy QHM outputs before appending a new segment.");
     }
@@ -309,7 +309,7 @@ FILE* QuantumHeatMoments::open_segment_file(const char* filename)
 {
   FILE* file = my_fopen(filename, "a");
   std::fprintf(file,
-    "# segment_begin id %s\n# qhm_segment_metadata_version 3\n# qhm_append_contract %s\n"
+    "# segment_begin id %s\n# qhm_segment_metadata_version 4\n# qhm_append_contract %s\n"
     "# qhm_append_contract_fields model_fnv1a64 N P mu0 mu2 mu4 complex_pi weyl_order dynamic a0_only T_start T_end dt fd_r fd_p integrate_mode sample_interval static_interval dynamic_interval candidate_interval n_moyal n_trace n_aux\n"
     "# analysis_rule group_numeric_rows_by_segment_id\n"
     "# force_model_filename %s\n# force_model_fnv1a64 %016llx\n"
@@ -444,6 +444,8 @@ void QuantumHeatMoments::pre_run(
     " " + std::to_string(n_static_trace_probe_) + " " + std::to_string(n_aux_probe_);
   cutoff_ = active_nep->rc;
   nep_sr_.reset(new NEP(model_path_storage_.c_str(), number_of_atoms_, force.get_run_input()));
+  nep_sr_->N1 = 0;
+  nep_sr_->N2 = number_of_atoms_;
   if (!nep_sr_->supports_local_edge_derivatives())
     PRINT_INPUT_ERROR("diagnostic NEP model includes a non-edge-resolved correction.");
   nep_sr_->enable_local_edge_derivatives();
@@ -482,8 +484,13 @@ void QuantumHeatMoments::pre_run(
   virial_gpu_.resize(static_cast<size_t>(number_of_atoms_) * 9);
   bead_position_host_.assign(number_of_beads_, std::vector<double>(static_cast<size_t>(number_of_atoms_) * 3));
   bead_velocity_host_.assign(number_of_beads_, std::vector<double>(static_cast<size_t>(number_of_atoms_) * 3));
-  for (auto& by_order : imaginary_stats_)
-    for (auto& by_alpha : by_order) by_alpha.resize(std::min(imag_lag_max_, number_of_beads_ - 1) + 1);
+  for (int order = 0; order < 3; ++order) {
+    for (int alpha = 0; alpha < 3; ++alpha) {
+      const size_t lag_count = static_cast<size_t>(std::min(imag_lag_max_, number_of_beads_ - 1) + 1);
+      imaginary_stats_[order][alpha].resize(lag_count);
+      imaginary_skipped_nan_[order][alpha].assign(lag_count, 0);
+    }
+  }
 
   const bool any_exact_static = exact_mu0_enabled_ || exact_mu2_enabled_ || exact_mu4_enabled_;
   bool appending_existing_output = false;
@@ -825,7 +832,8 @@ Complex QuantumHeatMoments::evaluate_gamma0(
   const double beta,
   const double step,
   const std::vector<MoyalProbe>& trace_probes,
-  double& imaginary_residual)
+  double& imaginary_residual,
+  std::vector<Complex>& probe_samples)
 {
   const size_t D = mass_by_dof_.size();
   const double epsilon = beta / number_of_beads_;
@@ -842,6 +850,8 @@ Complex QuantumHeatMoments::evaluate_gamma0(
   }
 
   double divergence_a = 0.0;
+  std::vector<double> divergence_samples;
+  divergence_samples.reserve(trace_probes.size());
   for (const MoyalProbe& probe : trace_probes) {
     const std::vector<double>& xi = probe.direction[0];
     std::vector<double> plus = position, minus = position;
@@ -849,10 +859,11 @@ Complex QuantumHeatMoments::evaluate_gamma0(
       plus[d] += step * xi[d];
       minus[d] -= step * xi[d];
     }
-    divergence_a += dot(
-      linear_coefficients(*evaluate_geometry(plus), alpha), xi) / (2.0 * step);
-    divergence_a -= dot(
-      linear_coefficients(*evaluate_geometry(minus), alpha), xi) / (2.0 * step);
+    const double plus_term = dot(linear_coefficients(*evaluate_geometry(plus), alpha), xi) / (2.0 * step);
+    const double minus_term = dot(linear_coefficients(*evaluate_geometry(minus), alpha), xi) / (2.0 * step);
+    divergence_a += plus_term;
+    divergence_a -= minus_term;
+    divergence_samples.push_back(plus_term - minus_term);
   }
   if (!trace_probes.empty()) divergence_a /= trace_probes.size();
 
@@ -883,12 +894,20 @@ Complex QuantumHeatMoments::evaluate_gamma0(
   }
   const double gamma_imag = -HBAR * (a_dot_g + 0.5 * divergence_a) +
     HBAR * HBAR * HBAR * C_R3 / 6.0;
-  const Complex gamma(0.0, gamma_imag);
+  const Complex imaginary_unit(0.0, 1.0);
+  const Complex gamma = imaginary_unit * gamma_imag;
+  probe_samples.clear();
+  probe_samples.reserve(divergence_samples.size());
+  for (const double divergence : divergence_samples) {
+    const double sample = -HBAR * (a_dot_g + 0.5 * divergence) +
+      HBAR * HBAR * HBAR * C_R3 / 6.0;
+    probe_samples.push_back(imaginary_unit * sample);
+  }
   imaginary_residual = std::fabs(gamma.real()) / std::max(std::fabs(gamma.imag()), 1.0e-30);
   return gamma;
 }
 
-double QuantumHeatMoments::evaluate_gamma1(
+Complex QuantumHeatMoments::evaluate_gamma1(
   const std::vector<double>& position,
   const std::vector<double>& link_displacement,
   const int alpha,
@@ -971,7 +990,10 @@ double QuantumHeatMoments::evaluate_gamma1(
     trace_sum += sample;
   }
   const double trace_mean = trace_probes.empty() ? 0.0 : trace_sum / trace_probes.size();
-  return C0 - HBAR * HBAR * (Bgg + trace_mean);
+  const double gamma_real = C0 - HBAR * HBAR * (Bgg + trace_mean);
+  const Complex minus_i(0.0, -1.0);
+  const Complex phase = minus_i * minus_i;
+  return phase * (-gamma_real);
 }
 
 Complex QuantumHeatMoments::evaluate_gamma2(
@@ -983,7 +1005,8 @@ Complex QuantumHeatMoments::evaluate_gamma2(
   const double step_p,
   const std::vector<MoyalProbe>& probes,
   double& imaginary_residual,
-  ComplexStats& contraction_stats)
+  ComplexStats& contraction_stats,
+  std::vector<Complex>& probe_samples)
 {
   const size_t Dof = mass_by_dof_.size();
   const double epsilon = beta / number_of_beads_;
@@ -1018,6 +1041,9 @@ Complex QuantumHeatMoments::evaluate_gamma2(
   const double D_ggg = evaluate_D_contraction(position, g, g, g, alpha, step_r, step_p);
   const double E_g = evaluate_E_contraction(position, g, alpha, step_r, step_p);
   ComplexStats samples;
+  probe_samples.clear();
+  probe_samples.reserve(probes.size());
+  const Complex imaginary_unit(0.0, 1.0);
   for (const MoyalProbe& probe : probes) {
     const std::vector<double>& xi = probe.direction[0];
     const std::vector<double>& eta = probe.direction[1];
@@ -1053,18 +1079,22 @@ Complex QuantumHeatMoments::evaluate_gamma2(
       0.75 * D_second_derivative + 0.125 * D_third_derivative;
     const double sample = HBAR * HBAR * HBAR * (D_ggg + d_bracket) -
       HBAR * (E_g + 0.5 * E_divergence);
-    if (!samples.add_if_finite(Complex(sample, 0.0))) {
+    const Complex gamma_sample = imaginary_unit * sample;
+    probe_samples.push_back(gamma_sample);
+    if (!samples.add_if_finite(gamma_sample)) {
+      probe_samples.clear();
       contraction_stats = ComplexStats();
       return Complex(std::numeric_limits<double>::quiet_NaN(),
         std::numeric_limits<double>::quiet_NaN());
     }
   }
   if (samples.count == 0) {
+    probe_samples.clear();
     contraction_stats = ComplexStats();
     return Complex(std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN());
   }
   contraction_stats = samples;
-  const Complex gamma(0.0, samples.mean.real());
+  const Complex gamma = samples.mean;
   imaginary_residual = std::fabs(gamma.real()) / std::max(std::fabs(gamma.imag()), 1.0e-30);
   return gamma;
 }
@@ -1222,27 +1252,35 @@ void QuantumHeatMoments::write_headers()
   if (imaginary_file_ != nullptr) {
     std::fprintf(imaginary_file_,
       "# lag_zero_policy unavailable_nan_same_bead_self_product_not_a_validated_same_point_estimator\n"
-      "# format_version 5\n# columns order alpha lag lambda_over_beta mean_corr_real mean_corr_imag stderr_naive_real stderr_naive_imag n_frames\n");
+      "# format_version 6\n# columns order alpha lag lambda_over_beta mean_corr_real mean_corr_imag variance_corr_complex variance_corr_real variance_corr_imag covariance_corr_real_imag stderr_naive_real stderr_naive_imag n_frames_total n_frames_used n_skipped_winding n_skipped_nan n_skipped_other valid reason\n");
   }
   if (estimator_stats_file_ != nullptr) {
     std::fprintf(estimator_stats_file_,
-      "# format_version 8\n# exact_static columns order alpha P n_frames mean_real mean_imag variance_complex variance_real variance_imag covariance_real_imag stderr_naive_real stderr_naive_imag mean_abs max_abs n_static_frames_total n_static_frames_used n_static_frames_skipped_nan n_static_frames_skipped_other\n"
+      "# format_version 9\n# exact_static columns order alpha P n_frames mean_real mean_imag variance_complex variance_real variance_imag covariance_real_imag stderr_naive_real stderr_naive_imag mean_abs max_abs n_frames_total n_frames_used n_skipped_winding n_skipped_nan n_skipped_other\n"
       "# candidate_frame columns step A_order alpha n_finite_probes mean_real mean_imag probe_stderr_naive_real probe_stderr_naive_imag probe_frame_complete frame_accepted\n"
       "# candidate_complex_pi columns A_order alpha n_valid_frames mean_real mean_imag variance_real variance_imag covariance_real_imag variance_complex stderr_naive_real stderr_naive_imag mean_abs max_abs n_invalid_frames\n");
   }
   if (fdcheck_file_ != nullptr) {
     std::fprintf(fdcheck_file_,
-      "# format_version 8\n# probe_statistics_available mu2_only_other_rows_nan\n"
+      "# format_version 9\n# probe_statistics_scope exact_static_moyal_and_trace_contractions\n"
+      "# probe_statistics_are_bead_averaged_contraction_samples_not_open_endpoint_moment_error\n"
        "# counter_scope per_alpha_pipeline_candidate_order_rows_repeat_shared_alpha_counts\n"
        "# alpha_wall_scope static_pipeline_candidate_probe_loop_including_warnings_excluding_frame_output_io\n"
       "# columns step time_fs estimator order alpha value_h_real value_h_imag value_h2_real value_h2_imag "
-      "value_Richardson_real value_Richardson_imag fd_abs_diff fd_rel_diff moyal_probe_count moyal_mean_real "
-      "moyal_mean_imag moyal_stderr_naive trace_probe_count trace_mean_real trace_mean_imag trace_stderr_naive "
+      "value_Richardson_real value_Richardson_imag fd_abs_diff fd_rel_diff "
+      "moyal_probe_applicable moyal_probe_status "
+      "moyal_probe_count_h moyal_probe_mean_h_real moyal_probe_mean_h_imag moyal_probe_variance_h_real moyal_probe_variance_h_imag moyal_probe_se_h_real moyal_probe_se_h_imag "
+      "moyal_probe_count_h2 moyal_probe_mean_h2_real moyal_probe_mean_h2_imag moyal_probe_variance_h2_real moyal_probe_variance_h2_imag moyal_probe_se_h2_real moyal_probe_se_h2_imag "
+      "moyal_probe_count_richardson moyal_probe_mean_richardson_real moyal_probe_mean_richardson_imag moyal_probe_variance_richardson_real moyal_probe_variance_richardson_imag moyal_probe_se_richardson_real moyal_probe_se_richardson_imag "
+      "trace_probe_applicable trace_probe_status "
+      "trace_probe_count_h trace_probe_mean_h_real trace_probe_mean_h_imag trace_probe_variance_h_real trace_probe_variance_h_imag trace_probe_se_h_real trace_probe_se_h_imag "
+      "trace_probe_count_h2 trace_probe_mean_h2_real trace_probe_mean_h2_imag trace_probe_variance_h2_real trace_probe_variance_h2_imag trace_probe_se_h2_real trace_probe_se_h2_imag "
+      "trace_probe_count_richardson trace_probe_mean_richardson_real trace_probe_mean_richardson_imag trace_probe_variance_richardson_real trace_probe_variance_richardson_imag trace_probe_se_richardson_real trace_probe_se_richardson_imag "
       "nep_eval_requested_alpha_pipeline nep_eval_executed_alpha_pipeline nep_eval_cache_hits_alpha_pipeline "
       "geometry_eval_requested_alpha_pipeline geometry_eval_executed_alpha_pipeline alpha_pipeline_wall_seconds\n");
   }
   if (edgecheck_file_ != nullptr) {
-    std::fprintf(edgecheck_file_, "# format_version 3\n# columns step center_atom neighbor_atom image_x image_y image_z component check_type has_radial has_angular pair_distance pair_radial_cutoff analytic fd_h fd_h2 fd_h4 fd_h8 fd_Richardson abs_error rel_error truncation_delta_h_h2 small_step_spread_h4_h8 n_matching_images not_coordinate_fd_testable_count\n");
+    std::fprintf(edgecheck_file_, "# format_version 4\n# columns step center_atom neighbor_atom image_x image_y image_z component record_type has_radial has_angular pair_distance pair_radial_cutoff analytic fd_h fd_h2 fd_h4 fd_h8 fd_Richardson abs_error rel_error truncation_delta_h_h2 small_step_spread_h4_h8 n_matching_images not_coordinate_fd_testable_count uij_x uij_y uij_z uij_norm\n# individual_image rows retain image IDs and analytic derivatives; their image-specific coordinate FD fields are NaN\n# summed_images rows use image 0 0 0 and NaN uij as aggregation sentinels; analytic sum is compared with physical-atom Ui FD\n");
   }
   if (winding_file_ != nullptr) {
     std::fprintf(winding_file_, "# format_version 2\n# columns step record_type bead_id atom_id component action_link_lift cartesian_closest_link_lift action_winding cartesian_closest_winding n_nonzero_action_winding_atoms max_abs_action_winding_component n_nonzero_cartesian_closest_winding_atoms max_abs_cartesian_closest_winding_component link_image_total link_image_mismatch_count max_link_length_action max_link_length_cartesian_closest spring_qhm_link_rule_match\n");
@@ -1279,11 +1317,11 @@ void QuantumHeatMoments::write_meta(const Box& box, const double temperature)
   const double beta = 1.0 / (K_B * temperature);
   const bool hac_available = hac_ != nullptr && hac_->centroid_force_source_is_immediate();
   std::fprintf(meta_file_,
-    "# segment_begin id %s\n# qhm_segment_metadata_version 3\n# qhm_append_contract %s\n"
+    "# segment_begin id %s\n# qhm_segment_metadata_version 4\n# qhm_append_contract %s\n"
     "# qhm_append_contract_fields model_fnv1a64 N P mu0 mu2 mu4 complex_pi weyl_order dynamic a0_only T_start T_end dt fd_r fd_p integrate_mode sample_interval static_interval dynamic_interval candidate_interval n_moyal n_trace n_aux\n"
     "# analysis_rule group_numeric_rows_by_segment_id\n"
     "# force_model_fnv1a64 %016llx\n# GPUMD_version 5.8\n# git_commit %s\n# git_commit_full %s\n"
-    "# git_describe %s\n# git_dirty %s\n# git_tree_dirty_at_configure %s\n"
+    "# git_describe %s\n# git_dirty %s\n# git_tree_dirty_at_metadata_capture %s\n"
     "# source_tree_not_fully_reproducible %s\n",
     segment_id_.c_str(), append_contract_.c_str(), model_fingerprint_,
     GPUMD_GIT_COMMIT, GPUMD_GIT_COMMIT_FULL,
@@ -1321,7 +1359,8 @@ void QuantumHeatMoments::write_meta(const Box& box, const double temperature)
     "# pimd_a0_only_current_enabled %s\n"
     "# exact_mu0_enabled %s\n# exact_mu2_enabled %s\n# exact_mu4_enabled %s\n# exact_mu6_enabled %s\n"
     "# imaginary_time_lag_zero unavailable_nan_same_bead_self_product_not_validated\n"
-    "# gamma_component_residuals analytic_pure_component_by_construction_not_independent_leakage_checks\n"
+    "# gamma_component_residuals raw_complex_phase_arithmetic_summary_written_at_segment_end\n"
+    "# gamma_forbidden_component_parity real_scalar_NEP_kernel_parity_structurally_constrained\n"
     "# open_endpoint_imag_residuals analytic_real_by_construction_not_independent_leakage_checks\n"
     "# required_operator_order %d\n"
     "# candidate_complex_pi_frame_weighting equal_weight_per_valid_frame\n"
@@ -1338,7 +1377,7 @@ void QuantumHeatMoments::write_meta(const Box& box, const double temperature)
     "# hac_baseline_available %s\n# hac_baseline_mode %s\n# hac_sampling_interval %d\n"
     "# qhm_dynamic_sampling_interval %d\n# hac_qhm_step_alignment same_MD_step_only\n"
     "# weyl_max_order %d\n# exact_static_max_order %d\n# static_backend directional\n"
-    "# mu4_fdcheck_trace_statistics unavailable_nan_probe_level_values_not_retained\n"
+    "# mu0_mu2_mu4_fdcheck_probe_statistics exact_static_trace_and_moyal_contractions_bead_averaged_by_probe_index\n"
     "# static_fd_within_threshold_rule abs(h-h2)/max(abs(h2),1e-30)_for_each_enabled_order_and_direction\n"
     "# static_fd_within_threshold_values 1_all_within_threshold_0_any_exceeds_or_nonfinite_minus1_not_evaluated\n"
     "# static_fd_within_threshold_scope diagnostic_only_does_not_filter_static_frame_statistics_or_prove_convergence\n"
@@ -1372,6 +1411,18 @@ void QuantumHeatMoments::write_meta(const Box& box, const double temperature)
     "# internal_time_unit sqrt(amu*angstrom^2/eV)\n# internal_time_unit_fs %.16e\n# internal_temperature_unit K\n"
     "# current_unit eV*angstrom/internal_time\n# mu0_unit current^2\n"
     "# mu2_unit current^2/internal_time^2\n# mu4_unit current^2/internal_time^4\n"
+    "# Gamma0_unit current\n# Gamma1_unit current/internal_time\n# Gamma2_unit current/internal_time^2\n"
+    "# imag_corr_mu0_unit current^2\n# imag_corr_mu2_unit current^2/internal_time^2\n"
+    "# imag_corr_mu4_unit current^2/internal_time^4\n"
+    "# variance_mu0_unit current^4\n# variance_mu2_unit current^4/internal_time^4\n"
+    "# variance_mu4_unit current^4/internal_time^8\n# variance_unit observable_squared\n"
+    "# stderr_unit same_as_observable\n# edge_uij_unit angstrom\n"
+    "# edge_derivative_unit eV/angstrom\n# fd_step_r_unit angstrom\n"
+    "# fd_step_p_unit amu*angstrom/internal_time\n"
+    "# fd_step_p_unit_equivalent sqrt(amu*eV)\n"
+    "# fd_step_p_coordinate canonical_momentum_equals_mass_times_velocity\n"
+    "# fd_probe_variance_unit corresponding_contraction_squared\n# fd_probe_stderr_unit same_as_probe_contraction\n"
+    "# imaginary_correlation_variance_unit corresponding_correlation_squared\n"
     "# smoothness_not_formally_verified\n# production_fd_choice Richardson\n"
     "# production_fd_choice_scope exact_static_only\n# candidate_complex_pi_fd_choice h\n",
     sample_interval_, static_sample_interval_, dynamic_sample_interval_, candidate_sample_interval_,
@@ -1399,7 +1450,7 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
 {
   if (edgecheck_file_ == nullptr) {
     edgecheck_file_ = open_segment_file("quantum_heat_edgecheck.out");
-    std::fprintf(edgecheck_file_, "# format_version 3\n# columns step center_atom neighbor_atom image_x image_y image_z component check_type has_radial has_angular pair_distance pair_radial_cutoff analytic fd_h fd_h2 fd_h4 fd_h8 fd_Richardson abs_error rel_error truncation_delta_h_h2 small_step_spread_h4_h8 n_matching_images not_coordinate_fd_testable_count\n");
+    std::fprintf(edgecheck_file_, "# format_version 4\n# columns step center_atom neighbor_atom image_x image_y image_z component record_type has_radial has_angular pair_distance pair_radial_cutoff analytic fd_h fd_h2 fd_h4 fd_h8 fd_Richardson abs_error rel_error truncation_delta_h_h2 small_step_spread_h4_h8 n_matching_images not_coordinate_fd_testable_count uij_x uij_y uij_z uij_norm\n# individual_image rows retain image IDs and analytic derivatives; their image-specific coordinate FD fields are NaN\n# summed_images rows use image 0 0 0 and NaN uij as aggregation sentinels; analytic sum is compared with physical-atom Ui FD\n");
   }
   std::map<std::pair<int, int>, int> image_counts;
   std::set<size_t> selected_set;
@@ -1454,6 +1505,16 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
     std::fprintf(stderr,
       "Warning: QHM edgecheck at step %d could not select both radial and angular NEP contributions.\n", step);
   const double nan = std::numeric_limits<double>::quiet_NaN();
+  const auto write_uij = [&](const double* uij) {
+    if (uij == nullptr) {
+      for (int mu = 0; mu < 4; ++mu) print_real(edgecheck_file_, nan);
+      return;
+    }
+    print_real(edgecheck_file_, uij[0]);
+    print_real(edgecheck_file_, uij[1]);
+    print_real(edgecheck_file_, uij[2]);
+    print_real(edgecheck_file_, std::sqrt(uij[0] * uij[0] + uij[1] * uij[1] + uij[2] * uij[2]));
+  };
   if (validate_fd_smoothness_ && cutoff_reference < geometry.edges.size()) {
     const NEP_Local_Edge& reference = geometry.edges[cutoff_reference];
     const double length = std::sqrt(reference.displacement[0] * reference.displacement[0] +
@@ -1490,7 +1551,9 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
       print_real(edgecheck_file_, nan);
       print_real(edgecheck_file_, std::fabs(third_derivative[0] - third_derivative[1]));
       print_real(edgecheck_file_, std::fabs(third_derivative[2] - third_derivative[3]));
-      std::fprintf(edgecheck_file_, " %d %d\n", matching, self_image_count);
+      std::fprintf(edgecheck_file_, " %d %d", matching, self_image_count);
+      write_uij(reference.displacement);
+      std::fprintf(edgecheck_file_, "\n");
     }
   }
   if (validate_edge_derivatives_) for (const size_t index : selected) {
@@ -1499,11 +1562,32 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
     const bool summed_images = n_matching > 1;
     double analytic[3] = {0.0, 0.0, 0.0};
     bool has_radial = false, has_angular = false;
+    const double pair_cutoff = nep_sr_->get_pair_radial_cutoff(
+      atom_type_host_[edge.center], atom_type_host_[edge.neighbor]);
     for (const NEP_Local_Edge& match : geometry.edges) {
       if (match.center != edge.center || match.neighbor != edge.neighbor) continue;
       for (int mu = 0; mu < 3; ++mu) analytic[mu] += match.derivative[mu];
       has_radial = has_radial || match.has_radial;
       has_angular = has_angular || match.has_angular;
+    }
+    if (summed_images) {
+      for (const NEP_Local_Edge& match : geometry.edges) {
+        if (match.center != edge.center || match.neighbor != edge.neighbor) continue;
+        const double image_distance = std::sqrt(match.displacement[0] * match.displacement[0] +
+          match.displacement[1] * match.displacement[1] + match.displacement[2] * match.displacement[2]);
+        for (int mu = 0; mu < 3; ++mu) {
+          std::fprintf(edgecheck_file_, "%d %d %d %d %d %d %c individual_image %d %d",
+            step, match.center, match.neighbor, match.image[0], match.image[1], match.image[2], "xyz"[mu],
+            match.has_radial ? 1 : 0, match.has_angular ? 1 : 0);
+          print_real(edgecheck_file_, image_distance);
+          print_real(edgecheck_file_, pair_cutoff);
+          print_real(edgecheck_file_, match.derivative[mu]);
+          for (int field = 0; field < 9; ++field) print_real(edgecheck_file_, nan);
+          std::fprintf(edgecheck_file_, " %d %d", n_matching, self_image_count);
+          write_uij(match.displacement);
+          std::fprintf(edgecheck_file_, "\n");
+        }
+      }
     }
     for (int mu = 0; mu < 3; ++mu) {
       const auto local_energy = [&](const std::vector<double>& displaced) {
@@ -1522,19 +1606,16 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
       const double richardson = (4.0 * fd_h2 - fd_h) / 3.0;
       const double abs_error = std::fabs(richardson - analytic[mu]);
       const double rel_error = abs_error / std::max(std::fabs(analytic[mu]), 1.0e-30);
-      const double pair_cutoff = nep_sr_->get_pair_radial_cutoff(
-        atom_type_host_[edge.center], atom_type_host_[edge.neighbor]);
       const double distance = std::sqrt(edge.displacement[0] * edge.displacement[0] +
         edge.displacement[1] * edge.displacement[1] + edge.displacement[2] * edge.displacement[2]);
-      const char* check_type = index == cutoff_reference ?
-        (summed_images ? "cutoff_reference_summed_images" : "cutoff_reference_unique_edge") :
-        (summed_images ? "summed_images" : "unique_edge");
+      const char* check_type = summed_images ? "summed_images" :
+        (index == cutoff_reference ? "cutoff_reference_unique_edge" : "unique_edge");
       std::fprintf(edgecheck_file_, "%d %d %d %d %d %d %c %s %d %d",
         step, edge.center, edge.neighbor,
         summed_images ? 0 : edge.image[0], summed_images ? 0 : edge.image[1], summed_images ? 0 : edge.image[2],
         "xyz"[mu], check_type,
         has_radial ? 1 : 0, has_angular ? 1 : 0);
-      print_real(edgecheck_file_, distance);
+      print_real(edgecheck_file_, summed_images ? nan : distance);
       print_real(edgecheck_file_, pair_cutoff);
       print_real(edgecheck_file_, analytic[mu]);
       print_real(edgecheck_file_, fd_h);
@@ -1546,14 +1627,16 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
       print_real(edgecheck_file_, rel_error);
       print_real(edgecheck_file_, std::fabs(fd_h - fd_h2));
       print_real(edgecheck_file_, std::fabs(fd_h4 - fd_h8));
-      std::fprintf(edgecheck_file_, " %d %d\n", n_matching, self_image_count);
+      std::fprintf(edgecheck_file_, " %d %d", n_matching, self_image_count);
+      write_uij(summed_images ? nullptr : edge.displacement);
+      std::fprintf(edgecheck_file_, "\n");
     }
   }
 
   if (validate_fd_smoothness_) {
     const auto write_cutoff_skip = [&](const char* side_name, const char* reason,
                                        const NEP_Local_Edge* reference, const double target_distance,
-                                       const double pair_cutoff, const int matching) {
+                                       const double pair_cutoff, const int matching, const double* uij) {
       const int center = reference == nullptr ? -1 : reference->center;
       const int neighbor = reference == nullptr ? -1 : reference->neighbor;
       const int image_x = reference == nullptr ? 0 : reference->image[0];
@@ -1566,11 +1649,13 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
       print_real(edgecheck_file_, target_distance);
       print_real(edgecheck_file_, pair_cutoff);
       for (int field = 0; field < 10; ++field) print_real(edgecheck_file_, nan);
-      std::fprintf(edgecheck_file_, " %d %d\n", matching, self_image_count);
+      std::fprintf(edgecheck_file_, " %d %d", matching, self_image_count);
+      write_uij(uij);
+      std::fprintf(edgecheck_file_, "\n");
     };
     if (cutoff_reference >= geometry.edges.size()) {
-      write_cutoff_skip("inside", "no_unique_pair", nullptr, nan, nan, 0);
-      write_cutoff_skip("outside", "no_unique_pair", nullptr, nan, nan, 0);
+      write_cutoff_skip("inside", "no_unique_pair", nullptr, nan, nan, 0, nullptr);
+      write_cutoff_skip("outside", "no_unique_pair", nullptr, nan, nan, 0, nullptr);
     } else {
       const NEP_Local_Edge& reference = geometry.edges[cutoff_reference];
       const double length = std::sqrt(reference.displacement[0] * reference.displacement[0] +
@@ -1585,12 +1670,14 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
         for (int side = -1; side <= 1; side += 2) {
           const char* side_name = side < 0 ? "inside" : "outside";
           const double target_distance = pair_cutoff + side * offset;
+          const double target_uij[3] = {target_distance * unit[0],
+            target_distance * unit[1], target_distance * unit[2]};
           if (target_distance <= 0.0) {
-            write_cutoff_skip(side_name, "nonpositive_radius", &reference, target_distance, pair_cutoff, 1);
+            write_cutoff_skip(side_name, "nonpositive_radius", &reference, target_distance, pair_cutoff, 1, target_uij);
             continue;
           }
           if (target_distance + 3.0 * edgecheck_step_ >= 0.5 * shortest_lattice_vector_) {
-            write_cutoff_skip(side_name, "periodic_image_boundary", &reference, target_distance, pair_cutoff, 1);
+            write_cutoff_skip(side_name, "periodic_image_boundary", &reference, target_distance, pair_cutoff, 1, target_uij);
             continue;
           }
           std::vector<double> side_position = position;
@@ -1637,7 +1724,9 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
             std::max(std::fabs(analytic), 1.0e-30));
           print_real(edgecheck_file_, std::fabs(fd[0] - fd[1]));
           print_real(edgecheck_file_, std::fabs(fd[2] - fd[3]));
-          std::fprintf(edgecheck_file_, " %d %d\n", matching, self_image_count);
+          std::fprintf(edgecheck_file_, " %d %d", matching, self_image_count);
+          write_uij(target_uij);
+          std::fprintf(edgecheck_file_, "\n");
 
           std::vector<double> direction(static_cast<size_t>(number_of_atoms_) * 3, 0.0);
           for (int mu = 0; mu < 3; ++mu)
@@ -1664,7 +1753,9 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
           print_real(edgecheck_file_, nan);
           print_real(edgecheck_file_, std::fabs(third_derivative[0] - third_derivative[1]));
           print_real(edgecheck_file_, std::fabs(third_derivative[2] - third_derivative[3]));
-          std::fprintf(edgecheck_file_, " %d %d\n", matching, self_image_count);
+          std::fprintf(edgecheck_file_, " %d %d", matching, self_image_count);
+          write_uij(target_uij);
+          std::fprintf(edgecheck_file_, "\n");
         }
       }
     }
@@ -1672,7 +1763,9 @@ void QuantumHeatMoments::validate_local_edge_derivatives(
 
   std::fprintf(edgecheck_file_, "%d -1 -1 0 0 0 - not_coordinate_fd_testable 0 0", step);
   for (int field = 0; field < 12; ++field) print_real(edgecheck_file_, nan);
-  std::fprintf(edgecheck_file_, " 0 %d\n", self_image_count);
+  std::fprintf(edgecheck_file_, " 0 %d", self_image_count);
+  write_uij(nullptr);
+  std::fprintf(edgecheck_file_, "\n");
   std::fflush(edgecheck_file_);
 }
 
@@ -1856,25 +1949,64 @@ void QuantumHeatMoments::end_of_step(
   const double beta = 1.0 / (K_B * sample_temperature);
   if (static_due) ++static_frames_total_;
   const double nan = std::numeric_limits<double>::quiet_NaN();
+  struct ProbeStatsSeries
+  {
+    bool applicable = false;
+    const char* status = "not_applicable";
+    std::array<ComplexStats, 3> by_step;
+  };
+  struct FDProbeStats
+  {
+    ProbeStatsSeries moyal;
+    ProbeStatsSeries trace;
+  };
   const auto fdcheck_counter_snapshot = [this]() {
     return std::array<long long, 5>{{nep_eval_requested_, nep_eval_executed_, nep_eval_cache_hits_,
       geometry_eval_requested_, geometry_eval_executed_}};
   };
+  const auto update_scaled_squares = [](const double value, double& scale, double& sumsq) {
+    const double magnitude = std::fabs(value);
+    if (magnitude == 0.0) return;
+    if (magnitude > scale) {
+      const double ratio = scale / magnitude;
+      sumsq = 1.0 + sumsq * ratio * ratio;
+      scale = magnitude;
+    } else {
+      const double ratio = magnitude / scale;
+      sumsq += ratio * ratio;
+    }
+  };
+  const auto record_gamma_component = [this, &update_scaled_squares](const int order, const Complex gamma) {
+    if (!finite(gamma)) return;
+    const double forbidden = order == 1 ? gamma.imag() : gamma.real();
+    const double allowed = order == 1 ? gamma.real() : gamma.imag();
+    ++gamma_component_count_[order];
+    gamma_forbidden_max_[order] = std::max(gamma_forbidden_max_[order], std::fabs(forbidden));
+    update_scaled_squares(forbidden, gamma_forbidden_scale_[order], gamma_forbidden_sumsq_[order]);
+    update_scaled_squares(allowed, gamma_allowed_scale_[order], gamma_allowed_sumsq_[order]);
+  };
   const auto write_fdcheck_row = [&](const char* estimator, const int order, const int alpha,
                                      const Complex h, const Complex h2,
-                                     const Complex richardson, const ComplexStats& moyal_stats,
-                                     const ComplexStats& trace_stats,
+                                     const Complex richardson, const FDProbeStats& probe_stats,
                                      const std::array<long long, 5>& count_base,
-                                     const bool probe_stats_available, const double wall_seconds) {
+                                     const double wall_seconds) {
     if (fdcheck_file_ == nullptr) {
       fdcheck_file_ = open_segment_file("quantum_heat_fdcheck.out");
       std::fprintf(fdcheck_file_,
-        "# format_version 8\n# probe_statistics_available mu2_only_other_rows_nan\n"
+        "# format_version 9\n# probe_statistics_scope exact_static_moyal_and_trace_contractions\n"
+         "# probe_statistics_are_bead_averaged_contraction_samples_not_open_endpoint_moment_error\n"
          "# counter_scope per_alpha_pipeline_candidate_order_rows_repeat_shared_alpha_counts\n"
          "# alpha_wall_scope static_pipeline_candidate_probe_loop_including_warnings_excluding_frame_output_io\n"
         "# columns step time_fs estimator order alpha value_h_real value_h_imag value_h2_real value_h2_imag "
-        "value_Richardson_real value_Richardson_imag fd_abs_diff fd_rel_diff moyal_probe_count moyal_mean_real "
-        "moyal_mean_imag moyal_stderr_naive trace_probe_count trace_mean_real trace_mean_imag trace_stderr_naive "
+        "value_Richardson_real value_Richardson_imag fd_abs_diff fd_rel_diff "
+        "moyal_probe_applicable moyal_probe_status "
+        "moyal_probe_count_h moyal_probe_mean_h_real moyal_probe_mean_h_imag moyal_probe_variance_h_real moyal_probe_variance_h_imag moyal_probe_se_h_real moyal_probe_se_h_imag "
+        "moyal_probe_count_h2 moyal_probe_mean_h2_real moyal_probe_mean_h2_imag moyal_probe_variance_h2_real moyal_probe_variance_h2_imag moyal_probe_se_h2_real moyal_probe_se_h2_imag "
+        "moyal_probe_count_richardson moyal_probe_mean_richardson_real moyal_probe_mean_richardson_imag moyal_probe_variance_richardson_real moyal_probe_variance_richardson_imag moyal_probe_se_richardson_real moyal_probe_se_richardson_imag "
+        "trace_probe_applicable trace_probe_status "
+        "trace_probe_count_h trace_probe_mean_h_real trace_probe_mean_h_imag trace_probe_variance_h_real trace_probe_variance_h_imag trace_probe_se_h_real trace_probe_se_h_imag "
+        "trace_probe_count_h2 trace_probe_mean_h2_real trace_probe_mean_h2_imag trace_probe_variance_h2_real trace_probe_variance_h2_imag trace_probe_se_h2_real trace_probe_se_h2_imag "
+        "trace_probe_count_richardson trace_probe_mean_richardson_real trace_probe_mean_richardson_imag trace_probe_variance_richardson_real trace_probe_variance_richardson_imag trace_probe_se_richardson_real trace_probe_se_richardson_imag "
         "nep_eval_requested_alpha_pipeline nep_eval_executed_alpha_pipeline nep_eval_cache_hits_alpha_pipeline "
         "geometry_eval_requested_alpha_pipeline geometry_eval_executed_alpha_pipeline alpha_pipeline_wall_seconds\n");
     }
@@ -1887,22 +2019,34 @@ void QuantumHeatMoments::end_of_step(
     print_complex(fdcheck_file_, richardson);
     print_real(fdcheck_file_, abs_diff);
     print_real(fdcheck_file_, rel_diff);
-    if (probe_stats_available) {
-      std::fprintf(fdcheck_file_, " %d", moyal_stats.count);
-      print_real(fdcheck_file_, moyal_stats.mean.real());
-      print_real(fdcheck_file_, moyal_stats.mean.imag());
-      print_real(fdcheck_file_, moyal_stats.standard_error());
-      std::fprintf(fdcheck_file_, " %d", trace_stats.count);
-      print_real(fdcheck_file_, trace_stats.mean.real());
-      print_real(fdcheck_file_, trace_stats.mean.imag());
-      print_real(fdcheck_file_, trace_stats.standard_error());
-    } else {
-      for (int field = 0; field < 8; ++field) print_real(fdcheck_file_, nan);
-    }
+    const auto write_probe_series = [&](const ProbeStatsSeries& series) {
+      std::fprintf(fdcheck_file_, " %s %s", series.applicable ? "yes" : "no", series.status);
+      for (const ComplexStats& stats : series.by_step) {
+        const int count = series.applicable ? stats.count : 0;
+        const bool has_samples = count > 0;
+        std::fprintf(fdcheck_file_, " %d", count);
+        print_real(fdcheck_file_, has_samples ? stats.mean.real() : nan);
+        print_real(fdcheck_file_, has_samples ? stats.mean.imag() : nan);
+        print_real(fdcheck_file_, has_samples ? stats.variance_real() : nan);
+        print_real(fdcheck_file_, has_samples ? stats.variance_imag() : nan);
+        print_real(fdcheck_file_, has_samples ? stats.standard_error_real() : nan);
+        print_real(fdcheck_file_, has_samples ? stats.standard_error_imag() : nan);
+      }
+    };
+    write_probe_series(probe_stats.moyal);
+    write_probe_series(probe_stats.trace);
     std::fprintf(fdcheck_file_, " %lld %lld %lld %lld %lld %.8e\n",
       nep_eval_requested_ - count_base[0], nep_eval_executed_ - count_base[1],
       nep_eval_cache_hits_ - count_base[2], geometry_eval_requested_ - count_base[3],
       geometry_eval_executed_ - count_base[4], wall_seconds);
+  };
+  const auto mark_incomplete_probe_series = [](ProbeStatsSeries& series, const int expected) {
+    for (const ComplexStats& stats : series.by_step) {
+      if (stats.count != expected) {
+        series.status = "incomplete_probe_samples";
+        return;
+      }
+    }
   };
   if ((validate_edge_derivatives_ || validate_fd_smoothness_) && diagnostic_due) {
     const auto geometry = evaluate_geometry(path.wrapped[0], true, true);
@@ -1961,18 +2105,22 @@ void QuantumHeatMoments::end_of_step(
         order, relative_difference, md_step, alpha_name(alpha));
     }
   };
-  std::array<double, 3> mu2_h{}, mu2_h2{};
+  std::array<Complex, 3> mu2_h{}, mu2_h2{};
   std::array<Complex, 3> mu0_h{}, mu0_h2{}, mu4_h{}, mu4_h2{};
-  std::array<std::vector<double>, 3> gamma_richardson;
-  for (auto& values : gamma_richardson) values.assign(P, std::numeric_limits<double>::quiet_NaN());
+  std::array<std::vector<Complex>, 3> gamma_richardson;
+  for (auto& values : gamma_richardson) values.assign(P, Complex(nan, nan));
   if (exact_mu2_enabled_ && static_due) {
     for (int alpha = 0; alpha < 3; ++alpha) {
       const auto fdcheck_count_base = fdcheck_counter_snapshot();
       const auto alpha_begin = std::chrono::steady_clock::now();
-      std::vector<double> gamma_h(P), gamma_h2(P);
-      ComplexStats moyal_frame_h, trace_frame_h;
-      std::vector<Complex> moyal_frame_samples_h(n_moyal_probe_);
-      std::vector<Complex> trace_frame_samples_h(n_static_trace_probe_);
+      std::vector<Complex> gamma_h(P), gamma_h2(P);
+      FDProbeStats fd_probe_stats;
+      fd_probe_stats.moyal.applicable = true;
+      fd_probe_stats.moyal.status = "available";
+      fd_probe_stats.trace.applicable = true;
+      fd_probe_stats.trace.status = "available";
+      std::vector<Complex> moyal_frame_samples_h(n_moyal_probe_), moyal_frame_samples_h2(n_moyal_probe_);
+      std::vector<Complex> trace_frame_samples_h(n_static_trace_probe_), trace_frame_samples_h2(n_static_trace_probe_);
       for (int bead = 0; bead < P; ++bead) {
         RecursionSettings settings;
         settings.fd_step_r = fd_step_r_;
@@ -1997,22 +2145,54 @@ void QuantumHeatMoments::end_of_step(
         gamma_h2[bead] = evaluate_gamma1(
           path.wrapped[bead], path.link_displacement[bead], alpha, beta, fd_step_r_ * 0.5,
           moyal, trace, moyal_h2, trace_h2, moyal_samples_h2, trace_samples_h2);
-        for (size_t k = 0; k < moyal_samples_h.size(); ++k) {
-          moyal_frame_samples_h[k] += moyal_samples_h[k] / static_cast<double>(P);
+        if (moyal_samples_h.size() != static_cast<size_t>(n_moyal_probe_) ||
+            moyal_samples_h2.size() != static_cast<size_t>(n_moyal_probe_)) {
+          fd_probe_stats.moyal.status = "incomplete_probe_samples";
+        } else {
+          for (size_t k = 0; k < moyal_samples_h.size(); ++k) {
+            moyal_frame_samples_h[k] += moyal_samples_h[k] / static_cast<double>(P);
+            moyal_frame_samples_h2[k] += moyal_samples_h2[k] / static_cast<double>(P);
+          }
         }
-        for (size_t k = 0; k < trace_samples_h.size(); ++k) {
-          trace_frame_samples_h[k] += trace_samples_h[k] / static_cast<double>(P);
+        if (trace_samples_h.size() != static_cast<size_t>(n_static_trace_probe_) ||
+            trace_samples_h2.size() != static_cast<size_t>(n_static_trace_probe_)) {
+          fd_probe_stats.trace.status = "incomplete_probe_samples";
+        } else {
+          for (size_t k = 0; k < trace_samples_h.size(); ++k) {
+            trace_frame_samples_h[k] += trace_samples_h[k] / static_cast<double>(P);
+            trace_frame_samples_h2[k] += trace_samples_h2[k] / static_cast<double>(P);
+          }
         }
         gamma_richardson[alpha][bead] = (4.0 * gamma_h2[bead] - gamma_h[bead]) / 3.0;
+        record_gamma_component(1, gamma_h[bead]);
+        record_gamma_component(1, gamma_h2[bead]);
       }
-      for (const Complex value : moyal_frame_samples_h) moyal_frame_h.add(value);
-      for (const Complex value : trace_frame_samples_h) trace_frame_h.add(value);
+      if (std::strcmp(fd_probe_stats.moyal.status, "available") == 0) {
+        for (size_t k = 0; k < moyal_frame_samples_h.size(); ++k) {
+          const Complex richardson = (4.0 * moyal_frame_samples_h2[k] - moyal_frame_samples_h[k]) / 3.0;
+          fd_probe_stats.moyal.by_step[0].add_if_finite(moyal_frame_samples_h[k]);
+          fd_probe_stats.moyal.by_step[1].add_if_finite(moyal_frame_samples_h2[k]);
+          fd_probe_stats.moyal.by_step[2].add_if_finite(richardson);
+        }
+      }
+      if (std::strcmp(fd_probe_stats.trace.status, "available") == 0) {
+        for (size_t k = 0; k < trace_frame_samples_h.size(); ++k) {
+          const Complex richardson = (4.0 * trace_frame_samples_h2[k] - trace_frame_samples_h[k]) / 3.0;
+          fd_probe_stats.trace.by_step[0].add_if_finite(trace_frame_samples_h[k]);
+          fd_probe_stats.trace.by_step[1].add_if_finite(trace_frame_samples_h2[k]);
+          fd_probe_stats.trace.by_step[2].add_if_finite(richardson);
+        }
+      }
+      mark_incomplete_probe_series(fd_probe_stats.moyal, n_moyal_probe_);
+      mark_incomplete_probe_series(fd_probe_stats.trace, n_static_trace_probe_);
       mu2_h[alpha] = quantum_heat_moments::open_endpoint_pair_average(gamma_h);
       mu2_h2[alpha] = quantum_heat_moments::open_endpoint_pair_average(gamma_h2);
-      mu2[alpha] = (4.0 * mu2_h2[alpha] - mu2_h[alpha]) / 3.0;
-      mu2_complex[alpha] = Complex(mu2[alpha], 0.0);
+      mu2_complex[alpha] = (4.0 * mu2_h2[alpha] - mu2_h[alpha]) / 3.0;
+      mu2[alpha] = mu2_complex[alpha].real();
 
-      check_static_fd(2, alpha, Complex(mu2_h[alpha], 0.0), Complex(mu2_h2[alpha], 0.0));
+      check_static_fd(2, alpha, mu2_h[alpha], mu2_h2[alpha]);
+      const ComplexStats& moyal_frame_h = fd_probe_stats.moyal.by_step[0];
+      const ComplexStats& trace_frame_h = fd_probe_stats.trace.by_step[0];
       const double moyal_rel = moyal_frame_h.standard_error() /
         std::max(std::abs(moyal_frame_h.mean), 1.0e-30);
       const double trace_rel = trace_frame_h.standard_error() /
@@ -2024,8 +2204,8 @@ void QuantumHeatMoments::end_of_step(
       }
       const double alpha_wall_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - alpha_begin).count();
-      write_fdcheck_row("mu2", 2, alpha, Complex(mu2_h[alpha], 0.0), Complex(mu2_h2[alpha], 0.0),
-        Complex(mu2[alpha], 0.0), moyal_frame_h, trace_frame_h, fdcheck_count_base, true, alpha_wall_seconds);
+      write_fdcheck_row("mu2", 2, alpha, mu2_h[alpha], mu2_h2[alpha],
+        mu2_complex[alpha], fd_probe_stats, fdcheck_count_base, alpha_wall_seconds);
     }
     mu2[3] = (mu2[0] + mu2[1] + mu2[2]) / 3.0;
     mu2_complex[3] = (mu2_complex[0] + mu2_complex[1] + mu2_complex[2]) / 3.0;
@@ -2040,6 +2220,11 @@ void QuantumHeatMoments::end_of_step(
       const auto fdcheck_count_base = fdcheck_counter_snapshot();
       const auto alpha_begin = std::chrono::steady_clock::now();
       std::vector<Complex> gamma_h(P), gamma_h2(P);
+      FDProbeStats fd_probe_stats;
+      fd_probe_stats.trace.applicable = true;
+      fd_probe_stats.trace.status = "available";
+      std::vector<Complex> trace_frame_samples_h(n_static_trace_probe_);
+      std::vector<Complex> trace_frame_samples_h2(n_static_trace_probe_);
       double max_residual = 0.0;
       for (int bead = 0; bead < P; ++bead) {
         RecursionSettings settings;
@@ -2050,10 +2235,22 @@ void QuantumHeatMoments::end_of_step(
         const auto trace_probes = quantum_heat_moments::make_moyal_probes(
           n_static_trace_probe_, 3 * N, settings);
         double residual_h = nan, residual_h2 = nan;
+        std::vector<Complex> trace_samples_h, trace_samples_h2;
         gamma_h[bead] = evaluate_gamma0(path.wrapped[bead], path.link_displacement[bead],
-          alpha, beta, fd_step_r_, trace_probes, residual_h);
+          alpha, beta, fd_step_r_, trace_probes, residual_h, trace_samples_h);
         gamma_h2[bead] = evaluate_gamma0(path.wrapped[bead], path.link_displacement[bead],
-          alpha, beta, 0.5 * fd_step_r_, trace_probes, residual_h2);
+          alpha, beta, 0.5 * fd_step_r_, trace_probes, residual_h2, trace_samples_h2);
+        if (trace_samples_h.size() != static_cast<size_t>(n_static_trace_probe_) ||
+            trace_samples_h2.size() != static_cast<size_t>(n_static_trace_probe_)) {
+          fd_probe_stats.trace.status = "incomplete_probe_samples";
+        } else {
+          for (size_t k = 0; k < trace_samples_h.size(); ++k) {
+            trace_frame_samples_h[k] += trace_samples_h[k] / static_cast<double>(P);
+            trace_frame_samples_h2[k] += trace_samples_h2[k] / static_cast<double>(P);
+          }
+        }
+        record_gamma_component(0, gamma_h[bead]);
+        record_gamma_component(0, gamma_h2[bead]);
         max_residual = std::max(max_residual, std::max(residual_h, residual_h2));
         gamma0_richardson[alpha][bead] = (4.0 * gamma_h2[bead] - gamma_h[bead]) / 3.0;
         if (!finite(gamma_h[bead]) || !finite(gamma_h2[bead]) ||
@@ -2062,6 +2259,15 @@ void QuantumHeatMoments::end_of_step(
           static_nonfinite_failure = true;
         }
       }
+      if (std::strcmp(fd_probe_stats.trace.status, "available") == 0) {
+        for (size_t k = 0; k < trace_frame_samples_h.size(); ++k) {
+          const Complex richardson = (4.0 * trace_frame_samples_h2[k] - trace_frame_samples_h[k]) / 3.0;
+          fd_probe_stats.trace.by_step[0].add_if_finite(trace_frame_samples_h[k]);
+          fd_probe_stats.trace.by_step[1].add_if_finite(trace_frame_samples_h2[k]);
+          fd_probe_stats.trace.by_step[2].add_if_finite(richardson);
+        }
+      }
+      mark_incomplete_probe_series(fd_probe_stats.trace, n_static_trace_probe_);
       mu0_h[alpha] = quantum_heat_moments::open_endpoint_pair_average(gamma_h);
       mu0_h2[alpha] = quantum_heat_moments::open_endpoint_pair_average(gamma_h2);
       check_static_fd(0, alpha, mu0_h[alpha], mu0_h2[alpha]);
@@ -2081,7 +2287,7 @@ void QuantumHeatMoments::end_of_step(
         static_other_failure = true;
       }
       write_fdcheck_row("mu0", 0, alpha, mu0_h[alpha], mu0_h2[alpha], mu0_richardson,
-        ComplexStats(), ComplexStats(), fdcheck_count_base, false, std::chrono::duration<double>(
+        fd_probe_stats, fdcheck_count_base, std::chrono::duration<double>(
           std::chrono::steady_clock::now() - alpha_begin).count());
     }
     mu0[3] = (mu0[0] + mu0[1] + mu0[2]) / 3.0;
@@ -2098,8 +2304,8 @@ void QuantumHeatMoments::end_of_step(
         static_numeric_valid = false;
         static_nonfinite_failure = true;
       }
-      for (const double gamma : gamma_richardson[alpha])
-        if (!std::isfinite(gamma)) {
+      for (const Complex gamma : gamma_richardson[alpha])
+        if (!finite(gamma)) {
           static_numeric_valid = false;
           static_nonfinite_failure = true;
         }
@@ -2111,6 +2317,11 @@ void QuantumHeatMoments::end_of_step(
       const auto fdcheck_count_base = fdcheck_counter_snapshot();
       const auto alpha_begin = std::chrono::steady_clock::now();
       std::vector<Complex> gamma_h(P), gamma_h2(P);
+      FDProbeStats fd_probe_stats;
+      fd_probe_stats.trace.applicable = true;
+      fd_probe_stats.trace.status = "available";
+      std::vector<Complex> trace_frame_samples_h(n_static_trace_probe_);
+      std::vector<Complex> trace_frame_samples_h2(n_static_trace_probe_);
       double max_residual = 0.0;
       for (int bead = 0; bead < P; ++bead) {
         RecursionSettings settings;
@@ -2121,11 +2332,24 @@ void QuantumHeatMoments::end_of_step(
         const auto trace_probes = quantum_heat_moments::make_moyal_probes(
           n_static_trace_probe_, 3 * N, settings);
         ComplexStats contraction_h, contraction_h2;
+        std::vector<Complex> probe_samples_h, probe_samples_h2;
         double residual_h = nan, residual_h2 = nan;
         gamma_h[bead] = evaluate_gamma2(path.wrapped[bead], path.link_displacement[bead],
-          alpha, beta, fd_step_r_, fd_step_p_, trace_probes, residual_h, contraction_h);
+          alpha, beta, fd_step_r_, fd_step_p_, trace_probes, residual_h, contraction_h, probe_samples_h);
         gamma_h2[bead] = evaluate_gamma2(path.wrapped[bead], path.link_displacement[bead],
-          alpha, beta, 0.5 * fd_step_r_, 0.5 * fd_step_p_, trace_probes, residual_h2, contraction_h2);
+          alpha, beta, 0.5 * fd_step_r_, 0.5 * fd_step_p_, trace_probes, residual_h2, contraction_h2,
+          probe_samples_h2);
+        if (probe_samples_h.size() != static_cast<size_t>(n_static_trace_probe_) ||
+            probe_samples_h2.size() != static_cast<size_t>(n_static_trace_probe_)) {
+          fd_probe_stats.trace.status = "incomplete_probe_samples";
+        } else {
+          for (size_t k = 0; k < probe_samples_h.size(); ++k) {
+            trace_frame_samples_h[k] += probe_samples_h[k] / static_cast<double>(P);
+            trace_frame_samples_h2[k] += probe_samples_h2[k] / static_cast<double>(P);
+          }
+        }
+        record_gamma_component(2, gamma_h[bead]);
+        record_gamma_component(2, gamma_h2[bead]);
         max_residual = std::max(max_residual, std::max(residual_h, residual_h2));
         gamma2_richardson[alpha][bead] = (4.0 * gamma_h2[bead] - gamma_h[bead]) / 3.0;
         if (!finite(gamma_h[bead]) || !finite(gamma_h2[bead]) ||
@@ -2134,6 +2358,15 @@ void QuantumHeatMoments::end_of_step(
           static_nonfinite_failure = true;
         }
       }
+      if (std::strcmp(fd_probe_stats.trace.status, "available") == 0) {
+        for (size_t k = 0; k < trace_frame_samples_h.size(); ++k) {
+          const Complex richardson = (4.0 * trace_frame_samples_h2[k] - trace_frame_samples_h[k]) / 3.0;
+          fd_probe_stats.trace.by_step[0].add_if_finite(trace_frame_samples_h[k]);
+          fd_probe_stats.trace.by_step[1].add_if_finite(trace_frame_samples_h2[k]);
+          fd_probe_stats.trace.by_step[2].add_if_finite(richardson);
+        }
+      }
+      mark_incomplete_probe_series(fd_probe_stats.trace, n_static_trace_probe_);
       mu4_h[alpha] = quantum_heat_moments::open_endpoint_pair_average(gamma_h);
       mu4_h2[alpha] = quantum_heat_moments::open_endpoint_pair_average(gamma_h2);
       check_static_fd(4, alpha, mu4_h[alpha], mu4_h2[alpha]);
@@ -2153,7 +2386,7 @@ void QuantumHeatMoments::end_of_step(
         static_other_failure = true;
       }
       write_fdcheck_row("mu4", 4, alpha, mu4_h[alpha], mu4_h2[alpha], mu4_richardson,
-        ComplexStats(), ComplexStats(), fdcheck_count_base, false, std::chrono::duration<double>(
+        fd_probe_stats, fdcheck_count_base, std::chrono::duration<double>(
           std::chrono::steady_clock::now() - alpha_begin).count());
     }
     mu4[3] = (mu4[0] + mu4[1] + mu4[2]) / 3.0;
@@ -2280,7 +2513,7 @@ void QuantumHeatMoments::end_of_step(
             valid_h ? frame_stats.mean : nan_complex,
             valid_h2 ? frame_h2.mean : nan_complex,
             valid_h && valid_h2 ? (4.0 * frame_h2.mean - frame_stats.mean) / 3.0 : nan_complex,
-            ComplexStats(), ComplexStats(), fdcheck_count_base, false, alpha_probe_loop_seconds);
+            FDProbeStats(), fdcheck_count_base, alpha_probe_loop_seconds);
         }
       }
     }
@@ -2293,16 +2526,25 @@ void QuantumHeatMoments::end_of_step(
       auto next_mu0 = mu0_stats_;
       auto next_mu2 = mu2_stats_;
       auto next_mu4 = mu4_stats_;
+      auto next_mu0_iso = mu0_iso_stats_;
+      auto next_mu2_iso = mu2_iso_stats_;
+      auto next_mu4_iso = mu4_iso_stats_;
       bool stats_valid = true;
       for (int alpha = 0; alpha < 3; ++alpha) {
         if (exact_mu0_enabled_ && !next_mu0[alpha].add_if_finite(mu0_complex[alpha])) stats_valid = false;
         if (exact_mu2_enabled_ && !next_mu2[alpha].add_if_finite(mu2_complex[alpha])) stats_valid = false;
         if (exact_mu4_enabled_ && !next_mu4[alpha].add_if_finite(mu4_complex[alpha])) stats_valid = false;
       }
+      if (exact_mu0_enabled_ && !next_mu0_iso.add_if_finite(mu0_complex[3])) stats_valid = false;
+      if (exact_mu2_enabled_ && !next_mu2_iso.add_if_finite(mu2_complex[3])) stats_valid = false;
+      if (exact_mu4_enabled_ && !next_mu4_iso.add_if_finite(mu4_complex[3])) stats_valid = false;
       if (stats_valid) {
         mu0_stats_ = next_mu0;
         mu2_stats_ = next_mu2;
         mu4_stats_ = next_mu4;
+        mu0_iso_stats_ = next_mu0_iso;
+        mu2_iso_stats_ = next_mu2_iso;
+        mu4_iso_stats_ = next_mu4_iso;
         ++static_frames_used_;
         for (int order = 0; order < 3; ++order) {
           const bool order_enabled = order == 0 ? exact_mu0_enabled_ :
@@ -2315,17 +2557,19 @@ void QuantumHeatMoments::end_of_step(
               for (int bead = 0; bead < P; ++bead) {
                 const int other = (bead + lag) % P;
                 const Complex left = order == 0 ? gamma0_richardson[alpha][bead] :
-                  order == 1 ? Complex(gamma_richardson[alpha][bead], 0.0) :
+                  order == 1 ? gamma_richardson[alpha][bead] :
                     gamma2_richardson[alpha][bead];
                 const Complex right = order == 0 ? gamma0_richardson[alpha][other] :
-                  order == 1 ? Complex(gamma_richardson[alpha][other], 0.0) :
+                  order == 1 ? gamma_richardson[alpha][other] :
                     gamma2_richardson[alpha][other];
                 correlation += left * right / static_cast<double>(P);
               }
-              if (!imaginary_stats_[order][alpha][lag].add_if_finite(correlation))
+              if (!imaginary_stats_[order][alpha][lag].add_if_finite(correlation)) {
+                ++imaginary_skipped_nan_[order][alpha][lag];
                 std::fprintf(stderr,
                   "Warning: imaginary-time correlation statistics overflow at step %d order=%d alpha=%c lag=%d.\n",
                   md_step, order, alpha_name(alpha), lag);
+              }
             }
           }
         }
@@ -2375,7 +2619,7 @@ void QuantumHeatMoments::end_of_step(
       (exact_mu0_enabled_ || exact_mu2_enabled_ || exact_mu4_enabled_)) {
     if (link_file_ == nullptr) {
       link_file_ = open_segment_file("quantum_heat_link.out");
-      std::fprintf(link_file_, "# format_version 3\n# columns step bead_id alpha deltaR_norm ");
+      std::fprintf(link_file_, "# format_version 4\n# columns step bead_id alpha deltaR_norm ");
       if (exact_mu0_enabled_) std::fprintf(link_file_, "Gamma0_real Gamma0_imag Gamma0_real_residual ");
       if (exact_mu2_enabled_) std::fprintf(link_file_, "Gamma1_real Gamma1_imag Gamma1_imag_residual ");
       if (exact_mu4_enabled_) std::fprintf(link_file_, "Gamma2_real Gamma2_imag Gamma2_real_residual ");
@@ -2390,8 +2634,9 @@ void QuantumHeatMoments::end_of_step(
           print_real(link_file_, gamma0_residual[alpha]);
         }
         if (exact_mu2_enabled_) {
-          print_complex(link_file_, Complex(gamma_richardson[alpha][bead], 0.0));
-          print_real(link_file_, 0.0);
+          print_complex(link_file_, gamma_richardson[alpha][bead]);
+          print_real(link_file_, std::fabs(gamma_richardson[alpha][bead].imag()) /
+            std::max(std::fabs(gamma_richardson[alpha][bead].real()), 1.0e-30));
         }
         if (exact_mu4_enabled_) {
           print_complex(link_file_, gamma2_richardson[alpha][bead]);
@@ -2464,27 +2709,30 @@ void QuantumHeatMoments::write_finalize_outputs()
   const double nan = std::numeric_limits<double>::quiet_NaN();
   if (estimator_stats_file_ != nullptr && (exact_mu0_enabled_ || exact_mu2_enabled_ || exact_mu4_enabled_)) {
     const std::array<const std::array<ComplexStats, 3>*, 3> stats_by_order{&mu0_stats_, &mu2_stats_, &mu4_stats_};
+    const std::array<const ComplexStats*, 3> iso_stats_by_order{&mu0_iso_stats_, &mu2_iso_stats_, &mu4_iso_stats_};
     const std::array<bool, 3> enabled{exact_mu0_enabled_, exact_mu2_enabled_, exact_mu4_enabled_};
+    const auto write_exact_stats = [&](const int order, const char* alpha, const ComplexStats& stats) {
+      std::fprintf(estimator_stats_file_, "%d %s %d %d", order * 2, alpha, number_of_beads_, stats.count);
+      print_real(estimator_stats_file_, stats.count > 0 ? stats.mean.real() : nan);
+      print_real(estimator_stats_file_, stats.count > 0 ? stats.mean.imag() : nan);
+      print_real(estimator_stats_file_, stats.variance());
+      print_real(estimator_stats_file_, stats.variance_real());
+      print_real(estimator_stats_file_, stats.variance_imag());
+      print_real(estimator_stats_file_, stats.covariance());
+      print_real(estimator_stats_file_, stats.standard_error_real());
+      print_real(estimator_stats_file_, stats.standard_error_imag());
+      print_real(estimator_stats_file_, stats.count > 0 ? stats.mean_abs() : nan);
+      print_real(estimator_stats_file_, stats.count > 0 ? stats.max_abs : nan);
+      std::fprintf(estimator_stats_file_, " %lld %d %d %lld %lld\n",
+        static_frames_total_, stats.count, 0, static_frames_skipped_nan_, static_frames_skipped_other_);
+    };
     for (int order = 0; order < 3; ++order) {
       if (!enabled[order]) continue;
       for (int alpha = 0; alpha < 3; ++alpha) {
         const ComplexStats& stats = (*stats_by_order[order])[alpha];
-        std::fprintf(estimator_stats_file_, "%d %c %d %d", order * 2, alpha_name(alpha),
-          number_of_beads_, stats.count);
-        print_real(estimator_stats_file_, stats.count > 0 ? stats.mean.real() : nan);
-        print_real(estimator_stats_file_, stats.count > 0 ? stats.mean.imag() : nan);
-        print_real(estimator_stats_file_, stats.variance());
-        print_real(estimator_stats_file_, stats.variance_real());
-        print_real(estimator_stats_file_, stats.variance_imag());
-        print_real(estimator_stats_file_, stats.covariance());
-        print_real(estimator_stats_file_, stats.standard_error_real());
-        print_real(estimator_stats_file_, stats.standard_error_imag());
-        print_real(estimator_stats_file_, stats.mean_abs());
-        print_real(estimator_stats_file_, stats.count > 0 ? stats.max_abs : nan);
-        std::fprintf(estimator_stats_file_, " %lld %lld %lld %lld\n",
-          static_frames_total_, static_frames_used_, static_frames_skipped_nan_,
-          static_frames_skipped_other_);
+        write_exact_stats(order, std::string(1, alpha_name(alpha)).c_str(), stats);
       }
+      write_exact_stats(order, "iso", *iso_stats_by_order[order]);
     }
   }
   if (imaginary_file_ != nullptr) {
@@ -2494,13 +2742,25 @@ void QuantumHeatMoments::write_finalize_outputs()
       for (int alpha = 0; alpha < 3; ++alpha) {
         for (int lag = 0; lag < static_cast<int>(imaginary_stats_[order][alpha].size()); ++lag) {
           const ComplexStats& stats = imaginary_stats_[order][alpha][lag];
+          const bool lag_zero = lag == 0;
           std::fprintf(imaginary_file_, "%d %c %d %.16e", 2 * order, alpha_name(alpha), lag,
             static_cast<double>(lag) / number_of_beads_);
-          print_real(imaginary_file_, stats.count > 0 ? stats.mean.real() : nan);
-          print_real(imaginary_file_, stats.count > 0 ? stats.mean.imag() : nan);
-          print_real(imaginary_file_, stats.standard_error_real());
-          print_real(imaginary_file_, stats.standard_error_imag());
-          std::fprintf(imaginary_file_, " %d\n", stats.count);
+          print_real(imaginary_file_, !lag_zero && stats.count > 0 ? stats.mean.real() : nan);
+          print_real(imaginary_file_, !lag_zero && stats.count > 0 ? stats.mean.imag() : nan);
+          print_real(imaginary_file_, lag_zero ? nan : stats.variance());
+          print_real(imaginary_file_, lag_zero ? nan : stats.variance_real());
+          print_real(imaginary_file_, lag_zero ? nan : stats.variance_imag());
+          print_real(imaginary_file_, lag_zero ? nan : stats.covariance());
+          print_real(imaginary_file_, lag_zero ? nan : stats.standard_error_real());
+          print_real(imaginary_file_, lag_zero ? nan : stats.standard_error_imag());
+          const long long n_total = static_frames_total_;
+          const int n_used = lag_zero ? 0 : stats.count;
+          const long long n_skipped_nan = lag_zero ? 0 :
+            static_frames_skipped_nan_ + imaginary_skipped_nan_[order][alpha][lag];
+          const long long n_skipped_other = lag_zero ? n_total : static_frames_skipped_other_;
+          std::fprintf(imaginary_file_, " %lld %d 0 %lld %lld %s %s\n", n_total, n_used,
+            n_skipped_nan, n_skipped_other, !lag_zero && stats.count > 0 ? "yes" : "no",
+            lag_zero ? "open_endpoint_excluded" : (stats.count > 0 ? "none" : "no_valid_frames"));
         }
       }
     }
@@ -2563,6 +2823,36 @@ void QuantumHeatMoments::write_finalize_outputs()
       profile_candidate_seconds_, profile_hac_lookup_seconds_, profile_sample_wall_seconds_,
       static_frames_total_, static_frames_used_,
       static_frames_skipped_nan_, static_frames_skipped_other_);
+    const std::array<bool, 3> gamma_enabled{exact_mu0_enabled_, exact_mu2_enabled_, exact_mu4_enabled_};
+    const std::array<const char*, 3> gamma_name{"Gamma0", "Gamma1", "Gamma2"};
+    const std::array<const char*, 3> forbidden_component{"real", "imag", "real"};
+    const std::array<const char*, 3> allowed_component{"imag", "real", "imag"};
+    for (int order = 0; order < 3; ++order) {
+      if (!gamma_enabled[order]) continue;
+      const long long count = gamma_component_count_[order];
+      const double forbidden_rms = count > 0 ? gamma_forbidden_scale_[order] *
+        std::sqrt(gamma_forbidden_sumsq_[order] / count) : nan;
+      const double allowed_rms = count > 0 ? gamma_allowed_scale_[order] *
+        std::sqrt(gamma_allowed_sumsq_[order] / count) : nan;
+      const double relative_rms = count > 0 ? forbidden_rms / std::max(allowed_rms, 1.0e-30) : nan;
+      std::fprintf(meta_file_,
+        "# %s_component_observations %lld\n# %s_forbidden_%s_max %.16e\n"
+        "# %s_forbidden_%s_rms %.16e\n# %s_allowed_%s_rms %.16e\n"
+        "# %s_forbidden_rms_over_allowed_rms %.16e\n",
+        gamma_name[order], count,
+        gamma_name[order], forbidden_component[order], count > 0 ? gamma_forbidden_max_[order] : nan,
+        gamma_name[order], forbidden_component[order], forbidden_rms,
+        gamma_name[order], allowed_component[order], allowed_rms,
+        gamma_name[order], relative_rms);
+      if (count > 0 && relative_rms > stochastic_warning_threshold_)
+        std::fprintf(stderr,
+          "Warning: %s forbidden-component RMS ratio %.6g exceeds threshold %.6g.\n",
+          gamma_name[order], relative_rms, stochastic_warning_threshold_);
+    }
+    std::fprintf(meta_file_,
+      "# gamma_forbidden_component_observation_scope per_bead_h_and_h2_gamma_values_not_Richardson\n"
+      "# gamma_forbidden_component_diagnostic_scope raw_complex_phase_arithmetic_real_scalar_NEP_kernel_parity_structurally_constrained\n"
+      "# gamma_forbidden_component_residual_source returned_raw_Complex_components_not_literal_zero\n");
     std::fprintf(meta_file_, "# winding_diagnostic_frames %lld\n", winding_sample_count_);
     if (winding_sample_count_ > 0) {
       std::fprintf(meta_file_,

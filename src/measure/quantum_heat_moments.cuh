@@ -189,6 +189,12 @@ private:
   long long static_frames_used_ = 0;
   long long static_frames_skipped_nan_ = 0;
   long long static_frames_skipped_other_ = 0;
+  std::array<long long, 3> gamma_component_count_{};
+  std::array<double, 3> gamma_forbidden_max_{};
+  std::array<double, 3> gamma_forbidden_scale_{};
+  std::array<double, 3> gamma_forbidden_sumsq_{};
+  std::array<double, 3> gamma_allowed_scale_{};
+  std::array<double, 3> gamma_allowed_sumsq_{};
   int nonzero_action_winding_atoms_max_ = 0;
   int max_abs_action_winding_component_ = 0;
   int nonzero_closest_winding_atoms_max_ = 0;
@@ -212,7 +218,11 @@ private:
   std::array<quantum_heat_moments::ComplexStats, 3> mu2_stats_;
   std::array<quantum_heat_moments::ComplexStats, 3> mu0_stats_;
   std::array<quantum_heat_moments::ComplexStats, 3> mu4_stats_;
+  quantum_heat_moments::ComplexStats mu0_iso_stats_;
+  quantum_heat_moments::ComplexStats mu2_iso_stats_;
+  quantum_heat_moments::ComplexStats mu4_iso_stats_;
   std::array<std::array<std::vector<quantum_heat_moments::ComplexStats>, 3>, 3> imaginary_stats_;
+  std::array<std::array<std::vector<long long>, 3>, 3> imaginary_skipped_nan_;
   std::array<std::array<quantum_heat_moments::ComplexStats, 4>, 3> candidate_pi_stats_;
   std::array<std::array<int, 4>, 3> candidate_invalid_frame_count_{};
   Box* box_ = nullptr;
@@ -264,14 +274,15 @@ private:
     double beta,
     double step,
     const std::vector<quantum_heat_moments::MoyalProbe>& trace_probes,
-    double& imaginary_residual);
+    double& imaginary_residual,
+    std::vector<quantum_heat_moments::Complex>& probe_samples);
   double evaluate_B(
     const std::vector<double>& position,
     const std::vector<double>& left,
     const std::vector<double>& right,
     int alpha,
     double step);
-  double evaluate_gamma1(
+  quantum_heat_moments::Complex evaluate_gamma1(
     const std::vector<double>& position,
     const std::vector<double>& link_displacement,
     int alpha,
@@ -292,7 +303,8 @@ private:
     double step_p,
     const std::vector<quantum_heat_moments::MoyalProbe>& probes,
     double& imaginary_residual,
-    quantum_heat_moments::ComplexStats& contraction_stats);
+    quantum_heat_moments::ComplexStats& contraction_stats,
+    std::vector<quantum_heat_moments::Complex>& probe_samples);
   void reconstruct_bead_chain(
     const Box& box,
     const std::vector<std::vector<double>>& positions,
