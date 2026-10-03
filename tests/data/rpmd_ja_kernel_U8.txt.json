@@ -1,0 +1,23 @@
+{
+  "source_npz": "D:\\\u6587\u4ef6\\\u6211\u7684\u5468\u62a5\\\u6570\u636e\\rpmd\u70ed\u6d41\u51fd\u6570\u63a8\u5bfc\\RPMD_heat_current_theory_2026\\RPMD_heat_current_theory_2026_v2_expanded\\data\\45_\u5b8c\u6574\u6838\u4f4e\u79e9\u7cfb\u6570_U8.npz",
+  "U": 8.0,
+  "degree": 34,
+  "interpolation_certificate": [
+    4.165592581556004e-10,
+    3.0951104328675144e-09
+  ],
+  "rank_L1_residual": [
+    2.946514078900781e-11,
+    1.0603788227773819e-11
+  ],
+  "arithmetic_reserve": 1e-10,
+  "total_kernel_budget": [
+    5.460243989446082e-10,
+    3.2057142210952883e-09
+  ],
+  "S2_actual_compressed": [
+    0.0007936495832402343,
+    0.044444443814421766
+  ],
+  "provenance": "theory NPZ exported without recomputing kernel"
+}

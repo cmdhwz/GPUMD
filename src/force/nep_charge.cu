@@ -55,15 +55,21 @@ void NEP_Charge::check_ewald_pppm(const RunInput& run_input)
   for (const auto& line : run_input.lines()) {
     const std::vector<std::string>& tokens = line.tokens;
     if (!tokens.empty() && tokens[0] == "kspace") {
-      if (tokens.size() != 2) {
-        std::cout << "kspace must have 1 parameter\n";
-        exit(1);
+      if (tokens.size() < 2 || tokens.size() > 3) {
+        PRINT_INPUT_ERROR("kspace requires ewald or pppm [spacing].");
       }
-      std::string kspace_method = tokens[1];
-      if (kspace_method == "ewald") {
+      if (tokens[1] == "ewald") {
+        if (tokens.size() != 2) {
+          PRINT_INPUT_ERROR("kspace ewald does not accept spacing.");
+        }
         use_pppm = false;
-      } else if (kspace_method == "pppm") {
+      } else if (tokens[1] == "pppm") {
         use_pppm = true;
+        if (tokens.size() == 3 &&
+            (!is_valid_real(tokens[2], &pppm_spacing) ||
+             !(pppm_spacing >= 0.2 && pppm_spacing <= 2.0))) {
+          PRINT_INPUT_ERROR("PPPM spacing must be a finite number between 0.2 and 2.0 A.");
+        }
       } else {
         std::cout << "kspace method can only be ewald or pppm\n";
         exit(1);
@@ -440,7 +446,8 @@ NEP_Charge::NEP_Charge(
     pppm.initialize(
       charge_para.alpha,
       virial_requirements.anywhere,
-      virial_requirements.every_batch);
+      virial_requirements.every_batch,
+      pppm_spacing);
   } else {
     ewald.initialize(charge_para.alpha);
   }

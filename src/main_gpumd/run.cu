@@ -19,6 +19,7 @@ Run simulation according to the inputs in the run.in file.
 
 #include "cohesive.cuh"
 #include "force/force.cuh"
+#include "force/nep.cuh"
 #include "integrate/ensemble.cuh"
 #include "integrate/integrate.cuh"
 
@@ -66,6 +67,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/plumed.cuh"
 #include "measure/property.cuh"
 #include "measure/proton_tunneling.cuh"
+#include "measure/rpmd_ja_reference.cuh"
 #include "measure/rdf.cuh"
 #include "measure/sdc.cuh"
 #include "measure/shc.cuh"
@@ -88,6 +90,7 @@ Run simulation according to the inputs in the run.in file.
 #include "velocity.cuh"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include <cmath>
 #include <cstring>
@@ -314,6 +317,26 @@ void Run::perform_a_run(const int number_of_steps)
       centroid_force_hac = dynamic_cast<HAC*>(action.get());
     } else if (action->action_name == "compute_quantum_heat_moments") {
       quantum_heat_moments = dynamic_cast<QuantumHeatMoments*>(action.get());
+    }
+  }
+  if (rpmd_ja_enabled_ && centroid_force_hac == nullptr) {
+    PRINT_INPUT_ERROR("rpmd_ja on requires compute_hac in the same run.");
+  }
+  if (rpmd_ja_enabled_) {
+    if (max_distance_per_step > 0.0) {
+      PRINT_INPUT_ERROR("rpmd_ja requires a fixed integration time step; adaptive max_distance_per_step is unsupported.");
+    }
+    if (integrate.get_fixed_group() != -1 || integrate.get_move_group() != -1) {
+      PRINT_INPUT_ERROR("rpmd_ja does not support fixed or moving atom groups.");
+    }
+    for (const auto& action : actions) {
+      const std::string& name = action->action_name;
+      if (
+        action->modifies_force() || name == "compute_hnemd" || name == "compute_hnemdec" ||
+        name == "compute_hnema" || name == "plumed" || name == "deform") {
+        const std::string error = "rpmd_ja does not support the external drive/action " + name + ".";
+        PRINT_INPUT_ERROR(error.c_str());
+      }
     }
   }
   const bool has_hnemd_driving = std::any_of(
@@ -635,16 +658,73 @@ void Run::parse_one_keyword(
     }
     hac_current_option_seen_ = true;
     measure.set_hac_current(hac_current_qnep_full_a_);
+  } else if (tokens[0] == "rpmd_ja") {
+    parse_rpmd_ja(tokens);
   } else if (tokens[0] == "run") {
     parse_run(tokens);
     hac_current_option_seen_ = false;
     hac_current_qnep_full_a_ = false;
     measure.set_hac_current(false);
+    rpmd_ja_option_seen_ = false;
+    rpmd_ja_enabled_ = false;
+    rpmd_ja_reference_path_.clear();
+    measure.set_rpmd_ja(false);
   } else if (!measure.parse_action(
                tokens, number_of_types, integrate, group, atom, box, force,
                first_potential_filename_)) {
     PRINT_KEYWORD_ERROR(tokens[0].c_str());
   }
+}
+
+void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
+{
+  if (tokens.size() < 2) {
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, generate <file> <T> <fd_step>, or generate_sparse <file> <T> <fd_step> <kernel_table>.");
+  }
+  if (tokens[1] == "generate" || tokens[1] == "generate_sparse") {
+    const bool sparse = tokens[1] == "generate_sparse";
+    if (tokens.size() != (sparse ? 6U : 5U)) {
+      PRINT_INPUT_ERROR("rpmd_ja generate requires <file> <T> <fd_step>.");
+    }
+    if (integrate.has_ensemble() || global_time != 0.0) {
+      PRINT_INPUT_ERROR("rpmd_ja generate must appear before any ensemble or run.");
+    }
+    if (
+      force.potentials.size() != 1 || force.primary_nep_model_path().empty() ||
+      dynamic_cast<NEP*>(force.potentials[0].get()) == nullptr) {
+      PRINT_INPUT_ERROR("rpmd_ja generate requires exactly one short-range NEP potential.");
+    }
+    char* end = nullptr;
+    const double temperature = std::strtod(tokens[3].c_str(), &end);
+    if (end == tokens[3].c_str() || *end != '\0' || !std::isfinite(temperature) || temperature <= 0.0) {
+      PRINT_INPUT_ERROR("rpmd_ja reference temperature must be a positive finite number.");
+    }
+    end = nullptr;
+    const double fd_step = std::strtod(tokens[4].c_str(), &end);
+    if (end == tokens[4].c_str() || *end != '\0' || !std::isfinite(fd_step) || fd_step <= 0.0) {
+      PRINT_INPUT_ERROR("rpmd_ja finite-difference step must be a positive finite number.");
+    }
+    if (sparse) {
+      generate_rpmd_ja_sparse_reference(tokens[2], temperature, fd_step, tokens[5], atom, box, force);
+    } else {
+      generate_rpmd_ja_reference(tokens[2], temperature, fd_step, atom, box, force);
+    }
+    return;
+  }
+  if (rpmd_ja_option_seen_) {
+    PRINT_INPUT_ERROR("rpmd_ja may be specified only once per run.");
+  }
+  rpmd_ja_option_seen_ = true;
+  if (tokens[1] == "off" && tokens.size() == 2) {
+    rpmd_ja_enabled_ = false;
+    rpmd_ja_reference_path_.clear();
+  } else if (tokens[1] == "on" && tokens.size() == 3) {
+    rpmd_ja_enabled_ = true;
+    rpmd_ja_reference_path_ = tokens[2];
+  } else {
+    PRINT_INPUT_ERROR("rpmd_ja expects off or on <referencefile>.");
+  }
+  measure.set_rpmd_ja(rpmd_ja_enabled_, rpmd_ja_reference_path_);
 }
 void Run::parse_velocity(const std::vector<std::string>& tokens)
 {

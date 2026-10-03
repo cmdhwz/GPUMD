@@ -16,16 +16,27 @@
 #pragma once
 #include "action.cuh"
 #include "qnep_projection.cuh"
+#include "rpmd_ja.cuh"
+#include "rpmd_ja_reference.cuh"
 #include "utilities/gpu_vector.cuh"
+#include <memory>
+#include <string>
 
 class NEP_Charge;
+class NEP;
 
 class HAC : public Action
 {
 public:
   HAC(const std::vector<std::string>& tokens);
+  ~HAC();
 
   void set_qnep_full_a(const bool enabled) { qnep_full_a_ = enabled; }
+  void set_rpmd_ja(const bool enabled, const std::string& reference_path)
+  {
+    rpmd_ja_enabled_ = enabled;
+    rpmd_ja_reference_path_ = reference_path;
+  }
 
   bool centroid_force_source_is_immediate() const
   {
@@ -51,6 +62,7 @@ public:
   int sample_interval; // sample interval for heat current
   int Nc;              // number of correlation points
   int output_interval; // only output Nc/output_interval data
+  bool uses_centroid_heat_flux() const { return use_centroid_heat_flux_ != 0; }
 
   bool get_current_for_step(int step, double current[3]) const;
 
@@ -140,6 +152,21 @@ private:
   double deferred_heat_wall_time_ = 0.0;
   double deferred_hac_wall_time_ = 0.0;
   bool qnep_full_a_ = false;
+  bool rpmd_ja_enabled_ = false;
+  std::string rpmd_ja_reference_path_;
+  RpmdJAReference rpmd_ja_reference_;
+  std::uint64_t rpmd_ja_reference_file_fingerprint_ = 0;
+  RpmdJASparseWorkspace rpmd_ja_sparse_workspace_;
+  std::unique_ptr<NEP> rpmd_ja_nep_;
+  GPU_Vector<double> rpmd_ja_reference_positions_;
+  GPU_Vector<double> rpmd_ja_last_wrapped_centroid_;
+  GPU_Vector<double> rpmd_ja_continuous_centroid_;
+  GPU_Vector<double> rpmd_ja_delta_h_[3];
+  GPU_Vector<double> rpmd_ja_delta_current_;
+  GPU_Vector<double> rpmd_ja_current_[3];
+  GPU_Vector<int> rpmd_ja_branch_error_;
+  bool rpmd_ja_tracker_initialized_ = false;
+  int rpmd_ja_number_of_frames_ = 0;
   NEP_Charge* qnep_full_a_qnep_ = nullptr;
   QNEP_Full_A_Current_Workspace qnep_full_a_workspace_;
   GPU_Vector<double> qnep_full_a_dynamic_local_channel_per_atom_;
@@ -166,6 +193,12 @@ private:
   double qnep_full_a_local_channel_validation_error_ = 0.0;
 
   void flush_deferred_centroid_chunk_();
+  void pre_run_rpmd_ja_(
+    const int number_of_frames, Integrate& integrate, Atom& atom, Box& box, Force& force);
+  void update_rpmd_ja_centroid_(const int step, const bool check_error, Atom& atom, Box& box);
+  void compute_rpmd_ja_current_(const int frame, Atom& atom, Box& box);
+  void write_rpmd_ja_outputs_(
+    const int Nd, const int Nc, const double dt, const double dt_in_ps, Box& box);
   void process_deferred_centroid_frames_(
     Atom& atom, Box& box, const int number_of_frames, const int number_of_types, const int Nd);
   void check_qnep_full_a_fixed_cell_(const Box& box) const;

@@ -77,6 +77,14 @@ Output files
      - :ref:`compute_hac <kw_compute_hac>`
      - Thermal conductivity data from the :term:`EMD` method
      - Append
+   * - :ref:`heat_current_rpmd_ja.out <heat_current_rpmd_ja_out>`
+     - :ref:`rpmd_ja <kw_rpmd_ja>`
+     - Centroid, correction, and total reference-flow current components
+     - Append
+   * - :ref:`hac_rpmd_ja.out <hac_rpmd_ja_out>`
+     - :ref:`rpmd_ja <kw_rpmd_ja>`
+     - Autocorrelation and running integral of the total reference-flow current
+     - Append
    * - :ref:`kappa.out <kappa_out>`
      - :ref:`compute_hnemd <kw_compute_hnemd>`
      - Thermal conductivity data from the :term:`HNEMD` method

@@ -83,3 +83,44 @@ def test_dynamic_mesh_kernel_can_skip_q_deposition_without_changing_diagnostic_p
     assert "dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_FORWARD" in production
     assert "dynamic_Q_.data(), dynamic_Q_.data(), GPUFFT_INVERSE" in production
     assert "Q.data(), Q.data(), GPUFFT_FORWARD" in diagnostic
+
+
+def test_pppm_merge_preserves_spacing_virial_and_fft_lifecycle_contracts():
+    pppm_header = (ROOT / "src/force/pppm.cuh").read_text(encoding="utf-8")
+    pppm_source = (ROOT / "src/force/pppm.cu").read_text(encoding="utf-8")
+    nep_source = (ROOT / "src/force/nep_charge.cu").read_text(encoding="utf-8")
+    nep_header = (ROOT / "src/force/nep_charge.cuh").read_text(encoding="utf-8")
+    force_source = (ROOT / "src/force/force.cu").read_text(encoding="utf-8")
+    force_header = (ROOT / "src/force/force.cuh").read_text(encoding="utf-8")
+    find_para = _function_body(pppm_source, "void PPPM::find_para(")
+    parse_potential = _function_body(force_source, "void Force::parse_potential(")
+    kspace_parser = _function_body(nep_source, "void NEP_Charge::check_ewald_pppm(")
+
+    assert "const bool need_peratom_virial_every_batch_input,\n    const double mesh_spacing_input" in pppm_header
+    assert "Para para = {};" in pppm_header
+    assert "pppm.initialize(\n      charge_para.alpha,\n      virial_requirements.anywhere,\n      virial_requirements.every_batch,\n      pppm_spacing);" in nep_source
+    assert "tokens.size() < 2 || tokens.size() > 3" in kspace_parser
+    assert "kspace ewald does not accept spacing" in kspace_parser
+    assert "tokens.size() == 3" in kspace_parser
+    assert "!is_valid_real(tokens[2], &pppm_spacing)" in kspace_parser
+    assert "pppm_spacing >= 0.2 && pppm_spacing <= 2.0" in kspace_parser
+    assert "bool use_pppm = true;" in nep_header
+    assert "bool pppm_mesh_spacing_explicit_ = false;" in force_header
+    assert "pppm_mesh_spacing_explicit_ = true;" in force_source
+    assert "if (!pppm_mesh_spacing_explicit_)" in parse_potential
+    assert "qnep->get_pppm_mesh_spacing()" in parse_potential
+    assert parse_potential.index("qnep->get_pppm_mesh_spacing()") < parse_potential.index(
+        "potential->set_pppm_mesh_spacing(pppm_mesh_spacing_);"
+    )
+    assert "void PPPM::destroy_plans()" in pppm_source
+    assert "plan_batch" in _function_body(pppm_source, "void PPPM::destroy_plans()")
+    assert "plan_inverse_batch" in _function_body(pppm_source, "void PPPM::destroy_plans()")
+    assert "plan_virial_batch" in _function_body(pppm_source, "void PPPM::destroy_plans()")
+    assert "batch_capacity = 0;" in _function_body(pppm_source, "void PPPM::destroy_plans()")
+    assert "is_good_K" in pppm_source
+    assert "if (required > para.K[d])" in find_para
+    assert "if (number_of_points > max_mesh_points)" in find_para
+    assert find_para.index("if (number_of_points > max_mesh_points)") < find_para.index(
+        "static_cast<int>(number_of_points)"
+    )
+    assert "current_force_mesh_valid_ = false;" in find_para

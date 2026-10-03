@@ -47,6 +47,7 @@ protected:
   std::vector<float> fitness_virial;
   std::vector<float> fitness_charge;
   std::vector<float> fitness_bec;
+  std::vector<float> fitness_ediff; // one value per member, the same for every type
   std::vector<float> population;
   std::vector<float> mu;
   std::vector<float> sigma;
@@ -66,7 +67,7 @@ protected:
   GPU_Vector<float> gpu_cost_L1reg;
   GPU_Vector<float> gpu_cost_L2reg;
 
-  void initialize_rng();
+  void initialize_rng(const int seed);
   void initialize_mu_and_sigma(Parameters& para);
   void initialize_mu_and_sigma_fine_tune(Parameters& para);
   void calculate_utility();

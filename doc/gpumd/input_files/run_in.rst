@@ -192,6 +192,10 @@ Actions
      - Compute the thermal conductivity using the :term:`EMD` method
      - No
      - No
+   * - :ref:`rpmd_ja <kw_rpmd_ja>`
+     - Enable a reference-flow correction to the fixed-cell RPMD centroid heat current
+     - No
+     - No
    * - :ref:`centroid_force_diagnostic <kw_centroid_force_diagnostic>`
      - Diagnose the mismatch between bead-average and centroid forces in PIMD/RPMD/TRPMD
      - No

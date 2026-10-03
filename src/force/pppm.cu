@@ -19,10 +19,12 @@ The k-space part of the PPPM method.
 
 #include "pppm.cuh"
 #include "utilities/common.cuh"
+#include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -32,6 +34,26 @@ The k-space part of the PPPM method.
 #include <vector>
 
 namespace{
+
+constexpr int max_mesh_points = 512 * 512 * 512;
+
+bool is_good_K(int n)
+{
+  const int primes[4] = {2, 3, 5, 7};
+  for (const int p : primes) {
+    while (n % p == 0) n /= p;
+  }
+  return n == 1;
+}
+
+int get_best_K(const double required)
+{
+  int n = static_cast<int>(std::ceil(std::fmin(required, max_mesh_points)));
+  if (n < 16) n = 16;
+  if (n % 2 != 0) ++n;
+  while (!is_good_K(n)) n += 2;
+  return n;
+}
 
 constexpr const char* PPPM_DEBUG_SOURCE_SIGNATURE = "PPPM_ASSIGN_DEBUG_20260910_V1";
 constexpr const char* PPPM_DYNAMIC_SOURCE_SIGNATURE = "PPPM_DYNAMIC_Q_DIAG";
@@ -202,15 +224,6 @@ bool append_text_file(
   file << rows;
   file.flush();
   return file.good();
-}
-
-int get_best_K(const int m)
-{
-  int n = 16;
-  while (n < m) {
-    n *= 2;
-  }
-  return n;
 }
 
 __constant__ float sinc_coeff[6] = {1.0f, -1.6666667e-1f, 8.3333333e-3f, -1.9841270e-4f, 2.7557319e-6f, -2.5052108e-8f};
@@ -1439,21 +1452,27 @@ PPPM::PPPM()
 PPPM::~PPPM()
 {
   flush_dynamic_charge_diagnostics();
-  if (plan != 0) {
-    gpufftDestroy(plan);
-  }
-  if (plan_batch != 0) {
-    gpufftDestroy(plan_batch);
-  }
-  if (plan_inverse_batch != 0) {
-    gpufftDestroy(plan_inverse_batch);
-  }
-  if (plan_virial != 0) {
-    gpufftDestroy(plan_virial);
-  }
-  if (plan_virial_batch != 0) {
-    gpufftDestroy(plan_virial_batch);
-  }
+  destroy_plans();
+}
+
+void PPPM::destroy_plans()
+{
+  if (plan_initialized) gpufftDestroy(plan);
+  if (plan_virial_initialized) gpufftDestroy(plan_virial);
+  if (plan_batch_initialized_) gpufftDestroy(plan_batch);
+  if (plan_inverse_batch_initialized_) gpufftDestroy(plan_inverse_batch);
+  if (plan_virial_batch_initialized_) gpufftDestroy(plan_virial_batch);
+  plan = 0;
+  plan_virial = 0;
+  plan_batch = 0;
+  plan_inverse_batch = 0;
+  plan_virial_batch = 0;
+  plan_initialized = false;
+  plan_virial_initialized = false;
+  plan_batch_initialized_ = false;
+  plan_inverse_batch_initialized_ = false;
+  plan_virial_batch_initialized_ = false;
+  batch_capacity = 0;
 }
 
 void PPPM::flush_dynamic_charge_diagnostics()
@@ -1757,9 +1776,7 @@ void PPPM::write_debug(
 
 void PPPM::allocate_virial_memory()
 {
-  if (plan_virial != 0) {
-    return;
-  }
+  if (plan_virial_initialized) return;
   mesh_virial.resize(para.K0K1K2 * 6);
   int n[3] = {para.K[2], para.K[1], para.K[0]};
   if (gpufftPlanMany(
@@ -1777,31 +1794,12 @@ void PPPM::allocate_virial_memory()
     std::cout << "GPUFFT error: plan_virial creation failed" << std::endl;
     exit(1);
   }
+  plan_virial_initialized = true;
 }
 
 void PPPM::allocate_memory()
 {
-  if (plan != 0) {
-    gpufftDestroy(plan);
-    plan = 0;
-  }
-  if (plan_virial != 0) {
-    gpufftDestroy(plan_virial);
-    plan_virial = 0;
-  }
-  if (plan_batch != 0) {
-    gpufftDestroy(plan_batch);
-    plan_batch = 0;
-  }
-  if (plan_inverse_batch != 0) {
-    gpufftDestroy(plan_inverse_batch);
-    plan_inverse_batch = 0;
-  }
-  if (plan_virial_batch != 0) {
-    gpufftDestroy(plan_virial_batch);
-    plan_virial_batch = 0;
-  }
-  batch_capacity = 0;
+  destroy_plans();
   kx.resize(para.K0K1K2);
   ky.resize(para.K0K1K2);
   kz.resize(para.K0K1K2);
@@ -1816,26 +1814,26 @@ void PPPM::allocate_memory()
     std::cout << "GPUFFT error: Plan creation failed" << std::endl;
     exit(1);
   }
-
+  plan_initialized = true;
 }
 
 void PPPM::allocate_batch_memory(const int number_of_beads)
 {
-  if (number_of_beads == batch_capacity) {
+  if (number_of_beads == batch_capacity && plan_batch_initialized_ &&
+      plan_inverse_batch_initialized_ &&
+      (!need_peratom_virial || plan_virial_batch_initialized_)) {
     return;
   }
-  if (plan_batch != 0) {
-    gpufftDestroy(plan_batch);
-    plan_batch = 0;
-  }
-  if (plan_virial_batch != 0) {
-    gpufftDestroy(plan_virial_batch);
-    plan_virial_batch = 0;
-  }
-  if (plan_inverse_batch != 0) {
-    gpufftDestroy(plan_inverse_batch);
-    plan_inverse_batch = 0;
-  }
+  if (plan_batch_initialized_) gpufftDestroy(plan_batch);
+  if (plan_virial_batch_initialized_) gpufftDestroy(plan_virial_batch);
+  if (plan_inverse_batch_initialized_) gpufftDestroy(plan_inverse_batch);
+  plan_batch = 0;
+  plan_virial_batch = 0;
+  plan_inverse_batch = 0;
+  plan_batch_initialized_ = false;
+  plan_virial_batch_initialized_ = false;
+  plan_inverse_batch_initialized_ = false;
+  batch_capacity = 0;
   batch_capacity = number_of_beads;
   const size_t batch_mesh_size = static_cast<size_t>(number_of_beads) * para.K0K1K2;
   mesh_batch.resize(batch_mesh_size);
@@ -1856,6 +1854,7 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
     std::cout << "GPUFFT error: plan_batch creation failed" << std::endl;
     exit(1);
   }
+  plan_batch_initialized_ = true;
   if (gpufftPlanMany(
         &plan_inverse_batch,
         3,
@@ -1871,6 +1870,7 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
     std::cout << "GPUFFT error: plan_inverse_batch creation failed" << std::endl;
     exit(1);
   }
+  plan_inverse_batch_initialized_ = true;
   if (need_peratom_virial) {
     mesh_virial_batch.resize(static_cast<size_t>(number_of_beads) * 6 * para.K0K1K2);
     if (gpufftPlanMany(
@@ -1888,14 +1888,19 @@ void PPPM::allocate_batch_memory(const int number_of_beads)
       std::cout << "GPUFFT error: plan_virial_batch creation failed" << std::endl;
       exit(1);
     }
+    plan_virial_batch_initialized_ = true;
   }
 }
 
 void PPPM::initialize(
   const float alpha_input,
   const bool need_peratom_virial_input,
-  const bool need_peratom_virial_every_batch_input)
+  const bool need_peratom_virial_every_batch_input,
+  const double mesh_spacing_input)
 {
+  destroy_plans();
+  para = {};
+  mesh_spacing = mesh_spacing_input;
   current_force_mesh_valid_ = false;
   dynamic_operator_cache_valid_ = false;
   dynamic_operator_host_cache_valid_ = false;
@@ -1906,8 +1911,6 @@ void PPPM::initialize(
   para.K[0] = 16;
   para.K[1] = 16;
   para.K[2] = 16;
-  para.K0K1K2 = para.K[0] * para.K[1] * para.K[2];
-  allocate_memory();
 }
 
 void PPPM::find_para(const int N, const Box& box)
@@ -1915,22 +1918,34 @@ void PPPM::find_para(const int N, const Box& box)
   const float two_pi = 6.2831853f;
   const double volume = box.get_volume();
   para.two_pi_over_V = two_pi / volume;
-  int K[3] = {0};
   for (int d = 0; d < 3; ++d) {
-    const double box_thickness = volume / box.get_area(d);
-    K[d] = box_thickness / mesh_spacing;
-    K[d] = get_best_K(K[d]);
-    para.K_half[d] = K[d] / 2;
-    para.two_pi_over_K[d] = two_pi / K[d];
+    const double required = volume / box.get_area(d) / mesh_spacing;
+    if (required > para.K[d]) para.K[d] = get_best_K(required);
   }
-  para.K0K1 = K[0] * K[1];
-  para.K0K1K2 = para.K0K1 * K[2];
-  if (K[0] != para.K[0] || K[1] != para.K[1] || K[2] != para.K[2]) {
+  const double number_of_points =
+    static_cast<double>(para.K[0]) * para.K[1] * para.K[2];
+  if (number_of_points > max_mesh_points) {
+    PRINT_INPUT_ERROR("PPPM mesh is too large; increase spacing or reduce the box size.");
+  }
+  const bool first_mesh = !plan_initialized;
+  for (int d = 0; d < 3; ++d) {
+    para.K_half[d] = para.K[d] / 2;
+    para.two_pi_over_K[d] = two_pi / para.K[d];
+  }
+  const double old_number_of_points = para.K0K1K2;
+  if (number_of_points != old_number_of_points) {
+    para.K0K1 = para.K[0] * para.K[1];
+    para.K0K1K2 = static_cast<int>(number_of_points);
     current_force_mesh_valid_ = false;
-    para.K[0] = K[0];
-    para.K[1] = K[1];
-    para.K[2] = K[2];
     allocate_memory();
+  }
+  if (first_mesh) {
+    printf(
+      "PPPM mesh: %d x %d x %d (target spacing %.17g A; actual spacing %.17g %.17g %.17g A).\n",
+      para.K[0], para.K[1], para.K[2], mesh_spacing,
+      volume / box.get_area(0) / para.K[0],
+      volume / box.get_area(1) / para.K[1],
+      volume / box.get_area(2) / para.K[2]);
   }
   para.potential_factor = K_C_SP / N;
   for (int d = 0; d < 3; ++d) {

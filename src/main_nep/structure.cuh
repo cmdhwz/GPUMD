@@ -14,11 +14,13 @@
 */
 
 #pragma once
+#include <string>
 #include <vector>
 
 class Parameters;
 
 struct Structure {
+  int index_in_file = 0; // position of the structure in train.xyz or test.xyz
   int pbc = 1; // 1 for PPP and 0 for FFF in long-range training
   int num_cell[3];
   int num_atom;
@@ -30,6 +32,7 @@ struct Structure {
   float weight;
   float charge = 0.0f;
   float energy = 0.0f;
+  double energy_total = 0.0; // the reference total energy, for the combinations of ediff.in
   float energy_weight = 1.0f;
   float virial[6];
   float box_original[9];
@@ -50,6 +53,7 @@ struct Structure {
   std::vector<float> avirialyz;
   std::vector<float> avirialzx;
   std::vector<float> bec;
+  std::string name; // lowercase label from the optional name= field
 };
 
 bool read_structures(bool is_train, Parameters& para, std::vector<Structure>& structures);

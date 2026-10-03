@@ -313,6 +313,11 @@ void Force::parse_potential(
 
   potential->N1 = 0;
   potential->N2 = number_of_atoms;
+  if (!pppm_mesh_spacing_explicit_) {
+    if (auto* qnep = dynamic_cast<NEP_Charge*>(potential.get())) {
+      pppm_mesh_spacing_ = qnep->get_pppm_mesh_spacing();
+    }
+  }
   potential->set_pppm_mesh_spacing(pppm_mesh_spacing_);
   potential->set_md_qnep_bec(md_qnep_bec_mode_ == 1);
 
@@ -377,6 +382,7 @@ void Force::set_pimd_bead_neighbor_rebuild(const bool always_rebuild)
 void Force::set_pppm_mesh_spacing(const double spacing)
 {
   pppm_mesh_spacing_ = spacing;
+  pppm_mesh_spacing_explicit_ = true;
   for (auto& potential : potentials) {
     potential->set_pppm_mesh_spacing(spacing);
   }

@@ -127,9 +127,12 @@ public:
   std::vector<std::unique_ptr<Action>>& get_actions() { return actions_; }
   const std::vector<std::unique_ptr<Action>>& get_actions() const { return actions_; }
   void set_hac_current(const bool qnep_full_a);
+  void set_rpmd_ja(const bool enabled, const std::string& reference_path = {});
   void process_dynamics(const int md_step, Box& box, Atom& atom);
 
 private:
   std::vector<std::unique_ptr<Action>> actions_;
   bool hac_current_qnep_full_a_ = false;
+  bool rpmd_ja_enabled_ = false;
+  std::string rpmd_ja_reference_path_;
 };

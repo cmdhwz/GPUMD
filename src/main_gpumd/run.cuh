@@ -69,6 +69,7 @@ private:
     const std::vector<std::string>& tokens, const std::vector<Group>& group);
   void parse_time_step(const std::vector<std::string>& tokens);
   void parse_run(const std::vector<std::string>& tokens);
+  void parse_rpmd_ja(const std::vector<std::string>& tokens);
 
   int number_of_types; // number of atom types
   int has_velocity_in_xyz = 0;
@@ -82,6 +83,9 @@ private:
   double max_distance_per_step = -1.0;
   bool hac_current_option_seen_ = false;
   bool hac_current_qnep_full_a_ = false;
+  bool rpmd_ja_option_seen_ = false;
+  bool rpmd_ja_enabled_ = false;
+  std::string rpmd_ja_reference_path_;
   Atom atom;
   GPU_Vector<double> thermo; // some thermodynamic quantities
   Velocity velocity;

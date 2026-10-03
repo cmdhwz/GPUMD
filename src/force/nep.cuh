@@ -176,6 +176,10 @@ public:
   {
     return 0.5f * (paramb.rc_radial[type1] + paramb.rc_radial[type2]);
   }
+  float get_pair_angular_cutoff(const int type1, const int type2) const
+  {
+    return 0.5f * (paramb.rc_angular[type1] + paramb.rc_angular[type2]);
+  }
   void set_pimd_batch_profile(const bool enabled) override { pimd_batch_profile_enabled_ = enabled; }
   bool pimd_batch_profile_enabled() const override { return pimd_batch_profile_enabled_; }
   const PIMD_Batch_Timing& get_pimd_batch_timing() const override { return pimd_batch_timing_; }

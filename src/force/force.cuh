@@ -205,6 +205,7 @@ private:
   int pimd_bead_gpu_parallel_devices_ = 1;
   bool pimd_bead_neighbor_always_rebuild_ = true;
   double pppm_mesh_spacing_ = 1.0;
+  bool pppm_mesh_spacing_explicit_ = false;
   int md_qnep_bec_mode_ = 0; // 0: auto, 1: on, 2: off
   bool md_qnep_bec_required_ = false;
   bool pimd_bead_batch_enabled_ = false;

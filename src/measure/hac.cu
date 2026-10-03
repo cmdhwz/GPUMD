@@ -19,9 +19,11 @@ Calculate the heat current autocorrelation (HAC) function.
 
 #include "compute_heat.cuh"
 #include "force/force.cuh"
+#include "force/nep.cuh"
 #include "force/nep_charge.cuh"
 #include "integrate/integrate.cuh"
 #include "hac.cuh"
+#include "rpmd_ja_math.cuh"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
@@ -107,6 +109,8 @@ void HAC::pre_run(
     if (number_of_frames <= 0 || Nc > number_of_frames) {
       PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
     }
+    if (rpmd_ja_enabled_ && qnep_full_a_)
+      PRINT_INPUT_ERROR("rpmd_ja does not support hac_current qnep_full_a.");
 
     if (qnep_full_a_) {
       const bool centroid_qnep_full_a = use_centroid_heat_flux_ != 0;
@@ -316,6 +320,7 @@ void HAC::pre_run(
         electro_potential_per_atom_.resize(atom.number_of_atoms);
       }
     }
+    if (rpmd_ja_enabled_) pre_run_rpmd_ja_(number_of_frames, integrate, atom, box, force);
   }
 }
 
@@ -955,6 +960,10 @@ void HAC::end_of_step(
     qnep_full_a_sample_times_fs_[nd] = sample_time_fs;
     return;
   }
+  if (rpmd_ja_enabled_) {
+    update_rpmd_ja_centroid_(
+      step + 1, step + 1 == number_of_steps && (step + 1) % sample_interval != 0, atom, box);
+  }
   if ((step + 1) % sample_interval != 0)
     return;
 
@@ -985,16 +994,32 @@ void HAC::end_of_step(
       return;
     }
     ++centroid_direct_evaluations_;
-    force.compute(
-      box,
-      atom.position_per_atom,
-      atom.type,
-      group,
-      centroid_potential_per_atom_,
-      centroid_force_per_atom_,
-      centroid_virial_per_atom_,
-      atom.velocity_per_atom,
-      atom.mass);
+    if (rpmd_ja_enabled_) {
+      rpmd_ja_wrap_positions(
+        atom.number_of_atoms, rpmd_ja_continuous_centroid_, centroid_position_work_, box,
+        rpmd_ja_branch_error_.data());
+      centroid_potential_per_atom_.fill(0.0);
+      centroid_force_per_atom_.fill(0.0);
+      centroid_virial_per_atom_.fill(0.0);
+      rpmd_ja_nep_->compute(
+        box,
+        atom.type,
+        centroid_position_work_,
+        centroid_potential_per_atom_,
+        centroid_force_per_atom_,
+        centroid_virial_per_atom_);
+    } else {
+      force.compute(
+        box,
+        atom.position_per_atom,
+        atom.type,
+        group,
+        centroid_potential_per_atom_,
+        centroid_force_per_atom_,
+        centroid_virial_per_atom_,
+        atom.velocity_per_atom,
+        atom.mass);
+    }
     centroid_force_step_ = step + 1;
     centroid_potential_source = &centroid_potential_per_atom_;
     centroid_virial_source = &centroid_virial_per_atom_;
@@ -1055,6 +1080,9 @@ void HAC::end_of_step(
   int nd = (step + 1) / sample_interval - 1;
   int Nd = number_of_steps / sample_interval;
   gpu_sum_heat<<<NUM_OF_HEAT_COMPONENTS, 1024>>>(N, Nd, nd, atom.heat_per_atom.data(), heat_all.data());
+  if (rpmd_ja_enabled_) {
+    compute_rpmd_ja_current_(nd, atom, box);
+  }
   gpu_sum_heat_by_type<<<atom.cpu_type_size.size() * NUM_OF_TYPE_HEAT_COMPONENTS, 1024>>>(
     N,
     Nd,
@@ -1179,12 +1207,7 @@ static __global__ void gpu_find_hac_3(const int Nc, const int Nd, const double* 
 static void find_rtc_components(
   const int Nc, const int number_of_components, const double factor, const double* hac, double* rtc)
 {
-  for (int k = 0; k < number_of_components; k++) {
-    for (int nc = 1; nc < Nc; nc++) {
-      const int index = Nc * k + nc;
-      rtc[index] = rtc[index - 1] + (hac[index - 1] + hac[index]) * factor;
-    }
-  }
+  rpmd_ja_integrate_hac(Nc, number_of_components, factor, hac, rtc);
 }
 
 static void find_rtc(const int Nc, const double factor, const double* hac, double* rtc)
@@ -1798,6 +1821,8 @@ void HAC::post_run(
   fflush(fid);
   fclose(fid);
 
+  if (rpmd_ja_enabled_) write_rpmd_ja_outputs_(Nd, Nc, dt, dt_in_ps, box);
+
   printf("HAC and related quantities are calculated.\n");
   if (use_centroid_heat_flux_) {
     printf("Centroid HAC force source:\n");
@@ -1882,4 +1907,136 @@ HAC::HAC(const std::vector<std::string>& tokens)
 {
   parse(tokens);
   action_name = "compute_hac";
+}
+
+HAC::~HAC() = default;
+
+void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, const double dt_in_ps, Box& box)
+{
+  std::vector<double> histories[3];
+  for (auto& history : histories) history.resize(static_cast<size_t>(Nd) * 3);
+  for (int kind = 0; kind < 3; ++kind) rpmd_ja_current_[kind].copy_to_host(histories[kind].data());
+  for (int frame = 0; frame < Nd; ++frame) {
+    for (int direction = 0; direction < 3; ++direction) {
+      const size_t index = static_cast<size_t>(frame) + static_cast<size_t>(Nd) * direction;
+      const double jcent = histories[0][index];
+      const double delta = histories[1][index];
+      const double ja = histories[2][index];
+      const double scale = std::max({1.0, std::fabs(jcent), std::fabs(delta), std::fabs(ja)});
+      if (!std::isfinite(jcent) || !std::isfinite(delta) || !std::isfinite(ja) ||
+          std::fabs(ja - (jcent + delta)) > 1.0e-12 * scale) {
+        PRINT_INPUT_ERROR("rpmd_ja sampled current is non-finite or violates JA = Jcent + DeltaJ.");
+      }
+    }
+  }
+  const double volume = box.get_volume();
+  if (!qnep_existing_file_has_schema(
+        "heat_current_rpmd_ja.out",
+        {"# segment_metadata_version 1",
+         "# columns time_ps Jcent_x Jcent_y Jcent_z DeltaJ_x DeltaJ_y DeltaJ_z JA_x JA_y JA_z"}) ||
+      !qnep_existing_file_has_schema(
+        "hac_rpmd_ja.out",
+        {"# segment_metadata_version 1",
+         "# columns lag_index_first lag_time_ps HAC_x HAC_y HAC_z RTC_x RTC_y RTC_z"})) {
+    PRINT_INPUT_ERROR("rpmd_ja output schema changed during the run; refusing to append incompatible data.");
+  }
+  FILE* current_file = my_fopen("heat_current_rpmd_ja.out", "a");
+  fprintf(current_file, "# segment_metadata_version 1\n");
+  fprintf(current_file, "# backend %s\n", rpmd_ja_reference_.backend == 0 ? "dense-v1" : "sparse-v2");
+  fprintf(current_file, "# reference_fingerprint %016llx\n# model_fingerprint %016llx\n",
+    static_cast<unsigned long long>(rpmd_ja_reference_file_fingerprint_),
+    static_cast<unsigned long long>(rpmd_ja_reference_.model_fingerprint));
+  if (rpmd_ja_reference_.backend == 1) {
+    fprintf(current_file, "# reference_edge_count %llu\n# reference_edge_fingerprint %016llx\n# edge_policy %s\n",
+      static_cast<unsigned long long>(rpmd_ja_reference_.reference_edge_count),
+      static_cast<unsigned long long>(rpmd_ja_reference_.reference_edge_fingerprint),
+      rpmd_ja_reference_.edge_policy.c_str());
+  }
+  fprintf(current_file, "# T_reference_K %.17g\n# cell_volume_A3 %.17g\n", rpmd_ja_reference_.temperature, volume);
+  fprintf(current_file, "# sample_interval_steps %d\n# sample_frames %d\n", sample_interval, Nd);
+  if (rpmd_ja_reference_.backend == 1) {
+    fprintf(current_file, "# kernel_degree %d\n# p_rank %d\n# q_rank %d\n", rpmd_ja_reference_.kernel_degree, rpmd_ja_reference_.p_rank, rpmd_ja_reference_.q_rank);
+    fprintf(current_file, "# kernel_error_P %.17g\n# kernel_error_Q %.17g\n", rpmd_ja_reference_.kernel_error[0], rpmd_ja_reference_.kernel_error[1]);
+    fprintf(current_file, "# kernel_s2_P %.17g\n# kernel_s2_Q %.17g\n", rpmd_ja_reference_.kernel_s2[0], rpmd_ja_reference_.kernel_s2[1]);
+    fprintf(current_file, "# D_nnz %llu\n# BxT_nnz %llu\n# ByT_nnz %llu\n# BzT_nnz %llu\n",
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.dynamical_nnz()),
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(0)),
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(1)),
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(2)));
+    fprintf(current_file, "# sparse_workspace_bytes %llu\n", static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
+  }
+  fprintf(current_file, "# columns time_ps Jcent_x Jcent_y Jcent_z DeltaJ_x DeltaJ_y DeltaJ_z JA_x JA_y JA_z\n");
+  fprintf(current_file, "# current_units eV*Angstrom/natural_time\n");
+  for (int nd = 0; nd < Nd; ++nd) {
+    fprintf(current_file, "%25.15e", (nd + 1) * dt_in_ps);
+    for (int kind = 0; kind < 3; ++kind)
+      for (int d = 0; d < 3; ++d) fprintf(current_file, "%25.15e", histories[kind][nd + Nd * d]);
+    fprintf(current_file, "\n");
+  }
+  fflush(current_file);
+  fclose(current_file);
+
+  GPU_Vector<double> hac_gpu(static_cast<size_t>(3) * Nc);
+  std::vector<double> hac(static_cast<size_t>(3) * Nc);
+  std::vector<double> rtc(static_cast<size_t>(3) * Nc, 0.0);
+  gpu_find_hac_3<<<Nc, 128>>>(Nc, Nd, rpmd_ja_current_[2].data(), hac_gpu.data());
+  GPU_CHECK_KERNEL
+  hac_gpu.copy_to_host(hac.data());
+  const double factor = dt * 0.5 /
+    (K_B * rpmd_ja_reference_.temperature * rpmd_ja_reference_.temperature * box.get_volume()) *
+    KAPPA_UNIT_CONVERSION;
+  if (!std::isfinite(factor) || !(factor > 0.0)) {
+    PRINT_INPUT_ERROR("rpmd_ja HAC normalization factor must be positive and finite.");
+  }
+  find_rtc_components(Nc, 3, factor, hac.data(), rtc.data());
+
+  FILE* hac_file = my_fopen("hac_rpmd_ja.out", "a");
+  fprintf(hac_file, "# segment_metadata_version 1\n");
+  fprintf(hac_file, "# backend %s\n", rpmd_ja_reference_.backend == 0 ? "dense-v1" : "sparse-v2");
+  fprintf(hac_file, "# reference_fingerprint %016llx\n# model_fingerprint %016llx\n",
+    static_cast<unsigned long long>(rpmd_ja_reference_file_fingerprint_),
+    static_cast<unsigned long long>(rpmd_ja_reference_.model_fingerprint));
+  if (rpmd_ja_reference_.backend == 1) {
+    fprintf(hac_file, "# reference_edge_count %llu\n# reference_edge_fingerprint %016llx\n# edge_policy %s\n",
+      static_cast<unsigned long long>(rpmd_ja_reference_.reference_edge_count),
+      static_cast<unsigned long long>(rpmd_ja_reference_.reference_edge_fingerprint),
+      rpmd_ja_reference_.edge_policy.c_str());
+  }
+  fprintf(hac_file, "# sample_interval_steps %d\n# sample_frames %d\n", sample_interval, Nd);
+  fprintf(hac_file, "# operator rpmd_ja_reference_flow\n");
+  fprintf(hac_file, "# normalization 1/(k_B*T_reference^2*V), trapezoid_running_integral\n");
+  fprintf(hac_file, "# T_reference_K %.17g\n", rpmd_ja_reference_.temperature);
+  fprintf(hac_file, "# cell_volume_A3 %.17g\n", volume);
+  if (rpmd_ja_reference_.backend == 1) {
+    fprintf(hac_file, "# kernel_degree %d\n# p_rank %d\n# q_rank %d\n", rpmd_ja_reference_.kernel_degree, rpmd_ja_reference_.p_rank, rpmd_ja_reference_.q_rank);
+    fprintf(hac_file, "# kernel_error_P %.17g\n# kernel_error_Q %.17g\n", rpmd_ja_reference_.kernel_error[0], rpmd_ja_reference_.kernel_error[1]);
+    fprintf(hac_file, "# kernel_s2_P %.17g\n# kernel_s2_Q %.17g\n", rpmd_ja_reference_.kernel_s2[0], rpmd_ja_reference_.kernel_s2[1]);
+    fprintf(hac_file, "# D_nnz %llu\n# BxT_nnz %llu\n# ByT_nnz %llu\n# BzT_nnz %llu\n",
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.dynamical_nnz()),
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(0)),
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(1)),
+      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(2)));
+    fprintf(hac_file, "# sparse_workspace_bytes %llu\n", static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
+  }
+  fprintf(hac_file, "# current_units eV*Angstrom/natural_time\n");
+  fprintf(hac_file, "# hac_units (eV*Angstrom/natural_time)^2\n");
+  fprintf(hac_file, "# rtc_units W/m/K\n");
+  fprintf(hac_file, "# columns lag_index_first lag_time_ps HAC_x HAC_y HAC_z RTC_x RTC_y RTC_z\n");
+  for (int lag = 0; lag < Nc; lag += output_interval) {
+    double hac_average[3] = {0.0, 0.0, 0.0};
+    double rtc_average[3] = {0.0, 0.0, 0.0};
+    const int count = std::min(output_interval, Nc - lag);
+    for (int d = 0; d < 3; ++d) {
+      for (int m = 0; m < count; ++m) {
+        hac_average[d] += hac[lag + m + Nc * d] / count;
+        rtc_average[d] += rtc[lag + m + Nc * d] / count;
+      }
+    }
+    fprintf(hac_file, "%d %25.15e", lag, (lag + 0.5 * (count - 1)) * dt_in_ps);
+    for (int d = 0; d < 3; ++d) fprintf(hac_file, "%25.15e", hac_average[d]);
+    for (int d = 0; d < 3; ++d) fprintf(hac_file, "%25.15e", rtc_average[d]);
+    fprintf(hac_file, "\n");
+  }
+  fflush(hac_file);
+  fclose(hac_file);
 }

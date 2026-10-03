@@ -20,6 +20,7 @@
 #include "utilities/read_file.cuh"
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -69,8 +70,10 @@ void Parameters::set_default_parameters()
   is_lambda_v_set = false;
   is_atomic_v_set = false;
   is_lambda_shear_set = false;
+  is_lambda_d_set = false;
   is_batch_set = false;
   is_population_set = false;
+  is_seed_set = false;
   is_generation_set = false;
   is_type_weight_set = false;
   is_zbl_set = false;
@@ -105,9 +108,11 @@ void Parameters::set_default_parameters()
   lambda_shear = 1.0f;         // do not weight shear virial more by default
   lambda_q = 0.1f;             // close to optimal
   lambda_z = 0.5f;             // close to optimal
+  lambda_d = 0.0f;             // no energy-difference loss by default
   force_delta = 0.0f;          // no modification of force loss
   batch_size = 1000;           // large enough in most cases
   population_size = 50;        // almost optimal
+  seed = -1;                   // negative keeps the built-in seeds
   maximum_generation = 100000; // a good starting point
   save_potential = 100000;     // write checkpoint nep.txt files at these intervals
   save_potential_format = 1;   // 1 = include time stamp when writing checkpoint nep.txt files
@@ -200,6 +205,10 @@ void Parameters::calculate_parameters()
     if (atomic_v == 1) {
       PRINT_INPUT_ERROR("Atomic tensor is only supported for dipole or polarizability model.");
     }
+  }
+
+  if (is_lambda_d_set && (model_type == 1 || model_type == 2)) {
+    PRINT_INPUT_ERROR("lambda_d is only supported for potential models.");
   }
 
   if (model_type != 0 && model_type != 3) {
@@ -960,7 +969,7 @@ void Parameters::check_existing_model()
 
   if (import_q_scaler) {
     check_nep_txt("nep.txt", true, "Correct nep.in, or switch off import_q_scaler.");
-  } else if (model_type == 0 && does_file_exist("nep.txt")) {
+  } else if (does_file_exist("nep.txt")) {
     // nep.txt is an input when predicting or when there is a nep.restart to resume from,
     // and merely a stale output otherwise
     if (prediction == 1) {
@@ -974,7 +983,7 @@ void Parameters::check_existing_model()
   }
 
   // nep.restart is read only when resuming a training run, not when predicting
-  if (model_type == 0 && prediction == 0 && does_file_exist("nep.restart")) {
+  if (prediction == 0 && does_file_exist("nep.restart")) {
     check_nep_restart();
   }
 }
@@ -1165,6 +1174,10 @@ void Parameters::report_inputs()
     printf("    (default) lambda_shear = %g.\n", lambda_shear);
   }
 
+  if (is_lambda_d_set) {
+    printf("    (input)   lambda_d = %g.\n", lambda_d);
+  }
+
   if (is_force_delta_set) {
     printf("    (input)   force_delta = %g.\n", force_delta);
   } else {
@@ -1181,6 +1194,12 @@ void Parameters::report_inputs()
     printf("    (input)   population size = %d.\n", population_size);
   } else {
     printf("    (default) population size = %d.\n", population_size);
+  }
+
+  if (is_seed_set) {
+    printf("    (input)   random seed = %d.\n", seed);
+  } else {
+    printf("    (default) random seed not set.\n");
   }
 
   if (is_generation_set) {
@@ -1253,6 +1272,8 @@ void Parameters::parse_one_keyword(std::vector<std::string>& tokens)
     parse_batch(param, num_param);
   } else if (strcmp(param[0], "population") == 0) {
     parse_population(param, num_param);
+  } else if (strcmp(param[0], "seed") == 0) {
+    parse_seed(param, num_param);
   } else if (strcmp(param[0], "nep_compile") == 0) {
     parse_nep_compile(param, num_param);
   } else if (strcmp(param[0], "generation") == 0) {
@@ -1271,6 +1292,8 @@ void Parameters::parse_one_keyword(std::vector<std::string>& tokens)
     parse_lambda_q(param, num_param);
   } else if (strcmp(param[0], "lambda_z") == 0) {
     parse_lambda_z(param, num_param);
+  } else if (strcmp(param[0], "lambda_d") == 0) {
+    parse_lambda_d(param, num_param);
   } else if (strcmp(param[0], "lambda_shear") == 0) {
     parse_lambda_shear(param, num_param);
   } else if (strcmp(param[0], "type_weight") == 0) {
@@ -1809,6 +1832,27 @@ void Parameters::parse_lambda_z(const char** param, int num_param)
   }
 }
 
+void Parameters::parse_lambda_d(const char** param, int num_param)
+{
+  is_lambda_d_set = true;
+
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("lambda_d should have 1 parameter.\n");
+  }
+
+  double lambda_d_tmp = 0.0;
+  if (!is_valid_real(param[1], &lambda_d_tmp)) {
+    PRINT_INPUT_ERROR("Energy difference loss weight should be a number.\n");
+  }
+  // the weight has to be positive and survive the conversion to float
+  if (!std::isfinite(lambda_d_tmp) || lambda_d_tmp < FLT_MIN || lambda_d_tmp > FLT_MAX) {
+    PRINT_INPUT_ERROR(
+      "Energy difference loss weight should be a finite positive number within the range of "
+      "float.");
+  }
+  lambda_d = lambda_d_tmp;
+}
+
 void Parameters::parse_atomic_v(const char** param, int num_param)
 {
   is_atomic_v_set = true;
@@ -1890,6 +1934,21 @@ void Parameters::parse_population(const char** param, int num_param)
     printf("The input population size is not divisible by the number of GPUs.\n");
     printf("This causes an inefficient use of resources.\n");
     printf("The population size has therefore been increased to %d.\n", population_size);
+  }
+}
+
+void Parameters::parse_seed(const char** param, int num_param)
+{
+  is_seed_set = true;
+
+  if (num_param != 2) {
+    PRINT_INPUT_ERROR("The seed keyword must be followed by a parameter.\n");
+  }
+  if (!is_valid_int(param[1], &seed)) {
+    PRINT_INPUT_ERROR("seed should be an integer.\n");
+  }
+  if (seed < 0) {
+    PRINT_INPUT_ERROR("seed should be >= 0.\n");
   }
 }
 

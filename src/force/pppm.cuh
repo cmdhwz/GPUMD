@@ -56,7 +56,8 @@ public:
   void initialize(
     const float alpha_input,
     const bool need_peratom_virial_input,
-    const bool need_peratom_virial_every_batch_input);
+    const bool need_peratom_virial_every_batch_input,
+    const double mesh_spacing_input);
   void set_mesh_spacing(const double value)
   {
     mesh_spacing = value;
@@ -159,7 +160,7 @@ public:
   };
 private:
   double mesh_spacing = 1.0;
-  Para para;
+  Para para = {};
   GPU_Vector<float> kx;
   GPU_Vector<float> ky;
   GPU_Vector<float> kz;
@@ -225,6 +226,7 @@ private:
   double debug_mesh_before_assignment_sum_real_ = 0.0;
   double debug_mesh_after_assignment_sum_real_ = 0.0;
   gpufftHandle plan = 0;
+  bool plan_initialized = false;
   bool current_force_mesh_valid_ = false;
   unsigned long long current_force_mesh_force_evaluation_id_ = 0;
   int current_force_mesh_N_ = -1;
@@ -237,11 +239,14 @@ private:
   GPU_Vector<gpufftComplex> mesh_batch;
   GPU_Vector<gpufftComplex> mesh_inverse_batch;
   gpufftHandle plan_batch = 0;
+  bool plan_batch_initialized_ = false;
   gpufftHandle plan_inverse_batch = 0;
+  bool plan_inverse_batch_initialized_ = false;
   int batch_capacity = 0;
   void allocate_memory();
   void allocate_virial_memory();
   void allocate_batch_memory(const int number_of_beads);
+  void destroy_plans();
   void find_para(const int N, const Box& box);
   bool current_force_mesh_matches(
     const int N,
@@ -270,6 +275,8 @@ private:
   bool last_batch_used_peratom_virial_ = false;
   GPU_Vector<gpufftComplex> mesh_virial;
   gpufftHandle plan_virial = 0;
+  bool plan_virial_initialized = false;
   GPU_Vector<gpufftComplex> mesh_virial_batch;
   gpufftHandle plan_virial_batch = 0;
+  bool plan_virial_batch_initialized_ = false;
 };
