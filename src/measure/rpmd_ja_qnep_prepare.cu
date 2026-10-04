@@ -217,6 +217,12 @@ __global__ void asymmetry_sums(const double* a,const double* masses,double* sums
 __global__ void diagonal_values(const double* a,double* d,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)d[i]=a[static_cast<std::size_t>(i)*n+i];}
 
+__global__ void failure_column(const double* a,double* b,int d,int n,int column,int count)
+{
+  const int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i<count){const int row=i+1+(i>=n-1)+(i>=2*n-2),col=column+1+(column>=n-1)+(column>=2*n-2);b[i]=a[static_cast<std::size_t>(row)*d+col];}
+}
+
 __global__ void translation_product(const double* a,const double* mass_translation,double* y,int d,int n,int axis)
 {
   const int i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -327,9 +333,9 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   throw std::runtime_error("qNEP rpmd_ja reference preparation currently requires CUDA cuSOLVER");
 #else
   if (raw_path.empty() || output_path.empty() || kernel_table_path.empty()) throw std::invalid_argument("qNEP rpmd_ja prepare requires raw, output, and kernel-table paths");
-  const std::string sidecar_path = output_path + ".stability", tmp_path = output_path + ".tmp", side_tmp = sidecar_path + ".tmp";
-  std::ifstream ex1(output_path), ex2(sidecar_path), ex3(tmp_path), ex4(side_tmp);
-  if (ex1.good() || ex2.good() || ex3.good() || ex4.good()) throw std::runtime_error("qNEP rpmd_ja output or temporary already exists");
+  const std::string sidecar_path = output_path + ".stability", tmp_path = output_path + ".tmp", side_tmp = sidecar_path + ".tmp", failure_path = output_path + ".failure.txt";
+  std::ifstream ex1(output_path), ex2(sidecar_path), ex3(tmp_path), ex4(side_tmp), ex5(failure_path);
+  if (ex1.good() || ex2.good() || ex3.good() || ex4.good() || ex5.good()) throw std::runtime_error("qNEP rpmd_ja output, temporary, or failure diagnostic already exists: " + (ex5.good()?failure_path:output_path));
   Raw raw = read_raw_header(raw_path);
   RpmdJAReference& ref = raw.reference;
   load_rpmd_ja_kernel_table(kernel_table_path, ref);
@@ -442,7 +448,66 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     solver_check(cusolverDnDpotrf(solver,CUBLAS_FILL_MODE_LOWER,r,physical,r,work,potrf_work,dinfo),"cusolverDnDpotrf");
     cuda_check(cudaDeviceSynchronize(),"synchronize Cholesky");
     int info=0; cuda_check(cudaMemcpy(&info,dinfo,sizeof(info),cudaMemcpyDeviceToHost),"read Cholesky info");
-    if(info!=0)throw std::runtime_error(info>0?"qNEP translation-complement Hessian is not positive definite":"cuSOLVER Cholesky parameter failure");
+    if(info!=0){
+      if(info>0){
+        const int j=info-1;
+        const int original=j+1+(j>=n-1)+(j>=2*n-2);
+        double original_diagonal=std::numeric_limits<double>::quiet_NaN(),failed_slot=std::numeric_limits<double>::quiet_NaN();
+        cuda_check(cudaMemcpy(&original_diagonal,a+static_cast<std::size_t>(original)*d+original,sizeof(double),cudaMemcpyDeviceToHost),"read failed Hessian diagonal");
+        cuda_check(cudaMemcpy(&failed_slot,physical+static_cast<std::size_t>(j)*r+j,sizeof(double),cudaMemcpyDeviceToHost),"read failed Cholesky slot");
+        bool candidate_available=false;double candidate_rho=std::numeric_limits<double>::quiet_NaN(),candidate_residual=std::numeric_limits<double>::quiet_NaN();
+        std::ofstream report(failure_path,std::ios::out|std::ios::trunc);
+        if(report){
+          report<<std::setprecision(17)<<"qNEP rpmd_ja Cholesky failure\nraw_path: "<<raw_path<<"\nleading_minor_1based: "<<info<<"\ndimension: "<<r
+            <<"\noriginal_projected_diagonal: "<<original_diagonal<<"\ncholesky_failure_slot_value: "<<failed_slot
+            <<"\nhessian_symmetry_relative_error: "<<ref.hessian_symmetry_relative_error<<"\nprojection_relative_change: "<<ref.projection_relative_change<<"\nraw_stats:";
+          for(int i=0;i<18;++i)report<<"\n  ["<<i<<"] "<<raw.stats[i];
+          report<<"\nraw_h_h2_stats: K_h_h2_relative="<<raw.stats[4]<<" Cx_h_h2_relative="<<raw.stats[6]
+            <<" Cy_h_h2_relative="<<raw.stats[7]<<" Cz_h_h2_relative="<<raw.stats[8]
+            <<" projected_D_h_h2_consistency="<<raw.stats[14]<<" projected_D_h_h2_convergence="<<raw.stats[15];
+          try{
+            std::vector<double> candidate(static_cast<std::size_t>(r),0.0);
+            if(j>0){
+              failure_column<<<(j+255)/256,256>>>(a,dv,d,n,j,j);cuda_check(cudaGetLastError(),"extract failure candidate column");cuda_check(cudaDeviceSynchronize(),"extract failure candidate column");
+              blas_check(cublasDtrsv(blas,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_N,CUBLAS_DIAG_NON_UNIT,j,physical,r,dv,1),"failure candidate forward solve");
+              blas_check(cublasDtrsv(blas,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_T,CUBLAS_DIAG_NON_UNIT,j,physical,r,dv,1),"failure candidate transpose solve");
+              std::vector<double> prefix(static_cast<std::size_t>(j));cuda_check(cudaMemcpy(prefix.data(),dv,prefix.size()*sizeof(double),cudaMemcpyDeviceToHost),"read failure candidate prefix");
+              for(int i=0;i<j;++i)candidate[i]=-prefix[i];
+            }
+            candidate[j]=1.0;
+            double norm2=0.0;for(double x:candidate){if(!std::isfinite(x))throw std::runtime_error("non-finite prefix solve");norm2+=x*x;}
+            if(!(norm2>0.0)||!std::isfinite(norm2))throw std::runtime_error("invalid candidate norm");
+            const double inv=1.0/std::sqrt(norm2);for(double& x:candidate)x*=inv;
+            std::vector<double> direction(static_cast<std::size_t>(d),0.0);
+            for(int i=0;i<r;++i){const int k=i+1+(i>=n-1)+(i>=2*n-2);direction[k]=candidate[i];}
+            cuda_check(cudaMemcpy(dv,direction.data(),direction.size()*sizeof(double),cudaMemcpyHostToDevice),"upload failure candidate");
+            matvec_kernel<<<(d+255)/256,256>>>(a,dv,dw,d,d);cuda_check(cudaGetLastError(),"candidate direction product");cuda_check(cudaDeviceSynchronize(),"candidate direction product");
+            std::vector<double> product(static_cast<std::size_t>(d));cuda_check(cudaMemcpy(product.data(),dw,product.size()*sizeof(double),cudaMemcpyDeviceToHost),"read candidate direction product");
+            double rho=0.0, product2=0.0;for(int i=0;i<d;++i){rho+=direction[i]*product[i];product2+=product[i]*product[i];}
+            double residual2=0.0;for(int i=0;i<d;++i){const double x=product[i]-rho*direction[i];residual2+=x*x;}
+            if(!std::isfinite(rho)||!std::isfinite(residual2)||!std::isfinite(product2))throw std::runtime_error("non-finite candidate product");
+            candidate_available=true;candidate_rho=rho;candidate_residual=std::sqrt(residual2);
+            for(int axis=2;axis>=0;--axis){const auto& h=householder[axis];double dot=0.0;for(int i=0;i<d;++i)dot+=h[i]*direction[i];for(int i=0;i<d;++i)direction[i]-=2.0*dot*h[i];}
+            std::vector<int> dominant;for(int i=0;i<d;++i)dominant.push_back(i);std::partial_sort(dominant.begin(),dominant.begin()+std::min(8,d),dominant.end(),[&](int x,int y){return std::abs(direction[x])>std::abs(direction[y]);});
+            report<<"candidate_direction_status: available\nrho_eV_per_A2_per_amu: "<<rho<<"\ncandidate_direction_residual_norm: "<<candidate_residual
+              <<"\noperator_product_norm: "<<std::sqrt(product2)<<"\nnormalization: unit Euclidean norm in translation-complement mass-weighted coordinates\n"
+              <<"rho is the Rayleigh quotient of this candidate; residual is not an eigenvalue certificate.\n"
+              <<"negative rho indicates a negative direction in the generated projected Hessian; it does not establish instability of the physical structure.\ndominant_original_mass_weighted_components:";
+            for(int q=0;q<std::min(8,d);++q){const int index=dominant[q];report<<"\n  atom "<<index%n<<" type "<<ref.types[index%n]<<" axis "<<"xyz"[index/n]<<" value "<<direction[index];}
+          }catch(const std::exception& e){report<<"candidate_direction_status: unavailable ("<<e.what()<<")\n";}
+          report.flush();
+          if(!report)std::fprintf(stderr,"qNEP rpmd_ja: failed writing Cholesky diagnostic %s\n",failure_path.c_str());
+        }else{
+          std::fprintf(stderr,"qNEP rpmd_ja: cannot create Cholesky diagnostic %s\n",failure_path.c_str());
+        }
+        std::printf("    qNEP rpmd_ja Cholesky failure: leading minor %d/%d; original projected diagonal %.9g; failed factor slot %.9g; Hessian asymmetry %.3e; projection change %.3e; diagnostic %s\n",
+          info,r,original_diagonal,failed_slot,ref.hessian_symmetry_relative_error,ref.projection_relative_change,failure_path.c_str());
+        if(candidate_available)std::printf("    qNEP rpmd_ja candidate direction: rho %.9g eV/A^2/amu; candidate-direction residual %.3e\n",candidate_rho,candidate_residual);
+        else std::printf("    qNEP rpmd_ja candidate direction: unavailable\n");
+        std::fflush(stdout);
+      }
+      throw std::runtime_error(info>0?"qNEP translation-complement Hessian is not positive definite (POTRF leading minor "+std::to_string(info)+" of dimension "+std::to_string(r)+", raw: "+raw_path+")":"cuSOLVER Cholesky parameter failure (info="+std::to_string(info)+", invalid parameter index "+std::to_string(-info)+")");
+    }
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&pivot_device),r*sizeof(double)),"allocate Cholesky pivots");
     diagonal_values<<<(r+255)/256,256>>>(physical,pivot_device,r);cuda_check(cudaGetLastError(),"read Cholesky pivots");cuda_check(cudaDeviceSynchronize(),"read Cholesky pivots");
     std::vector<double> pivots(r);cuda_check(cudaMemcpy(pivots.data(),pivot_device,r*sizeof(double),cudaMemcpyDeviceToHost),"copy Cholesky pivots");

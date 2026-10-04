@@ -69,6 +69,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/property.cuh"
 #include "measure/proton_tunneling.cuh"
 #include "measure/rpmd_ja_reference.cuh"
+#include "measure/rpmd_ja_qnep_prepare.cuh"
 #include "measure/rdf.cuh"
 #include "measure/sdc.cuh"
 #include "measure/shc.cuh"
@@ -680,7 +681,14 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, generate <file> <T> <fd_step>, or generate_sparse <file> <T> <fd_step> <kernel_table>.");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table>.");
+  }
+  if (tokens[1] == "prepare") {
+    if (tokens.size() != 5) PRINT_INPUT_ERROR("rpmd_ja prepare requires <rawfile> <outfile> <kernel_table>.");
+    if (integrate.has_ensemble() || global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja prepare must appear before any ensemble or run.");
+    prepare_rpmd_ja_qnep_reference(tokens[2], tokens[3], tokens[4]);
+    return;
   }
   if (tokens[1] == "diagnose") {
     if (tokens.size() != 3) PRINT_INPUT_ERROR("rpmd_ja diagnose requires exactly one fd_step.");

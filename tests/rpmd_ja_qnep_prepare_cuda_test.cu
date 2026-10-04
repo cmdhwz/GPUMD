@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -15,13 +17,13 @@ template <typename T> void put(std::ostream& out,const T& x){out.write(reinterpr
 template <typename T> void array(std::ostream& out,const std::vector<T>& x){if(!x.empty())out.write(reinterpret_cast<const char*>(x.data()),x.size()*sizeof(T));}
 
 void make_input(const std::string& raw,const std::string& kernel,const int n,const double stiffness,
-                const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0)
+                const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0,const int negative_axis=-1)
 {
   const int d=3*n;const double temperature=300.0,step=0.01;
   std::vector<double> mass(n),position(d,0.0),v(static_cast<std::size_t>(d)*n),vc(v.size()),c(static_cast<std::size_t>(3)*d*d),k(static_cast<std::size_t>(d)*d),coarse_c(c.size());
   std::vector<int> types(n,0),pbc(3,1);double mass_sum=0.0;
   for(int i=0;i<n;++i){mass[i]=1.0+0.07*i;mass_sum+=mass[i];}
-  for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double dm=stiffness*((row==col?1.0:0.0)-tr*tc);k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
+  for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double axis_stiffness=negative_axis<0?stiffness:(row/n==negative_axis?-1.0e-10:1.0e-10);const double dm=axis_stiffness*((row==col?1.0:0.0)-tr*tc);k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
   for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=version==2?v[ix]:0.97*v[ix];}
   for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double target=left*right;double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
   std::ofstream out(raw,std::ios::binary);if(!out)throw std::runtime_error("cannot create raw fixture");
@@ -74,7 +76,7 @@ void verify_matrices(const RpmdJAReference& r,const double stiffness)
   }
 }
 
-void clean(const std::string& p){std::remove(p.c_str());std::remove((p+".tmp").c_str());std::remove((p+".stability").c_str());std::remove((p+".stability.tmp").c_str());}
+void clean(const std::string& p){std::remove(p.c_str());std::remove((p+".tmp").c_str());std::remove((p+".stability").c_str());std::remove((p+".stability.tmp").c_str());std::remove((p+".failure.txt").c_str());}
 
 void run_positive(const std::string& base,const int n,const std::uint32_t version)
 {
@@ -88,11 +90,28 @@ void run_positive(const std::string& base,const int n,const std::uint32_t versio
   clean(raw);clean(kernel);clean(out);
 }
 
-void run_negative(const std::string& base)
+void run_failure(const std::string& base,const std::string& suffix,const int negative_axis,const int minimum_minor,const double expected_rho)
 {
-  const std::string stem=base+"_negative",raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja";
-  make_input(raw,kernel,3,-1.0e-10);bool rejected=false;std::string reason;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){reason=e.what();rejected=reason.find("not positive definite")!=std::string::npos;}
-  if(!rejected)throw std::runtime_error("negative qNEP soft mode was accepted or rejected for a different reason");clean(raw);clean(kernel);clean(out);
+  const std::string stem=base+suffix,raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja",failure=out+".failure.txt";
+  make_input(raw,kernel,3,1.0e-10,1,-1.0,0.0,negative_axis);bool rejected=false;std::string reason;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){reason=e.what();rejected=reason.find("not positive definite")!=std::string::npos;}
+  std::ifstream report(failure);std::string text((std::istreambuf_iterator<char>(report)),std::istreambuf_iterator<char>());
+  const std::string marker="leading_minor_1based: ";const std::size_t at=text.find(marker);int minor=0;if(at!=std::string::npos)minor=std::atoi(text.c_str()+at+marker.size());
+  const std::string rho_marker="rho_eV_per_A2_per_amu: ";const std::size_t rho_at=text.find(rho_marker);const double rho=rho_at==std::string::npos?0.0:std::strtod(text.c_str()+rho_at+rho_marker.size(),nullptr);
+  std::ifstream raw_check(raw),out_check(out),sidecar_check(out+".stability");
+  if(!rejected||!raw_check.good()||out_check.good()||sidecar_check.good()||text.empty()||minor<minimum_minor||text.find("candidate_direction_status: available")==std::string::npos||std::abs(rho-expected_rho)>1.0e-20)
+    throw std::runtime_error("qNEP Cholesky failure diagnostic fixture did not preserve input or report a negative candidate direction");
+  clean(raw);clean(kernel);clean(out);
+}
+
+void run_zero(const std::string& base)
+{
+  const std::string stem=base+"_zero",raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja",failure=out+".failure.txt";
+  make_input(raw,kernel,3,0.0);bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){rejected=std::string(e.what()).find("not positive definite")!=std::string::npos;}
+  std::ifstream report(failure);std::string text((std::istreambuf_iterator<char>(report)),std::istreambuf_iterator<char>());
+  const std::string marker="rho_eV_per_A2_per_amu: ";const std::size_t at=text.find(marker);const double rho=at==std::string::npos?1.0:std::strtod(text.c_str()+at+marker.size(),nullptr);
+  std::ifstream raw_check(raw),out_check(out),sidecar_check(out+".stability");
+  if(!rejected||!raw_check.good()||out_check.good()||sidecar_check.good()||text.find("candidate_direction_status: available")==std::string::npos||std::abs(rho)>1.0e-20)
+    throw std::runtime_error("zero qNEP projected Hessian failure diagnostic did not report a zero candidate direction");clean(raw);clean(kernel);clean(out);
 }
 
 void run_raw2_rejections(const std::string& base)
@@ -112,6 +131,6 @@ void run_raw2_rejections(const std::string& base)
 
 int main(int argc,char** argv)
 {
-  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,44,1);run_negative(base);run_raw2_rejections(base);return 0;}
+  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_zero(base);run_raw2_rejections(base);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}
 }

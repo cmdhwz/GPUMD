@@ -517,7 +517,7 @@ struct QEvaluator
     qnep.N1 = 0;
     qnep.N2 = n;
     qnep.configure_mechanical_observer();
-    qnep.set_neighbor_rebuild(true);
+    qnep.set_neighbor_rebuild(false);
     qnep.set_neighbor_diagnostics(false);
     qnep.set_pimd_batch_profile(false);
     if (qnep.uses_pppm()) qnep.set_pppm_mesh_spacing(pppm_spacing);
@@ -2141,6 +2141,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   for (int alpha = 0; alpha < 3; ++alpha) { c_fine[alpha].resize(d); c_coarse[alpha].resize(d); }
   constexpr int virial_component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}};
   std::uint64_t next_decile = 1;
+  const auto v_phase_start = std::chrono::steady_clock::now();
   const auto save_row = [&](const std::streampos start, const int row, const int width, const std::vector<double>& values) {
     out.seekp(start + static_cast<std::streamoff>(row) * width * sizeof(double));
     write_vector(out, values);
@@ -2165,10 +2166,12 @@ static void generate_rpmd_ja_qnep_raw_reference(
       std::fflush(stdout);
     }
   }
+  const double v_phase_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - v_phase_start).count();
   const double jvp_identity_abs = std::sqrt(jvp_identity_diff2 / d);
   const double jvp_identity_relative = std::sqrt(jvp_identity_diff2 / std::max(jvp_identity_scale2, 1.0e-300));
   if (!std::isfinite(jvp_identity_abs) || !std::isfinite(jvp_identity_relative) || jvp_identity_abs > kForceTolerance)
     throw std::runtime_error("qNEP rpmd_ja site-JVP/analytic-gradient identity exceeds 1e-4 eV/A");
+  const auto kc_phase_start = std::chrono::steady_clock::now();
   for (int coordinate = 0; coordinate < d; ++coordinate) {
     plus = minus = plus_half = minus_half = positions;
     plus[coordinate] += fd_step; minus[coordinate] -= fd_step;
@@ -2228,6 +2231,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
       std::fflush(stdout);
     }
   }
+  const double kc_phase_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - kc_phase_start).count();
 
   const double scalar_energy_gradient_error = std::sqrt(energy_gradient_diff2 / std::max(energy_gradient_scale2, 1.0e-300));
   const double k_relative = std::sqrt(k_diff2 / std::max(k_fine2, 1.0e-300));
@@ -2311,6 +2315,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
     static_cast<double>(23ULL * n * sizeof(double) + static_cast<std::uint64_t>(n) * sizeof(int)) /
       (1024.0 * 1024.0));
   const double elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_start).count();
+  std::printf("    qNEP rpmd_ja raw phases: V %.3f s; K/C %.3f s\n", v_phase_seconds, kc_phase_seconds);
   std::printf("    qNEP rpmd_ja raw generation elapsed %.3f s\n", elapsed_seconds);
   const bool finite_diagnostics = std::isfinite(native_gradient_abs) && std::isfinite(jvp_identity_abs) &&
     std::isfinite(scalar_energy_gradient_error) && std::isfinite(scalar_energy_curvature_error) &&
