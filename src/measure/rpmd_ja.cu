@@ -1,4 +1,5 @@
 #include "force/nep.cuh"
+#include "force/nep_charge.cuh"
 #include "hac.cuh"
 #include "integrate/integrate.cuh"
 #include "utilities/common.cuh"
@@ -199,11 +200,12 @@ void HAC::pre_run_rpmd_ja_(
       1.0e-12 * std::max(1.0, std::fabs(target_temperature))) {
     PRINT_INPUT_ERROR("rpmd_ja requires a constant positive RPMD target temperature.");
   }
-  if (force.potentials.size() != 1 || force.primary_nep_model_path().empty()) {
-    PRINT_INPUT_ERROR("rpmd_ja requires exactly one short-range NEP potential.");
-  }
+  if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+    PRINT_INPUT_ERROR("rpmd_ja requires exactly one supported NEP or qNEP potential.");
+  auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
   auto* active_nep = dynamic_cast<NEP*>(force.potentials[0].get());
-  if (active_nep == nullptr || !active_nep->supports_local_edge_derivatives()) {
+  if (active_qnep == nullptr &&
+      (active_nep == nullptr || !active_nep->supports_local_edge_derivatives())) {
     PRINT_INPUT_ERROR("rpmd_ja requires one short-range NEP without unsupported corrections.");
   }
 
@@ -217,6 +219,26 @@ void HAC::pre_run_rpmd_ja_(
     rpmd_ja_reference_.model_fingerprint !=
       rpmd_ja_model_fingerprint(force.primary_nep_model_path())) {
     PRINT_INPUT_ERROR("rpmd_ja reference atom metadata or NEP model does not match this run.");
+  }
+  if (active_qnep != nullptr) {
+    const double active_mesh_spacing = active_qnep->get_pppm_mesh_spacing();
+    if (rpmd_ja_reference_.backend != 2 || !rpmd_ja_reference_.stability_checked ||
+        (rpmd_ja_reference_.q_charge_mode != 1 && rpmd_ja_reference_.q_charge_mode != 2) ||
+        rpmd_ja_reference_.q_charge_mode != active_qnep->get_charge_mode() ||
+        !active_qnep->uses_pppm() || !std::isfinite(active_mesh_spacing) || !(active_mesh_spacing > 0.0) ||
+        !rpmd_ja_reference_.q_uses_pppm ||
+        !std::isfinite(rpmd_ja_reference_.q_mesh_spacing) || !(rpmd_ja_reference_.q_mesh_spacing > 0.0) ||
+        std::fabs(rpmd_ja_reference_.q_mesh_spacing - active_mesh_spacing) >
+          1.0e-12 * std::max(1.0, std::fabs(active_mesh_spacing)) ||
+        rpmd_ja_reference_.mechanical_policy != "native_reference_transport" ||
+        rpmd_ja_reference_.mechanical_config_fingerprint !=
+          rpmd_ja_qnep_config_fingerprint(force)) {
+      PRINT_INPUT_ERROR(
+        "rpmd_ja qNEP v3 reference charge settings, native transport policy, or mechanical configuration do not match.");
+    }
+  } else if (rpmd_ja_reference_.backend == 2 ||
+             (rpmd_ja_reference_.backend != 0 && rpmd_ja_reference_.backend != 1)) {
+    PRINT_INPUT_ERROR("rpmd_ja reference backend does not match the active NEP potential.");
   }
   if (
     !std::isfinite(rpmd_ja_reference_.temperature) ||
@@ -269,6 +291,9 @@ void HAC::pre_run_rpmd_ja_(
   } else if (rpmd_ja_reference_.backend == 1) {
     if (!rpmd_ja_reference_.stability_checked)
       PRINT_INPUT_ERROR("rpmd_ja sparse reference has no verified stability certificate.");
+  } else if (rpmd_ja_reference_.backend == 2) {
+    if (!rpmd_ja_reference_.stability_checked)
+      PRINT_INPUT_ERROR("rpmd_ja qNEP v3 reference has no verified stability certificate.");
   } else {
     PRINT_INPUT_ERROR("rpmd_ja reference uses an unsupported backend.");
   }
@@ -292,20 +317,44 @@ void HAC::pre_run_rpmd_ja_(
     PRINT_INPUT_ERROR("rpmd_ja initial structure is non-finite or outside the reference crystal branch.");
   }
 
-  rpmd_ja_nep_.reset(new NEP(force.primary_nep_model_path().c_str(), N, force.get_run_input()));
-  rpmd_ja_nep_->N1 = 0;
-  rpmd_ja_nep_->N2 = N;
-  rpmd_ja_nep_->set_neighbor_rebuild(false);
-  rpmd_ja_nep_->set_neighbor_log_enabled(false);
-  if (rpmd_ja_reference_.backend == 1) {
+  if (active_qnep == nullptr) {
+    rpmd_ja_nep_.reset(new NEP(force.primary_nep_model_path().c_str(), N, force.get_run_input()));
+    rpmd_ja_nep_->N1 = 0;
+    rpmd_ja_nep_->N2 = N;
+    rpmd_ja_nep_->set_neighbor_rebuild(false);
+    rpmd_ja_nep_->set_neighbor_log_enabled(false);
+  } else if (!centroid_qnep_observer_) {
+    PRINT_INPUT_ERROR("rpmd_ja qNEP requires the private direct-centroid mechanical observer.");
+  }
+  if (rpmd_ja_reference_.backend == 1 || rpmd_ja_reference_.backend == 2) {
     rpmd_ja_sparse_workspace_.initialize(rpmd_ja_reference_, atom.cpu_mass);
-    printf(
-      "rpmd_ja sparse workspace: D nnz=%llu, B^T nnz=(%llu,%llu,%llu), workspace bytes=%llu (workspace only; full GPUMD peak not measured).\n",
-      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.dynamical_nnz()),
-      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(0)),
-      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(1)),
-      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(2)),
-      static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
+    if (rpmd_ja_reference_.backend == 2) {
+      auto release_host_tiles = [](RpmdJABlockMatrix& matrix) {
+        std::vector<RpmdJAMatrixTile>().swap(matrix.tiles);
+      };
+      release_host_tiles(rpmd_ja_reference_.block_dynamical);
+      for (RpmdJABlockMatrix& matrix : rpmd_ja_reference_.block_site_transpose)
+        release_host_tiles(matrix);
+    }
+    if (rpmd_ja_reference_.backend == 1) {
+      printf(
+        "rpmd_ja sparse workspace: D nnz=%llu, B^T nnz=(%llu,%llu,%llu), workspace bytes=%llu (workspace only; full GPUMD peak not measured).\n",
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.dynamical_nnz()),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(0)),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(1)),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(2)),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
+    } else {
+      printf(
+        "rpmd_ja qNEP fixed-reference modal cache: source D tiles=%llu, B^T tiles=(%llu,%llu,%llu), setup=%.3f s, steady bytes=%llu, peak estimate=%llu bytes (cache only); each sampled point applies two modal projections and three cached K matrices (five matrix actions; sample time not benchmarked).\n",
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.dynamical_block_count()),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(0)),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(1)),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(2)),
+        rpmd_ja_sparse_workspace_.preparation_seconds(),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()),
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.estimated_peak_bytes()));
+    }
   }
   rpmd_ja_tracker_initialized_ = true;
 }

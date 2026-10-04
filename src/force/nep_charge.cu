@@ -4658,6 +4658,16 @@ GPU_Vector<float>& NEP_Charge::get_charge_reference() { return nep_data.charge; 
 
 GPU_Vector<float>& NEP_Charge::get_bec_reference() { return nep_data.bec; }
 
+void NEP_Charge::configure_mechanical_observer()
+{
+  need_bec = false;
+  md_qnep_bec_enabled_ = false;
+  pimd_batch_bec_enabled_ = false;
+  neighbor_diagnostics_enabled_ = false;
+  charge_diagnostics_requested_ = false;
+  dynamic_charge_diagnostics_enabled_ = false;
+}
+
 void NEP_Charge::enable_charge_diagnostics()
 {
   if (charge_diagnostics_enabled_) return;

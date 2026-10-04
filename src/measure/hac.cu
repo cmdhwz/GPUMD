@@ -105,6 +105,7 @@ void HAC::pre_run(
     centroid_sampled_frames_ = 0;
     centroid_direct_evaluations_ = 0;
     centroid_force_step_ = -1;
+    centroid_qnep_observer_.reset();
     int number_of_frames = number_of_steps / sample_interval;
     if (number_of_frames <= 0 || Nc > number_of_frames) {
       PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
@@ -306,6 +307,24 @@ void HAC::pre_run(
         }
         printf(
           "    centroid HAC will use a direct single-configuration qNEP evaluation at sampled frames.\n");
+      }
+
+      if (
+        rpmd_ja_enabled_ && !qnep_full_a_ && split_qnep_heat_by_type_ == 0 && deferred_centroid_qnep_ == 0 &&
+        force.potentials.size() == 1 && !force.primary_nep_model_path().empty()) {
+        if (auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get())) {
+          centroid_qnep_observer_.reset(new NEP_Charge(
+            force.primary_nep_model_path().c_str(), atom.number_of_atoms, force.get_run_input()));
+          centroid_qnep_observer_->N1 = 0;
+          centroid_qnep_observer_->N2 = atom.number_of_atoms;
+          centroid_qnep_observer_->set_pppm_mesh_spacing(active_qnep->get_pppm_mesh_spacing());
+          centroid_qnep_observer_->configure_mechanical_observer();
+          centroid_position_work_.resize(static_cast<size_t>(atom.number_of_atoms) * 3);
+          centroid_qnep_observer_error_.resize(1, 0);
+          printf(
+            "    centroid qNEP HAC uses a private native full-mechanical observer (charge mode %d).\n",
+            active_qnep->get_charge_mode());
+        }
       }
     }
     if (split_qnep_heat_by_type_) {
@@ -994,7 +1013,7 @@ void HAC::end_of_step(
       return;
     }
     ++centroid_direct_evaluations_;
-    if (rpmd_ja_enabled_) {
+    if (rpmd_ja_enabled_ && !centroid_qnep_observer_) {
       rpmd_ja_wrap_positions(
         atom.number_of_atoms, rpmd_ja_continuous_centroid_, centroid_position_work_, box,
         rpmd_ja_branch_error_.data());
@@ -1002,6 +1021,31 @@ void HAC::end_of_step(
       centroid_force_per_atom_.fill(0.0);
       centroid_virial_per_atom_.fill(0.0);
       rpmd_ja_nep_->compute(
+        box,
+        atom.type,
+        centroid_position_work_,
+        centroid_potential_per_atom_,
+        centroid_force_per_atom_,
+        centroid_virial_per_atom_);
+    } else if (centroid_qnep_observer_) {
+      box.set_is_orthogonal();
+      centroid_qnep_observer_error_.fill(0);
+      rpmd_ja_wrap_positions(
+        atom.number_of_atoms,
+        atom.position_per_atom,
+        centroid_position_work_,
+        box,
+        centroid_qnep_observer_error_.data());
+      int position_error = 0;
+      centroid_qnep_observer_error_.copy_to_host(&position_error, 1);
+      if (position_error != 0) {
+        PRINT_INPUT_ERROR("qNEP centroid observer received a non-finite position.");
+      }
+      centroid_potential_per_atom_.fill(0.0);
+      centroid_force_per_atom_.fill(0.0);
+      centroid_virial_per_atom_.fill(0.0);
+      centroid_qnep_observer_->request_peratom_virial_for_next_force();
+      centroid_qnep_observer_->compute(
         box,
         atom.type,
         centroid_position_work_,
@@ -1625,6 +1669,22 @@ void HAC::post_run(
   const char* heat_current_file_name =
     use_centroid_heat_flux_ ? "heat_current_centroid.out" : "heat_current.out";
   FILE* fid_heat_current = fopen(heat_current_file_name, "a");
+  if (centroid_qnep_observer_) {
+    fprintf(fid_heat_current, "# centroid_operator qnep_native_full_mechanical\n");
+    fprintf(fid_heat_current, "# charge_snapshot q_of_centroid_configuration\n");
+    fprintf(fid_heat_current, "# additional_qnep_full_a_correction 0\n");
+    fprintf(fid_heat_current, "# charge_mode %d\n", centroid_qnep_observer_->get_charge_mode());
+    fprintf(
+      fid_heat_current,
+      "# kspace_method %s\n",
+      centroid_qnep_observer_->uses_pppm() ? "pppm" : "ewald");
+    if (centroid_qnep_observer_->uses_pppm()) {
+      fprintf(
+        fid_heat_current,
+        "# pppm_mesh_spacing_A %.17g\n",
+        centroid_qnep_observer_->get_pppm_mesh_spacing());
+    }
+  }
   fprintf(fid_heat_current, "# time_ps Jx Jy Jz\n");
   for (int nd = 0; nd < Nd; ++nd) {
     const double jx = heat_current_cpu[nd + Nd * 0] + heat_current_cpu[nd + Nd * 1];
@@ -1942,7 +2002,9 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
   }
   FILE* current_file = my_fopen("heat_current_rpmd_ja.out", "a");
   fprintf(current_file, "# segment_metadata_version 1\n");
-  fprintf(current_file, "# backend %s\n", rpmd_ja_reference_.backend == 0 ? "dense-v1" : "sparse-v2");
+  fprintf(current_file, "# backend %s\n",
+    rpmd_ja_reference_.backend == 0 ? "dense-v1" :
+      rpmd_ja_reference_.backend == 1 ? "sparse-v2" : "qnep-block-v3");
   fprintf(current_file, "# reference_fingerprint %016llx\n# model_fingerprint %016llx\n",
     static_cast<unsigned long long>(rpmd_ja_reference_file_fingerprint_),
     static_cast<unsigned long long>(rpmd_ja_reference_.model_fingerprint));
@@ -1964,6 +2026,29 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
       static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(1)),
       static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(2)));
     fprintf(current_file, "# sparse_workspace_bytes %llu\n", static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
+  } else if (rpmd_ja_reference_.backend == 2) {
+    fprintf(current_file,
+      "# potential_type qNEP-charge-mode-%d\n# mechanical_policy %s\n# mechanical_config_fingerprint %016llx\n",
+      rpmd_ja_reference_.q_charge_mode, rpmd_ja_reference_.mechanical_policy.c_str(),
+      static_cast<unsigned long long>(rpmd_ja_reference_.mechanical_config_fingerprint));
+    fprintf(current_file, "# q_uses_pppm %d\n# q_mesh_spacing_A %.17g\n",
+      rpmd_ja_reference_.q_uses_pppm ? 1 : 0, rpmd_ja_reference_.q_mesh_spacing);
+    fprintf(current_file,
+      "# derivative_consistency_energy_gradient %.17g\n# derivative_consistency_force_gradient %.17g\n# derivative_consistency_hessian_symmetry %.17g\n# derivative_consistency_energy_probe %.17g\n",
+      rpmd_ja_reference_.energy_gradient_relative_error,
+      rpmd_ja_reference_.force_gradient_relative_error,
+      rpmd_ja_reference_.hessian_symmetry_relative_error,
+      rpmd_ja_reference_.energy_second_probe_relative_error);
+    fprintf(current_file,
+      "# force_balance_residual %.17g\n# projection_relative_change %.17g\n# D_block_residual %.17g\n# BxT_block_residual %.17g\n# ByT_block_residual %.17g\n# BzT_block_residual %.17g\n",
+      rpmd_ja_reference_.force_balance_residual, rpmd_ja_reference_.projection_relative_change,
+      rpmd_ja_reference_.block_relative_residual[0], rpmd_ja_reference_.block_relative_residual[1],
+      rpmd_ja_reference_.block_relative_residual[2], rpmd_ja_reference_.block_relative_residual[3]);
+    fprintf(current_file,
+      "# BxT_transport_relative_error %.17g\n# ByT_transport_relative_error %.17g\n# BzT_transport_relative_error %.17g\n",
+      rpmd_ja_reference_.site_transport_relative_error[0],
+      rpmd_ja_reference_.site_transport_relative_error[1],
+      rpmd_ja_reference_.site_transport_relative_error[2]);
   }
   fprintf(current_file, "# columns time_ps Jcent_x Jcent_y Jcent_z DeltaJ_x DeltaJ_y DeltaJ_z JA_x JA_y JA_z\n");
   fprintf(current_file, "# current_units eV*Angstrom/natural_time\n");
@@ -1992,7 +2077,9 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
 
   FILE* hac_file = my_fopen("hac_rpmd_ja.out", "a");
   fprintf(hac_file, "# segment_metadata_version 1\n");
-  fprintf(hac_file, "# backend %s\n", rpmd_ja_reference_.backend == 0 ? "dense-v1" : "sparse-v2");
+  fprintf(hac_file, "# backend %s\n",
+    rpmd_ja_reference_.backend == 0 ? "dense-v1" :
+      rpmd_ja_reference_.backend == 1 ? "sparse-v2" : "qnep-block-v3");
   fprintf(hac_file, "# reference_fingerprint %016llx\n# model_fingerprint %016llx\n",
     static_cast<unsigned long long>(rpmd_ja_reference_file_fingerprint_),
     static_cast<unsigned long long>(rpmd_ja_reference_.model_fingerprint));
@@ -2017,6 +2104,29 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
       static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(1)),
       static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_nnz(2)));
     fprintf(hac_file, "# sparse_workspace_bytes %llu\n", static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
+  } else if (rpmd_ja_reference_.backend == 2) {
+    fprintf(hac_file,
+      "# potential_type qNEP-charge-mode-%d\n# mechanical_policy %s\n# mechanical_config_fingerprint %016llx\n",
+      rpmd_ja_reference_.q_charge_mode, rpmd_ja_reference_.mechanical_policy.c_str(),
+      static_cast<unsigned long long>(rpmd_ja_reference_.mechanical_config_fingerprint));
+    fprintf(hac_file, "# q_uses_pppm %d\n# q_mesh_spacing_A %.17g\n",
+      rpmd_ja_reference_.q_uses_pppm ? 1 : 0, rpmd_ja_reference_.q_mesh_spacing);
+    fprintf(hac_file,
+      "# derivative_consistency_energy_gradient %.17g\n# derivative_consistency_force_gradient %.17g\n# derivative_consistency_hessian_symmetry %.17g\n# derivative_consistency_energy_probe %.17g\n",
+      rpmd_ja_reference_.energy_gradient_relative_error,
+      rpmd_ja_reference_.force_gradient_relative_error,
+      rpmd_ja_reference_.hessian_symmetry_relative_error,
+      rpmd_ja_reference_.energy_second_probe_relative_error);
+    fprintf(hac_file,
+      "# force_balance_residual %.17g\n# projection_relative_change %.17g\n# D_block_residual %.17g\n# BxT_block_residual %.17g\n# ByT_block_residual %.17g\n# BzT_block_residual %.17g\n",
+      rpmd_ja_reference_.force_balance_residual, rpmd_ja_reference_.projection_relative_change,
+      rpmd_ja_reference_.block_relative_residual[0], rpmd_ja_reference_.block_relative_residual[1],
+      rpmd_ja_reference_.block_relative_residual[2], rpmd_ja_reference_.block_relative_residual[3]);
+    fprintf(hac_file,
+      "# BxT_transport_relative_error %.17g\n# ByT_transport_relative_error %.17g\n# BzT_transport_relative_error %.17g\n",
+      rpmd_ja_reference_.site_transport_relative_error[0],
+      rpmd_ja_reference_.site_transport_relative_error[1],
+      rpmd_ja_reference_.site_transport_relative_error[2]);
   }
   fprintf(hac_file, "# current_units eV*Angstrom/natural_time\n");
   fprintf(hac_file, "# hac_units (eV*Angstrom/natural_time)^2\n");

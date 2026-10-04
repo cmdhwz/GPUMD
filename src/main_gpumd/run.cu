@@ -20,6 +20,7 @@ Run simulation according to the inputs in the run.in file.
 #include "cohesive.cuh"
 #include "force/force.cuh"
 #include "force/nep.cuh"
+#include "force/nep_charge.cuh"
 #include "integrate/ensemble.cuh"
 #include "integrate/integrate.cuh"
 
@@ -689,11 +690,20 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     if (integrate.has_ensemble() || global_time != 0.0) {
       PRINT_INPUT_ERROR("rpmd_ja generate must appear before any ensemble or run.");
     }
-    if (
-      force.potentials.size() != 1 || force.primary_nep_model_path().empty() ||
-      dynamic_cast<NEP*>(force.potentials[0].get()) == nullptr) {
-      PRINT_INPUT_ERROR("rpmd_ja generate requires exactly one short-range NEP potential.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+      PRINT_INPUT_ERROR("rpmd_ja generate requires exactly one supported NEP or qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    const bool qnep = active_qnep != nullptr;
+    if (qnep && ((active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+                 !active_qnep->uses_pppm())) {
+      PRINT_INPUT_ERROR("rpmd_ja qNEP references support only charge mode 1 or 2 with PPPM.");
     }
+    if (qnep && !sparse) {
+      PRINT_INPUT_ERROR(
+        "qNEP references require rpmd_ja generate_sparse with a kernel table; it writes the final v3 reference and stability sidecar.");
+    }
+    if (!qnep && dynamic_cast<NEP*>(force.potentials[0].get()) == nullptr)
+      PRINT_INPUT_ERROR("rpmd_ja generate requires exactly one NEP or qNEP potential.");
     char* end = nullptr;
     const double temperature = std::strtod(tokens[3].c_str(), &end);
     if (end == tokens[3].c_str() || *end != '\0' || !std::isfinite(temperature) || temperature <= 0.0) {
@@ -705,7 +715,11 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
       PRINT_INPUT_ERROR("rpmd_ja finite-difference step must be a positive finite number.");
     }
     if (sparse) {
-      generate_rpmd_ja_sparse_reference(tokens[2], temperature, fd_step, tokens[5], atom, box, force);
+      if (qnep) {
+        generate_rpmd_ja_qnep_reference(tokens[2], temperature, fd_step, tokens[5], atom, box, force);
+      } else {
+        generate_rpmd_ja_sparse_reference(tokens[2], temperature, fd_step, tokens[5], atom, box, force);
+      }
     } else {
       generate_rpmd_ja_reference(tokens[2], temperature, fd_step, atom, box, force);
     }

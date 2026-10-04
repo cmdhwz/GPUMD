@@ -84,7 +84,11 @@ def demo():
 
     root = Path(__file__).resolve().parents[1]
     hac = (root / "src/measure/hac.cu").read_text(encoding="utf-8")
+    hac_header = (root / "src/measure/hac.cuh").read_text(encoding="utf-8")
+    qnep_source = (root / "src/force/nep_charge.cu").read_text(encoding="utf-8")
     ja_source = (root / "src/measure/rpmd_ja.cu").read_text(encoding="utf-8")
+    run_source = (root / "src/main_gpumd/run.cu").read_text(encoding="utf-8")
+    ja_doc = (root / "doc/gpumd/input_parameters/rpmd_ja.rst").read_text(encoding="utf-8")
     assert "compute_rpmd_ja_current_(nd, atom, box)" in hac
     assert "gpu_find_hac_3<<<Nc, 128>>>(Nc, Nd, rpmd_ja_current_[2].data(), hac_gpu.data())" in hac
     sparse = (root / "src/measure/rpmd_ja_sparse.cu").read_text(encoding="utf-8")
@@ -96,6 +100,48 @@ def demo():
     assert "centroid_potential_per_atom_.fill(0.0)" in hac
     assert "centroid_force_per_atom_.fill(0.0)" in hac
     assert "centroid_virial_per_atom_.fill(0.0)" in hac
+    assert "std::unique_ptr<NEP_Charge> centroid_qnep_observer_" in hac_header
+    assert "split_qnep_heat_by_type_ == 0" in hac
+    assert "deferred_centroid_qnep_ == 0" in hac
+    assert "centroid_qnep_observer_->configure_mechanical_observer()" in hac
+    assert "centroid_qnep_observer_->request_peratom_virial_for_next_force()" in hac
+    assert "centroid_qnep_observer_->compute(" in hac
+    assert "# centroid_operator qnep_native_full_mechanical" in hac
+    assert "# charge_snapshot q_of_centroid_configuration" in hac
+    assert "# additional_qnep_full_a_correction 0" in hac
+    assert 'rpmd_ja_reference_.backend != 2' in ja_source
+    assert 'rpmd_ja_reference_.mechanical_policy != "native_reference_transport"' in ja_source
+    assert 'rpmd_ja_qnep_config_fingerprint(force)' in ja_source
+    assert 'generate_rpmd_ja_qnep_reference(' in run_source
+    assert 'rpmd_ja_reference_.backend == 2' in ja_source
+    block_release = ja_source.split("rpmd_ja_sparse_workspace_.initialize", 1)[1].split(
+        "if (rpmd_ja_reference_.backend == 1)", 1
+    )[0]
+    assert 'if (rpmd_ja_reference_.backend == 2)' in block_release
+    assert 'std::vector<RpmdJAMatrixTile>().swap(matrix.tiles)' in block_release
+    assert 'rpmd_ja_sparse_workspace_.dynamical_block_count()' in ja_source
+    assert 'rpmd_ja_sparse_workspace_.site_block_count(0)' in ja_source
+    assert 'native_reference_transport' in ja_doc
+    assert 'if (rpmd_ja_enabled_ && !centroid_qnep_observer_)' in hac
+    assert 'rpmd_ja_enabled_ && !qnep_full_a_ && split_qnep_heat_by_type_ == 0' in hac
+    assert 'block_apply_right<<<' in sparse
+    assert 'block_apply_rows<<<' in sparse
+    assert 'qnep_cached_.initialize(reference, masses)' in sparse
+    assert 'mechanical_config_fingerprint' in hac
+    observer_body = hac.split("} else if (centroid_qnep_observer_) {", 1)[1].split("} else {", 1)[0]
+    compute_at = observer_body.index("centroid_qnep_observer_->compute(")
+    assert observer_body.index("centroid_potential_per_atom_.fill(0.0)") < compute_at
+    assert observer_body.index("centroid_force_per_atom_.fill(0.0)") < compute_at
+    assert observer_body.index("centroid_virial_per_atom_.fill(0.0)") < compute_at
+    assert observer_body.index("rpmd_ja_wrap_positions(") < compute_at
+    assert "atom.position_per_atom" in observer_body
+    observer_config = qnep_source.split("void NEP_Charge::configure_mechanical_observer()", 1)[1].split("void NEP_Charge::enable_charge_diagnostics()", 1)[0]
+    assert "need_bec = false" in observer_config
+    assert "md_qnep_bec_enabled_ = false" in observer_config
+    assert "pimd_batch_bec_enabled_ = false" in observer_config
+    cli_test = (root / "tests/rpmd_ja_qnep_centroid_cli_test.py").read_text(encoding="utf-8")
+    assert "--baseline-gpumd" in cli_test and "--candidate-gpumd" in cli_test
+    assert '"heat_current_centroid.out", "hac_centroid.out"' in cli_test
     assert "for (int d = 0; d < 3; ++d)" in ja_source
     assert "branch_limit = 0.45" in ja_source
     current_body = ja_source.split("void HAC::compute_rpmd_ja_current_", 1)[1]

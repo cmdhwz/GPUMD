@@ -1,15 +1,19 @@
 #include "rpmd_ja_reference.cuh"
 #include "rpmd_ja_reference_math.cuh"
+#include "rpmd_ja_qnep_prepare.cuh"
 #include "force/force.cuh"
 #include "force/nep.cuh"
+#include "force/nep_charge.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "utilities/common.cuh"
 #include "utilities/cusolver_wrapper.cuh"
 #include "utilities/error.cuh"
+#include "utilities/run_input.cuh"
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -43,8 +47,10 @@ constexpr char kMagic[8] = {'G', 'P', 'U', 'M', 'D', 'J', 'A', '\0'};
 constexpr char kUnits[] = "position:A;energy:eV;mass:amu;temperature:K;time:native";
 constexpr char kLayoutDense[] = "xyz_soa;delta_h_rowmajor_displacement_velocity";
 constexpr char kLayoutSparse[] = "xyz_soa;csr_output_row_input_col;runtime_translation_projection;cheb_rowmajor_degree_rank;fixed_d0_edges_v1";
+constexpr char kLayoutBlock[] = "xyz_soa;native_reference_transport;block_tiles_128;D_then_Bt;rowmajor_output_input";
 constexpr std::uint32_t kVersionDense = 1;
 constexpr std::uint32_t kVersionSparse = 2;
+constexpr std::uint32_t kVersionBlock = 3;
 constexpr std::uint32_t kEndian = 0x01020304;
 constexpr double kHessianSymmetryTolerance = 5.0e-2;
 constexpr double kDifferenceTolerance = 5.0e-2;
@@ -172,6 +178,8 @@ std::size_t checked_bytes(const std::uint64_t count, const std::size_t item_size
   return static_cast<std::size_t>(count) * item_size;
 }
 
+void require_finite(const std::vector<double>& values, const char* what);
+
 void require_remaining(std::istream& in, const std::streamoff file_size, const std::size_t bytes)
 {
   const std::streampos position = in.tellg();
@@ -250,6 +258,124 @@ void read_sparse_matrix(
   read_vector_checked(in, matrix.columns, nonzeros, file_size);
   read_vector_checked(in, matrix.values, nonzeros, file_size);
   validate_sparse_matrix(matrix, dimension);
+}
+
+void validate_block_matrix(const RpmdJABlockMatrix& matrix, const int dimension)
+{
+  if (matrix.tile_size < 64 || matrix.tile_size > 512 || dimension <= 0)
+    throw std::runtime_error("invalid RPMD-JA block dimensions");
+  const int grid = 1 + (dimension - 1) / matrix.tile_size;
+  if (matrix.tiles.size() != static_cast<std::size_t>(grid) * grid)
+    throw std::runtime_error("RPMD-JA block matrix does not cover its complete tile grid");
+  std::vector<unsigned char> seen(static_cast<std::size_t>(grid) * grid, 0);
+  for (const RpmdJAMatrixTile& tile : matrix.tiles) {
+    if (tile.row < 0 || tile.column < 0 || tile.row % matrix.tile_size || tile.column % matrix.tile_size ||
+        tile.row >= dimension || tile.column >= dimension)
+      throw std::runtime_error("invalid RPMD-JA block tile origin");
+    const int expected_rows = std::min(matrix.tile_size, dimension - tile.row);
+    const int expected_columns = std::min(matrix.tile_size, dimension - tile.column);
+    if (tile.rows != expected_rows || tile.columns != expected_columns)
+      throw std::runtime_error("invalid RPMD-JA block tile extent");
+    const std::size_t index = static_cast<std::size_t>(tile.row / matrix.tile_size) * grid + tile.column / matrix.tile_size;
+    if (seen[index]++) throw std::runtime_error("duplicate RPMD-JA block tile");
+    if (tile.rank < 0 || tile.rank > std::min(tile.rows, tile.columns))
+      throw std::runtime_error("invalid RPMD-JA block tile rank");
+    const std::size_t left_count = tile.rank == 0 ? static_cast<std::size_t>(tile.rows) * tile.columns :
+      static_cast<std::size_t>(tile.rows) * tile.rank;
+    const std::size_t right_count = tile.rank == 0 ? 0 : static_cast<std::size_t>(tile.rank) * tile.columns;
+    if (tile.left.size() != left_count || tile.right.size() != right_count)
+      throw std::runtime_error("invalid RPMD-JA block tile factor sizes");
+    require_finite(tile.left, "block tile left factors");
+    require_finite(tile.right, "block tile right factors");
+  }
+}
+
+void write_block_matrix(std::ostream& out, const RpmdJABlockMatrix& matrix, const int dimension)
+{
+  validate_block_matrix(matrix, dimension);
+  write_value(out, matrix.tile_size);
+  const std::uint64_t count = matrix.tiles.size();
+  write_value(out, count);
+  for (const RpmdJAMatrixTile& tile : matrix.tiles) {
+    write_value(out, tile.row); write_value(out, tile.column); write_value(out, tile.rows);
+    write_value(out, tile.columns); write_value(out, tile.rank);
+    const std::uint64_t left_count = tile.left.size(), right_count = tile.right.size();
+    write_value(out, left_count); write_value(out, right_count);
+    write_vector(out, tile.left); write_vector(out, tile.right);
+  }
+}
+
+void read_block_matrix(
+  std::istream& in,
+  RpmdJABlockMatrix& matrix,
+  const int dimension,
+  const std::streamoff file_size)
+{
+  std::uint64_t count = 0;
+  read_value_checked(in, matrix.tile_size, file_size);
+  read_value_checked(in, count, file_size);
+  if (matrix.tile_size < 64 || matrix.tile_size > 512)
+    throw std::runtime_error("invalid RPMD-JA block tile size");
+  const std::uint64_t grid = 1 + static_cast<std::uint64_t>(dimension - 1) / matrix.tile_size;
+  const std::uint64_t expected = grid * grid;
+  if (count != expected)
+    throw std::runtime_error("invalid RPMD-JA block matrix tile count");
+  constexpr std::uint64_t minimum_tile_header = 5 * sizeof(int) + 2 * sizeof(std::uint64_t);
+  if (count > std::numeric_limits<std::uint64_t>::max() / minimum_tile_header ||
+      count * minimum_tile_header > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+    throw std::runtime_error("RPMD-JA block matrix header size overflows platform offsets");
+  require_remaining(in, file_size, static_cast<std::size_t>(count * minimum_tile_header));
+  matrix.tiles.resize(static_cast<std::size_t>(count));
+  for (RpmdJAMatrixTile& tile : matrix.tiles) {
+    std::uint64_t left_count = 0, right_count = 0;
+    read_value_checked(in, tile.row, file_size); read_value_checked(in, tile.column, file_size);
+    read_value_checked(in, tile.rows, file_size); read_value_checked(in, tile.columns, file_size);
+    read_value_checked(in, tile.rank, file_size); read_value_checked(in, left_count, file_size);
+    read_value_checked(in, right_count, file_size);
+    if (tile.row < 0 || tile.column < 0 || tile.row % matrix.tile_size || tile.column % matrix.tile_size ||
+        tile.row >= dimension || tile.column >= dimension || tile.rows != std::min(matrix.tile_size, dimension - tile.row) ||
+        tile.columns != std::min(matrix.tile_size, dimension - tile.column) || tile.rank < 0 ||
+        tile.rank > std::min(tile.rows, tile.columns))
+      throw std::runtime_error("invalid RPMD-JA tile shape or rank");
+    const std::uint64_t expected_left = tile.rank == 0 ?
+      static_cast<std::uint64_t>(tile.rows) * tile.columns : static_cast<std::uint64_t>(tile.rows) * tile.rank;
+    const std::uint64_t expected_right = tile.rank == 0 ? 0 : static_cast<std::uint64_t>(tile.rank) * tile.columns;
+    if (left_count != expected_left || right_count != expected_right)
+      throw std::runtime_error("invalid RPMD-JA tile factor counts");
+    if (left_count > std::numeric_limits<std::size_t>::max() / sizeof(double) ||
+        right_count > std::numeric_limits<std::size_t>::max() / sizeof(double))
+      throw std::runtime_error("RPMD-JA block factor size overflows platform size");
+    read_vector_checked(in, tile.left, left_count, file_size);
+    read_vector_checked(in, tile.right, right_count, file_size);
+  }
+  validate_block_matrix(matrix, dimension);
+}
+
+double block_max_abs_row_sum(const RpmdJABlockMatrix& matrix, const int dimension)
+{
+  std::vector<double> sums(static_cast<std::size_t>(dimension), 0.0);
+  for (const RpmdJAMatrixTile& tile : matrix.tiles) {
+    std::vector<double> right_abs_sums;
+    if (tile.rank > 0) {
+      right_abs_sums.assign(static_cast<std::size_t>(tile.rank), 0.0);
+      for (int k = 0; k < tile.rank; ++k)
+        for (int j = 0; j < tile.columns; ++j)
+          right_abs_sums[k] += std::abs(tile.right[static_cast<std::size_t>(k) * tile.columns + j]);
+    }
+    for (int i = 0; i < tile.rows; ++i)
+      if (tile.rank == 0) {
+        for (int j = 0; j < tile.columns; ++j)
+          sums[static_cast<std::size_t>(tile.row + i)] +=
+            std::abs(tile.left[static_cast<std::size_t>(i) * tile.columns + j]);
+      } else {
+        double bound = 0.0;
+        for (int k = 0; k < tile.rank; ++k) {
+          bound += std::abs(tile.left[static_cast<std::size_t>(i) * tile.rank + k]) * right_abs_sums[k];
+        }
+        sums[static_cast<std::size_t>(tile.row + i)] += bound;
+      }
+  }
+  return *std::max_element(sums.begin(), sums.end());
 }
 
 int reference_dimension(const int n)
@@ -351,6 +477,62 @@ struct Evaluator
       const EdgeKey key{edge.center, edge.neighbor, edge.image[0], edge.image[1], edge.image[2]};
       result.edges.emplace(key, edge);
     }
+    return result;
+  }
+};
+
+struct QEvaluation
+{
+  std::vector<double> energy, force, virial;
+};
+
+struct QEvaluator
+{
+  NEP_Charge qnep;
+  Box& box;
+  GPU_Vector<int> type;
+  GPU_Vector<double> position, potential, force, virial;
+  const int n;
+
+  QEvaluator(
+    const std::string& model,
+    const int atom_count,
+    const RunInput& run_input,
+    Box& input_box,
+    const std::vector<int>& types,
+    const double pppm_spacing)
+    : qnep(model.c_str(), atom_count, run_input), box(input_box), type(atom_count), position(3 * atom_count),
+      potential(atom_count), force(3 * atom_count), virial(9 * atom_count), n(atom_count)
+  {
+    qnep.N1 = 0;
+    qnep.N2 = n;
+    qnep.configure_mechanical_observer();
+    qnep.set_neighbor_rebuild(true);
+    qnep.set_neighbor_diagnostics(false);
+    if (qnep.uses_pppm()) qnep.set_pppm_mesh_spacing(pppm_spacing);
+    type.copy_from_host(types.data());
+  }
+
+  QEvaluation evaluate(const std::vector<double>& xyz)
+  {
+    std::vector<double> wrapped = xyz;
+    wrap_positions_once(box, wrapped, n);
+    position.copy_from_host(wrapped.data());
+    potential.fill(0.0);
+    force.fill(0.0);
+    virial.fill(0.0);
+    qnep.request_peratom_virial_for_next_force();
+    qnep.compute(box, type, position, potential, force, virial);
+    QEvaluation result;
+    result.energy.resize(static_cast<std::size_t>(n));
+    result.force.resize(static_cast<std::size_t>(3) * n);
+    result.virial.resize(static_cast<std::size_t>(9) * n);
+    potential.copy_to_host(result.energy.data());
+    force.copy_to_host(result.force.data());
+    virial.copy_to_host(result.virial.data());
+    require_finite(result.energy, "qNEP site energies");
+    require_finite(result.force, "qNEP forces");
+    require_finite(result.virial, "qNEP per-atom virials");
     return result;
   }
 };
@@ -758,7 +940,8 @@ void transform_site_matrix(
 void write_reference(const std::string& path, const RpmdJAReference& reference)
 {
   const bool sparse = reference.backend == 1;
-  if (!sparse && reference.backend != 0) throw std::runtime_error("unsupported RPMD-JA reference backend");
+  const bool block = reference.backend == 2;
+  if (!sparse && !block && reference.backend != 0) throw std::runtime_error("unsupported RPMD-JA reference backend");
   const std::string temporary = path + ".tmp";
   bool created_temporary = false;
   try {
@@ -770,7 +953,7 @@ void write_reference(const std::string& path, const RpmdJAReference& reference)
     if (!out) throw std::runtime_error("cannot create RPMD-JA reference file: " + temporary);
     created_temporary = true;
     out.write(kMagic, sizeof(kMagic));
-    const std::uint32_t version = sparse ? kVersionSparse : kVersionDense, endian = kEndian;
+    const std::uint32_t version = block ? kVersionBlock : (sparse ? kVersionSparse : kVersionDense), endian = kEndian;
     write_value(out, version);
     write_value(out, endian);
     write_value(out, reference.number_of_atoms);
@@ -778,16 +961,16 @@ void write_reference(const std::string& path, const RpmdJAReference& reference)
     write_value(out, reference.fd_step);
     write_value(out, reference.model_fingerprint);
     out.write(kUnits, sizeof(kUnits));
-    const char* layout = sparse ? kLayoutSparse : kLayoutDense;
+    const char* layout = block ? kLayoutBlock : (sparse ? kLayoutSparse : kLayoutDense);
     out.write(layout, std::strlen(layout) + 1);
     out.write(reinterpret_cast<const char*>(reference.cell), sizeof(reference.cell));
     out.write(reinterpret_cast<const char*>(reference.pbc), sizeof(reference.pbc));
     write_vector(out, reference.types);
     write_vector(out, reference.masses);
     write_vector(out, reference.positions);
-    if (!sparse) {
+    if (!sparse && !block) {
       for (int a = 0; a < 3; ++a) write_vector(out, reference.delta_h[a]);
-    } else {
+    } else if (sparse) {
       const int d = 3 * reference.number_of_atoms;
       if (!reference.delta_h[0].empty() || !reference.delta_h[1].empty() || !reference.delta_h[2].empty())
         throw std::runtime_error("sparse RPMD-JA reference must not contain dense DeltaH");
@@ -810,6 +993,42 @@ void write_reference(const std::string& path, const RpmdJAReference& reference)
       write_vector(out, reference.q_values);
       write_vector(out, reference.p_vectors);
       write_vector(out, reference.q_vectors);
+    } else {
+      const int policy_size = static_cast<int>(reference.mechanical_policy.size());
+      if (reference.mechanical_policy != "native_reference_transport")
+        throw std::runtime_error("unsupported qNEP RPMD-JA mechanical policy");
+      write_value(out, reference.mechanical_config_fingerprint);
+      write_value(out, reference.q_charge_mode);
+      const int uses_pppm = reference.q_uses_pppm ? 1 : 0;
+      write_value(out, uses_pppm);
+      write_value(out, reference.q_mesh_spacing);
+      write_value(out, policy_size);
+      out.write(reference.mechanical_policy.data(), policy_size);
+      const double diagnostics[] = {
+        reference.energy_gradient_relative_error, reference.force_gradient_relative_error,
+        reference.hessian_symmetry_relative_error, reference.energy_second_probe_relative_error,
+        reference.force_balance_residual, reference.projection_relative_change,
+        reference.energy_gradient_absolute_rms, reference.force_gradient_absolute_rms,
+        reference.site_derivative_absolute_rms[0], reference.site_derivative_absolute_rms[1], reference.site_derivative_absolute_rms[2],
+        reference.site_transport_difference_absolute_rms[0], reference.site_transport_difference_absolute_rms[1], reference.site_transport_difference_absolute_rms[2],
+        reference.site_transport_relative_error[0], reference.site_transport_relative_error[1], reference.site_transport_relative_error[2],
+        reference.block_relative_residual[0], reference.block_relative_residual[1], reference.block_relative_residual[2], reference.block_relative_residual[3]};
+      write_vector(out, std::vector<double>(diagnostics, diagnostics + sizeof(diagnostics) / sizeof(double)));
+      write_value(out, reference.spectral_bound);
+      write_value(out, reference.kernel_u);
+      write_vector(out, std::vector<double>{reference.kernel_error[0], reference.kernel_error[1]});
+      write_vector(out, std::vector<double>{reference.kernel_s2[0], reference.kernel_s2[1]});
+      write_value(out, reference.kernel_degree);
+      write_value(out, reference.p_rank);
+      write_value(out, reference.q_rank);
+      write_vector(out, reference.p_values);
+      write_vector(out, reference.q_values);
+      write_vector(out, reference.p_vectors);
+      write_vector(out, reference.q_vectors);
+      write_block_matrix(out, reference.block_dynamical, 3 * reference.number_of_atoms);
+      for (int a = 0; a < 3; ++a) write_block_matrix(out, reference.block_site_transpose[a], 3 * reference.number_of_atoms);
+      const int stability_checked = reference.stability_checked ? 1 : 0;
+      write_value(out, stability_checked);
     }
     out.flush();
     if (!out) throw std::runtime_error("failed flushing RPMD-JA reference file");
@@ -823,6 +1042,49 @@ void write_reference(const std::string& path, const RpmdJAReference& reference)
 }
 } // namespace
 
+void load_rpmd_ja_kernel_table(const std::string& path, RpmdJAReference& reference)
+{
+  load_kernel_table(path, reference);
+}
+
+std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference)
+{
+  out.write(kMagic, sizeof(kMagic));
+  const std::uint32_t version = kVersionBlock, endian = kEndian;
+  write_value(out, version); write_value(out, endian);
+  write_value(out, reference.number_of_atoms); write_value(out, reference.temperature);
+  write_value(out, reference.fd_step); write_value(out, reference.model_fingerprint);
+  out.write(kUnits, sizeof(kUnits)); out.write(kLayoutBlock, sizeof(kLayoutBlock));
+  out.write(reinterpret_cast<const char*>(reference.cell), sizeof(reference.cell));
+  out.write(reinterpret_cast<const char*>(reference.pbc), sizeof(reference.pbc));
+  write_vector(out, reference.types); write_vector(out, reference.masses); write_vector(out, reference.positions);
+  write_value(out, reference.mechanical_config_fingerprint);
+  write_value(out, reference.q_charge_mode);
+  const int uses_pppm = reference.q_uses_pppm ? 1 : 0;
+  write_value(out, uses_pppm); write_value(out, reference.q_mesh_spacing);
+  const int policy_size = static_cast<int>(reference.mechanical_policy.size());
+  write_value(out, policy_size); out.write(reference.mechanical_policy.data(), policy_size);
+  const double diagnostics[] = {
+    reference.energy_gradient_relative_error, reference.force_gradient_relative_error,
+    reference.hessian_symmetry_relative_error, reference.energy_second_probe_relative_error,
+    reference.force_balance_residual, reference.projection_relative_change,
+    reference.energy_gradient_absolute_rms, reference.force_gradient_absolute_rms,
+    reference.site_derivative_absolute_rms[0], reference.site_derivative_absolute_rms[1], reference.site_derivative_absolute_rms[2],
+    reference.site_transport_difference_absolute_rms[0], reference.site_transport_difference_absolute_rms[1], reference.site_transport_difference_absolute_rms[2],
+    reference.site_transport_relative_error[0], reference.site_transport_relative_error[1], reference.site_transport_relative_error[2],
+    reference.block_relative_residual[0], reference.block_relative_residual[1], reference.block_relative_residual[2], reference.block_relative_residual[3]};
+  const std::streampos diagnostics_position = out.tellp();
+  out.write(reinterpret_cast<const char*>(diagnostics), sizeof(diagnostics));
+  write_value(out, reference.spectral_bound); write_value(out, reference.kernel_u);
+  write_vector(out, std::vector<double>{reference.kernel_error[0], reference.kernel_error[1]});
+  write_vector(out, std::vector<double>{reference.kernel_s2[0], reference.kernel_s2[1]});
+  write_value(out, reference.kernel_degree); write_value(out, reference.p_rank); write_value(out, reference.q_rank);
+  write_vector(out, reference.p_values); write_vector(out, reference.q_values);
+  write_vector(out, reference.p_vectors); write_vector(out, reference.q_vectors);
+  if (!out) throw std::runtime_error("failed writing qNEP RPMD-JA v3 stream prefix");
+  return diagnostics_position;
+}
+
 std::uint64_t rpmd_ja_model_fingerprint(const std::string& path)
 {
   std::ifstream in(path, std::ios::binary);
@@ -833,6 +1095,37 @@ std::uint64_t rpmd_ja_model_fingerprint(const std::string& path)
     for (std::streamsize i = 0; i < in.gcount(); ++i)
       hash = (hash ^ static_cast<unsigned char>(bytes[i])) * 1099511628211ULL;
   if (!in.eof()) throw std::runtime_error("failed reading NEP model for RPMD-JA fingerprint");
+  return hash;
+}
+
+std::uint64_t rpmd_ja_qnep_config_fingerprint(Force& force)
+{
+  if (force.get_number_of_potentials() != 1 || force.primary_nep_model_path().empty())
+    throw std::runtime_error("rpmd_ja qNEP fingerprint requires exactly one configured qNEP model");
+  auto* qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
+  if (qnep == nullptr)
+    throw std::runtime_error("rpmd_ja qNEP fingerprint does not support non-qNEP or mixed potentials");
+  if (force.get_run_input().contains("dftd3"))
+    throw std::runtime_error("rpmd_ja qNEP reference does not support dftd3 corrections");
+  if (!qnep->uses_pppm())
+    throw std::runtime_error("rpmd_ja qNEP reference currently supports kspace_method pppm only");
+  std::uint64_t hash = rpmd_ja_model_fingerprint(force.primary_nep_model_path());
+  const auto add_bytes = [&hash](const void* data, const std::size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < size; ++i) hash = (hash ^ bytes[i]) * 1099511628211ULL;
+  };
+  const int charge_mode = qnep->get_charge_mode();
+  const int uses_pppm = qnep->uses_pppm() ? 1 : 0;
+  const double mesh_spacing = qnep->get_pppm_mesh_spacing();
+  const float ewald_alpha = qnep->get_ewald_alpha();
+  const float realspace_cutoff = qnep->get_realspace_cutoff();
+  add_bytes(&charge_mode, sizeof(charge_mode));
+  add_bytes(&uses_pppm, sizeof(uses_pppm));
+  add_bytes(&mesh_spacing, sizeof(mesh_spacing));
+  add_bytes(&ewald_alpha, sizeof(ewald_alpha));
+  add_bytes(&realspace_cutoff, sizeof(realspace_cutoff));
+  constexpr char policy[] = "native_reference_transport";
+  add_bytes(policy, sizeof(policy));
   return hash;
 }
 
@@ -851,14 +1144,15 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
   read_value(in, result.fd_step);
   read_value(in, result.model_fingerprint);
   in.read(units, sizeof(units));
-  const char* expected_layout = version == kVersionSparse ? kLayoutSparse : kLayoutDense;
+  const char* expected_layout = version == kVersionBlock ? kLayoutBlock :
+    (version == kVersionSparse ? kLayoutSparse : kLayoutDense);
   std::vector<char> layout(std::strlen(expected_layout) + 1);
   in.read(layout.data(), static_cast<std::streamsize>(layout.size()));
   if (!in || std::memcmp(magic, kMagic, sizeof(kMagic)) != 0 ||
-      (version != kVersionDense && version != kVersionSparse) || endian != kEndian ||
+      (version != kVersionDense && version != kVersionSparse && version != kVersionBlock) || endian != kEndian ||
       std::memcmp(units, kUnits, sizeof(kUnits)) != 0 || std::memcmp(layout.data(), expected_layout, layout.size()) != 0)
     throw std::runtime_error("unsupported RPMD-JA reference magic, version, endian, units, or layout");
-  result.backend = version == kVersionSparse ? 1 : 0;
+  result.backend = version == kVersionBlock ? 2 : (version == kVersionSparse ? 1 : 0);
   if (!(result.temperature > 0.0) || !std::isfinite(result.temperature) || !(result.fd_step > 0.0) ||
       !std::isfinite(result.fd_step))
     throw std::runtime_error("invalid RPMD-JA reference temperature or finite-difference step");
@@ -887,7 +1181,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     const std::size_t matrix = matrix_size(result.number_of_atoms);
     for (int a = 0; a < 3; ++a)
       read_vector_checked(in, result.delta_h[a], matrix, file_size);
-  } else {
+  } else if (result.backend == 1) {
     int edge_policy_version = 0;
     read_value_checked(in, edge_policy_version, file_size);
     read_value_checked(in, result.reference_edge_count, file_size);
@@ -930,6 +1224,74 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     if (!std::isfinite(result.fd_relative_d) ||
         !std::all_of(result.fd_relative_b, result.fd_relative_b + 3, [](double x) { return std::isfinite(x); }))
       throw std::runtime_error("invalid RPMD-JA sparse finite-difference diagnostic");
+  } else {
+    read_value_checked(in, result.mechanical_config_fingerprint, file_size);
+    read_value_checked(in, result.q_charge_mode, file_size);
+    int uses_pppm = 0, policy_size = 0;
+    read_value_checked(in, uses_pppm, file_size);
+    result.q_uses_pppm = uses_pppm == 1;
+    read_value_checked(in, result.q_mesh_spacing, file_size);
+    read_value_checked(in, policy_size, file_size);
+    if (policy_size <= 0 || policy_size > 128) throw std::runtime_error("invalid qNEP RPMD-JA mechanical policy length");
+    require_remaining(in, file_size, static_cast<std::size_t>(policy_size));
+    result.mechanical_policy.resize(static_cast<std::size_t>(policy_size));
+    in.read(&result.mechanical_policy[0], policy_size);
+    std::vector<double> diagnostics;
+    read_vector_checked(in, diagnostics, 21, file_size);
+    result.energy_gradient_relative_error = diagnostics[0];
+    result.force_gradient_relative_error = diagnostics[1];
+    result.hessian_symmetry_relative_error = diagnostics[2];
+    result.energy_second_probe_relative_error = diagnostics[3];
+    result.force_balance_residual = diagnostics[4];
+    result.projection_relative_change = diagnostics[5];
+    result.energy_gradient_absolute_rms = diagnostics[6];
+    result.force_gradient_absolute_rms = diagnostics[7];
+    std::copy(diagnostics.begin() + 8, diagnostics.begin() + 11, result.site_derivative_absolute_rms);
+    std::copy(diagnostics.begin() + 11, diagnostics.begin() + 14, result.site_transport_difference_absolute_rms);
+    std::copy(diagnostics.begin() + 14, diagnostics.begin() + 17, result.site_transport_relative_error);
+    std::copy(diagnostics.begin() + 17, diagnostics.end(), result.block_relative_residual);
+    read_value_checked(in, result.spectral_bound, file_size);
+    read_value_checked(in, result.kernel_u, file_size);
+    std::vector<double> values;
+    read_vector_checked(in, values, 2, file_size);
+    std::copy(values.begin(), values.end(), result.kernel_error);
+    values.clear();
+    read_vector_checked(in, values, 2, file_size);
+    std::copy(values.begin(), values.end(), result.kernel_s2);
+    read_value_checked(in, result.kernel_degree, file_size);
+    read_value_checked(in, result.p_rank, file_size);
+    read_value_checked(in, result.q_rank, file_size);
+    if (result.kernel_degree < 0 || result.kernel_degree > 512 || result.p_rank <= 0 || result.q_rank <= 0 ||
+        result.p_rank > result.kernel_degree + 1 || result.q_rank > result.kernel_degree + 1)
+      throw std::runtime_error("invalid qNEP RPMD-JA kernel ranks or degree");
+    const std::uint64_t p_count = static_cast<std::uint64_t>(result.kernel_degree + 1) * result.p_rank;
+    const std::uint64_t q_count = static_cast<std::uint64_t>(result.kernel_degree + 1) * result.q_rank;
+    read_vector_checked(in, result.p_values, result.p_rank, file_size);
+    read_vector_checked(in, result.q_values, result.q_rank, file_size);
+    read_vector_checked(in, result.p_vectors, p_count, file_size);
+    read_vector_checked(in, result.q_vectors, q_count, file_size);
+    read_block_matrix(in, result.block_dynamical, dimension, file_size);
+    for (int alpha = 0; alpha < 3; ++alpha)
+      read_block_matrix(in, result.block_site_transpose[alpha], dimension, file_size);
+    int stability_checked = 0;
+    read_value_checked(in, stability_checked, file_size);
+    if (stability_checked != 1 || result.q_charge_mode < 1 || result.q_charge_mode > 2 || !result.q_uses_pppm ||
+        !(result.q_mesh_spacing > 0.0) || !std::isfinite(result.q_mesh_spacing) ||
+        result.mechanical_policy != "native_reference_transport" || result.mechanical_config_fingerprint == 0 ||
+        !(result.spectral_bound > 0.0) || !std::isfinite(result.spectral_bound) ||
+        !(result.kernel_u > 0.0) || !std::isfinite(result.kernel_u))
+      throw std::runtime_error("invalid or unchecked qNEP RPMD-JA v3 metadata");
+    const auto valid_nonnegative = [](const double value) { return value >= 0.0 && std::isfinite(value); };
+    for (double value : diagnostics) if (!valid_nonnegative(value))
+      throw std::runtime_error("non-finite qNEP RPMD-JA v3 diagnostics");
+    for (double value : result.kernel_error) if (!valid_nonnegative(value))
+      throw std::runtime_error("invalid qNEP RPMD-JA kernel error budget");
+    for (double value : result.kernel_s2) if (!valid_nonnegative(value))
+      throw std::runtime_error("invalid qNEP RPMD-JA kernel S2 budget");
+    const double tau = HBAR / (K_B * result.temperature);
+    if (tau * std::sqrt(result.spectral_bound) > result.kernel_u *
+        (1.0 + 32.0 * std::numeric_limits<double>::epsilon()))
+      throw std::runtime_error("qNEP RPMD-JA kernel table does not cover the stored spectrum");
   }
   if (in.peek() != std::char_traits<char>::eof()) throw std::runtime_error("trailing data in RPMD-JA reference file");
   require_finite(result.masses, "masses");
@@ -939,7 +1301,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
   for (int pbc : result.pbc) if (pbc != 0 && pbc != 1) throw std::runtime_error("invalid RPMD-JA PBC flag");
   if (result.backend == 0) {
     for (int a = 0; a < 3; ++a) require_finite(result.delta_h[a], "DeltaH");
-  } else {
+  } else if (result.backend == 1) {
     validate_sparse_matrix(result.dynamical, dimension);
     for (int a = 0; a < 3; ++a) validate_sparse_matrix(result.site_transpose[a], dimension);
     const double actual_bound = csr_max_abs_row_sum(result.dynamical);
@@ -975,6 +1337,81 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
         !std::isfinite(reconstruction_residual) || reconstruction_residual > 1.0e-8 ||
         fingerprint != rpmd_ja_model_fingerprint(path))
       throw std::runtime_error("RPMD-JA stability sidecar does not validate this reference file");
+    result.stability_checked = true;
+  } else {
+    validate_block_matrix(result.block_dynamical, dimension);
+    for (int a = 0; a < 3; ++a) validate_block_matrix(result.block_site_transpose[a], dimension);
+    require_finite(result.p_values, "qNEP P eigenvalues");
+    require_finite(result.q_values, "qNEP Q eigenvalues");
+    require_finite(result.p_vectors, "qNEP P eigenvectors");
+    require_finite(result.q_vectors, "qNEP Q eigenvectors");
+    if (result.force_balance_residual > kForceTolerance || result.energy_gradient_absolute_rms > kForceTolerance ||
+        result.projection_relative_change > 5.0e-2 ||
+        result.force_gradient_relative_error > kDifferenceTolerance ||
+        result.hessian_symmetry_relative_error > kHessianSymmetryTolerance ||
+        result.energy_second_probe_relative_error > kDifferenceTolerance ||
+        std::any_of(result.block_relative_residual, result.block_relative_residual + 4,
+          [](double x) { return !(x >= 0.0 && x <= 1.0e-8 && std::isfinite(x)); }) ||
+        std::any_of(result.pbc, result.pbc + 3, [](int p) { return p != 1; }) ||
+        std::any_of(result.site_transport_relative_error, result.site_transport_relative_error + 3,
+          [](double x) { return !(x >= 0.0 && x <= kDifferenceTolerance && std::isfinite(x)); }))
+      throw std::runtime_error("qNEP RPMD-JA reference diagnostics exceed the accepted finite-difference limits");
+    const double actual_bound = block_max_abs_row_sum(result.block_dynamical, dimension);
+    if (actual_bound > result.spectral_bound * (1.0 + 32.0 * std::numeric_limits<double>::epsilon()))
+      throw std::runtime_error("qNEP RPMD-JA stored spectral bound is below its block row-sum bound");
+    const std::string stability_path = path + ".stability";
+    std::ifstream stability(stability_path);
+    std::string tag;
+    int stability_version = 0, atom_count = 0;
+    std::uint64_t file_fingerprint = 0, config_fingerprint = 0;
+    double minimum_pivot = 0.0, operator_bound = 0.0, translation_residual = 0.0;
+    double reconstruction_residual = 0.0, softmode_error = 0.0;
+    stability >> tag >> stability_version;
+    if (tag != "GPUMDJA_QNEP_STABILITY" || (stability_version != 1 && stability_version != 2))
+      throw std::runtime_error("missing or unsupported qNEP RPMD-JA stability sidecar: " + stability_path);
+    stability >> tag >> std::hex >> file_fingerprint >> std::dec;
+    if (tag != "fingerprint") throw std::runtime_error("invalid qNEP RPMD-JA sidecar file fingerprint");
+    stability >> tag >> std::hex >> config_fingerprint >> std::dec;
+    if (tag != "config_fingerprint") throw std::runtime_error("invalid qNEP RPMD-JA sidecar config fingerprint");
+    stability >> tag >> atom_count;
+    if (tag != "atoms") throw std::runtime_error("invalid qNEP RPMD-JA sidecar atom count");
+    if (stability_version == 1) {
+      stability >> tag >> minimum_pivot;
+      if (tag != "minimum_positive_eigenvalue")
+        throw std::runtime_error("invalid qNEP RPMD-JA sidecar minimum eigenvalue");
+    } else {
+      std::string certificate;
+      stability >> tag >> certificate;
+      if (tag != "certificate" || certificate != "cholesky_relative_bound")
+        throw std::runtime_error("unsupported qNEP RPMD-JA stability certificate");
+      stability >> tag >> minimum_pivot;
+      if (tag != "minimum_cholesky_pivot")
+        throw std::runtime_error("invalid qNEP RPMD-JA sidecar Cholesky pivot");
+      stability >> tag >> operator_bound;
+      if (tag != "relative_operator_bound")
+        throw std::runtime_error("invalid qNEP RPMD-JA sidecar relative operator bound");
+    }
+    stability >> tag >> translation_residual;
+    if (tag != "translation_residual") throw std::runtime_error("invalid qNEP RPMD-JA sidecar translation residual");
+    stability >> tag >> reconstruction_residual;
+    if (tag != "reconstruction_residual") throw std::runtime_error("invalid qNEP RPMD-JA sidecar reconstruction residual");
+    stability >> tag >> softmode_error;
+    if (tag != "softmode_relative_error") throw std::runtime_error("invalid qNEP RPMD-JA sidecar softmode error");
+    std::string trailing;
+    if (!stability || stability >> trailing || atom_count != result.number_of_atoms || !(minimum_pivot > 0.0) ||
+        !std::isfinite(minimum_pivot) || !(translation_residual >= 0.0) || translation_residual > 1.0e-8 ||
+        !std::isfinite(translation_residual) || !(reconstruction_residual >= 0.0) ||
+        !std::isfinite(reconstruction_residual) || reconstruction_residual > 1.0e-8 ||
+        !(softmode_error >= 0.0) || softmode_error > 1.0e-2 || !std::isfinite(softmode_error) ||
+        config_fingerprint != result.mechanical_config_fingerprint ||
+        file_fingerprint != rpmd_ja_model_fingerprint(path))
+      throw std::runtime_error("qNEP RPMD-JA stability sidecar does not validate this reference file");
+    if (stability_version == 2 &&
+        (!(operator_bound >= 0.0) || operator_bound > 1.0e-2 || !std::isfinite(operator_bound)))
+      throw std::runtime_error("qNEP RPMD-JA relative operator certificate exceeds its accepted bound");
+    result.stability_certificate = stability_version == 2 ? "cholesky_relative_bound" : "legacy_spectrum_v1";
+    result.minimum_cholesky_pivot = minimum_pivot;
+    result.relative_operator_bound = operator_bound;
     result.stability_checked = true;
   }
   return result;
@@ -1413,4 +1850,302 @@ void generate_rpmd_ja_sparse_reference(
             << "; rebind a wider table offline, then run the stability checker";
     throw std::runtime_error(message.str());
   }
+}
+
+static void generate_rpmd_ja_qnep_raw_reference(
+  const std::string& path,
+  const double temperature,
+  const double fd_step,
+  const std::string& kernel_table_path,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  if (!(temperature > 0.0) || !std::isfinite(temperature) || !(fd_step > 0.0) || !std::isfinite(fd_step))
+    throw std::invalid_argument("qNEP rpmd_ja reference requires positive finite temperature and fd_step");
+  if (path.empty() || kernel_table_path.empty())
+    throw std::invalid_argument("qNEP rpmd_ja reference requires raw-output and kernel-table paths");
+  RpmdJAReference validated_kernel;
+  load_kernel_table(kernel_table_path, validated_kernel);
+  if (atom.number_of_atoms <= 1 || atom.cpu_type.size() != static_cast<size_t>(atom.number_of_atoms) ||
+      atom.cpu_mass.size() != static_cast<size_t>(atom.number_of_atoms))
+    throw std::runtime_error("qNEP rpmd_ja reference requires initialized atom types and masses");
+  if (force.get_number_of_potentials() != 1 || force.primary_nep_model_path().empty())
+    throw std::runtime_error("qNEP rpmd_ja reference supports exactly one qNEP potential");
+  auto* active_qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
+  if (active_qnep == nullptr)
+    throw std::runtime_error("qNEP rpmd_ja reference rejects non-qNEP and mixed potentials");
+  if (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2)
+    throw std::runtime_error("qNEP rpmd_ja reference supports charge modes 1 and 2 only");
+  if (!active_qnep->uses_pppm())
+    throw std::runtime_error("qNEP rpmd_ja reference currently supports kspace_method pppm only");
+  for (int pbc : {box.pbc_x, box.pbc_y, box.pbc_z})
+    if (pbc != 1) throw std::runtime_error("qNEP rpmd_ja reference currently requires a fully periodic fixed cell");
+
+  const int n = atom.number_of_atoms, d = reference_dimension(atom.number_of_atoms);
+  const std::string model = force.primary_nep_model_path();
+  const std::uint64_t model_fingerprint = rpmd_ja_model_fingerprint(model);
+  const std::uint64_t config_fingerprint = rpmd_ja_qnep_config_fingerprint(force);
+  std::vector<double> positions(static_cast<std::size_t>(d));
+  atom.position_per_atom.copy_to_host(positions.data());
+  require_finite(positions, "qNEP reference positions");
+  for (double mass : atom.cpu_mass)
+    if (!(mass > 0.0) || !std::isfinite(mass)) throw std::runtime_error("qNEP rpmd_ja requires positive finite masses");
+  for (double value : box.cpu_h)
+    if (!std::isfinite(value)) throw std::runtime_error("qNEP rpmd_ja requires a finite cell");
+
+  const std::string temporary = path + ".tmp";
+  std::ifstream existing(path, std::ios::binary), existing_temporary(temporary, std::ios::binary);
+  if (existing.good() || existing_temporary.good())
+    throw std::runtime_error("qNEP rpmd_ja raw output or temporary file already exists");
+  const auto generation_start = std::chrono::steady_clock::now();
+
+  Box observer_box = box;
+  observer_box.get_inverse();
+  observer_box.set_is_orthogonal();
+  QEvaluator evaluator(model, n, force.get_run_input(), observer_box, atom.cpu_type, active_qnep->get_pppm_mesh_spacing());
+  const QEvaluation reference = evaluator.evaluate(positions);
+  double max_force = 0.0, force_norm2 = 0.0, energy0 = 0.0;
+  for (double value : reference.force) {
+    max_force = std::max(max_force, std::abs(value));
+    force_norm2 += value * value;
+  }
+  for (double value : reference.energy) energy0 += value;
+  if (max_force > kForceTolerance)
+    throw std::runtime_error("qNEP rpmd_ja reference is not force-balanced; relax or choose a new reference");
+
+  struct RemoveRawTemporary
+  {
+    explicit RemoveRawTemporary(const std::string& value) : path(value) {}
+    std::string path;
+    bool active = true;
+    ~RemoveRawTemporary() { if (active) std::remove(path.c_str()); }
+  } remove_temporary(temporary);
+  std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+  if (!out) throw std::runtime_error("cannot create qNEP rpmd_ja raw file: " + temporary);
+  constexpr char raw_magic[8] = {'G','P','J','Q','R','A','W','\0'};
+  constexpr char raw_layout[] = "xyz_soa;derivative_input_rows_output_columns";
+  const std::uint32_t raw_version = 1, endian = kEndian;
+  const int charge_mode = active_qnep->get_charge_mode();
+  const int uses_pppm = active_qnep->uses_pppm() ? 1 : 0;
+  const double mesh_spacing = active_qnep->get_pppm_mesh_spacing();
+  out.write(raw_magic, sizeof(raw_magic));
+  write_value(out, raw_version); write_value(out, endian); write_value(out, n); write_value(out, d);
+  write_value(out, temperature); write_value(out, fd_step); write_value(out, model_fingerprint);
+  write_value(out, config_fingerprint); write_value(out, charge_mode); write_value(out, uses_pppm);
+  write_value(out, mesh_spacing); out.write(raw_layout, sizeof(raw_layout));
+  out.write(reinterpret_cast<const char*>(box.cpu_h), sizeof(box.cpu_h));
+  const int pbc[3] = {box.pbc_x, box.pbc_y, box.pbc_z};
+  out.write(reinterpret_cast<const char*>(pbc), sizeof(pbc));
+  write_vector(out, atom.cpu_type); write_vector(out, atom.cpu_mass); write_vector(out, positions);
+  write_value(out, energy0); write_vector(out, reference.energy); write_vector(out, reference.force);
+  write_vector(out, reference.virial);
+  if (!out) throw std::runtime_error("failed writing qNEP rpmd_ja raw header");
+
+  const std::streampos data_start = out.tellp();
+  const std::uint64_t v_count = static_cast<std::uint64_t>(d) * n;
+  const std::uint64_t c_count = static_cast<std::uint64_t>(3) * d * d;
+  const std::uint64_t k_count = static_cast<std::uint64_t>(d) * d;
+  const std::streamoff v_bytes = static_cast<std::streamoff>(v_count * sizeof(double));
+  const std::streamoff c_bytes = static_cast<std::streamoff>(c_count * sizeof(double));
+  const std::streamoff k_bytes = static_cast<std::streamoff>(k_count * sizeof(double));
+  const std::streamoff stats_bytes = static_cast<std::streamoff>(18 * sizeof(double));
+  if (data_start < 0 || 2 * v_bytes > std::numeric_limits<std::streamoff>::max() - 2 * c_bytes ||
+      2 * v_bytes + 2 * c_bytes > std::numeric_limits<std::streamoff>::max() - k_bytes - stats_bytes)
+    throw std::runtime_error("qNEP rpmd_ja raw output size overflows platform offsets");
+  const std::streampos coarse_v_start = data_start + v_bytes + c_bytes + k_bytes;
+  const std::streampos coarse_c_start = coarse_v_start + v_bytes;
+  const std::streampos stats_start = coarse_c_start + c_bytes;
+  out.seekp(stats_start + stats_bytes - 1);
+  out.put('\0');
+  out.flush();
+  if (!out) throw std::runtime_error("cannot reserve qNEP rpmd_ja raw matrix storage");
+
+  double v_diff2 = 0.0, v_fine2 = 0.0, k_diff2 = 0.0, k_fine2 = 0.0;
+  double c_diff2[3] = {}, c_fine2[3] = {};
+  double energy_gradient_diff2 = 0.0, energy_gradient_scale2 = 0.0;
+  std::vector<double> plus = positions, minus = positions, plus_half = positions, minus_half = positions;
+  std::vector<double> v_fine(n), v_coarse(n), k_fine(d), k_coarse(d);
+  std::vector<std::vector<double>> probe_directions(3, std::vector<double>(d));
+  for (int coordinate = 0; coordinate < d; ++coordinate) {
+    probe_directions[0][coordinate] = std::sin((coordinate + 1) * 0.7548776662466927) +
+      0.5 * std::cos((coordinate + 1) * 0.5698402909980532);
+    probe_directions[1][coordinate] = std::cos((coordinate + 1) * 0.438579021) -
+      0.25 * std::sin((coordinate + 1) * 0.812681);
+    probe_directions[2][coordinate] = std::sin((coordinate + 1) * 0.327491) +
+      0.75 * std::cos((coordinate + 1) * 0.639137);
+  }
+  double relative_com[3] = {}, total_mass = 0.0;
+  for (int i = 0; i < n; ++i) {
+    total_mass += atom.cpu_mass[i];
+    for (int alpha = 0; alpha < 3; ++alpha)
+      relative_com[alpha] += atom.cpu_mass[i] * probe_directions[2][alpha * n + i];
+  }
+  for (int alpha = 0; alpha < 3; ++alpha) relative_com[alpha] /= total_mass;
+  double probe_norm2[3] = {};
+  for (int coordinate = 0; coordinate < d; ++coordinate) {
+    const int alpha = coordinate / n;
+    probe_directions[2][coordinate] -= relative_com[alpha];
+    for (int probe = 0; probe < 3; ++probe)
+      probe_norm2[probe] += probe_directions[probe][coordinate] * probe_directions[probe][coordinate];
+  }
+  for (int probe = 0; probe < 3; ++probe) {
+    const double inverse = 1.0 / std::sqrt(probe_norm2[probe]);
+    for (double& value : probe_directions[probe]) value *= inverse;
+  }
+  double matrix_quadratic[3] = {};
+  std::array<std::vector<double>, 3> c_fine, c_coarse;
+  for (int alpha = 0; alpha < 3; ++alpha) { c_fine[alpha].resize(d); c_coarse[alpha].resize(d); }
+  constexpr int virial_component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}};
+  const auto save_row = [&](const std::streampos start, const int row, const int width, const std::vector<double>& values) {
+    out.seekp(start + static_cast<std::streamoff>(row) * width * sizeof(double));
+    write_vector(out, values);
+  };
+  for (int coordinate = 0; coordinate < d; ++coordinate) {
+    plus = minus = plus_half = minus_half = positions;
+    plus[coordinate] += fd_step; minus[coordinate] -= fd_step;
+    plus_half[coordinate] += 0.5 * fd_step; minus_half[coordinate] -= 0.5 * fd_step;
+    const QEvaluation ep = evaluator.evaluate(plus), em = evaluator.evaluate(minus);
+    const QEvaluation ehp = evaluator.evaluate(plus_half), ehm = evaluator.evaluate(minus_half);
+    double energy_grad = 0.0;
+    for (int i = 0; i < n; ++i) {
+      v_fine[i] = (ehp.energy[i] - ehm.energy[i]) / fd_step;
+      v_coarse[i] = (ep.energy[i] - em.energy[i]) / (2.0 * fd_step);
+      energy_grad += v_fine[i];
+      v_diff2 += (v_fine[i] - v_coarse[i]) * (v_fine[i] - v_coarse[i]);
+      v_fine2 += v_fine[i] * v_fine[i];
+    }
+    const double grad_error = energy_grad + reference.force[coordinate];
+    energy_gradient_diff2 += grad_error * grad_error;
+    energy_gradient_scale2 += reference.force[coordinate] * reference.force[coordinate] + energy_grad * energy_grad;
+    for (int r = 0; r < d; ++r) {
+      k_fine[r] = -(ehp.force[r] - ehm.force[r]) / fd_step;
+      k_coarse[r] = -(ep.force[r] - em.force[r]) / (2.0 * fd_step);
+      k_diff2 += (k_fine[r] - k_coarse[r]) * (k_fine[r] - k_coarse[r]);
+      k_fine2 += k_fine[r] * k_fine[r];
+    }
+    for (int probe = 0; probe < 3; ++probe) {
+      double output_projection = 0.0;
+      for (int r = 0; r < d; ++r) output_projection += k_fine[r] * probe_directions[probe][r];
+      matrix_quadratic[probe] += probe_directions[probe][coordinate] * output_projection;
+    }
+    save_row(data_start, coordinate, n, v_fine);
+    save_row(coarse_v_start, coordinate, n, v_coarse);
+    for (int alpha = 0; alpha < 3; ++alpha) {
+      for (int r = 0; r < d; ++r) {
+        const int site = r % n, mu = r / n;
+        const int offset = virial_component[alpha][mu] * n + site;
+        c_fine[alpha][r] = (ehp.virial[offset] - ehm.virial[offset]) / fd_step;
+        c_coarse[alpha][r] = (ep.virial[offset] - em.virial[offset]) / (2.0 * fd_step);
+        const double difference = c_fine[alpha][r] - c_coarse[alpha][r];
+        c_diff2[alpha] += difference * difference;
+        c_fine2[alpha] += c_fine[alpha][r] * c_fine[alpha][r];
+      }
+      const std::streampos c_start = data_start + v_bytes +
+        static_cast<std::streamoff>(alpha) * d * d * sizeof(double);
+      save_row(c_start, coordinate, d, c_fine[alpha]);
+      const std::streampos coarse_c_matrix_start = coarse_c_start +
+        static_cast<std::streamoff>(alpha) * d * d * sizeof(double);
+      save_row(coarse_c_matrix_start, coordinate, d, c_coarse[alpha]);
+    }
+    save_row(data_start + v_bytes + c_bytes, coordinate, d, k_fine);
+    if ((coordinate + 1) % 32 == 0 || coordinate + 1 == d)
+      std::printf("    qNEP rpmd_ja reference columns: %d/%d\n", coordinate + 1, d);
+  }
+
+  const double energy_gradient_error = std::sqrt(energy_gradient_diff2 / std::max(energy_gradient_scale2, 1.0e-300));
+  const double v_relative = std::sqrt(v_diff2 / std::max(v_fine2, 1.0e-300));
+  const double k_relative = std::sqrt(k_diff2 / std::max(k_fine2, 1.0e-300));
+  const double c_relative[3] = {
+    std::sqrt(c_diff2[0] / std::max(c_fine2[0], 1.0e-300)),
+    std::sqrt(c_diff2[1] / std::max(c_fine2[1], 1.0e-300)),
+    std::sqrt(c_diff2[2] / std::max(c_fine2[2], 1.0e-300))};
+  auto total_energy = [](const QEvaluation& evaluation) {
+    double value = 0.0;
+    for (double site_energy : evaluation.energy) value += site_energy;
+    return value;
+  };
+  double second_consistency = 0.0, second_convergence = 0.0;
+  for (int probe = 0; probe < 3; ++probe) {
+    const auto position_at = [&](const double scale) {
+      std::vector<double> value = positions;
+      for (int coordinate = 0; coordinate < d; ++coordinate)
+        value[coordinate] += scale * probe_directions[probe][coordinate];
+      return value;
+    };
+    const QEvaluation probe_plus = evaluator.evaluate(position_at(fd_step));
+    const QEvaluation probe_minus = evaluator.evaluate(position_at(-fd_step));
+    const QEvaluation probe_half_plus = evaluator.evaluate(position_at(0.5 * fd_step));
+    const QEvaluation probe_half_minus = evaluator.evaluate(position_at(-0.5 * fd_step));
+    const auto force_direction = [&](const QEvaluation& evaluation) {
+      double value = 0.0;
+      for (int coordinate = 0; coordinate < d; ++coordinate)
+        value += probe_directions[probe][coordinate] * evaluation.force[coordinate];
+      return value;
+    };
+    const double energy_h = (total_energy(probe_plus) + total_energy(probe_minus) - 2.0 * energy0) /
+      (fd_step * fd_step);
+    const double force_h = -(force_direction(probe_plus) - force_direction(probe_minus)) / (2.0 * fd_step);
+    const double energy_h2 = (total_energy(probe_half_plus) + total_energy(probe_half_minus) - 2.0 * energy0) /
+      (0.25 * fd_step * fd_step);
+    const double force_h2 = -(force_direction(probe_half_plus) - force_direction(probe_half_minus)) / fd_step;
+    const double scale = std::max({std::abs(energy_h), std::abs(force_h), std::abs(energy_h2), std::abs(force_h2), 1.0e-12});
+    second_consistency = std::max(second_consistency, std::max({std::abs(energy_h - force_h),
+      std::abs(energy_h2 - force_h2), std::abs(energy_h - matrix_quadratic[probe]),
+      std::abs(force_h - matrix_quadratic[probe])}) / scale);
+    second_convergence = std::max(second_convergence, std::abs(energy_h - energy_h2) /
+      std::max({std::abs(energy_h), std::abs(energy_h2), 1.0e-12}));
+  }
+  double stats[18] = {};
+  stats[0] = energy_gradient_error; stats[1] = std::sqrt(energy_gradient_diff2 / d);
+  stats[2] = v_relative; stats[3] = std::sqrt(v_diff2 / (static_cast<double>(d) * n));
+  stats[4] = k_relative; stats[5] = std::sqrt(k_diff2 / (static_cast<double>(d) * d));
+  for (int alpha = 0; alpha < 3; ++alpha) {
+    stats[6 + alpha] = c_relative[alpha];
+    stats[9 + alpha] = std::sqrt(c_diff2[alpha] / (static_cast<double>(d) * d));
+  }
+  stats[12] = max_force; stats[13] = std::sqrt(force_norm2 / d);
+  stats[14] = second_consistency; stats[15] = second_convergence;
+  stats[16] = fd_step; stats[17] = 1.0; // Finite-difference estimates, not interval proofs.
+  out.seekp(stats_start);
+  out.write(reinterpret_cast<const char*>(stats), sizeof(stats));
+  out.flush();
+  if (!out) throw std::runtime_error("failed writing qNEP rpmd_ja raw diagnostic footer");
+  out.close();
+  if (!out) throw std::runtime_error("failed closing qNEP rpmd_ja raw file");
+  if (std::rename(temporary.c_str(), path.c_str()) != 0)
+    throw std::runtime_error("cannot finalize qNEP rpmd_ja raw file");
+  remove_temporary.active = false;
+  std::printf("    qNEP rpmd_ja raw matrix storage %.3f GiB including coarse V/C; evaluations=%d; force-gradient h/h2 %.3e, energy-gradient consistency %.3e; site virial component h/h2 %.3e %.3e %.3e\n",
+    static_cast<double>(2 * v_bytes + 2 * c_bytes + k_bytes) / (1024.0 * 1024.0 * 1024.0), 4 * d + 13,
+    k_relative, energy_gradient_error, c_relative[0], c_relative[1], c_relative[2]);
+  const double elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_start).count();
+  std::printf("    qNEP rpmd_ja raw generation elapsed %.3f s; tracked host staging estimate %.3f MiB at N=%d (excludes private qNEP/GPU buffers and allocator overhead)\n",
+    elapsed_seconds, static_cast<double>(160ULL * n * sizeof(double)) / (1024.0 * 1024.0), n);
+  if (std::sqrt(energy_gradient_diff2 / d) > kForceTolerance || v_relative > kDifferenceTolerance ||
+      k_relative > kDifferenceTolerance || second_consistency > kDifferenceTolerance ||
+      second_convergence > kDifferenceTolerance || c_relative[0] > kDifferenceTolerance ||
+      c_relative[1] > kDifferenceTolerance || c_relative[2] > kDifferenceTolerance)
+    throw std::runtime_error("qNEP rpmd_ja raw finite-difference consistency check failed; inspect recorded diagnostics");
+}
+
+void generate_rpmd_ja_qnep_reference(
+  const std::string& path,
+  const double temperature,
+  const double fd_step,
+  const std::string& kernel_table_path,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  const std::string raw_path = path + ".qraw";
+  const std::string sidecar_path = path + ".stability";
+  std::ifstream existing(path, std::ios::binary), existing_sidecar(sidecar_path), existing_raw(raw_path, std::ios::binary);
+  if (existing.good() || existing_sidecar.good() || existing_raw.good())
+    throw std::runtime_error("qNEP rpmd_ja final output, sidecar, or scratch file already exists");
+  generate_rpmd_ja_qnep_raw_reference(
+    raw_path, temperature, fd_step, kernel_table_path, atom, box, force);
+  prepare_rpmd_ja_qnep_reference(raw_path, path, kernel_table_path);
+  if (std::remove(raw_path.c_str()) != 0)
+    throw std::runtime_error("qNEP rpmd_ja finalized but could not remove raw scratch file: " + raw_path);
 }

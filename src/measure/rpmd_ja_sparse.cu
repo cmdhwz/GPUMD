@@ -16,12 +16,42 @@
 namespace
 {
 constexpr int threads = 128;
+constexpr int warp_lanes = 32;
+constexpr int warps_per_block = threads / warp_lanes;
 
 void add_bytes(std::size_t& total, const std::size_t count, const std::size_t element_size)
 {
   if (count > (std::numeric_limits<std::size_t>::max() - total) / element_size)
     PRINT_INPUT_ERROR("rpmd_ja sparse workspace byte count overflowed.");
   total += count * element_size;
+}
+
+std::size_t block_operator_required_bytes(
+  const RpmdJABlockMatrix& matrix, const int dimension, const int max_vectors)
+{
+  if (dimension <= 0 || max_vectors <= 0 || matrix.tile_size <= 0 || matrix.tile_size > 4096)
+    PRINT_INPUT_ERROR("rpmd_ja block operator has invalid dimensions.");
+  const int number_of_tiles = (dimension - 1) / matrix.tile_size + 1;
+  const std::size_t expected_tiles = static_cast<std::size_t>(number_of_tiles) * number_of_tiles;
+  if (matrix.tiles.size() != expected_tiles)
+    PRINT_INPUT_ERROR("rpmd_ja block operator does not cover its full matrix grid.");
+  std::size_t bytes = 0;
+  add_bytes(bytes, matrix.tiles.size(), sizeof(RpmdJABlockTileDevice));
+  std::size_t factor_bytes = 0;
+  std::size_t right_bytes = 0;
+  std::size_t projection_bytes = 0;
+  for (const auto& tile : matrix.tiles) {
+    if (tile.rank < 0 || tile.rank > std::min(tile.rows, tile.columns))
+      PRINT_INPUT_ERROR("rpmd_ja block operator has an invalid tile rank.");
+    add_bytes(factor_bytes, tile.left.size(), sizeof(double));
+    add_bytes(right_bytes, tile.right.size(), sizeof(double));
+    if (tile.rank > 0)
+      add_bytes(projection_bytes, static_cast<std::size_t>(max_vectors) * tile.rank, sizeof(double));
+  }
+  add_bytes(bytes, factor_bytes, 1);
+  add_bytes(bytes, std::max<std::size_t>(sizeof(double), right_bytes), 1);
+  add_bytes(bytes, std::max<std::size_t>(sizeof(double), projection_bytes), 1);
+  return bytes;
 }
 
 void validate_matrix(const RpmdJASparseMatrix& matrix, const int dimension, const char* name)
@@ -262,6 +292,99 @@ static __global__ void sparse_apply_b_batch(
   output[static_cast<std::size_t>(vector) * D + row] = sum;
 }
 
+__device__ double warp_sum_double(double value)
+{
+  for (int offset = warp_lanes / 2; offset > 0; offset >>= 1) {
+#ifdef USE_HIP
+    value += __shfl_down(value, offset, warp_lanes);
+#else
+    value += __shfl_down_sync(0xffffffff, value, offset, warp_lanes);
+#endif
+  }
+  return value;
+}
+
+static __global__ void block_apply_right(
+  const int D,
+  const int tile_size,
+  const int number_of_tiles,
+  const int number_of_tile_columns,
+  const RpmdJABlockTileDevice* tiles,
+  const double* right,
+  const double* input,
+  double* projection,
+  int* error)
+{
+  const int tile = blockIdx.x * warps_per_block + threadIdx.x / warp_lanes;
+  const int lane = threadIdx.x % warp_lanes;
+  const int vector = blockIdx.y;
+  if (tile >= number_of_tiles) return;
+  const RpmdJABlockTileDevice descriptor = tiles[tile];
+  if (descriptor.rank == 0) return;
+  const int column_tile = tile % number_of_tile_columns;
+  const int column_start = column_tile * tile_size;
+  for (int rank = 0; rank < descriptor.rank; ++rank) {
+    double sum = 0.0;
+    for (int column = lane; column < descriptor.columns; column += warp_lanes)
+      sum += right[descriptor.right_offset + static_cast<std::size_t>(rank) * descriptor.columns + column] *
+        input[static_cast<std::size_t>(vector) * D + column_start + column];
+    sum = warp_sum_double(sum);
+    if (lane == 0) {
+      if (!isfinite(sum)) {
+        atomicOr(error, RPMD_JA_ERROR_NUMERICAL);
+        sum = 0.0;
+      }
+      projection[descriptor.projection_offset + static_cast<std::size_t>(vector) * descriptor.rank + rank] = sum;
+    }
+  }
+}
+
+static __global__ void block_apply_rows(
+  const int D,
+  const int tile_size,
+  const int number_of_tiles,
+  const int number_of_tile_columns,
+  const int number_of_vectors,
+  const RpmdJABlockTileDevice* tiles,
+  const double* left,
+  const double* input,
+  const double* projection,
+  double* output,
+  int* error)
+{
+  const int row = blockIdx.x * warps_per_block + threadIdx.x / warp_lanes;
+  const int lane = threadIdx.x % warp_lanes;
+  const int vector = blockIdx.y;
+  if (row >= D || vector >= number_of_vectors) return;
+  const int row_tile = row / tile_size;
+  const int local_row = row % tile_size;
+  double sum = 0.0;
+  for (int column_tile = 0; column_tile < number_of_tile_columns; ++column_tile) {
+    const int tile = row_tile * number_of_tile_columns + column_tile;
+    if (tile >= number_of_tiles) continue;
+    const RpmdJABlockTileDevice descriptor = tiles[tile];
+    if (local_row >= descriptor.rows) continue;
+    if (descriptor.rank == 0) {
+      const int column_start = column_tile * tile_size;
+      for (int column = lane; column < descriptor.columns; column += warp_lanes)
+        sum += left[descriptor.left_offset + static_cast<std::size_t>(local_row) * descriptor.columns + column] *
+          input[static_cast<std::size_t>(vector) * D + column_start + column];
+    } else {
+      for (int rank = lane; rank < descriptor.rank; rank += warp_lanes)
+        sum += left[descriptor.left_offset + static_cast<std::size_t>(local_row) * descriptor.rank + rank] *
+          projection[descriptor.projection_offset + static_cast<std::size_t>(vector) * descriptor.rank + rank];
+    }
+  }
+  sum = warp_sum_double(sum);
+  if (lane == 0) {
+    if (!isfinite(sum)) {
+      atomicOr(error, RPMD_JA_ERROR_NUMERICAL);
+      sum = 0.0;
+    }
+    output[static_cast<std::size_t>(vector) * D + row] = sum;
+  }
+}
+
 static __global__ void reduce_modal_current(
   const int D,
   const int p_rank,
@@ -337,6 +460,131 @@ static __global__ void add_modal_q_term(
 }
 } // namespace
 
+void RpmdJABlockOperator::initialize(
+  const RpmdJABlockMatrix& matrix, const int dimension, const int max_vectors)
+{
+  if (dimension <= 0 || max_vectors <= 0 || matrix.tile_size <= 0 || matrix.tile_size > 4096) {
+    PRINT_INPUT_ERROR("rpmd_ja block operator has invalid dimensions.");
+  }
+  dimension_ = dimension;
+  tile_size_ = matrix.tile_size;
+  max_vectors_ = max_vectors;
+  has_low_rank_ = false;
+  number_of_tiles_ = (dimension_ - 1) / tile_size_ + 1;
+  const std::size_t grid_size = static_cast<std::size_t>(number_of_tiles_) * number_of_tiles_;
+  if (matrix.tiles.size() != grid_size || grid_size > std::numeric_limits<int>::max())
+    PRINT_INPUT_ERROR("rpmd_ja block operator does not cover its full matrix grid.");
+  block_count_ = static_cast<int>(grid_size);
+
+  std::vector<RpmdJABlockTileDevice> descriptors(grid_size);
+  std::vector<unsigned char> seen(grid_size, 0);
+  std::size_t left_size = 0;
+  std::size_t right_size = 0;
+  std::size_t projection_size = 0;
+  for (const auto& tile : matrix.tiles) {
+    if (tile.row < 0 || tile.column < 0 || tile.row % tile_size_ != 0 ||
+        tile.column % tile_size_ != 0 || tile.row >= dimension_ || tile.column >= dimension_) {
+      PRINT_INPUT_ERROR("rpmd_ja block operator has a tile outside its aligned grid.");
+    }
+    const int row_tile = tile.row / tile_size_;
+    const int column_tile = tile.column / tile_size_;
+    const std::size_t index = static_cast<std::size_t>(row_tile) * number_of_tiles_ + column_tile;
+    const int rows = std::min(tile_size_, dimension_ - tile.row);
+    const int columns = std::min(tile_size_, dimension_ - tile.column);
+    if (seen[index] || tile.rows != rows || tile.columns != columns || tile.rank < 0 ||
+        tile.rank > std::min(rows, columns)) {
+      PRINT_INPUT_ERROR("rpmd_ja block operator has duplicate, malformed, or oversized tiles.");
+    }
+    const std::size_t left_count = tile.rank == 0
+      ? static_cast<std::size_t>(rows) * columns
+      : static_cast<std::size_t>(rows) * tile.rank;
+    const std::size_t right_count = tile.rank == 0
+      ? 0
+      : static_cast<std::size_t>(tile.rank) * columns;
+    if (tile.left.size() != left_count || tile.right.size() != right_count ||
+        !std::all_of(tile.left.begin(), tile.left.end(), [](double value) { return std::isfinite(value); }) ||
+        !std::all_of(tile.right.begin(), tile.right.end(), [](double value) { return std::isfinite(value); })) {
+      PRINT_INPUT_ERROR("rpmd_ja block operator has malformed or non-finite tile factors.");
+    }
+    auto& descriptor = descriptors[index];
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.rank = tile.rank;
+    has_low_rank_ = has_low_rank_ || tile.rank > 0;
+    descriptor.left_offset = left_size;
+    descriptor.right_offset = right_size;
+    descriptor.projection_offset = projection_size;
+    if (left_count > std::numeric_limits<std::size_t>::max() - left_size ||
+        right_count > std::numeric_limits<std::size_t>::max() - right_size)
+      PRINT_INPUT_ERROR("rpmd_ja block operator factor storage size overflowed.");
+    left_size += left_count;
+    right_size += right_count;
+    const std::size_t tile_projection_size = static_cast<std::size_t>(max_vectors_) * tile.rank;
+    if (tile_projection_size > std::numeric_limits<std::size_t>::max() - projection_size)
+      PRINT_INPUT_ERROR("rpmd_ja block operator projection storage size overflowed.");
+    projection_size += tile_projection_size;
+    seen[index] = 1;
+  }
+  if (std::any_of(seen.begin(), seen.end(), [](unsigned char present) { return present == 0; }))
+    PRINT_INPUT_ERROR("rpmd_ja block operator omits one or more matrix tiles.");
+
+  allocated_bytes_ = 0;
+  add_bytes(allocated_bytes_, descriptors.size(), sizeof(RpmdJABlockTileDevice));
+  add_bytes(allocated_bytes_, left_size, sizeof(double));
+  add_bytes(allocated_bytes_, std::max<std::size_t>(1, right_size), sizeof(double));
+  add_bytes(allocated_bytes_, std::max<std::size_t>(1, projection_size), sizeof(double));
+  if (allocated_bytes_ != block_operator_required_bytes(matrix, dimension_, max_vectors_))
+    PRINT_INPUT_ERROR("rpmd_ja block operator storage preflight mismatch.");
+  std::size_t free_bytes = 0, total_bytes = 0;
+#ifdef USE_HIP
+  CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+#else
+  CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+#endif
+  if (allocated_bytes_ > free_bytes)
+    PRINT_INPUT_ERROR("rpmd_ja block operator does not fit available GPU memory.");
+  tiles_.resize(descriptors.size());
+  tiles_.copy_from_host(descriptors.data());
+  left_.resize(left_size);
+  {
+    right_.resize(std::max<std::size_t>(1, right_size));
+  }
+  projection_.resize(std::max<std::size_t>(1, projection_size));
+  for (const auto& tile : matrix.tiles) {
+    const int row_tile = tile.row / tile_size_;
+    const int column_tile = tile.column / tile_size_;
+    const std::size_t index = static_cast<std::size_t>(row_tile) * number_of_tiles_ + column_tile;
+    const auto& descriptor = descriptors[index];
+    if (!tile.left.empty())
+      CHECK(gpuMemcpy(left_.data() + descriptor.left_offset, tile.left.data(),
+        tile.left.size() * sizeof(double), gpuMemcpyHostToDevice));
+    if (!tile.right.empty())
+      CHECK(gpuMemcpy(right_.data() + descriptor.right_offset, tile.right.data(),
+        tile.right.size() * sizeof(double), gpuMemcpyHostToDevice));
+  }
+}
+
+void RpmdJABlockOperator::apply(
+  const double* input, const int number_of_vectors, double* output, int* device_error)
+{
+  if (dimension_ <= 0 || input == nullptr || output == nullptr || device_error == nullptr ||
+      number_of_vectors <= 0 || number_of_vectors > max_vectors_) {
+    PRINT_INPUT_ERROR("rpmd_ja block matvec received invalid buffers or vector count.");
+  }
+  if (has_low_rank_) {
+    const unsigned int grid_x = static_cast<unsigned int>((block_count_ - 1) / warps_per_block + 1);
+    block_apply_right<<<dim3(grid_x, number_of_vectors), threads>>>(
+      dimension_, tile_size_, block_count_, number_of_tiles_,
+      tiles_.data(), right_.data(), input,
+      projection_.data(), device_error);
+    GPU_CHECK_KERNEL
+  }
+  block_apply_rows<<<dim3((dimension_ - 1) / warps_per_block + 1, number_of_vectors), threads>>>(
+    dimension_, tile_size_, block_count_, number_of_tiles_, number_of_vectors,
+    tiles_.data(), left_.data(), input, projection_.data(), output, device_error);
+  GPU_CHECK_KERNEL
+}
+
 void RpmdJASparseWorkspace::initialize(
   const RpmdJAReference& reference,
   const std::vector<double>& masses)
@@ -345,6 +593,7 @@ void RpmdJASparseWorkspace::initialize(
   degree_ = reference.kernel_degree;
   p_rank_ = reference.p_rank;
   q_rank_ = reference.q_rank;
+  backend_ = reference.backend;
   if (!reference.stability_checked || number_of_atoms_ <= 0 ||
       number_of_atoms_ > (std::numeric_limits<int>::max() - (threads - 1)) / 9 ||
       degree_ < 0 || degree_ > 512 ||
@@ -355,9 +604,15 @@ void RpmdJASparseWorkspace::initialize(
     PRINT_INPUT_ERROR("rpmd_ja sparse reference is unstable or has invalid dimensions.");
   }
   dimension_ = 3 * number_of_atoms_;
-  validate_matrix(reference.dynamical, dimension_, "rpmd_ja sparse D matrix is malformed.");
-  for (int alpha = 0; alpha < 3; ++alpha)
-    validate_matrix(reference.site_transpose[alpha], dimension_, "rpmd_ja sparse B matrix is malformed.");
+  if (backend_ == 1) {
+    validate_matrix(reference.dynamical, dimension_, "rpmd_ja sparse D matrix is malformed.");
+    for (int alpha = 0; alpha < 3; ++alpha)
+      validate_matrix(reference.site_transpose[alpha], dimension_, "rpmd_ja sparse B matrix is malformed.");
+  } else if (backend_ == 2) {
+    // The fixed-reference cache validates and uploads these source tiles.
+  } else {
+    PRINT_INPUT_ERROR("rpmd_ja sparse workspace received an unsupported backend.");
+  }
   if (reference.p_values.size() != static_cast<std::size_t>(p_rank_) ||
       reference.q_values.size() != static_cast<std::size_t>(q_rank_) ||
       reference.p_vectors.size() != static_cast<std::size_t>(degree_ + 1) * p_rank_ ||
@@ -392,6 +647,11 @@ void RpmdJASparseWorkspace::initialize(
   if (!std::isfinite(mass_sum) || !(mass_sum > 0.0))
     PRINT_INPUT_ERROR("rpmd_ja sparse reference has an invalid total mass.");
   inverse_mass_sum_ = 1.0 / mass_sum;
+  if (backend_ == 2) {
+    qnep_cached_.initialize(reference, masses);
+    allocated_bytes_ = qnep_cached_.allocated_bytes();
+    return;
+  }
 
   const int maximum_projected_vectors = std::max({3, 2 * p_rank_, 2 * q_rank_});
   allocated_bytes_ = 0;
@@ -419,22 +679,24 @@ void RpmdJASparseWorkspace::initialize(
     PRINT_INPUT_ERROR("rpmd_ja sparse workspace does not fit available GPU memory; dense fallback is disabled.");
   }
 
-  dynamical_rows_.resize(reference.dynamical.row_offsets.size());
-  dynamical_rows_.copy_from_host(reference.dynamical.row_offsets.data());
-  if (!reference.dynamical.columns.empty()) {
-    dynamical_columns_.resize(reference.dynamical.columns.size());
-    dynamical_columns_.copy_from_host(reference.dynamical.columns.data());
-    dynamical_values_.resize(reference.dynamical.values.size());
-    dynamical_values_.copy_from_host(reference.dynamical.values.data());
-  }
-  for (int alpha = 0; alpha < 3; ++alpha) {
-    site_rows_[alpha].resize(reference.site_transpose[alpha].row_offsets.size());
-    site_rows_[alpha].copy_from_host(reference.site_transpose[alpha].row_offsets.data());
-    if (!reference.site_transpose[alpha].columns.empty()) {
-      site_columns_[alpha].resize(reference.site_transpose[alpha].columns.size());
-      site_columns_[alpha].copy_from_host(reference.site_transpose[alpha].columns.data());
-      site_values_[alpha].resize(reference.site_transpose[alpha].values.size());
-      site_values_[alpha].copy_from_host(reference.site_transpose[alpha].values.data());
+  if (backend_ == 1) {
+    dynamical_rows_.resize(reference.dynamical.row_offsets.size());
+    dynamical_rows_.copy_from_host(reference.dynamical.row_offsets.data());
+    if (!reference.dynamical.columns.empty()) {
+      dynamical_columns_.resize(reference.dynamical.columns.size());
+      dynamical_columns_.copy_from_host(reference.dynamical.columns.data());
+      dynamical_values_.resize(reference.dynamical.values.size());
+      dynamical_values_.copy_from_host(reference.dynamical.values.data());
+    }
+    for (int alpha = 0; alpha < 3; ++alpha) {
+      site_rows_[alpha].resize(reference.site_transpose[alpha].row_offsets.size());
+      site_rows_[alpha].copy_from_host(reference.site_transpose[alpha].row_offsets.data());
+      if (!reference.site_transpose[alpha].columns.empty()) {
+        site_columns_[alpha].resize(reference.site_transpose[alpha].columns.size());
+        site_columns_[alpha].copy_from_host(reference.site_transpose[alpha].columns.data());
+        site_values_[alpha].resize(reference.site_transpose[alpha].values.size());
+        site_values_[alpha].copy_from_host(reference.site_transpose[alpha].values.data());
+      }
     }
   }
   sqrt_mass_.resize(sqrt_mass.size());
@@ -489,6 +751,11 @@ void RpmdJASparseWorkspace::compute_correction(
   double* device_result,
   int* device_error)
 {
+  if (backend_ == 2) {
+    qnep_cached_.compute_correction(
+      continuous, reference_positions, velocity, device_result, device_error);
+    return;
+  }
   const int D = dimension_;
   const int blocks = (D - 1) / threads + 1;
   build_weighted_inputs<<<blocks, threads>>>(

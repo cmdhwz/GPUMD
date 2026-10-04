@@ -118,6 +118,7 @@ private:
   GPU_Vector<double> centroid_force_per_atom_;
   GPU_Vector<double> centroid_virial_per_atom_;
   GPU_Vector<double> centroid_position_work_;
+  GPU_Vector<int> centroid_qnep_observer_error_;
   GPU_Vector<float> centroid_charge_backup_;
   GPU_Vector<float> centroid_bec_backup_;
   GPU_Vector<double> non_electro_potential_per_atom_;
@@ -158,6 +159,7 @@ private:
   std::uint64_t rpmd_ja_reference_file_fingerprint_ = 0;
   RpmdJASparseWorkspace rpmd_ja_sparse_workspace_;
   std::unique_ptr<NEP> rpmd_ja_nep_;
+  std::unique_ptr<NEP_Charge> centroid_qnep_observer_;
   GPU_Vector<double> rpmd_ja_reference_positions_;
   GPU_Vector<double> rpmd_ja_last_wrapped_centroid_;
   GPU_Vector<double> rpmd_ja_continuous_centroid_;

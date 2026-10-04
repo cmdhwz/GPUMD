@@ -164,6 +164,10 @@ public:
     const int active_number_of_beads = -1,
     const bool request_peratom_virial = false);
 
+  // Configure a dedicated observer instance for mechanical U/F/virial evaluation.
+  // This disables observer-only BEC and diagnostic work without changing qNEP forces.
+  void configure_mechanical_observer();
+
   const GPU_Vector<int>& get_NN_radial_ptr();
 
   const GPU_Vector<int>& get_NL_radial_ptr();
