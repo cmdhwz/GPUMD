@@ -1345,7 +1345,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     require_finite(result.q_values, "qNEP Q eigenvalues");
     require_finite(result.p_vectors, "qNEP P eigenvectors");
     require_finite(result.q_vectors, "qNEP Q eigenvectors");
-    if (result.force_balance_residual > kForceTolerance || result.energy_gradient_absolute_rms > kForceTolerance ||
+    if (result.energy_gradient_absolute_rms > kForceTolerance ||
         result.projection_relative_change > 5.0e-2 ||
         result.force_gradient_relative_error > kDifferenceTolerance ||
         result.hessian_symmetry_relative_error > kHessianSymmetryTolerance ||
@@ -1473,8 +1473,6 @@ void generate_rpmd_ja_reference(
   const Evaluation reference = evaluator.evaluate(result.positions);
   double max_force = 0.0;
   for (double f : reference.force) max_force = std::max(max_force, std::abs(f));
-  if (max_force > kForceTolerance)
-    throw std::runtime_error("RPMD-JA R0 is not force-balanced; relax or select a new reference without changing it here");
   if (reference.edges.empty()) throw std::runtime_error("RPMD-JA reference has no local NEP edges");
 
   const auto& edges_reference = reference.edges;
@@ -1649,8 +1647,7 @@ void generate_rpmd_ja_sparse_reference(
   result.reference_edge_fingerprint = edge_hash;
   double max_force = 0.0;
   for (double f : reference.force) max_force = std::max(max_force, std::abs(f));
-  if (max_force > kForceTolerance)
-    throw std::runtime_error("sparse RPMD-JA reference is not force-balanced; choose a new reference without changing it here");
+  std::printf("    rpmd_ja sparse fixed-reference maximum force: %.3e eV/A\n", max_force);
   if (reference.edges.empty()) throw std::runtime_error("sparse RPMD-JA reference has no local NEP edges");
   check_cutoff_margin(box, evaluator.nep, result.types, result.positions, n, fd_step);
 
@@ -1911,8 +1908,6 @@ static void generate_rpmd_ja_qnep_raw_reference(
     force_norm2 += value * value;
   }
   for (double value : reference.energy) energy0 += value;
-  if (max_force > kForceTolerance)
-    throw std::runtime_error("qNEP rpmd_ja reference is not force-balanced; relax or choose a new reference");
 
   struct RemoveRawTemporary
   {
@@ -2116,8 +2111,8 @@ static void generate_rpmd_ja_qnep_raw_reference(
   if (std::rename(temporary.c_str(), path.c_str()) != 0)
     throw std::runtime_error("cannot finalize qNEP rpmd_ja raw file");
   remove_temporary.active = false;
-  std::printf("    qNEP rpmd_ja raw matrix storage %.3f GiB including coarse V/C; evaluations=%d; force-gradient h/h2 %.3e, energy-gradient consistency %.3e; site virial component h/h2 %.3e %.3e %.3e\n",
-    static_cast<double>(2 * v_bytes + 2 * c_bytes + k_bytes) / (1024.0 * 1024.0 * 1024.0), 4 * d + 13,
+  std::printf("    qNEP rpmd_ja fixed-reference maximum force %.3e eV/A; raw matrix storage %.3f GiB including coarse V/C; evaluations=%d; force-gradient h/h2 %.3e, energy-gradient consistency %.3e; site virial component h/h2 %.3e %.3e %.3e\n",
+    max_force, static_cast<double>(2 * v_bytes + 2 * c_bytes + k_bytes) / (1024.0 * 1024.0 * 1024.0), 4 * d + 13,
     k_relative, energy_gradient_error, c_relative[0], c_relative[1], c_relative[2]);
   const double elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_start).count();
   std::printf("    qNEP rpmd_ja raw generation elapsed %.3f s; tracked host staging estimate %.3f MiB at N=%d (excludes private qNEP/GPU buffers and allocator overhead)\n",

@@ -28,8 +28,8 @@ void make_input(const std::string& raw,const std::string& kernel,const int n,con
   const std::uint32_t version=1,endian=0x01020304;const int charge=1,pppm=1;const std::uint64_t model=0x12345678,config=0x87654321;const double spacing=0.5;
   out.write(magic,8);put(out,version);put(out,endian);put(out,n);put(out,d);put(out,temperature);put(out,step);put(out,model);put(out,config);put(out,charge);put(out,pppm);put(out,spacing);out.write(layout,sizeof(layout));
   double cell[18]={1,0,0,0,1,0,0,0,1,1,0,0,0,1,0,0,0,1};out.write(reinterpret_cast<char*>(cell),sizeof(cell));out.write(reinterpret_cast<const char*>(pbc.data()),sizeof(int)*3);
-  array(out,types);array(out,mass);array(out,position);const double energy=0.0;std::vector<double> site_energy(n,0),force(d,0),virial(9*n,0);put(out,energy);array(out,site_energy);array(out,force);array(out,virial);
-  array(out,v);array(out,c);array(out,k);array(out,vc);array(out,coarse_c);double stats[18]={};stats[16]=step;stats[17]=1.0;out.write(reinterpret_cast<char*>(stats),sizeof(stats));out.close();if(!out)throw std::runtime_error("failed writing raw fixture");
+  array(out,types);array(out,mass);array(out,position);const double energy=0.0;std::vector<double> site_energy(n,0),force(d,0),virial(9*n,0);for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom)force[row]-=v[static_cast<std::size_t>(row)*n+atom];put(out,energy);array(out,site_energy);array(out,force);array(out,virial);
+  array(out,v);array(out,c);array(out,k);array(out,vc);array(out,coarse_c);double stats[18]={};for(double value:force)stats[12]=std::max(stats[12],std::abs(value));stats[16]=step;stats[17]=1.0;out.write(reinterpret_cast<char*>(stats),sizeof(stats));out.close();if(!out)throw std::runtime_error("failed writing raw fixture");
   std::ofstream kt(kernel);if(!kt)throw std::runtime_error("cannot create kernel fixture");
   kt<<"GPUMDJA_KERNEL 1\nU 100\ndegree 1\nP_rank 1\nQ_rank 1\nP_error 0\nQ_error 0\nP_S2 0\nQ_S2 0\nP_values\n1\nP_vectors\n0 1\nQ_values\n1\nQ_vectors\n0 1\nEND\n";
 }
@@ -79,7 +79,7 @@ void run_positive(const std::string& base,const int n)
 {
   const std::string stem=base+"_N"+std::to_string(n),raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja";
   make_input(raw,kernel,n,1.0e-10);prepare_rpmd_ja_qnep_reference(raw,out,kernel);const RpmdJAReference r=read_rpmd_ja_reference(out);
-  if(r.backend!=2||r.number_of_atoms!=n||r.block_dynamical.tiles.empty()||r.block_site_transpose[0].tiles.empty()||!r.stability_checked||!has_compressed_h(r))throw std::runtime_error("prepared qNEP v3 fixture failed readback or H compression");
+  if(r.backend!=2||r.number_of_atoms!=n||r.block_dynamical.tiles.empty()||r.block_site_transpose[0].tiles.empty()||!r.stability_checked||!has_compressed_h(r)||!(r.force_balance_residual>1.0e-4))throw std::runtime_error("prepared qNEP v3 fixture failed nonzero-force readback or H compression");
   if(r.block_dynamical.tiles.size()!=static_cast<std::size_t>((3*n+127)/128)*((3*n+127)/128))throw std::runtime_error("D tile grid readback incomplete");
   verify_matrices(r,1.0e-10);
   clean(raw);clean(kernel);clean(out);

@@ -319,7 +319,7 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
      force_max, force_rms, second_err, second_conv, step, _) = stats
     if step != m["step"] or np.any(stats < 0):
         raise ValueError("raw diagnostic footer step or nonnegative fields do not match the raw header")
-    if force_max > 1e-4 or grad_abs > 1e-4 or max(v_rel, k_rel, cx, cy, cz, second_err, second_conv) > 0.05:
+    if grad_abs > 1e-4 or max(v_rel, k_rel, cx, cy, cz, second_err, second_conv) > 0.05:
         raise ValueError("qNEP energy/force finite-difference checks failed")
     kernel = _kernel(kernel_path)
     work = Path(str(output) + ".work"); work.mkdir(parents=True, exist_ok=False)

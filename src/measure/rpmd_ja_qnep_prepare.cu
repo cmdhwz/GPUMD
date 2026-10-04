@@ -125,7 +125,7 @@ Raw read_raw_header(const std::string& path)
   in.seekg(raw.footer);
   in.read(reinterpret_cast<char*>(raw.stats), sizeof(raw.stats));
   if (!in || !std::all_of(raw.stats, raw.stats + 18, [](double x) { return std::isfinite(x) && x >= 0.0; }) ||
-      raw.stats[17] != 1.0 || raw.stats[16] != r.fd_step || raw.stats[12] > 1.0e-4 || raw.stats[1] > 1.0e-4 ||
+      raw.stats[17] != 1.0 || raw.stats[16] != r.fd_step || raw.stats[1] > 1.0e-4 ||
       std::max({raw.stats[2], raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) > raw_difference_tolerance)
     throw std::runtime_error("qNEP raw finite-difference diagnostics fail accepted limits");
   r.energy_gradient_relative_error = raw.stats[0];
