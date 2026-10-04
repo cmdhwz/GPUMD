@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -17,13 +18,18 @@ template <typename T> void put(std::ostream& out,const T& x){out.write(reinterpr
 template <typename T> void array(std::ostream& out,const std::vector<T>& x){if(!x.empty())out.write(reinterpret_cast<const char*>(x.data()),x.size()*sizeof(T));}
 
 void make_input(const std::string& raw,const std::string& kernel,const int n,const double stiffness,
-                const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0,const int negative_axis=-1)
+                const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0,const int negative_axis=-1,const bool multi_spectrum=false)
 {
   const int d=3*n;const double temperature=300.0,step=0.01;
   std::vector<double> mass(n),position(d,0.0),v(static_cast<std::size_t>(d)*n),vc(v.size()),c(static_cast<std::size_t>(3)*d*d),k(static_cast<std::size_t>(d)*d),coarse_c(c.size());
   std::vector<int> types(n,0),pbc(3,1);double mass_sum=0.0;
   for(int i=0;i<n;++i){mass[i]=1.0+0.07*i;mass_sum+=mass[i];}
-  for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double axis_stiffness=negative_axis<0?stiffness:(row/n==negative_axis?-1.0e-10:1.0e-10);const double dm=axis_stiffness*((row==col?1.0:0.0)-tr*tc);k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
+  std::vector<std::vector<double>> complement;
+  if(multi_spectrum){
+    const double inv_mass=1.0/std::sqrt(mass_sum);std::vector<double> translation(n);for(int i=0;i<n;++i)translation[i]=std::sqrt(mass[i])*inv_mass;
+    for(int q=0;q<n-1;++q){std::vector<double> u(n,0.0);u[q]=1.0;double dot=0.0;for(int i=0;i<n;++i)dot+=u[i]*translation[i];for(int i=0;i<n;++i)u[i]-=dot*translation[i];for(const auto& vq:complement){dot=0.0;for(int i=0;i<n;++i)dot+=u[i]*vq[i];for(int i=0;i<n;++i)u[i]-=dot*vq[i];}double norm=0.0;for(double x:u)norm+=x*x;norm=std::sqrt(norm);for(double& x:u)x/=norm;complement.push_back(u);}
+  }
+  for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){double dm=0.0;if(multi_spectrum){for(int q=0;q<n-1;++q){const double value=(row/n)*10.0+ (q==0?-1.0:static_cast<double>(q));dm+=value*complement[q][ar]*complement[q][ac];}}else{const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double axis_stiffness=negative_axis<0?stiffness:(row/n==negative_axis?-1.0e-10:1.0e-10);dm=axis_stiffness*((row==col?1.0:0.0)-tr*tc);}k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
   for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=version==2?v[ix]:0.97*v[ix];}
   for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double target=left*right;double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
   std::ofstream out(raw,std::ios::binary);if(!out)throw std::runtime_error("cannot create raw fixture");
@@ -90,15 +96,25 @@ void run_positive(const std::string& base,const int n,const std::uint32_t versio
   clean(raw);clean(kernel);clean(out);
 }
 
-void run_failure(const std::string& base,const std::string& suffix,const int negative_axis,const int minimum_minor,const double expected_rho)
+void run_failure(const std::string& base,const std::string& suffix,const int negative_axis,const int minimum_minor,const double expected_rho,const int n=3,const bool multi_spectrum=false)
 {
   const std::string stem=base+suffix,raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja",failure=out+".failure.txt";
-  make_input(raw,kernel,3,1.0e-10,1,-1.0,0.0,negative_axis);bool rejected=false;std::string reason;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){reason=e.what();rejected=reason.find("not positive definite")!=std::string::npos;}
+  make_input(raw,kernel,n,1.0e-10,1,-1.0,0.0,negative_axis,multi_spectrum);bool rejected=false;std::string reason;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){reason=e.what();rejected=reason.find("not positive definite")!=std::string::npos;}
   std::ifstream report(failure);std::string text((std::istreambuf_iterator<char>(report)),std::istreambuf_iterator<char>());
   const std::string marker="leading_minor_1based: ";const std::size_t at=text.find(marker);int minor=0;if(at!=std::string::npos)minor=std::atoi(text.c_str()+at+marker.size());
   const std::string rho_marker="rho_eV_per_A2_per_amu: ";const std::size_t rho_at=text.find(rho_marker);const double rho=rho_at==std::string::npos?0.0:std::strtod(text.c_str()+rho_at+rho_marker.size(),nullptr);
+  const std::string eigen_marker="ritz_1_eV_per_A2_per_amu: ";const std::size_t eigen_at=text.find(eigen_marker);const double eigen=eigen_at==std::string::npos?0.0:std::strtod(text.c_str()+eigen_at+eigen_marker.size(),nullptr);
+  const std::string residual_marker="ritz_1_residual_norm: ";const std::size_t residual_at=text.find(residual_marker);const double residual=residual_at==std::string::npos?1.0:std::strtod(text.c_str()+residual_at+residual_marker.size(),nullptr);
+  const std::string frequency_marker="ritz_1_imaginary_frequency_THz: ";const std::size_t frequency_at=text.find(frequency_marker);const double frequency=frequency_at==std::string::npos?0.0:std::strtod(text.c_str()+frequency_at+frequency_marker.size(),nullptr);
+  const std::string basis_marker="low_spectrum_basis_dimension: ";const std::size_t basis_at=text.find(basis_marker);const int basis=basis_at==std::string::npos?0:std::atoi(text.c_str()+basis_at+basis_marker.size());
+  const double expected_eigenvalue=multi_spectrum?-1.0:-1.0e-10;
+  const double expected_frequency=std::sqrt(std::abs(expected_eigenvalue))*1000.0/(2.0*std::acos(-1.0)*10.18051);
   std::ifstream raw_check(raw),out_check(out),sidecar_check(out+".stability");
-  if(!rejected||!raw_check.good()||out_check.good()||sidecar_check.good()||text.empty()||minor<minimum_minor||text.find("candidate_direction_status: available")==std::string::npos||std::abs(rho-expected_rho)>1.0e-20)
+  const std::string expected_method=n<=10?"exact_dense_small_projected_matrix":"bounded_full_reorthogonalization_Lanczos";
+  if(!rejected||!raw_check.good()||out_check.good()||sidecar_check.good()||text.empty()||minor<minimum_minor||text.find("candidate_direction_status: available")==std::string::npos||(std::isfinite(expected_rho)&&(!std::isfinite(rho)||std::abs(rho-expected_rho)>1.0e-20))||
+     text.find("low_spectrum_method: "+expected_method)==std::string::npos||text.find("low_spectrum_status: unavailable")!=std::string::npos||
+     !std::isfinite(eigen)||!std::isfinite(residual)||!std::isfinite(frequency)||std::abs(eigen-expected_eigenvalue)>(multi_spectrum?1.0e-8:1.0e-15)||residual>(multi_spectrum?1.01e-8:1.0e-14)||std::abs(frequency-expected_frequency)>1.0e-8||text.find("ritz_1_negative_sign_resolved: yes")==std::string::npos||
+     (multi_spectrum&&basis<=2))
     throw std::runtime_error("qNEP Cholesky failure diagnostic fixture did not preserve input or report a negative candidate direction");
   clean(raw);clean(kernel);clean(out);
 }
@@ -109,8 +125,11 @@ void run_zero(const std::string& base)
   make_input(raw,kernel,3,0.0);bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){rejected=std::string(e.what()).find("not positive definite")!=std::string::npos;}
   std::ifstream report(failure);std::string text((std::istreambuf_iterator<char>(report)),std::istreambuf_iterator<char>());
   const std::string marker="rho_eV_per_A2_per_amu: ";const std::size_t at=text.find(marker);const double rho=at==std::string::npos?1.0:std::strtod(text.c_str()+at+marker.size(),nullptr);
+  const std::string eigen_marker="ritz_1_eV_per_A2_per_amu: ";const std::size_t eigen_at=text.find(eigen_marker);const double eigen=eigen_at==std::string::npos?1.0:std::strtod(text.c_str()+eigen_at+eigen_marker.size(),nullptr);
+  const std::string residual_marker="ritz_1_residual_norm: ";const std::size_t residual_at=text.find(residual_marker);const double residual=residual_at==std::string::npos?1.0:std::strtod(text.c_str()+residual_at+residual_marker.size(),nullptr);
   std::ifstream raw_check(raw),out_check(out),sidecar_check(out+".stability");
-  if(!rejected||!raw_check.good()||out_check.good()||sidecar_check.good()||text.find("candidate_direction_status: available")==std::string::npos||std::abs(rho)>1.0e-20)
+  if(!rejected||!raw_check.good()||out_check.good()||sidecar_check.good()||text.find("candidate_direction_status: available")==std::string::npos||!std::isfinite(rho)||std::abs(rho)>1.0e-20||
+     text.find("low_spectrum_status: EXACT_DENSE_SMALL")==std::string::npos||!std::isfinite(eigen)||!std::isfinite(residual)||std::abs(eigen)>1.0e-20||residual>1.0e-20)
     throw std::runtime_error("zero qNEP projected Hessian failure diagnostic did not report a zero candidate direction");clean(raw);clean(kernel);clean(out);
 }
 
@@ -131,6 +150,6 @@ void run_raw2_rejections(const std::string& base)
 
 int main(int argc,char** argv)
 {
-  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_zero(base);run_raw2_rejections(base);return 0;}
+  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}
 }

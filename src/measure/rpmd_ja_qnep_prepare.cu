@@ -3,6 +3,7 @@
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -151,6 +153,240 @@ void solver_check(const cusolverStatus_t status, const char* where)
 { if (status != CUSOLVER_STATUS_SUCCESS) throw std::runtime_error(std::string(where) + " failed"); }
 void blas_check(const cublasStatus_t status, const char* where)
 { if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string(where) + " failed"); }
+__global__ void compact_physical(const double* a, double* p, int d, int r, int n);
+
+template <typename T> struct SpectrumBuffer
+{
+  T* pointer = nullptr;
+  SpectrumBuffer(const std::size_t count, const char* where)
+  {
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&pointer), count * sizeof(T)), where);
+  }
+  SpectrumBuffer(const SpectrumBuffer&) = delete;
+  SpectrumBuffer& operator=(const SpectrumBuffer&) = delete;
+  ~SpectrumBuffer() { if (pointer) cudaFree(pointer); }
+  T* data() { return pointer; }
+  void copy_from_host(const T* source, const std::size_t count) { cuda_check(cudaMemcpy(pointer, source, count * sizeof(T), cudaMemcpyHostToDevice), "copy spectrum buffer to device"); }
+  void copy_to_host(T* target, const std::size_t count) const { cuda_check(cudaMemcpy(target, pointer, count * sizeof(T), cudaMemcpyDeviceToHost), "copy spectrum buffer to host"); }
+};
+
+std::string low_spectrum_diagnostic(const double* a, const int d, const int r, const int n,
+                                   cusolverDnHandle_t solver, cublasHandle_t blas, const double known_negative_rho)
+{
+  constexpr int maximum_basis = 1024;
+  constexpr int wanted = 4;
+  const int limit = std::min(r, maximum_basis);
+  const std::size_t basis_bytes = static_cast<std::size_t>(d) * limit * sizeof(double);
+  std::size_t free_bytes = 0, total_bytes = 0;
+  cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "spectrum cudaMemGetInfo");
+  (void)total_bytes;
+  const std::size_t small_bytes = static_cast<std::size_t>(limit) * limit * sizeof(double) * 3 +
+    static_cast<std::size_t>(limit) * sizeof(double) * 4 + 64ULL * 1024 * 1024;
+  if (basis_bytes > free_bytes || small_bytes > free_bytes - basis_bytes)
+    throw std::runtime_error("insufficient free GPU memory for bounded low-spectrum basis");
+
+  SpectrumBuffer<double> basis(static_cast<std::size_t>(d) * limit, "allocate Lanczos basis");
+  SpectrumBuffer<double> work_vector(d, "allocate Lanczos work vector");
+  SpectrumBuffer<double> coefficients(limit, "allocate Lanczos coefficients");
+  SpectrumBuffer<double> projected(static_cast<std::size_t>(limit) * limit, "allocate projected spectrum matrix");
+  SpectrumBuffer<double> eigenvalues(limit, "allocate spectrum eigenvalues");
+  SpectrumBuffer<double> ritz(d, "allocate Ritz vector");
+  SpectrumBuffer<double> product(d, "allocate Ritz residual product");
+  SpectrumBuffer<int> info(1, "allocate spectrum solver info");
+  std::vector<double> initial(d), h(static_cast<std::size_t>(limit) * limit, 0.0);
+  for (int i = 0; i < d; ++i)
+    if (i != 0 && i != n && i != 2 * n) initial[i] = std::sin((i + 1) * 0.7548776662466927) +
+      0.25 * std::cos((i + 1) * 0.5698402909980532);
+  double norm = std::sqrt(std::inner_product(initial.begin(), initial.end(), initial.begin(), 0.0));
+  if (!(norm > 0.0) || !std::isfinite(norm)) throw std::runtime_error("invalid deterministic Lanczos start vector");
+  for (double& x : initial) x /= norm;
+  basis.copy_from_host(initial.data(), d);
+
+  int lwork = 0;
+  solver_check(cusolverDnDsyevd_bufferSize(solver, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+    limit, projected.data(), limit, eigenvalues.data(), &lwork), "query spectrum Dsyevd workspace");
+  if (lwork <= 0) throw std::runtime_error("cuSOLVER returned invalid spectrum workspace size");
+  SpectrumBuffer<double> eig_work(lwork, "allocate spectrum Dsyevd workspace");
+
+  const double one = 1.0, zero = 0.0, minus_one = -1.0;
+  const auto started = std::chrono::steady_clock::now();
+  const double lanczos_scratch_gib = static_cast<double>(basis_bytes +
+    (static_cast<std::size_t>(limit) * limit * 2 + lwork) * sizeof(double) +
+    static_cast<std::size_t>(3) * d * sizeof(double)) / (1024.0 * 1024.0 * 1024.0);
+  if (r <= 32) {
+    SpectrumBuffer<double> compact(static_cast<std::size_t>(r) * r, "allocate exact small spectrum matrix");
+    SpectrumBuffer<double> exact_values(r, "allocate exact small spectrum eigenvalues");
+    dim3 block(16, 16), grid((r + 15) / 16, (r + 15) / 16);
+    compact_physical<<<grid, block>>>(a, compact.data(), d, r, n);
+    cuda_check(cudaGetLastError(), "extract exact small spectrum matrix");
+    int exact_lwork = 0;
+    solver_check(cusolverDnDsyevd_bufferSize(solver, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+      r, compact.data(), r, exact_values.data(), &exact_lwork), "query exact small spectrum workspace");
+    if (exact_lwork <= 0) throw std::runtime_error("invalid exact small spectrum workspace size");
+    SpectrumBuffer<double> exact_work(exact_lwork, "allocate exact small spectrum workspace");
+    SpectrumBuffer<int> exact_info(1, "allocate exact small spectrum info");
+    const double scratch_gib = static_cast<double>(basis_bytes +
+      (2ULL * r * r + 3ULL * d + 3ULL * r + lwork + exact_lwork) * sizeof(double) + 2 * sizeof(int)) / (1024.0 * 1024.0 * 1024.0);
+    std::printf("    qNEP rpmd_ja low-spectrum diagnostic starting: exact dimension %d, GPU scratch estimate %.3f GiB\n", r, scratch_gib);
+    std::fflush(stdout);
+    solver_check(cusolverDnDsyevd(solver, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+      r, compact.data(), r, exact_values.data(), exact_work.data(), exact_lwork, exact_info.data()), "exact small spectrum Dsyevd");
+    cuda_check(cudaDeviceSynchronize(), "synchronize exact small spectrum");
+    int host_info = 0; exact_info.copy_to_host(&host_info, 1);
+    if (host_info != 0) throw std::runtime_error("exact small spectrum Dsyevd did not converge");
+    std::vector<double> eig(r), vectors(static_cast<std::size_t>(r) * r);
+    exact_values.copy_to_host(eig.data(), eig.size()); compact.copy_to_host(vectors.data(), vectors.size());
+    if (!std::all_of(eig.begin(), eig.end(), [](double x) { return std::isfinite(x); }))
+      throw std::runtime_error("exact small spectrum returned non-finite eigenvalues");
+    std::ostringstream out;
+    out << std::scientific << std::setprecision(17)
+        << "\nlow_spectrum_status: EXACT_DENSE_SMALL\nlow_spectrum_method: exact_dense_small_projected_matrix"
+        << "\nlow_spectrum_basis_dimension: " << r << "\nlow_spectrum_maximum_basis: " << r
+        << "\nlow_spectrum_checkpoints: 1\nlow_spectrum_breakdown: no"
+        << "\nlow_spectrum_gpu_scratch_estimate_GiB: "
+        << scratch_gib << "\nlow_spectrum_elapsed_seconds: "
+        << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << '\n'
+        << "Exact eigenvalues of the compact translation-complement matrix; reports at most four values.\n";
+    out << "known_negative_rayleigh_upper_bound: ";
+    if (std::isfinite(known_negative_rho) && known_negative_rho < 0.0) out << known_negative_rho;
+    else out << "unavailable";
+    out << '\n';
+    for (int q = 0; q < std::min(wanted, r); ++q) {
+      std::vector<double> vector(d, 0.0);
+      for (int i = 0; i < r; ++i) {
+        const int original = i + 1 + (i >= n - 1) + (i >= 2 * n - 2);
+        vector[original] = vectors[static_cast<std::size_t>(q) * r + i];
+      }
+      ritz.copy_from_host(vector.data(), d);
+      blas_check(cublasDsymv(blas, CUBLAS_FILL_MODE_LOWER, d, &one, a, d, ritz.data(), 1,
+        &zero, product.data(), 1), "exact small spectrum residual product");
+      const double neg_lambda = -eig[q];
+      blas_check(cublasDaxpy(blas, d, &neg_lambda, ritz.data(), 1, product.data(), 1), "exact small spectrum residual shift");
+      double residual = 0.0; blas_check(cublasDnrm2(blas, d, product.data(), 1, &residual), "exact small spectrum residual norm");
+      if (!std::isfinite(residual)) throw std::runtime_error("exact small spectrum residual is non-finite");
+      const double frequency = std::sqrt(std::abs(eig[q])) * 1000.0 / (2.0 * PI * TIME_UNIT_CONVERSION);
+      out << "ritz_" << q + 1 << "_eV_per_A2_per_amu: " << eig[q]
+          << "\nritz_" << q + 1 << "_residual_norm: " << residual << "\nritz_" << q + 1 << "_status: exact\n";
+      if (eig[q] < 0.0) out << "ritz_" << q + 1 << "_imaginary_frequency_THz: " << frequency
+        << "\nritz_" << q + 1 << "_negative_sign_resolved: " << (eig[q] + residual < 0.0 ? "yes" : "no_residual_comparable") << '\n';
+    }
+    return out.str();
+  }
+  std::printf("    qNEP rpmd_ja low-spectrum diagnostic starting: max basis %d, GPU scratch estimate %.3f GiB\n", limit, lanczos_scratch_gib);
+  std::fflush(stdout);
+  auto analyze = [&](const int k, std::vector<double>& report_values,
+                     std::vector<double>& report_residuals) {
+    std::vector<double> square(static_cast<std::size_t>(k) * k);
+    for (int j = 0; j < k; ++j) for (int i = 0; i < k; ++i)
+      square[static_cast<std::size_t>(j) * k + i] = h[static_cast<std::size_t>(j) * limit + i];
+    projected.copy_from_host(square.data(), square.size());
+    solver_check(cusolverDnDsyevd(solver, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+      k, projected.data(), k, eigenvalues.data(), eig_work.data(), lwork, info.data()), "spectrum Dsyevd");
+    cuda_check(cudaDeviceSynchronize(), "synchronize spectrum Dsyevd");
+    int host_info = 0;
+    info.copy_to_host(&host_info, 1);
+    if (host_info != 0) throw std::runtime_error("spectrum Dsyevd did not converge");
+    std::vector<double> eig(k), vectors(static_cast<std::size_t>(k) * k);
+    eigenvalues.copy_to_host(eig.data(), k); projected.copy_to_host(vectors.data(), vectors.size());
+      if (!std::all_of(eig.begin(), eig.end(), [](double x) { return std::isfinite(x); }))
+        throw std::runtime_error("spectrum Dsyevd returned non-finite eigenvalues");
+    report_values.assign(eig.begin(), eig.begin() + std::min(wanted, k));
+    report_residuals.clear();
+    for (int q = 0; q < static_cast<int>(report_values.size()); ++q) {
+      std::vector<double> y(k);
+      for (int i = 0; i < k; ++i) y[i] = vectors[static_cast<std::size_t>(q) * k + i];
+      coefficients.copy_from_host(y.data(), k);
+      blas_check(cublasDgemv(blas, CUBLAS_OP_N, d, k, &one, basis.data(), d,
+        coefficients.data(), 1, &zero, ritz.data(), 1), "reconstruct spectrum Ritz vector");
+      blas_check(cublasDsymv(blas, CUBLAS_FILL_MODE_LOWER, d, &one, a, d, ritz.data(), 1,
+        &zero, product.data(), 1), "spectrum residual product");
+      const double lambda = eig[q], shift = -lambda;
+      blas_check(cublasDaxpy(blas, d, &shift, ritz.data(), 1, product.data(), 1), "spectrum residual shift");
+      double residual = 0.0;
+      blas_check(cublasDnrm2(blas, d, product.data(), 1, &residual), "spectrum residual norm");
+      if (!std::isfinite(residual)) throw std::runtime_error("spectrum Ritz residual is non-finite");
+      report_residuals.push_back(residual);
+    }
+  };
+
+  std::vector<double> report_values, report_residuals;
+  int k = 1, next_check = std::min(limit, 32), checks = 0;
+  bool converged = false, breakdown = false;
+  while (k <= limit) {
+    const double* current = basis.data() + static_cast<std::size_t>(k - 1) * d;
+    blas_check(cublasDsymv(blas, CUBLAS_FILL_MODE_LOWER, d, &one, a, d, current, 1,
+      &zero, work_vector.data(), 1), "Lanczos Hessian product");
+    std::vector<double> coeff(k);
+    blas_check(cublasDgemv(blas, CUBLAS_OP_T, d, k, &one, basis.data(), d,
+      work_vector.data(), 1, &zero, coefficients.data(), 1), "Lanczos projection");
+    coefficients.copy_to_host(coeff.data(), k);
+    for (int i = 0; i < k; ++i) h[static_cast<std::size_t>(k - 1) * limit + i] = coeff[i];
+    blas_check(cublasDgemv(blas, CUBLAS_OP_N, d, k, &one, basis.data(), d,
+      coefficients.data(), 1, &zero, ritz.data(), 1), "Lanczos orthogonalization");
+    blas_check(cublasDaxpy(blas, d, &minus_one, ritz.data(), 1, work_vector.data(), 1), "Lanczos orthogonalization");
+    for (int pass = 0; pass < 2; ++pass) {
+      blas_check(cublasDgemv(blas, CUBLAS_OP_T, d, k, &one, basis.data(), d,
+        work_vector.data(), 1, &zero, coefficients.data(), 1), "Lanczos reorthogonalization");
+      std::vector<double> correction(k); coefficients.copy_to_host(correction.data(), k);
+      for (int i = 0; i < k; ++i) h[static_cast<std::size_t>(k - 1) * limit + i] += correction[i];
+      blas_check(cublasDgemv(blas, CUBLAS_OP_N, d, k, &one, basis.data(), d,
+        coefficients.data(), 1, &zero, ritz.data(), 1), "Lanczos reorthogonalization");
+      blas_check(cublasDaxpy(blas, d, &minus_one, ritz.data(), 1, work_vector.data(), 1), "Lanczos reorthogonalization");
+    }
+    for (int i = 0; i < k - 1; ++i)
+      h[static_cast<std::size_t>(i) * limit + k - 1] = h[static_cast<std::size_t>(k - 1) * limit + i];
+    double beta = 0.0;
+    blas_check(cublasDnrm2(blas, d, work_vector.data(), 1, &beta), "Lanczos residual norm");
+    if (!std::isfinite(beta)) throw std::runtime_error("Lanczos residual norm is non-finite");
+    if (k >= next_check || beta <= 64.0 * std::numeric_limits<double>::epsilon() || k == limit) {
+      analyze(k, report_values, report_residuals); ++checks;
+      converged = report_values.size() == wanted;
+      for (std::size_t q = 0; q < report_values.size(); ++q)
+        converged = converged && report_residuals[q] <= 1.0e-10 + 1.0e-8 * std::abs(report_values[q]);
+      if (std::isfinite(known_negative_rho) && known_negative_rho < 0.0)
+        converged = converged && !report_values.empty() && report_values[0] <= known_negative_rho + 1.0e-10 + 1.0e-8 * std::abs(known_negative_rho);
+      if (converged || beta <= 64.0 * std::numeric_limits<double>::epsilon() || k == limit) {
+        breakdown = beta <= 64.0 * std::numeric_limits<double>::epsilon() && k < r;
+        break;
+      }
+      next_check = std::min(limit, next_check + 64);
+    }
+    if (beta <= 64.0 * std::numeric_limits<double>::epsilon()) { breakdown = k < r; break; }
+    if (k < limit) {
+      const double inv = 1.0 / beta;
+      blas_check(cublasDscal(blas, d, &inv, work_vector.data(), 1), "normalize Lanczos vector");
+      cuda_check(cudaMemcpy(basis.data() + static_cast<std::size_t>(k) * d, work_vector.data(),
+        static_cast<std::size_t>(d) * sizeof(double), cudaMemcpyDeviceToDevice), "append Lanczos basis vector");
+      ++k;
+    } else break;
+  }
+
+  std::ostringstream out;
+  out << std::scientific << std::setprecision(17)
+      << "\nlow_spectrum_status: " << (converged ? "CONVERGED_RITZ" : "UNCONVERGED_RITZ")
+      << "\nlow_spectrum_method: bounded_full_reorthogonalization_Lanczos"
+      << "\nlow_spectrum_basis_dimension: " << k << "\nlow_spectrum_maximum_basis: " << limit
+      << "\nlow_spectrum_checkpoints: " << checks << "\nlow_spectrum_breakdown: " << (breakdown ? "yes_partial_subspace" : "no")
+      << "\nlow_spectrum_gpu_scratch_estimate_GiB: "
+      << lanczos_scratch_gib << "\nlow_spectrum_elapsed_seconds: "
+      << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+      << "\nRitz values are approximate unless the exact small projected matrix path is used; this reports at most four values and does not certify the full negative spectrum.\n";
+  out << "known_negative_rayleigh_upper_bound: ";
+  if (std::isfinite(known_negative_rho) && known_negative_rho < 0.0) out << known_negative_rho;
+  else out << "unavailable";
+  out << '\n';
+  for (std::size_t q = 0; q < report_values.size(); ++q) {
+    const double lambda = report_values[q], residual = report_residuals[q];
+    const double frequency = std::sqrt(std::abs(lambda)) * 1000.0 / (2.0 * PI * TIME_UNIT_CONVERSION);
+    out << "ritz_" << q + 1 << "_eV_per_A2_per_amu: " << lambda
+        << "\nritz_" << q + 1 << "_residual_norm: " << residual
+        << "\nritz_" << q + 1 << "_status: "
+        << (residual <= 1.0e-10 + 1.0e-8 * std::abs(lambda) ? "converged" : "UNCONVERGED") << '\n';
+    if (lambda < 0.0) out << "ritz_" << q + 1 << "_imaginary_frequency_THz: " << frequency
+      << "\nritz_" << q + 1 << "_negative_sign_resolved: " << (lambda + residual < 0.0 ? "yes" : "no_residual_comparable") << '\n';
+  }
+  return out.str();
+}
 
 __global__ void make_mass_hessian(const double* k, const double* masses, double* a, int d, int n)
 {
@@ -502,6 +738,22 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         }
         std::printf("    qNEP rpmd_ja Cholesky failure: leading minor %d/%d; original projected diagonal %.9g; failed factor slot %.9g; Hessian asymmetry %.3e; projection change %.3e; diagnostic %s\n",
           info,r,original_diagonal,failed_slot,ref.hessian_symmetry_relative_error,ref.projection_relative_change,failure_path.c_str());
+        std::fflush(stdout);
+        std::string spectrum;
+        try {
+          if (physical) { cuda_check(cudaFree(physical), "free failed Cholesky factor before spectrum diagnostic"); physical = nullptr; }
+          if (work) { cuda_check(cudaFree(work), "free POTRF workspace before spectrum diagnostic"); work = nullptr; }
+          spectrum = low_spectrum_diagnostic(a, d, r, n, solver, blas,
+            candidate_available ? candidate_rho : std::numeric_limits<double>::quiet_NaN());
+          std::ofstream append(failure_path, std::ios::out | std::ios::app);
+          if (append) { append << spectrum; append.flush(); if (!append) std::fprintf(stderr,"qNEP rpmd_ja: failed appending low-spectrum diagnostic %s\n",failure_path.c_str()); }
+          std::printf("%s", spectrum.c_str());
+        } catch (const std::exception& e) {
+          const std::string unavailable = std::string("\nlow_spectrum_status: unavailable (") + e.what() + ")\n";
+          std::ofstream append(failure_path, std::ios::out | std::ios::app);
+          if (append) { append << unavailable; append.flush(); }
+          std::printf("%s", unavailable.c_str());
+        }
         if(candidate_available)std::printf("    qNEP rpmd_ja candidate direction: rho %.9g eV/A^2/amu; candidate-direction residual %.3e\n",candidate_rho,candidate_residual);
         else std::printf("    qNEP rpmd_ja candidate direction: unavailable\n");
         std::fflush(stdout);
