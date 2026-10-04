@@ -10,6 +10,85 @@
 
 namespace rpmd_ja_reference_math
 {
+struct CurvatureEvidence
+{
+  bool direct_negative_supported = false;
+  bool matrix_derivative_mismatch = false;
+  bool energy_force_inconsistent = false;
+  bool site_jvp_gradient_mismatch = false;
+  bool short_range_consistent = false;
+  bool unresolved = true;
+  int selected_pair = -1;
+};
+
+inline CurvatureEvidence classify_curvature(
+  const double saved_lambda, const double residual, const double jvp_normalized_error,
+  const double energy_noise, const double short_energy_noise, const double mass_norm, const std::vector<double>& steps,
+  const std::vector<double>& gradient_lambda, const std::vector<double>& force_lambda,
+  const std::vector<double>& energy_lambda, const std::vector<double>& hvp_relative,
+  const std::vector<double>& short_force_lambda, const std::vector<double>& short_energy_lambda)
+{
+  const std::size_t count = steps.size();
+  if (count < 2 || gradient_lambda.size() != count || force_lambda.size() != count ||
+      energy_lambda.size() != count || hvp_relative.size() != count ||
+      short_force_lambda.size() != count || short_energy_lambda.size() != count ||
+      !(mass_norm > 0.0) || !std::isfinite(mass_norm))
+    throw std::invalid_argument("invalid RPMD-JA curvature evidence dimensions");
+  const auto relative = [](double a, double b) {
+    return std::abs(a - b) / std::max({std::abs(a), std::abs(b), 1.0e-300});
+  };
+  const double residual_limit = 1.0e-10 + 1.0e-8 * std::abs(saved_lambda);
+  const bool eigen_sign_resolved = residual <= residual_limit && saved_lambda + residual < 0.0;
+  CurvatureEvidence result;
+  result.site_jvp_gradient_mismatch = !std::isfinite(jvp_normalized_error) || jvp_normalized_error > 1.0e-4;
+  for (std::size_t i = 1; i < count; ++i) {
+    const bool gradient_stable = gradient_lambda[i - 1] * gradient_lambda[i] > 0.0 &&
+      relative(gradient_lambda[i - 1], gradient_lambda[i]) <= 0.05;
+    const bool force_stable = force_lambda[i - 1] * force_lambda[i] > 0.0 &&
+      relative(force_lambda[i - 1], force_lambda[i]) <= 0.05;
+    const bool direct = gradient_stable && force_stable &&
+      relative(gradient_lambda[i - 1], force_lambda[i - 1]) <= 0.05 &&
+      relative(gradient_lambda[i], force_lambda[i]) <= 0.05;
+    const bool energy_window = steps[i - 1] >= 0.01 && steps[i] >= 0.01 &&
+      energy_lambda[i - 1] * energy_lambda[i] > 0.0 &&
+      std::abs(energy_lambda[i - 1] * steps[i - 1] * steps[i - 1] * mass_norm) > 10.0 * energy_noise &&
+      std::abs(energy_lambda[i] * steps[i] * steps[i] * mass_norm) > 10.0 * energy_noise &&
+      relative(energy_lambda[i - 1], energy_lambda[i]) <= 0.20;
+    const bool energy_matches_direct = energy_window &&
+      relative(energy_lambda[i - 1], gradient_lambda[i - 1]) <= 0.20 &&
+      relative(energy_lambda[i - 1], force_lambda[i - 1]) <= 0.20 &&
+      relative(energy_lambda[i], gradient_lambda[i]) <= 0.20 &&
+      relative(energy_lambda[i], force_lambda[i]) <= 0.20;
+    if (direct && energy_matches_direct) {
+      const bool matrix_agrees = hvp_relative[i - 1] <= 0.05 && hvp_relative[i] <= 0.05;
+      const bool matrix_error_stable = hvp_relative[i - 1] > 0.05 && hvp_relative[i] > 0.05 &&
+        relative(hvp_relative[i - 1], hvp_relative[i]) <= 0.05;
+      if (eigen_sign_resolved && energy_lambda[i] < 0.0 && matrix_agrees && !result.site_jvp_gradient_mismatch) {
+        result.direct_negative_supported = true;
+        result.selected_pair = static_cast<int>(i - 1);
+      } else if (eigen_sign_resolved && matrix_error_stable) {
+        result.matrix_derivative_mismatch = true;
+        result.selected_pair = static_cast<int>(i - 1);
+      }
+    } else if (gradient_stable && force_stable && energy_window) {
+      result.energy_force_inconsistent = true;
+      result.selected_pair = static_cast<int>(i - 1);
+    }
+    const bool short_direct = short_force_lambda[i - 1] * short_force_lambda[i] > 0.0 &&
+      relative(short_force_lambda[i - 1], short_force_lambda[i]) <= 0.05;
+    const bool short_energy = steps[i - 1] >= 0.01 && steps[i] >= 0.01 &&
+      short_energy_lambda[i - 1] * short_energy_lambda[i] > 0.0 &&
+      std::abs(short_energy_lambda[i - 1] * steps[i - 1] * steps[i - 1] * mass_norm) > 10.0 * short_energy_noise &&
+      std::abs(short_energy_lambda[i] * steps[i] * steps[i] * mass_norm) > 10.0 * short_energy_noise &&
+      relative(short_energy_lambda[i - 1], short_energy_lambda[i]) <= 0.20 &&
+      relative(short_energy_lambda[i], short_force_lambda[i]) <= 0.20;
+    result.short_range_consistent = result.short_range_consistent || (short_direct && short_energy);
+  }
+  result.unresolved = !result.direct_negative_supported && !result.matrix_derivative_mismatch &&
+    !result.energy_force_inconsistent;
+  return result;
+}
+
 inline long double h(const long double x)
 {
   if (std::abs(x) < 1.0e-4L) {

@@ -1141,6 +1141,31 @@ std::uint64_t rpmd_ja_model_fingerprint(const std::string& path)
   return hash;
 }
 
+namespace
+{
+std::uint64_t qnep_config_fingerprint(Force& force, NEP_Charge& qnep, const double mesh_spacing)
+{
+  if (force.get_run_input().contains("dftd3"))
+    throw std::runtime_error("rpmd_ja qNEP reference does not support dftd3 corrections");
+  if (!qnep.uses_pppm()) throw std::runtime_error("rpmd_ja qNEP reference currently supports kspace_method pppm only");
+  std::uint64_t hash = rpmd_ja_model_fingerprint(force.primary_nep_model_path());
+  const auto add_bytes = [&hash](const void* data, const std::size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < size; ++i) hash = (hash ^ bytes[i]) * 1099511628211ULL;
+  };
+  const int charge_mode = qnep.get_charge_mode();
+  const int uses_pppm = qnep.uses_pppm() ? 1 : 0;
+  const float ewald_alpha = qnep.get_ewald_alpha();
+  const float realspace_cutoff = qnep.get_realspace_cutoff();
+  add_bytes(&charge_mode, sizeof(charge_mode)); add_bytes(&uses_pppm, sizeof(uses_pppm));
+  add_bytes(&mesh_spacing, sizeof(mesh_spacing)); add_bytes(&ewald_alpha, sizeof(ewald_alpha));
+  add_bytes(&realspace_cutoff, sizeof(realspace_cutoff));
+  constexpr char policy[] = "native_reference_transport";
+  add_bytes(policy, sizeof(policy));
+  return hash;
+}
+}
+
 std::uint64_t rpmd_ja_qnep_config_fingerprint(Force& force)
 {
   if (force.get_number_of_potentials() != 1 || force.primary_nep_model_path().empty())
@@ -1148,28 +1173,201 @@ std::uint64_t rpmd_ja_qnep_config_fingerprint(Force& force)
   auto* qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
   if (qnep == nullptr)
     throw std::runtime_error("rpmd_ja qNEP fingerprint does not support non-qNEP or mixed potentials");
-  if (force.get_run_input().contains("dftd3"))
-    throw std::runtime_error("rpmd_ja qNEP reference does not support dftd3 corrections");
-  if (!qnep->uses_pppm())
-    throw std::runtime_error("rpmd_ja qNEP reference currently supports kspace_method pppm only");
-  std::uint64_t hash = rpmd_ja_model_fingerprint(force.primary_nep_model_path());
-  const auto add_bytes = [&hash](const void* data, const std::size_t size) {
-    const auto* bytes = static_cast<const unsigned char*>(data);
-    for (std::size_t i = 0; i < size; ++i) hash = (hash ^ bytes[i]) * 1099511628211ULL;
+  return qnep_config_fingerprint(force, *qnep, qnep->get_pppm_mesh_spacing());
+}
+
+RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom& atom, Box& active_box, Force& force)
+{
+  return [&atom, &active_box, &force](const RpmdJAReference& raw, const std::vector<RpmdJADiagnosticMode>& modes) {
+    const auto started = std::chrono::steady_clock::now();
+    const int n = raw.number_of_atoms, d = 3 * n;
+    if (atom.number_of_atoms != n || atom.cpu_type != raw.types || atom.cpu_mass.size() != raw.masses.size())
+      throw std::runtime_error("INPUT_MISMATCH: current atom count, types, or mass count differs from raw reference");
+    for (std::size_t i = 0; i < raw.masses.size(); ++i)
+      if (atom.cpu_mass[i] != raw.masses[i]) throw std::runtime_error("INPUT_MISMATCH: current atom mass differs from raw reference");
+    if (active_box.pbc_x != raw.pbc[0] || active_box.pbc_y != raw.pbc[1] || active_box.pbc_z != raw.pbc[2])
+      throw std::runtime_error("INPUT_MISMATCH: current periodic boundary flags differ from raw reference");
+    Box observer_box = active_box;
+    for (int i = 0; i < 9; ++i) {
+      if (!std::isfinite(active_box.cpu_h[i]) || std::abs(active_box.cpu_h[i] - raw.cell[i]) > 1.0e-12 * std::max(1.0, std::abs(raw.cell[i])))
+        throw std::runtime_error("INPUT_MISMATCH: current cell differs from raw reference");
+      observer_box.cpu_h[i] = raw.cell[i];
+    }
+    observer_box.get_inverse();
+    observer_box.set_is_orthogonal();
+    if (force.get_number_of_potentials() != 1 || force.primary_nep_model_path().empty())
+      throw std::runtime_error("INPUT_MISMATCH: prepare requires the same single qNEP model used for raw generation");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
+    if (!active_qnep || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) || !active_qnep->uses_pppm())
+      throw std::runtime_error("INPUT_MISMATCH: prepare requires qNEP charge mode 1 or 2 with PPPM");
+    if (rpmd_ja_model_fingerprint(force.primary_nep_model_path()) != raw.model_fingerprint ||
+        qnep_config_fingerprint(force, *active_qnep, raw.q_mesh_spacing) != raw.mechanical_config_fingerprint)
+      throw std::runtime_error("INPUT_MISMATCH: model or qNEP configuration fingerprint differs from raw reference");
+    QEvaluator evaluator(force.primary_nep_model_path(), n, force.get_run_input(), observer_box, raw.types, raw.q_mesh_spacing);
+    const auto energy = [](const QEvaluation& e) {
+      double sum = 0.0, correction = 0.0;
+      for (double value : e.energy) { const double y = value - correction, t = sum + y; correction = (t - sum) - y; sum = t; }
+      return sum;
+    };
+    const auto rms = [](const std::vector<double>& a, const std::vector<double>& b) {
+      double sum = 0.0;
+      for (std::size_t i = 0; i < a.size(); ++i) { const double x = a[i] - b[i]; sum += x*x; }
+      return std::sqrt(sum / a.size());
+    };
+    const auto gradient_force_rms = [](const std::vector<double>& gradient, const std::vector<double>& force) {
+      double sum = 0.0;
+      for (std::size_t i = 0; i < gradient.size(); ++i) { const double x = gradient[i] + force[i]; sum += x*x; }
+      return std::sqrt(sum / gradient.size());
+    };
+    std::uint64_t force_evaluations = 0, gradient_calls = 0, jvp_calls = 0;
+    std::array<QEvaluation, 3> full0, short0;
+    std::array<std::vector<double>, 3> gradient0;
+    for (int i = 0; i < 3; ++i) {
+      full0[i] = evaluator.evaluate(raw.positions, true); ++force_evaluations;
+      gradient0[i] = evaluator.analytic_gradient(); ++gradient_calls;
+      short0[i] = evaluator.evaluate(raw.positions, false); ++force_evaluations;
+    }
+    double full_min = energy(full0[0]), full_max = full_min, short_min = energy(short0[0]), short_max = short_min;
+    for (int i = 1; i < 3; ++i) { full_min=std::min(full_min,energy(full0[i])); full_max=std::max(full_max,energy(full0[i])); short_min=std::min(short_min,energy(short0[i])); short_max=std::max(short_max,energy(short0[i])); }
+    const double full_force_repeat = std::sqrt((rms(full0[0].force,full0[2].force)*rms(full0[0].force,full0[2].force)+rms(full0[1].force,full0[2].force)*rms(full0[1].force,full0[2].force))/2.0);
+    const double short_force_repeat = std::sqrt((rms(short0[0].force,short0[2].force)*rms(short0[0].force,short0[2].force)+rms(short0[1].force,short0[2].force)*rms(short0[1].force,short0[2].force))/2.0);
+    const double gradient_repeat = std::sqrt((rms(gradient0[0],gradient0[2])*rms(gradient0[0],gradient0[2])+rms(gradient0[1],gradient0[2])*rms(gradient0[1],gradient0[2]))/2.0);
+    double ng2 = 0.0, nf2 = 0.0;
+    for (int i=0;i<d;++i) { const double e=gradient0[2][i]+full0[2].force[i]; ng2+=e*e; nf2+=full0[2].force[i]*full0[2].force[i]; }
+    std::ostringstream out;
+    out << std::scientific << std::setprecision(8)
+      << "\nmode_validation_status: complete\nR0_full_total_energy_span_eV: " << full_max-full_min
+      << "\nR0_short_total_energy_span_eV: " << short_max-short_min
+      << "\nR0_full_force_repeat_RMS_eV_per_A: " << full_force_repeat
+      << "\nR0_short_force_repeat_RMS_eV_per_A: " << short_force_repeat
+      << "\nR0_analytic_gradient_repeat_RMS_eV_per_A: " << gradient_repeat
+      << "\nR0_native_force_vs_analytic_gradient_RMS_eV_per_A: " << std::sqrt(ng2/d)
+      << "\nR0_native_force_vs_analytic_gradient_relative_RMS: " << std::sqrt(ng2/std::max(nf2,1.0e-300)) << '\n';
+    std::vector<double> base_positions = raw.positions;
+    bool any_direct_supported=false, any_energy_force_inconsistent=false, any_matrix_mismatch=false, any_grid_sensitive=false, any_jvp_mismatch=false;
+    for (std::size_t mi=0; mi<modes.size(); ++mi) {
+      const auto& mode=modes[mi];
+      if (!(mode.eigenvalue < 0.0) || mode.mass_weighted_direction.size()!=static_cast<std::size_t>(d)) continue;
+      std::vector<double> p(d); double maxp=0.0;
+      for(int i=0;i<d;++i) { p[i]=mode.mass_weighted_direction[i]/std::sqrt(raw.masses[i%n]); maxp=std::max(maxp,std::abs(p[i])); }
+      if (!(maxp>0.0)) continue;
+      double mnorm=0.0; for(int i=0;i<d;++i) { p[i]/=maxp; mnorm+=raw.masses[i%n]*p[i]*p[i]; }
+      std::vector<double> steps{raw.fd_step*0.5,raw.fd_step,raw.fd_step*2.0,0.005,0.01,0.02,0.05};
+      std::sort(steps.begin(),steps.end()); steps.erase(std::unique(steps.begin(),steps.end()),steps.end());
+      std::vector<double> lg,lf,le,ls,le_short,hvp_relative;
+      out << "mode_validation_"<<mi+1<<"_lambda_eV_per_A2_amu: "<<mode.eigenvalue
+          <<"\nmode_validation_"<<mi+1<<"_residual: "<<mode.residual<<"\nmode_validation_"<<mi+1<<"_Mnorm: "<<mnorm<<'\n';
+      const QEvaluation& e0=full0[2]; const double E0=energy(e0);
+      const std::vector<double>& g0=gradient0[2];
+      double force_projection=0.0; for(int i=0;i<d;++i) force_projection+=g0[i]*p[i];
+      out<<"mode_validation_"<<mi+1<<"_reference_gradient_projection_eV_per_A: "<<force_projection<<'\n';
+      double jvp_normalized_error=std::numeric_limits<double>::quiet_NaN();
+      {
+        const auto reset=evaluator.evaluate(raw.positions,true); ++force_evaluations;
+        const auto greset=evaluator.analytic_gradient(); ++gradient_calls;
+        const auto site=evaluator.analytic_site_jvp(p); ++jvp_calls;
+        double site_sum=std::accumulate(site.begin(),site.end(),0.0), projection=0.0;
+        for(int i=0;i<d;++i)projection+=greset[i]*p[i];
+        jvp_normalized_error=std::abs(site_sum-projection)/std::sqrt(mnorm);
+        out<<"mode_validation_"<<mi+1<<"_R0_sum_site_JVP_eV_per_A: "<<site_sum
+           <<"\nmode_validation_"<<mi+1<<"_R0_gradient_dot_p_eV_per_A: "<<projection
+           <<"\nmode_validation_"<<mi+1<<"_R0_JVP_identity_error: "<<site_sum-projection
+           <<"\nmode_validation_"<<mi+1<<"_R0_JVP_normalized_error: "<<jvp_normalized_error<<'\n';
+        (void)reset;
+      }
+      for(double h:steps) {
+        std::vector<double> plus=base_positions,minus=base_positions;
+        for(int i=0;i<d;++i){plus[i]+=h*p[i];minus[i]-=h*p[i];}
+        const auto fp=evaluator.evaluate(plus,true); ++force_evaluations; const auto gp=evaluator.analytic_gradient(); ++gradient_calls;
+        const auto fm=evaluator.evaluate(minus,true); ++force_evaluations; const auto gm=evaluator.analytic_gradient(); ++gradient_calls;
+        const auto sp=evaluator.evaluate(plus,false); ++force_evaluations;
+        const auto sm=evaluator.evaluate(minus,false); ++force_evaluations;
+        double gradient_curv=0.0,native_curv=0.0,energy_curv=(energy(fp)+energy(fm)-2.0*E0)/(h*h*mnorm),short_force_curv=0.0,short_energy_curv=(energy(sp)+energy(sm)-2.0*energy(short0[2]))/(h*h*mnorm);
+        double hvp2=0.0;
+        for(int i=0;i<d;++i){gradient_curv+=p[i]*(gp[i]-gm[i])/(2.0*h)/(mnorm);native_curv-=p[i]*(fp.force[i]-fm.force[i])/(2.0*h)/(mnorm);short_force_curv-=p[i]*(sp.force[i]-sm.force[i])/(2.0*h)/(mnorm);const double y=(gp[i]-gm[i])/(2.0*h),err=(y-mode.eigenvalue*raw.masses[i%n]*p[i])/std::sqrt(raw.masses[i%n]);hvp2+=err*err;}
+        double mismatch=std::sqrt(hvp2)/std::sqrt(mnorm);
+        lg.push_back(gradient_curv);lf.push_back(native_curv);le.push_back(energy_curv);ls.push_back(short_force_curv);
+        le_short.push_back(short_energy_curv);hvp_relative.push_back(mismatch/std::max(std::abs(mode.eigenvalue),1.0e-300));
+        out<<"mode_"<<mi+1<<"_h_A: "<<h<<" gradient_lambda: "<<gradient_curv<<" native_force_lambda: "<<native_curv
+           <<" energy_lambda: "<<energy_curv<<" short_force_lambda: "<<short_force_curv<<" short_energy_lambda: "<<short_energy_curv
+           <<" electro_related_gradient_minus_short: "<<gradient_curv-short_force_curv
+           <<" HVP_massweighted_error: "<<mismatch<<" HVP_relative_to_abs_lambda: "<<mismatch/std::max(std::abs(mode.eigenvalue),1.0e-300)<<'\n';
+      }
+      const auto spread=[](const std::vector<double>& values){const auto mm=std::minmax_element(values.begin(),values.end());return (std::abs(*mm.second-*mm.first))/std::max(std::abs(std::accumulate(values.begin(),values.end(),0.0)/values.size()),1.0e-300);};
+      out<<"mode_"<<mi+1<<"_gradient_step_spread: "<<spread(lg)<<"\nmode_"<<mi+1<<"_native_force_step_spread: "<<spread(lf)<<"\nmode_"<<mi+1<<"_energy_step_spread: "<<spread(le)<<'\n';
+      const auto evidence=rpmd_ja_reference_math::classify_curvature(mode.eigenvalue,mode.residual,
+        jvp_normalized_error,full_max-full_min,short_max-short_min,mnorm,steps,lg,lf,le,hvp_relative,ls,le_short);
+      const bool direct_supported=evidence.direct_negative_supported;
+      const bool energy_force_inconsistent=evidence.energy_force_inconsistent;
+      const bool matrix_mismatch=evidence.matrix_derivative_mismatch;
+      bool grid_sensitive=false;
+      if(evidence.selected_pair>=0)out<<"mode_"<<mi+1<<"_selected_reliable_h_interval_A: "<<steps[evidence.selected_pair]<<' '<<steps[evidence.selected_pair+1]<<'\n';
+      out<<"mode_"<<mi+1<<"_DIRECT_NEGATIVE_CURVATURE_SUPPORTED: "<<(direct_supported?"yes":"no")
+        <<"\nmode_"<<mi+1<<"_POTENTIAL_ENERGY_FORCE_INCONSISTENCY: "<<(energy_force_inconsistent?"yes":"no")
+        <<"\nmode_"<<mi+1<<"_MATRIX_DERIVATIVE_MISMATCH: "<<(matrix_mismatch?"yes":"no")
+        <<"\nmode_"<<mi+1<<"_SITE_JVP_GRADIENT_MISMATCH: "<<(evidence.site_jvp_gradient_mismatch?"yes":"no")
+        <<"\nmode_"<<mi+1<<"_SHORT_RANGE_FORCE_ENERGY_CONSISTENT: "<<(evidence.short_range_consistent?"yes":"no")
+        <<"\nmode_"<<mi+1<<"_NUMERICAL_OR_NONLINEAR_UNRESOLVED: "<<(evidence.unresolved?"yes":"no")<<'\n';
+      any_direct_supported=any_direct_supported||direct_supported;
+      any_energy_force_inconsistent=any_energy_force_inconsistent||energy_force_inconsistent;
+      any_matrix_mismatch=any_matrix_mismatch||matrix_mismatch;
+      any_jvp_mismatch=any_jvp_mismatch||evidence.site_jvp_gradient_mismatch;
+      if(mi==0) {
+        const double coarse_spacing=raw.q_mesh_spacing;
+        evaluator.qnep.set_pppm_mesh_spacing(coarse_spacing*0.5);
+        const auto fine0a=evaluator.evaluate(raw.positions,true); ++force_evaluations;
+        const auto fineg0a=evaluator.analytic_gradient(); ++gradient_calls;
+        const auto fine0b=evaluator.evaluate(raw.positions,true); ++force_evaluations;
+        const auto fineg0b=evaluator.analytic_gradient(); ++gradient_calls;
+        const auto fine0c=evaluator.evaluate(raw.positions,true); ++force_evaluations;
+        const auto fineg0c=evaluator.analytic_gradient(); ++gradient_calls;
+        double fspan=std::max({energy(fine0a),energy(fine0b),energy(fine0c)})-std::min({energy(fine0a),energy(fine0b),energy(fine0c)});
+        const double fine_r0_grad_delta=rms(fineg0c,g0)/std::max(std::sqrt(std::inner_product(g0.begin(),g0.end(),g0.begin(),0.0)/d),1.0e-300);
+        const double fine_r0_force_delta=rms(fine0c.force,full0[2].force)/std::max(std::sqrt(std::inner_product(full0[2].force.begin(),full0[2].force.end(),full0[2].force.begin(),0.0)/d),1.0e-300);
+        if(fine_r0_grad_delta>0.05||fine_r0_force_delta>0.05)grid_sensitive=true;
+        out<<"fine_mesh_spacing_A: "<<coarse_spacing*0.5<<"\nfine_mesh_R0_repeat_energy_span_eV: "<<fspan
+           <<"\nfine_mesh_R0_gradient_repeat_RMS_eV_per_A: "<<std::sqrt((rms(fineg0a,fineg0c)*rms(fineg0a,fineg0c)+rms(fineg0b,fineg0c)*rms(fineg0b,fineg0c))/2.0)
+           <<"\nfine_mesh_R0_native_force_gradient_RMS_eV_per_A: "<<gradient_force_rms(fineg0c,fine0c.force)
+           <<"\nfine_mesh_R0_gradient_relative_delta: "<<fine_r0_grad_delta
+           <<"\nfine_mesh_R0_native_force_relative_delta: "<<fine_r0_force_delta<<'\n';
+        for(double h:{0.005,0.01,0.02}) {
+          std::vector<double> plus=base_positions,minus=base_positions;for(int i=0;i<d;++i){plus[i]+=h*p[i];minus[i]-=h*p[i];}
+          const auto fp=evaluator.evaluate(plus,true);++force_evaluations;const auto gp=evaluator.analytic_gradient();++gradient_calls;
+          const auto fm=evaluator.evaluate(minus,true);++force_evaluations;const auto gm=evaluator.analytic_gradient();++gradient_calls;
+          double curv=0.0,native_curv=0.0;for(int i=0;i<d;++i){curv+=p[i]*(gp[i]-gm[i])/(2*h*mnorm);native_curv-=p[i]*(fp.force[i]-fm.force[i])/(2*h*mnorm);}
+          const double ecurv=(energy(fp)+energy(fm)-2*energy(fine0c))/(h*h*mnorm);
+          const auto coarse=std::find(steps.begin(),steps.end(),h);
+          const std::size_t cj=static_cast<std::size_t>(coarse-steps.begin());
+          const double gradient_delta=(curv-lg[cj])/std::max({std::abs(curv),std::abs(lg[cj]),1.0e-300});
+          const double force_delta=(native_curv-lf[cj])/std::max({std::abs(native_curv),std::abs(lf[cj]),1.0e-300});
+          if(std::abs(gradient_delta)>0.05||std::abs(force_delta)>0.05)grid_sensitive=true;
+          out<<"fine_mesh_h_A: "<<h<<" gradient_lambda: "<<curv<<" native_force_lambda: "<<native_curv<<" energy_lambda: "<<ecurv
+             <<" coarse_grid_gradient_relative_delta: "<<gradient_delta<<" coarse_grid_native_force_relative_delta: "<<force_delta<<'\n';
+        }
+        out<<"mode_"<<mi+1<<"_GRID_SENSITIVE: "<<(grid_sensitive?"yes":"no")<<'\n';
+        any_grid_sensitive=any_grid_sensitive||grid_sensitive;
+        evaluator.qnep.set_pppm_mesh_spacing(coarse_spacing);
+      }
+    }
+    out << "mode_validation_force_evaluations: " << force_evaluations << "\nmode_validation_gradient_calls: " << gradient_calls
+        << "\nmode_validation_site_jvp_calls: " << jvp_calls
+        << "\nmode_validation_elapsed_seconds: " << std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()
+        << "\nmode_validation_peak_private_GPU_workspace: unknown (NEP/PPPM private allocation excluded)\n";
+    out << "mode_validation_flags: ";
+    if(any_direct_supported) out << "DIRECT_NEGATIVE_CURVATURE_SUPPORTED ";
+    if(any_matrix_mismatch) out << "MATRIX_DERIVATIVE_MISMATCH ";
+    if(any_energy_force_inconsistent) out << "POTENTIAL_ENERGY_FORCE_INCONSISTENCY ";
+    if(any_grid_sensitive) out << "GRID_SENSITIVE ";
+    if(any_jvp_mismatch) out << "SITE_JVP_GRADIENT_MISMATCH ";
+    if(!any_direct_supported&&!any_matrix_mismatch&&!any_energy_force_inconsistent) out << "NUMERICAL_OR_NONLINEAR_UNRESOLVED ";
+    out << "\nConclusion: ";
+    if(any_direct_supported) out << "the evaluated reference potential has supported negative local curvature along at least one reported mode";
+    else if(any_matrix_mismatch) out << "direct curvature evidence disagrees with the saved matrix mode";
+    else if(any_energy_force_inconsistent) out << "energy and force curvature evidence remains inconsistent";
+    else out << "the available finite-difference evidence does not resolve the curvature cause";
+    out << ". This does not classify the sampled structure as wrong or establish material-wide instability.\n";
+    return out.str();
   };
-  const int charge_mode = qnep->get_charge_mode();
-  const int uses_pppm = qnep->uses_pppm() ? 1 : 0;
-  const double mesh_spacing = qnep->get_pppm_mesh_spacing();
-  const float ewald_alpha = qnep->get_ewald_alpha();
-  const float realspace_cutoff = qnep->get_realspace_cutoff();
-  add_bytes(&charge_mode, sizeof(charge_mode));
-  add_bytes(&uses_pppm, sizeof(uses_pppm));
-  add_bytes(&mesh_spacing, sizeof(mesh_spacing));
-  add_bytes(&ewald_alpha, sizeof(ewald_alpha));
-  add_bytes(&realspace_cutoff, sizeof(realspace_cutoff));
-  constexpr char policy[] = "native_reference_transport";
-  add_bytes(policy, sizeof(policy));
-  return hash;
 }
 
 RpmdJAReference read_rpmd_ja_reference(const std::string& path)
@@ -2350,7 +2548,7 @@ void generate_rpmd_ja_qnep_reference(
     throw std::runtime_error("qNEP rpmd_ja final output, sidecar, or scratch file already exists");
   generate_rpmd_ja_qnep_raw_reference(
     raw_path, temperature, fd_step, kernel_table_path, atom, box, force);
-  prepare_rpmd_ja_qnep_reference(raw_path, path, kernel_table_path);
+  prepare_rpmd_ja_qnep_reference(raw_path, path, kernel_table_path, make_rpmd_ja_qnep_mode_validator(atom, box, force));
   if (std::remove(raw_path.c_str()) != 0)
     throw std::runtime_error("qNEP rpmd_ja finalized but could not remove raw scratch file: " + raw_path);
 }

@@ -214,6 +214,38 @@ void check_cross_edges_and_duplicate_images()
       "cross-edge or repeated-image contribution/sign failed the analytic site-flow oracle");
   }
 }
+
+void check_curvature_classifier()
+{
+  using rpmd_ja_reference_math::classify_curvature;
+  const std::vector<double> h{0.005,0.01,0.02,0.05};
+  const std::vector<double> neg{-2.0,-2.001,-2.002,-2.003}, pos{2.0,2.001,2.002,2.003};
+  const std::vector<double> energy_neg{-2.0,-2.001,-2.002,-2.003}, energy_pos{2.0,2.001,2.002,2.003};
+  const std::vector<double> short_force{-1.5,-1.501,-1.502,-1.503}, short_energy{-1.5,-1.501,-1.502,-1.503};
+  const std::vector<double> good_hvp{0.001,0.001,0.001,0.001}, bad_hvp{0.2,0.2,0.2,0.2};
+  const auto supported=classify_curvature(-2.0,1.0e-12,1.0e-8,0.0,0.0,1.0,h,neg,neg,energy_neg,good_hvp,short_force,short_energy);
+  if(!supported.direct_negative_supported||supported.unresolved||!supported.short_range_consistent||supported.selected_pair<0)
+    throw std::runtime_error("stable negative curvature was not supported");
+  const auto matrix=classify_curvature(-2.0,1.0e-12,0.0,0.0,0.0,1.0,h,pos,pos,energy_pos,bad_hvp,pos,energy_pos);
+  if(!matrix.matrix_derivative_mismatch||matrix.direct_negative_supported)
+    throw std::runtime_error("stable positive direct curvature was not classified against the saved negative matrix mode");
+  const auto nonlinear=classify_curvature(-2.0,1.0e-12,0.0,1.0,1.0,1.0,h,{-2.0,1.0,-3.0,2.0},{-2.0,1.0,-3.0,2.0},{0.0,0.0,0.0,0.0},bad_hvp,short_force,{0.0,0.0,0.0,0.0});
+  if(!nonlinear.unresolved||nonlinear.matrix_derivative_mismatch||nonlinear.energy_force_inconsistent)
+    throw std::runtime_error("noise or nonlinear finite differences were assigned to a specific cause");
+  const auto nonconservative=classify_curvature(-2.0,1.0e-12,0.0,0.0,0.0,1.0,h,neg,neg,energy_pos,good_hvp,short_force,energy_pos);
+  if(!nonconservative.energy_force_inconsistent||nonconservative.direct_negative_supported)
+    throw std::runtime_error("stable nonconservative energy curvature was not identified");
+  const auto unresolved_mode=classify_curvature(-2.0,0.1,0.0,0.0,0.0,1.0,h,neg,neg,energy_neg,good_hvp,short_force,short_energy);
+  if(!unresolved_mode.unresolved||unresolved_mode.direct_negative_supported||unresolved_mode.matrix_derivative_mismatch)
+    throw std::runtime_error("unconverged negative Ritz mode was accepted");
+  const auto bad_jvp=classify_curvature(-2.0,1.0e-12,1.0e-3,0.0,0.0,1.0,h,neg,neg,energy_neg,good_hvp,short_force,short_energy);
+  if(!bad_jvp.site_jvp_gradient_mismatch)throw std::runtime_error("site-JVP identity failure was not flagged");
+  const auto mismatched_force=classify_curvature(-2.0,1.0e-12,0.0,0.0,0.0,1.0,h,neg,{-1.0,-1.001,-1.002,-1.003},energy_neg,good_hvp,short_force,short_energy);
+  if(!mismatched_force.energy_force_inconsistent)throw std::runtime_error("stable gradient/native-force disagreement was not identified");
+  const auto isolated_hvp_error=classify_curvature(-2.0,1.0e-12,0.0,0.0,0.0,1.0,h,neg,neg,energy_neg,{0.001,0.001,0.001,0.2},short_force,short_energy);
+  if(!isolated_hvp_error.direct_negative_supported||isolated_hvp_error.matrix_derivative_mismatch)
+    throw std::runtime_error("isolated large-step HVP error overrode a reliable adjacent window");
+}
 } // namespace
 
 int main()
@@ -224,5 +256,6 @@ int main()
   check_translation_complement();
   check_finite_difference_site_hessian();
   check_cross_edges_and_duplicate_images();
+  check_curvature_classifier();
   std::puts("rpmd_ja_reference_math: all CPU checks passed");
 }

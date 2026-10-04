@@ -171,7 +171,8 @@ template <typename T> struct SpectrumBuffer
 };
 
 std::string low_spectrum_diagnostic(const double* a, const int d, const int r, const int n,
-                                   cusolverDnHandle_t solver, cublasHandle_t blas, const double known_negative_rho)
+                                   cusolverDnHandle_t solver, cublasHandle_t blas, const double known_negative_rho,
+                                   std::vector<RpmdJADiagnosticMode>& modes)
 {
   constexpr int maximum_basis = 1024;
   constexpr int wanted = 4;
@@ -264,6 +265,7 @@ std::string low_spectrum_diagnostic(const double* a, const int d, const int r, c
       blas_check(cublasDaxpy(blas, d, &neg_lambda, ritz.data(), 1, product.data(), 1), "exact small spectrum residual shift");
       double residual = 0.0; blas_check(cublasDnrm2(blas, d, product.data(), 1, &residual), "exact small spectrum residual norm");
       if (!std::isfinite(residual)) throw std::runtime_error("exact small spectrum residual is non-finite");
+      modes.push_back({eig[q], residual, vector});
       const double frequency = std::sqrt(std::abs(eig[q])) * 1000.0 / (2.0 * PI * TIME_UNIT_CONVERSION);
       out << "ritz_" << q + 1 << "_eV_per_A2_per_amu: " << eig[q]
           << "\nritz_" << q + 1 << "_residual_norm: " << residual << "\nritz_" << q + 1 << "_status: exact\n";
@@ -274,8 +276,10 @@ std::string low_spectrum_diagnostic(const double* a, const int d, const int r, c
   }
   std::printf("    qNEP rpmd_ja low-spectrum diagnostic starting: max basis %d, GPU scratch estimate %.3f GiB\n", limit, lanczos_scratch_gib);
   std::fflush(stdout);
+  std::vector<std::vector<double>> report_directions;
   auto analyze = [&](const int k, std::vector<double>& report_values,
-                     std::vector<double>& report_residuals) {
+                     std::vector<double>& report_residuals,
+                     std::vector<std::vector<double>>& directions) {
     std::vector<double> square(static_cast<std::size_t>(k) * k);
     for (int j = 0; j < k; ++j) for (int i = 0; i < k; ++i)
       square[static_cast<std::size_t>(j) * k + i] = h[static_cast<std::size_t>(j) * limit + i];
@@ -292,6 +296,7 @@ std::string low_spectrum_diagnostic(const double* a, const int d, const int r, c
         throw std::runtime_error("spectrum Dsyevd returned non-finite eigenvalues");
     report_values.assign(eig.begin(), eig.begin() + std::min(wanted, k));
     report_residuals.clear();
+    directions.clear();
     for (int q = 0; q < static_cast<int>(report_values.size()); ++q) {
       std::vector<double> y(k);
       for (int i = 0; i < k; ++i) y[i] = vectors[static_cast<std::size_t>(q) * k + i];
@@ -306,6 +311,9 @@ std::string low_spectrum_diagnostic(const double* a, const int d, const int r, c
       blas_check(cublasDnrm2(blas, d, product.data(), 1, &residual), "spectrum residual norm");
       if (!std::isfinite(residual)) throw std::runtime_error("spectrum Ritz residual is non-finite");
       report_residuals.push_back(residual);
+      std::vector<double> direction(d);
+      ritz.copy_to_host(direction.data(), direction.size());
+      directions.push_back(std::move(direction));
     }
   };
 
@@ -339,7 +347,7 @@ std::string low_spectrum_diagnostic(const double* a, const int d, const int r, c
     blas_check(cublasDnrm2(blas, d, work_vector.data(), 1, &beta), "Lanczos residual norm");
     if (!std::isfinite(beta)) throw std::runtime_error("Lanczos residual norm is non-finite");
     if (k >= next_check || beta <= 64.0 * std::numeric_limits<double>::epsilon() || k == limit) {
-      analyze(k, report_values, report_residuals); ++checks;
+      analyze(k, report_values, report_residuals, report_directions); ++checks;
       converged = report_values.size() == wanted;
       for (std::size_t q = 0; q < report_values.size(); ++q)
         converged = converged && report_residuals[q] <= 1.0e-10 + 1.0e-8 * std::abs(report_values[q]);
@@ -384,6 +392,7 @@ std::string low_spectrum_diagnostic(const double* a, const int d, const int r, c
         << (residual <= 1.0e-10 + 1.0e-8 * std::abs(lambda) ? "converged" : "UNCONVERGED") << '\n';
     if (lambda < 0.0) out << "ritz_" << q + 1 << "_imaginary_frequency_THz: " << frequency
       << "\nritz_" << q + 1 << "_negative_sign_resolved: " << (lambda + residual < 0.0 ? "yes" : "no_residual_comparable") << '\n';
+    modes.push_back({lambda, residual, report_directions[q]});
   }
   return out.str();
 }
@@ -562,10 +571,11 @@ void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* inpu
 #endif
 } // namespace
 
-void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::string& output_path, const std::string& kernel_table_path)
+void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::string& output_path, const std::string& kernel_table_path,
+                                    const RpmdJAModeValidator& mode_validator)
 {
 #ifdef USE_HIP
-  (void)raw_path; (void)output_path; (void)kernel_table_path;
+  (void)raw_path; (void)output_path; (void)kernel_table_path; (void)mode_validator;
   throw std::runtime_error("qNEP rpmd_ja reference preparation currently requires CUDA cuSOLVER");
 #else
   if (raw_path.empty() || output_path.empty() || kernel_table_path.empty()) throw std::invalid_argument("qNEP rpmd_ja prepare requires raw, output, and kernel-table paths");
@@ -740,16 +750,78 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
           info,r,original_diagonal,failed_slot,ref.hessian_symmetry_relative_error,ref.projection_relative_change,failure_path.c_str());
         std::fflush(stdout);
         std::string spectrum;
+        std::vector<RpmdJADiagnosticMode> modes;
         try {
           if (physical) { cuda_check(cudaFree(physical), "free failed Cholesky factor before spectrum diagnostic"); physical = nullptr; }
           if (work) { cuda_check(cudaFree(work), "free POTRF workspace before spectrum diagnostic"); work = nullptr; }
           spectrum = low_spectrum_diagnostic(a, d, r, n, solver, blas,
-            candidate_available ? candidate_rho : std::numeric_limits<double>::quiet_NaN());
+            candidate_available ? candidate_rho : std::numeric_limits<double>::quiet_NaN(), modes);
+          {
+            std::ofstream append(failure_path, std::ios::out | std::ios::app);
+            if (append) { append << spectrum; append.flush(); if (!append) std::fprintf(stderr,"qNEP rpmd_ja: failed appending low-spectrum diagnostic %s\n",failure_path.c_str()); }
+            std::printf("%s", spectrum.c_str());
+          }
+          std::vector<double> mode_norms, translation_residuals;
+          for (auto& mode : modes) {
+            for (int axis = 2; axis >= 0; --axis) {
+              const auto& hvec = householder[axis];
+              const double dot = std::inner_product(hvec.begin(), hvec.end(), mode.mass_weighted_direction.begin(), 0.0);
+              for (int i = 0; i < d; ++i) mode.mass_weighted_direction[i] -= 2.0 * dot * hvec[i];
+            }
+            const double norm = std::sqrt(std::inner_product(mode.mass_weighted_direction.begin(), mode.mass_weighted_direction.end(), mode.mass_weighted_direction.begin(), 0.0));
+            if (!(norm > 0.0) || !std::isfinite(norm)) throw std::runtime_error("invalid unrotated Ritz mode norm");
+            mode_norms.push_back(norm);
+            for (double& x : mode.mass_weighted_direction) x /= norm;
+            double overlap2 = 0.0;
+            double mass_sum = std::accumulate(ref.masses.begin(), ref.masses.end(), 0.0);
+            for (int axis = 0; axis < 3; ++axis) {
+              double overlap = 0.0;
+              for (int i = 0; i < n; ++i) overlap += std::sqrt(ref.masses[i] / mass_sum) * mode.mass_weighted_direction[axis * n + i];
+              overlap2 += overlap * overlap;
+            }
+            translation_residuals.push_back(std::sqrt(overlap2));
+            if (translation_residuals.back() > 1.0e-8) throw std::runtime_error("unrotated Ritz mode has excessive translation overlap");
+          }
           std::ofstream append(failure_path, std::ios::out | std::ios::app);
-          if (append) { append << spectrum; append.flush(); if (!append) std::fprintf(stderr,"qNEP rpmd_ja: failed appending low-spectrum diagnostic %s\n",failure_path.c_str()); }
-          std::printf("%s", spectrum.c_str());
+          if (append) {
+            for (std::size_t q = 0; q < modes.size(); ++q) {
+              const auto& mode = modes[q];
+              append << "mode_" << q + 1 << "_vector_basis: original_cartesian_mass_weighted\n"
+                << "mode_" << q + 1 << "_mass_weighted_norm_before_normalization: " << mode_norms[q] << '\n'
+                << "mode_" << q + 1 << "_mass_weighted_norm_after_normalization: 1\n"
+                << "mode_" << q + 1 << "_translation_overlap_norm: " << translation_residuals[q] << '\n';
+              std::vector<int> dominant(d); std::iota(dominant.begin(), dominant.end(), 0);
+              std::partial_sort(dominant.begin(), dominant.begin() + std::min(8, d), dominant.end(), [&](int x, int y) { return std::abs(mode.mass_weighted_direction[x]) > std::abs(mode.mass_weighted_direction[y]); });
+              double fourth = 0.0, square = 0.0;
+              for (double x : mode.mass_weighted_direction) { square += x*x; fourth += x*x*x*x; }
+              append << "mode_" << q + 1 << "_IPR: " << fourth / (square*square) << "\nmode_" << q + 1 << "_dominant_components:\n";
+              for (int j = 0; j < std::min(8, d); ++j) { const int ix=dominant[j]; append << "  atom " << ix%n << " type " << ref.types[ix%n] << " axis " << "xyz"[ix/n] << " E " << mode.mass_weighted_direction[ix] << '\n'; }
+            }
+            append.flush(); if (!append) std::fprintf(stderr,"qNEP rpmd_ja: failed appending low-spectrum diagnostic %s\n",failure_path.c_str());
+          }
+          for (const auto& mode : modes) std::printf("    qNEP rpmd_ja mode: lambda %.9g, residual %.3e, original Cartesian mass-weighted norm %.12g\n", mode.eigenvalue, mode.residual, std::sqrt(std::inner_product(mode.mass_weighted_direction.begin(),mode.mass_weighted_direction.end(),mode.mass_weighted_direction.begin(),0.0)));
+          if (mode_validator && !modes.empty()) {
+            try {
+              const std::string validation = mode_validator(ref, modes);
+              std::ofstream append(failure_path, std::ios::out | std::ios::app);
+              if (append) { append << validation; append.flush(); }
+              std::printf("%s", validation.c_str());
+            } catch (const std::exception& e) {
+              const std::string message = e.what();
+              const std::string unavailable = std::string("\nmode_validation: unavailable (") + message + ")\nmode_validation_flags: " +
+                (message.find("INPUT_MISMATCH:") == 0 ? "INPUT_MISMATCH\n" : "NUMERICAL_OR_NONLINEAR_UNRESOLVED\n");
+              std::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
+              std::printf("%s", unavailable.c_str());
+            }
+          } else if (!mode_validator) {
+            const std::string unavailable = "\nmode_validation: unavailable (no qNEP evaluator supplied)\n";
+            std::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
+            std::printf("%s", unavailable.c_str());
+          }
         } catch (const std::exception& e) {
-          const std::string unavailable = std::string("\nlow_spectrum_status: unavailable (") + e.what() + ")\n";
+          const std::string unavailable = spectrum.empty() ?
+            std::string("\nlow_spectrum_status: unavailable (") + e.what() + ")\n" :
+            std::string("\nmode_validation: unavailable (mode vector conversion/evaluator error: ") + e.what() + ")\n";
           std::ofstream append(failure_path, std::ios::out | std::ios::app);
           if (append) { append << unavailable; append.flush(); }
           std::printf("%s", unavailable.c_str());

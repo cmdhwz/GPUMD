@@ -99,7 +99,20 @@ void run_positive(const std::string& base,const int n,const std::uint32_t versio
 void run_failure(const std::string& base,const std::string& suffix,const int negative_axis,const int minimum_minor,const double expected_rho,const int n=3,const bool multi_spectrum=false)
 {
   const std::string stem=base+suffix,raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja",failure=out+".failure.txt";
-  make_input(raw,kernel,n,1.0e-10,1,-1.0,0.0,negative_axis,multi_spectrum);bool rejected=false;std::string reason;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){reason=e.what();rejected=reason.find("not positive definite")!=std::string::npos;}
+  make_input(raw,kernel,n,1.0e-10,1,-1.0,0.0,negative_axis,multi_spectrum);bool rejected=false,validated=false;std::string reason;
+  const RpmdJAModeValidator validator=[&](const RpmdJAReference&,const std::vector<RpmdJADiagnosticMode>& modes){
+    if(modes.empty())throw std::runtime_error("mode validator received no Ritz vectors");
+    for(const auto& mode:modes){
+      if(mode.mass_weighted_direction.size()!=static_cast<std::size_t>(3*n)||!std::isfinite(mode.eigenvalue)||!std::isfinite(mode.residual))throw std::runtime_error("Ritz mode vector metadata invalid");
+      double norm2=0.0;for(double x:mode.mass_weighted_direction)norm2+=x*x;
+      if(std::abs(norm2-1.0)>1.0e-10)throw std::runtime_error("Ritz vector is not unit mass-weighted norm");
+      for(int axis=0;axis<3;++axis){double overlap=0.0;for(int i=0;i<n;++i)overlap+=std::sqrt((1.0+0.07*i)/(n+0.07*n*(n-1)/2.0))*mode.mass_weighted_direction[axis*n+i];if(std::abs(overlap)>1.0e-8)throw std::runtime_error("Ritz vector retained translation component");}
+    }
+    const int expected_axis=multi_spectrum?0:negative_axis;
+    if(expected_axis>=0){double outside=0.0;for(int axis=0;axis<3;++axis)if(axis!=expected_axis)for(int i=0;i<n;++i)outside+=modes[0].mass_weighted_direction[axis*n+i]*modes[0].mass_weighted_direction[axis*n+i];if(outside>1.0e-12)throw std::runtime_error("Ritz vector was not restored to original Cartesian axes");}
+    validated=true;return std::string("\nmode_validation_test: actual unit translation-free original-basis Ritz vectors received\n");
+  };
+  try{prepare_rpmd_ja_qnep_reference(raw,out,kernel,validator);}catch(const std::exception& e){reason=e.what();rejected=reason.find("not positive definite")!=std::string::npos;}
   std::ifstream report(failure);std::string text((std::istreambuf_iterator<char>(report)),std::istreambuf_iterator<char>());
   const std::string marker="leading_minor_1based: ";const std::size_t at=text.find(marker);int minor=0;if(at!=std::string::npos)minor=std::atoi(text.c_str()+at+marker.size());
   const std::string rho_marker="rho_eV_per_A2_per_amu: ";const std::size_t rho_at=text.find(rho_marker);const double rho=rho_at==std::string::npos?0.0:std::strtod(text.c_str()+rho_at+rho_marker.size(),nullptr);
@@ -111,7 +124,7 @@ void run_failure(const std::string& base,const std::string& suffix,const int neg
   const double expected_frequency=std::sqrt(std::abs(expected_eigenvalue))*1000.0/(2.0*std::acos(-1.0)*10.18051);
   std::ifstream raw_check(raw),out_check(out),sidecar_check(out+".stability");
   const std::string expected_method=n<=10?"exact_dense_small_projected_matrix":"bounded_full_reorthogonalization_Lanczos";
-  if(!rejected||!raw_check.good()||out_check.good()||sidecar_check.good()||text.empty()||minor<minimum_minor||text.find("candidate_direction_status: available")==std::string::npos||(std::isfinite(expected_rho)&&(!std::isfinite(rho)||std::abs(rho-expected_rho)>1.0e-20))||
+  if(!rejected||!validated||text.find("mode_validation_test: actual unit translation-free original-basis Ritz vectors received")==std::string::npos||!raw_check.good()||out_check.good()||sidecar_check.good()||text.empty()||minor<minimum_minor||text.find("candidate_direction_status: available")==std::string::npos||(std::isfinite(expected_rho)&&(!std::isfinite(rho)||std::abs(rho-expected_rho)>1.0e-20))||
      text.find("low_spectrum_method: "+expected_method)==std::string::npos||text.find("low_spectrum_status: unavailable")!=std::string::npos||
      !std::isfinite(eigen)||!std::isfinite(residual)||!std::isfinite(frequency)||std::abs(eigen-expected_eigenvalue)>(multi_spectrum?1.0e-8:1.0e-15)||residual>(multi_spectrum?1.01e-8:1.0e-14)||std::abs(frequency-expected_frequency)>1.0e-8||text.find("ritz_1_negative_sign_resolved: yes")==std::string::npos||
      (multi_spectrum&&basis<=2))

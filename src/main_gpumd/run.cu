@@ -687,7 +687,7 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     if (tokens.size() != 5) PRINT_INPUT_ERROR("rpmd_ja prepare requires <rawfile> <outfile> <kernel_table>.");
     if (integrate.has_ensemble() || global_time != 0.0)
       PRINT_INPUT_ERROR("rpmd_ja prepare must appear before any ensemble or run.");
-    prepare_rpmd_ja_qnep_reference(tokens[2], tokens[3], tokens[4]);
+    prepare_rpmd_ja_qnep_reference(tokens[2], tokens[3], tokens[4], make_rpmd_ja_qnep_mode_validator(atom, box, force));
     return;
   }
   if (tokens[1] == "diagnose") {
