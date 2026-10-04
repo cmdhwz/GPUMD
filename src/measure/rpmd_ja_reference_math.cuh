@@ -10,6 +10,17 @@
 
 namespace rpmd_ja_reference_math
 {
+inline double central_difference_2nd(const double plus, const double minus, const double h)
+{
+  return (plus - minus) / (2.0 * h);
+}
+
+inline double central_difference_4th(
+  const double plus_h, const double minus_h, const double plus_2h, const double minus_2h, const double h)
+{
+  return (8.0 * (plus_h - minus_h) - (plus_2h - minus_2h)) / (12.0 * h);
+}
+
 struct CurvatureEvidence
 {
   bool direct_negative_supported = false;

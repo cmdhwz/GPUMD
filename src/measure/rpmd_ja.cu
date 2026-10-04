@@ -231,7 +231,8 @@ void HAC::pre_run_rpmd_ja_(
         std::fabs(rpmd_ja_reference_.q_mesh_spacing - active_mesh_spacing) >
           1.0e-12 * std::max(1.0, std::fabs(active_mesh_spacing)) ||
         (rpmd_ja_reference_.mechanical_policy != "native_reference_transport" &&
-         rpmd_ja_reference_.mechanical_policy != "native_reference_transport;analytic_site_gradient_v1") ||
+         rpmd_ja_reference_.mechanical_policy != "native_reference_transport;analytic_site_gradient_v1" &&
+         rpmd_ja_reference_.mechanical_policy != "native_reference_transport;analytic_site_gradient_fd4_v1") ||
         rpmd_ja_reference_.mechanical_config_fingerprint !=
           rpmd_ja_qnep_config_fingerprint(force)) {
       PRINT_INPUT_ERROR(

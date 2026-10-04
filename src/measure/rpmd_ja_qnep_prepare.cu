@@ -68,7 +68,7 @@ Raw read_raw_header(const std::string& path)
   read_value(in, raw.reference.fd_step); read_value(in, raw.reference.model_fingerprint);
   read_value(in, raw.config); read_value(in, raw.charge); read_value(in, uses_pppm);
   read_value(in, raw.spacing); in.read(layout, sizeof(layout));
-  if (!in || std::memcmp(magic, raw_magic, sizeof(magic)) || (version != 1 && version != 2) || endian != 0x01020304 ||
+  if (!in || std::memcmp(magic, raw_magic, sizeof(magic)) || (version != 1 && version != 2 && version != 3) || endian != 0x01020304 ||
       n <= 1 || n > std::numeric_limits<int>::max()/3 || d != 3 * n ||
       !(raw.reference.temperature > 0.0) || !std::isfinite(raw.reference.temperature) ||
       !(raw.reference.fd_step > 0.0) || !std::isfinite(raw.reference.fd_step) ||
@@ -80,7 +80,8 @@ Raw read_raw_header(const std::string& path)
   r.backend = 2; r.number_of_atoms = n; r.q_charge_mode = raw.charge; r.q_uses_pppm = true;
   r.q_mesh_spacing = raw.spacing;
   r.mechanical_policy = version == 1 ? "native_reference_transport" :
-    "native_reference_transport;analytic_site_gradient_v1";
+    (version == 2 ? "native_reference_transport;analytic_site_gradient_v1" :
+      "native_reference_transport;analytic_site_gradient_fd4_v1");
   r.mechanical_config_fingerprint = raw.config;
   double raw_cell[18];
   in.read(reinterpret_cast<char*>(raw_cell), sizeof(raw_cell));
@@ -133,8 +134,10 @@ Raw read_raw_header(const std::string& path)
     std::max({raw.stats[2], raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
   const bool analytic_checks = raw.stats[17] == 2.0 && raw.stats[1] <= 1.0e-4 && raw.stats[3] <= 1.0e-4 &&
     std::max({raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
+  const bool analytic_fd4_checks = raw.stats[17] == 3.0 && raw.stats[1] <= 1.0e-4 && raw.stats[3] <= 1.0e-4 &&
+    std::max({raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
   if (!in || !finite_stats || raw.stats[16] != r.fd_step ||
-      (version == 1 ? !legacy_checks : !analytic_checks))
+      (version == 1 ? !legacy_checks : (version == 2 ? !analytic_checks : !analytic_fd4_checks)))
     throw std::runtime_error("qNEP raw finite-difference diagnostics fail accepted limits");
   r.energy_gradient_relative_error = raw.stats[0];
   r.force_gradient_relative_error = raw.stats[4];
@@ -584,6 +587,10 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   if (ex1.good() || ex2.good() || ex3.good() || ex4.good() || ex5.good()) throw std::runtime_error("qNEP rpmd_ja output, temporary, or failure diagnostic already exists: " + (ex5.good()?failure_path:output_path));
   Raw raw = read_raw_header(raw_path);
   RpmdJAReference& ref = raw.reference;
+  std::printf("    qNEP rpmd_ja raw derivative policy: %s; fd_step %.9g A; %s\n",
+    ref.mechanical_policy.c_str(), ref.fd_step,
+    ref.mechanical_policy == "native_reference_transport;analytic_site_gradient_fd4_v1" ?
+      "D4 +/-h,+/-2h with D2(h)-D2(2h) checks" : "legacy stencil checks");
   load_rpmd_ja_kernel_table(kernel_table_path, ref);
   const int n = ref.number_of_atoms, d = raw.dimension, r = d - 3;
   const std::size_t dd = static_cast<std::size_t>(d) * d;
@@ -702,15 +709,20 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         cuda_check(cudaMemcpy(&original_diagonal,a+static_cast<std::size_t>(original)*d+original,sizeof(double),cudaMemcpyDeviceToHost),"read failed Hessian diagonal");
         cuda_check(cudaMemcpy(&failed_slot,physical+static_cast<std::size_t>(j)*r+j,sizeof(double),cudaMemcpyDeviceToHost),"read failed Cholesky slot");
         bool candidate_available=false;double candidate_rho=std::numeric_limits<double>::quiet_NaN(),candidate_residual=std::numeric_limits<double>::quiet_NaN();
+        const bool fd4_policy = ref.mechanical_policy == "native_reference_transport;analytic_site_gradient_fd4_v1";
         std::ofstream report(failure_path,std::ios::out|std::ios::trunc);
         if(report){
           report<<std::setprecision(17)<<"qNEP rpmd_ja Cholesky failure\nraw_path: "<<raw_path<<"\nleading_minor_1based: "<<info<<"\ndimension: "<<r
             <<"\noriginal_projected_diagonal: "<<original_diagonal<<"\ncholesky_failure_slot_value: "<<failed_slot
             <<"\nhessian_symmetry_relative_error: "<<ref.hessian_symmetry_relative_error<<"\nprojection_relative_change: "<<ref.projection_relative_change<<"\nraw_stats:";
           for(int i=0;i<18;++i)report<<"\n  ["<<i<<"] "<<raw.stats[i];
-          report<<"\nraw_h_h2_stats: K_h_h2_relative="<<raw.stats[4]<<" Cx_h_h2_relative="<<raw.stats[6]
-            <<" Cy_h_h2_relative="<<raw.stats[7]<<" Cz_h_h2_relative="<<raw.stats[8]
-            <<" projected_D_h_h2_consistency="<<raw.stats[14]<<" projected_D_h_h2_convergence="<<raw.stats[15];
+          report<<"\nraw_stencil_policy: "<<ref.mechanical_policy
+            <<"\nraw_fd_stats: K_"<<(fd4_policy?"D2h_D22h":"h_h2")<<"_relative="<<raw.stats[4]
+            <<" Cx_"<<(fd4_policy?"D2h_D22h":"h_h2")<<"_relative="<<raw.stats[6]
+            <<" Cy_"<<(fd4_policy?"D2h_D22h":"h_h2")<<"_relative="<<raw.stats[7]
+            <<" Cz_"<<(fd4_policy?"D2h_D22h":"h_h2")<<"_relative="<<raw.stats[8]
+            <<" projected_D_consistency="<<raw.stats[14]<<" projected_D_"<<(fd4_policy?"D2h_D22h":"h_h2")
+            <<"_step_consistency="<<raw.stats[15];
           try{
             std::vector<double> candidate(static_cast<std::size_t>(r),0.0);
             if(j>0){
@@ -925,7 +937,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     if(std::rename(tmp_path.c_str(),output_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP v3 output");created=output_path;
     cuda_check(cudaFree(dv),"free probe vector");dv=nullptr;cuda_check(cudaFree(dw),"free probe result");dw=nullptr;cuda_check(cudaFree(dinfo),"free solver info");dinfo=nullptr;
     std::ofstream side(side_tmp,std::ios::trunc);if(!side)throw std::runtime_error("cannot create qNEP stability sidecar");
-    side<<"GPUMDJA_QNEP_STABILITY 2\nfingerprint "<<std::hex<<rpmd_ja_model_fingerprint(output_path)<<"\nconfig_fingerprint "<<raw.config<<std::dec<<"\natoms "<<n<<"\ncertificate cholesky_relative_bound\nminimum_cholesky_pivot "<<std::setprecision(17)<<min_pivot<<"\nrelative_operator_bound 0\ntranslation_residual "<<translation_residual<<"\nreconstruction_residual "<<reconstruction<<"\nsoftmode_relative_error 0\n";side.flush();if(!side)throw std::runtime_error("failed writing qNEP stability sidecar");side.close();if(std::rename(side_tmp.c_str(),sidecar_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP stability sidecar");created.clear();
+    side<<"GPUMDJA_QNEP_STABILITY 3\nfingerprint "<<std::hex<<rpmd_ja_model_fingerprint(output_path)<<"\nconfig_fingerprint "<<raw.config<<std::dec<<"\natoms "<<n<<"\nderivative_policy "<<ref.mechanical_policy<<"\ncertificate cholesky_relative_bound\nminimum_cholesky_pivot "<<std::setprecision(17)<<min_pivot<<"\nrelative_operator_bound 0\ntranslation_residual "<<translation_residual<<"\nreconstruction_residual "<<reconstruction<<"\nsoftmode_relative_error 0\n";side.flush();if(!side)throw std::runtime_error("failed writing qNEP stability sidecar");side.close();if(std::rename(side_tmp.c_str(),sidecar_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP stability sidecar");created.clear();
   } catch (...) {
     if(dk)cudaFree(dk);if(a)cudaFree(a);if(physical)cudaFree(physical);if(dv)cudaFree(dv);if(dw)cudaFree(dw);if(dm)cudaFree(dm);if(dinfo)cudaFree(dinfo);if(work)cudaFree(work);if(query_matrix)cudaFree(query_matrix);if(pivot_device)cudaFree(pivot_device);if(tilebuf)cudaFree(tilebuf);if(sm)cudaFree(sm);if(su)cudaFree(su);if(svt)cudaFree(svt);if(sw)cudaFree(sw);if(dleft)cudaFree(dleft);if(dright)cudaFree(dright);if(dproduct)cudaFree(dproduct);if(dsingular)cudaFree(dsingular);if(sinfo)cudaFree(sinfo);if(blas)cublasDestroy(blas);if(solver)cusolverDnDestroy(solver);
     std::remove(tmp_path.c_str());std::remove(side_tmp.c_str());if(created==output_path)std::remove(output_path.c_str());throw;

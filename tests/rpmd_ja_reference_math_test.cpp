@@ -246,6 +246,47 @@ void check_curvature_classifier()
   if(!isolated_hvp_error.direct_negative_supported||isolated_hvp_error.matrix_derivative_mismatch)
     throw std::runtime_error("isolated large-step HVP error overrode a reliable adjacent window");
 }
+
+void check_fourth_order_finite_difference()
+{
+  using rpmd_ja_reference_math::central_difference_2nd;
+  using rpmd_ja_reference_math::central_difference_4th;
+  const double x = 0.7, step = 0.2, epsilon = 1.0e-7;
+  const auto cubic = [](const double value) { return 2.0 - 3.0 * value + 0.5 * value * value * value; };
+  const double cubic_d4 = central_difference_4th(cubic(x + step), cubic(x - step), cubic(x + 2.0 * step), cubic(x - 2.0 * step), step);
+  check_close(cubic_d4, -3.0 + 1.5 * x * x, 2.0e-14, "fourth-order stencil missed exact cubic derivative");
+  const auto quintic = [](const double value) { return 1.0 + 2.0 * value - 0.3 * value * value * value * value * value; };
+  const double quintic_d4 = central_difference_4th(quintic(x + step), quintic(x - step), quintic(x + 2.0 * step), quintic(x - 2.0 * step), step);
+  const double exact_quintic = 2.0 - 1.5 * x * x * x * x;
+  check_close(quintic_d4, exact_quintic + 1.2 * std::pow(step, 4), 2.0e-14,
+    "fourth-order stencil quintic truncation did not scale as h^4");
+  const double noisy = central_difference_4th(
+    quintic(x + step) + epsilon, quintic(x - step) - epsilon,
+    quintic(x + 2.0 * step) - epsilon, quintic(x - 2.0 * step) + epsilon, step);
+  check_close(noisy - quintic_d4, 1.5 * epsilon / step, 1.0e-14,
+    "fourth-order stencil noise amplification bound changed");
+  const double d2 = central_difference_2nd(cubic(x + step), cubic(x - step), step);
+  check(std::abs(d2 - cubic_d4) > 1.0e-4, "D2 and D4 comparison lost its independent truncation check");
+  const double d2_twice = central_difference_2nd(cubic(x + 2.0 * step), cubic(x - 2.0 * step), 2.0 * step);
+  check_close(3.0 * (cubic_d4 - d2), d2 - d2_twice, 2.0e-14,
+    "D4 to D2(h) difference no longer reports the independent D2(h)-D2(2h) step change");
+
+  constexpr int n = 3;
+  double x_input[n] = {0.2, -0.4, 0.9};
+  double matrix[ n * n ];
+  for (int row = 0; row < n; ++row) {
+    for (int column = 0; column < n; ++column) {
+      const double a = 1.0 + 3.0 * row - 0.4 * column;
+      const double b = 0.2 + 0.1 * row + 0.03 * column;
+      const auto output = [&](const double delta) { const double value = x_input[column] + delta; return a * value + b * value * value * value; };
+      matrix[row * n + column] = central_difference_4th(
+        output(step), output(-step), output(2.0 * step), output(-2.0 * step), step);
+      check_close(matrix[row * n + column], a + 3.0 * b * x_input[column] * x_input[column], 2.0e-14,
+        "fourth-order stencil changed row-major output/input indexing");
+    }
+  }
+  check(std::abs(matrix[1] - matrix[n]) > 0.1, "finite-difference layout oracle became symmetric");
+}
 } // namespace
 
 int main()
@@ -257,5 +298,6 @@ int main()
   check_finite_difference_site_hessian();
   check_cross_edges_and_duplicate_images();
   check_curvature_classifier();
+  check_fourth_order_finite_difference();
   std::puts("rpmd_ja_reference_math: all CPU checks passed");
 }

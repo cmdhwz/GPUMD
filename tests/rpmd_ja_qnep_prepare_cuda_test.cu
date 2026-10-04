@@ -30,7 +30,7 @@ void make_input(const std::string& raw,const std::string& kernel,const int n,con
     for(int q=0;q<n-1;++q){std::vector<double> u(n,0.0);u[q]=1.0;double dot=0.0;for(int i=0;i<n;++i)dot+=u[i]*translation[i];for(int i=0;i<n;++i)u[i]-=dot*translation[i];for(const auto& vq:complement){dot=0.0;for(int i=0;i<n;++i)dot+=u[i]*vq[i];for(int i=0;i<n;++i)u[i]-=dot*vq[i];}double norm=0.0;for(double x:u)norm+=x*x;norm=std::sqrt(norm);for(double& x:u)x/=norm;complement.push_back(u);}
   }
   for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){double dm=0.0;if(multi_spectrum){for(int q=0;q<n-1;++q){const double value=(row/n)*10.0+ (q==0?-1.0:static_cast<double>(q));dm+=value*complement[q][ar]*complement[q][ac];}}else{const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double axis_stiffness=negative_axis<0?stiffness:(row/n==negative_axis?-1.0e-10:1.0e-10);dm=axis_stiffness*((row==col?1.0:0.0)-tr*tc);}k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
-  for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=version==2?v[ix]:0.97*v[ix];}
+  for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=version>=2?v[ix]:0.97*v[ix];}
   for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double target=left*right;double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
   std::ofstream out(raw,std::ios::binary);if(!out)throw std::runtime_error("cannot create raw fixture");
   const char magic[8]={'G','P','J','Q','R','A','W','\0'};const char layout[]="xyz_soa;derivative_input_rows_output_columns";
@@ -89,7 +89,8 @@ void run_positive(const std::string& base,const int n,const std::uint32_t versio
   const std::string stem=base+"_N"+std::to_string(n),raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja";
   make_input(raw,kernel,n,1.0e-10,version);prepare_rpmd_ja_qnep_reference(raw,out,kernel);const RpmdJAReference r=read_rpmd_ja_reference(out);
   if(r.backend!=2||r.number_of_atoms!=n||r.block_dynamical.tiles.empty()||r.block_site_transpose[0].tiles.empty()||!r.stability_checked||!has_compressed_h(r)||!(r.force_balance_residual>1.0e-4))throw std::runtime_error("prepared qNEP v3 fixture failed nonzero-force readback or H compression");
-  const std::string expected_policy=version==1?"native_reference_transport":"native_reference_transport;analytic_site_gradient_v1";
+  const std::string expected_policy=version==1?"native_reference_transport":
+    (version==2?"native_reference_transport;analytic_site_gradient_v1":"native_reference_transport;analytic_site_gradient_fd4_v1");
   if(r.mechanical_policy!=expected_policy)throw std::runtime_error("prepared qNEP v3 fixture lost its derivative-source marker");
   if(r.block_dynamical.tiles.size()!=static_cast<std::size_t>((3*n+127)/128)*((3*n+127)/128))throw std::runtime_error("D tile grid readback incomplete");
   verify_matrices(r,1.0e-10);
@@ -149,20 +150,23 @@ void run_zero(const std::string& base)
 void run_raw2_rejections(const std::string& base)
 {
   const std::string kernel=base+"_raw2.kernel";
-  const auto rejected=[&](const std::string& suffix,const double marker,const double identity) {
+  const auto rejected=[&](const std::string& suffix,const double marker,const double identity,const std::uint32_t version) {
     const std::string raw=base+suffix+".qraw",out=base+suffix+".ja";
-    make_input(raw,kernel,3,1.0e-10,2,marker,identity);
+    make_input(raw,kernel,3,1.0e-10,version,marker,identity);
     bool failed=false;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception&){failed=true;}
     if(!failed)throw std::runtime_error("qNEP raw v2 accepted an invalid stats marker or site-JVP identity");
     clean(raw);clean(kernel);clean(out);
   };
-  rejected("_bad_marker",1.0,0.0);
-  rejected("_bad_identity",2.0,1.1e-4);
+  rejected("_bad_marker_v2",1.0,0.0,2);
+  rejected("_bad_identity_v2",2.0,1.1e-4,2);
+  rejected("_bad_marker_v1",2.0,0.0,1);
+  rejected("_bad_marker_v3",2.0,0.0,3);
+  rejected("_bad_identity_v3",3.0,1.1e-4,3);
 }
 } // namespace
 
 int main(int argc,char** argv)
 {
-  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);return 0;}
+  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}
 }
