@@ -2480,7 +2480,8 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       if (!(h > 0.0) || !std::isfinite(h))
         throw std::invalid_argument("scaled qNEP rpmd_ja diagnosis fd_step is not finite");
       double grad_diff2 = 0.0, grad_reference2 = 0.0;
-  double k_diff2 = 0.0, k_fine2 = 0.0;
+      double v_diff2 = 0.0, v_fine2 = 0.0;
+      double k_diff2 = 0.0, k_fine2 = 0.0;
       double c_diff2[3] = {}, c_fine2[3] = {};
       for (int coordinate : coordinates) {
         std::vector<double> plus = positions, minus = positions, plus_half = positions, minus_half = positions;
