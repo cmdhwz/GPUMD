@@ -566,7 +566,7 @@ struct QEvaluator
     host_packed_batch_results.resize(static_cast<std::size_t>(4) * 13 * n);
   }
 
-  QEvaluation evaluate(const std::vector<double>& xyz)
+  QEvaluation evaluate(const std::vector<double>& xyz, const bool include_electro = true)
   {
     std::vector<double> wrapped = xyz;
     wrap_positions_once(box, wrapped, n);
@@ -574,8 +574,12 @@ struct QEvaluator
     potential.fill(0.0);
     force.fill(0.0);
     virial.fill(0.0);
-    qnep.request_peratom_virial_for_next_force();
-    qnep.compute(box, type, position, potential, force, virial);
+    if (include_electro) {
+      qnep.request_peratom_virial_for_next_force();
+      qnep.compute(box, type, position, potential, force, virial);
+    } else {
+      qnep.compute_non_electro(box, type, position, potential, force, virial);
+    }
     QEvaluation result;
     result.energy.resize(static_cast<std::size_t>(n));
     result.force.resize(static_cast<std::size_t>(3) * n);
@@ -2369,4 +2373,147 @@ void generate_rpmd_ja_qnep_reference(
   prepare_rpmd_ja_qnep_reference(raw_path, path, kernel_table_path);
   if (std::remove(raw_path.c_str()) != 0)
     throw std::runtime_error("qNEP rpmd_ja finalized but could not remove raw scratch file: " + raw_path);
+}
+
+void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box, Force& force)
+{
+  if (!(fd_step > 0.0) || !std::isfinite(fd_step))
+    throw std::invalid_argument("qNEP rpmd_ja diagnose requires a positive finite fd_step");
+  if (atom.number_of_atoms <= 1 || atom.cpu_type.size() != static_cast<std::size_t>(atom.number_of_atoms))
+    throw std::runtime_error("qNEP rpmd_ja diagnose requires initialized atom count and types");
+  if (force.get_number_of_potentials() != 1 || force.primary_nep_model_path().empty())
+    throw std::runtime_error("qNEP rpmd_ja diagnose requires exactly one qNEP potential");
+  auto* active_qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
+  if (active_qnep == nullptr || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+      !active_qnep->uses_pppm())
+    throw std::runtime_error("qNEP rpmd_ja diagnose supports charge mode 1 or 2 with PPPM only");
+  if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+    throw std::runtime_error("qNEP rpmd_ja diagnose requires a fully periodic fixed cell");
+
+  const int n = atom.number_of_atoms, d = reference_dimension(atom.number_of_atoms);
+  std::vector<double> positions(static_cast<std::size_t>(d));
+  atom.position_per_atom.copy_to_host(positions.data());
+  require_finite(positions, "qNEP diagnosis positions");
+  for (double value : box.cpu_h)
+    if (!std::isfinite(value)) throw std::runtime_error("qNEP rpmd_ja diagnose requires a finite cell");
+  std::map<int, int> first_atom_by_type;
+  for (int i = 0; i < n; ++i) first_atom_by_type.emplace(atom.cpu_type[i], i);
+  std::vector<int> coordinates;
+  for (const auto& entry : first_atom_by_type)
+    for (int alpha = 0; alpha < 3; ++alpha) coordinates.push_back(alpha * n + entry.second);
+
+  const auto start = std::chrono::steady_clock::now();
+  Box observer_box = box;
+  observer_box.get_inverse();
+  observer_box.set_is_orthogonal();
+  QEvaluator evaluator(force.primary_nep_model_path(), n, force.get_run_input(), observer_box,
+    atom.cpu_type, active_qnep->get_pppm_mesh_spacing());
+  std::printf("rpmd_ja diagnose only: qNEP charge mode %d, PPPM mesh spacing %.6g A, N=%d, sampled coordinates=%zu; no reference will be produced.\n",
+    active_qnep->get_charge_mode(), active_qnep->get_pppm_mesh_spacing(), n, coordinates.size());
+  std::printf("  full mode includes q(R), charge chain, real-space and PPPM terms; short-range/no-electrostatic mode uses the qNEP ANN and short-range corrections via compute_non_electro.\n");
+  std::printf("  Differences between their errors are electrostatic-related and do not isolate PPPM alone.\n");
+  std::printf("  Existing generation thresholds (display only; not applied to these sampled diagnostics): gradient abs RMS %.3g, h/h2 relative %.3g.\n",
+    kForceTolerance, kDifferenceTolerance);
+
+  const auto total_energy = [](const QEvaluation& evaluation) {
+    double total = 0.0;
+    for (double value : evaluation.energy) total += value;
+    return total;
+  };
+  const int virial_component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}};
+  std::uint64_t evaluations = 0;
+  const bool include_electro[2] = {true, false};
+  const char* mode_name[2] = {"full-qNEP", "short-range/no-electrostatic"};
+  for (int mode = 0; mode < 2; ++mode) {
+    std::array<QEvaluation, 3> repeated_reference;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      repeated_reference[repeat] = evaluator.evaluate(positions, include_electro[mode]);
+      ++evaluations;
+    }
+    const QEvaluation& reference = repeated_reference[0];
+    const double energy0 = total_energy(reference);
+    double energy_min = energy0, energy_max = energy0;
+    double force_repeat_diff2 = 0.0, virial_repeat_diff2 = 0.0;
+    for (int repeat = 1; repeat < 3; ++repeat) {
+      const double energy = total_energy(repeated_reference[repeat]);
+      energy_min = std::min(energy_min, energy);
+      energy_max = std::max(energy_max, energy);
+      for (std::size_t i = 0; i < reference.force.size(); ++i) {
+        const double delta = repeated_reference[repeat].force[i] - reference.force[i];
+        force_repeat_diff2 += delta * delta;
+      }
+      for (std::size_t i = 0; i < reference.virial.size(); ++i) {
+        const double delta = repeated_reference[repeat].virial[i] - reference.virial[i];
+        virial_repeat_diff2 += delta * delta;
+      }
+    }
+    const double force_repeat_rms = std::sqrt(force_repeat_diff2 / (2.0 * reference.force.size()));
+    const double virial_repeat_rms = std::sqrt(virial_repeat_diff2 / (2.0 * reference.virial.size()));
+    std::printf("  %s R0 repeatability: total-E span %.6g eV, force-difference RMS %.6g eV/A, 9W-difference RMS %.6g eV\n",
+      mode_name[mode], energy_max - energy_min, force_repeat_rms, virial_repeat_rms);
+
+    for (int step_scale : {1, 10, 100}) {
+      const double h = fd_step * step_scale;
+      if (!(h > 0.0) || !std::isfinite(h))
+        throw std::invalid_argument("scaled qNEP rpmd_ja diagnosis fd_step is not finite");
+      double grad_diff2 = 0.0, grad_reference2 = 0.0;
+      double v_diff2 = 0.0, v_fine2 = 0.0, k_diff2 = 0.0, k_fine2 = 0.0;
+      double c_diff2[3] = {}, c_fine2[3] = {};
+      for (int coordinate : coordinates) {
+        std::vector<double> plus = positions, minus = positions, plus_half = positions, minus_half = positions;
+        plus[coordinate] += h; minus[coordinate] -= h;
+        plus_half[coordinate] += 0.5 * h; minus_half[coordinate] -= 0.5 * h;
+        const QEvaluation ep = evaluator.evaluate(plus, include_electro[mode]);
+        const QEvaluation em = evaluator.evaluate(minus, include_electro[mode]);
+        const QEvaluation ehp = evaluator.evaluate(plus_half, include_electro[mode]);
+        const QEvaluation ehm = evaluator.evaluate(minus_half, include_electro[mode]);
+        evaluations += 4;
+        double energy_gradient = 0.0;
+        for (int i = 0; i < n; ++i) {
+          const double fine = (ehp.energy[i] - ehm.energy[i]) / h;
+          const double coarse = (ep.energy[i] - em.energy[i]) / (2.0 * h);
+          energy_gradient += fine;
+          const double difference = fine - coarse;
+          v_diff2 += difference * difference;
+          v_fine2 += fine * fine;
+        }
+        const double gradient_error = energy_gradient + reference.force[coordinate];
+        grad_diff2 += gradient_error * gradient_error;
+        grad_reference2 += reference.force[coordinate] * reference.force[coordinate];
+        for (int r = 0; r < d; ++r) {
+          const double fine_k = -(ehp.force[r] - ehm.force[r]) / h;
+          const double coarse_k = -(ep.force[r] - em.force[r]) / (2.0 * h);
+          const double k_difference = fine_k - coarse_k;
+          k_diff2 += k_difference * k_difference;
+          k_fine2 += fine_k * fine_k;
+          for (int alpha = 0; alpha < 3; ++alpha) {
+            const int offset = virial_component[alpha][r / n] * n + r % n;
+            const double fine_c = (ehp.virial[offset] - ehm.virial[offset]) / h;
+            const double coarse_c = (ep.virial[offset] - em.virial[offset]) / (2.0 * h);
+            const double c_difference = fine_c - coarse_c;
+            c_diff2[alpha] += c_difference * c_difference;
+            c_fine2[alpha] += fine_c * fine_c;
+          }
+        }
+      }
+      const double grad_abs = std::sqrt(grad_diff2 / coordinates.size());
+      const double grad_rel = std::sqrt(grad_diff2 / std::max(grad_reference2, 1.0e-300));
+      const double v_relative = std::sqrt(v_diff2 / std::max(v_fine2, 1.0e-300));
+      const double k_relative = std::sqrt(k_diff2 / std::max(k_fine2, 1.0e-300));
+      const double c_relative[3] = {
+        std::sqrt(c_diff2[0] / std::max(c_fine2[0], 1.0e-300)),
+        std::sqrt(c_diff2[1] / std::max(c_fine2[1], 1.0e-300)),
+        std::sqrt(c_diff2[2] / std::max(c_fine2[2], 1.0e-300))};
+      if (!std::isfinite(grad_abs) || !std::isfinite(grad_rel) || !std::isfinite(v_relative) ||
+          !std::isfinite(k_relative) || !std::isfinite(c_relative[0]) ||
+          !std::isfinite(c_relative[1]) || !std::isfinite(c_relative[2]))
+        throw std::runtime_error("qNEP rpmd_ja diagnose produced a non-finite finite-difference diagnostic");
+      std::printf("  %s h=%.6g A: energy-gradient abs RMS %.6g, relative to sampled |F0| norm %.6g; V %.6g K %.6g Cxyz %.6g %.6g %.6g\n",
+        mode_name[mode], h, grad_abs, grad_rel, v_relative, k_relative,
+        c_relative[0], c_relative[1], c_relative[2]);
+    }
+  }
+  const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  std::printf("rpmd_ja diagnose completed: evaluations=%llu, elapsed %.3f s; diagnostics only, no reference produced.\n",
+    static_cast<unsigned long long>(evaluations), elapsed);
 }

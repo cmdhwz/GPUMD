@@ -680,7 +680,24 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, generate <file> <T> <fd_step>, or generate_sparse <file> <T> <fd_step> <kernel_table>.");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, generate <file> <T> <fd_step>, or generate_sparse <file> <T> <fd_step> <kernel_table>.");
+  }
+  if (tokens[1] == "diagnose") {
+    if (tokens.size() != 3) PRINT_INPUT_ERROR("rpmd_ja diagnose requires exactly one fd_step.");
+    if (integrate.has_ensemble() || global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose must appear after potential and before any ensemble or run.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+      PRINT_INPUT_ERROR("rpmd_ja diagnose requires exactly one qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    if (active_qnep == nullptr || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+        !active_qnep->uses_pppm())
+      PRINT_INPUT_ERROR("rpmd_ja diagnose supports qNEP charge mode 1 or 2 with PPPM only.");
+    char* end = nullptr;
+    const double fd_step = std::strtod(tokens[2].c_str(), &end);
+    if (end == tokens[2].c_str() || *end != '\0' || !std::isfinite(fd_step) || fd_step <= 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose fd_step must be a positive finite number.");
+    diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force);
+    return;
   }
   if (tokens[1] == "generate" || tokens[1] == "generate_sparse") {
     const bool sparse = tokens[1] == "generate_sparse";
