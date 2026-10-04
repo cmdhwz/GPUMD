@@ -486,12 +486,37 @@ struct QEvaluation
   std::vector<double> energy, force, virial;
 };
 
+__global__ void pack_qnep_batch_results(
+  const int n,
+  const double* const* energy,
+  const double* const* force,
+  const double* const* virial,
+  double* packed)
+{
+  const int lane_size = 13 * n;
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane = index / lane_size;
+  const int component = index % lane_size;
+  if (lane >= 4) return;
+  double value;
+  if (component < n) value = energy[lane][component];
+  else if (component < 4 * n) value = force[lane][component - n];
+  else value = virial[lane][component - 4 * n];
+  packed[index] = value;
+}
+
 struct QEvaluator
 {
   NEP_Charge qnep;
   Box& box;
   GPU_Vector<int> type;
   GPU_Vector<double> position, potential, force, virial;
+  std::array<GPU_Vector<double>, 4> batch_position, batch_potential, batch_force, batch_virial;
+  std::array<std::vector<double>, 4> wrapped_batch_positions;
+  std::vector<GPU_Vector<double>*> batch_positions, batch_potentials, batch_forces, batch_virials;
+  GPU_Vector<double*> batch_potential_ptrs, batch_force_ptrs, batch_virial_ptrs;
+  GPU_Vector<double> packed_batch_results;
+  std::vector<double> host_packed_batch_results;
   const int n;
 
   QEvaluator(
@@ -509,8 +534,36 @@ struct QEvaluator
     qnep.configure_mechanical_observer();
     qnep.set_neighbor_rebuild(true);
     qnep.set_neighbor_diagnostics(false);
+    qnep.set_pimd_batch_profile(false);
     if (qnep.uses_pppm()) qnep.set_pppm_mesh_spacing(pppm_spacing);
     type.copy_from_host(types.data());
+    std::array<double*, 4> potential_ptrs{}, force_ptrs{}, virial_ptrs{};
+    batch_positions.reserve(4);
+    batch_potentials.reserve(4);
+    batch_forces.reserve(4);
+    batch_virials.reserve(4);
+    for (int lane = 0; lane < 4; ++lane) {
+      wrapped_batch_positions[lane].resize(static_cast<std::size_t>(3) * n);
+      batch_position[lane].resize(3 * n);
+      batch_potential[lane].resize(n);
+      batch_force[lane].resize(3 * n);
+      batch_virial[lane].resize(9 * n);
+      batch_positions.push_back(&batch_position[lane]);
+      batch_potentials.push_back(&batch_potential[lane]);
+      batch_forces.push_back(&batch_force[lane]);
+      batch_virials.push_back(&batch_virial[lane]);
+      potential_ptrs[lane] = batch_potential[lane].data();
+      force_ptrs[lane] = batch_force[lane].data();
+      virial_ptrs[lane] = batch_virial[lane].data();
+    }
+    batch_potential_ptrs.resize(4);
+    batch_force_ptrs.resize(4);
+    batch_virial_ptrs.resize(4);
+    batch_potential_ptrs.copy_from_host(potential_ptrs.data());
+    batch_force_ptrs.copy_from_host(force_ptrs.data());
+    batch_virial_ptrs.copy_from_host(virial_ptrs.data());
+    packed_batch_results.resize(4 * 13 * n);
+    host_packed_batch_results.resize(static_cast<std::size_t>(4) * 13 * n);
   }
 
   QEvaluation evaluate(const std::vector<double>& xyz)
@@ -533,6 +586,35 @@ struct QEvaluator
     require_finite(result.energy, "qNEP site energies");
     require_finite(result.force, "qNEP forces");
     require_finite(result.virial, "qNEP per-atom virials");
+    return result;
+  }
+
+  std::array<QEvaluation, 4> evaluate_batch(const std::array<std::vector<double>, 4>& xyz)
+  {
+    for (int lane = 0; lane < 4; ++lane) {
+      wrapped_batch_positions[lane] = xyz[lane];
+      wrap_positions_once(box, wrapped_batch_positions[lane], n);
+      batch_position[lane].copy_from_host(wrapped_batch_positions[lane].data());
+    }
+    if (!qnep.compute_pimd_batch(box, type, batch_positions, batch_potentials, batch_forces, batch_virials, 4, true)) {
+      (void)gpuGetLastError();
+      throw std::runtime_error("qNEP rpmd_ja private four-lane batch evaluation failed");
+    }
+    pack_qnep_batch_results<<<(4 * 13 * n - 1) / 256 + 1, 256>>>(
+      n, batch_potential_ptrs.data(), batch_force_ptrs.data(), batch_virial_ptrs.data(), packed_batch_results.data());
+    GPU_CHECK_KERNEL
+    packed_batch_results.copy_to_host(host_packed_batch_results.data());
+    std::array<QEvaluation, 4> result;
+    const std::size_t lane_size = static_cast<std::size_t>(13) * n;
+    for (int lane = 0; lane < 4; ++lane) {
+      const double* lane_data = host_packed_batch_results.data() + static_cast<std::size_t>(lane) * lane_size;
+      result[lane].energy.assign(lane_data, lane_data + n);
+      result[lane].force.assign(lane_data + n, lane_data + 4 * n);
+      result[lane].virial.assign(lane_data + 4 * n, lane_data + 13 * n);
+      require_finite(result[lane].energy, "qNEP batch site energies");
+      require_finite(result[lane].force, "qNEP batch forces");
+      require_finite(result[lane].virial, "qNEP batch per-atom virials");
+    }
     return result;
   }
 };
@@ -1902,6 +1984,127 @@ static void generate_rpmd_ja_qnep_raw_reference(
   observer_box.set_is_orthogonal();
   QEvaluator evaluator(model, n, force.get_run_input(), observer_box, atom.cpu_type, active_qnep->get_pppm_mesh_spacing());
   const QEvaluation reference = evaluator.evaluate(positions);
+  const auto relative_difference = [](const std::vector<double>& a, const std::vector<double>& b) {
+    double difference2 = 0.0, scale2 = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double difference = a[i] - b[i];
+      difference2 += difference * difference;
+      scale2 += b[i] * b[i];
+    }
+    return std::sqrt(difference2 / std::max(scale2, 1.0e-300));
+  };
+  std::vector<int> precheck_coordinates;
+  std::vector<int> representative_types;
+  for (int atom_index = 0; atom_index < n; ++atom_index) {
+    if (std::find(representative_types.begin(), representative_types.end(), atom.cpu_type[atom_index]) ==
+        representative_types.end()) {
+      representative_types.push_back(atom.cpu_type[atom_index]);
+      for (int alpha = 0; alpha < 3; ++alpha) precheck_coordinates.push_back(alpha * n + atom_index);
+    }
+  }
+  double precheck_v_diff2 = 0.0, precheck_v_fine2 = 0.0;
+  double precheck_k_diff2 = 0.0, precheck_k_fine2 = 0.0;
+  double precheck_c_diff2[3] = {}, precheck_c_fine2[3] = {};
+  double precheck_energy_gradient_diff2 = 0.0;
+  for (std::size_t sample = 0; sample < precheck_coordinates.size(); ++sample) {
+    const int coordinate = precheck_coordinates[sample];
+    std::array<std::vector<double>, 4> probe_positions = {positions, positions, positions, positions};
+    probe_positions[0][coordinate] += fd_step;
+    probe_positions[1][coordinate] -= fd_step;
+    probe_positions[2][coordinate] += 0.5 * fd_step;
+    probe_positions[3][coordinate] -= 0.5 * fd_step;
+    const auto batch = evaluator.evaluate_batch(probe_positions);
+    std::array<QEvaluation, 4> serial_stencil;
+    if (sample == 0) {
+      for (int lane = 0; lane < 4; ++lane) {
+        serial_stencil[lane] = evaluator.evaluate(probe_positions[lane]);
+      }
+      std::vector<double> batch_v(n), serial_v(n), batch_k(d), serial_k(d);
+      std::array<std::vector<double>, 3> batch_c, serial_c;
+      for (int flux = 0; flux < 3; ++flux) { batch_c[flux].resize(d); serial_c[flux].resize(d); }
+      for (int i = 0; i < n; ++i) {
+        batch_v[i] = (batch[2].energy[i] - batch[3].energy[i]) / fd_step;
+        serial_v[i] = (serial_stencil[2].energy[i] - serial_stencil[3].energy[i]) / fd_step;
+      }
+      for (int r = 0; r < d; ++r) {
+        batch_k[r] = -(batch[2].force[r] - batch[3].force[r]) / fd_step;
+        serial_k[r] = -(serial_stencil[2].force[r] - serial_stencil[3].force[r]) / fd_step;
+        for (int flux = 0; flux < 3; ++flux) {
+          const int component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}};
+          const int offset = component[flux][r / n] * n + r % n;
+          batch_c[flux][r] = (batch[2].virial[offset] - batch[3].virial[offset]) / fd_step;
+          serial_c[flux][r] = (serial_stencil[2].virial[offset] - serial_stencil[3].virial[offset]) / fd_step;
+        }
+      }
+      const double v_error = relative_difference(batch_v, serial_v);
+      const double k_error = relative_difference(batch_k, serial_k);
+      const double c_error[3] = {relative_difference(batch_c[0], serial_c[0]),
+        relative_difference(batch_c[1], serial_c[1]), relative_difference(batch_c[2], serial_c[2])};
+      if (!std::isfinite(v_error) || !std::isfinite(k_error) || !std::isfinite(c_error[0]) ||
+          !std::isfinite(c_error[1]) || !std::isfinite(c_error[2]) ||
+          v_error > kDifferenceTolerance || k_error > kDifferenceTolerance ||
+          c_error[0] > kDifferenceTolerance || c_error[1] > kDifferenceTolerance ||
+          c_error[2] > kDifferenceTolerance) {
+        std::fprintf(stderr,
+          "qNEP rpmd_ja serial/batch fine-difference check failed at fd_step=%.9g: V %.6g, K %.6g, Cxyz %.6g %.6g %.6g (relative limits %.3g)\n",
+          fd_step, v_error, k_error, c_error[0], c_error[1], c_error[2], kDifferenceTolerance);
+        throw std::runtime_error("qNEP rpmd_ja batch finite differences disagree with serial evaluation");
+      }
+    }
+    double gradient = 0.0;
+    for (int i = 0; i < n; ++i) {
+      const double fine = (batch[2].energy[i] - batch[3].energy[i]) / fd_step;
+      const double coarse = (batch[0].energy[i] - batch[1].energy[i]) / (2.0 * fd_step);
+      gradient += fine;
+      const double difference = fine - coarse;
+      precheck_v_diff2 += difference * difference;
+      precheck_v_fine2 += fine * fine;
+    }
+    const double gradient_error = gradient + reference.force[coordinate];
+    precheck_energy_gradient_diff2 += gradient_error * gradient_error;
+    for (int r = 0; r < d; ++r) {
+      const double fine = -(batch[2].force[r] - batch[3].force[r]) / fd_step;
+      const double coarse = -(batch[0].force[r] - batch[1].force[r]) / (2.0 * fd_step);
+      const double difference = fine - coarse;
+      precheck_k_diff2 += difference * difference;
+      precheck_k_fine2 += fine * fine;
+      for (int flux = 0; flux < 3; ++flux) {
+        const int component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}};
+        const int offset = component[flux][r / n] * n + r % n;
+        const double c_fine = (batch[2].virial[offset] - batch[3].virial[offset]) / fd_step;
+        const double c_coarse = (batch[0].virial[offset] - batch[1].virial[offset]) / (2.0 * fd_step);
+        const double c_difference = c_fine - c_coarse;
+        precheck_c_diff2[flux] += c_difference * c_difference;
+        precheck_c_fine2[flux] += c_fine * c_fine;
+      }
+    }
+  }
+  const double precheck_energy_gradient_abs =
+    std::sqrt(precheck_energy_gradient_diff2 / precheck_coordinates.size());
+  const double precheck_energy_gradient_lower_bound =
+    std::sqrt(precheck_energy_gradient_diff2 / d);
+  const double precheck_v = std::sqrt(precheck_v_diff2 / std::max(precheck_v_fine2, 1.0e-300));
+  const double precheck_k = std::sqrt(precheck_k_diff2 / std::max(precheck_k_fine2, 1.0e-300));
+  const double precheck_c[3] = {
+    std::sqrt(precheck_c_diff2[0] / std::max(precheck_c_fine2[0], 1.0e-300)),
+    std::sqrt(precheck_c_diff2[1] / std::max(precheck_c_fine2[1], 1.0e-300)),
+    std::sqrt(precheck_c_diff2[2] / std::max(precheck_c_fine2[2], 1.0e-300))};
+  const bool precheck_failed = !std::isfinite(precheck_energy_gradient_abs) ||
+    !std::isfinite(precheck_energy_gradient_lower_bound) ||
+    !std::isfinite(precheck_v) || !std::isfinite(precheck_k) ||
+    !std::isfinite(precheck_c[0]) || !std::isfinite(precheck_c[1]) || !std::isfinite(precheck_c[2]) ||
+    precheck_energy_gradient_lower_bound > kForceTolerance;
+  if (precheck_failed) {
+    std::fprintf(stderr,
+      "qNEP rpmd_ja sampled h/h2 precheck failed before raw matrix generation: fd_step=%.9g, sampled energy-gradient RMS %.6g, full-RMS lower bound %.6g (limit %.3g), V %.6g, K %.6g, Cxyz %.6g %.6g %.6g (diagnostic limits %.3g)\n"
+      "Check qNEP/PPPM evaluation consistency and finite-difference cancellation at this fd_step; no tolerance was changed.\n",
+      fd_step, precheck_energy_gradient_abs, precheck_energy_gradient_lower_bound, kForceTolerance, precheck_v, precheck_k,
+      precheck_c[0], precheck_c[1], precheck_c[2], kDifferenceTolerance);
+    throw std::runtime_error("qNEP rpmd_ja sampled h/h2 consistency check failed; raw generation stopped early");
+  }
+  std::printf("    qNEP rpmd_ja sampled h/h2 precheck: grad_RMS %.3e (full-RMS lower bound %.3e), V %.3e, K %.3e, Cxyz %.3e %.3e %.3e\n",
+    precheck_energy_gradient_abs, precheck_energy_gradient_lower_bound, precheck_v, precheck_k,
+    precheck_c[0], precheck_c[1], precheck_c[2]);
   double max_force = 0.0, force_norm2 = 0.0, energy0 = 0.0;
   for (double value : reference.force) {
     max_force = std::max(max_force, std::abs(value));
@@ -1992,6 +2195,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   std::array<std::vector<double>, 3> c_fine, c_coarse;
   for (int alpha = 0; alpha < 3; ++alpha) { c_fine[alpha].resize(d); c_coarse[alpha].resize(d); }
   constexpr int virial_component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}};
+  std::uint64_t next_decile = 1;
   const auto save_row = [&](const std::streampos start, const int row, const int width, const std::vector<double>& values) {
     out.seekp(start + static_cast<std::streamoff>(row) * width * sizeof(double));
     write_vector(out, values);
@@ -2000,8 +2204,11 @@ static void generate_rpmd_ja_qnep_raw_reference(
     plus = minus = plus_half = minus_half = positions;
     plus[coordinate] += fd_step; minus[coordinate] -= fd_step;
     plus_half[coordinate] += 0.5 * fd_step; minus_half[coordinate] -= 0.5 * fd_step;
-    const QEvaluation ep = evaluator.evaluate(plus), em = evaluator.evaluate(minus);
-    const QEvaluation ehp = evaluator.evaluate(plus_half), ehm = evaluator.evaluate(minus_half);
+    const std::array<QEvaluation, 4> batch = evaluator.evaluate_batch({plus, minus, plus_half, minus_half});
+    const QEvaluation& ep = batch[0];
+    const QEvaluation& em = batch[1];
+    const QEvaluation& ehp = batch[2];
+    const QEvaluation& ehm = batch[3];
     double energy_grad = 0.0;
     for (int i = 0; i < n; ++i) {
       v_fine[i] = (ehp.energy[i] - ehm.energy[i]) / fd_step;
@@ -2044,8 +2251,13 @@ static void generate_rpmd_ja_qnep_raw_reference(
       save_row(coarse_c_matrix_start, coordinate, d, c_coarse[alpha]);
     }
     save_row(data_start + v_bytes + c_bytes, coordinate, d, k_fine);
-    if ((coordinate + 1) % 32 == 0 || coordinate + 1 == d)
-      std::printf("    qNEP rpmd_ja reference columns: %d/%d\n", coordinate + 1, d);
+    const std::uint64_t completed = static_cast<std::uint64_t>(coordinate) + 1;
+    if (next_decile <= 10 && completed * 10 >= next_decile * static_cast<std::uint64_t>(d)) {
+      while (next_decile <= 10 && completed * 10 >= next_decile * static_cast<std::uint64_t>(d)) ++next_decile;
+      const int percent = static_cast<int>(std::min<std::uint64_t>(10 * (next_decile - 1), 100));
+      std::printf("    qNEP rpmd_ja reference columns: %d/%d (%d%%)\n", coordinate + 1, d, percent);
+      std::fflush(stdout);
+    }
   }
 
   const double energy_gradient_error = std::sqrt(energy_gradient_diff2 / std::max(energy_gradient_scale2, 1.0e-300));
@@ -2062,16 +2274,19 @@ static void generate_rpmd_ja_qnep_raw_reference(
   };
   double second_consistency = 0.0, second_convergence = 0.0;
   for (int probe = 0; probe < 3; ++probe) {
+    double max_component = 0.0;
+    for (double value : probe_directions[probe]) max_component = std::max(max_component, std::abs(value));
+    const double probe_step = fd_step / max_component;
     const auto position_at = [&](const double scale) {
       std::vector<double> value = positions;
       for (int coordinate = 0; coordinate < d; ++coordinate)
-        value[coordinate] += scale * probe_directions[probe][coordinate];
+        value[coordinate] += scale * probe_step * probe_directions[probe][coordinate];
       return value;
     };
-    const QEvaluation probe_plus = evaluator.evaluate(position_at(fd_step));
-    const QEvaluation probe_minus = evaluator.evaluate(position_at(-fd_step));
-    const QEvaluation probe_half_plus = evaluator.evaluate(position_at(0.5 * fd_step));
-    const QEvaluation probe_half_minus = evaluator.evaluate(position_at(-0.5 * fd_step));
+    const QEvaluation probe_plus = evaluator.evaluate(position_at(1.0));
+    const QEvaluation probe_minus = evaluator.evaluate(position_at(-1.0));
+    const QEvaluation probe_half_plus = evaluator.evaluate(position_at(0.5));
+    const QEvaluation probe_half_minus = evaluator.evaluate(position_at(-0.5));
     const auto force_direction = [&](const QEvaluation& evaluation) {
       double value = 0.0;
       for (int coordinate = 0; coordinate < d; ++coordinate)
@@ -2079,11 +2294,11 @@ static void generate_rpmd_ja_qnep_raw_reference(
       return value;
     };
     const double energy_h = (total_energy(probe_plus) + total_energy(probe_minus) - 2.0 * energy0) /
-      (fd_step * fd_step);
-    const double force_h = -(force_direction(probe_plus) - force_direction(probe_minus)) / (2.0 * fd_step);
+      (probe_step * probe_step);
+    const double force_h = -(force_direction(probe_plus) - force_direction(probe_minus)) / (2.0 * probe_step);
     const double energy_h2 = (total_energy(probe_half_plus) + total_energy(probe_half_minus) - 2.0 * energy0) /
-      (0.25 * fd_step * fd_step);
-    const double force_h2 = -(force_direction(probe_half_plus) - force_direction(probe_half_minus)) / fd_step;
+      (0.25 * probe_step * probe_step);
+    const double force_h2 = -(force_direction(probe_half_plus) - force_direction(probe_half_minus)) / probe_step;
     const double scale = std::max({std::abs(energy_h), std::abs(force_h), std::abs(energy_h2), std::abs(force_h2), 1.0e-12});
     second_consistency = std::max(second_consistency, std::max({std::abs(energy_h - force_h),
       std::abs(energy_h2 - force_h2), std::abs(energy_h - matrix_quadratic[probe]),
@@ -2111,17 +2326,28 @@ static void generate_rpmd_ja_qnep_raw_reference(
   if (std::rename(temporary.c_str(), path.c_str()) != 0)
     throw std::runtime_error("cannot finalize qNEP rpmd_ja raw file");
   remove_temporary.active = false;
-  std::printf("    qNEP rpmd_ja fixed-reference maximum force %.3e eV/A; raw matrix storage %.3f GiB including coarse V/C; evaluations=%d; force-gradient h/h2 %.3e, energy-gradient consistency %.3e; site virial component h/h2 %.3e %.3e %.3e\n",
-    max_force, static_cast<double>(2 * v_bytes + 2 * c_bytes + k_bytes) / (1024.0 * 1024.0 * 1024.0), 4 * d + 13,
+  std::printf("    qNEP rpmd_ja fixed-reference maximum force %.3e eV/A; raw matrix storage %.3f GiB including coarse V/C; evaluations=%llu; persistent four-lane scratch %.3f MiB plus qNEP private batch buffers; force-gradient h/h2 %.3e, energy-gradient consistency %.3e; site virial component h/h2 %.3e %.3e %.3e\n",
+    max_force, static_cast<double>(2 * v_bytes + 2 * c_bytes + k_bytes) / (1024.0 * 1024.0 * 1024.0),
+    static_cast<unsigned long long>(4ULL * d + 17ULL + 4ULL * precheck_coordinates.size()),
+    static_cast<double>(116ULL * n * sizeof(double) + 12ULL * sizeof(double*)) / (1024.0 * 1024.0),
     k_relative, energy_gradient_error, c_relative[0], c_relative[1], c_relative[2]);
   const double elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_start).count();
-  std::printf("    qNEP rpmd_ja raw generation elapsed %.3f s; tracked host staging estimate %.3f MiB at N=%d (excludes private qNEP/GPU buffers and allocator overhead)\n",
-    elapsed_seconds, static_cast<double>(160ULL * n * sizeof(double)) / (1024.0 * 1024.0), n);
-  if (std::sqrt(energy_gradient_diff2 / d) > kForceTolerance || v_relative > kDifferenceTolerance ||
+  std::printf("    qNEP rpmd_ja raw generation elapsed %.3f s\n", elapsed_seconds);
+  const double energy_gradient_abs = std::sqrt(energy_gradient_diff2 / d);
+  const bool finite_diagnostics = std::isfinite(energy_gradient_abs) && std::isfinite(v_relative) &&
+    std::isfinite(k_relative) && std::isfinite(c_relative[0]) && std::isfinite(c_relative[1]) &&
+    std::isfinite(c_relative[2]) && std::isfinite(second_consistency) && std::isfinite(second_convergence);
+  if (!finite_diagnostics || energy_gradient_abs > kForceTolerance || v_relative > kDifferenceTolerance ||
       k_relative > kDifferenceTolerance || second_consistency > kDifferenceTolerance ||
       second_convergence > kDifferenceTolerance || c_relative[0] > kDifferenceTolerance ||
-      c_relative[1] > kDifferenceTolerance || c_relative[2] > kDifferenceTolerance)
+      c_relative[1] > kDifferenceTolerance || c_relative[2] > kDifferenceTolerance) {
+    std::fflush(stdout);
+    std::fprintf(stderr,
+      "qNEP rpmd_ja raw consistency check failed for %s at fd_step=%.9g: grad_RMS %.6g (limit %.3g), V %.6g, K %.6g, Cxyz %.6g %.6g %.6g, second_consistency %.6g, second_convergence %.6g (relative limits %.3g)\n",
+      path.c_str(), fd_step, energy_gradient_abs, kForceTolerance, v_relative, k_relative,
+      c_relative[0], c_relative[1], c_relative[2], second_consistency, second_convergence, kDifferenceTolerance);
     throw std::runtime_error("qNEP rpmd_ja raw finite-difference consistency check failed; inspect recorded diagnostics");
+  }
 }
 
 void generate_rpmd_ja_qnep_reference(
