@@ -14,22 +14,23 @@ namespace
 template <typename T> void put(std::ostream& out,const T& x){out.write(reinterpret_cast<const char*>(&x),sizeof(x));}
 template <typename T> void array(std::ostream& out,const std::vector<T>& x){if(!x.empty())out.write(reinterpret_cast<const char*>(x.data()),x.size()*sizeof(T));}
 
-void make_input(const std::string& raw,const std::string& kernel,const int n,const double stiffness)
+void make_input(const std::string& raw,const std::string& kernel,const int n,const double stiffness,
+                const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0)
 {
   const int d=3*n;const double temperature=300.0,step=0.01;
   std::vector<double> mass(n),position(d,0.0),v(static_cast<std::size_t>(d)*n),vc(v.size()),c(static_cast<std::size_t>(3)*d*d),k(static_cast<std::size_t>(d)*d),coarse_c(c.size());
   std::vector<int> types(n,0),pbc(3,1);double mass_sum=0.0;
   for(int i=0;i<n;++i){mass[i]=1.0+0.07*i;mass_sum+=mass[i];}
   for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double dm=stiffness*((row==col?1.0:0.0)-tr*tc);k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
-  for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=0.97*v[ix];}
+  for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=version==2?v[ix]:0.97*v[ix];}
   for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double target=left*right;double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
   std::ofstream out(raw,std::ios::binary);if(!out)throw std::runtime_error("cannot create raw fixture");
   const char magic[8]={'G','P','J','Q','R','A','W','\0'};const char layout[]="xyz_soa;derivative_input_rows_output_columns";
-  const std::uint32_t version=1,endian=0x01020304;const int charge=1,pppm=1;const std::uint64_t model=0x12345678,config=0x87654321;const double spacing=0.5;
+  const std::uint32_t endian=0x01020304;const int charge=1,pppm=1;const std::uint64_t model=0x12345678,config=0x87654321;const double spacing=0.5;
   out.write(magic,8);put(out,version);put(out,endian);put(out,n);put(out,d);put(out,temperature);put(out,step);put(out,model);put(out,config);put(out,charge);put(out,pppm);put(out,spacing);out.write(layout,sizeof(layout));
   double cell[18]={1,0,0,0,1,0,0,0,1,1,0,0,0,1,0,0,0,1};out.write(reinterpret_cast<char*>(cell),sizeof(cell));out.write(reinterpret_cast<const char*>(pbc.data()),sizeof(int)*3);
   array(out,types);array(out,mass);array(out,position);const double energy=0.0;std::vector<double> site_energy(n,0),force(d,0),virial(9*n,0);for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom)force[row]-=v[static_cast<std::size_t>(row)*n+atom];put(out,energy);array(out,site_energy);array(out,force);array(out,virial);
-  array(out,v);array(out,c);array(out,k);array(out,vc);array(out,coarse_c);double stats[18]={};for(double value:force)stats[12]=std::max(stats[12],std::abs(value));stats[16]=step;stats[17]=1.0;out.write(reinterpret_cast<char*>(stats),sizeof(stats));out.close();if(!out)throw std::runtime_error("failed writing raw fixture");
+  array(out,v);array(out,c);array(out,k);array(out,vc);array(out,coarse_c);double stats[18]={};for(double value:force)stats[12]=std::max(stats[12],std::abs(value));stats[3]=identity_abs;stats[16]=step;stats[17]=stats_marker<0.0?static_cast<double>(version):stats_marker;out.write(reinterpret_cast<char*>(stats),sizeof(stats));out.close();if(!out)throw std::runtime_error("failed writing raw fixture");
   std::ofstream kt(kernel);if(!kt)throw std::runtime_error("cannot create kernel fixture");
   kt<<"GPUMDJA_KERNEL 1\nU 100\ndegree 1\nP_rank 1\nQ_rank 1\nP_error 0\nQ_error 0\nP_S2 0\nQ_S2 0\nP_values\n1\nP_vectors\n0 1\nQ_values\n1\nQ_vectors\n0 1\nEND\n";
 }
@@ -75,11 +76,13 @@ void verify_matrices(const RpmdJAReference& r,const double stiffness)
 
 void clean(const std::string& p){std::remove(p.c_str());std::remove((p+".tmp").c_str());std::remove((p+".stability").c_str());std::remove((p+".stability.tmp").c_str());}
 
-void run_positive(const std::string& base,const int n)
+void run_positive(const std::string& base,const int n,const std::uint32_t version)
 {
   const std::string stem=base+"_N"+std::to_string(n),raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja";
-  make_input(raw,kernel,n,1.0e-10);prepare_rpmd_ja_qnep_reference(raw,out,kernel);const RpmdJAReference r=read_rpmd_ja_reference(out);
+  make_input(raw,kernel,n,1.0e-10,version);prepare_rpmd_ja_qnep_reference(raw,out,kernel);const RpmdJAReference r=read_rpmd_ja_reference(out);
   if(r.backend!=2||r.number_of_atoms!=n||r.block_dynamical.tiles.empty()||r.block_site_transpose[0].tiles.empty()||!r.stability_checked||!has_compressed_h(r)||!(r.force_balance_residual>1.0e-4))throw std::runtime_error("prepared qNEP v3 fixture failed nonzero-force readback or H compression");
+  const std::string expected_policy=version==1?"native_reference_transport":"native_reference_transport;analytic_site_gradient_v1";
+  if(r.mechanical_policy!=expected_policy)throw std::runtime_error("prepared qNEP v3 fixture lost its derivative-source marker");
   if(r.block_dynamical.tiles.size()!=static_cast<std::size_t>((3*n+127)/128)*((3*n+127)/128))throw std::runtime_error("D tile grid readback incomplete");
   verify_matrices(r,1.0e-10);
   clean(raw);clean(kernel);clean(out);
@@ -91,10 +94,24 @@ void run_negative(const std::string& base)
   make_input(raw,kernel,3,-1.0e-10);bool rejected=false;std::string reason;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception& e){reason=e.what();rejected=reason.find("not positive definite")!=std::string::npos;}
   if(!rejected)throw std::runtime_error("negative qNEP soft mode was accepted or rejected for a different reason");clean(raw);clean(kernel);clean(out);
 }
+
+void run_raw2_rejections(const std::string& base)
+{
+  const std::string kernel=base+"_raw2.kernel";
+  const auto rejected=[&](const std::string& suffix,const double marker,const double identity) {
+    const std::string raw=base+suffix+".qraw",out=base+suffix+".ja";
+    make_input(raw,kernel,3,1.0e-10,2,marker,identity);
+    bool failed=false;try{prepare_rpmd_ja_qnep_reference(raw,out,kernel);}catch(const std::exception&){failed=true;}
+    if(!failed)throw std::runtime_error("qNEP raw v2 accepted an invalid stats marker or site-JVP identity");
+    clean(raw);clean(kernel);clean(out);
+  };
+  rejected("_bad_marker",1.0,0.0);
+  rejected("_bad_identity",2.0,1.1e-4);
+}
 } // namespace
 
 int main(int argc,char** argv)
 {
-  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2);run_positive(base,3);run_positive(base,44);run_negative(base);return 0;}
+  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,44,1);run_negative(base);run_raw2_rejections(base);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}
 }

@@ -3017,6 +3017,7 @@ static bool get_expanded_box(const double rc, const Box& box, NEP_Charge::Expand
 
 void NEP_Charge::invalidate_current_force_caches_()
 {
+  reference_force_frame_valid_ = false;
   pppm.invalidate_current_force_mesh();
   charge_rate_cache_set_ = false;
   charge_heat_channel_cache_set_ = false;
@@ -3090,6 +3091,16 @@ void NEP_Charge::compute(
     dftd3.compute(
       box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
   }
+  reference_force_frame_valid_ = true;
+  reference_force_frame_N_ = type.size();
+  reference_force_frame_id_ = force_evaluation_id_;
+  reference_force_frame_type_ = type.data();
+  reference_force_frame_position_ = position_per_atom.data();
+  reference_force_frame_force_ = force_per_atom.data();
+  reference_force_frame_small_box_ = is_small_box;
+  reference_force_frame_N1_ = N1;
+  reference_force_frame_N2_ = N2;
+  for (int i = 0; i < 18; ++i) reference_force_frame_box_[i] = box.cpu_h[i];
 }
 
 static __device__ __forceinline__ void find_charge_gradient_radial_pair(
@@ -3172,6 +3183,274 @@ static __device__ __forceinline__ void find_charge_gradient_angular_pair(
       sum_fxyz,
       f12);
   }
+}
+
+static __global__ void compute_reference_local_tangent(
+  const NEP_Charge::ParaMB paramb,
+  const NEP_Charge::ANN annmb,
+  const NEP_Charge::ZBL zbl,
+  const int N,
+  const Box box,
+  const bool small_box,
+  const int* NN_radial,
+  const int* NL_radial,
+  const int* NN_angular,
+  const int* NL_angular,
+  const int* type,
+  const double* position,
+  const double* direction,
+  const float* x12_radial,
+  const float* y12_radial,
+  const float* z12_radial,
+  const float* x12_angular,
+  const float* y12_angular,
+  const float* z12_angular,
+  const float* Fp,
+  const float* charge_derivative,
+  const float* sum_fxyz,
+  double* charge_direction_raw,
+  double* short_site_derivative)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  float energy_fp[MAX_DIM_ANGULAR] = {0.0f};
+  float charge_fp[MAX_DIM_ANGULAR] = {0.0f};
+  float angular_sum[NUM_OF_ABC * MAX_NUM_N];
+  for (int d = 0; d < paramb.dim_angular; ++d)
+    energy_fp[d] = Fp[(paramb.n_max_radial + 1 + d) * N + i];
+  for (int d = 0; d < paramb.dim_angular; ++d)
+    charge_fp[d] = charge_derivative[(paramb.n_max_radial + 1 + d) * N + i];
+  for (int n = 0; n <= paramb.n_max_angular; ++n)
+    for (int abc = 0; abc < (paramb.L_max + 1) * (paramb.L_max + 1) - 1; ++abc)
+      angular_sum[n * NUM_OF_ABC + abc] =
+        sum_fxyz[(n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) * N + i];
+
+  double local = 0.0;
+  double charge_tangent = 0.0;
+  const double ux = direction[i], uy = direction[i + N], uz = direction[i + 2 * N];
+  for (int pass = 0; pass < 2; ++pass) {
+    const bool angular = pass != 0;
+    const int count = angular ? NN_angular[i] : NN_radial[i];
+    const int* NL = angular ? NL_angular : NL_radial;
+    const float* xx = angular ? x12_angular : x12_radial;
+    const float* yy = angular ? y12_angular : y12_radial;
+    const float* zz = angular ? z12_angular : z12_radial;
+    for (int edge = 0; edge < count; ++edge) {
+      const int idx = i + N * edge;
+      const int j = NL[idx];
+      float r[3];
+      if (small_box) {
+        r[0] = xx[idx]; r[1] = yy[idx]; r[2] = zz[idx];
+      } else {
+        r[0] = static_cast<float>(position[j] - position[i]);
+        r[1] = static_cast<float>(position[j + N] - position[i + N]);
+        r[2] = static_cast<float>(position[j + 2 * N] - position[i + 2 * N]);
+        apply_mic(box, r[0], r[1], r[2]);
+      }
+      const double dux = direction[j] - ux, duy = direction[j + N] - uy, duz = direction[j + 2 * N] - uz;
+      if (dux == 0.0 && duy == 0.0 && duz == 0.0) continue;
+      float energy_gradient[3] = {0.0f, 0.0f, 0.0f};
+      float charge_gradient[3] = {0.0f, 0.0f, 0.0f};
+      if (angular) {
+        find_charge_gradient_angular_pair(paramb, annmb, i, j, type, r, energy_fp, angular_sum, energy_gradient);
+        find_charge_gradient_angular_pair(paramb, annmb, i, j, type, r, charge_fp, angular_sum, charge_gradient);
+      } else {
+        find_charge_gradient_radial_pair(paramb, annmb, N, i, j, type, r, Fp, energy_gradient);
+        find_charge_gradient_radial_pair(paramb, annmb, N, i, j, type, r, charge_derivative, charge_gradient);
+      }
+      local += energy_gradient[0] * dux + energy_gradient[1] * duy + energy_gradient[2] * duz;
+      charge_tangent += charge_gradient[0] * dux + charge_gradient[1] * duy + charge_gradient[2] * duz;
+      if (zbl.enabled && angular) {
+        const float distance = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        if (distance > 0.0f) {
+          const int t1 = type[i], t2 = type[j];
+          const int zi = zbl.atomic_numbers[t1], zj = zbl.atomic_numbers[t2];
+          const float a_inv = (powf(static_cast<float>(zi), 0.23f) + powf(static_cast<float>(zj), 0.23f)) * 2.134563f;
+          const float zizj = K_C_SP * zi * zj;
+          float value, derivative;
+          if (zbl.flexible) {
+            const int lo = min(t1, t2), hi = max(t1, t2);
+            const int zbl_index = lo * zbl.num_types - (lo * (lo - 1)) / 2 + (hi - lo);
+            float parameters[10];
+            for (int k = 0; k < 10; ++k) parameters[k] = zbl.para[10 * zbl_index + k];
+            find_f_and_fp_zbl(parameters, zizj, a_inv, distance, 1.0f / distance, value, derivative);
+          } else {
+            float inner = zbl.rc_inner, outer = zbl.rc_outer;
+            if (paramb.use_typewise_cutoff_zbl) {
+              outer = min((COVALENT_RADIUS[zi - 1] + COVALENT_RADIUS[zj - 1]) * paramb.typewise_cutoff_zbl_factor, outer);
+              inner = 0.0f;
+            }
+            find_f_and_fp_zbl(zizj, a_inv, inner, outer, distance, 1.0f / distance, value, derivative);
+          }
+          local += 0.5 * derivative * (r[0] * dux + r[1] * duy + r[2] * duz) / distance;
+        }
+      }
+    }
+  }
+  charge_direction_raw[i] = charge_tangent;
+  short_site_derivative[i] = local;
+}
+
+static __global__ void project_reference_charge_direction(
+  const int N, const double* raw, double* projected)
+{
+  __shared__ double sums[1024];
+  const int tid = threadIdx.x;
+  double sum = 0.0;
+  for (int i = tid; i < N; i += 1024) sum += raw[i];
+  sums[tid] = sum;
+  __syncthreads();
+  for (int offset = 512; offset > 0; offset >>= 1) {
+    if (tid < offset) sums[tid] += sums[tid + offset];
+    __syncthreads();
+  }
+  const double mean = sums[0] / N;
+  for (int i = tid; i < N; i += 1024) projected[i] = raw[i] - mean;
+}
+
+static __global__ void add_reference_real_site_tangent(
+  const int N,
+  const NEP_Charge::Charge_Para charge_para,
+  const Box box,
+  const bool small_box,
+  const int* NN,
+  const int* NL,
+  const float* x12,
+  const float* y12,
+  const float* z12,
+  const double* position,
+  const double* direction,
+  const float* charge,
+  const double* charge_direction,
+  double* site_derivative)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  const double qi = charge[i], dqi = charge_direction[i];
+  double value = -static_cast<double>(charge_para.two_alpha_over_sqrt_pi) * qi * dqi;
+  for (int e = 0; e < NN[i]; ++e) {
+    const int index = i + N * e, j = NL[index];
+    double r[3];
+    if (small_box) {
+      r[0] = x12[index]; r[1] = y12[index]; r[2] = z12[index];
+    } else {
+      float r_float[3] = {
+        static_cast<float>(position[j] - position[i]),
+        static_cast<float>(position[j + N] - position[i + N]),
+        static_cast<float>(position[j + 2 * N] - position[i + 2 * N])};
+      apply_mic(box, r_float[0], r_float[1], r_float[2]);
+      r[0] = r_float[0]; r[1] = r_float[1]; r[2] = r_float[2];
+    }
+    const double r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+    if (r2 <= 0.0) continue;
+    const double distance = sqrt(r2), invr = 1.0 / distance;
+    const double alpha = charge_para.alpha;
+    const double phi = erfc(alpha * distance) * invr;
+    const double dphi = -charge_para.two_alpha_over_sqrt_pi * exp(-alpha * alpha * r2) * invr - phi * invr;
+    const double dqj = charge_direction[j];
+    const double dr = (r[0] * (direction[j] - direction[i]) +
+                       r[1] * (direction[j + N] - direction[i + N]) +
+                       r[2] * (direction[j + 2 * N] - direction[i + 2 * N])) * invr;
+    value += 0.5 * ((dqi * charge[j] + qi * dqj) * phi + qi * charge[j] * dphi * dr);
+  }
+  site_derivative[i] += static_cast<double>(K_C_SP) * value;
+}
+
+static __global__ void combine_reference_tangent(
+  const int N,
+  const double* short_site,
+  const double* pppm_site,
+  double* site_derivative,
+  const double* native_force,
+  const double* pppm_ik_force,
+  const double* pppm_explicit_gradient,
+  double* total_gradient)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N && site_derivative != nullptr) site_derivative[i] = short_site[i] + pppm_site[i];
+  if (i < 3 * N)
+    total_gradient[i] = -native_force[i] + pppm_ik_force[i] + pppm_explicit_gradient[i];
+}
+
+bool NEP_Charge::compute_reference_site_energy_derivative(
+  const Box& box,
+  const GPU_Vector<int>& type,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& native_force,
+  const GPU_Vector<double>* direction,
+  GPU_Vector<double>* site_derivative,
+  GPU_Vector<double>& total_energy_gradient)
+{
+  const int N = type.size();
+  if (!reference_force_frame_valid_ || reference_force_frame_id_ != force_evaluation_id_ ||
+      N <= 0 || reference_force_frame_N_ != N || reference_force_frame_type_ != type.data() ||
+      reference_force_frame_position_ != position.data() || reference_force_frame_force_ != native_force.data() ||
+      reference_force_frame_N1_ != 0 || reference_force_frame_N2_ != N || has_dftd3 || !use_pppm ||
+      (paramb.charge_mode != 1 && paramb.charge_mode != 2) ||
+      box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1 ||
+      position.size() < static_cast<size_t>(3) * N || native_force.size() < static_cast<size_t>(3) * N ||
+      ((direction == nullptr) != (site_derivative == nullptr)) ||
+      (direction != nullptr && direction->size() < static_cast<size_t>(3) * N) ||
+      nep_data.charge.size() != static_cast<size_t>(N))
+    return false;
+  for (int i = 0; i < 18; ++i)
+    if (reference_force_frame_box_[i] != box.cpu_h[i]) return false;
+
+  const bool small_box = reference_force_frame_small_box_;
+  const int* NN_radial = small_box ? small_box_data.NN_radial.data() : nep_data.NN_radial.data();
+  const int* NL_radial = small_box ? small_box_data.NL_radial.data() : nep_data.NL_radial.data();
+  const int* NN_angular = small_box ? small_box_data.NN_angular.data() : nep_data.NN_angular.data();
+  const int* NL_angular = small_box ? small_box_data.NL_angular.data() : nep_data.NL_angular.data();
+  const float* x12_radial = small_box ? small_box_data.r12.data() : nullptr;
+  const size_t small_box_stride = small_box ? small_box_data.r12.size() / 6 : 0;
+  const float* y12_radial = small_box ? small_box_data.r12.data() + small_box_stride : nullptr;
+  const float* z12_radial = small_box ? small_box_data.r12.data() + 2 * small_box_stride : nullptr;
+  const float* x12_angular = small_box ? small_box_data.r12.data() + 3 * small_box_stride : nullptr;
+  const float* y12_angular = small_box ? small_box_data.r12.data() + 4 * small_box_stride : nullptr;
+  const float* z12_angular = small_box ? small_box_data.r12.data() + 5 * small_box_stride : nullptr;
+  const size_t size_n = static_cast<size_t>(N);
+  const size_t size_3n = 3 * size_n;
+  if (reference_charge_direction_.size() != size_n) reference_charge_direction_.resize(size_n);
+  if (reference_charge_direction_raw_.size() != size_n) reference_charge_direction_raw_.resize(size_n);
+  if (reference_short_site_derivative_.size() != size_n) reference_short_site_derivative_.resize(size_n);
+  if (reference_pppm_site_derivative_.size() != size_n) reference_pppm_site_derivative_.resize(size_n);
+  if (reference_pppm_explicit_gradient_.size() != size_3n) reference_pppm_explicit_gradient_.resize(size_3n);
+  if (reference_pppm_ik_force_.size() != size_3n) reference_pppm_ik_force_.resize(size_3n);
+  if (site_derivative != nullptr && site_derivative->size() != size_n) site_derivative->resize(size_n);
+  if (total_energy_gradient.size() != size_3n) total_energy_gradient.resize(size_3n);
+
+  if (direction != nullptr) {
+    compute_reference_local_tangent<<<(N - 1) / 64 + 1, 64>>>(
+      paramb, annmb, zbl, N, box, small_box, NN_radial, NL_radial, NN_angular, NL_angular,
+      type.data(), position.data(), direction->data(), x12_radial, y12_radial, z12_radial,
+      x12_angular, y12_angular, z12_angular, nep_data.Fp.data(), nep_data.charge_derivative.data(),
+      nep_data.sum_fxyz.data(), reference_charge_direction_raw_.data(), reference_short_site_derivative_.data());
+    GPU_CHECK_KERNEL
+    project_reference_charge_direction<<<1, 1024>>>(
+      N, reference_charge_direction_raw_.data(), reference_charge_direction_.data());
+    GPU_CHECK_KERNEL
+    if (paramb.charge_mode == 1) {
+      add_reference_real_site_tangent<<<(N - 1) / 64 + 1, 64>>>(
+        N, charge_para, box, small_box, NN_radial, NL_radial, x12_radial, y12_radial, z12_radial,
+        position.data(), direction->data(), nep_data.charge.data(), reference_charge_direction_.data(),
+        reference_short_site_derivative_.data());
+      GPU_CHECK_KERNEL
+    }
+  }
+  if (!pppm.compute_reference_energy_tangent(
+        N, box, nep_data.charge, position, direction,
+        direction == nullptr ? nullptr : &reference_charge_direction_, force_evaluation_id_,
+        site_derivative == nullptr ? nullptr : &reference_pppm_site_derivative_,
+        reference_pppm_explicit_gradient_, reference_pppm_ik_force_))
+    return false;
+  combine_reference_tangent<<<(3 * N - 1) / 64 + 1, 64>>>(
+    N, direction == nullptr ? nullptr : reference_short_site_derivative_.data(),
+    direction == nullptr ? nullptr : reference_pppm_site_derivative_.data(),
+    site_derivative == nullptr ? nullptr : site_derivative->data(),
+    native_force.data(), reference_pppm_ik_force_.data(), reference_pppm_explicit_gradient_.data(),
+    total_energy_gradient.data());
+  GPU_CHECK_KERNEL
+  return true;
 }
 
 static __device__ __forceinline__ void accumulate_charge_heat_channel(

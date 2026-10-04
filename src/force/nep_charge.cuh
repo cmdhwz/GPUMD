@@ -153,6 +153,14 @@ public:
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial);
+  bool compute_reference_site_energy_derivative(
+    const Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& native_force,
+    const GPU_Vector<double>* direction,
+    GPU_Vector<double>* site_derivative,
+    GPU_Vector<double>& total_energy_gradient);
 
   bool compute_pimd_batch(
     Box& box,
@@ -455,6 +463,16 @@ private:
   bool charge_diagnostics_enabled_ = false;
   bool dynamic_charge_diagnostics_enabled_ = false;
   bool charge_diagnostics_requested_ = false;
+  bool reference_force_frame_valid_ = false;
+  int reference_force_frame_N_ = -1;
+  unsigned long long reference_force_frame_id_ = 0;
+  const void* reference_force_frame_type_ = nullptr;
+  const void* reference_force_frame_position_ = nullptr;
+  const void* reference_force_frame_force_ = nullptr;
+  bool reference_force_frame_small_box_ = false;
+  int reference_force_frame_N1_ = -1;
+  int reference_force_frame_N2_ = -1;
+  double reference_force_frame_box_[18] = {};
   bool charge_diagnostics_available_ = false;
   unsigned long long charge_diagnostics_force_evaluation_id_ = 0;
   bool single_frame_neighbor_invalidation_pending_ = false;
@@ -468,6 +486,12 @@ private:
   bool dynamic_q_cache_diagnostic_checks_pass_ = false;
   bool dynamic_q_last_diagnostic_checks_pass_ = false;
   GPU_Vector<double> charge_heat_channel_cache_;
+  GPU_Vector<double> reference_charge_direction_;
+  GPU_Vector<double> reference_charge_direction_raw_;
+  GPU_Vector<double> reference_short_site_derivative_;
+  GPU_Vector<double> reference_pppm_site_derivative_;
+  GPU_Vector<double> reference_pppm_explicit_gradient_;
+  GPU_Vector<double> reference_pppm_ik_force_;
   GPU_Vector<double> virial_diag_potential_;
   GPU_Vector<double> virial_diag_force_;
   GPU_Vector<float> virial_diag_charge_saved_;

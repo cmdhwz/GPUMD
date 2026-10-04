@@ -236,6 +236,49 @@ __constant__ float W_coeff[5][5] = {
   {2.6041667e-03f, 2.0833333e-02f, 6.2500000e-02f, 8.3333333e-02f, 4.1666667e-02f}
 };
 
+struct PPPMReferenceStencil
+{
+  int index[3];
+  float weight[3][5];
+  float derivative[3][5];
+  double ds_dR[3][3];
+};
+
+__device__ inline PPPMReferenceStencil make_reference_stencil(
+  const PPPM::Para para, const Box box, const double x, const double y, const double z)
+{
+  const float sx = (box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z) * para.K[0];
+  const float sy = (box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z) * para.K[1];
+  const float sz = (box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z) * para.K[2];
+  const float delta[3] = {
+    sx - int(sx + 0.5f), sy - int(sy + 0.5f), sz - int(sz + 0.5f)};
+  PPPMReferenceStencil result;
+  result.index[0] = int(sx + 0.5f);
+  result.index[1] = int(sy + 0.5f);
+  result.index[2] = int(sz + 0.5f);
+  for (int axis = 0; axis < 3; ++axis) {
+    for (int j = 0; j < 5; ++j) {
+      result.weight[axis][j] = pppm_reference_weight(W_coeff, j, delta[axis]);
+      result.derivative[axis][j] = pppm_reference_weight_derivative(W_coeff, j, delta[axis]);
+    }
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    for (int mu = 0; mu < 3; ++mu)
+      result.ds_dR[axis][mu] = static_cast<double>(para.K[axis]) * box.cpu_h[9 + 3 * axis + mu];
+  }
+  return result;
+}
+
+__device__ inline double reference_stencil_dW_dR(
+  const PPPMReferenceStencil& stencil, const int n0, const int n1, const int n2, const int mu)
+{
+  const int i = n0 + 2, j = n1 + 2, k = n2 + 2;
+  const double wx = stencil.weight[0][i], wy = stencil.weight[1][j], wz = stencil.weight[2][k];
+  return static_cast<double>(stencil.derivative[0][i]) * wy * wz * stencil.ds_dR[0][mu] +
+         wx * static_cast<double>(stencil.derivative[1][j]) * wz * stencil.ds_dR[1][mu] +
+         wx * wy * static_cast<double>(stencil.derivative[2][k]) * stencil.ds_dR[2][mu];
+}
+
 __device__ inline float sinc(const float x)
 {
   float y = 0.0f;
@@ -408,6 +451,126 @@ __global__ void find_mesh(
         }
       }
     }
+  }
+}
+
+__global__ void clear_reference_delta_Q(double* delta_Q, const int M)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < M) delta_Q[i] = 0.0;
+}
+
+__global__ void assign_reference_delta_Q(
+  const int N,
+  const PPPM::Para para,
+  const Box box,
+  const float* charge,
+  const double* position,
+  const double* direction,
+  const double* charge_direction,
+  double* delta_Q)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  const PPPMReferenceStencil stencil = make_reference_stencil(
+    para, box, position[i], position[i + N], position[i + 2 * N]);
+  const double qi = charge[i];
+  const double dqi = charge_direction[i];
+  for (int n0 = -2; n0 <= 2; ++n0) {
+    const int j0 = get_index_within_mesh(para.K[0], stencil.index[0] + n0);
+    for (int n1 = -2; n1 <= 2; ++n1) {
+      const int j1 = get_index_within_mesh(para.K[1], stencil.index[1] + n1);
+      for (int n2 = -2; n2 <= 2; ++n2) {
+        const int j2 = get_index_within_mesh(para.K[2], stencil.index[2] + n2);
+        const int mesh_index = j0 + para.K[0] * (j1 + para.K[1] * j2);
+        const float W = stencil.weight[0][n0 + 2] * stencil.weight[1][n1 + 2] *
+                        stencil.weight[2][n2 + 2];
+        const double dW = reference_stencil_dW_dR(stencil, n0, n1, n2, 0) * direction[i] +
+                          reference_stencil_dW_dR(stencil, n0, n1, n2, 1) * direction[i + N] +
+                          reference_stencil_dW_dR(stencil, n0, n1, n2, 2) * direction[i + 2 * N];
+        const double value = dqi * static_cast<double>(W) + qi * dW;
+        atomicAdd(&delta_Q[mesh_index], value);
+      }
+    }
+  }
+}
+
+__global__ void convert_reference_delta_Q(
+  const double* delta_Q, gpufftComplex* mesh, const int M)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < M) mesh[i] = {static_cast<float>(delta_Q[i]), 0.0f};
+}
+
+__global__ void apply_reference_G(
+  const float* G, gpufftComplex* mesh, const int M)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < M) {
+    mesh[i].x *= G[i];
+    mesh[i].y *= G[i];
+  }
+}
+
+__global__ void gather_reference_energy_tangent(
+  const int N,
+  const PPPM::Para para,
+  const Box box,
+  const float* charge,
+  const double* position,
+  const double* direction,
+  const double* charge_direction,
+  const gpufftComplex* phi,
+  const gpufftComplex* delta_phi,
+  const gpufftComplex* field_x,
+  const gpufftComplex* field_y,
+  const gpufftComplex* field_z,
+  double* dsite,
+  double* explicit_gradient,
+  double* native_ik_force)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  const PPPMReferenceStencil stencil = make_reference_stencil(
+    para, box, position[i], position[i + N], position[i + 2 * N]);
+  double potential = 0.0, dpotential_shape = 0.0, dpotential_field = 0.0;
+  double grad[3] = {0.0, 0.0, 0.0}, ik[3] = {0.0, 0.0, 0.0};
+  for (int n0 = -2; n0 <= 2; ++n0) {
+    const int j0 = get_index_within_mesh(para.K[0], stencil.index[0] + n0);
+    for (int n1 = -2; n1 <= 2; ++n1) {
+      const int j1 = get_index_within_mesh(para.K[1], stencil.index[1] + n1);
+      for (int n2 = -2; n2 <= 2; ++n2) {
+        const int j2 = get_index_within_mesh(para.K[2], stencil.index[2] + n2);
+        const int mesh_index = j0 + para.K[0] * (j1 + para.K[1] * j2);
+        const int a = n0 + 2, b = n1 + 2, c = n2 + 2;
+        const float W = stencil.weight[0][a] * stencil.weight[1][b] * stencil.weight[2][c];
+        const double value = phi[mesh_index].x;
+        potential += static_cast<double>(W) * value;
+        if (delta_phi != nullptr) dpotential_field += static_cast<double>(W) * delta_phi[mesh_index].x;
+        const double shape = reference_stencil_dW_dR(stencil, n0, n1, n2, 0);
+        const double shape_y = reference_stencil_dW_dR(stencil, n0, n1, n2, 1);
+        const double shape_z = reference_stencil_dW_dR(stencil, n0, n1, n2, 2);
+        dpotential_shape += (direction == nullptr ? 0.0 :
+          (shape * direction[i] + shape_y * direction[i + N] + shape_z * direction[i + 2 * N])) * value;
+        grad[0] += shape * value;
+        grad[1] += shape_y * value;
+        grad[2] += shape_z * value;
+        ik[0] += static_cast<double>(W) * field_x[mesh_index].x;
+        ik[1] += static_cast<double>(W) * field_y[mesh_index].x;
+        ik[2] += static_cast<double>(W) * field_z[mesh_index].x;
+      }
+    }
+  }
+  const double qi = charge[i];
+  const double prefactor = static_cast<double>(K_C_SP) * qi;
+  if (dsite != nullptr) {
+    const double dqi = charge_direction[i];
+    dsite[i] = static_cast<double>(K_C_SP) *
+      (dqi * potential + qi * dpotential_shape + qi * dpotential_field);
+  }
+  for (int mu = 0; mu < 3; ++mu) {
+    explicit_gradient[i + mu * N] = 2.0 * prefactor * grad[mu];
+    native_ik_force[i + mu * N] = 2.0 * prefactor * ik[mu];
   }
 }
 
@@ -1902,6 +2065,7 @@ void PPPM::initialize(
   para = {};
   mesh_spacing = mesh_spacing_input;
   current_force_mesh_valid_ = false;
+  current_force_mesh_peratom_ = false;
   dynamic_operator_cache_valid_ = false;
   dynamic_operator_host_cache_valid_ = false;
   need_peratom_virial = need_peratom_virial_input;
@@ -1962,7 +2126,8 @@ bool PPPM::current_force_mesh_matches(
   const Box& box,
   const GPU_Vector<float>& charge,
   const GPU_Vector<double>& position,
-  const unsigned long long force_evaluation_id) const
+  const unsigned long long force_evaluation_id,
+  const bool require_orthogonal) const
 {
   if (
     !current_force_mesh_valid_ || force_evaluation_id == 0 ||
@@ -1970,7 +2135,7 @@ bool PPPM::current_force_mesh_matches(
     N1 != 0 || N2 != N || current_force_mesh_N_ != N ||
     current_force_mesh_N1_ != N1 || current_force_mesh_N2_ != N2 ||
     current_force_mesh_charge_ != charge.data() || current_force_mesh_position_ != position.data() ||
-    !box.is_orthogonal || mesh.size() != static_cast<size_t>(para.K0K1K2) ||
+    (require_orthogonal && !box.is_orthogonal) || mesh.size() != static_cast<size_t>(para.K0K1K2) ||
     mesh_G.size() != static_cast<size_t>(para.K0K1K2)) {
     return false;
   }
@@ -2464,6 +2629,7 @@ void PPPM::find_force(
   }
   if (force_evaluation_id != 0) {
     current_force_mesh_valid_ = true;
+    current_force_mesh_peratom_ = calculate_peratom_virial;
     current_force_mesh_force_evaluation_id_ = force_evaluation_id;
     current_force_mesh_N_ = N;
     current_force_mesh_N1_ = N1;
@@ -2473,6 +2639,78 @@ void PPPM::find_force(
     for (int d = 0; d < 3; ++d) current_force_mesh_K_[d] = para.K[d];
     for (int i = 0; i < 18; ++i) current_force_mesh_box_[i] = box.cpu_h[i];
   }
+}
+
+bool PPPM::compute_reference_energy_tangent(
+  const int N,
+  const Box& box,
+  const GPU_Vector<float>& charge,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>* direction,
+  const GPU_Vector<double>* charge_direction,
+  const unsigned long long force_evaluation_id,
+  GPU_Vector<double>* dsite,
+  GPU_Vector<double>& explicit_space_gradient,
+  GPU_Vector<double>& native_ik_force)
+{
+  const bool tangent_requested = dsite != nullptr;
+  const bool tangent_inputs_valid = tangent_requested
+    ? direction != nullptr && charge_direction != nullptr
+    : direction == nullptr && charge_direction == nullptr;
+  if (
+    N <= 0 || charge.size() < static_cast<size_t>(N) || position.size() < static_cast<size_t>(3) * N ||
+    !tangent_inputs_valid ||
+    (direction != nullptr &&
+      (direction->size() < static_cast<size_t>(3) * N ||
+       charge_direction->size() < static_cast<size_t>(N))) ||
+    box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1 || !plan_initialized ||
+    mesh_x.size() != static_cast<size_t>(para.K0K1K2) ||
+    mesh_y.size() != static_cast<size_t>(para.K0K1K2) ||
+    mesh_z.size() != static_cast<size_t>(para.K0K1K2) ||
+    !current_force_mesh_peratom_ ||
+    !current_force_mesh_matches(N, 0, N, box, charge, position, force_evaluation_id, false)) {
+    return false;
+  }
+  if (para.K[0] < 5 || para.K[1] < 5 || para.K[2] < 5) return false;
+
+  if (explicit_space_gradient.size() != static_cast<size_t>(3) * N)
+    explicit_space_gradient.resize(static_cast<size_t>(3) * N);
+  if (native_ik_force.size() != static_cast<size_t>(3) * N)
+    native_ik_force.resize(static_cast<size_t>(3) * N);
+  if (tangent_requested && dsite->size() != static_cast<size_t>(N))
+    dsite->resize(static_cast<size_t>(N));
+
+  const int M = para.K0K1K2;
+  if (tangent_requested) {
+    if (reference_delta_Q_.size() != static_cast<size_t>(M)) reference_delta_Q_.resize(M);
+    if (reference_delta_phi_.size() != static_cast<size_t>(M)) reference_delta_phi_.resize(M);
+    clear_reference_delta_Q<<<(M - 1) / 256 + 1, 256>>>(reference_delta_Q_.data(), M);
+    GPU_CHECK_KERNEL
+    assign_reference_delta_Q<<<(N - 1) / 64 + 1, 64>>>(
+      N, para, box, charge.data(), position.data(), direction->data(), charge_direction->data(),
+      reference_delta_Q_.data());
+    GPU_CHECK_KERNEL
+    convert_reference_delta_Q<<<(M - 1) / 256 + 1, 256>>>(
+      reference_delta_Q_.data(), reference_delta_phi_.data(), M);
+    GPU_CHECK_KERNEL
+    if (gpufftExecC2C(plan, reference_delta_phi_.data(), reference_delta_phi_.data(), GPUFFT_FORWARD) != GPUFFT_SUCCESS)
+      return false;
+    apply_reference_G<<<(M - 1) / 256 + 1, 256>>>(G.data(), reference_delta_phi_.data(), M);
+    GPU_CHECK_KERNEL
+    if (gpufftExecC2C(plan, reference_delta_phi_.data(), reference_delta_phi_.data(), GPUFFT_INVERSE) != GPUFFT_SUCCESS)
+      return false;
+  }
+
+  gather_reference_energy_tangent<<<(N - 1) / 64 + 1, 64>>>(
+    N, para, box, charge.data(), position.data(),
+    tangent_requested ? direction->data() : nullptr,
+    tangent_requested ? charge_direction->data() : nullptr,
+    mesh_G.data(), tangent_requested ? reference_delta_phi_.data() : nullptr,
+    mesh_x.data(), mesh_y.data(), mesh_z.data(),
+    tangent_requested ? dsite->data() : nullptr,
+    explicit_space_gradient.data(), native_ik_force.data());
+  GPU_CHECK_KERNEL
+  return true;
 }
 
 void PPPM::find_force_batch(

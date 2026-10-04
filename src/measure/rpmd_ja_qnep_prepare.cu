@@ -66,7 +66,7 @@ Raw read_raw_header(const std::string& path)
   read_value(in, raw.reference.fd_step); read_value(in, raw.reference.model_fingerprint);
   read_value(in, raw.config); read_value(in, raw.charge); read_value(in, uses_pppm);
   read_value(in, raw.spacing); in.read(layout, sizeof(layout));
-  if (!in || std::memcmp(magic, raw_magic, sizeof(magic)) || version != 1 || endian != 0x01020304 ||
+  if (!in || std::memcmp(magic, raw_magic, sizeof(magic)) || (version != 1 && version != 2) || endian != 0x01020304 ||
       n <= 1 || n > std::numeric_limits<int>::max()/3 || d != 3 * n ||
       !(raw.reference.temperature > 0.0) || !std::isfinite(raw.reference.temperature) ||
       !(raw.reference.fd_step > 0.0) || !std::isfinite(raw.reference.fd_step) ||
@@ -76,7 +76,9 @@ Raw read_raw_header(const std::string& path)
   raw.dimension = d;
   RpmdJAReference& r = raw.reference;
   r.backend = 2; r.number_of_atoms = n; r.q_charge_mode = raw.charge; r.q_uses_pppm = true;
-  r.q_mesh_spacing = raw.spacing; r.mechanical_policy = "native_reference_transport";
+  r.q_mesh_spacing = raw.spacing;
+  r.mechanical_policy = version == 1 ? "native_reference_transport" :
+    "native_reference_transport;analytic_site_gradient_v1";
   r.mechanical_config_fingerprint = raw.config;
   double raw_cell[18];
   in.read(reinterpret_cast<char*>(raw_cell), sizeof(raw_cell));
@@ -124,9 +126,13 @@ Raw read_raw_header(const std::string& path)
     throw std::runtime_error("qNEP raw file size does not match its matrix layout");
   in.seekg(raw.footer);
   in.read(reinterpret_cast<char*>(raw.stats), sizeof(raw.stats));
-  if (!in || !std::all_of(raw.stats, raw.stats + 18, [](double x) { return std::isfinite(x) && x >= 0.0; }) ||
-      raw.stats[17] != 1.0 || raw.stats[16] != r.fd_step || raw.stats[1] > 1.0e-4 ||
-      std::max({raw.stats[2], raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) > raw_difference_tolerance)
+  const bool finite_stats = std::all_of(raw.stats, raw.stats + 18, [](double x) { return std::isfinite(x) && x >= 0.0; });
+  const bool legacy_checks = raw.stats[17] == 1.0 && raw.stats[1] <= 1.0e-4 &&
+    std::max({raw.stats[2], raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
+  const bool analytic_checks = raw.stats[17] == 2.0 && raw.stats[1] <= 1.0e-4 && raw.stats[3] <= 1.0e-4 &&
+    std::max({raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
+  if (!in || !finite_stats || raw.stats[16] != r.fd_step ||
+      (version == 1 ? !legacy_checks : !analytic_checks))
     throw std::runtime_error("qNEP raw finite-difference diagnostics fail accepted limits");
   r.energy_gradient_relative_error = raw.stats[0];
   r.force_gradient_relative_error = raw.stats[4];

@@ -44,6 +44,20 @@ struct PPPMAssignmentStencilDebug
   float W, qW;
 };
 
+__host__ __device__ inline float pppm_reference_weight(
+  const float coeff[5][5], const int stencil, const float delta)
+{
+  return (((coeff[stencil][4] * delta + coeff[stencil][3]) * delta + coeff[stencil][2]) * delta +
+          coeff[stencil][1]) * delta + coeff[stencil][0];
+}
+
+__host__ __device__ inline float pppm_reference_weight_derivative(
+  const float coeff[5][5], const int stencil, const float delta)
+{
+  return ((4.0f * coeff[stencil][4] * delta + 3.0f * coeff[stencil][3]) * delta +
+          2.0f * coeff[stencil][2]) * delta + coeff[stencil][1];
+}
+
 class PPPM
 {
 public:
@@ -102,6 +116,19 @@ public:
     GPU_Vector<double>& potential_per_atom,
     const bool request_peratom_virial = false,
     const unsigned long long force_evaluation_id = 0);
+  // Uses only the last single-frame mesh; positions must be in the primary periodic cell.
+  // Pass all three tangent pointers or none (gradient-only, with no FFT).
+  bool compute_reference_energy_tangent(
+    const int N,
+    const Box& box,
+    const GPU_Vector<float>& charge,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>* direction,
+    const GPU_Vector<double>* charge_direction,
+    const unsigned long long force_evaluation_id,
+    GPU_Vector<double>* dsite,
+    GPU_Vector<double>& explicit_space_gradient,
+    GPU_Vector<double>& native_ik_force);
   void find_force_batch(
     const int N,
     const int N1,
@@ -170,6 +197,8 @@ private:
   GPU_Vector<gpufftComplex> mesh_x;
   GPU_Vector<gpufftComplex> mesh_y;
   GPU_Vector<gpufftComplex> mesh_z;
+  GPU_Vector<double> reference_delta_Q_;
+  GPU_Vector<gpufftComplex> reference_delta_phi_;
   bool debug_requested_ = false;
   int debug_call_index_ = 0;
   std::string debug_prefix_;
@@ -228,6 +257,7 @@ private:
   gpufftHandle plan = 0;
   bool plan_initialized = false;
   bool current_force_mesh_valid_ = false;
+  bool current_force_mesh_peratom_ = false;
   unsigned long long current_force_mesh_force_evaluation_id_ = 0;
   int current_force_mesh_N_ = -1;
   int current_force_mesh_N1_ = -1;
@@ -255,7 +285,8 @@ private:
     const Box& box,
     const GPU_Vector<float>& charge,
     const GPU_Vector<double>& position,
-    const unsigned long long force_evaluation_id) const;
+    const unsigned long long force_evaluation_id,
+    const bool require_orthogonal = true) const;
   void resize_dynamic_charge_workspace(const int M, const bool diagnostic);
   void prepare_dynamic_operator(const int N, const Box& box, const int grid_size);
   void cache_dynamic_operator_on_host();
