@@ -2410,7 +2410,7 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
     const double energy0 = total_energy(reference);
     double energy_min = energy0, energy_max = energy0;
     double force_repeat_diff2 = 0.0, virial_repeat_diff2 = 0.0;
-    for (int repeat = 1; repeat < 3; ++repeat) {
+    for (int repeat = 0; repeat < 2; ++repeat) {
       const double energy = total_energy(repeated_reference[repeat]);
       energy_min = std::min(energy_min, energy);
       energy_max = std::max(energy_max, energy);
@@ -2439,7 +2439,39 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       analytic_gradient.copy_to_host(host_gradient.data());
       require_finite(host_gradient, "qNEP diagnostic analytic gradient");
       double force_gradient_diff2 = 0.0, force_gradient_scale2 = 0.0;
+      double all_coordinate_diff2 = 0.0, native_force_scale2 = 0.0;
+      double axis_diff2[3] = {};
+      double max_abs_error = 0.0;
+      int max_coordinate = 0, coordinates_over_tolerance = 0;
       double jvp_identity_diff2 = 0.0, jvp_identity_scale2 = 0.0;
+      for (int coordinate = 0; coordinate < d; ++coordinate) {
+        const double error = host_gradient[coordinate] + reference.force[coordinate];
+        const double abs_error = std::abs(error);
+        if (!std::isfinite(error))
+          throw std::runtime_error("qNEP rpmd_ja all-coordinate gradient diagnostic produced a non-finite residual");
+        all_coordinate_diff2 += error * error;
+        native_force_scale2 += reference.force[coordinate] * reference.force[coordinate];
+        axis_diff2[coordinate / n] += error * error;
+        if (abs_error > max_abs_error) {
+          max_abs_error = abs_error;
+          max_coordinate = coordinate;
+        }
+        if (abs_error > kForceTolerance) ++coordinates_over_tolerance;
+      }
+      const double all_coordinate_abs = std::sqrt(all_coordinate_diff2 / d);
+      const double all_coordinate_relative = std::sqrt(all_coordinate_diff2 / std::max(native_force_scale2, 1.0e-300));
+      const bool all_coordinate_pass = all_coordinate_abs <= kForceTolerance;
+      if (!std::isfinite(all_coordinate_abs) || !std::isfinite(all_coordinate_relative))
+        throw std::runtime_error("qNEP rpmd_ja all-coordinate gradient diagnostic produced non-finite RMS values");
+      const int max_atom = max_coordinate % n;
+      const int max_axis = max_coordinate / n;
+      const char* axis_name[3] = {"x", "y", "z"};
+      std::printf("  full-qNEP all-coordinate gradient check: coordinates=%d, abs RMS %.6g eV/A, relative %.6g, limit=%.1e eV/A, %s (this check only; not reference-generation acceptance).\n",
+        d, all_coordinate_abs, all_coordinate_relative, kForceTolerance,
+        all_coordinate_pass ? "PASS" : "FAIL");
+      std::printf("    axis abs RMS x/y/z %.6g %.6g %.6g eV/A; max|e| %.6g eV/A at atom %d (0-based) axis %s type %d; coordinates |e|>tol %d.\n",
+        std::sqrt(axis_diff2[0] / n), std::sqrt(axis_diff2[1] / n), std::sqrt(axis_diff2[2] / n),
+        max_abs_error, max_atom, axis_name[max_axis], atom.cpu_type[max_atom], coordinates_over_tolerance);
       std::vector<double> unit_direction(static_cast<std::size_t>(3) * n, 0.0);
       std::vector<double> host_jvp(n);
       for (int coordinate : coordinates) {
@@ -2471,7 +2503,7 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       if (!std::isfinite(jvp_identity_abs) || !std::isfinite(jvp_identity_relative) ||
           !std::isfinite(force_gradient_abs) || !std::isfinite(force_gradient_relative))
         throw std::runtime_error("qNEP rpmd_ja analytic diagnostic produced non-finite RMS values");
-      std::printf("  full-qNEP analytic checks: JVP-gradient identity abs RMS %.6g, relative %.6g; analytic-gradient/native-force difference RMS %.6g, relative %.6g eV/A.\n",
+      std::printf("  full-qNEP analytic checks: JVP-gradient identity abs RMS %.6g, relative %.6g; sampled analytic-gradient/native-force difference RMS %.6g eV/A, relative %.6g.\n",
         jvp_identity_abs, jvp_identity_relative, force_gradient_abs, force_gradient_relative);
     }
 
