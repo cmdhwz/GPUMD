@@ -1176,6 +1176,25 @@ std::uint64_t rpmd_ja_model_fingerprint(const std::string& path)
 
 namespace
 {
+void print_qnep_precheck_table(const double h, const char* label,
+  const double gradient, const bool gradient_pass, const double jvp, const bool jvp_pass,
+  const double k, const bool k_pass, const double c[3], const bool c_pass[3],
+  const bool v_finite, const bool overall_failed, const bool requested_h)
+{
+  const auto status = [](const bool pass) { return pass ? "PASS" : "FAIL"; };
+  std::printf("    %s precheck h=%.6g A%s\n", label, h, requested_h ? " (REQUESTED fd_step)" : "");
+  std::printf("    %-25s %12s %-12s %12s %-6s\n", "Check", "Value", "Units", "Max/Required", "Result");
+  std::printf("    %-25s %12.4g %-12s %12.4g %-6s\n", "Gradient/native force RMS", gradient, "eV/A", kForceTolerance, status(gradient_pass));
+  std::printf("    %-25s %12.4g %-12s %12.4g %-6s\n", "Site JVP/gradient RMS", jvp, "eV/A", kForceTolerance, status(jvp_pass));
+  std::printf("    %-25s %11.4g%% %-12s %11.4g%% %-6s\n", "K stencil", 100.0 * k, "relative", 100.0 * kDifferenceTolerance, status(k_pass));
+  for (int alpha = 0; alpha < 3; ++alpha)
+    std::printf("    %-25s %11.4g%% %-12s %11.4g%% %-6s\n", alpha == 0 ? "Cx stencil" : alpha == 1 ? "Cy stencil" : "Cz stencil",
+      100.0 * c[alpha], "relative", 100.0 * kDifferenceTolerance,
+      status(c_pass[alpha]));
+  std::printf("    %-25s %12s %-12s %12s %-6s\n", "V finite", v_finite ? "yes" : "no", "-", "finite", status(v_finite));
+  std::printf("    Overall: %s\n", overall_failed ? "FAIL" : "PASS");
+}
+
 std::uint64_t qnep_config_fingerprint(Force& force, NEP_Charge& qnep, const double mesh_spacing)
 {
   if (force.get_run_input().contains("dftd3"))
@@ -2310,6 +2329,19 @@ static void generate_rpmd_ja_qnep_raw_reference(
     precheck_force_gradient_abs > kForceTolerance || precheck_identity_abs > kForceTolerance ||
     precheck_k > kDifferenceTolerance || precheck_c[0] > kDifferenceTolerance ||
     precheck_c[1] > kDifferenceTolerance || precheck_c[2] > kDifferenceTolerance;
+  const bool precheck_gradient_pass = std::isfinite(precheck_force_gradient_abs) && precheck_force_gradient_abs <= kForceTolerance;
+  const bool precheck_jvp_pass = std::isfinite(precheck_identity_abs) && std::isfinite(precheck_identity_relative) &&
+    precheck_identity_abs <= kForceTolerance;
+  const bool precheck_k_pass = std::isfinite(precheck_k) && precheck_k <= kDifferenceTolerance;
+  const bool precheck_c_pass[3] = {
+    std::isfinite(precheck_c[0]) && precheck_c[0] <= kDifferenceTolerance,
+    std::isfinite(precheck_c[1]) && precheck_c[1] <= kDifferenceTolerance,
+    std::isfinite(precheck_c[2]) && precheck_c[2] <= kDifferenceTolerance};
+  const bool precheck_v_finite = std::isfinite(precheck_v);
+  print_qnep_precheck_table(fd_step, "Generation", precheck_force_gradient_abs, precheck_gradient_pass,
+    precheck_identity_abs, precheck_jvp_pass, precheck_k, precheck_k_pass, precheck_c, precheck_c_pass,
+    precheck_v_finite, precheck_failed, false);
+  std::fflush(stdout);
   if (precheck_failed) {
     std::ostringstream failure;
     failure << "qNEP rpmd_ja sampled stencil-step consistency check failed; raw generation stopped early: fd_step="
@@ -2740,6 +2772,8 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
   double r0_gradient_native_abs = 0.0, r0_site_jvp_abs = 0.0;
   bool r0_jvp_pass = false;
   int r0_jvp_worst_coordinate = 0;
+  int precheck_steps_passed = 0, precheck_steps_total = 0;
+  bool requested_h_seen = false, requested_h_pass = false;
   for (int mode = 0; mode < 2; ++mode) {
     std::array<QEvaluation, 3> repeated_reference;
     for (int repeat = 0; repeat < 3; ++repeat) {
@@ -3033,6 +3067,21 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           std::sqrt(c_precheck_delta2[2] / std::max(c_precheck_d4_norm2[2], 1.0e-300))};
         const double v_precheck_relative = std::sqrt(v_precheck_delta2 / std::max(v_precheck_d4_norm2, 1.0e-300));
         v_stencil_finite = v_stencil_finite && std::isfinite(v_precheck_relative);
+        const bool gradient_pass = std::isfinite(r0_gradient_native_abs) && r0_gradient_native_abs <= kForceTolerance;
+        const bool jvp_pass = std::isfinite(r0_site_jvp_abs) && r0_site_jvp_abs <= kForceTolerance;
+        const bool k_pass = std::isfinite(precheck_k_relative) && precheck_k_relative <= kDifferenceTolerance;
+        const bool c_pass[3] = {
+          std::isfinite(precheck_c_relative[0]) && precheck_c_relative[0] <= kDifferenceTolerance,
+          std::isfinite(precheck_c_relative[1]) && precheck_c_relative[1] <= kDifferenceTolerance,
+          std::isfinite(precheck_c_relative[2]) && precheck_c_relative[2] <= kDifferenceTolerance};
+        const bool precheck_failed = !gradient_pass || !jvp_pass || !k_pass || !c_pass[0] || !c_pass[1] ||
+          !c_pass[2] || !v_stencil_finite;
+        print_qnep_precheck_table(h, "full-qNEP", r0_gradient_native_abs, gradient_pass,
+          r0_site_jvp_abs, jvp_pass, precheck_k_relative, k_pass, precheck_c_relative, c_pass,
+          v_stencil_finite, precheck_failed, h == fd_step);
+        ++precheck_steps_total;
+        if (!precheck_failed) ++precheck_steps_passed;
+        if (h == fd_step) { requested_h_seen = true; requested_h_pass = !precheck_failed; }
         const int ia = worst_input % n, ix = worst_input / n, oa = worst_output % n, ox = worst_output / n;
         std::printf("    analytic-gradient Hessian sampled D4 norm %.6g eV/A2; D2(h)-D2(2h) abs RMS %.6g eV/A2, relative-to-D4 %.6g (limit %.3g) %s; worst analytic column input atom %d type %d axis %s -> output atom %d type %d axis %s, column-relative %.6g.\n",
           std::sqrt(analytic_d4_norm2), abs_rms, relative, kDifferenceTolerance,
@@ -3049,11 +3098,11 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           if (!first_fail) summary << ',';
           summary << item; first_fail = false;
         };
-        if (!std::isfinite(r0_gradient_native_abs) || r0_gradient_native_abs > kForceTolerance) fail("gradient_native_force");
-        if (!std::isfinite(r0_site_jvp_abs) || r0_site_jvp_abs > kForceTolerance) fail("site_jvp_gradient");
-        if (!std::isfinite(precheck_k_relative) || precheck_k_relative > kDifferenceTolerance) fail("K");
+        if (!gradient_pass) fail("gradient_native_force");
+        if (!jvp_pass) fail("site_jvp_gradient");
+        if (!k_pass) fail("K");
         for (int alpha = 0; alpha < 3; ++alpha)
-          if (!std::isfinite(precheck_c_relative[alpha]) || precheck_c_relative[alpha] > kDifferenceTolerance)
+          if (!c_pass[alpha])
             fail(alpha == 0 ? "Cx" : alpha == 1 ? "Cy" : "Cz");
         if (!v_stencil_finite) fail("V_non_finite");
         if (first_fail) summary << "none";
@@ -3080,6 +3129,9 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       target_spacing, std::sqrt(delta2 / d), std::sqrt(gradient2 / d), std::sqrt(native_mismatch2 / d));
     std::fflush(stdout);
   }
+  std::printf("rpmd_ja requested-h precheck: %s; sampled full-qNEP h steps PASS=%d/%d; SAMPLED PRECHECK ONLY / full reference acceptance still required.\n",
+    requested_h_seen && requested_h_pass ? "PASS" : "FAIL", precheck_steps_passed, precheck_steps_total);
+  std::fflush(stdout);
   const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   std::printf("rpmd_ja diagnose completed: evaluations=%llu, elapsed %.3f s; diagnostics only, no reference produced.\n",
     static_cast<unsigned long long>(evaluations), elapsed);

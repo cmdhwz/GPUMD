@@ -24,6 +24,14 @@ assert "diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force)" in sample_di
 fit_wrapper = native[native.index("void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options"):native.index("void diagnose_rpmd_ja_native_fit_samples(")]
 assert "diagnose_rpmd_ja_qnep_reference" not in fit_wrapper
 assert "const bool precheck_failed" in text and "throw std::runtime_error(failure.str())" in text
+precheck_table = text[text.index("void print_qnep_precheck_table("):text.index("std::uint64_t qnep_config_fingerprint(")]
+assert "100.0 * k" in precheck_table and "100.0 * c[alpha]" in precheck_table
+generation = text[text.index("static void generate_rpmd_ja_qnep_raw_reference("):text.index("void diagnose_rpmd_ja_qnep_reference(")]
+assert generation.index("print_qnep_precheck_table(") < generation.index("if (precheck_failed)") < generation.index("throw std::runtime_error(failure.str())")
+diagnose = text[text.index("void diagnose_rpmd_ja_qnep_reference("):]
+assert "print_qnep_precheck_table(h, \"full-qNEP\"" in diagnose
+assert "h == fd_step" in diagnose and "(REQUESTED fd_step)" in precheck_table
+assert "requested-h precheck:" in diagnose and "SAMPLED PRECHECK ONLY / full reference acceptance still required" in diagnose
 assert "rpmd_ja_reference_math::central_difference_4th(g[0][r], g[1][r], g[2][r], g[3][r], h)" in text
 assert "precheck-matched summary h=" in text and "std::fflush(stdout)" in text
 
