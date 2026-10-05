@@ -290,9 +290,7 @@ QuantumHeatMoments::QuantumHeatMoments(const char** param, const int num_param)
   exact_mu2_enabled_ = exact_static_max_order_ >= 2;
   exact_mu4_enabled_ = exact_static_max_order_ >= 4;
   exact_mu6_enabled_ = false;
-  required_operator_order_ = std::max(
-    exact_mu4_enabled_ ? 2 : exact_mu2_enabled_ ? 1 : exact_mu0_enabled_ ? 0 : 0,
-    weyl_max_order_ / 2);
+  required_operator_order_ = std::max(exact_mu4_enabled_ ? 2 : exact_mu2_enabled_ ? 1 : 0, weyl_max_order_ / 2);
   if (weyl_max_order_ > 0 && n_moyal_probe_ == 0)
     PRINT_INPUT_ERROR("n_moyal_probe must be positive when weyl_max_order is nonzero.");
   if (exact_mu2_enabled_ && n_moyal_probe_ == 0)
@@ -359,7 +357,8 @@ void QuantumHeatMoments::pre_run(
     PRINT_INPUT_ERROR("compute_quantum_heat_moments requires complete ring-polymer bead arrays.");
   if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
     PRINT_INPUT_ERROR("compute_quantum_heat_moments requires three-dimensional PBC.");
-  if (force.potentials.size() != 1 || dynamic_cast<NEP*>(force.potentials[0].get()) == nullptr) {
+  auto* active_nep = force.potentials.size() == 1 ? dynamic_cast<NEP*>(force.potentials[0].get()) : nullptr;
+  if (active_nep == nullptr) {
     PRINT_INPUT_ERROR("compute_quantum_heat_moments requires one pure NEP potential; qNEP is rejected by default.");
   }
   number_of_atoms_ = atom.number_of_atoms;
@@ -421,7 +420,6 @@ void QuantumHeatMoments::pre_run(
   if (output_level_ == 2 && number_of_atoms_ > 128 && !force_debug_large_)
     PRINT_INPUT_ERROR("debug output for N>128 requires force_debug_large yes.");
 
-  auto* active_nep = dynamic_cast<NEP*>(force.potentials[0].get());
   if (!active_nep->supports_local_edge_derivatives())
     PRINT_INPUT_ERROR("NEP with DFTD3 or ZBL corrections has no supported edge-resolved current path.");
   model_path_storage_ = force.primary_nep_model_path();
