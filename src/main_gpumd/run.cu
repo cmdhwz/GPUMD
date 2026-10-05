@@ -70,6 +70,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/proton_tunneling.cuh"
 #include "measure/rpmd_ja_reference.cuh"
 #include "measure/rpmd_ja_fit.cuh"
+#include "measure/rpmd_ja_native_fit.cuh"
 #include "measure/rpmd_ja_qnep_prepare.cuh"
 #include "measure/rdf.cuh"
 #include "measure/sdc.cuh"
@@ -722,7 +723,7 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, diagnose_samples <samples_file> <fd_step>, generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
@@ -774,6 +775,25 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     if (end == tokens[2].c_str() || *end != '\0' || !std::isfinite(fd_step) || fd_step <= 0.0)
       PRINT_INPUT_ERROR("rpmd_ja diagnose fd_step must be a positive finite number.");
     diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force);
+    return;
+  }
+  if (tokens[1] == "diagnose_samples") {
+    if (tokens.size() != 4) PRINT_INPUT_ERROR("rpmd_ja diagnose_samples requires <samples_file> <fd_step>.");
+    if (integrate.has_ensemble() || global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_samples must appear after potential and before any ensemble or run.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_samples requires exactly one qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    if (active_qnep == nullptr || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+        !active_qnep->uses_pppm())
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_samples supports qNEP charge mode 1 or 2 with PPPM only.");
+    if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_samples requires fully periodic boundaries.");
+    char* end = nullptr;
+    const double fd_step = std::strtod(tokens[3].c_str(), &end);
+    if (end == tokens[3].c_str() || *end != '\0' || !std::isfinite(fd_step) || fd_step <= 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_samples fd_step must be a positive finite number.");
+    diagnose_rpmd_ja_native_fit_samples(tokens[2], fd_step, atom, box, force);
     return;
   }
   if (tokens[1] == "generate" || tokens[1] == "generate_sparse") {

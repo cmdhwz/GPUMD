@@ -3,8 +3,21 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <sstream>
 
+static std::vector<double> diagnostic_expected_r0;
+static bool diagnostic_should_throw = false;
+
+Force::Force(void) {}
+void diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&)
+{
+  std::vector<double> x(diagnostic_expected_r0.size());
+  atom.position_per_atom.copy_to_host(x.data());
+  for (std::size_t i = 0; i < x.size(); ++i) assert(std::abs(x[i] - diagnostic_expected_r0[i]) < 1e-12);
+  if (diagnostic_should_throw) throw std::runtime_error("diagnostic test failure");
+}
 void generate_rpmd_ja_qnep_raw(const std::string&, double, double, const std::string&, Atom&, Box&, Force&) {}
 void prepare_rpmd_ja_qnep_reference(const std::string&, const std::string&, const std::string&,
                                     const RpmdJAModeValidator&, const std::string&) {}
@@ -13,6 +26,112 @@ std::uint64_t rpmd_ja_model_fingerprint(const std::string&) { return 0; }
 
 namespace
 {
+std::string write_sample_spool(const std::string& suffix, const int frames)
+{
+  const std::string path = "rpmd_ja_native_samples_test_" +
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + suffix;
+  std::ofstream out(path, std::ios::binary);
+  const char magic[8] = {'G','P','J','A','S','M','P','1'};
+  const std::uint32_t version = 1, endian = native_endian;
+  const std::int32_t n = 2, beads = 4;
+  const double temperature = 300.0;
+  const double cell[9] = {10,0,0, 0,10,0, 0,0,10};
+  const double masses[2] = {1.0,2.0};
+  const std::int32_t types[2] = {0,1};
+  out.write(magic, sizeof(magic));
+  out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+  out.write(reinterpret_cast<const char*>(&endian), sizeof(endian));
+  out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+  out.write(reinterpret_cast<const char*>(&beads), sizeof(beads));
+  out.write(reinterpret_cast<const char*>(&temperature), sizeof(temperature));
+  out.write(reinterpret_cast<const char*>(cell), sizeof(cell));
+  out.write(reinterpret_cast<const char*>(masses), sizeof(masses));
+  out.write(reinterpret_cast<const char*>(types), sizeof(types));
+  for (int frame = 0; frame < frames; ++frame) {
+    const double step = 5.0 + 2.5 * frame;
+    double x[6], f[6];
+    for (int i = 0; i < 6; ++i) { x[i] = 0.1 + 0.01 * frame; f[i] = -0.2; }
+    out.write(reinterpret_cast<const char*>(&step), sizeof(step));
+    out.write(reinterpret_cast<const char*>(x), sizeof(x));
+    out.write(reinterpret_cast<const char*>(f), sizeof(f));
+  }
+  assert(out.good());
+  return path;
+}
+
+struct RemoveTestFile { std::string path; ~RemoveTestFile() { std::remove(path.c_str()); } };
+
+void test_saved_sample_diagnostic()
+{
+  const std::string path = write_sample_spool(".bin", 3);
+  RemoveTestFile cleanup{path};
+  Atom atom;
+  atom.number_of_atoms = 2;
+  atom.cpu_mass = {1.0, 2.0};
+  atom.cpu_type = {0, 1};
+  atom.number_of_beads = 0;
+  atom.position_per_atom.resize(6);
+  std::vector<double> before = {0.7,0.8,0.9,1.0,1.1,1.2};
+  atom.position_per_atom.copy_from_host(before.data());
+  Box box{};
+  box.cpu_h[0] = box.cpu_h[4] = box.cpu_h[8] = 10.0;
+  box.cpu_h[9] = box.cpu_h[13] = box.cpu_h[17] = 0.1;
+
+  {
+    std::ifstream in(path, std::ios::binary);
+    const auto header = read_header(in, 0, atom, box, 0.0, true);
+    assert(header.frame_count == 3 && header.beads == 4 && header.temperature == 300.0);
+  }
+  atom.number_of_beads = 4;
+  {
+    std::ifstream in(path, std::ios::binary);
+    bool rejected = false;
+    try { (void)read_header(in, 0, atom, box, 300.0); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected);
+  }
+  atom.number_of_beads = 0;
+  atom.cpu_mass[0] = 3.0;
+  {
+    std::ifstream in(path, std::ios::binary);
+    bool rejected = false;
+    try { (void)read_header(in, 0, atom, box, 0.0, true); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected);
+  }
+  atom.cpu_mass[0] = 1.0;
+
+  diagnostic_expected_r0.assign(6, 0.105);
+  Force force;
+  diagnose_rpmd_ja_native_fit_samples(path, 1e-4, atom, box, force);
+  std::vector<double> after(6);
+  atom.position_per_atom.copy_to_host(after.data());
+  assert(after == before);
+  diagnostic_should_throw = true;
+  bool failed = false;
+  try { diagnose_rpmd_ja_native_fit_samples(path, 1e-4, atom, box, force); }
+  catch (const std::runtime_error&) { failed = true; }
+  diagnostic_should_throw = false;
+  assert(failed);
+  atom.position_per_atom.copy_to_host(after.data());
+  assert(after == before);
+
+  const std::string truncated_path = write_sample_spool(".truncated", 3);
+  RemoveTestFile truncated_cleanup{truncated_path};
+  std::ifstream source(truncated_path, std::ios::binary);
+  std::string bytes((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  source.close();
+  bytes.pop_back();
+  std::ofstream truncated(truncated_path, std::ios::binary | std::ios::trunc);
+  truncated.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  truncated.close();
+  std::ifstream invalid(truncated_path, std::ios::binary);
+  bool rejected = false;
+  try { (void)read_header(invalid, 0, atom, box, 0.0, true); }
+  catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected);
+}
+
 void check_close(const double a, const double b, const double tol=2e-9)
 {
   assert(std::abs(a-b)<=tol*std::max({1.0,std::abs(a),std::abs(b)}));
@@ -237,6 +356,7 @@ void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
 
 int main()
 {
+  test_saved_sample_diagnostic();
   test_design_and_edge_operator();
   test_pap_baseline();
   DeviceQR qr;qr.initialize(2,3);

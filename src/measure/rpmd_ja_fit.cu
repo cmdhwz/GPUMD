@@ -1,5 +1,6 @@
 #include "rpmd_ja_fit.cuh"
 
+#include "rpmd_ja_fit_sampling.cuh"
 #include "rpmd_ja_native_fit.cuh"
 #include "rpmd_ja_reference.cuh"
 #include "integrate/integrate.cuh"
@@ -38,6 +39,11 @@ bool file_exists(const std::string& path)
   return in.good();
 }
 
+bool apply_fit_mic(const Box& box, double& x, double& y, double& z)
+{
+  return rpmd_ja_fit_mic(box.cpu_h + 9, box.cpu_h, x, y, z);
+}
+
 void write_or_throw(std::ofstream& out, const void* data, const std::size_t bytes)
 {
   if (bytes > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
@@ -45,21 +51,6 @@ void write_or_throw(std::ofstream& out, const void* data, const std::size_t byte
   }
   out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
   if (!out) throw std::runtime_error("failed writing RPMD-JA sample spool");
-}
-
-bool apply_fit_mic(const Box& box, double& x, double& y, double& z)
-{
-  double sx = box.cpu_h[9] * x + box.cpu_h[10] * y + box.cpu_h[11] * z;
-  double sy = box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z;
-  double sz = box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z;
-  if (!std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(sz)) return false;
-  if (box.pbc_x) sx -= std::nearbyint(sx);
-  if (box.pbc_y) sy -= std::nearbyint(sy);
-  if (box.pbc_z) sz -= std::nearbyint(sz);
-  x = box.cpu_h[0] * sx + box.cpu_h[1] * sy + box.cpu_h[2] * sz;
-  y = box.cpu_h[3] * sx + box.cpu_h[4] * sy + box.cpu_h[5] * sz;
-  z = box.cpu_h[6] * sx + box.cpu_h[7] * sy + box.cpu_h[8] * sz;
-  return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
 }
 
 } // namespace
@@ -195,13 +186,20 @@ void RpmdJA_Fit::pre_run(
   const std::size_t coordinates = static_cast<std::size_t>(number_of_atoms_) * 3;
   previous_centroid_.resize(coordinates);
   centroid_.resize(coordinates);
-  mic_centroid_.resize(coordinates);
-  ring_first_.resize(coordinates);
-  bead_position_.resize(coordinates);
-  previous_bead_.resize(coordinates);
-  bead_force_.resize(coordinates);
   mean_force_.resize(coordinates);
   frame_buffer_.resize(1 + 2 * coordinates);
+  bead_position_ptrs_.resize(number_of_beads_);
+  bead_force_ptrs_.resize(number_of_beads_);
+  for (int bead = 0; bead < number_of_beads_; ++bead) {
+    bead_position_ptrs_[bead] = atom.position_beads[bead].data();
+    bead_force_ptrs_[bead] = atom.force_beads[bead].data();
+  }
+  bead_position_ptrs_gpu_.resize(number_of_beads_);
+  bead_force_ptrs_gpu_.resize(number_of_beads_);
+  bead_position_ptrs_gpu_.copy_from_host(bead_position_ptrs_.data());
+  bead_force_ptrs_gpu_.copy_from_host(bead_force_ptrs_.data());
+  sample_output_.resize(static_cast<std::size_t>(10) * number_of_atoms_);
+  sample_output_gpu_.resize(sample_output_.size());
   force_ = &force;
 
   lock_file_ = std::fopen(lock_path_.c_str(), "wx");
@@ -259,54 +257,43 @@ void RpmdJA_Fit::post_force(
   if (pbc_[0] != box.pbc_x || pbc_[1] != box.pbc_y || pbc_[2] != box.pbc_z) {
     PRINT_INPUT_ERROR("rpmd_ja fit detected changing periodic boundary conditions during sampling.");
   }
-  std::fill(centroid_.begin(), centroid_.end(), 0.0);
-  std::fill(mic_centroid_.begin(), mic_centroid_.end(), 0.0);
-  std::fill(mean_force_.begin(), mean_force_.end(), 0.0);
-  double coordinate_scale = 1.0;
-
+  bool refresh_pointers = false;
   for (int bead = 0; bead < number_of_beads_; ++bead) {
-    atom.position_beads[bead].copy_to_host(bead_position_.data());
-    atom.force_beads[bead].copy_to_host(bead_force_.data());
-    if (bead == 0) {
-      previous_bead_ = bead_position_;
-      ring_first_ = bead_position_;
-      for (std::size_t i = 0; i < coordinates; ++i) centroid_[i] = bead_position_[i] / number_of_beads_;
-    } else {
-      for (int atom_id = 0; atom_id < number_of_atoms_; ++atom_id) {
-        const std::size_t x = static_cast<std::size_t>(atom_id);
-        const std::size_t y = x + number_of_atoms_;
-        const std::size_t z = y + number_of_atoms_;
-        double dx = bead_position_[x] - previous_bead_[x];
-        double dy = bead_position_[y] - previous_bead_[y];
-        double dz = bead_position_[z] - previous_bead_[z];
-        if (!apply_fit_mic(box, dx, dy, dz)) PRINT_INPUT_ERROR("rpmd_ja fit MIC produced a non-finite displacement.");
-        previous_bead_[x] += dx;
-        previous_bead_[y] += dy;
-        previous_bead_[z] += dz;
-        centroid_[x] += previous_bead_[x] / number_of_beads_;
-        centroid_[y] += previous_bead_[y] / number_of_beads_;
-        centroid_[z] += previous_bead_[z] / number_of_beads_;
-      }
+    const double* position = atom.position_beads[bead].data();
+    const double* force = atom.force_beads[bead].data();
+    if (position != bead_position_ptrs_[bead] || force != bead_force_ptrs_[bead]) {
+      bead_position_ptrs_[bead] = position;
+      bead_force_ptrs_[bead] = force;
+      refresh_pointers = true;
     }
-    for (std::size_t i = 0; i < coordinates; ++i) {
-      if (!std::isfinite(bead_position_[i]) || !std::isfinite(bead_force_[i])) {
-        PRINT_INPUT_ERROR("rpmd_ja fit encountered a nonfinite bead position or physical force.");
-      }
-      coordinate_scale = std::max(coordinate_scale, std::abs(bead_position_[i]));
-      mean_force_[i] += bead_force_[i] / number_of_beads_;
-    }
-    for (int atom_id = 0; atom_id < number_of_atoms_; ++atom_id) {
-      const std::size_t x = static_cast<std::size_t>(atom_id);
-      const std::size_t y = x + number_of_atoms_;
-      const std::size_t z = y + number_of_atoms_;
-      double dx = bead_position_[x] - ring_first_[x];
-      double dy = bead_position_[y] - ring_first_[y];
-      double dz = bead_position_[z] - ring_first_[z];
-      if (!apply_fit_mic(box, dx, dy, dz)) PRINT_INPUT_ERROR("rpmd_ja fit MIC produced a non-finite displacement.");
-      mic_centroid_[x] += dx / number_of_beads_;
-      mic_centroid_[y] += dy / number_of_beads_;
-      mic_centroid_[z] += dz / number_of_beads_;
-    }
+  }
+  if (refresh_pointers) {
+    bead_position_ptrs_gpu_.copy_from_host(bead_position_ptrs_.data());
+    bead_force_ptrs_gpu_.copy_from_host(bead_force_ptrs_.data());
+  }
+  RpmdJAFitCell sampling_box;
+  for (int i = 0; i < 9; ++i) {
+    sampling_box.cell[i] = box.cpu_h[i];
+    sampling_box.inverse[i] = box.cpu_h[9 + i];
+  }
+  constexpr int block_size = 128;
+  rpmd_ja_fit_sampling_kernel<<<(number_of_atoms_ + block_size - 1) / block_size, block_size>>>(
+    number_of_atoms_, number_of_beads_, bead_position_ptrs_gpu_.data(),
+    bead_force_ptrs_gpu_.data(), sampling_box, sample_output_gpu_.data());
+  GPU_CHECK_KERNEL
+  sample_output_gpu_.copy_to_host(sample_output_.data());
+
+  const std::size_t atom_count = static_cast<std::size_t>(number_of_atoms_);
+  std::copy(sample_output_.begin(), sample_output_.begin() + coordinates, centroid_.begin());
+  std::copy(sample_output_.begin() + coordinates, sample_output_.begin() + 2 * coordinates, mean_force_.begin());
+  double coordinate_scale = 1.0;
+  for (int atom_id = 0; atom_id < number_of_atoms_; ++atom_id) {
+    const unsigned int error = static_cast<unsigned int>(sample_output_[9 * atom_count + atom_id]);
+    if (error & 3) PRINT_INPUT_ERROR("rpmd_ja fit encountered a nonfinite bead position or physical force.");
+    if (error & (4 | 8)) PRINT_INPUT_ERROR("rpmd_ja fit MIC produced a non-finite displacement.");
+    if (error & 16) PRINT_INPUT_ERROR("rpmd_ja fit MIC produced a non-finite ring closure.");
+    if (error & (32 | 64)) PRINT_INPUT_ERROR("rpmd_ja fit produced a non-finite winding or branch norm.");
+    coordinate_scale = std::max(coordinate_scale, sample_output_[6 * atom_count + atom_id]);
   }
   double box_scale = 1.0;
   for (int i = 0; i < 9; ++i) box_scale = std::max(box_scale, std::abs(box.cpu_h[i]));
@@ -316,23 +303,10 @@ void RpmdJA_Fit::post_force(
   const double ring_tolerance = 128.0 * std::numeric_limits<double>::epsilon() *
     number_of_beads_ * std::max(box_scale, coordinate_scale);
   for (int atom_id = 0; atom_id < number_of_atoms_; ++atom_id) {
-    const std::size_t x = static_cast<std::size_t>(atom_id);
-    const std::size_t y = x + number_of_atoms_;
-    const std::size_t z = y + number_of_atoms_;
-    double close_x = ring_first_[x] - previous_bead_[x];
-    double close_y = ring_first_[y] - previous_bead_[y];
-    double close_z = ring_first_[z] - previous_bead_[z];
-    if (!apply_fit_mic(box, close_x, close_y, close_z)) PRINT_INPUT_ERROR("rpmd_ja fit MIC produced a non-finite ring closure.");
-    const double winding_x = previous_bead_[x] - ring_first_[x] + close_x;
-    const double winding_y = previous_bead_[y] - ring_first_[y] + close_y;
-    const double winding_z = previous_bead_[z] - ring_first_[z] + close_z;
-    if (std::sqrt(winding_x * winding_x + winding_y * winding_y + winding_z * winding_z) > ring_tolerance) {
+    if (sample_output_[7 * atom_count + atom_id] > ring_tolerance) {
       PRINT_INPUT_ERROR("rpmd_ja fit rejected a ring path with nonzero periodic winding.");
     }
-    double branch_x = centroid_[x] - (ring_first_[x] + mic_centroid_[x]);
-    double branch_y = centroid_[y] - (ring_first_[y] + mic_centroid_[y]);
-    double branch_z = centroid_[z] - (ring_first_[z] + mic_centroid_[z]);
-    if (std::sqrt(branch_x * branch_x + branch_y * branch_y + branch_z * branch_z) > ring_tolerance) {
+    if (sample_output_[8 * atom_count + atom_id] > ring_tolerance) {
       PRINT_INPUT_ERROR("rpmd_ja fit ring-unwrapped centroid differs from the bead-0 MIC centroid.");
     }
   }

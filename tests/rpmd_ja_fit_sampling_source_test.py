@@ -12,6 +12,7 @@ def source(path):
 run = source("src/main_gpumd/run.cu")
 measure = source("src/measure/measure.cu")
 sampler = source("src/measure/rpmd_ja_fit.cu")
+sampling = source("src/measure/rpmd_ja_fit_sampling.cuh")
 native_header = source("src/measure/rpmd_ja_native_fit.cuh")
 sampler_fit = source("src/measure/rpmd_ja_fit.cu")
 
@@ -25,9 +26,22 @@ force_call = run.index("compute_force();", run.index("for (int step = 0; step < 
 sample_call = run.index("measure.post_force(", force_call)
 integrate2_call = run.index("integrate.compute2(", sample_call)
 assert force_call < sample_call < integrate2_call
-assert "atom.position_beads[bead].copy_to_host(bead_position_.data())" in sampler
-assert "atom.force_beads[bead].copy_to_host(bead_force_.data())" in sampler
 assert "if ((step + 1) % sample_interval_ != 0) return;" in sampler
+post_force_start = sampler.index("void RpmdJA_Fit::post_force(")
+post_run_start = sampler.index("void RpmdJA_Fit::post_run(", post_force_start)
+post_force = sampler[post_force_start:post_run_start]
+assert post_force.index("if ((step + 1) % sample_interval_ != 0) return;") < post_force.index("rpmd_ja_fit_sampling_kernel<<<")
+assert "sample_output_gpu_.copy_to_host(sample_output_.data());" in post_force
+assert post_force.count("copy_to_host(") == 1
+assert "position != bead_position_ptrs_[bead] || force != bead_force_ptrs_[bead]" in post_force
+assert "if (refresh_pointers)" in post_force
+assert "sample_output_.resize(static_cast<std::size_t>(10) * number_of_atoms_);" in sampler
+assert "coordinate_scale = std::max(coordinate_scale, sample_output_[6 * atom_count + atom_id]);" in post_force
+assert "const double ring_tolerance = 128.0 * std::numeric_limits<double>::epsilon()" in post_force
+assert "coordinate_scale > 1.0e12 * box_scale" in post_force
+assert "previous_centroid_ = centroid_;" in post_force
+assert "write_or_throw(spool_, frame_buffer_.data(), frame_buffer_.size() * sizeof(double));" in post_force
+assert "bead_position_." not in sampler and "bead_force_." not in sampler
 
 assert "'G', 'P', 'J', 'A', 'S', 'M', 'P', '1'" in sampler
 assert "ring path with nonzero periodic winding" in sampler
@@ -62,14 +76,12 @@ post_run_body = sampler_fit[post_run_start:]
 assert post_run_body.index("catch (...) {") < post_run_body.index("release_lock_();") < post_run_body.index("throw;")
 assert post_run_body.rindex("release_lock_();") > post_run_body.index("fit_rpmd_ja_native_reference(")
 
-mic_start = sampler_fit.index("bool apply_fit_mic(")
-mic_end = sampler_fit.index("\n}\n", mic_start) + 2
-mic = sampler_fit[mic_start:mic_end]
-assert "box.cpu_h[9]" in mic and "box.cpu_h[17]" in mic
-assert "std::nearbyint(sx)" in mic and "std::nearbyint(sy)" in mic and "std::nearbyint(sz)" in mic
-assert "box.cpu_h[0]" in mic and "box.cpu_h[8]" in mic
-assert "return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);" in mic
-assert sampler_fit.count("apply_fit_mic(box,") == 4
+assert "__host__ __device__ inline bool rpmd_ja_fit_mic(" in sampling
+assert "nearbyint(sx)" in sampling and "nearbyint(sy)" in sampling and "nearbyint(sz)" in sampling
+assert "return isfinite(x) && isfinite(y) && isfinite(z);" in sampling
+assert "output[static_cast<std::size_t>(9) * atoms + atom] = static_cast<double>(error);" in sampling
+assert "rpmd_ja_fit_mic(box.cpu_h + 9, box.cpu_h, x, y, z)" in sampler
+assert sampler.count("apply_fit_mic(box,") == 1
 
 
 # Algebra-only multi-cell check; the C++ helper remains covered by source-contract checks above.

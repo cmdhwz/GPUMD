@@ -2236,6 +2236,8 @@ static void generate_rpmd_ja_qnep_raw_reference(
   double precheck_k_diff2 = 0.0, precheck_k_fine2 = 0.0;
   double precheck_c_diff2[3] = {}, precheck_c_fine2[3] = {};
   double precheck_identity_diff2 = 0.0, precheck_identity_scale2 = 0.0;
+  double precheck_identity_max_abs = 0.0;
+  int precheck_identity_max_coordinate = precheck_coordinates.empty() ? 0 : precheck_coordinates.front();
   std::vector<double> unit_direction(static_cast<std::size_t>(d), 0.0);
   for (int coordinate : precheck_coordinates) {
     unit_direction[coordinate] = 1.0;
@@ -2244,6 +2246,10 @@ static void generate_rpmd_ja_qnep_raw_reference(
     const double error = summed_jvp - reference_gradient[coordinate];
     precheck_identity_diff2 += error * error;
     precheck_identity_scale2 += reference_gradient[coordinate] * reference_gradient[coordinate];
+    if (std::abs(error) > precheck_identity_max_abs) {
+      precheck_identity_max_abs = std::abs(error);
+      precheck_identity_max_coordinate = coordinate;
+    }
     unit_direction[coordinate] = 0.0;
   }
   for (std::size_t sample = 0; sample < precheck_coordinates.size(); ++sample) {
@@ -2305,11 +2311,35 @@ static void generate_rpmd_ja_qnep_raw_reference(
     precheck_k > kDifferenceTolerance || precheck_c[0] > kDifferenceTolerance ||
     precheck_c[1] > kDifferenceTolerance || precheck_c[2] > kDifferenceTolerance;
   if (precheck_failed) {
-    std::fprintf(stderr,
-      "qNEP rpmd_ja analytic stencil-step precheck failed before raw matrix generation: fd_step=%.9g, analytic-gradient/native-force abs RMS %.6g, site-JVP/gradient identity abs RMS %.6g (limit %.3g), V D2(h)-D2(2h) %.6g (diagnostic only), K %.6g, Cxyz %.6g %.6g %.6g (limits %.3g)\n",
-      fd_step, precheck_force_gradient_abs, precheck_identity_abs, kForceTolerance, precheck_v, precheck_k,
-      precheck_c[0], precheck_c[1], precheck_c[2], kDifferenceTolerance);
-    throw std::runtime_error("qNEP rpmd_ja sampled stencil-step consistency check failed; raw generation stopped early");
+    std::ostringstream failure;
+    failure << "qNEP rpmd_ja sampled stencil-step consistency check failed; raw generation stopped early: fd_step="
+      << fd_step << ", analytic-gradient/native-force abs RMS " << precheck_force_gradient_abs
+      << " (limit " << kForceTolerance << "), site-JVP/gradient identity abs RMS " << precheck_identity_abs
+      << " (relative " << precheck_identity_relative << ", limit " << kForceTolerance
+      << " eV/A absolute), V D2(h)-D2(2h) " << precheck_v
+      << " (finite required; diagnostic only), K " << precheck_k << " (limit " << kDifferenceTolerance
+      << "), Cxyz " << precheck_c[0] << ' ' << precheck_c[1] << ' ' << precheck_c[2]
+      << " (each limit " << kDifferenceTolerance << "), site-JVP max|e| " << precheck_identity_max_abs
+      << " at atom " << precheck_identity_max_coordinate % n << " type "
+      << atom.cpu_type[precheck_identity_max_coordinate % n] << " axis "
+      << "xyz"[precheck_identity_max_coordinate / n] << "; FAIL=";
+    bool first_failure = true;
+    const auto add_failure = [&](const char* name) {
+      if (!first_failure) failure << ',';
+      failure << name; first_failure = false;
+    };
+    if (!std::isfinite(precheck_force_gradient_abs) || !std::isfinite(precheck_identity_abs) ||
+        !std::isfinite(precheck_identity_relative) || !std::isfinite(precheck_v) || !std::isfinite(precheck_k) || !std::isfinite(precheck_c[0]) ||
+        !std::isfinite(precheck_c[1]) || !std::isfinite(precheck_c[2])) add_failure("non_finite");
+    if (precheck_force_gradient_abs > kForceTolerance) add_failure("gradient_native_force");
+    if (precheck_identity_abs > kForceTolerance) add_failure("site_jvp_gradient");
+    if (!std::isfinite(precheck_v)) add_failure("V_non_finite");
+    if (precheck_k > kDifferenceTolerance) add_failure("K_stencil");
+    if (precheck_c[0] > kDifferenceTolerance) add_failure("Cx_stencil");
+    if (precheck_c[1] > kDifferenceTolerance) add_failure("Cy_stencil");
+    if (precheck_c[2] > kDifferenceTolerance) add_failure("Cz_stencil");
+    std::fprintf(stderr, "%s\n", failure.str().c_str());
+    throw std::runtime_error(failure.str());
   }
   std::printf("    qNEP rpmd_ja precheck: analytic-gradient/native-force abs RMS %.3e; site-JVP/gradient identity abs RMS %.3e (relative %.3e); V D2(h)-D2(2h) %.3e diagnostic, K/C stencil-step consistency %.3e %.3e %.3e %.3e\n",
     precheck_force_gradient_abs, precheck_identity_abs, precheck_identity_relative, precheck_v, precheck_k,
@@ -2669,6 +2699,7 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
     throw std::runtime_error("qNEP rpmd_ja diagnose requires a fully periodic fixed cell");
 
   const int n = atom.number_of_atoms, d = reference_dimension(atom.number_of_atoms);
+  const char* axis_name[3] = {"x", "y", "z"};
   std::vector<double> positions(static_cast<std::size_t>(d));
   atom.position_per_atom.copy_to_host(positions.data());
   require_finite(positions, "qNEP diagnosis positions");
@@ -2677,8 +2708,9 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
   std::map<int, int> first_atom_by_type;
   for (int i = 0; i < n; ++i) first_atom_by_type.emplace(atom.cpu_type[i], i);
   std::vector<int> coordinates;
-  for (const auto& entry : first_atom_by_type)
-    for (int alpha = 0; alpha < 3; ++alpha) coordinates.push_back(alpha * n + entry.second);
+  for (int i = 0; i < n; ++i)
+    if (first_atom_by_type.at(atom.cpu_type[i]) == i)
+      for (int alpha = 0; alpha < 3; ++alpha) coordinates.push_back(alpha * n + i);
 
   const auto start = std::chrono::steady_clock::now();
   Box observer_box = box;
@@ -2690,6 +2722,7 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
     active_qnep->get_charge_mode(), active_qnep->get_pppm_mesh_spacing(), n, coordinates.size());
   std::printf("  full mode includes q(R), charge chain, real-space and PPPM terms; short-range/no-electrostatic mode uses the qNEP ANN and short-range corrections via compute_non_electro.\n");
   std::printf("  Differences between their errors are electrostatic-related and do not isolate PPPM alone.\n");
+  std::printf("  For full-qNEP, analytic gradient + native force equals the discrete PPPM explicit-gradient plus IK-force residual; it is diagnostic, not a reason to relax generation thresholds.\n");
   std::printf("  Existing generation thresholds (display only; not applied to these sampled diagnostics): gradient abs RMS %.3g, h/h2 relative %.3g.\n",
     kForceTolerance, kDifferenceTolerance);
   std::printf("  Analytic checks use the current single-frame force data: summed site JVP versus analytic gradient, and analytic gradient versus native force; these are reported separately from the existing h/h2 checks.\n");
@@ -2703,6 +2736,10 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
   std::uint64_t evaluations = 0;
   const bool include_electro[2] = {true, false};
   const char* mode_name[2] = {"full-qNEP", "short-range/no-electrostatic"};
+  std::vector<double> full_r0_gradient;
+  double r0_gradient_native_abs = 0.0, r0_site_jvp_abs = 0.0;
+  bool r0_jvp_pass = false;
+  int r0_jvp_worst_coordinate = 0;
   for (int mode = 0; mode < 2; ++mode) {
     std::array<QEvaluation, 3> repeated_reference;
     for (int repeat = 0; repeat < 3; ++repeat) {
@@ -2741,12 +2778,13 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       std::vector<double> host_gradient(static_cast<std::size_t>(3) * n);
       analytic_gradient.copy_to_host(host_gradient.data());
       require_finite(host_gradient, "qNEP diagnostic analytic gradient");
+      full_r0_gradient = host_gradient;
       double force_gradient_diff2 = 0.0, force_gradient_scale2 = 0.0;
       double all_coordinate_diff2 = 0.0, native_force_scale2 = 0.0;
       double axis_diff2[3] = {};
       double max_abs_error = 0.0;
       int max_coordinate = 0, coordinates_over_tolerance = 0;
-      double jvp_identity_diff2 = 0.0, jvp_identity_scale2 = 0.0;
+      double jvp_identity_diff2 = 0.0, jvp_identity_scale2 = 0.0, jvp_identity_max_abs = 0.0;
       for (int coordinate = 0; coordinate < d; ++coordinate) {
         const double error = host_gradient[coordinate] + reference.force[coordinate];
         const double abs_error = std::abs(error);
@@ -2764,11 +2802,11 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       const double all_coordinate_abs = std::sqrt(all_coordinate_diff2 / d);
       const double all_coordinate_relative = std::sqrt(all_coordinate_diff2 / std::max(native_force_scale2, 1.0e-300));
       const bool all_coordinate_pass = all_coordinate_abs <= kForceTolerance;
+      r0_gradient_native_abs = all_coordinate_abs;
       if (!std::isfinite(all_coordinate_abs) || !std::isfinite(all_coordinate_relative))
         throw std::runtime_error("qNEP rpmd_ja all-coordinate gradient diagnostic produced non-finite RMS values");
       const int max_atom = max_coordinate % n;
       const int max_axis = max_coordinate / n;
-      const char* axis_name[3] = {"x", "y", "z"};
       std::printf("  full-qNEP all-coordinate gradient check: coordinates=%d, abs RMS %.6g eV/A, relative %.6g, limit=%.1e eV/A, %s (this check only; not reference-generation acceptance).\n",
         d, all_coordinate_abs, all_coordinate_relative, kForceTolerance,
         all_coordinate_pass ? "PASS" : "FAIL");
@@ -2793,6 +2831,10 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           throw std::runtime_error("qNEP rpmd_ja analytic diagnostic produced a non-finite identity residual");
         jvp_identity_diff2 += identity_error * identity_error;
         jvp_identity_scale2 += host_gradient[coordinate] * host_gradient[coordinate];
+        if (std::abs(identity_error) > jvp_identity_max_abs) {
+          jvp_identity_max_abs = std::abs(identity_error);
+          r0_jvp_worst_coordinate = coordinate;
+        }
         const double force_error = host_gradient[coordinate] + reference.force[coordinate];
         force_gradient_diff2 += force_error * force_error;
         force_gradient_scale2 += host_gradient[coordinate] * host_gradient[coordinate] +
@@ -2800,6 +2842,8 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
         unit_direction[coordinate] = 0.0;
       }
       const double jvp_identity_abs = std::sqrt(jvp_identity_diff2 / coordinates.size());
+      r0_site_jvp_abs = jvp_identity_abs;
+      r0_jvp_pass = std::isfinite(jvp_identity_max_abs) && jvp_identity_max_abs <= kForceTolerance;
       const double jvp_identity_relative = std::sqrt(jvp_identity_diff2 / std::max(jvp_identity_scale2, 1.0e-300));
       const double force_gradient_abs = std::sqrt(force_gradient_diff2 / coordinates.size());
       const double force_gradient_relative = std::sqrt(force_gradient_diff2 / std::max(force_gradient_scale2, 1.0e-300));
@@ -2808,29 +2852,71 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
         throw std::runtime_error("qNEP rpmd_ja analytic diagnostic produced non-finite RMS values");
       std::printf("  full-qNEP analytic checks: JVP-gradient identity abs RMS %.6g, relative %.6g; sampled analytic-gradient/native-force difference RMS %.6g eV/A, relative %.6g.\n",
         jvp_identity_abs, jvp_identity_relative, force_gradient_abs, force_gradient_relative);
+      std::printf("    R0 site-JVP identity max|e| %.6g eV/A at atom %d type %d axis %s; limit %.3g %s.\n",
+        jvp_identity_max_abs, r0_jvp_worst_coordinate % n,
+        atom.cpu_type[r0_jvp_worst_coordinate % n], axis_name[r0_jvp_worst_coordinate / n],
+        kForceTolerance, r0_jvp_pass ? "PASS" : "FAIL");
+      for (const auto& entry : first_atom_by_type) {
+        const int type = entry.first;
+        double diff2 = 0.0, force2 = 0.0, max_error = 0.0;
+        int max_coordinate = entry.second;
+        int count = 0;
+        for (int coordinate = 0; coordinate < d; ++coordinate) {
+          const int atom_index = coordinate % n;
+          if (atom.cpu_type[atom_index] != type) continue;
+          const double error = host_gradient[coordinate] + reference.force[coordinate];
+          diff2 += error * error; force2 += reference.force[coordinate] * reference.force[coordinate]; ++count;
+          if (std::abs(error) > max_error) { max_error = std::abs(error); max_coordinate = coordinate; }
+        }
+        std::printf("    type %d R0 gradient/native-force: abs RMS %.6g eV/A, relative %.6g, max|e| %.6g at atom %d axis %s\n",
+          type, std::sqrt(diff2 / count), std::sqrt(diff2 / std::max(force2, 1.0e-300)), max_error,
+          max_coordinate % n, axis_name[max_coordinate / n]);
+      }
+      std::fflush(stdout);
     }
 
-    for (int step_scale : {1, 10, 100}) {
+    for (const double step_scale : {0.5, 1.0, 2.0, 5.0, 10.0}) {
       const double h = fd_step * step_scale;
       if (!(h > 0.0) || !std::isfinite(h))
         throw std::invalid_argument("scaled qNEP rpmd_ja diagnosis fd_step is not finite");
       double grad_diff2 = 0.0, grad_reference2 = 0.0;
       double v_diff2 = 0.0, v_fine2 = 0.0;
       double k_diff2 = 0.0, k_fine2 = 0.0;
+      double native_k_d4_norm2 = 0.0, native_k_delta2 = 0.0;
       double c_diff2[3] = {}, c_fine2[3] = {};
+      double c_d4_norm2[3] = {}, c_delta2[3] = {}, c_worst_column[3] = {-1.0, -1.0, -1.0};
+      int c_worst_input[3] = {}, c_worst_output[3] = {};
+      double analytic_d4_norm2 = 0.0, analytic_delta2 = 0.0;
+      double analytic_precheck_d4_norm2 = 0.0, analytic_precheck_delta2 = 0.0;
+      double c_precheck_d4_norm2[3] = {}, c_precheck_delta2[3] = {};
+      double v_precheck_d4_norm2 = 0.0, v_precheck_delta2 = 0.0;
+      bool v_stencil_finite = true;
+      double worst_column_relative = -1.0;
+      int worst_input = 0, worst_output = 0;
       for (int coordinate : coordinates) {
-        std::vector<double> plus = positions, minus = positions, plus_half = positions, minus_half = positions;
-        plus[coordinate] += h; minus[coordinate] -= h;
-        plus_half[coordinate] += 0.5 * h; minus_half[coordinate] -= 0.5 * h;
-        const QEvaluation ep = evaluator.evaluate(plus, include_electro[mode]);
-        const QEvaluation em = evaluator.evaluate(minus, include_electro[mode]);
-        const QEvaluation ehp = evaluator.evaluate(plus_half, include_electro[mode]);
-        const QEvaluation ehm = evaluator.evaluate(minus_half, include_electro[mode]);
-        evaluations += 4;
+        std::array<std::vector<double>, 4> xyz = {positions, positions, positions, positions};
+        xyz[0][coordinate] += h; xyz[1][coordinate] -= h;
+        xyz[2][coordinate] += 2.0 * h; xyz[3][coordinate] -= 2.0 * h;
+        std::array<QEvaluation, 4> q;
+        std::array<std::vector<double>, 4> g;
+        for (int lane = 0; lane < 4; ++lane) {
+          q[lane] = evaluator.evaluate(xyz[lane], include_electro[mode]);
+          ++evaluations;
+          if (mode == 0) g[lane] = evaluator.analytic_gradient();
+        }
+        const QEvaluation& ep = q[0]; const QEvaluation& em = q[1];
+        const QEvaluation& ehp = q[2]; const QEvaluation& ehm = q[3];
         double energy_gradient = 0.0;
         for (int i = 0; i < n; ++i) {
-          const double fine = (ehp.energy[i] - ehm.energy[i]) / h;
-          const double coarse = (ep.energy[i] - em.energy[i]) / (2.0 * h);
+          const double fine = rpmd_ja_reference_math::central_difference_2nd(ep.energy[i], em.energy[i], h);
+          const double coarse = rpmd_ja_reference_math::central_difference_2nd(ehp.energy[i], ehm.energy[i], 2.0 * h);
+          const double v_d4 = rpmd_ja_reference_math::central_difference_4th(
+            ep.energy[i], em.energy[i], ehp.energy[i], ehm.energy[i], h);
+          v_stencil_finite = v_stencil_finite && std::isfinite(v_d4) && std::isfinite(fine) &&
+            std::isfinite(coarse) && std::isfinite(fine - coarse);
+          const double v_precheck_delta = 3.0 * (v_d4 - fine);
+          v_precheck_d4_norm2 += v_d4 * v_d4;
+          v_precheck_delta2 += v_precheck_delta * v_precheck_delta;
           energy_gradient += fine;
           const double difference = fine - coarse;
           v_diff2 += difference * difference;
@@ -2839,19 +2925,69 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
         const double gradient_error = energy_gradient + reference.force[coordinate];
         grad_diff2 += gradient_error * gradient_error;
         grad_reference2 += reference.force[coordinate] * reference.force[coordinate];
+        double c_column_d4[3] = {}, c_column_delta[3] = {}, c_column_max_delta[3] = {};
+        int c_column_output[3] = {};
         for (int r = 0; r < d; ++r) {
-          const double fine_k = -(ehp.force[r] - ehm.force[r]) / h;
-          const double coarse_k = -(ep.force[r] - em.force[r]) / (2.0 * h);
+          const double fine_k = -rpmd_ja_reference_math::central_difference_2nd(ep.force[r], em.force[r], h);
+          const double coarse_k = -rpmd_ja_reference_math::central_difference_2nd(ehp.force[r], ehm.force[r], 2.0 * h);
           const double k_difference = fine_k - coarse_k;
           k_diff2 += k_difference * k_difference;
           k_fine2 += fine_k * fine_k;
+          const double native_k_d4 = -rpmd_ja_reference_math::central_difference_4th(
+            ep.force[r], em.force[r], ehp.force[r], ehm.force[r], h);
+          native_k_d4_norm2 += native_k_d4 * native_k_d4; native_k_delta2 += k_difference * k_difference;
           for (int alpha = 0; alpha < 3; ++alpha) {
             const int offset = virial_component[alpha][r / n] * n + r % n;
-            const double fine_c = (ehp.virial[offset] - ehm.virial[offset]) / h;
-            const double coarse_c = (ep.virial[offset] - em.virial[offset]) / (2.0 * h);
+            const double fine_c = rpmd_ja_reference_math::central_difference_2nd(ep.virial[offset], em.virial[offset], h);
+            const double coarse_c = rpmd_ja_reference_math::central_difference_2nd(ehp.virial[offset], ehm.virial[offset], 2.0 * h);
             const double c_difference = fine_c - coarse_c;
             c_diff2[alpha] += c_difference * c_difference;
             c_fine2[alpha] += fine_c * fine_c;
+            const double c_d4 = rpmd_ja_reference_math::central_difference_4th(
+              ep.virial[offset], em.virial[offset], ehp.virial[offset], ehm.virial[offset], h);
+            c_d4_norm2[alpha] += c_d4 * c_d4; c_delta2[alpha] += c_difference * c_difference;
+            if (mode == 0) {
+              const double c2h = rpmd_ja_reference_math::central_difference_2nd(
+                ep.virial[offset], em.virial[offset], h);
+              const double precheck_delta = 3.0 * (c_d4 - c2h);
+              c_precheck_d4_norm2[alpha] += c_d4 * c_d4;
+              c_precheck_delta2[alpha] += precheck_delta * precheck_delta;
+            }
+            c_column_d4[alpha] += c_d4 * c_d4; c_column_delta[alpha] += c_difference * c_difference;
+            if (std::abs(c_difference) > c_column_max_delta[alpha]) {
+              c_column_max_delta[alpha] = std::abs(c_difference); c_column_output[alpha] = r;
+            }
+          }
+        }
+        for (int alpha = 0; alpha < 3; ++alpha) {
+          const double column_relative = std::sqrt(c_column_delta[alpha] / std::max(c_column_d4[alpha], 1.0e-300));
+          if (column_relative > c_worst_column[alpha]) {
+            c_worst_column[alpha] = column_relative; c_worst_input[alpha] = coordinate;
+            c_worst_output[alpha] = c_column_output[alpha];
+          }
+        }
+        if (mode == 0) {
+          double column_d4_2 = 0.0, column_delta2 = 0.0;
+          for (int r = 0; r < d; ++r) {
+            const double d4 = rpmd_ja_reference_math::central_difference_4th(g[0][r], g[1][r], g[2][r], g[3][r], h);
+            const double d2h = rpmd_ja_reference_math::central_difference_2nd(g[0][r], g[1][r], h);
+            const double d22h = rpmd_ja_reference_math::central_difference_2nd(g[2][r], g[3][r], 2.0 * h);
+            const double delta = d2h - d22h;
+            analytic_d4_norm2 += d4 * d4; analytic_delta2 += delta * delta;
+            const double precheck_delta = 3.0 * (d4 - d2h);
+            analytic_precheck_d4_norm2 += d4 * d4;
+            analytic_precheck_delta2 += precheck_delta * precheck_delta;
+            column_d4_2 += d4 * d4; column_delta2 += delta * delta;
+          }
+          const double column_relative = std::sqrt(column_delta2 / std::max(column_d4_2, 1.0e-300));
+          if (column_relative > worst_column_relative) {
+            worst_column_relative = column_relative; worst_input = coordinate;
+            double largest_residual = -1.0;
+            for (int r = 0; r < d; ++r) {
+              const double delta = rpmd_ja_reference_math::central_difference_2nd(g[0][r], g[1][r], h) -
+                rpmd_ja_reference_math::central_difference_2nd(g[2][r], g[3][r], 2.0 * h);
+              if (std::abs(delta) > largest_residual) { largest_residual = std::abs(delta); worst_output = r; }
+            }
           }
         }
       }
@@ -2870,7 +3006,79 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       std::printf("  %s h=%.6g A: energy-gradient abs RMS %.6g, relative to sampled |F0| norm %.6g; V %.6g K %.6g Cxyz %.6g %.6g %.6g\n",
         mode_name[mode], h, grad_abs, grad_rel, v_relative, k_relative,
         c_relative[0], c_relative[1], c_relative[2]);
+      const double native_k_abs = std::sqrt(native_k_delta2 / (d * coordinates.size()));
+      const double native_k_relative = std::sqrt(native_k_delta2 / std::max(native_k_d4_norm2, 1.0e-300));
+      std::printf("    %s native-force K D4 norm %.6g eV/A2, D2(h)-D2(2h) abs RMS %.6g eV/A2, relative %.6g (limit %.3g) %s.\n",
+        mode_name[mode], std::sqrt(native_k_d4_norm2), native_k_abs, native_k_relative,
+        kDifferenceTolerance, std::isfinite(native_k_relative) && native_k_relative <= kDifferenceTolerance ? "PASS" : "FAIL");
+      std::printf("    virial C D2(h)-D2(2h), D4 denominator; Cxyz: ");
+      for (int alpha = 0; alpha < 3; ++alpha) {
+        const double c_abs = std::sqrt(c_delta2[alpha] / (d * coordinates.size()));
+        const double c_rel = std::sqrt(c_delta2[alpha] / std::max(c_d4_norm2[alpha], 1.0e-300));
+        const int ci = c_worst_input[alpha], co = c_worst_output[alpha];
+        std::printf("%s%c D4norm %.6g eV/A absRMS %.6g eV/A rel %.6g %s worst input %d type %d axis %s -> output %d type %d axis %s (column %.5g)", alpha ? ", " : "", "xyz"[alpha],
+          std::sqrt(c_d4_norm2[alpha]), c_abs, c_rel,
+          std::isfinite(c_rel) && c_rel <= kDifferenceTolerance ? "PASS" : "FAIL",
+          ci % n, atom.cpu_type[ci % n], axis_name[ci / n], co % n, atom.cpu_type[co % n],
+          axis_name[co / n], c_worst_column[alpha]);
+      }
+      std::printf("\n");
+      if (mode == 0) {
+        const double abs_rms = std::sqrt(analytic_delta2 / (d * coordinates.size()));
+        const double relative = std::sqrt(analytic_delta2 / std::max(analytic_d4_norm2, 1.0e-300));
+        const double precheck_k_relative = std::sqrt(analytic_precheck_delta2 / std::max(analytic_precheck_d4_norm2, 1.0e-300));
+        const double precheck_c_relative[3] = {
+          std::sqrt(c_precheck_delta2[0] / std::max(c_precheck_d4_norm2[0], 1.0e-300)),
+          std::sqrt(c_precheck_delta2[1] / std::max(c_precheck_d4_norm2[1], 1.0e-300)),
+          std::sqrt(c_precheck_delta2[2] / std::max(c_precheck_d4_norm2[2], 1.0e-300))};
+        const double v_precheck_relative = std::sqrt(v_precheck_delta2 / std::max(v_precheck_d4_norm2, 1.0e-300));
+        v_stencil_finite = v_stencil_finite && std::isfinite(v_precheck_relative);
+        const int ia = worst_input % n, ix = worst_input / n, oa = worst_output % n, ox = worst_output / n;
+        std::printf("    analytic-gradient Hessian sampled D4 norm %.6g eV/A2; D2(h)-D2(2h) abs RMS %.6g eV/A2, relative-to-D4 %.6g (limit %.3g) %s; worst analytic column input atom %d type %d axis %s -> output atom %d type %d axis %s, column-relative %.6g.\n",
+          std::sqrt(analytic_d4_norm2), abs_rms, relative, kDifferenceTolerance,
+          std::isfinite(relative) && relative <= kDifferenceTolerance ? "PASS" : "FAIL",
+          ia, atom.cpu_type[ia], axis_name[ix], oa, atom.cpu_type[oa], axis_name[ox], worst_column_relative);
+        std::ostringstream summary;
+        summary << "    precheck-matched summary h=" << h << ": gradient_native_force=" << r0_gradient_native_abs
+          << " site_jvp_gradient=" << r0_site_jvp_abs << " K=" << precheck_k_relative
+          << " Cx=" << precheck_c_relative[0] << " Cy=" << precheck_c_relative[1]
+          << " Cz=" << precheck_c_relative[2] << " Vfinite=" << (v_stencil_finite ? "yes" : "no")
+          << "; limits gradient/JVP=" << kForceTolerance << " K/C=" << kDifferenceTolerance << "; FAIL=";
+        bool first_fail = true;
+        const auto fail = [&](const char* item) {
+          if (!first_fail) summary << ',';
+          summary << item; first_fail = false;
+        };
+        if (!std::isfinite(r0_gradient_native_abs) || r0_gradient_native_abs > kForceTolerance) fail("gradient_native_force");
+        if (!std::isfinite(r0_site_jvp_abs) || r0_site_jvp_abs > kForceTolerance) fail("site_jvp_gradient");
+        if (!std::isfinite(precheck_k_relative) || precheck_k_relative > kDifferenceTolerance) fail("K");
+        for (int alpha = 0; alpha < 3; ++alpha)
+          if (!std::isfinite(precheck_c_relative[alpha]) || precheck_c_relative[alpha] > kDifferenceTolerance)
+            fail(alpha == 0 ? "Cx" : alpha == 1 ? "Cy" : "Cz");
+        if (!v_stencil_finite) fail("V_non_finite");
+        if (first_fail) summary << "none";
+        summary << " (diagnostic only; PASS is sampled-column evidence, not full-matrix acceptance)";
+        std::printf("%s\n", summary.str().c_str());
+      }
+      std::fflush(stdout);
     }
+  }
+  const double spacing = active_qnep->get_pppm_mesh_spacing();
+  for (const double factor : {0.75, 0.5}) {
+    const double target_spacing = spacing * factor;
+    QEvaluator mesh_evaluator(force.primary_nep_model_path(), n, force.get_run_input(), observer_box,
+      atom.cpu_type, target_spacing);
+    const QEvaluation mesh_eval = mesh_evaluator.evaluate(positions, true); ++evaluations;
+    const std::vector<double> mesh_gradient = mesh_evaluator.analytic_gradient();
+    double delta2 = 0.0, gradient2 = 0.0, native_mismatch2 = 0.0;
+    for (int i = 0; i < d; ++i) {
+      const double delta = mesh_gradient[i] - full_r0_gradient[i];
+      delta2 += delta * delta; gradient2 += mesh_gradient[i] * mesh_gradient[i];
+      const double mismatch = mesh_gradient[i] + mesh_eval.force[i]; native_mismatch2 += mismatch * mismatch;
+    }
+    std::printf("  R0 PPPM mesh-spacing trend configured target %.6g A: gradient delta-from-active RMS %.6g, analytic-gradient RMS %.6g, native-force mismatch RMS %.6g eV/A.\n",
+      target_spacing, std::sqrt(delta2 / d), std::sqrt(gradient2 / d), std::sqrt(native_mismatch2 / d));
+    std::fflush(stdout);
   }
   const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   std::printf("rpmd_ja diagnose completed: evaluations=%llu, elapsed %.3f s; diagnostics only, no reference produced.\n",

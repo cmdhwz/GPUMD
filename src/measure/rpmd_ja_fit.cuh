@@ -10,6 +10,7 @@
 #pragma once
 
 #include "action.cuh"
+#include "utilities/gpu_vector.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -69,13 +70,14 @@ private:
   std::FILE* lock_file_ = nullptr;
   Force* force_ = nullptr;
   std::vector<double> masses_;
+  std::vector<const double*> bead_position_ptrs_;
+  std::vector<const double*> bead_force_ptrs_;
+  GPU_Vector<const double*> bead_position_ptrs_gpu_;
+  GPU_Vector<const double*> bead_force_ptrs_gpu_;
+  GPU_Vector<double> sample_output_gpu_;
+  std::vector<double> sample_output_;
   std::vector<double> previous_centroid_;
   std::vector<double> centroid_;
-  std::vector<double> mic_centroid_;
-  std::vector<double> ring_first_;
-  std::vector<double> bead_position_;
-  std::vector<double> previous_bead_;
-  std::vector<double> bead_force_;
   std::vector<double> mean_force_;
   std::vector<double> frame_buffer_;
   double com_shift_[3] = {0.0, 0.0, 0.0};

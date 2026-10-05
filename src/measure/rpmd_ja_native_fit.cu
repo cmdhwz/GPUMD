@@ -61,10 +61,11 @@ struct SampleHeader
   std::vector<double> masses;
   std::vector<int> types;
   std::streamoff frames = 0;
+  std::uint64_t frame_count = 0;
 };
 
 SampleHeader read_header(std::istream& in, const std::uint64_t frame_count, const Atom& atom, const Box& box,
-                         const double temperature)
+                         const double temperature, const bool diagnostic = false)
 {
   char magic[8]; in.read(magic, sizeof(magic));
   const auto version = read<std::uint32_t>(in, "version");
@@ -73,7 +74,8 @@ SampleHeader read_header(std::istream& in, const std::uint64_t frame_count, cons
   h.n = read<std::int32_t>(in, "atom count");
   h.beads = read<std::int32_t>(in, "bead count");
   h.temperature = read<double>(in, "temperature");
-  if (h.n != atom.number_of_atoms || h.n < 2 || h.n > std::numeric_limits<int>::max()/3 || h.beads != atom.number_of_beads)
+  if (h.n != atom.number_of_atoms || h.n < 2 || h.n > std::numeric_limits<int>::max()/3 ||
+      (diagnostic ? h.beads < 1 : h.beads != atom.number_of_beads))
     throw std::runtime_error("native fit spool has invalid atom or bead count");
   read_array(in, h.cell, 9, "cell");
   h.masses.resize(h.n); h.types.resize(h.n);
@@ -81,18 +83,25 @@ SampleHeader read_header(std::istream& in, const std::uint64_t frame_count, cons
   read_array(in, h.types.data(), h.types.size(), "types");
   h.frames = in.tellg();
   if (std::memcmp(magic, sample_magic, sizeof(magic)) || version != 1 || endian != native_endian || h.n != atom.number_of_atoms ||
-      h.n < 2 || h.beads != atom.number_of_beads || !std::isfinite(h.temperature) || h.temperature <= 0.0 ||
-      std::abs(h.temperature - temperature) > 1.0e-10 * temperature ||
-      h.masses != atom.cpu_mass || h.types != atom.cpu_type || frame_count < 3)
+      h.n < 2 || (diagnostic ? h.beads < 1 : h.beads != atom.number_of_beads) || !std::isfinite(h.temperature) || h.temperature <= 0.0 ||
+      (!diagnostic && std::abs(h.temperature - temperature) > 1.0e-10 * temperature) ||
+      h.masses != atom.cpu_mass || h.types != atom.cpu_type || (!diagnostic && frame_count < 3))
     throw std::runtime_error("native fit spool identity, temperature, or dimensions do not match the initialized system");
   if(!std::all_of(h.masses.begin(),h.masses.end(),[](double m){return std::isfinite(m)&&m>0.0;})||
      !std::all_of(h.cell,h.cell+9,[](double x){return std::isfinite(x);}))
     throw std::runtime_error("native fit spool has non-finite cell or invalid masses");
   const auto here=in.tellg();in.seekg(0,std::ios::end);const std::streamoff end=in.tellg();in.seekg(here);
   const std::uint64_t dimension=3ULL*static_cast<std::uint64_t>(h.n),frame_bytes=sizeof(double)+2*dimension*sizeof(double);
-  if(h.frames<0||frame_count>(std::numeric_limits<std::uint64_t>::max()-static_cast<std::uint64_t>(h.frames))/frame_bytes||
-     static_cast<std::uint64_t>(h.frames)+frame_count*frame_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())||
-     end!=static_cast<std::streamoff>(static_cast<std::uint64_t>(h.frames)+frame_count*frame_bytes))
+  if(h.frames<0||end<h.frames||frame_bytes==0)
+    throw std::runtime_error("native fit spool has an invalid byte length");
+  const std::uint64_t payload=static_cast<std::uint64_t>(end-h.frames);
+  if(payload%frame_bytes!=0)
+    throw std::runtime_error("native fit spool has a truncated frame or extra partial data");
+  h.frame_count=payload/frame_bytes;
+  if(h.frame_count<3 || (frame_count!=0 && h.frame_count!=frame_count) ||
+     h.frame_count>(std::numeric_limits<std::uint64_t>::max()-static_cast<std::uint64_t>(h.frames))/frame_bytes||
+     static_cast<std::uint64_t>(h.frames)+h.frame_count*frame_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())||
+     end!=static_cast<std::streamoff>(static_cast<std::uint64_t>(h.frames)+h.frame_count*frame_bytes))
     throw std::runtime_error("native fit spool byte length does not match frame_count");
   for (int i = 0; i < 9; ++i)
     if (!std::isfinite(h.cell[i]) || std::abs(h.cell[i] - box.cpu_h[i]) > 1.0e-9 * std::max(1.0, std::abs(box.cpu_h[i])))
@@ -109,6 +118,54 @@ void read_frame(std::istream& in, std::vector<double>& x, std::vector<double>& f
   if (!std::all_of(x.begin(), x.end(), [](double v) { return std::isfinite(v); }) ||
       !std::all_of(f.begin(), f.end(), [](double v) { return std::isfinite(v); }))
     throw std::runtime_error("native fit spool frame contains non-finite values");
+}
+
+double read_training_r0(std::istream& in, const SampleHeader& header, const std::uint64_t frame_count,
+                        const double expected_interval, std::vector<double>& r0)
+{
+  const std::uint64_t train = 2 * frame_count / 3;
+  std::vector<double> x(r0.size()), f(r0.size());
+  double step = 0.0, previous = -std::numeric_limits<double>::infinity(), interval = 0.0;
+  in.clear(); in.seekg(header.frames);
+  for (std::uint64_t frame = 0; frame < frame_count; ++frame) {
+    read_frame(in, x, f, step);
+    if (frame == 1) {
+      interval = step - previous;
+      if (!(interval > 0.0) || !std::isfinite(interval))
+        throw std::runtime_error("native fit spool sample interval must be positive and finite");
+    }
+    if (frame && (!(step > previous) || !std::isfinite(step - previous) ||
+        std::abs((step - previous) - interval) > 1.0e-9 ||
+        (std::isfinite(expected_interval) && std::abs((step - previous) - expected_interval) > 1.0e-9)))
+      throw std::runtime_error("native fit sample steps must be strictly increasing with a uniform interval");
+    previous = step;
+    if (frame < train)
+      for (std::size_t k = 0; k < r0.size(); ++k) r0[k] += x[k] / static_cast<double>(train);
+  }
+  if (!std::all_of(r0.begin(), r0.end(), [](double v) { return std::isfinite(v); }))
+    throw std::runtime_error("native fit training R0 is non-finite");
+  return interval;
+}
+
+void validate_fit_branches(std::istream& in, const SampleHeader& header, const std::uint64_t frame_count,
+                           const Box& box, const std::vector<double>& r0)
+{
+  std::vector<double> x(r0.size()), f(r0.size());
+  in.clear(); in.seekg(header.frames);
+  for (std::uint64_t frame = 0; frame < frame_count; ++frame) {
+    double step = 0.0;
+    read_frame(in, x, f, step);
+    for (int i = 0; i < header.n; ++i) {
+      const double delta[3] = {x[i] - r0[i], x[header.n + i] - r0[header.n + i],
+                               x[2 * header.n + i] - r0[2 * header.n + i]};
+      for (int a = 0; a < 3; ++a) {
+        double fractional = 0.0;
+        for (int b = 0; b < 3; ++b) fractional += box.cpu_h[9 + 3 * a + b] * delta[b];
+        if (!std::isfinite(fractional) || std::abs(fractional) >= 0.45)
+          throw std::runtime_error("native fit sample centroid exceeds the fixed-reference branch limit 0.45");
+      }
+    }
+  }
 }
 
 struct Edge
@@ -560,12 +617,9 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const int expected_probes=std::min(3*n-3,16+std::min(4,static_cast<int>(unique_types.size()))+4);
   if(validation<=expected_probes)throw std::runtime_error("native fit requires at least " + std::to_string(expected_probes+1) + " held-out frames for its fixed probe policy");
   std::vector<double> position(3*n),force_frame(3*n),r0(3*n,0.0);double step=0.0,previous=-std::numeric_limits<double>::infinity();
-  for(int f=0;f<train;++f){read_frame(in,position,force_frame,step);if(!(step>previous)||(f&&std::abs((step-previous)-options.sample_interval)>1e-9))throw std::runtime_error("native fit sample steps must strictly match sample_interval");previous=step;for(int k=0;k<d;++k)r0[k]+=position[k]/train;}
+  read_training_r0(in,header,frame_count,static_cast<double>(options.sample_interval),r0);
+  validate_fit_branches(in,header,frame_count,box,r0);
   // Rewind to the first frame for streaming block-QR fitting.
-  in.clear();in.seekg(header.frames);
-  previous=-std::numeric_limits<double>::infinity();
-  for(std::uint64_t frame=0;frame<frame_count;++frame){read_frame(in,position,force_frame,step);if(!(step>previous)||(frame&&std::abs((step-previous)-options.sample_interval)>1e-9))throw std::runtime_error("native fit sample steps must strictly match sample_interval");previous=step;
-    for(int i=0;i<n;++i){double delta[3]={position[i]-r0[i],position[n+i]-r0[n+i],position[2*n+i]-r0[2*n+i]};for(int a=0;a<3;++a){double s=0.0;for(int b=0;b<3;++b)s+=box.cpu_h[9+3*a+b]*delta[b];if(std::abs(s)>=0.45)throw std::runtime_error("native fit sample centroid exceeds the fixed-reference branch limit 0.45");}}}
   in.clear();in.seekg(header.frames);
   previous=-std::numeric_limits<double>::infinity();
   const Graph graph=make_graph(r0,header.types,box,options.cutoff);
@@ -698,11 +752,52 @@ void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options,const st
     throw;
   }
 }
+
+void diagnose_rpmd_ja_native_fit_samples(const std::string& spool_path, const double fd_step,
+                                         Atom& atom, Box& box, Force& force)
+{
+  if (spool_path.empty() || !std::isfinite(fd_step) || fd_step <= 0.0)
+    throw std::invalid_argument("native fit sample diagnostic requires a spool path and positive finite fd_step");
+  std::ifstream in(spool_path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open native rpmd_ja sample spool: " + spool_path);
+  const SampleHeader header = read_header(in, 0, atom, box, 0.0, true);
+  if (header.frame_count > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+    throw std::runtime_error("native fit sample diagnostic frame count exceeds indexing limits");
+  const std::uint64_t train = 2 * header.frame_count / 3;
+  const std::uint64_t validation = header.frame_count - train;
+  std::vector<double> r0(static_cast<std::size_t>(3) * header.n, 0.0);
+  const double sample_interval = read_training_r0(
+    in, header, header.frame_count, std::numeric_limits<double>::quiet_NaN(), r0);
+  validate_fit_branches(in, header, header.frame_count, box, r0);
+
+  std::printf("rpmd_ja diagnose_samples: spool=%s frames=%llu train=%llu validation=%llu P=%d T=%.17g K sample_interval=%.17g fd_step=%.17g\n",
+    spool_path.c_str(), static_cast<unsigned long long>(header.frame_count),
+    static_cast<unsigned long long>(train), static_cast<unsigned long long>(validation),
+    header.beads, header.temperature, sample_interval, fd_step);
+  std::printf("  train R0 is the xyz-SoA arithmetic mean of centroid x from the first floor(2F/3) spool frames.\n");
+  std::printf("  Evaluating with the currently loaded potential and PPPM configuration; GPJASMP1 has no potential fingerprint.\n");
+
+  std::vector<double> saved(static_cast<std::size_t>(3) * header.n);
+  if (atom.position_per_atom.size() != saved.size())
+    throw std::runtime_error("native fit sample diagnostic requires an initialized centroid position array");
+  atom.position_per_atom.copy_to_host(saved.data());
+  struct RestorePosition {
+    Atom& atom;
+    std::vector<double>& saved;
+    ~RestorePosition() { atom.position_per_atom.copy_from_host(saved.data()); }
+  } restore{atom, saved};
+  atom.position_per_atom.copy_from_host(r0.data());
+  diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force);
+}
 #else
 #include <stdexcept>
 void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions&, const std::string&,
   const std::uint64_t, Atom&, Box&, Force&)
 {
   throw std::runtime_error("native rpmd_ja reference fitting requires CUDA");
+}
+void diagnose_rpmd_ja_native_fit_samples(const std::string&, double, Atom&, Box&, Force&)
+{
+  throw std::runtime_error("native rpmd_ja sample diagnostics require CUDA");
 }
 #endif

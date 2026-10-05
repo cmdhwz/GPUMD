@@ -26,3 +26,10 @@ void fit_rpmd_ja_native_reference(
   Atom& atom,
   Box& box,
   Force& force);
+
+void diagnose_rpmd_ja_native_fit_samples(
+  const std::string& spool_path,
+  double fd_step,
+  Atom& atom,
+  Box& box,
+  Force& force);
