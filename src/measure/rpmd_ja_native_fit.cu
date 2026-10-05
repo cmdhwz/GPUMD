@@ -759,7 +759,7 @@ void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options,const st
 }
 
 void diagnose_rpmd_ja_native_fit_samples(const std::string& spool_path, const double fd_step,
-                                         Atom& atom, Box& box, Force& force)
+                                         Atom& atom, Box& box, Force& force, const bool full)
 {
   if (spool_path.empty() || !std::isfinite(fd_step) || fd_step <= 0.0)
     throw std::invalid_argument("native fit sample diagnostic requires a spool path and positive finite fd_step");
@@ -792,7 +792,7 @@ void diagnose_rpmd_ja_native_fit_samples(const std::string& spool_path, const do
     ~RestorePosition() { atom.position_per_atom.copy_from_host(saved.data()); }
   } restore{atom, saved};
   atom.position_per_atom.copy_from_host(r0.data());
-  diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force);
+  diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force, full);
 }
 #else
 #include <stdexcept>
@@ -801,7 +801,7 @@ void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions&, const std::stri
 {
   throw std::runtime_error("native rpmd_ja reference fitting requires CUDA");
 }
-void diagnose_rpmd_ja_native_fit_samples(const std::string&, double, Atom&, Box&, Force&)
+void diagnose_rpmd_ja_native_fit_samples(const std::string&, double, Atom&, Box&, Force&, bool)
 {
   throw std::runtime_error("native rpmd_ja sample diagnostics require CUDA");
 }

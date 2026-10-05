@@ -32,4 +32,5 @@ void diagnose_rpmd_ja_native_fit_samples(
   double fd_step,
   Atom& atom,
   Box& box,
-  Force& force);
+  Force& force,
+  bool full = false);

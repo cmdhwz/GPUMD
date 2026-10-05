@@ -11,7 +11,7 @@ static std::vector<double> diagnostic_expected_r0;
 static bool diagnostic_should_throw = false;
 
 Force::Force(void) {}
-void diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&)
+void diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&, bool)
 {
   std::vector<double> x(diagnostic_expected_r0.size());
   atom.position_per_atom.copy_to_host(x.data());

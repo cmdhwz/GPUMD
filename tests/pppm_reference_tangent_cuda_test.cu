@@ -96,6 +96,37 @@ int main()
     ik_force.copy_to_host(tangent_ik.data());
     const double tangent = total(tangent_site);
 
+    PPPMReferenceTranslationReport translation_report;
+    require(pppm.diagnose_reference_translation_energy(
+      N, box, charge, position, 1, translation_report, 6.0e-7),
+      "reference translation oracle rejected its current mesh");
+    require(translation_report.even_G && translation_report.mesh_zero_mode,
+      "reference translation oracle found an invalid reciprocal operator");
+    require(translation_report.mesh_invariant_pass,
+      "reference translation oracle failed integer-grid translation closure");
+    require(translation_report.assignment_closure_pass,
+      "reference translation oracle failed charge-assignment closure");
+    require(translation_report.fd_platform_pass,
+      "reference translation oracle did not establish a finite-difference platform");
+    require(std::isfinite(translation_report.native_vs_fp64_energy_error),
+      "reference translation oracle did not report the native/FP64 energy difference");
+    require(std::abs(total(baseline_site) - translation_report.native_reciprocal_energy) < 2.0e-5,
+      "reference translation oracle used an inconsistent reciprocal FFT energy factor");
+    for (int axis = 0; axis < 3; ++axis) {
+      require(std::isfinite(translation_report.axis[axis].native_energy_derivative),
+        "reference translation oracle produced a non-finite native derivative");
+      require(std::isfinite(translation_report.axis[axis].native_vs_fp64_error[0]),
+        "reference translation oracle did not compare native and FP64 derivatives");
+      for (int phase = 0; phase < 2; ++phase) {
+        require(std::isfinite(translation_report.axis[axis].richardson_derivative[phase][1]) &&
+                translation_report.axis[axis].fd_plateau_error[phase] <= 6.0e-7,
+          "reference translation oracle failed its three-step Richardson convergence check");
+        for (int step = 0; step < 3; ++step)
+          require(std::isfinite(translation_report.axis[axis].fd_derivative[phase][step]),
+            "reference translation oracle produced a non-finite finite difference");
+      }
+    }
+
     GPU_Vector<double> repeated_site;
     require(pppm.compute_reference_energy_tangent(
       N, box, charge, position, &direction, &charge_direction, 1, &repeated_site,

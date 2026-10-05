@@ -21,7 +21,9 @@
 #include "utilities/gpu_vector.cuh"
 #include "ewald.cuh"
 #include "pppm.cuh"
+#include <array>
 #include <memory>
+#include <vector>
 
 class RunInput;
 
@@ -54,6 +56,27 @@ struct NEP_Charge_Data {
   GPU_Vector<float> D_projected;
   GPU_Vector<float> charge_rate_raw;
   GPU_Vector<float> charge_rate;
+};
+
+struct QNEPReferenceTangentReduction {
+  double ordered_sum = 0.0;
+  double compensated_sum = 0.0;
+  long double extended_sum = 0.0L;
+  double sum_abs = 0.0;
+  double max_abs = 0.0;
+  double rms = 0.0;
+};
+
+struct QNEPReferenceTangentDiagnostics {
+  bool valid = false;
+  std::vector<double> local_site_tangent;
+  std::vector<double> real_site_tangent;
+  std::vector<double> pppm_site_tangent;
+  QNEPReferenceTangentReduction raw_charge_direction;
+  QNEPReferenceTangentReduction projected_charge_direction;
+  std::array<double, 3> pppm_ik_force_sum = {};
+  std::array<double, 3> pppm_explicit_gradient_sum = {};
+  std::array<double, 3> native_force_sum = {};
 };
 
 class NEP_Charge : public Potential
@@ -160,7 +183,15 @@ public:
     const GPU_Vector<double>& native_force,
     const GPU_Vector<double>* direction,
     GPU_Vector<double>* site_derivative,
-    GPU_Vector<double>& total_energy_gradient);
+    GPU_Vector<double>& total_energy_gradient,
+    QNEPReferenceTangentDiagnostics* diagnostics = nullptr);
+  bool diagnose_reference_translation_energy(
+    const Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    const GPU_Vector<double>& native_force,
+    PPPMReferenceTranslationReport& report,
+    const double precision_target);
 
   bool compute_pimd_batch(
     Box& box,

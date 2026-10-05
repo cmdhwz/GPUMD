@@ -44,6 +44,56 @@ struct PPPMAssignmentStencilDebug
   float W, qW;
 };
 
+enum class PPPMReferenceTranslationStatus { not_run, pass, fail, inconclusive };
+enum class PPPMReferenceTranslationReason {
+  none, invalid_frame, unsupported_box, unsupported_mesh, insufficient_memory,
+  invalid_precision_target, nonfinite_input, coefficient_copy_failed, fft_plan_failed, fft_execute_failed
+};
+
+struct PPPMReferenceTranslationAxisReport
+{
+  // Derivatives, errors, and the target use eV/Angstrom; phase 0 is original and 1 is half-grid shifted.
+  double native_energy_derivative = 0.0;
+  double fd_derivative[2][3] = {};
+  double richardson_derivative[2][2] = {};
+  double fd_error_estimate[2] = {};
+  double fd_roundoff_estimate[2] = {};
+  bool fd_signal_resolved[2] = {};
+  double fp64_forward_energy_derivative[2] = {};
+  double fd_plateau_error[2] = {};
+  double native_vs_fp64_error[2] = {};
+  bool native_vs_fp64_compared[2] = {true, false};
+  double integer_shift_energy_error = 0.0;
+  double integer_shift_assignment_error = 0.0;
+  double half_shift_energy_change = 0.0;
+};
+
+struct PPPMReferenceTranslationReport
+{
+  // Oracle promotes production float W coefficients to double; it is not native-float arithmetic.
+  bool continuous_fp64_extension_of_fp32_weights = true;
+  PPPMReferenceTranslationStatus status = PPPMReferenceTranslationStatus::not_run;
+  PPPMReferenceTranslationReason reason = PPPMReferenceTranslationReason::none;
+  PPPMReferenceTranslationAxisReport axis[3] = {};
+  // E = K_C_SP * sum_k G_k |Qhat_k|^2; both Z2Z transforms are unnormalized.
+  double native_reciprocal_energy = 0.0;
+  double fp64_forward_energy = 0.0;
+  double native_vs_fp64_energy_error = 0.0;
+  // Maximum accepted FD and derivative-comparison uncertainty, in eV/Angstrom.
+  double precision_target = 0.0;
+  double assignment_charge_error = 0.0;
+  double max_even_G_error = 0.0;
+  double mesh_zero_mode_value = 0.0;
+  bool even_G = false;
+  bool mesh_zero_mode = false;
+  bool assignment_closure_pass = false;
+  bool mesh_invariant_pass = false;
+  bool fd_platform_pass = false;
+  bool native_derivative_comparison_pass = false;
+  bool native_derivative_comparison_inconclusive = false;
+  bool native_derivative_precision_limited = false;
+};
+
 __host__ __device__ inline float pppm_reference_weight(
   const float coeff[5][5], const int stencil, const float delta)
 {
@@ -129,6 +179,14 @@ public:
     GPU_Vector<double>* dsite,
     GPU_Vector<double>& explicit_space_gradient,
     GPU_Vector<double>& native_ik_force);
+  bool diagnose_reference_translation_energy(
+    const int N,
+    const Box& box,
+    const GPU_Vector<float>& charge,
+    const GPU_Vector<double>& position,
+    const unsigned long long force_evaluation_id,
+    PPPMReferenceTranslationReport& report,
+    const double precision_target);
   void find_force_batch(
     const int N,
     const int N1,

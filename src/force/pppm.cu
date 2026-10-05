@@ -24,6 +24,7 @@ The k-space part of the PPPM method.
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -33,7 +34,47 @@ The k-space part of the PPPM method.
 #include <sys/stat.h>
 #include <vector>
 
+#ifdef USE_HIP
+using PPPMDoubleComplex = hipfftDoubleComplex;
+#else
+using PPPMDoubleComplex = cufftDoubleComplex;
+#endif
+
 namespace{
+
+bool pppm_make_double_plan(gpufftHandle& plan, const int K0, const int K1, const int K2)
+{
+#ifdef USE_HIP
+  return hipfftPlan3d(&plan, K2, K1, K0, HIPFFT_Z2Z) == HIPFFT_SUCCESS;
+#else
+  return cufftPlan3d(&plan, K2, K1, K0, CUFFT_Z2Z) == CUFFT_SUCCESS;
+#endif
+}
+
+bool pppm_forward_double(gpufftHandle plan, PPPMDoubleComplex* data)
+{
+#ifdef USE_HIP
+  return hipfftExecZ2Z(plan, data, data, HIPFFT_FORWARD) == HIPFFT_SUCCESS;
+#else
+  return cufftExecZ2Z(plan, data, data, CUFFT_FORWARD) == CUFFT_SUCCESS;
+#endif
+}
+
+struct PPPMDoublePlan
+{
+  gpufftHandle handle = 0;
+  bool initialized = false;
+  ~PPPMDoublePlan()
+  {
+    if (initialized) {
+#ifdef USE_HIP
+      hipfftDestroy(handle);
+#else
+      cufftDestroy(handle);
+#endif
+    }
+  }
+};
 
 constexpr int max_mesh_points = 512 * 512 * 512;
 
@@ -2710,6 +2751,359 @@ bool PPPM::compute_reference_energy_tangent(
     tangent_requested ? dsite->data() : nullptr,
     explicit_space_gradient.data(), native_ik_force.data());
   GPU_CHECK_KERNEL
+  return true;
+}
+
+bool PPPM::diagnose_reference_translation_energy(
+  const int N,
+  const Box& box,
+  const GPU_Vector<float>& charge,
+  const GPU_Vector<double>& position,
+  const unsigned long long force_evaluation_id,
+  PPPMReferenceTranslationReport& report,
+  const double precision_target)
+{
+  report = {};
+  if (!(precision_target > 0.0) || !std::isfinite(precision_target)) {
+    report.reason = PPPMReferenceTranslationReason::invalid_precision_target;
+    return false;
+  }
+  report.precision_target = precision_target;
+  if (N <= 0 || charge.size() < static_cast<size_t>(N) ||
+      position.size() < static_cast<size_t>(3) * N ||
+      !current_force_mesh_matches(N, 0, N, box, charge, position, force_evaluation_id, false) ||
+      !plan_initialized || para.K0K1K2 <= 0) {
+    report.reason = PPPMReferenceTranslationReason::invalid_frame;
+    return false;
+  }
+
+  const int K0 = para.K[0], K1 = para.K[1], K2 = para.K[2], M = para.K0K1K2;
+  if (!box.is_orthogonal || box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1 ||
+      K0 < 5 || K1 < 5 || K2 < 5) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = (!box.is_orthogonal || box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+      ? PPPMReferenceTranslationReason::unsupported_box
+      : PPPMReferenceTranslationReason::unsupported_mesh;
+    return true;
+  }
+  if (static_cast<size_t>(K0) * K1 * K2 != static_cast<size_t>(M) ||
+      static_cast<size_t>(M) > std::numeric_limits<size_t>::max() / sizeof(PPPMDoubleComplex)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::unsupported_mesh;
+    return true;
+  }
+  const size_t fp64_mesh_bytes = static_cast<size_t>(M) * sizeof(PPPMDoubleComplex);
+  if (fp64_mesh_bytes > (std::numeric_limits<size_t>::max() - 16u * 1024u * 1024u) / 2) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::unsupported_mesh;
+    return true;
+  }
+  size_t free_bytes = 0, total_bytes = 0;
+#ifdef USE_HIP
+  const bool memory_query_ok = hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess;
+#else
+  const bool memory_query_ok = cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
+#endif
+  const size_t required_bytes = 2 * fp64_mesh_bytes + 16u * 1024u * 1024u;
+  if (!memory_query_ok || free_bytes < required_bytes) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::insufficient_memory;
+    return true;
+  }
+
+  std::vector<float> host_q(N), host_G(M);
+  std::vector<double> host_r(static_cast<size_t>(3) * N);
+  std::vector<gpufftComplex> native_phi(M);
+  float host_W_coeff[5][5];
+  charge.copy_to_host(host_q.data());
+  position.copy_to_host(host_r.data());
+  G.copy_to_host(host_G.data());
+  mesh_G.copy_to_host(native_phi.data());
+  if (gpuMemcpyFromSymbol(host_W_coeff, W_coeff, sizeof(host_W_coeff)) != gpuSuccess) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::coefficient_copy_failed;
+    return true;
+  }
+  for (float q : host_q) if (!std::isfinite(q)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+    return true;
+  }
+  for (double r : host_r) if (!std::isfinite(r)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+    return true;
+  }
+  for (float g : host_G) if (!std::isfinite(g)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+    return true;
+  }
+  for (const gpufftComplex phi : native_phi) if (!std::isfinite(phi.x) || !std::isfinite(phi.y)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+    return true;
+  }
+  for (const auto& row : host_W_coeff) for (float coefficient : row) if (!std::isfinite(coefficient)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+    return true;
+  }
+
+  const double inverse[9] = {box.cpu_h[9], box.cpu_h[10], box.cpu_h[11],
+                             box.cpu_h[12], box.cpu_h[13], box.cpu_h[14],
+                             box.cpu_h[15], box.cpu_h[16], box.cpu_h[17]};
+  for (double value : inverse) if (!std::isfinite(value)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+    return true;
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    const double row_offdiag0 = inverse[axis * 3 + (axis + 1) % 3];
+    const double row_offdiag1 = inverse[axis * 3 + (axis + 2) % 3];
+    if (std::abs(row_offdiag0) > 1.0e-14 || std::abs(row_offdiag1) > 1.0e-14 ||
+        std::abs(box.cpu_h[axis * 3 + (axis + 1) % 3]) > 1.0e-14 ||
+        std::abs(box.cpu_h[axis * 3 + (axis + 2) % 3]) > 1.0e-14) {
+      report.status = PPPMReferenceTranslationStatus::inconclusive;
+      report.reason = PPPMReferenceTranslationReason::unsupported_box;
+      return true;
+    }
+  }
+
+  double scale_G = 0.0;
+  for (float g : host_G) scale_G = std::max(scale_G, std::abs(static_cast<double>(g)));
+  for (int iz = 0; iz < K2; ++iz) {
+    for (int iy = 0; iy < K1; ++iy) {
+      for (int ix = 0; ix < K0; ++ix) {
+        const int index = ix + K0 * (iy + K1 * iz);
+        const int opposite = ((K0 - ix) % K0) + K0 * (((K1 - iy) % K1) + K1 * ((K2 - iz) % K2));
+        report.max_even_G_error = std::max(report.max_even_G_error,
+          std::abs(static_cast<double>(host_G[index]) - host_G[opposite]));
+      }
+    }
+  }
+  report.even_G = report.max_even_G_error <= 32.0 * std::numeric_limits<float>::epsilon() * scale_G;
+  report.mesh_zero_mode_value = host_G[0];
+  report.mesh_zero_mode = host_G[0] == 0.0f;
+
+  auto compensated_add = [](double value, double& sum, double& correction) {
+    const double next = sum + value;
+    correction += std::abs(sum) >= std::abs(value) ? (sum - next) + value : (value - next) + sum;
+    sum = next;
+  };
+  auto wrap_index = [](int value, const int size) {
+    value %= size;
+    return value < 0 ? value + size : value;
+  };
+  auto native_energy_and_derivative = [&](double& energy, double derivative[3]) {
+    double esum = 0.0, ecorr = 0.0, dsum[3] = {}, dcorr[3] = {};
+    for (int atom = 0; atom < N; ++atom) {
+      float s[3];
+      for (int a = 0; a < 3; ++a)
+        s[a] = static_cast<float>((inverse[3 * a] * host_r[atom] +
+          inverse[3 * a + 1] * host_r[atom + N] + inverse[3 * a + 2] * host_r[atom + 2 * N]) * para.K[a]);
+      int center[3]; float delta[3], w[3][5], dw[3][5];
+      for (int a = 0; a < 3; ++a) {
+        center[a] = static_cast<int>(s[a] + 0.5f);
+        delta[a] = s[a] - center[a];
+        for (int j = 0; j < 5; ++j) {
+          w[a][j] = pppm_reference_weight(host_W_coeff, j, delta[a]);
+          dw[a][j] = pppm_reference_weight_derivative(host_W_coeff, j, delta[a]);
+        }
+      }
+      double potential = 0.0, grad[3] = {};
+      for (int a = -2; a <= 2; ++a) for (int b = -2; b <= 2; ++b) for (int c = -2; c <= 2; ++c) {
+        const int index = wrap_index(center[0] + a, K0) + K0 * (wrap_index(center[1] + b, K1) + K1 * wrap_index(center[2] + c, K2));
+        const float W = w[0][a + 2] * w[1][b + 2] * w[2][c + 2];
+        const double phi = native_phi[index].x;
+        potential += static_cast<double>(W) * phi;
+        const double shape[3] = {
+          static_cast<double>(dw[0][a + 2]) * w[1][b + 2] * w[2][c + 2] * para.K[0] * inverse[0],
+          static_cast<double>(w[0][a + 2]) * dw[1][b + 2] * w[2][c + 2] * para.K[1] * inverse[4],
+          static_cast<double>(w[0][a + 2]) * w[1][b + 2] * dw[2][c + 2] * para.K[2] * inverse[8]};
+        for (int axis = 0; axis < 3; ++axis) grad[axis] += shape[axis] * phi;
+      }
+      compensated_add(static_cast<double>(K_C_SP) * host_q[atom] * potential, esum, ecorr);
+      for (int axis = 0; axis < 3; ++axis)
+        compensated_add(2.0 * static_cast<double>(K_C_SP) * host_q[atom] * grad[axis], dsum[axis], dcorr[axis]);
+    }
+    energy = esum + ecorr;
+    for (int axis = 0; axis < 3; ++axis) derivative[axis] = dsum[axis] + dcorr[axis];
+  };
+  double native_derivative[3] = {};
+  native_energy_and_derivative(report.native_reciprocal_energy, native_derivative);
+  if (!std::isfinite(report.native_reciprocal_energy)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+    return true;
+  }
+  for (int axis = 0; axis < 3; ++axis)
+    report.axis[axis].native_energy_derivative = native_derivative[axis];
+
+  PPPMDoublePlan double_plan;
+  if (!pppm_make_double_plan(double_plan.handle, K0, K1, K2)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::fft_plan_failed;
+    return true;
+  }
+  double_plan.initialized = true;
+  size_t free_after_plan = 0, total_after_plan = 0;
+#ifdef USE_HIP
+  const bool post_plan_memory_ok =
+    hipMemGetInfo(&free_after_plan, &total_after_plan) == hipSuccess && free_after_plan >= fp64_mesh_bytes;
+#else
+  const bool post_plan_memory_ok =
+    cudaMemGetInfo(&free_after_plan, &total_after_plan) == cudaSuccess && free_after_plan >= fp64_mesh_bytes;
+#endif
+  if (!post_plan_memory_ok) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::insufficient_memory;
+    return true;
+  }
+  GPU_Vector<PPPMDoubleComplex> fp64_mesh(static_cast<size_t>(M));
+  std::vector<PPPMDoubleComplex> host_mesh(static_cast<size_t>(M));
+  std::vector<double> base_charge_mesh(static_cast<size_t>(M));
+  bool oracle_fft_ok = true;
+  auto fp64_energy = [&](const int translate_axis, const double shift, double* assignment_error) {
+    std::fill(host_mesh.begin(), host_mesh.end(), PPPMDoubleComplex{0.0, 0.0});
+    for (int atom = 0; atom < N; ++atom) {
+      double r[3] = {host_r[atom] + (translate_axis == 0 ? shift : 0.0),
+                     host_r[atom + N] + (translate_axis == 1 ? shift : 0.0),
+                     host_r[atom + 2 * N] + (translate_axis == 2 ? shift : 0.0)};
+      double s[3]; int center[3]; double w[3][5];
+      for (int a = 0; a < 3; ++a) {
+        s[a] = (inverse[3 * a] * r[0] + inverse[3 * a + 1] * r[1] + inverse[3 * a + 2] * r[2]) * para.K[a];
+        center[a] = static_cast<int>(std::floor(s[a] + 0.5));
+        const double delta = s[a] - center[a];
+        for (int j = 0; j < 5; ++j) {
+          const float* coeff = host_W_coeff[j];
+          w[a][j] = (((static_cast<double>(coeff[4]) * delta + coeff[3]) * delta + coeff[2]) * delta + coeff[1]) * delta + coeff[0];
+        }
+      }
+      for (int a = -2; a <= 2; ++a) for (int b = -2; b <= 2; ++b) for (int c = -2; c <= 2; ++c) {
+        const int index = wrap_index(center[0] + a, K0) + K0 * (wrap_index(center[1] + b, K1) + K1 * wrap_index(center[2] + c, K2));
+        host_mesh[index].x += static_cast<double>(host_q[atom]) * w[0][a + 2] * w[1][b + 2] * w[2][c + 2];
+      }
+    }
+    if (assignment_error != nullptr) {
+      double assigned = 0.0, assigned_correction = 0.0;
+      double requested = 0.0, requested_correction = 0.0;
+      for (int i = 0; i < M; ++i) compensated_add(host_mesh[i].x, assigned, assigned_correction);
+      for (float q : host_q) compensated_add(q, requested, requested_correction);
+      *assignment_error = std::abs((assigned + assigned_correction) - (requested + requested_correction));
+      if (translate_axis < 0) {
+        for (int i = 0; i < M; ++i) base_charge_mesh[i] = host_mesh[i].x;
+      } else {
+        double cycle_error = 0.0;
+        for (int iz = 0; iz < K2; ++iz) for (int iy = 0; iy < K1; ++iy) for (int ix = 0; ix < K0; ++ix) {
+          const int source = ix + K0 * (iy + K1 * iz);
+          const int shifted = (ix + (translate_axis == 0)) % K0 + K0 *
+            ((iy + (translate_axis == 1)) % K1 + K1 * ((iz + (translate_axis == 2)) % K2));
+          cycle_error = std::max(cycle_error, std::abs(host_mesh[shifted].x - base_charge_mesh[source]));
+        }
+        *assignment_error = std::max(*assignment_error, cycle_error);
+      }
+    }
+    fp64_mesh.copy_from_host(host_mesh.data());
+    const bool fft_ok = pppm_forward_double(double_plan.handle, fp64_mesh.data());
+    if (!fft_ok) {
+      oracle_fft_ok = false;
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    fp64_mesh.copy_to_host(host_mesh.data());
+    double sum = 0.0, correction = 0.0;
+    for (int i = 0; i < M; ++i) {
+      const double re = host_mesh[i].x, im = host_mesh[i].y;
+      compensated_add(static_cast<double>(K_C_SP) * host_G[i] * (re * re + im * im), sum, correction);
+    }
+    return sum + correction;
+  };
+  report.fp64_forward_energy = fp64_energy(-1, 0.0, &report.assignment_charge_error);
+  if (!std::isfinite(report.fp64_forward_energy)) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::fft_execute_failed;
+    return true;
+  }
+  report.native_vs_fp64_energy_error = std::abs(report.native_reciprocal_energy - report.fp64_forward_energy);
+
+  constexpr double steps[3] = {0.01, 0.005, 0.0025};
+  bool all_fd_platforms_ok = true;
+  bool native_comparison_inconclusive = false;
+  bool native_precision_limited = false;
+  for (int axis = 0; axis < 3; ++axis) {
+    const double lattice_length = box.cpu_h[axis * 3 + axis];
+    const double grid_shift = lattice_length / para.K[axis];
+    const double integer_energy = fp64_energy(axis, grid_shift, &report.axis[axis].integer_shift_assignment_error);
+    report.axis[axis].integer_shift_energy_error = std::abs(integer_energy - report.fp64_forward_energy);
+    const double half_energy = fp64_energy(axis, 0.5 * grid_shift, nullptr);
+    report.axis[axis].half_shift_energy_change = half_energy - report.fp64_forward_energy;
+    for (int phase = 0; phase < 2; ++phase) {
+      const double origin = phase == 0 ? 0.0 : 0.5 * grid_shift;
+      double terms_abs = 0.0;
+      for (int step_id = 0; step_id < 3; ++step_id) {
+        const double h = steps[step_id];
+        const double plus = fp64_energy(axis, origin + h, nullptr);
+        const double minus = fp64_energy(axis, origin - h, nullptr);
+        terms_abs += std::abs(plus) + std::abs(minus);
+        report.axis[axis].fd_derivative[phase][step_id] = (plus - minus) / (2.0 * h);
+      }
+      const double* d = report.axis[axis].fd_derivative[phase];
+      const double d4_coarse = (4.0 * d[1] - d[0]) / 3.0;
+      const double d4_fine = (4.0 * d[2] - d[1]) / 3.0;
+      report.axis[axis].richardson_derivative[phase][0] = d4_coarse;
+      report.axis[axis].richardson_derivative[phase][1] = d4_fine;
+      const double extrapolation_difference = std::abs(d4_fine - d4_coarse);
+      report.axis[axis].fd_error_estimate[phase] = extrapolation_difference / 15.0;
+      report.axis[axis].fd_roundoff_estimate[phase] =
+        std::numeric_limits<double>::epsilon() * terms_abs / (2.0 * steps[2]);
+      report.axis[axis].fd_plateau_error[phase] =
+        extrapolation_difference + report.axis[axis].fd_roundoff_estimate[phase];
+      report.axis[axis].fp64_forward_energy_derivative[phase] = d4_fine;
+      report.axis[axis].fd_signal_resolved[phase] =
+        std::abs(d4_fine) > 3.0 * report.axis[axis].fd_plateau_error[phase];
+      if (!std::isfinite(d4_fine) || report.axis[axis].fd_plateau_error[phase] > precision_target)
+        all_fd_platforms_ok = false;
+      if (phase == 0) {
+        report.axis[axis].native_vs_fp64_error[phase] =
+          std::abs(report.axis[axis].native_energy_derivative - d4_fine);
+        if (report.axis[axis].fd_plateau_error[phase] > precision_target ||
+            !report.axis[axis].fd_signal_resolved[phase]) {
+          native_comparison_inconclusive = true;
+        } else if (report.axis[axis].native_vs_fp64_error[phase] > precision_target) {
+          native_precision_limited = true;
+        }
+      }
+    }
+  }
+  if (!oracle_fft_ok) {
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+    report.reason = PPPMReferenceTranslationReason::fft_execute_failed;
+    return true;
+  }
+  double charge_scale = 0.0;
+  for (float q : host_q) charge_scale += std::abs(static_cast<double>(q));
+  const double assignment_tol = 8.0 * std::numeric_limits<float>::epsilon() * std::max(1.0, charge_scale);
+  report.assignment_closure_pass = report.assignment_charge_error <= assignment_tol;
+  for (int axis = 0; axis < 3; ++axis)
+    report.assignment_closure_pass = report.assignment_closure_pass &&
+      report.axis[axis].integer_shift_assignment_error <= assignment_tol;
+  report.mesh_invariant_pass = report.even_G && report.mesh_zero_mode && report.assignment_closure_pass;
+  for (int axis = 0; axis < 3; ++axis) {
+    const double energy_tol = 4096.0 * std::numeric_limits<double>::epsilon() *
+      std::max(1.0, std::abs(report.fp64_forward_energy));
+    report.mesh_invariant_pass = report.mesh_invariant_pass &&
+      report.axis[axis].integer_shift_energy_error <= energy_tol;
+  }
+  report.fd_platform_pass = all_fd_platforms_ok;
+  report.native_derivative_comparison_inconclusive = native_comparison_inconclusive || !all_fd_platforms_ok;
+  report.native_derivative_precision_limited = native_precision_limited;
+  report.native_derivative_comparison_pass = !native_precision_limited && !report.native_derivative_comparison_inconclusive;
+  if (!report.mesh_invariant_pass)
+    report.status = PPPMReferenceTranslationStatus::fail;
+  else if (!report.fd_platform_pass || report.native_derivative_comparison_inconclusive || native_precision_limited)
+    report.status = PPPMReferenceTranslationStatus::inconclusive;
+  else
+    report.status = PPPMReferenceTranslationStatus::pass;
   return true;
 }
 

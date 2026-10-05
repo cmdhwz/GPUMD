@@ -9,7 +9,7 @@ native = (root / "src/measure/rpmd_ja_native_fit.cu").read_text(encoding="utf-8"
 header = (root / "src/measure/rpmd_ja_reference.cuh").read_text(encoding="utf-8")
 
 # Keep the diagnostic entry point stable for the saved-spool caller.
-assert "void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box, Force& force)" in text
+assert "void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box, Force& force, const bool full)" in text
 assert "for (const double step_scale : {0.5, 1.0, 2.0, 5.0, 10.0})" in text
 assert "analytic-gradient Hessian sampled D4 norm" in text
 assert "relative-to-D4" in text and "native-force K D4 norm" in text
@@ -17,11 +17,18 @@ assert "FAIL=" in text and "qNEP rpmd_ja sampled stencil-step consistency check 
 assert "const int component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}}" in text
 assert "for (const double factor : {0.75, 0.5})" in text
 assert 'tokens[1] == "diagnose_samples"' in cli
-assert "diagnose_rpmd_ja_native_fit_samples(tokens[2], fd_step, atom, box, force)" in cli
+assert 'tokens[1] == "diagnose"' in cli and 'tokens[3] == "full"' in cli
+assert 'tokens[4] == "full"' in cli
+assert "diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force, full)" in cli
+assert "diagnose_rpmd_ja_native_fit_samples(tokens[2], fd_step, atom, box, force, full)" in cli
+assert "bool full = false" in header
 assert "const SampleHeader header = read_header(in, 0, atom, box, 0.0, true)" in native
 assert "struct RestorePosition" in native and "~RestorePosition()" in native
 sample_diagnostic = native[native.index("void diagnose_rpmd_ja_native_fit_samples("):native.index("#else", native.index("void diagnose_rpmd_ja_native_fit_samples("))]
-assert "diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force)" in sample_diagnostic
+assert "bool full)" in sample_diagnostic
+assert "diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force, full)" in sample_diagnostic
+assert "bool full = false" in (root / "src/measure/rpmd_ja_native_fit.cuh").read_text(encoding="utf-8")
+assert "diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&, bool)" in (root / "tests/rpmd_ja_native_fit_cuda_test.cu").read_text(encoding="utf-8")
 fit_wrapper = native[native.index("void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options"):native.index("void diagnose_rpmd_ja_native_fit_samples(")]
 assert "diagnose_rpmd_ja_qnep_reference" not in fit_wrapper
 assert "const bool precheck_failed" in text and "throw std::runtime_error(failure.str())" in text
@@ -41,6 +48,20 @@ assert 'proxies, not the full-column V sum' in text
 assert 'baseline repeated force net[%d]' in text
 assert 'mesh net-force quick diagnostic' in text
 assert 'exact full-column V gradient net xyz=' in text
+assert "if (full) {" in diagnose and "for (int coordinate = 0; coordinate < d; ++coordinate)" in diagnose
+assert "site_values = evaluator.analytic_site_jvp(direction_host)" in diagnose
+assert "axis_site_columns[(coordinate / n) * n + site] += value" in diagnose
+assert "QNEPReferenceTangentDiagnostics tangent" in diagnose
+assert "compensated_running_sum" in diagnose and "long double extended" in diagnose
+assert "diagnose_reference_translation_energy(" in diagnose
+for label in ("CODE_INVARIANT", "ENERGY_ORACLE", "PRECISION", "EXACT_V_NET"):
+    assert label in diagnose
+assert "a.native_vs_fp64_error[1]" not in diagnose
+assert "3.0 * a.fd_plateau_error[0] > oracle.precision_target" in diagnose
+assert "native_derivative_precision_limited ? \"INCONCLUSIVE\"" in diagnose
+assert "mesh_oracle, mesh_gradient_net_for_target.limit" in diagnose
+assert "full V columns" in diagnose
+assert ".qraw" not in diagnose and "std::ofstream" not in diagnose
 raw_generation = text[text.index("static void generate_rpmd_ja_qnep_raw_reference("):text.index("void generate_rpmd_ja_qnep_raw(")]
 assert raw_generation.index("exact full-column V gradient net xyz=") < raw_generation.index("if (require_zero_net_gradient && !net_stats.within_limit)") < raw_generation.index("const auto kc_phase_start")
 assert "bool require_zero_net_gradient = false" in header
@@ -55,6 +76,35 @@ def central2(plus, minus, h):
 
 def central4(plus_h, minus_h, plus_2h, minus_2h, h):
     return (8.0 * (plus_h - minus_h) - (plus_2h - minus_2h)) / (12.0 * h)
+
+
+def neumaier(values):
+    running = correction = 0.0
+    for value in values:
+        next_sum = running + value
+        correction += ((running - next_sum) + value if abs(running) >= abs(value)
+                       else (value - next_sum) + running)
+        running = next_sum
+    return running + correction
+
+
+# Cancellation verifies the compensated path recovers the lost unit.
+cancelled = [1.0e16, 1.0, -1.0e16]
+ordered_cancelled = 0.0
+for value in cancelled:
+    ordered_cancelled += value
+assert ordered_cancelled == 0.0
+assert neumaier(cancelled) == 1.0
+
+
+def resolved_nonzero(derivative, plateau_error, target):
+    return abs(derivative) - 3.0 * plateau_error > target
+
+
+# The fixed-grid derivative is called resolved only when its conservative
+# plateau bound stays above the caller's tolerance.
+assert resolved_nonzero(2.0e-5, 2.0e-6, 1.0e-5)
+assert not resolved_nonzero(2.0e-5, 4.0e-6, 1.0e-5)
 
 
 # For a quartic g, D4 is exact at zero; D2(h)-D2(2h) is -6 h^2.

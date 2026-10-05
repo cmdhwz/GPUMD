@@ -121,6 +121,6 @@ void generate_rpmd_ja_qnep_raw(
   Box& box,
   Force& force,
   bool require_zero_net_gradient = false);
-void diagnose_rpmd_ja_qnep_reference(double fd_step, Atom& atom, Box& box, Force& force);
+void diagnose_rpmd_ja_qnep_reference(double fd_step, Atom& atom, Box& box, Force& force, bool full = false);
 std::uint64_t rpmd_ja_model_fingerprint(const std::string& path);
 std::uint64_t rpmd_ja_qnep_config_fingerprint(Force& force);

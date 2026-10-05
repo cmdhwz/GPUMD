@@ -3322,7 +3322,8 @@ static __global__ void add_reference_real_site_tangent(
   const double* direction,
   const float* charge,
   const double* charge_direction,
-  double* site_derivative)
+  double* site_derivative,
+  double* real_site_tangent)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= N) return;
@@ -3353,7 +3354,49 @@ static __global__ void add_reference_real_site_tangent(
                        r[2] * (direction[j + 2 * N] - direction[i + 2 * N])) * invr;
     value += 0.5 * ((dqi * charge[j] + qi * dqj) * phi + qi * charge[j] * dphi * dr);
   }
+  if (real_site_tangent != nullptr) real_site_tangent[i] = static_cast<double>(K_C_SP) * value;
   site_derivative[i] += static_cast<double>(K_C_SP) * value;
+}
+
+static bool reduce_reference_tangent_values(
+  const std::vector<double>& values, QNEPReferenceTangentReduction& result)
+{
+  result = {};
+  long double squares = 0.0L;
+  double compensation = 0.0;
+  for (double value : values) {
+    if (!std::isfinite(value)) return false;
+    result.ordered_sum += value;
+    const double next = result.compensated_sum + value;
+    compensation += std::abs(result.compensated_sum) >= std::abs(value)
+      ? (result.compensated_sum - next) + value
+      : (value - next) + result.compensated_sum;
+    result.compensated_sum = next;
+    result.extended_sum += static_cast<long double>(value);
+    result.sum_abs += std::abs(value);
+    result.max_abs = std::max(result.max_abs, std::abs(value));
+    squares += static_cast<long double>(value) * value;
+  }
+  result.compensated_sum += compensation;
+  result.rms = std::sqrt(static_cast<double>(squares / values.size()));
+  return std::isfinite(result.ordered_sum) && std::isfinite(result.compensated_sum) &&
+    std::isfinite(result.extended_sum) && std::isfinite(result.sum_abs) &&
+    std::isfinite(result.max_abs) && std::isfinite(result.rms);
+}
+
+static bool reduce_reference_tangent_xyz(
+  const std::vector<double>& values, const int N, std::array<double, 3>& result)
+{
+  result = {};
+  for (int d = 0; d < 3; ++d) {
+    for (int i = 0; i < N; ++i) {
+      const double value = values[d * N + i];
+      if (!std::isfinite(value)) return false;
+      result[d] += value;
+    }
+    if (!std::isfinite(result[d])) return false;
+  }
+  return true;
 }
 
 static __global__ void combine_reference_tangent(
@@ -3379,9 +3422,12 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
   const GPU_Vector<double>& native_force,
   const GPU_Vector<double>* direction,
   GPU_Vector<double>* site_derivative,
-  GPU_Vector<double>& total_energy_gradient)
+  GPU_Vector<double>& total_energy_gradient,
+  QNEPReferenceTangentDiagnostics* diagnostics)
 {
   const int N = type.size();
+  if (diagnostics != nullptr) *diagnostics = {};
+  if (diagnostics != nullptr && direction == nullptr) return false;
   if (!reference_force_frame_valid_ || reference_force_frame_id_ != force_evaluation_id_ ||
       N <= 0 || reference_force_frame_N_ != N || reference_force_frame_type_ != type.data() ||
       reference_force_frame_position_ != position.data() || reference_force_frame_force_ != native_force.data() ||
@@ -3420,6 +3466,11 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
   if (total_energy_gradient.size() != size_3n) total_energy_gradient.resize(size_3n);
 
   if (direction != nullptr) {
+    if (diagnostics != nullptr) {
+      diagnostics->local_site_tangent.resize(size_n);
+      diagnostics->real_site_tangent.resize(size_n);
+      diagnostics->pppm_site_tangent.resize(size_n);
+    }
     compute_reference_local_tangent<<<(N - 1) / 64 + 1, 64>>>(
       paramb, annmb, zbl, N, box, small_box, NN_radial, NL_radial, NN_angular, NL_angular,
       type.data(), position.data(), direction->data(), x12_radial, y12_radial, z12_radial,
@@ -3429,12 +3480,26 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
     project_reference_charge_direction<<<1, 1024>>>(
       N, reference_charge_direction_raw_.data(), reference_charge_direction_.data());
     GPU_CHECK_KERNEL
+    if (diagnostics != nullptr) {
+      std::vector<double> raw(size_n), projected(size_n);
+      reference_charge_direction_raw_.copy_to_host(raw.data());
+      reference_charge_direction_.copy_to_host(projected.data());
+      if (!reduce_reference_tangent_values(raw, diagnostics->raw_charge_direction) ||
+          !reduce_reference_tangent_values(projected, diagnostics->projected_charge_direction))
+        return false;
+      reference_short_site_derivative_.copy_to_host(diagnostics->local_site_tangent.data());
+    }
     if (paramb.charge_mode == 1) {
       add_reference_real_site_tangent<<<(N - 1) / 64 + 1, 64>>>(
         N, charge_para, box, small_box, NN_radial, NL_radial, x12_radial, y12_radial, z12_radial,
         position.data(), direction->data(), nep_data.charge.data(), reference_charge_direction_.data(),
-        reference_short_site_derivative_.data());
+        reference_short_site_derivative_.data(),
+        diagnostics == nullptr ? nullptr : reference_pppm_site_derivative_.data());
       GPU_CHECK_KERNEL
+      if (diagnostics != nullptr)
+        reference_pppm_site_derivative_.copy_to_host(diagnostics->real_site_tangent.data());
+    } else if (diagnostics != nullptr) {
+      std::fill(diagnostics->real_site_tangent.begin(), diagnostics->real_site_tangent.end(), 0.0);
     }
   }
   if (!pppm.compute_reference_energy_tangent(
@@ -3443,6 +3508,20 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
         site_derivative == nullptr ? nullptr : &reference_pppm_site_derivative_,
         reference_pppm_explicit_gradient_, reference_pppm_ik_force_))
     return false;
+  if (diagnostics != nullptr) {
+    reference_pppm_site_derivative_.copy_to_host(diagnostics->pppm_site_tangent.data());
+    std::vector<double> ik(size_3n), explicit_gradient(size_3n), native(size_3n);
+    reference_pppm_ik_force_.copy_to_host(ik.data());
+    reference_pppm_explicit_gradient_.copy_to_host(explicit_gradient.data());
+    native_force.copy_to_host(native.data());
+    if (!reduce_reference_tangent_xyz(ik, N, diagnostics->pppm_ik_force_sum) ||
+        !reduce_reference_tangent_xyz(explicit_gradient, N, diagnostics->pppm_explicit_gradient_sum) ||
+        !reduce_reference_tangent_xyz(native, N, diagnostics->native_force_sum)) return false;
+    for (size_t i = 0; i < size_n; ++i)
+      if (!std::isfinite(diagnostics->local_site_tangent[i]) ||
+          !std::isfinite(diagnostics->real_site_tangent[i]) ||
+          !std::isfinite(diagnostics->pppm_site_tangent[i])) return false;
+  }
   combine_reference_tangent<<<(3 * N - 1) / 64 + 1, 64>>>(
     N, direction == nullptr ? nullptr : reference_short_site_derivative_.data(),
     direction == nullptr ? nullptr : reference_pppm_site_derivative_.data(),
@@ -3450,7 +3529,40 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
     native_force.data(), reference_pppm_ik_force_.data(), reference_pppm_explicit_gradient_.data(),
     total_energy_gradient.data());
   GPU_CHECK_KERNEL
+  if (diagnostics != nullptr) {
+    std::vector<double> gradient(size_3n), site(size_n);
+    total_energy_gradient.copy_to_host(gradient.data());
+    site_derivative->copy_to_host(site.data());
+    for (double value : gradient) if (!std::isfinite(value)) return false;
+    for (double value : site) if (!std::isfinite(value)) return false;
+  }
+  if (diagnostics != nullptr) diagnostics->valid = true;
   return true;
+}
+
+bool NEP_Charge::diagnose_reference_translation_energy(
+  const Box& box,
+  const GPU_Vector<int>& type,
+  const GPU_Vector<double>& position,
+  const GPU_Vector<double>& native_force,
+  PPPMReferenceTranslationReport& report,
+  const double precision_target)
+{
+  report = {};
+  const int N = type.size();
+  if (!reference_force_frame_valid_ || reference_force_frame_id_ != force_evaluation_id_ ||
+      N <= 0 || reference_force_frame_N_ != N || reference_force_frame_type_ != type.data() ||
+      reference_force_frame_position_ != position.data() || reference_force_frame_force_ != native_force.data() ||
+      reference_force_frame_N1_ != 0 || reference_force_frame_N2_ != N || has_dftd3 || !use_pppm ||
+      (paramb.charge_mode != 1 && paramb.charge_mode != 2) ||
+      box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1 ||
+      position.size() < static_cast<size_t>(3) * N || native_force.size() < static_cast<size_t>(3) * N ||
+      nep_data.charge.size() != static_cast<size_t>(N))
+    return false;
+  for (int i = 0; i < 18; ++i)
+    if (reference_force_frame_box_[i] != box.cpu_h[i]) return false;
+  return pppm.diagnose_reference_translation_energy(
+    N, box, nep_data.charge, position, force_evaluation_id_, report, precision_target);
 }
 
 static __device__ __forceinline__ void accumulate_charge_heat_channel(
