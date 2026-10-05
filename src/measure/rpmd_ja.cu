@@ -232,9 +232,12 @@ void HAC::pre_run_rpmd_ja_(
           1.0e-12 * std::max(1.0, std::fabs(active_mesh_spacing)) ||
         (rpmd_ja_reference_.mechanical_policy != "native_reference_transport" &&
          rpmd_ja_reference_.mechanical_policy != "native_reference_transport;analytic_site_gradient_v1" &&
-         rpmd_ja_reference_.mechanical_policy != "native_reference_transport;analytic_site_gradient_fd4_v1") ||
+         rpmd_ja_reference_.mechanical_policy != "native_reference_transport;analytic_site_gradient_fd4_v1" &&
+         rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) <= 0) ||
         rpmd_ja_reference_.mechanical_config_fingerprint !=
-          rpmd_ja_qnep_config_fingerprint(force)) {
+          rpmd_ja_qnep_config_fingerprint(force) ||
+        (rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) > 0 &&
+         rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) != atom.number_of_beads)) {
       PRINT_INPUT_ERROR(
         "rpmd_ja qNEP v3 reference charge settings, native transport policy, or mechanical configuration do not match.");
     }

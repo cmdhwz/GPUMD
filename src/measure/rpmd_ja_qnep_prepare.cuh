@@ -25,4 +25,5 @@ void prepare_rpmd_ja_qnep_reference(
   const std::string& raw_path,
   const std::string& output_path,
   const std::string& kernel_table_path,
-  const RpmdJAModeValidator& mode_validator = {});
+  const RpmdJAModeValidator& mode_validator = {},
+  const std::string& additive_path = {});

@@ -61,9 +61,35 @@ constexpr char kNativeReferencePolicy[] = "native_reference_transport";
 constexpr char kAnalyticSitePolicy[] = "native_reference_transport;analytic_site_gradient_v1";
 constexpr char kAnalyticSiteFd4Policy[] = "native_reference_transport;analytic_site_gradient_fd4_v1";
 
+bool parse_additive_policy(const std::string& policy, int& beads, int& derivative)
+{
+  constexpr char prefix[] = "native_reference_transport;finite_temperature_additive_v1;beads=";
+  const std::string p(prefix);
+  if (policy.compare(0, p.size(), p) != 0) return false;
+  const std::size_t split = policy.find(";derivative=", p.size());
+  if (split == std::string::npos) return false;
+  auto parse = [](const std::string& s, int& v) {
+    if (s.empty() || (s.size() > 1 && s[0] == '0')) return false;
+    int value = 0;
+    for (char c : s) {
+      if (c < '0' || c > '9' || value > (std::numeric_limits<int>::max() - (c-'0')) / 10) return false;
+      value = value * 10 + (c-'0');
+    }
+    v = value;
+    return true;
+  };
+  const std::string b = policy.substr(p.size(), split-p.size());
+  const std::string v = policy.substr(split+12);
+  if (!parse(b, beads) || !parse(v, derivative) || beads <= 0 || derivative < 1 || derivative > 3)
+    return false;
+  return std::to_string(beads) == b && std::to_string(derivative) == v;
+}
+
 bool is_supported_qnep_policy(const std::string& policy)
 {
-  return policy == kNativeReferencePolicy || policy == kAnalyticSitePolicy || policy == kAnalyticSiteFd4Policy;
+  int beads=0, derivative=0;
+  return policy == kNativeReferencePolicy || policy == kAnalyticSitePolicy ||
+    policy == kAnalyticSiteFd4Policy || parse_additive_policy(policy, beads, derivative);
 }
 
 std::vector<std::array<int, 3>> periodic_wrap_offsets(
@@ -1089,6 +1115,12 @@ void load_rpmd_ja_kernel_table(const std::string& path, RpmdJAReference& referen
   load_kernel_table(path, reference);
 }
 
+int rpmd_ja_reference_policy_beads(const std::string& policy)
+{
+  int beads=0, derivative=0;
+  return parse_additive_policy(policy, beads, derivative) ? beads : 0;
+}
+
 std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference)
 {
   if (!is_supported_qnep_policy(reference.mechanical_policy))
@@ -1613,7 +1645,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     double minimum_pivot = 0.0, operator_bound = 0.0, translation_residual = 0.0;
     double reconstruction_residual = 0.0, softmode_error = 0.0;
     stability >> tag >> stability_version;
-    if (tag != "GPUMDJA_QNEP_STABILITY" || (stability_version < 1 || stability_version > 3))
+    if (tag != "GPUMDJA_QNEP_STABILITY" || (stability_version < 1 || stability_version > 4))
       throw std::runtime_error("missing or unsupported qNEP RPMD-JA stability sidecar: " + stability_path);
     stability >> tag >> std::hex >> file_fingerprint >> std::dec;
     if (tag != "fingerprint") throw std::runtime_error("invalid qNEP RPMD-JA sidecar file fingerprint");
@@ -1627,10 +1659,32 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
       if (tag != "derivative_policy" || derivative_policy != result.mechanical_policy)
         throw std::runtime_error("qNEP RPMD-JA sidecar derivative policy does not match the reference");
     }
+    int policy_beads=0, policy_derivative=0;
+    const bool additive_policy=parse_additive_policy(result.mechanical_policy,policy_beads,policy_derivative);
+    if (additive_policy != (stability_version == 4))
+      throw std::runtime_error("additive qNEP RPMD-JA policy requires its own shifted certificate");
     if (stability_version == 1) {
       stability >> tag >> minimum_pivot;
       if (tag != "minimum_positive_eigenvalue")
         throw std::runtime_error("invalid qNEP RPMD-JA sidecar minimum eigenvalue");
+    } else if (stability_version == 4) {
+      std::string derivative_policy;
+      stability >> tag >> derivative_policy;
+      if (tag != "derivative_policy" || derivative_policy != result.mechanical_policy)
+        throw std::runtime_error("qNEP RPMD-JA sidecar derivative policy does not match the reference");
+      std::string certificate;
+      stability >> tag >> certificate;
+      if (tag != "certificate" || certificate != "additive_shifted_frobenius_v1")
+        throw std::runtime_error("unsupported additive qNEP RPMD-JA stability certificate");
+      stability >> tag >> result.additive_epsilon;
+      if (tag != "epsilon_num") throw std::runtime_error("invalid additive qNEP epsilon field");
+      stability >> tag >> result.additive_reconstruction_bound;
+      if (tag != "reconstruction_bound") throw std::runtime_error("invalid additive qNEP reconstruction bound");
+      stability >> tag >> minimum_pivot;
+      if (tag != "minimum_cholesky_pivot") throw std::runtime_error("invalid additive qNEP shifted Cholesky pivot");
+      stability >> tag >> operator_bound;
+      if (tag != "relative_operator_bound") throw std::runtime_error("invalid additive qNEP operator bound");
+      result.additive_beads=policy_beads;
     } else {
       std::string certificate;
       stability >> tag >> certificate;
@@ -1658,10 +1712,18 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
         config_fingerprint != result.mechanical_config_fingerprint ||
         file_fingerprint != rpmd_ja_model_fingerprint(path))
       throw std::runtime_error("qNEP RPMD-JA stability sidecar does not validate this reference file");
-    if (stability_version >= 2 &&
+    if (stability_version >= 2 && stability_version < 4 &&
         (!(operator_bound >= 0.0) || operator_bound > 1.0e-2 || !std::isfinite(operator_bound)))
       throw std::runtime_error("qNEP RPMD-JA relative operator certificate exceeds its accepted bound");
-    result.stability_certificate = stability_version >= 2 ? "cholesky_relative_bound" : "legacy_spectrum_v1";
+    if (stability_version == 4 &&
+        (!(result.additive_epsilon > 0.0) || !std::isfinite(result.additive_epsilon) ||
+         !(result.additive_reconstruction_bound >= 0.0) ||
+         !(result.additive_reconstruction_bound < 0.5 * result.additive_epsilon) ||
+         !std::isfinite(result.additive_reconstruction_bound) || !(minimum_pivot > 0.0) ||
+         !std::isfinite(minimum_pivot) || operator_bound != 0.0))
+      throw std::runtime_error("additive qNEP RPMD-JA shifted Frobenius certificate is invalid");
+    result.stability_certificate = stability_version == 4 ? "additive_shifted_frobenius_v1" :
+      (stability_version >= 2 ? "cholesky_relative_bound" : "legacy_spectrum_v1");
     result.minimum_cholesky_pivot = minimum_pivot;
     result.relative_operator_bound = operator_bound;
     result.stability_checked = true;
@@ -2556,6 +2618,18 @@ static void generate_rpmd_ja_qnep_raw_reference(
       c_relative[0], c_relative[1], c_relative[2], second_consistency, second_convergence, kDifferenceTolerance);
     throw std::runtime_error("qNEP rpmd_ja raw stencil-step finite-difference consistency check failed; inspect recorded diagnostics");
   }
+}
+
+void generate_rpmd_ja_qnep_raw(
+  const std::string& raw_path,
+  const double temperature,
+  const double fd_step,
+  const std::string& kernel_table_path,
+  Atom& atom,
+  Box& box,
+  Force& force)
+{
+  generate_rpmd_ja_qnep_raw_reference(raw_path, temperature, fd_step, kernel_table_path, atom, box, force);
 }
 
 void generate_rpmd_ja_qnep_reference(

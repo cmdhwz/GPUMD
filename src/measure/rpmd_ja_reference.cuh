@@ -57,6 +57,9 @@ struct RpmdJAReference
   std::vector<double> p_vectors, q_vectors; // Row-major [degree + 1, rank].
   std::string stability_certificate;
   double minimum_cholesky_pivot = 0.0;
+  double additive_epsilon = 0.0;
+  double additive_reconstruction_bound = 0.0;
+  int additive_beads = 0;
   double relative_operator_bound = 0.0;
   double fd_relative_d = 0.0;
   double fd_relative_b[3] = {};
@@ -83,6 +86,7 @@ struct RpmdJAReference
 };
 
 RpmdJAReference read_rpmd_ja_reference(const std::string& path);
+int rpmd_ja_reference_policy_beads(const std::string& policy);
 void load_rpmd_ja_kernel_table(const std::string& path, RpmdJAReference& reference);
 std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference);
 void generate_rpmd_ja_reference(
@@ -102,6 +106,14 @@ void generate_rpmd_ja_sparse_reference(
   Force& force);
 void generate_rpmd_ja_qnep_reference(
   const std::string& path,
+  double temperature,
+  double fd_step,
+  const std::string& kernel_table_path,
+  Atom& atom,
+  Box& box,
+  Force& force);
+void generate_rpmd_ja_qnep_raw(
+  const std::string& raw_path,
   double temperature,
   double fd_step,
   const std::string& kernel_table_path,

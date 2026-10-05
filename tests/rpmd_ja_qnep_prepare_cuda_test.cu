@@ -147,6 +147,78 @@ void run_zero(const std::string& base)
     throw std::runtime_error("zero qNEP projected Hessian failure diagnostic did not report a zero candidate direction");clean(raw);clean(kernel);clean(out);
 }
 
+void patch_additive_source_geometry(const std::string& raw,const int n)
+{
+  const int d=3*n;const char layout[]="xyz_soa;derivative_input_rows_output_columns";
+  const std::streamoff header=8+4+4+4+4+8+8+8+8+4+4+8+sizeof(layout);
+  const std::streamoff positions=header+18*8+12+n*4+n*8;
+  const std::streamoff vstart=positions+d*8+8+n*8+d*8+9*n*8;
+  const std::streamoff force_start=vstart-9*n*8-d*8, cstart=vstart+static_cast<std::streamoff>(d)*n*8;
+  const std::streamoff kstart=cstart+static_cast<std::streamoff>(3)*d*d*8;
+  const std::streamoff coarse_v=kstart+static_cast<std::streamoff>(d)*d*8;
+  const std::streamoff coarse_c=coarse_v+static_cast<std::streamoff>(d)*n*8;
+  std::fstream file(raw,std::ios::binary|std::ios::in|std::ios::out);
+  if(!file)throw std::runtime_error("cannot patch additive fixture raw");
+  std::vector<double> xyz(d),zero_v(static_cast<std::size_t>(d)*n,0.0),c(static_cast<std::size_t>(3)*d*d);
+  const std::streamoff cell_start=header;const double cell[18]={10.,.4,0.,0.,11.,.3,0.,0.,12.,.1,-.4/110.,.4*.3/1320.,0.,1./11.,-.3/132.,0.,0.,1./12.};
+  for(int i=0;i<n;++i){xyz[i]=0.2*i;xyz[n+i]=0.1*i*i;xyz[2*n+i]=0.05*i;}
+  for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const double left=1.+.01*std::sin((row+1)*(alpha+1)),right=1.+.01*std::cos((col+1)*(alpha+2));c[static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row]=left*right;}
+  file.seekp(cell_start);file.write(reinterpret_cast<const char*>(cell),sizeof(cell));file.seekp(positions);array(file,xyz);file.seekp(force_start);array(file,std::vector<double>(d,0.0));
+  file.seekp(vstart);array(file,zero_v);file.seekp(cstart);array(file,c);file.seekp(coarse_v);array(file,zero_v);file.seekp(coarse_c);array(file,c);
+  const std::streamoff footer=coarse_c+static_cast<std::streamoff>(3)*d*d*8;
+  double stats[18]={};stats[16]=.01;stats[17]=3.;file.seekp(footer);file.write(reinterpret_cast<char*>(stats),sizeof(stats));file.close();
+  if(!file)throw std::runtime_error("failed patching additive raw fixture");
+}
+
+void write_additive_package(const std::string& path,const std::string& raw,const int n)
+{
+  std::ofstream out(path,std::ios::binary);if(!out)throw std::runtime_error("cannot create additive fixture package");
+  const char magic[8]={'G','P','J','A','A','D','D','1'};const std::uint32_t version=1,endian=0x01020304;
+  const int beads=8;const std::uint64_t source=rpmd_ja_model_fingerprint(raw),training=4,validation=2;
+  const double temperature=300.,epsilon=1e-8,response=0.,budget=.02;
+  out.write(magic,8);put(out,version);put(out,endian);put(out,n);put(out,beads);put(out,source);
+  put(out,temperature);put(out,epsilon);put(out,response);put(out,budget);put(out,training);put(out,validation);
+  const int d=3*n,q=6,z=2;
+  for(int i=0;i<n;++i){put(out,z);const int neighbors[2]={(i+1)%n,(i+n-1)%n};
+    for(int e=0;e<2;++e){put(out,neighbors[e]);int image[3]={0,0,0};if(e==0&&i==n-1)image[0]=1;if(e==1&&i==0)image[0]=-1;array(out,std::vector<int>(image,image+3));}
+    std::vector<double> ell(q,0.0);ell[0]=.1;ell[3]=-.1;array(out,ell);
+    std::vector<double> b(static_cast<std::size_t>(q)*q,0.0);for(int a=0;a<q;++a)b[static_cast<std::size_t>(a)*q+a]=.02;
+    b[0*q+4]=b[4*q+0]=.003;b[1*q+5]=b[5*q+1]=.002;array(out,b);
+  }
+  out.close();if(!out)throw std::runtime_error("failed writing additive fixture package");(void)d;
+}
+
+void verify_additive_reference(const RpmdJAReference& r,const int n)
+{
+  const int d=3*n,q=6;double mass_sum=0.0;for(double m:r.masses)mass_sum+=m;
+  std::vector<double> kadd(static_cast<std::size_t>(d)*d,0.0),hadd[3];for(auto& h:hadd)h.assign(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<n;++i){const int neighbors[2]={(i+1)%n,(i+n-1)%n};double b[q*q]={};for(int x=0;x<q;++x)b[x*q+x]=.02;b[0*q+4]=b[4*q+0]=.003;b[1*q+5]=b[5*q+1]=.002;
+    double xyz[2][3]={{.2*neighbors[0]-.2*i,.1*neighbors[0]*neighbors[0]-.1*i*i,.05*neighbors[0]-.05*i},{.2*neighbors[1]-.2*i,.1*neighbors[1]*neighbors[1]-.1*i*i,.05*neighbors[1]-.05*i}};
+    int edge_images[2][3]={{0,0,0},{0,0,0}};if(i==n-1)edge_images[0][0]=1;if(i==0)edge_images[1][0]=-1;
+    const double h[3][3]={{10.,.4,0.},{0.,11.,.3},{0.,0.,12.}};
+    for(int e=0;e<2;++e)for(int a=0;a<3;++a)for(int c=0;c<3;++c)xyz[e][a]+=h[a][c]*edge_images[e][c];
+    for(int x=0;x<q;++x)for(int y=0;y<q;++y){const int ex=x/3,ey=y/3,ax=x%3,ay=y%3,ix[2]={ax*n+neighbors[ex],ax*n+i},iy[2]={ay*n+neighbors[ey],ay*n+i};const double signs[2]={1.,-1.};for(int u=0;u<2;++u)for(int v=0;v<2;++v)kadd[static_cast<std::size_t>(ix[u])*d+iy[v]]+=signs[u]*b[x*q+y]*signs[v];}
+    for(int e=0;e<2;++e)for(int mu=0;mu<3;++mu)for(int y=0;y<q;++y){const int axis=y%3,edge=y/3,disp[2]={axis*n+neighbors[edge],axis*n+i},vel=mu*n+neighbors[e];const double signs[2]={1.,-1.};for(int a=0;a<3;++a)for(int v=0;v<2;++v)hadd[a][static_cast<std::size_t>(disp[v])*d+vel]-=xyz[e][a]*b[(3*e+mu)*q+y]*signs[v];}
+  }
+  if(r.mechanical_policy!="native_reference_transport;finite_temperature_additive_v1;beads=8;derivative=3"||r.additive_beads!=8||r.stability_certificate!="additive_shifted_frobenius_v1"||!(r.additive_reconstruction_bound<.5*r.additive_epsilon))throw std::runtime_error("additive reference policy/certificate mismatch");
+  for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ax=row/n,ay=col/n;const double tr=std::sqrt(r.masses[row%n]/mass_sum),tc=std::sqrt(r.masses[col%n]/mass_sum);const double baseline=ax==ay?1e-10*((row==col?1.0:0.0)-tr*tc):0.0;const double expected=baseline+kadd[static_cast<std::size_t>(row)*d+col]/std::sqrt(r.masses[row%n]*r.masses[col%n]);if(std::abs(tile_value(r.block_dynamical,row,col)-expected)>2e-9)throw std::runtime_error("additive K readback mismatch");}
+  bool nonsymmetric=false;
+  for(int a=0;a<3;++a)for(int row=0;row<d;++row)for(int col=0;col<d;++col){const double left=1.+.01*std::sin((row+1)*(a+1)),right=1.+.01*std::cos((col+1)*(a+2));const double expected=left*right/std::sqrt(r.masses[row%n]*r.masses[col%n])+hadd[a][static_cast<std::size_t>(col)*d+row]/std::sqrt(r.masses[row%n]*r.masses[col%n]);const double actual=tile_value(r.block_site_transpose[a],row,col);if(std::abs(actual-expected)>2e-8)throw std::runtime_error("additive transposed H readback mismatch");if(std::abs(actual-tile_value(r.block_site_transpose[a],col,row))>1e-7)nonsymmetric=true;}
+  if(!nonsymmetric)throw std::runtime_error("additive H fixture did not exercise non-symmetric cross-axis terms");
+}
+
+void run_additive(const std::string& base)
+{
+  const int n=3;const std::string stem=base+"_additive",raw=stem+".qraw",kernel=stem+".kernel",pack=stem+".gpjaadd",out=stem+".ja";
+  make_input(raw,kernel,n,1.0e-10,3);patch_additive_source_geometry(raw,n);write_additive_package(pack,raw,n);
+  prepare_rpmd_ja_qnep_reference(raw,out,kernel,{},pack);verify_additive_reference(read_rpmd_ja_reference(out),n);
+  const std::string wrong=stem+"_wrong.gpjaadd",truncated=stem+"_truncated.gpjaadd";std::ifstream in(pack,std::ios::binary);std::vector<char> bytes((std::istreambuf_iterator<char>(in)),{}),wrong_bytes=bytes;wrong_bytes[24]^=1;
+  {std::ofstream f(wrong,std::ios::binary);f.write(wrong_bytes.data(),wrong_bytes.size());}
+  bytes.pop_back();{std::ofstream f(truncated,std::ios::binary);f.write(bytes.data(),bytes.size());}
+  for(const std::string& bad:{wrong,truncated}){const std::string failed=bad+".ja";bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,failed,kernel,{},bad);}catch(const std::exception&){rejected=true;}if(!rejected)throw std::runtime_error("invalid additive package was accepted");clean(failed);}
+  clean(raw);clean(kernel);clean(pack);clean(out);clean(wrong);clean(truncated);
+}
+
 void run_raw2_rejections(const std::string& base)
 {
   const std::string kernel=base+"_raw2.kernel";
@@ -167,6 +239,6 @@ void run_raw2_rejections(const std::string& base)
 
 int main(int argc,char** argv)
 {
-  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);return 0;}
+  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);run_additive(base);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}
 }

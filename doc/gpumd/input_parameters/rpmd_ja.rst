@@ -61,6 +61,39 @@ The reference temperature must equal the constant RPMD target temperature. The o
 
 The centroid position is followed continuously across periodic wraps. The run stops with an error if any periodic per-step fractional jump is ambiguous (at least 0.45) or if the accumulated fractional displacement from the fixed reference reaches 0.45. This bounds the reference displacement branch and does not wrap accumulated diffusion back toward the reference.
 
+Finite-temperature qNEP additive reference workflow
+---------------------------------------------------
+
+The optional additive workflow fits a local finite-temperature force response from complete, fixed-cell RPMD bead samples. It produces an auxiliary coefficient package; the ordinary qNEP reference generation and measurement paths remain available. The training system must contain all mobile atoms under one Hamiltonian, with the same atom ordering, masses, cell, target temperature, and bead count as the raw reference. Do not select a subset of atoms and treat it as a smaller system. The fitting data are split chronologically into training and held-out validation frames; correlated frames may make this validation optimistic, so independent blocks and material-level uncertainty remain necessary.
+
+First equilibrate the beads and collect aligned centroid samples and ``mean.xyz``. List every bead file explicitly; this two-bead invocation is only a short example. Real eight-decimal ``dump_beads`` cells require ``--cell-model`` with the original full-precision structure. Omitting it is suitable only when the supplied XYZ already has enough cell precision for downstream raw-reference checks::
+
+  python tools/rpmd_ja_fit_reference.py collect --bead-files bead_0.xyz bead_1.xyz --temperature 300 --output samples.npz --mean-model mean.xyz --masses 1.008 15.999 --cell-model original_model.xyz
+
+Replace the example mass list with every atom's actual mass in original model order. The forces in each bead dump must be that bead's physical force under the sampled Hamiltonian, not ring-spring forces and not a force recomputed at the centroid :math:`R_c`. The collector averages bead forces exactly once, :math:`P^{-1}\sum_b F_b`, while forming the centroid samples. The fitter assumes these forces are energy-consistent with the Hamiltonian used for raw derivatives; independently check qNEP/PPPM energy and force deviations against the material accuracy target. The collector uses the full-precision cell from ``--cell-model`` after checking every bead dump against the eight-decimal serialization bound. It writes ``mean.xyz`` from the first two thirds of chronological frames. In a separate raw-generation directory, copy this output as ``model.xyz`` and provide the same full-precision cell, atom types, masses, qNEP model, and PPPM settings as the bead simulation. Then generate the raw reference::
+
+  potential nep.txt
+  kspace pppm 1.0
+  rpmd_ja generate_raw ja_raw.qraw 300 1e-4 ja_kernel_u8.tbl
+
+Run GPUMD in that directory. Reuse the PPPM spacing from the original Hamiltonian (or the default 1.0 Angstrom spacing if that was used); do not change electrostatics settings. The raw ``R0`` must match the collected training mean or ``fit`` will reject it. Then fit and prepare the auxiliary package. Use the same kernel table for raw generation and preparation::
+
+  python tools/rpmd_ja_fit_reference.py fit --raw ja_raw.qraw --samples samples.npz --output ja_additive.bin --cutoff 5.0 --epsilon 1e-8 --response-tolerance 0.15
+
+The fitter uses one fractional minimum-image distance per ordered distinct atom pair within the cutoff. It does not enumerate multiple periodic images or self-image edges and is not the full qNEP neighbor graph; this defines the fitted model space, whose cutoff and system-size adequacy must be checked on held-out data. Collection keeps ring unwrapping as a helper but rejects bead configurations whose resulting centroid differs from the production bead-zero minimum-image centroid. Samples must also remain within the existing 0.45 fractional fixed-reference branch. Sparse dump cadence can alias periodic motion, so choose sampling that resolves the dynamics; no cadence threshold is inferred by this utility.
+
+For CPU-only preparation, build the final v3 reference with the fitted package::
+
+  python tools/rpmd_ja_qnep_prepare.py ja_raw.qraw ja_additive.bin --kernel-table ja_kernel_u8.tbl --output ja_reference.bin --lossless
+
+The equivalent GPUMD production preparation command is ``rpmd_ja prepare ja_raw.qraw ja_reference.bin ja_kernel_u8.tbl ja_additive.bin`` before any ``ensemble`` or ``run``. Both forms bind the auxiliary package to its raw source, temperature, bead count, and fixed cell. To measure, use matching reference metadata and full-system ordering, and initialize from an equilibrated bead-resolved restart within the reference's 0.45 fractional branch. The measurement need not start at the training mean position. Enable ``rpmd_ja on ja_reference.bin`` in the measurement input. A separate legacy preparation without the additive package is the native comparison. The JA current implementation is unchanged.
+
+The collector's synthetic integration fixture uses full-precision coordinates and forces to check exact zero-addition recovery; real ``dump_beads`` coordinates, forces, and lattice are serialized to eight decimal places. The optional cell model restores only the original cell and does not recover quantized positions or forces. Quantization sensitivity must therefore be measured on real data before interpreting a material fit. The included ``U=8`` kernel fixture is a repository test input, not evidence of physical kernel accuracy. The CPU workflow tests do not run qNEP generation or the CUDA prepare path.
+
+The fitter limits dense matrices to 6,000,000 elements, the dense parameter set to 1,600, the translation-free internal dimension to 384 (at most 129 atoms), and the uncompressed sample arrays to 256 MiB. Additive CPU preparation additionally limits dense assembly to 4,000,000 elements and the package to 64 MiB. These limits do not include all NumPy, LAPACK, eigensolver, process, or source-matrix memory; estimate host memory before larger jobs. The GPU prepare path has its own preflight and memory constraints. No larger-system performance or fit accuracy is implied.
+
+``heat_current_rpmd_ja.out`` stores the three directional centroid current, additive correction, and their sum. ``hac_rpmd_ja.out`` stores only the three directional :math:`C_{AA}` self-correlation components and their integrals. All four correlation terms can be reconstructed offline at each lag from the three current series in ``heat_current_rpmd_ja.out``; GPUMD does not write four HAC files.
+
 Observable and scope
 --------------------
 

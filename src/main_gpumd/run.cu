@@ -681,13 +681,34 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table>.");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "prepare") {
-    if (tokens.size() != 5) PRINT_INPUT_ERROR("rpmd_ja prepare requires <rawfile> <outfile> <kernel_table>.");
+    if (tokens.size() != 5 && tokens.size() != 6) PRINT_INPUT_ERROR("rpmd_ja prepare requires <rawfile> <outfile> <kernel_table> [<additive-pack>].");
     if (integrate.has_ensemble() || global_time != 0.0)
       PRINT_INPUT_ERROR("rpmd_ja prepare must appear before any ensemble or run.");
-    prepare_rpmd_ja_qnep_reference(tokens[2], tokens[3], tokens[4], make_rpmd_ja_qnep_mode_validator(atom, box, force));
+    prepare_rpmd_ja_qnep_reference(tokens[2], tokens[3], tokens[4], make_rpmd_ja_qnep_mode_validator(atom, box, force), tokens.size() == 6 ? tokens[5] : std::string());
+    return;
+  }
+  if (tokens[1] == "generate_raw") {
+    if (tokens.size() != 6) PRINT_INPUT_ERROR("rpmd_ja generate_raw requires <rawfile> <T> <fd_step> <kernel_table>.");
+    if (integrate.has_ensemble() || global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja generate_raw must appear before any ensemble or run.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty() ||
+        dynamic_cast<NEP_Charge*>(force.potentials[0].get()) == nullptr)
+      PRINT_INPUT_ERROR("rpmd_ja generate_raw requires exactly one qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    if ((active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) || !active_qnep->uses_pppm())
+      PRINT_INPUT_ERROR("rpmd_ja generate_raw supports qNEP charge mode 1 or 2 with PPPM only.");
+    char* end = nullptr;
+    const double temperature = std::strtod(tokens[3].c_str(), &end);
+    if (end == tokens[3].c_str() || *end != '\0' || !std::isfinite(temperature) || temperature <= 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja raw temperature must be a positive finite number.");
+    end = nullptr;
+    const double fd_step = std::strtod(tokens[4].c_str(), &end);
+    if (end == tokens[4].c_str() || *end != '\0' || !std::isfinite(fd_step) || fd_step <= 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja raw finite-difference step must be a positive finite number.");
+    generate_rpmd_ja_qnep_raw(tokens[2], temperature, fd_step, tokens[5], atom, box, force);
     return;
   }
   if (tokens[1] == "diagnose") {

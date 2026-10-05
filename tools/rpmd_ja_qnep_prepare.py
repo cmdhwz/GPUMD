@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.util
 import math
 import os
 from pathlib import Path
@@ -22,6 +23,42 @@ LAYOUT = b"xyz_soa;native_reference_transport;block_tiles_128;D_then_Bt;rowmajor
 ENDIAN = 0x01020304
 TILE = 128
 HBAR, KB = 6.465412e-2, 8.617343e-5
+MAX_ADDITIVE_DENSE_ELEMENTS = 4_000_000
+
+_FITTER_SPEC = importlib.util.spec_from_file_location(
+    "_rpmd_ja_fit_reference", Path(__file__).with_name("rpmd_ja_fit_reference.py"))
+_FITTER = importlib.util.module_from_spec(_FITTER_SPEC)
+_FITTER_SPEC.loader.exec_module(_FITTER)
+
+
+def read_additive(path, expected_n=None):
+    path = Path(path)
+    size = path.stat().st_size
+    if size < 88 or size > 64 * 1024 * 1024:
+        raise ValueError("GPJAADD1 package must be between 88 bytes and 64 MiB")
+    with path.open("rb") as f:
+        header = _exact(f, 32)
+        magic, version, endian, n, beads, _source = struct.unpack("<8sIIiiQ", header)
+        if magic != b"GPJAADD1" or version != 1 or endian != ENDIAN or n < 2 or beads < 1 or \
+           (expected_n is not None and n != expected_n):
+            raise ValueError("GPJAADD1 magic, version, dimensions, or atom count do not match")
+        _exact(f, 48)
+        for _ in range(n):
+            (z,) = struct.unpack("<i", _exact(f, 4))
+            if z < 0 or z > 3*n:
+                raise ValueError("invalid GPJAADD1 local coordination")
+            remaining = size - f.tell()
+            need = 16*z + 8*(3*z) + 8*(3*z)*(3*z)
+            if need > remaining:
+                raise ValueError("truncated GPJAADD1 site block")
+            f.seek(need, os.SEEK_CUR)
+        if f.tell() != size:
+            raise ValueError("trailing data in GPJAADD1 package")
+    return _FITTER.read_additive(path)
+
+
+def prepare_additive(pack, positions, cell):
+    return _FITTER.assemble_additive(pack, positions, cell)
 
 
 def _exact(stream, size):
@@ -57,18 +94,25 @@ def _available_memory():
         return None
 
 
-def _read_raw(path):
+def _read_raw(path, additive=False):
     path = Path(path).resolve()
     with path.open("rb") as f:
         if _exact(f, 8) != RAW_MAGIC:
             raise ValueError("input is not a qNEP raw reference")
         ver, endian, n, d = struct.unpack("<IIii", _exact(f, 16))
-        if (ver, endian) != (1, ENDIAN) or n < 2 or d != 3 * n:
+        if ver not in (1, 2, 3) or endian != ENDIAN or n < 2 or d != 3 * n:
             raise ValueError("unsupported qNEP raw version or dimensions")
+        if additive and d * d > MAX_ADDITIVE_DENSE_ELEMENTS:
+            raise MemoryError(f"additive dense assembly refuses d*d={d*d} above {MAX_ADDITIVE_DENSE_ELEMENTS}")
         temp, step, model_fp, config_fp = struct.unpack("<ddQQ", _exact(f, 32))
         charge, pppm, spacing = struct.unpack("<iid", _exact(f, 16))
         if _exact(f, len(RAW_LAYOUT)) != RAW_LAYOUT:
             raise ValueError("unsupported qNEP raw layout")
+        vb, cb, kb = d * n * 8, 3 * d * d * 8, d * d * 8
+        start = f.tell() + 18 * 8 + 12 + n * 4 + n * 8 + d * 8 + 8 + n * 8 + d * 8 + 9 * n * 8
+        expected_size = start + 2 * vb + 2 * cb + kb + 18 * 8
+        if path.stat().st_size != expected_size:
+            raise ValueError("qNEP raw file has an invalid length")
         cell = np.frombuffer(_exact(f, 18 * 8), "<f8").copy()
         pbc = np.frombuffer(_exact(f, 12), "<i4").copy()
         types = np.frombuffer(_exact(f, n * 4), "<i4").copy()
@@ -79,12 +123,9 @@ def _read_raw(path):
         force = np.frombuffer(_exact(f, d * 8), "<f8").copy()
         virial = np.frombuffer(_exact(f, 9 * n * 8), "<f8").copy()
         start = f.tell()
-    vb, cb, kb = d * n * 8, 3 * d * d * 8, d * d * 8
     coarse_v = start + vb + cb + kb
     coarse_c = coarse_v + vb
     footer = coarse_c + cb
-    if path.stat().st_size != footer + 18 * 8:
-        raise ValueError("qNEP raw file has an invalid length")
     if charge not in (1, 2) or pppm != 1 or not np.isfinite([temp, step, spacing]).all() or \
        temp <= 0 or step <= 0 or spacing <= 0 or config_fp == 0:
         raise ValueError("this tool supports qNEP charge 1/2 with PPPM only")
@@ -93,7 +134,7 @@ def _read_raw(path):
        not np.isfinite(energy0) or abs(float(site_energy.sum())-energy0) > 1e-9*max(1.0,abs(energy0)) or \
        np.any(masses <= 0) or np.any(pbc != 1):
         raise ValueError("non-finite or invalid raw geometry, mass, force, or virial")
-    return dict(path=path, n=n, d=d, temperature=temp, step=step, model_fp=model_fp,
+    return dict(path=path, raw_version=ver, n=n, d=d, temperature=temp, step=step, model_fp=model_fp,
                 config_fp=config_fp, charge=charge, spacing=spacing, cell=cell, pbc=pbc,
                 types=types, masses=masses, positions=positions, energy0=energy0,
                 site_energy=site_energy, force=force, virial=virial, start=start,
@@ -301,31 +342,74 @@ def _eigenvalues(matrix, translation, available):
     return values
 
 
+def _internal_dynamical(matrix, translation):
+    d = matrix.shape[0]; n = len(translation)
+    householder = np.zeros((d, 3))
+    for axis in range(3):
+        w = translation.copy(); w[0] -= 1.0
+        norm = np.linalg.norm(w)
+        if norm:
+            householder[axis*n:(axis+1)*n, axis] = w / norm
+    a = np.array(matrix, dtype=np.float64, copy=True)
+    dw = a @ householder; middle = householder.T @ dw
+    a -= 2.0 * (householder @ dw.T) + 2.0 * (dw @ householder.T)
+    a += 4.0 * (householder @ middle @ householder.T)
+    indices = np.delete(np.arange(d), [0, n, 2*n])
+    return a[np.ix_(indices, indices)]
+
+
 def _read_matrix(path, offset, shape):
     return np.memmap(path, dtype="<f8", mode="r", offset=offset, shape=shape)
 
 
-def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
+def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, additive_path=None):
     started = time.perf_counter()
     raw_path, kernel_path, output = map(lambda x: Path(x).resolve(), (raw_path, kernel_path, output))
     sidecar = Path(str(output) + ".stability")
     if output.exists() or sidecar.exists():
         raise FileExistsError("refusing to overwrite final qNEP reference or stability sidecar")
-    m = _read_raw(raw_path); n, d = m["n"], m["d"]
+    m = _read_raw(raw_path, additive_path is not None); n, d = m["n"], m["d"]
     stats = np.fromfile(raw_path, dtype="<f8", count=18, offset=m["footer"])
-    if len(stats) != 18 or not np.isfinite(stats).all() or stats[17] != 1:
+    if len(stats) != 18 or not np.isfinite(stats).all():
         raise ValueError("raw reference lacks finite-difference diagnostics")
     (grad_rel, grad_abs, v_rel, v_abs, k_rel, k_abs, cx, cy, cz, cax, cay, caz,
      force_max, force_rms, second_err, second_conv, step, _) = stats
     if step != m["step"] or np.any(stats < 0):
         raise ValueError("raw diagnostic footer step or nonnegative fields do not match the raw header")
-    if grad_abs > 1e-4 or max(v_rel, k_rel, cx, cy, cz, second_err, second_conv) > 0.05:
+    raw_version = m["raw_version"]
+    if stats[17] != raw_version or raw_version not in (1, 2, 3) or stats[1] > 1e-4 or \
+       (raw_version == 1 and max(stats[i] for i in (2, 4, 6, 7, 8, 14, 15)) > 0.05) or \
+       (raw_version >= 2 and (stats[3] > 1e-4 or max(stats[i] for i in (4, 6, 7, 8, 14, 15)) > 0.05)):
         raise ValueError("qNEP energy/force finite-difference checks failed")
     kernel = _kernel(kernel_path)
+    additive = None
+    assembled = None
+    if additive_path is not None:
+        if d * d > MAX_ADDITIVE_DENSE_ELEMENTS:
+            raise MemoryError(f"additive dense assembly refuses d*d={d*d} above {MAX_ADDITIVE_DENSE_ELEMENTS}")
+        additive = read_additive(additive_path, n)
+        if additive["n"] != n or additive["source_fingerprint"] != _fnv64(raw_path):
+            raise ValueError("additive package atom count or raw source fingerprint does not match")
+        if additive["temperature"] != m["temperature"]:
+            raise ValueError("additive package temperature does not match raw reference")
+        assembled = prepare_additive(additive, m["positions"].reshape(3, n).T, m["cell"][:9].reshape(3, 3))
+        raw_v = _read_matrix(raw_path, m["start"], (d,n))
+        raw_gradient = np.asarray(raw_v).sum(axis=1).reshape(3,n).T
+        assembled_gradient = assembled["linear_gradient"]
+        residual = raw_gradient + assembled_gradient
+        if not np.isfinite(raw_gradient).all() or not np.isfinite(assembled_gradient).all() or not np.isfinite(residual).all():
+            raise ValueError("additive linear gradient check produced non-finite values")
+        gradient_error = _FITTER._stable_norm(residual)
+        raw_gradient_norm = _FITTER._stable_norm(raw_gradient)
+        if not math.isfinite(gradient_error) or not math.isfinite(raw_gradient_norm) or \
+           gradient_error > 1e-8 * max(1.0, raw_gradient_norm):
+            raise ValueError("additive linear term does not cancel raw reference gradient")
     work = Path(str(output) + ".work"); work.mkdir(parents=True, exist_ok=False)
+    work_maps = []
     try:
         k = _read_matrix(raw_path, m["start"] + m["vb"] + m["cb"], (d, d))
         dmat = np.memmap(work / "D.f64", dtype="<f8", mode="w+", shape=(d, d))
+        work_maps.append(dmat)
         mc = np.tile(m["masses"], 3)
         asym2 = norm2 = 0.0
         for r0 in range(0, d, TILE):
@@ -334,8 +418,11 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
                 c1 = min(c0 + TILE, d)
                 a = np.asarray(k[c0:c1, r0:r1]).T
                 b = np.asarray(k[r0:r1, c0:c1])
-                asym2 += float(np.sum((a-b)**2)); norm2 += float(np.sum((0.5*(a+b))**2))
-                dmat[r0:r1, c0:c1] = 0.5*(a+b) / np.sqrt(mc[r0:r1, None]*mc[None,c0:c1])
+                scale = np.sqrt(mc[r0:r1, None]*mc[None,c0:c1])
+                aw, bw = a / scale, b / scale
+                asym2 += float(np.sum((aw-bw)**2)); norm2 += float(np.sum((0.5*(aw+bw))**2))
+                dmat[r0:r1, c0:c1] = 0.5*(a+b) / scale
+                if not np.isfinite(dmat[r0:r1, c0:c1]).all(): raise ValueError("mass-weighted D contains non-finite values")
         asym = math.sqrt(asym2 / max(norm2, 1e-300))
         if asym > 0.05: raise ValueError(f"force Jacobian antisymmetry {asym:.3e} exceeds 5e-2")
         translation = np.sqrt(m["masses"] / np.sum(m["masses"]))
@@ -345,6 +432,11 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
         projection = _project_translation(dmat, translation)
         if projection > 0.05:
             raise ValueError(f"strict translation projection changes D by {projection:.3e} (>5e-2)")
+        if assembled is not None:
+            kadd = assembled["Kadd"]
+            dmat[:] += kadd / np.sqrt(mc[:, None] * mc[None, :])
+            dmat.flush()
+            if not np.isfinite(dmat).all(): raise ValueError("additive mass-weighted D contains non-finite values")
         trans_resid = _translation_residual(dmat, translation)
         if trans_resid > 1e-8: raise ValueError(f"D translation residual {trans_resid:.3e} exceeds 1e-8")
         dense_spectral = 0.0
@@ -365,13 +457,28 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
                    not np.isfinite(c[r0:r1]).all() or not np.isfinite(cc[r0:r1]).all():
                     raise ValueError("raw site derivative matrices contain non-finite values")
             bf = np.memmap(work/f"Bt{alpha}.f64", dtype="<f8", mode="w+", shape=(d,d))
+            work_maps.append(bf)
             bc = np.memmap(work/f"Btc{alpha}.f64", dtype="<f8", mode="w+", shape=(d,d))
+            work_maps.append(bc)
             ae,re = build_native_transport(v,c,vc,cc,m["masses"],n,alpha,bf,bc)
+            if not math.isfinite(re) or re > 0.05:
+                raise ValueError(f"baseline native H h/h2 error exceeds tolerance on axis {alpha}: {re}")
+            if assembled is not None:
+                htranspose = assembled["Hadd"][alpha].T
+                mass_scale = np.sqrt(np.tile(m["masses"], 3)[:, None] * np.tile(m["masses"], 3)[None, :])
+                bf[:] += htranspose / mass_scale
+                bc[:] += htranspose / mass_scale
+                if not np.isfinite(bf).all() or not np.isfinite(bc).all():
+                    raise ValueError("additive mass-weighted H contains non-finite values")
+                bf.flush(); bc.flush()
             b_fine.append(bf); b_coarse.append(bc); transport_abs.append(ae); transport_rel.append(re)
         if not np.isfinite(transport_rel).all() or max(transport_rel) > 0.05:
             raise ValueError(f"native H h/h2 error exceeds tolerance: {transport_rel}")
 
+        if assembled is not None:
+            lossless = True
         dcomp = np.memmap(work/"Dcompressed.f64", dtype="<f8", mode="w+", shape=(d,d))
+        work_maps.append(dcomp)
         matrices = [dmat, *b_fine]; sections=[]; residuals=[]; d_bound = dense_spectral
         for j, mat in enumerate(matrices):
             path = work/f"M{j}.tiles"; sections.append(path)
@@ -418,14 +525,16 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
             if required>kernel["u"]*(1+32*np.finfo(float).eps):
                 raise ValueError(f"kernel U={kernel['u']:.8g} does not cover lossless block bound {required:.8g}")
 
+        policy = (f"native_reference_transport;finite_temperature_additive_v1;beads={additive['beads']};derivative={raw_version}"
+                  if additive is not None else "native_reference_transport")
         tmp=work/"reference.tmp"
         with tmp.open("xb") as out:
             out.write(MAGIC);out.write(struct.pack("<IIiddQ",3,ENDIAN,n,m["temperature"],step,m["model_fp"]))
             out.write(UNITS);out.write(LAYOUT);out.write(np.asarray(m["cell"][:9],"<f8").tobytes())
             out.write(np.asarray(m["pbc"],"<i4").tobytes());out.write(np.asarray(m["types"],"<i4").tobytes())
             out.write(np.asarray(m["masses"],"<f8").tobytes());out.write(np.asarray(m["positions"],"<f8").tobytes())
-            policy=b"native_reference_transport"
-            out.write(struct.pack("<Qiidi",m["config_fp"],m["charge"],1,m["spacing"],len(policy)));out.write(policy)
+            policy_bytes=policy.encode("ascii")
+            out.write(struct.pack("<Qiidi",m["config_fp"],m["charge"],1,m["spacing"],len(policy_bytes)));out.write(policy_bytes)
             diag=[grad_rel,k_rel,asym,max(second_err,second_conv),force_max,projection,grad_abs,k_abs,
                   cax,cay,caz,*transport_abs,*transport_rel,*residuals]
             if len(diag)!=21:raise AssertionError("v3 diagnostic layout mismatch")
@@ -437,11 +546,32 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
                 with p.open("rb") as f:shutil.copyfileobj(f,out,4*1024*1024)
             out.write(struct.pack("<i",1));out.flush();os.fsync(out.fileno())
         min_pivot=float(eig0[0])
+        eta = 0.0
+        if additive is not None:
+            stored_translation_residual = _translation_residual(dcomp, translation)
+            if not math.isfinite(stored_translation_residual) or stored_translation_residual > 1e-8:
+                raise ValueError(f"stored D translation residual {stored_translation_residual:.3e} exceeds 1e-8")
+            trans_resid = stored_translation_residual
+            internal = _internal_dynamical(dcomp, translation)
+            shifted = internal - 0.5 * additive["epsilon"] * np.eye(d-3)
+            factor = np.linalg.cholesky(shifted)
+            eta = float(np.linalg.norm(shifted - factor @ factor.T, "fro"))
+            if not math.isfinite(eta) or eta >= 0.5 * additive["epsilon"]:
+                raise ValueError("additive shifted full-Frobenius certificate eta is not below epsilon/2")
+            min_pivot = float(np.min(np.diag(factor)))
         sidecar_tmp=work/"stability.tmp"
         with sidecar_tmp.open("x",encoding="ascii",newline="\n") as f:
-            f.write("GPUMDJA_QNEP_STABILITY 1\n")
+            f.write("GPUMDJA_QNEP_STABILITY 4\n" if additive is not None else "GPUMDJA_QNEP_STABILITY 1\n")
             f.write(f"fingerprint {_fnv64(tmp):016x}\nconfig_fingerprint {m['config_fp']:016x}\n")
-            f.write(f"atoms {n}\nminimum_positive_eigenvalue {min_pivot:.17g}\ntranslation_residual {trans_resid:.17g}\n")
+            f.write(f"atoms {n}\n")
+            if additive is not None:
+                f.write("derivative_policy " + policy + "\n")
+                f.write("certificate additive_shifted_frobenius_v1\n")
+                f.write(f"epsilon_num {additive['epsilon']:.17g}\nreconstruction_bound {eta:.17g}\n")
+                f.write(f"minimum_cholesky_pivot {min_pivot:.17g}\nrelative_operator_bound 0\n")
+            else:
+                f.write(f"minimum_positive_eigenvalue {min_pivot:.17g}\n")
+            f.write(f"translation_residual {trans_resid:.17g}\n")
             f.write(f"reconstruction_residual {max(residuals):.17g}\nsoftmode_relative_error {soft_error:.17g}\n")
         os.replace(tmp,output)
         os.replace(sidecar_tmp,sidecar)
@@ -455,15 +585,20 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
               f"prepare time={time.perf_counter()-started:.1f}s (observed)")
     except Exception:
         raise
+    finally:
+        for matrix in work_maps:
+            mapping = getattr(matrix, "_mmap", None)
+            if mapping is not None and not mapping.closed:
+                mapping.close()
 
 
-def _prepare(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
+def _prepare(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, additive_path=None):
     output = Path(output).resolve()
     sidecar = Path(str(output) + ".stability")
     work = Path(str(output) + ".work")
     had_output, had_sidecar, had_work = output.exists(), sidecar.exists(), work.exists()
     try:
-        return _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol)
+        return _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, additive_path)
     except Exception:
         if not had_output:
             output.unlink(missing_ok=True)
@@ -477,14 +612,15 @@ def _prepare(raw_path, kernel_path, output, lossless, tile_tol, soft_tol):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument("raw",type=Path);p.add_argument("--kernel-table",required=True,type=Path)
+    p.add_argument("raw",type=Path);p.add_argument("additive_pack",nargs="?",type=Path)
+    p.add_argument("--kernel-table",required=True,type=Path)
     p.add_argument("--output",required=True,type=Path);p.add_argument("--lossless",action="store_true")
     p.add_argument("--block-relative-tolerance",type=float,default=1e-8)
     p.add_argument("--softmode-relative-tolerance",type=float,default=1e-2)
     a=p.parse_args(argv)
     if not 0<a.block_relative_tolerance<=1e-8 or not 0<a.softmode_relative_tolerance<=1e-2:
         p.error("block tolerance must be in (0,1e-8]; softmode tolerance must be in (0,1e-2]")
-    try:_prepare(a.raw,a.kernel_table,a.output,a.lossless,a.block_relative_tolerance,a.softmode_relative_tolerance)
+    try:_prepare(a.raw,a.kernel_table,a.output,a.lossless,a.block_relative_tolerance,a.softmode_relative_tolerance,a.additive_pack)
     except (OSError,ValueError,MemoryError,np.linalg.LinAlgError) as exc:p.error(str(exc))
 
 

@@ -1,5 +1,6 @@
 #include "rpmd_ja_qnep_prepare.cuh"
 #include "rpmd_ja_reference.cuh"
+#include "rpmd_ja_additive.cuh"
 #include "utilities/common.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <algorithm>
@@ -47,6 +48,7 @@ template <typename T> void read_vector(std::istream& in, std::vector<T>& value, 
 struct Raw
 {
   RpmdJAReference reference;
+  int version = 0;
   std::uint64_t config = 0;
   int dimension = 0;
   int charge = 0;
@@ -75,6 +77,7 @@ Raw read_raw_header(const std::string& path)
       std::memcmp(layout, raw_layout, sizeof(layout)) || raw.charge < 1 || raw.charge > 2 ||
       uses_pppm != 1 || !(raw.spacing > 0.0) || !std::isfinite(raw.spacing) || raw.config == 0)
     throw std::runtime_error("unsupported or invalid qNEP rpmd_ja raw header");
+  raw.version = static_cast<int>(version);
   raw.dimension = d;
   RpmdJAReference& r = raw.reference;
   r.backend = 2; r.number_of_atoms = n; r.q_charge_mode = raw.charge; r.q_uses_pppm = true;
@@ -434,12 +437,31 @@ __global__ void compact_physical(const double* a, double* p, int d, int r, int n
   }
 }
 
+__global__ void subtract_diagonal(double* a, int n, double value)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[static_cast<std::size_t>(i) * n + i] -= value;
+}
+
+__global__ void zero_upper_column_major(double* a, int n)
+{
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < n*n && index % n < index / n) a[index] = 0.0;
+}
+
 __global__ void project_translation_rows(double* a, int d, int n)
 {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x < d && y < d && (x == 0 || x == n || x == 2*n || y == 0 || y == n || y == 2*n))
     a[static_cast<std::size_t>(x) * d + y] = 0.0;
+}
+
+__global__ void add_matrix(double* target, const double* increment, int d)
+{
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x < d && y < d) target[static_cast<std::size_t>(x)*d+y] += increment[static_cast<std::size_t>(x)*d+y];
 }
 
 __global__ void matrix_projection_sums(const double* a, double* sums, int d, int n)
@@ -575,10 +597,10 @@ void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* inpu
 } // namespace
 
 void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::string& output_path, const std::string& kernel_table_path,
-                                    const RpmdJAModeValidator& mode_validator)
+                                    const RpmdJAModeValidator& mode_validator, const std::string& additive_path)
 {
 #ifdef USE_HIP
-  (void)raw_path; (void)output_path; (void)kernel_table_path; (void)mode_validator;
+  (void)raw_path; (void)output_path; (void)kernel_table_path; (void)mode_validator; (void)additive_path;
   throw std::runtime_error("qNEP rpmd_ja reference preparation currently requires CUDA cuSOLVER");
 #else
   if (raw_path.empty() || output_path.empty() || kernel_table_path.empty()) throw std::invalid_argument("qNEP rpmd_ja prepare requires raw, output, and kernel-table paths");
@@ -589,7 +611,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   RpmdJAReference& ref = raw.reference;
   std::printf("    qNEP rpmd_ja raw derivative policy: %s; fd_step %.9g A; %s\n",
     ref.mechanical_policy.c_str(), ref.fd_step,
-    ref.mechanical_policy == "native_reference_transport;analytic_site_gradient_fd4_v1" ?
+    raw.version == 3 ?
       "D4 +/-h,+/-2h with D2(h)-D2(2h) checks" : "legacy stencil checks");
   load_rpmd_ja_kernel_table(kernel_table_path, ref);
   const int n = ref.number_of_atoms, d = raw.dimension, r = d - 3;
@@ -598,7 +620,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   std::ifstream raw_in(raw_path, std::ios::binary);
   if (!raw_in) throw std::runtime_error("cannot reopen qNEP raw file");
   const std::streamoff k_start = raw.data + static_cast<std::streamoff>(1ULL*d*n + 3ULL*d*d) * sizeof(double);
-  double *dk = nullptr, *a = nullptr, *physical = nullptr, *dv = nullptr, *dw = nullptr, *dm = nullptr;
+  double *dk = nullptr, *a = nullptr, *physical = nullptr, *shifted = nullptr, *reconstructed_device = nullptr, *dv = nullptr, *dw = nullptr, *dm = nullptr;
   double *work=nullptr,*query_matrix=nullptr,*pivot_device=nullptr,*tilebuf=nullptr;
   double *sm=nullptr,*su=nullptr,*svt=nullptr,*sw=nullptr,*dleft=nullptr,*dright=nullptr,*dproduct=nullptr,*dsingular=nullptr;
   int* dinfo = nullptr;
@@ -606,7 +628,24 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   cusolverDnHandle_t solver = nullptr;
   cublasHandle_t blas = nullptr;
   std::string created;
+  std::vector<double> additive_reconstruction;
   try {
+    RpmdJAAdditiveData additive;
+    const bool use_additive = !additive_path.empty();
+    if (use_additive) {
+      std::vector<double> raw_gradient(static_cast<std::size_t>(d), 0.0), site_energy(static_cast<std::size_t>(n));
+      for (int coordinate = 0; coordinate < d; ++coordinate) {
+        raw_in.clear(); raw_in.seekg(raw.data + static_cast<std::streamoff>(coordinate) * n * sizeof(double));
+        raw_in.read(reinterpret_cast<char*>(site_energy.data()), static_cast<std::streamsize>(n * sizeof(double)));
+        if (!raw_in) throw std::runtime_error("truncated qNEP raw V while checking additive gradient");
+        raw_gradient[coordinate] = std::accumulate(site_energy.begin(), site_energy.end(), 0.0);
+      }
+      additive = read_rpmd_ja_additive(additive_path, raw_path, ref, -1, raw_gradient);
+      ref.mechanical_policy = "native_reference_transport;finite_temperature_additive_v1;beads=" +
+        std::to_string(additive.beads) + ";derivative=" + std::to_string(raw.version);
+      ref.additive_beads = additive.beads;
+      ref.additive_epsilon = additive.epsilon;
+    }
     std::size_t free_bytes = 0, total_bytes = 0;
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
     (void)total_bytes;
@@ -626,7 +665,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     const std::size_t workspace_bytes=static_cast<std::size_t>(potrf_work)*sizeof(double);
     if(workspace_bytes>std::numeric_limits<std::size_t>::max()-matrix_bytes-physical_bytes-safety_bytes)
       throw std::runtime_error("qNEP rpmd_ja Cholesky workspace size overflows");
-    const std::size_t factor_peak=matrix_bytes+physical_bytes+workspace_bytes+safety_bytes;
+    const std::size_t factor_peak=matrix_bytes+(use_additive?3:1)*physical_bytes+workspace_bytes+safety_bytes;
     const std::size_t memory_required=std::max(2*matrix_bytes+safety_bytes,factor_peak);
     std::printf("    qNEP rpmd_ja prepare GPU preflight: %.3f GiB conservative peak, %.3f GiB free\n",
       static_cast<double>(memory_required)/(1024.0*1024.0*1024.0),static_cast<double>(free_bytes)/(1024.0*1024.0*1024.0));
@@ -683,10 +722,41 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     ref.projection_relative_change=std::sqrt(removed2/std::max(total2,1.0e-300));
     if(!std::isfinite(ref.projection_relative_change)||!(ref.projection_relative_change<=5.0e-2))throw std::runtime_error("translation projection changes D by more than 5e-2");
     project_translation_rows<<<grid,block>>>(a,d,n);cuda_check(cudaGetLastError(),"remove translation modes");cuda_check(cudaDeviceSynchronize(),"remove translation modes");
+    if (use_additive) {
+      std::vector<double> weighted_k(additive.k.size());
+      for (int x=0;x<d;++x) for(int y=0;y<d;++y)
+        weighted_k[static_cast<std::size_t>(x)*d+y] = additive.k[static_cast<std::size_t>(x)*d+y] /
+          std::sqrt(ref.masses[x%n]*ref.masses[y%n]);
+      if (!std::all_of(weighted_k.begin(),weighted_k.end(),[](double x){return std::isfinite(x);}))
+        throw std::runtime_error("non-finite weighted additive Kadd");
+      cuda_check(cudaMalloc(reinterpret_cast<void**>(&dk),dd*sizeof(double)), "allocate weighted additive Kadd");
+      cuda_check(cudaMemcpy(dk,weighted_k.data(),dd*sizeof(double),cudaMemcpyHostToDevice), "upload weighted additive Kadd");
+      for (int axis=0;axis<3;++axis) {
+        cuda_check(cudaMemcpy(dv,householder[axis].data(),d*sizeof(double),cudaMemcpyHostToDevice), "upload additive Householder vector");
+        matvec_kernel<<<(d+255)/256,256>>>(dk,dv,dw,d,d);
+        cuda_check(cudaGetLastError(), "apply additive Householder matvec"); cuda_check(cudaDeviceSynchronize(), "apply additive Householder matvec");
+        cuda_check(cudaMemcpy(result_host.data(),dw,d*sizeof(double),cudaMemcpyDeviceToHost), "read additive Householder matvec");
+        double gamma=0.0; for(int i=0;i<d;++i) gamma+=householder[axis][i]*result_host[i];
+        householder_kernel<<<grid,block>>>(dk,dv,dw,d,gamma);
+        cuda_check(cudaGetLastError(), "apply additive Householder congruence"); cuda_check(cudaDeviceSynchronize(), "apply additive Householder congruence");
+      }
+      project_translation_rows<<<grid,block>>>(dk,d,n); cuda_check(cudaGetLastError(), "project additive translation rows"); cuda_check(cudaDeviceSynchronize(), "project additive translation rows");
+      add_matrix<<<grid,block>>>(a,dk,d); cuda_check(cudaGetLastError(), "add projected mass-weighted Kadd"); cuda_check(cudaDeviceSynchronize(), "add projected mass-weighted Kadd");
+      cuda_check(cudaFree(dk), "free weighted additive Kadd"); dk=nullptr;
+      std::printf("    additive K/H coefficients loaded: beads=%d, epsilon=%.9g; baseline Hessian diagnostics retained\n", additive.beads, additive.epsilon);
+    }
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&physical),rr*sizeof(double)),"allocate physical Hessian");
     dim3 pgrid((r+15)/16,(r+15)/16);
     compact_physical<<<pgrid,block>>>(a,physical,d,r,n);
     cuda_check(cudaGetLastError(),"compact translation complement"); cuda_check(cudaDeviceSynchronize(),"compact translation complement");
+    if (use_additive) {
+      const double shift = 0.5 * additive.epsilon;
+      cuda_check(cudaMalloc(reinterpret_cast<void**>(&shifted), rr*sizeof(double)), "allocate shifted D certificate reference");
+      cuda_check(cudaMemcpy(shifted, physical, rr*sizeof(double), cudaMemcpyDeviceToDevice), "save shifted D certificate reference");
+      subtract_diagonal<<<(r+255)/256,256>>>(shifted,r,shift);
+      subtract_diagonal<<<(r+255)/256,256>>>(physical,r,shift);
+      cuda_check(cudaGetLastError(), "apply additive epsilon/2 stability shift"); cuda_check(cudaDeviceSynchronize(), "apply additive epsilon/2 stability shift");
+    }
     // Save exact D operator probes before POTRF; the stored D remains lossless.
     std::vector<std::vector<double>> probes(3,std::vector<double>(r)), products(3,std::vector<double>(r));
     for(int p=0;p<3;++p){
@@ -812,7 +882,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
             append.flush(); if (!append) std::fprintf(stderr,"qNEP rpmd_ja: failed appending low-spectrum diagnostic %s\n",failure_path.c_str());
           }
           for (const auto& mode : modes) std::printf("    qNEP rpmd_ja mode: lambda %.9g, residual %.3e, original Cartesian mass-weighted norm %.12g\n", mode.eigenvalue, mode.residual, std::sqrt(std::inner_product(mode.mass_weighted_direction.begin(),mode.mass_weighted_direction.end(),mode.mass_weighted_direction.begin(),0.0)));
-          if (mode_validator && !modes.empty()) {
+          if (mode_validator && !use_additive && !modes.empty()) {
             try {
               const std::string validation = mode_validator(ref, modes);
               std::ofstream append(failure_path, std::ios::out | std::ios::app);
@@ -825,7 +895,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
               std::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
               std::printf("%s", unavailable.c_str());
             }
-          } else if (!mode_validator) {
+          } else if (!mode_validator && !use_additive) {
             const std::string unavailable = "\nmode_validation: unavailable (no qNEP evaluator supplied)\n";
             std::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
             std::printf("%s", unavailable.c_str());
@@ -849,6 +919,25 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     std::vector<double> pivots(r);cuda_check(cudaMemcpy(pivots.data(),pivot_device,r*sizeof(double),cudaMemcpyDeviceToHost),"copy Cholesky pivots");
     cuda_check(cudaFree(pivot_device),"free Cholesky pivots");pivot_device=nullptr;
     double min_pivot=std::numeric_limits<double>::infinity();for(double x:pivots){if(!(x>0.0)||!std::isfinite(x))throw std::runtime_error("invalid Cholesky pivot");min_pivot=std::min(min_pivot,x);}
+    double additive_eta=0.0;
+    if (use_additive) {
+      cuda_check(cudaMalloc(reinterpret_cast<void**>(&reconstructed_device),rr*sizeof(double)), "allocate full shifted reconstruction");
+      zero_upper_column_major<<<(static_cast<int>(rr)+255)/256,256>>>(physical,r);
+      cuda_check(cudaGetLastError(), "clear unused Cholesky upper triangle"); cuda_check(cudaDeviceSynchronize(), "clear unused Cholesky upper triangle");
+      const double one=1.0, zero=0.0;
+      blas_check(cublasDgemm(blas,CUBLAS_OP_N,CUBLAS_OP_T,r,r,r,&one,physical,r,physical,r,&zero,reconstructed_device,r), "reconstruct shifted Cholesky factor");
+      std::vector<double> expected(rr), reconstructed(rr);
+      cuda_check(cudaMemcpy(expected.data(),shifted,rr*sizeof(double),cudaMemcpyDeviceToHost), "read shifted reference matrix");
+      cuda_check(cudaMemcpy(reconstructed.data(),reconstructed_device,rr*sizeof(double),cudaMemcpyDeviceToHost), "read full shifted reconstruction");
+      double error2=0.0;
+      for(std::size_t i=0;i<rr;++i){const double e=expected[i]-reconstructed[i];error2+=e*e;}
+      additive_eta=std::sqrt(error2);
+      if(!std::isfinite(additive_eta)||!(additive_eta<0.5*additive.epsilon))
+        throw std::runtime_error("additive shifted full-Frobenius Cholesky reconstruction bound must be below epsilon/2");
+      additive_reconstruction = std::move(reconstructed);
+      cuda_check(cudaFree(reconstructed_device), "free full shifted reconstruction"); reconstructed_device=nullptr;
+      cuda_check(cudaFree(shifted), "free shifted D certificate reference"); shifted=nullptr;
+    }
     // Reconstruct only three vectors with triangular BLAS calls; no full factor reaches the host.
     double reconstruction=0.0;
     std::vector<double> reconstructed(r);
@@ -857,6 +946,29 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     cuda_check(cudaFree(work),"free Cholesky workspace"); work=nullptr;
     // Restore the projected Cartesian operator for v3; only its complement copy was factored.
     for(int axis=2;axis>=0;--axis){cuda_check(cudaMemcpy(dv,householder[axis].data(),d*sizeof(double),cudaMemcpyHostToDevice),"restore Cartesian D basis");matvec_kernel<<<(d+255)/256,256>>>(a,dv,dw,d,d);cuda_check(cudaGetLastError(),"restore D basis matvec");cuda_check(cudaDeviceSynchronize(),"restore D basis matvec");cuda_check(cudaMemcpy(result_host.data(),dw,d*sizeof(double),cudaMemcpyDeviceToHost),"read restore D matvec");double gamma=0.0;for(int i=0;i<d;++i)gamma+=householder[axis][i]*result_host[i];householder_kernel<<<grid,block>>>(a,dv,dw,d,gamma);cuda_check(cudaGetLastError(),"restore Cartesian D basis");cuda_check(cudaDeviceSynchronize(),"restore Cartesian D basis");}
+    if (use_additive) {
+      cuda_check(cudaMalloc(reinterpret_cast<void**>(&dk),dd*sizeof(double)), "allocate stored-D certificate transform");
+      cuda_check(cudaMemcpy(dk,a,dd*sizeof(double),cudaMemcpyDeviceToDevice), "copy final unshifted stored D");
+      for(int axis=0;axis<3;++axis){
+        cuda_check(cudaMemcpy(dv,householder[axis].data(),d*sizeof(double),cudaMemcpyHostToDevice), "upload stored-D Householder vector");
+        matvec_kernel<<<(d+255)/256,256>>>(dk,dv,dw,d,d);cuda_check(cudaGetLastError(), "stored-D Householder matvec");cuda_check(cudaDeviceSynchronize(), "stored-D Householder matvec");
+        cuda_check(cudaMemcpy(result_host.data(),dw,d*sizeof(double),cudaMemcpyDeviceToHost), "read stored-D Householder matvec");
+        double gamma=0.0;for(int i=0;i<d;++i)gamma+=householder[axis][i]*result_host[i];
+        householder_kernel<<<grid,block>>>(dk,dv,dw,d,gamma);cuda_check(cudaGetLastError(), "stored-D Householder congruence");cuda_check(cudaDeviceSynchronize(), "stored-D Householder congruence");
+      }
+      project_translation_rows<<<grid,block>>>(dk,d,n);cuda_check(cudaGetLastError(), "project stored-D certificate translation");cuda_check(cudaDeviceSynchronize(), "project stored-D certificate translation");
+      cuda_check(cudaMalloc(reinterpret_cast<void**>(&shifted),rr*sizeof(double)), "allocate stored-D internal certificate");
+      compact_physical<<<pgrid,block>>>(dk,shifted,d,r,n);cuda_check(cudaGetLastError(), "compact stored-D certificate");cuda_check(cudaDeviceSynchronize(), "compact stored-D certificate");
+      subtract_diagonal<<<(r+255)/256,256>>>(shifted,r,0.5*additive.epsilon);cuda_check(cudaGetLastError(), "shift stored-D certificate");cuda_check(cudaDeviceSynchronize(), "shift stored-D certificate");
+      std::vector<double> stored_internal(rr);cuda_check(cudaMemcpy(stored_internal.data(),shifted,rr*sizeof(double),cudaMemcpyDeviceToHost), "read stored-D shifted internal block");
+      double error2=0.0;for(std::size_t i=0;i<rr;++i){const double e=stored_internal[i]-additive_reconstruction[i];error2+=e*e;}
+      additive_eta=std::sqrt(error2);
+      if(!std::isfinite(additive_eta)||!(additive_eta<0.5*additive.epsilon))
+        throw std::runtime_error("stored additive D shifted full-Frobenius bound must be below epsilon/2");
+      cuda_check(cudaFree(dk), "free stored-D certificate transform");dk=nullptr;
+      cuda_check(cudaFree(shifted), "free stored-D internal certificate");shifted=nullptr;
+      additive_reconstruction.clear(); additive_reconstruction.shrink_to_fit();
+    }
     matrix_projection_sums<<<(d+255)/256,256>>>(a,dw,d,n);cuda_check(cudaGetLastError(),"measure projected D norm");cuda_check(cudaDeviceSynchronize(),"measure projected D norm");cuda_check(cudaMemcpy(projection_sums.data(),dw,projection_sums.size()*sizeof(double),cudaMemcpyDeviceToHost),"read projected D norm");
     total2=0.0;for(int i=0;i<d;++i)total2+=projection_sums[i];
     cuda_check(cudaMemcpy(dm,mass_translation.data(),n*sizeof(double),cudaMemcpyHostToDevice),"upload normalized mass translation");
@@ -869,7 +981,8 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     const double kernel_required=HBAR/(K_B*ref.temperature)*std::sqrt(ref.spectral_bound);
     if(!std::isfinite(ref.spectral_bound)||!std::isfinite(kernel_required)||!(kernel_required<=ref.kernel_u*(1.0+32.0*std::numeric_limits<double>::epsilon())))throw std::runtime_error("qNEP kernel table does not cover lossless D row bound");
     ref.minimum_cholesky_pivot=min_pivot; ref.relative_operator_bound=0.0;
-    ref.stability_certificate="cholesky_relative_bound"; ref.stability_checked=true;
+    ref.stability_certificate=use_additive?"additive_shifted_frobenius_v1":"cholesky_relative_bound"; ref.stability_checked=true;
+    ref.additive_reconstruction_bound=additive_eta;
     ref.block_relative_residual[0]=0.0;
     for(int aidx=0;aidx<3;++aidx)ref.block_relative_residual[aidx+1]=0.0;
     ref.site_transport_relative_error[0]=ref.site_transport_relative_error[1]=ref.site_transport_relative_error[2]=0.0;
@@ -917,6 +1030,13 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         for(int x=0;x<nr;++x)for(int y=0;y<nc;++y){const int rr0=i+x,cc0=j+y,site=rr0%n,atom=cc0%n,nu=cc0/n;const double mass=std::sqrt(ref.masses[site]*ref.masses[atom]);double v=0,vc=0;if(nu==alpha){v=vrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];vc=vcrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];}double q=crows[static_cast<std::size_t>(y)*d+rr0],qc=ccrows[static_cast<std::size_t>(y)*d+rr0];if(nu==alpha&&site==atom){q-=fenergy[rr0];qc-=fcoarse[rr0];}h[static_cast<std::size_t>(x)*nc+y]=(q-v)/mass;hc[static_cast<std::size_t>(x)*nc+y]=(qc-vc)/mass;}
         if(!std::all_of(h.begin(),h.end(),[](double x){return std::isfinite(x);})||!std::all_of(hc.begin(),hc.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("qNEP raw H tile contains non-finite values");
         for(std::size_t k=0;k<h.size();++k){const double dx=h[k]-hc[k];transport_diff2[alpha]+=dx*dx;transport_norm2[alpha]+=h[k]*h[k];}
+        if(use_additive) for(int x=0;x<nr;++x) for(int y=0;y<nc;++y) {
+          const int row=i+x, col=j+y;
+          const double scale=std::sqrt(ref.masses[row%n]*ref.masses[col%n]);
+          const double increment=additive.h[alpha][static_cast<std::size_t>(col)*d+row]/scale;
+          h[static_cast<std::size_t>(x)*nc+y]+=increment;
+          hc[static_cast<std::size_t>(x)*nc+y]+=increment;
+        }
         RpmdJAMatrixTile result;result.row=i;result.column=j;result.rows=nr;result.columns=nc;
         double tile_residual=0.0;
         svd_tile(solver,blas,h.data(),nr,nc,result,sw,lwork,sm,dsingular,su,svt,sinfo,dleft,dright,dproduct,tile_residual);
@@ -937,9 +1057,11 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     if(std::rename(tmp_path.c_str(),output_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP v3 output");created=output_path;
     cuda_check(cudaFree(dv),"free probe vector");dv=nullptr;cuda_check(cudaFree(dw),"free probe result");dw=nullptr;cuda_check(cudaFree(dinfo),"free solver info");dinfo=nullptr;
     std::ofstream side(side_tmp,std::ios::trunc);if(!side)throw std::runtime_error("cannot create qNEP stability sidecar");
-    side<<"GPUMDJA_QNEP_STABILITY 3\nfingerprint "<<std::hex<<rpmd_ja_model_fingerprint(output_path)<<"\nconfig_fingerprint "<<raw.config<<std::dec<<"\natoms "<<n<<"\nderivative_policy "<<ref.mechanical_policy<<"\ncertificate cholesky_relative_bound\nminimum_cholesky_pivot "<<std::setprecision(17)<<min_pivot<<"\nrelative_operator_bound 0\ntranslation_residual "<<translation_residual<<"\nreconstruction_residual "<<reconstruction<<"\nsoftmode_relative_error 0\n";side.flush();if(!side)throw std::runtime_error("failed writing qNEP stability sidecar");side.close();if(std::rename(side_tmp.c_str(),sidecar_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP stability sidecar");created.clear();
+    if(use_additive) side<<"GPUMDJA_QNEP_STABILITY 4\nfingerprint "<<std::hex<<rpmd_ja_model_fingerprint(output_path)<<"\nconfig_fingerprint "<<raw.config<<std::dec<<"\natoms "<<n<<"\nderivative_policy "<<ref.mechanical_policy<<"\ncertificate additive_shifted_frobenius_v1\nepsilon_num "<<std::setprecision(17)<<additive.epsilon<<"\nreconstruction_bound "<<additive_eta<<"\nminimum_cholesky_pivot "<<min_pivot<<"\nrelative_operator_bound 0\ntranslation_residual "<<translation_residual<<"\nreconstruction_residual "<<reconstruction<<"\nsoftmode_relative_error 0\n";
+    else side<<"GPUMDJA_QNEP_STABILITY 3\nfingerprint "<<std::hex<<rpmd_ja_model_fingerprint(output_path)<<"\nconfig_fingerprint "<<raw.config<<std::dec<<"\natoms "<<n<<"\nderivative_policy "<<ref.mechanical_policy<<"\ncertificate cholesky_relative_bound\nminimum_cholesky_pivot "<<std::setprecision(17)<<min_pivot<<"\nrelative_operator_bound 0\ntranslation_residual "<<translation_residual<<"\nreconstruction_residual "<<reconstruction<<"\nsoftmode_relative_error 0\n";
+    side.flush();if(!side)throw std::runtime_error("failed writing qNEP stability sidecar");side.close();if(std::rename(side_tmp.c_str(),sidecar_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP stability sidecar");created.clear();
   } catch (...) {
-    if(dk)cudaFree(dk);if(a)cudaFree(a);if(physical)cudaFree(physical);if(dv)cudaFree(dv);if(dw)cudaFree(dw);if(dm)cudaFree(dm);if(dinfo)cudaFree(dinfo);if(work)cudaFree(work);if(query_matrix)cudaFree(query_matrix);if(pivot_device)cudaFree(pivot_device);if(tilebuf)cudaFree(tilebuf);if(sm)cudaFree(sm);if(su)cudaFree(su);if(svt)cudaFree(svt);if(sw)cudaFree(sw);if(dleft)cudaFree(dleft);if(dright)cudaFree(dright);if(dproduct)cudaFree(dproduct);if(dsingular)cudaFree(dsingular);if(sinfo)cudaFree(sinfo);if(blas)cublasDestroy(blas);if(solver)cusolverDnDestroy(solver);
+    if(dk)cudaFree(dk);if(a)cudaFree(a);if(physical)cudaFree(physical);if(shifted)cudaFree(shifted);if(reconstructed_device)cudaFree(reconstructed_device);if(dv)cudaFree(dv);if(dw)cudaFree(dw);if(dm)cudaFree(dm);if(dinfo)cudaFree(dinfo);if(work)cudaFree(work);if(query_matrix)cudaFree(query_matrix);if(pivot_device)cudaFree(pivot_device);if(tilebuf)cudaFree(tilebuf);if(sm)cudaFree(sm);if(su)cudaFree(su);if(svt)cudaFree(svt);if(sw)cudaFree(sw);if(dleft)cudaFree(dleft);if(dright)cudaFree(dright);if(dproduct)cudaFree(dproduct);if(dsingular)cudaFree(dsingular);if(sinfo)cudaFree(sinfo);if(blas)cublasDestroy(blas);if(solver)cusolverDnDestroy(solver);
     std::remove(tmp_path.c_str());std::remove(side_tmp.c_str());if(created==output_path)std::remove(output_path.c_str());throw;
   }
   if(blas)blas_check(cublasDestroy(blas),"cublasDestroy");
