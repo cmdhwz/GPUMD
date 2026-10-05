@@ -69,6 +69,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/property.cuh"
 #include "measure/proton_tunneling.cuh"
 #include "measure/rpmd_ja_reference.cuh"
+#include "measure/rpmd_ja_fit.cuh"
 #include "measure/rpmd_ja_qnep_prepare.cuh"
 #include "measure/rdf.cuh"
 #include "measure/sdc.cuh"
@@ -93,6 +94,8 @@ Run simulation according to the inputs in the run.in file.
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
+#include <string>
 
 #include <cmath>
 #include <cstring>
@@ -299,6 +302,44 @@ void Run::perform_a_run(const int number_of_steps)
   Centroid_DeltaF_O* centroid_deltaF_O = nullptr;
 #endif
   auto& actions = measure.get_actions();
+  RpmdJA_Fit* rpmd_ja_fit = nullptr;
+  for (const auto& action : actions) {
+    if (action->action_name == "rpmd_ja_fit") {
+      if (rpmd_ja_fit != nullptr) PRINT_INPUT_ERROR("rpmd_ja fit may be specified only once per run.");
+      rpmd_ja_fit = dynamic_cast<RpmdJA_Fit*>(action.get());
+    }
+  }
+  if (rpmd_ja_fit != nullptr) {
+    if (rpmd_ja_enabled_) PRINT_INPUT_ERROR("rpmd_ja fit cannot run in the same segment as rpmd_ja on.");
+    if (max_distance_per_step > 0.0) {
+      PRINT_INPUT_ERROR("rpmd_ja fit requires a fixed integration time step; adaptive max_distance_per_step is unsupported.");
+    }
+    if (force.get_number_of_potentials() != 1) {
+      PRINT_INPUT_ERROR("rpmd_ja fit requires exactly one supported qNEP potential.");
+    }
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
+    if (active_qnep == nullptr ||
+        (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+        !active_qnep->uses_pppm()) {
+      PRINT_INPUT_ERROR("rpmd_ja fit currently supports exactly one qNEP potential in charge mode 1 or 2 with PPPM.");
+    }
+    try {
+      rpmd_ja_qnep_config_fingerprint(force);
+    } catch (const std::exception& error) {
+      const std::string message = std::string("rpmd_ja fit cannot use the current qNEP configuration: ") + error.what();
+      PRINT_INPUT_ERROR(message.c_str());
+    }
+    for (const auto& action : actions) {
+      if (action.get() == rpmd_ja_fit) continue;
+      const std::string& name = action->action_name;
+      if (action->modifies_force() || name == "compute_hnemd" || name == "compute_hnemdec" ||
+          name == "compute_hnema" || name == "plumed" || name == "deform" ||
+          name == "compute_es" || name == "active" || name == "dump_observer") {
+        const std::string error = "rpmd_ja fit does not support external drive/action " + name + ".";
+        PRINT_INPUT_ERROR(error.c_str());
+      }
+    }
+  }
   if (is_pimd(integrate.get_type())) {
     for (const auto& action : actions) {
       if (action->modifies_force() && !action->supports_ring_polymer_force()) {
@@ -682,6 +723,13 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
     PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step>, generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+  }
+  if (tokens[1] == "fit") {
+    if (!measure.parse_action(
+          tokens, number_of_types, integrate, group, atom, box, force, first_potential_filename_)) {
+      PRINT_INPUT_ERROR("Could not register rpmd_ja fit sampler.");
+    }
+    return;
   }
   if (tokens[1] == "prepare") {
     if (tokens.size() != 5 && tokens.size() != 6) PRINT_INPUT_ERROR("rpmd_ja prepare requires <rawfile> <outfile> <kernel_table> [<additive-pack>].");

@@ -57,6 +57,7 @@ The driver class dealing with measurement.
 #include "orientorder.cuh"
 #include "plumed.cuh"
 #include "proton_tunneling.cuh"
+#include "rpmd_ja_fit.cuh"
 #include "quantum_heat_moments.cuh"
 #include "qnep_projection.cuh"
 #include "rdf.cuh"
@@ -72,6 +73,7 @@ The driver class dealing with measurement.
 #include "utilities/error.cuh"
 #include "utilities/read_file.cuh"
 #include <iostream>
+#include <exception>
 #include <string>
 #include <utility>
 #include <vector>
@@ -129,7 +131,14 @@ bool Measure::parse_action(
   const std::string& first_potential_filename)
 {
   auto params = get_token_pointers(tokens);
-  if (tokens[0] == "dump_thermo") {
+  if (tokens[0] == "rpmd_ja" && tokens.size() > 1 && tokens[1] == "fit") {
+    try {
+      actions_.emplace_back(new RpmdJA_Fit(tokens));
+    } catch (const std::exception& error) {
+      const std::string message = error.what();
+      PRINT_INPUT_ERROR(message.c_str());
+    }
+  } else if (tokens[0] == "dump_thermo") {
     std::unique_ptr<Action> action;
     action.reset(new Dump_Thermo(tokens));
     actions_.emplace_back(std::move(action));

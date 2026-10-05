@@ -164,6 +164,7 @@ __global__ void compact_physical(const double* a, double* p, int d, int r, int n
 template <typename T> struct SpectrumBuffer
 {
   T* pointer = nullptr;
+  SpectrumBuffer() = default;
   SpectrumBuffer(const std::size_t count, const char* where)
   {
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&pointer), count * sizeof(T)), where);
@@ -464,6 +465,13 @@ __global__ void add_matrix(double* target, const double* increment, int d)
   if (x < d && y < d) target[static_cast<std::size_t>(x)*d+y] += increment[static_cast<std::size_t>(x)*d+y];
 }
 
+__global__ void scatter_sparse(double* target, const std::uint64_t* indices,
+                               const double* values, const int count)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count) target[indices[i]] = values[i];
+}
+
 __global__ void matrix_projection_sums(const double* a, double* sums, int d, int n)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -628,7 +636,6 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   cusolverDnHandle_t solver = nullptr;
   cublasHandle_t blas = nullptr;
   std::string created;
-  std::vector<double> additive_reconstruction;
   try {
     RpmdJAAdditiveData additive;
     const bool use_additive = !additive_path.empty();
@@ -649,8 +656,12 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     std::size_t free_bytes = 0, total_bytes = 0;
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
     (void)total_bytes;
+    if(dd>std::numeric_limits<std::size_t>::max()/sizeof(double)||rr>std::numeric_limits<std::size_t>::max()/sizeof(double))
+      throw std::runtime_error("qNEP rpmd_ja matrix byte count overflows host address space");
     const std::size_t matrix_bytes=dd*sizeof(double), physical_bytes=rr*sizeof(double);
     const std::size_t safety_bytes=64ULL*1024*1024;
+    if(matrix_bytes>(std::numeric_limits<std::size_t>::max()-safety_bytes)/2)
+      throw std::runtime_error("qNEP rpmd_ja matrix preflight size overflows");
     const std::size_t minimum_required=2*matrix_bytes+safety_bytes;
     if(minimum_required>free_bytes)throw std::runtime_error("qNEP rpmd_ja matrix preflight exceeds free GPU memory");
     solver_check(cusolverDnCreate(&solver), "cusolverDnCreate");
@@ -665,8 +676,22 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     const std::size_t workspace_bytes=static_cast<std::size_t>(potrf_work)*sizeof(double);
     if(workspace_bytes>std::numeric_limits<std::size_t>::max()-matrix_bytes-physical_bytes-safety_bytes)
       throw std::runtime_error("qNEP rpmd_ja Cholesky workspace size overflows");
+    const std::size_t peak_base=std::numeric_limits<std::size_t>::max()-matrix_bytes-safety_bytes;
+    if(workspace_bytes>peak_base||physical_bytes>(peak_base-workspace_bytes)/(use_additive?3:1))
+      throw std::runtime_error("qNEP rpmd_ja Cholesky peak size overflows");
     const std::size_t factor_peak=matrix_bytes+(use_additive?3:1)*physical_bytes+workspace_bytes+safety_bytes;
-    const std::size_t memory_required=std::max(2*matrix_bytes+safety_bytes,factor_peak);
+    if(use_additive){
+      if(matrix_bytes>(std::numeric_limits<std::size_t>::max()-2*physical_bytes-safety_bytes)/2)
+        throw std::runtime_error("qNEP additive certificate peak size overflows");
+    }
+    const std::size_t certificate_peak=use_additive?2*matrix_bytes+2*physical_bytes+safety_bytes:0;
+    if(use_additive&&(additive.k.values.size()>std::numeric_limits<std::size_t>::max()/(sizeof(std::uint64_t)+sizeof(double)) ||
+       additive.k.values.size()*(sizeof(std::uint64_t)+sizeof(double))>std::numeric_limits<std::size_t>::max()-safety_bytes))
+      throw std::runtime_error("sparse additive K transfer size overflows host address space");
+    const std::size_t additive_sparse_bytes=use_additive ? additive.k.values.size()*(sizeof(std::uint64_t)+sizeof(double)) : 0;
+    if(2*matrix_bytes>std::numeric_limits<std::size_t>::max()-additive_sparse_bytes-safety_bytes)
+      throw std::runtime_error("qNEP rpmd_ja GPU preflight size overflows");
+    const std::size_t memory_required=std::max({2*matrix_bytes+additive_sparse_bytes+safety_bytes,factor_peak,certificate_peak});
     std::printf("    qNEP rpmd_ja prepare GPU preflight: %.3f GiB conservative peak, %.3f GiB free\n",
       static_cast<double>(memory_required)/(1024.0*1024.0*1024.0),static_cast<double>(free_bytes)/(1024.0*1024.0*1024.0));
     if (memory_required > free_bytes) throw std::runtime_error("qNEP rpmd_ja Cholesky preflight exceeds free GPU memory");
@@ -723,14 +748,32 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     if(!std::isfinite(ref.projection_relative_change)||!(ref.projection_relative_change<=5.0e-2))throw std::runtime_error("translation projection changes D by more than 5e-2");
     project_translation_rows<<<grid,block>>>(a,d,n);cuda_check(cudaGetLastError(),"remove translation modes");cuda_check(cudaDeviceSynchronize(),"remove translation modes");
     if (use_additive) {
-      std::vector<double> weighted_k(additive.k.size());
-      for (int x=0;x<d;++x) for(int y=0;y<d;++y)
-        weighted_k[static_cast<std::size_t>(x)*d+y] = additive.k[static_cast<std::size_t>(x)*d+y] /
-          std::sqrt(ref.masses[x%n]*ref.masses[y%n]);
-      if (!std::all_of(weighted_k.begin(),weighted_k.end(),[](double x){return std::isfinite(x);}))
-        throw std::runtime_error("non-finite weighted additive Kadd");
+      const std::size_t count=additive.k.values.size();
+      if(count>static_cast<std::size_t>(std::numeric_limits<int>::max())||count>std::numeric_limits<std::size_t>::max()/sizeof(std::uint64_t))
+        throw std::runtime_error("sparse additive K exceeds GPU scatter index limits");
+      std::vector<std::uint64_t> indices(count);
+      std::vector<double> weighted_values(count);
+      for(int row=0;row<d;++row)for(std::size_t p=additive.k.offsets[row];p<additive.k.offsets[row+1];++p)
+      {
+        indices[p]=static_cast<std::uint64_t>(row)*d+additive.k.columns[p];
+        const double value=additive.k.values[p];
+        const double scale=std::sqrt(ref.masses[row%n])*std::sqrt(ref.masses[additive.k.columns[p]%n]);
+        const double weighted=value/scale;
+        if(!std::isfinite(value)||!std::isfinite(scale)||!(scale>0.0)||!std::isfinite(weighted)||
+           (value!=0.0&&(weighted==0.0||std::abs(weighted)<std::numeric_limits<double>::min())))
+          throw std::runtime_error("invalid mass-weighted sparse additive Kadd");
+        weighted_values[p]=weighted;
+      }
       cuda_check(cudaMalloc(reinterpret_cast<void**>(&dk),dd*sizeof(double)), "allocate weighted additive Kadd");
-      cuda_check(cudaMemcpy(dk,weighted_k.data(),dd*sizeof(double),cudaMemcpyHostToDevice), "upload weighted additive Kadd");
+      cuda_check(cudaMemset(dk,0,dd*sizeof(double)), "zero weighted additive Kadd");
+      if(count){
+        SpectrumBuffer<std::uint64_t> dindices(count,"allocate sparse K indices");
+        SpectrumBuffer<double> dvalues(count,"allocate sparse K values");
+        dindices.copy_from_host(indices.data(),count);
+        dvalues.copy_from_host(weighted_values.data(),count);
+        scatter_sparse<<<static_cast<unsigned>((count+255)/256),256>>>(dk,dindices.data(),dvalues.data(),static_cast<int>(count));
+        cuda_check(cudaGetLastError(),"scatter mass-weighted sparse Kadd");cuda_check(cudaDeviceSynchronize(),"scatter mass-weighted sparse Kadd");
+      }
       for (int axis=0;axis<3;++axis) {
         cuda_check(cudaMemcpy(dv,householder[axis].data(),d*sizeof(double),cudaMemcpyHostToDevice), "upload additive Householder vector");
         matvec_kernel<<<(d+255)/256,256>>>(dk,dv,dw,d,d);
@@ -926,16 +969,17 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       cuda_check(cudaGetLastError(), "clear unused Cholesky upper triangle"); cuda_check(cudaDeviceSynchronize(), "clear unused Cholesky upper triangle");
       const double one=1.0, zero=0.0;
       blas_check(cublasDgemm(blas,CUBLAS_OP_N,CUBLAS_OP_T,r,r,r,&one,physical,r,physical,r,&zero,reconstructed_device,r), "reconstruct shifted Cholesky factor");
-      std::vector<double> expected(rr), reconstructed(rr);
-      cuda_check(cudaMemcpy(expected.data(),shifted,rr*sizeof(double),cudaMemcpyDeviceToHost), "read shifted reference matrix");
-      cuda_check(cudaMemcpy(reconstructed.data(),reconstructed_device,rr*sizeof(double),cudaMemcpyDeviceToHost), "read full shifted reconstruction");
+      std::vector<double> expected(static_cast<std::size_t>(tile_size)*tile_size), reconstructed(expected.size());
       double error2=0.0;
-      for(std::size_t i=0;i<rr;++i){const double e=expected[i]-reconstructed[i];error2+=e*e;}
+      for(int i=0;i<r;i+=tile_size)for(int j=0;j<r;j+=tile_size){
+        const int nr=std::min(tile_size,r-i),nc=std::min(tile_size,r-j);
+        cuda_check(cudaMemcpy2D(expected.data(),tile_size*sizeof(double),shifted+static_cast<std::size_t>(i)*r+j,r*sizeof(double),nc*sizeof(double),nr,cudaMemcpyDeviceToHost),"read shifted certificate tile");
+        cuda_check(cudaMemcpy2D(reconstructed.data(),tile_size*sizeof(double),reconstructed_device+static_cast<std::size_t>(i)*r+j,r*sizeof(double),nc*sizeof(double),nr,cudaMemcpyDeviceToHost),"read Cholesky reconstruction tile");
+        for(int x=0;x<nr;++x)for(int y=0;y<nc;++y){const std::size_t q=static_cast<std::size_t>(x)*tile_size+y;const double e=expected[q]-reconstructed[q];error2+=e*e;}
+      }
       additive_eta=std::sqrt(error2);
       if(!std::isfinite(additive_eta)||!(additive_eta<0.5*additive.epsilon))
         throw std::runtime_error("additive shifted full-Frobenius Cholesky reconstruction bound must be below epsilon/2");
-      additive_reconstruction = std::move(reconstructed);
-      cuda_check(cudaFree(reconstructed_device), "free full shifted reconstruction"); reconstructed_device=nullptr;
       cuda_check(cudaFree(shifted), "free shifted D certificate reference"); shifted=nullptr;
     }
     // Reconstruct only three vectors with triangular BLAS calls; no full factor reaches the host.
@@ -944,6 +988,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     for(int p=0;p<3;++p){cuda_check(cudaMemcpy(dv,probes[p].data(),r*sizeof(double),cudaMemcpyHostToDevice),"upload Cholesky probe");blas_check(cublasDtrmv(blas,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_T,CUBLAS_DIAG_NON_UNIT,r,physical,r,dv,1),"Cholesky probe L transpose");blas_check(cublasDtrmv(blas,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_N,CUBLAS_DIAG_NON_UNIT,r,physical,r,dv,1),"Cholesky probe L");cuda_check(cudaMemcpy(reconstructed.data(),dv,r*sizeof(double),cudaMemcpyDeviceToHost),"read Cholesky reconstruction");double e2=0.0,n2=0.0;for(int i=0;i<r;++i){e2+=(reconstructed[i]-products[p][i])*(reconstructed[i]-products[p][i]);n2+=products[p][i]*products[p][i];}reconstruction=std::max(reconstruction,std::sqrt(e2/std::max(n2,1.0e-300)));}
     if(!(reconstruction<=1.0e-8))throw std::runtime_error("Cholesky probe reconstruction residual exceeds 1e-8");
     cuda_check(cudaFree(work),"free Cholesky workspace"); work=nullptr;
+    cuda_check(cudaFree(physical),"free Cholesky factor after probes");physical=nullptr;
     // Restore the projected Cartesian operator for v3; only its complement copy was factored.
     for(int axis=2;axis>=0;--axis){cuda_check(cudaMemcpy(dv,householder[axis].data(),d*sizeof(double),cudaMemcpyHostToDevice),"restore Cartesian D basis");matvec_kernel<<<(d+255)/256,256>>>(a,dv,dw,d,d);cuda_check(cudaGetLastError(),"restore D basis matvec");cuda_check(cudaDeviceSynchronize(),"restore D basis matvec");cuda_check(cudaMemcpy(result_host.data(),dw,d*sizeof(double),cudaMemcpyDeviceToHost),"read restore D matvec");double gamma=0.0;for(int i=0;i<d;++i)gamma+=householder[axis][i]*result_host[i];householder_kernel<<<grid,block>>>(a,dv,dw,d,gamma);cuda_check(cudaGetLastError(),"restore Cartesian D basis");cuda_check(cudaDeviceSynchronize(),"restore Cartesian D basis");}
     if (use_additive) {
@@ -960,14 +1005,26 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       cuda_check(cudaMalloc(reinterpret_cast<void**>(&shifted),rr*sizeof(double)), "allocate stored-D internal certificate");
       compact_physical<<<pgrid,block>>>(dk,shifted,d,r,n);cuda_check(cudaGetLastError(), "compact stored-D certificate");cuda_check(cudaDeviceSynchronize(), "compact stored-D certificate");
       subtract_diagonal<<<(r+255)/256,256>>>(shifted,r,0.5*additive.epsilon);cuda_check(cudaGetLastError(), "shift stored-D certificate");cuda_check(cudaDeviceSynchronize(), "shift stored-D certificate");
-      std::vector<double> stored_internal(rr);cuda_check(cudaMemcpy(stored_internal.data(),shifted,rr*sizeof(double),cudaMemcpyDeviceToHost), "read stored-D shifted internal block");
-      double error2=0.0;for(std::size_t i=0;i<rr;++i){const double e=stored_internal[i]-additive_reconstruction[i];error2+=e*e;}
+      std::vector<double> stored_internal(static_cast<std::size_t>(tile_size)*tile_size), reconstructed(static_cast<std::size_t>(tile_size)*tile_size);
+      double error2=0.0;
+      for(int i=0;i<r;i+=tile_size)for(int j=0;j<r;j+=tile_size){
+        const int nr=std::min(tile_size,r-i),nc=std::min(tile_size,r-j);
+        cuda_check(cudaMemcpy2D(stored_internal.data(),tile_size*sizeof(double),shifted+static_cast<std::size_t>(i)*r+j,r*sizeof(double),nc*sizeof(double),nr,cudaMemcpyDeviceToHost),"read stored-D certificate tile");
+        cuda_check(cudaMemcpy2D(reconstructed.data(),tile_size*sizeof(double),reconstructed_device+static_cast<std::size_t>(i)*r+j,r*sizeof(double),nc*sizeof(double),nr,cudaMemcpyDeviceToHost),"read retained Cholesky reconstruction tile");
+        for(int x=0;x<nr;++x)for(int y=0;y<nc;++y){const std::size_t q=static_cast<std::size_t>(x)*tile_size+y;const double e=stored_internal[q]-reconstructed[q];error2+=e*e;}
+      }
       additive_eta=std::sqrt(error2);
       if(!std::isfinite(additive_eta)||!(additive_eta<0.5*additive.epsilon))
         throw std::runtime_error("stored additive D shifted full-Frobenius bound must be below epsilon/2");
+      const double certificate_shift=0.5*additive.epsilon;
+      const double certified_lower_bound=certificate_shift-additive_eta;
+      if(!std::isfinite(certified_lower_bound)||!(certified_lower_bound>0.0))
+        throw std::runtime_error("stored additive D certificate does not prove positive definiteness");
+      std::printf("    additive stored-D certificate: Cholesky shift=%.17g, Frobenius reconstruction bound eta=%.17g, certified lambda_min lower bound shift-eta=%.17g (SPD only; not an epsilon eigenvalue floor).\n",
+        certificate_shift,additive_eta,certified_lower_bound);
       cuda_check(cudaFree(dk), "free stored-D certificate transform");dk=nullptr;
       cuda_check(cudaFree(shifted), "free stored-D internal certificate");shifted=nullptr;
-      additive_reconstruction.clear(); additive_reconstruction.shrink_to_fit();
+      cuda_check(cudaFree(reconstructed_device), "free retained Cholesky reconstruction");reconstructed_device=nullptr;
     }
     matrix_projection_sums<<<(d+255)/256,256>>>(a,dw,d,n);cuda_check(cudaGetLastError(),"measure projected D norm");cuda_check(cudaDeviceSynchronize(),"measure projected D norm");cuda_check(cudaMemcpy(projection_sums.data(),dw,projection_sums.size()*sizeof(double),cudaMemcpyDeviceToHost),"read projected D norm");
     total2=0.0;for(int i=0;i<d;++i)total2+=projection_sums[i];
@@ -995,7 +1052,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     for(int i=0;i<d;i+=tile_size)for(int j=0;j<d;j+=tile_size){const int nr=std::min(tile_size,d-i),nc=std::min(tile_size,d-j);vectorize_tile<<<dim3((nr+15)/16,(nc+15)/16),block>>>(a,tilebuf,d,i,j,nr,nc);cuda_check(cudaGetLastError(),"read D tile");cuda_check(cudaDeviceSynchronize(),"read D tile");cuda_check(cudaMemcpy(tile.data(),tilebuf,static_cast<std::size_t>(nr)*nc*sizeof(double),cudaMemcpyDeviceToHost),"copy D tile");write_tile(out,dense_tile(i,j,nr,nc,tile.data()));}
 
     // Free the dense D GPU workspace before processing H tiles.
-    cuda_check(cudaFree(a),"free D matrix"); a=nullptr; cuda_check(cudaFree(physical),"free physical D"); physical=nullptr;cuda_check(cudaFree(tilebuf),"free D tile buffer");tilebuf=nullptr;
+    cuda_check(cudaFree(a),"free D matrix"); a=nullptr;if(physical){cuda_check(cudaFree(physical),"free physical D");physical=nullptr;}cuda_check(cudaFree(tilebuf),"free D tile buffer");tilebuf=nullptr;
     if(!out)throw std::runtime_error("failed writing qNEP D tiles");
     // H tiles are appended in matrix order; row/column sizes stay bounded by 128.
     std::ifstream vf(raw_path,std::ios::binary),cf(raw_path,std::ios::binary),vcf(raw_path,std::ios::binary),ccf(raw_path,std::ios::binary);
@@ -1030,12 +1087,19 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         for(int x=0;x<nr;++x)for(int y=0;y<nc;++y){const int rr0=i+x,cc0=j+y,site=rr0%n,atom=cc0%n,nu=cc0/n;const double mass=std::sqrt(ref.masses[site]*ref.masses[atom]);double v=0,vc=0;if(nu==alpha){v=vrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];vc=vcrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];}double q=crows[static_cast<std::size_t>(y)*d+rr0],qc=ccrows[static_cast<std::size_t>(y)*d+rr0];if(nu==alpha&&site==atom){q-=fenergy[rr0];qc-=fcoarse[rr0];}h[static_cast<std::size_t>(x)*nc+y]=(q-v)/mass;hc[static_cast<std::size_t>(x)*nc+y]=(qc-vc)/mass;}
         if(!std::all_of(h.begin(),h.end(),[](double x){return std::isfinite(x);})||!std::all_of(hc.begin(),hc.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("qNEP raw H tile contains non-finite values");
         for(std::size_t k=0;k<h.size();++k){const double dx=h[k]-hc[k];transport_diff2[alpha]+=dx*dx;transport_norm2[alpha]+=h[k]*h[k];}
-        if(use_additive) for(int x=0;x<nr;++x) for(int y=0;y<nc;++y) {
-          const int row=i+x, col=j+y;
-          const double scale=std::sqrt(ref.masses[row%n]*ref.masses[col%n]);
-          const double increment=additive.h[alpha][static_cast<std::size_t>(col)*d+row]/scale;
-          h[static_cast<std::size_t>(x)*nc+y]+=increment;
-          hc[static_cast<std::size_t>(x)*nc+y]+=increment;
+        if(use_additive) for(int x=0;x<nr;++x) {
+          const int row=i+x;
+          const auto& sparse=additive.h[alpha];
+          auto first=std::lower_bound(sparse.columns.begin()+sparse.offsets[row],
+                                      sparse.columns.begin()+sparse.offsets[row+1],j);
+          auto last=std::lower_bound(first,sparse.columns.begin()+sparse.offsets[row+1],j+nc);
+          for(auto it=first;it!=last;++it){
+            const std::size_t p=static_cast<std::size_t>(it-sparse.columns.begin());
+            const int col=*it;
+            const double increment=sparse.values[p]/std::sqrt(ref.masses[row%n]*ref.masses[col%n]);
+            h[static_cast<std::size_t>(x)*nc+col-j]+=increment;
+            hc[static_cast<std::size_t>(x)*nc+col-j]+=increment;
+          }
         }
         RpmdJAMatrixTile result;result.row=i;result.column=j;result.rows=nr;result.columns=nc;
         double tile_residual=0.0;
