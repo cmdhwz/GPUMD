@@ -3,6 +3,7 @@
 #ifndef USE_HIP
 #include "rpmd_ja_qnep_prepare.cuh"
 #include "rpmd_ja_reference.cuh"
+#include "rpmd_ja_reference_math.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "force/force.cuh"
@@ -19,6 +20,7 @@
 #include <map>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 #include <cuda_runtime.h>
@@ -574,7 +576,10 @@ std::vector<double> solve_upper(const std::vector<double>& r,const std::vector<d
 void make_edge_linear(const Graph& graph,const std::vector<double>& raw_gradient,const int n,
                       std::vector<std::array<double,3>>& edge_linear)
 {
-  double net2=0.0,gradient2=0.0;for(int a=0;a<3;++a){double net=0.0;for(int i=0;i<n;++i){net+=raw_gradient[a*n+i];gradient2+=raw_gradient[a*n+i]*raw_gradient[a*n+i];}net2+=net*net;}if(!std::isfinite(net2)||!std::isfinite(gradient2)||std::sqrt(net2)>1e-8*std::max(1.0,std::sqrt(gradient2)))throw std::runtime_error("native fit raw qNEP reference gradient has a nonzero net force");
+  const auto net=rpmd_ja_reference_math::net_force_stats(raw_gradient,n);
+  if(!net.within_limit){std::ostringstream message;message<<std::setprecision(17)<<"native fit raw qNEP reference gradient has a nonzero net force"
+    <<"; net_xyz=("<<net.net[0]<<','<<net.net[1]<<','<<net.net[2]<<"), net_norm="<<net.net_norm
+    <<", vector_norm="<<net.vector_norm<<", limit="<<net.limit<<", status=nonzero-net-or-nonfinite";throw std::runtime_error(message.str());}
   std::vector<std::vector<int>> incident(n);
   for(std::size_t e=0;e<graph.edges.size();++e){incident[graph.edges[e].i].push_back(static_cast<int>(e));incident[graph.edges[e].j].push_back(static_cast<int>(e));}
   edge_linear.resize(graph.edges.size());
@@ -649,7 +654,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::printf("    rpmd_ja native fit preflight: qraw %.2f GiB, GPU baseline %.2f GiB, free GPU %.2f GiB, host design+QR %.2f MiB\n",static_cast<double>(raw_bytes)/(1024.0*1024.0*1024.0),static_cast<double>(dd64*sizeof(double))/(1024.0*1024.0*1024.0),static_cast<double>(free_before)/(1024.0*1024.0*1024.0),static_cast<double>(design_bytes+qr_bytes)/(1024.0*1024.0));
   if(dd64*sizeof(double)>free_before||free_before-dd64*sizeof(double)<256ULL*1024*1024)throw std::runtime_error("native fit baseline matrix does not fit current GPU memory with a 256 MiB safety margin");
   struct OwnScratch{std::string raw,pack,output,sidecar,fit,fit_tmp;bool raw_owned=false,pack_owned=false,output_owned=false,sidecar_owned=false,fit_owned=false,fit_tmp_owned=false;~OwnScratch(){if(raw_owned)std::remove(raw.c_str());if(pack_owned)std::remove(pack.c_str());if(output_owned)std::remove(output.c_str());if(sidecar_owned)std::remove(sidecar.c_str());if(fit_owned)std::remove(fit.c_str());if(fit_tmp_owned)std::remove(fit_tmp.c_str());}} own_scratch{raw_path,pack_path,options.output_path,options.output_path+".stability",fit_path,fit_tmp};
-  generate_rpmd_ja_qnep_raw(raw_path,options.temperature,options.fd_step,options.kernel_table,atom,box,force);
+  generate_rpmd_ja_qnep_raw(raw_path,options.temperature,options.fd_step,options.kernel_table,atom,box,force,true);
   own_scratch.raw_owned=true;
   std::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("native fit did not find generated qNEP raw reference");
   char rawmagic[8];raw.read(rawmagic,8);const auto rawver=read<std::uint32_t>(raw,"qraw version");const auto endian=read<std::uint32_t>(raw,"qraw byte order");const int raw_n=read<std::int32_t>(raw,"qraw atom count"),raw_d=read<std::int32_t>(raw,"qraw dimension");

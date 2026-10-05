@@ -2189,7 +2189,8 @@ static void generate_rpmd_ja_qnep_raw_reference(
   const std::string& kernel_table_path,
   Atom& atom,
   Box& box,
-  Force& force)
+  Force& force,
+  const bool require_zero_net_gradient)
 {
   if (!(temperature > 0.0) || !std::isfinite(temperature) || !(fd_step > 0.0) || !std::isfinite(fd_step))
     throw std::invalid_argument("qNEP rpmd_ja reference requires positive finite temperature and fd_step");
@@ -2448,6 +2449,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   double energy_gradient_diff2 = 0.0, energy_gradient_scale2 = 0.0;
   std::vector<double> plus = positions, minus = positions, plus_twice = positions, minus_twice = positions;
   std::vector<double> v_fine(n), v_coarse(n), k_fine(d), k_coarse(d);
+  std::vector<double> full_v_gradient(static_cast<std::size_t>(d), 0.0);
   std::vector<std::vector<double>> probe_directions(3, std::vector<double>(d));
   for (int coordinate = 0; coordinate < d; ++coordinate) {
     probe_directions[0][coordinate] = std::sin((coordinate + 1) * 0.7548776662466927) +
@@ -2490,6 +2492,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
     unit_direction[coordinate] = 1.0;
     v_fine = evaluator.analytic_site_jvp(unit_direction);
     const double summed_jvp = std::accumulate(v_fine.begin(), v_fine.end(), 0.0);
+    full_v_gradient[coordinate] = summed_jvp;
     const double identity_error = summed_jvp - reference_gradient[coordinate];
     jvp_identity_diff2 += identity_error * identity_error;
     jvp_identity_scale2 += reference_gradient[coordinate] * reference_gradient[coordinate];
@@ -2506,10 +2509,34 @@ static void generate_rpmd_ja_qnep_raw_reference(
     }
   }
   const double v_phase_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - v_phase_start).count();
+  const auto net_stats = rpmd_ja_reference_math::net_force_stats(full_v_gradient, n);
+  std::printf("    exact full-column V gradient net xyz=(%.17g, %.17g, %.17g), norm=%.17g, vector_norm=%.17g, limit=%.17g, status=%s (eV/A); computed from every V column in qraw atom order.\n",
+    net_stats.net[0], net_stats.net[1], net_stats.net[2], net_stats.net_norm, net_stats.vector_norm,
+    net_stats.limit, net_stats.within_limit ? "within-limit" : "nonzero-net-or-nonfinite");
+  const double reference_net_difference = [&]() {
+    double norm2 = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+      double reference_net = 0.0;
+      for (int i = 0; i < n; ++i) reference_net += reference_gradient[axis * n + i];
+      const double difference = net_stats.net[axis] - reference_net;
+      norm2 += difference * difference;
+    }
+    return std::sqrt(norm2);
+  }();
+  std::printf("    exact full-column V net minus reference analytic-gradient net norm=%.17g eV/A.\n", reference_net_difference);
+  std::fflush(stdout);
   const double jvp_identity_abs = std::sqrt(jvp_identity_diff2 / d);
   const double jvp_identity_relative = std::sqrt(jvp_identity_diff2 / std::max(jvp_identity_scale2, 1.0e-300));
   if (!std::isfinite(jvp_identity_abs) || !std::isfinite(jvp_identity_relative) || jvp_identity_abs > kForceTolerance)
     throw std::runtime_error("qNEP rpmd_ja site-JVP/analytic-gradient identity exceeds 1e-4 eV/A");
+  if (require_zero_net_gradient && !net_stats.within_limit) {
+    std::ostringstream message;
+    message << std::setprecision(17) << "native fit raw qNEP reference gradient has a nonzero net force"
+      << "; net_xyz=(" << net_stats.net[0] << ',' << net_stats.net[1] << ',' << net_stats.net[2]
+      << "), net_norm=" << net_stats.net_norm << ", vector_norm=" << net_stats.vector_norm
+      << ", limit=" << net_stats.limit << ", status=nonzero-net-or-nonfinite";
+    throw std::runtime_error(message.str());
+  }
   const auto kc_phase_start = std::chrono::steady_clock::now();
   for (int coordinate = 0; coordinate < d; ++coordinate) {
     plus = minus = plus_twice = minus_twice = positions;
@@ -2689,9 +2716,11 @@ void generate_rpmd_ja_qnep_raw(
   const std::string& kernel_table_path,
   Atom& atom,
   Box& box,
-  Force& force)
+  Force& force,
+  const bool require_zero_net_gradient)
 {
-  generate_rpmd_ja_qnep_raw_reference(raw_path, temperature, fd_step, kernel_table_path, atom, box, force);
+  generate_rpmd_ja_qnep_raw_reference(raw_path, temperature, fd_step, kernel_table_path, atom, box, force,
+    require_zero_net_gradient);
 }
 
 void generate_rpmd_ja_qnep_reference(
@@ -2709,7 +2738,7 @@ void generate_rpmd_ja_qnep_reference(
   if (existing.good() || existing_sidecar.good() || existing_raw.good())
     throw std::runtime_error("qNEP rpmd_ja final output, sidecar, or scratch file already exists");
   generate_rpmd_ja_qnep_raw_reference(
-    raw_path, temperature, fd_step, kernel_table_path, atom, box, force);
+    raw_path, temperature, fd_step, kernel_table_path, atom, box, force, false);
   prepare_rpmd_ja_qnep_reference(raw_path, path, kernel_table_path, make_rpmd_ja_qnep_mode_validator(atom, box, force));
   if (std::remove(raw_path.c_str()) != 0)
     throw std::runtime_error("qNEP rpmd_ja finalized but could not remove raw scratch file: " + raw_path);
@@ -2719,7 +2748,8 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
 {
   if (!(fd_step > 0.0) || !std::isfinite(fd_step))
     throw std::invalid_argument("qNEP rpmd_ja diagnose requires a positive finite fd_step");
-  if (atom.number_of_atoms <= 1 || atom.cpu_type.size() != static_cast<std::size_t>(atom.number_of_atoms))
+  if (atom.number_of_atoms <= 1 || atom.cpu_type.size() != static_cast<std::size_t>(atom.number_of_atoms) ||
+      atom.cpu_mass.size() != static_cast<std::size_t>(atom.number_of_atoms))
     throw std::runtime_error("qNEP rpmd_ja diagnose requires initialized atom count and types");
   if (force.get_number_of_potentials() != 1 || force.primary_nep_model_path().empty())
     throw std::runtime_error("qNEP rpmd_ja diagnose requires exactly one qNEP potential");
@@ -2752,6 +2782,7 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
     atom.cpu_type, active_qnep->get_pppm_mesh_spacing());
   std::printf("rpmd_ja diagnose only: qNEP charge mode %d, PPPM mesh spacing %.6g A, N=%d, sampled coordinates=%zu; no reference will be produced.\n",
     active_qnep->get_charge_mode(), active_qnep->get_pppm_mesh_spacing(), n, coordinates.size());
+  std::printf("  This quick diagnose does not evaluate the exact full-column V sum; uniform-translation JVPs below are directional proxies only.\n");
   std::printf("  full mode includes q(R), charge chain, real-space and PPPM terms; short-range/no-electrostatic mode uses the qNEP ANN and short-range corrections via compute_non_electro.\n");
   std::printf("  Differences between their errors are electrostatic-related and do not isolate PPPM alone.\n");
   std::printf("  For full-qNEP, analytic gradient + native force equals the discrete PPPM explicit-gradient plus IK-force residual; it is diagnostic, not a reason to relax generation thresholds.\n");
@@ -2813,6 +2844,57 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       analytic_gradient.copy_to_host(host_gradient.data());
       require_finite(host_gradient, "qNEP diagnostic analytic gradient");
       full_r0_gradient = host_gradient;
+      const auto gradient_net = rpmd_ja_reference_math::net_force_stats(host_gradient, n);
+      const auto native_net = rpmd_ja_reference_math::net_force_stats(reference.force, n);
+      std::array<rpmd_ja_reference_math::NetForceStats, 3> repeated_gradient_net;
+      repeated_gradient_net[0] = gradient_net;
+      for (int repeat = 1; repeat < 3; ++repeat)
+        repeated_gradient_net[repeat] = rpmd_ja_reference_math::net_force_stats(evaluator.analytic_gradient(), n);
+      double total_mass = 0.0;
+      for (double mass : atom.cpu_mass) {
+        if (!(mass > 0.0) || !std::isfinite(mass)) throw std::runtime_error("qNEP rpmd_ja diagnose requires positive finite masses");
+        total_mass += mass;
+      }
+      if (!(total_mass > 0.0) || !std::isfinite(total_mass))
+        throw std::runtime_error("qNEP rpmd_ja diagnose total mass is not finite and positive");
+      const double sqrt_total_mass = std::sqrt(total_mass);
+      std::array<double, 3> uniform_jvp_net = {}, mass_translation_jvp_net = {};
+      std::vector<double> translation_direction(static_cast<std::size_t>(d), 0.0);
+      for (int axis = 0; axis < 3; ++axis) {
+        for (int i = 0; i < n; ++i) translation_direction[axis * n + i] = 1.0;
+        const auto uniform_site_jvp = evaluator.analytic_site_jvp(translation_direction);
+        uniform_jvp_net[axis] = std::accumulate(uniform_site_jvp.begin(), uniform_site_jvp.end(), 0.0);
+        for (int i = 0; i < n; ++i) translation_direction[axis * n + i] = 1.0 / sqrt_total_mass;
+        const auto mass_site_jvp = evaluator.analytic_site_jvp(translation_direction);
+        mass_translation_jvp_net[axis] = sqrt_total_mass *
+          std::accumulate(mass_site_jvp.begin(), mass_site_jvp.end(), 0.0);
+        for (int i = 0; i < n; ++i) translation_direction[axis * n + i] = 0.0;
+      }
+      double jvp_analytic_diff2 = 0.0, native_gradient_net_diff2 = 0.0;
+      for (int axis = 0; axis < 3; ++axis) {
+        const double jvp_error = uniform_jvp_net[axis] - gradient_net.net[axis];
+        const double net_force_residual = native_net.net[axis] + gradient_net.net[axis];
+        jvp_analytic_diff2 += jvp_error * jvp_error;
+        native_gradient_net_diff2 += net_force_residual * net_force_residual;
+      }
+      std::printf("  full-qNEP net-force quick diagnostic (eV/A): native force xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; analytic gradient xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s.\n",
+        native_net.net[0], native_net.net[1], native_net.net[2], native_net.net_norm, native_net.vector_norm,
+        native_net.limit, native_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
+        gradient_net.net[0], gradient_net.net[1], gradient_net.net[2], gradient_net.net_norm,
+        gradient_net.vector_norm, gradient_net.limit,
+        gradient_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE");
+      std::printf("    uniform physical translation JVP direction=1 xyz net=(%.9g, %.9g, %.9g) eV/A; mass-weighted translation direction=1/sqrt(total_mass), converted back to xyz net=(%.9g, %.9g, %.9g) eV/A; JVP-analytic net difference norm=%.9g; native_F+gradient net difference norm=%.9g. These directional derivatives are proxies, not the full-column V sum.\n",
+        uniform_jvp_net[0], uniform_jvp_net[1], uniform_jvp_net[2], mass_translation_jvp_net[0],
+        mass_translation_jvp_net[1], mass_translation_jvp_net[2], std::sqrt(jvp_analytic_diff2),
+        std::sqrt(native_gradient_net_diff2));
+      for (int repeat = 0; repeat < 3; ++repeat) {
+        const auto repeat_net = rpmd_ja_reference_math::net_force_stats(repeated_reference[repeat].force, n);
+        std::printf("    baseline repeated force net[%d] xyz=(%.9g, %.9g, %.9g), norm=%.9g eV/A.\n",
+          repeat + 1, repeat_net.net[0], repeat_net.net[1], repeat_net.net[2], repeat_net.net_norm);
+        const auto& repeat_gradient = repeated_gradient_net[repeat];
+        std::printf("    same-force-frame analytic gradient net[%d] xyz=(%.9g, %.9g, %.9g), norm=%.9g eV/A.\n",
+          repeat + 1, repeat_gradient.net[0], repeat_gradient.net[1], repeat_gradient.net[2], repeat_gradient.net_norm);
+      }
       double force_gradient_diff2 = 0.0, force_gradient_scale2 = 0.0;
       double all_coordinate_diff2 = 0.0, native_force_scale2 = 0.0;
       double axis_diff2[3] = {};
@@ -3119,6 +3201,23 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       atom.cpu_type, target_spacing);
     const QEvaluation mesh_eval = mesh_evaluator.evaluate(positions, true); ++evaluations;
     const std::vector<double> mesh_gradient = mesh_evaluator.analytic_gradient();
+    const auto mesh_native_net = rpmd_ja_reference_math::net_force_stats(mesh_eval.force, n);
+    const auto mesh_gradient_net = rpmd_ja_reference_math::net_force_stats(mesh_gradient, n);
+    std::array<double, 3> mesh_uniform_jvp = {};
+    std::vector<double> mesh_direction(static_cast<std::size_t>(d), 0.0);
+    for (int axis = 0; axis < 3; ++axis) {
+      for (int i = 0; i < n; ++i) mesh_direction[axis * n + i] = 1.0;
+      const auto site_jvp = mesh_evaluator.analytic_site_jvp(mesh_direction);
+      mesh_uniform_jvp[axis] = std::accumulate(site_jvp.begin(), site_jvp.end(), 0.0);
+      for (int i = 0; i < n; ++i) mesh_direction[axis * n + i] = 0.0;
+    }
+    double mesh_jvp_analytic_diff2 = 0.0, mesh_native_gradient_net_diff2 = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+      const double jvp_error = mesh_uniform_jvp[axis] - mesh_gradient_net.net[axis];
+      const double net_force_residual = mesh_native_net.net[axis] + mesh_gradient_net.net[axis];
+      mesh_jvp_analytic_diff2 += jvp_error * jvp_error;
+      mesh_native_gradient_net_diff2 += net_force_residual * net_force_residual;
+    }
     double delta2 = 0.0, gradient2 = 0.0, native_mismatch2 = 0.0;
     for (int i = 0; i < d; ++i) {
       const double delta = mesh_gradient[i] - full_r0_gradient[i];
@@ -3127,6 +3226,15 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
     }
     std::printf("  R0 PPPM mesh-spacing trend configured target %.6g A: gradient delta-from-active RMS %.6g, analytic-gradient RMS %.6g, native-force mismatch RMS %.6g eV/A.\n",
       target_spacing, std::sqrt(delta2 / d), std::sqrt(gradient2 / d), std::sqrt(native_mismatch2 / d));
+    std::printf("    mesh net-force quick diagnostic (eV/A): native force xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; analytic gradient xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; uniform translation JVP xyz=(%.9g, %.9g, %.9g); JVP-analytic net difference norm=%.9g; native_F+gradient net difference norm=%.9g.\n",
+      mesh_native_net.net[0], mesh_native_net.net[1], mesh_native_net.net[2], mesh_native_net.net_norm,
+      mesh_native_net.vector_norm, mesh_native_net.limit,
+      mesh_native_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
+      mesh_gradient_net.net[0], mesh_gradient_net.net[1], mesh_gradient_net.net[2], mesh_gradient_net.net_norm,
+      mesh_gradient_net.vector_norm, mesh_gradient_net.limit,
+      mesh_gradient_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
+      mesh_uniform_jvp[0], mesh_uniform_jvp[1], mesh_uniform_jvp[2],
+      std::sqrt(mesh_jvp_analytic_diff2), std::sqrt(mesh_native_gradient_net_diff2));
     std::fflush(stdout);
   }
   std::printf("rpmd_ja requested-h precheck: %s; sampled full-qNEP h steps PASS=%d/%d; SAMPLED PRECHECK ONLY / full reference acceptance still required.\n",

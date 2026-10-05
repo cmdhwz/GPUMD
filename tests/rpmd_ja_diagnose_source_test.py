@@ -6,6 +6,7 @@ text = source.read_text(encoding="utf-8")
 root = Path(__file__).parents[1]
 cli = (root / "src/main_gpumd/run.cu").read_text(encoding="utf-8")
 native = (root / "src/measure/rpmd_ja_native_fit.cu").read_text(encoding="utf-8")
+header = (root / "src/measure/rpmd_ja_reference.cuh").read_text(encoding="utf-8")
 
 # Keep the diagnostic entry point stable for the saved-spool caller.
 assert "void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box, Force& force)" in text
@@ -34,6 +35,18 @@ assert "h == fd_step" in diagnose and "(REQUESTED fd_step)" in precheck_table
 assert "requested-h precheck:" in diagnose and "SAMPLED PRECHECK ONLY / full reference acceptance still required" in diagnose
 assert "rpmd_ja_reference_math::central_difference_4th(g[0][r], g[1][r], g[2][r], g[3][r], h)" in text
 assert "precheck-matched summary h=" in text and "std::fflush(stdout)" in text
+assert 'uniform physical translation JVP direction=1' in text
+assert 'mass-weighted translation direction=1/sqrt(total_mass)' in text
+assert 'proxies, not the full-column V sum' in text
+assert 'baseline repeated force net[%d]' in text
+assert 'mesh net-force quick diagnostic' in text
+assert 'exact full-column V gradient net xyz=' in text
+raw_generation = text[text.index("static void generate_rpmd_ja_qnep_raw_reference("):text.index("void generate_rpmd_ja_qnep_raw(")]
+assert raw_generation.index("exact full-column V gradient net xyz=") < raw_generation.index("if (require_zero_net_gradient && !net_stats.within_limit)") < raw_generation.index("const auto kc_phase_start")
+assert "bool require_zero_net_gradient = false" in header
+fit_impl = native[native.index("static void fit_rpmd_ja_native_reference_impl("):native.index("void fit_rpmd_ja_native_reference(")]
+assert "force,true);" in fit_impl
+assert "rpmd_ja_reference_math::net_force_stats(raw_gradient,n)" in native
 
 
 def central2(plus, minus, h):

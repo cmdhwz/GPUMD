@@ -10,6 +10,39 @@
 
 namespace rpmd_ja_reference_math
 {
+struct NetForceStats
+{
+  std::array<double, 3> net = {};
+  double net_norm = 0.0;
+  double vector_norm = 0.0;
+  double limit = 0.0;
+  bool finite = false;
+  bool within_limit = false;
+};
+
+inline NetForceStats net_force_stats(const std::vector<double>& gradient, const int n)
+{
+  if (n <= 0 || n > std::numeric_limits<int>::max() / 3 || gradient.size() != static_cast<std::size_t>(3) * n)
+    throw std::invalid_argument("invalid RPMD-JA net-force dimensions");
+  NetForceStats result;
+  double net2 = 0.0, gradient2 = 0.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    for (int i = 0; i < n; ++i) {
+      const double value = gradient[static_cast<std::size_t>(axis) * n + i];
+      result.net[axis] += value;
+      gradient2 += value * value;
+    }
+    net2 += result.net[axis] * result.net[axis];
+  }
+  result.net_norm = std::sqrt(net2);
+  result.vector_norm = std::sqrt(gradient2);
+  result.limit = 1.0e-8 * std::max(1.0, result.vector_norm);
+  result.finite = std::isfinite(net2) && std::isfinite(gradient2) &&
+    std::isfinite(result.net_norm) && std::isfinite(result.vector_norm) && std::isfinite(result.limit);
+  result.within_limit = result.finite && result.net_norm <= result.limit;
+  return result;
+}
+
 inline double central_difference_2nd(const double plus, const double minus, const double h)
 {
   return (plus - minus) / (2.0 * h);

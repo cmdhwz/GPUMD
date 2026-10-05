@@ -18,7 +18,7 @@ void diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&)
   for (std::size_t i = 0; i < x.size(); ++i) assert(std::abs(x[i] - diagnostic_expected_r0[i]) < 1e-12);
   if (diagnostic_should_throw) throw std::runtime_error("diagnostic test failure");
 }
-void generate_rpmd_ja_qnep_raw(const std::string&, double, double, const std::string&, Atom&, Box&, Force&) {}
+void generate_rpmd_ja_qnep_raw(const std::string&, double, double, const std::string&, Atom&, Box&, Force&, bool) {}
 void prepare_rpmd_ja_qnep_reference(const std::string&, const std::string&, const std::string&,
                                     const RpmdJAModeValidator&, const std::string&) {}
 RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom&, Box&, Force&) { return {}; }

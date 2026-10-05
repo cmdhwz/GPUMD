@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -12,6 +13,37 @@ namespace
 void check(const bool condition, const char* message)
 {
   if (!condition) throw std::runtime_error(message);
+}
+
+void test_net_force_stats()
+{
+  const std::vector<double> balanced={1.0,-1.0,2.0,-2.0,3.0,-3.0};
+  const auto zero=rpmd_ja_reference_math::net_force_stats(balanced,2);
+  check(zero.finite && zero.within_limit,"balanced net force rejected");
+  check(zero.net_norm==0.0 && std::abs(zero.vector_norm-std::sqrt(28.0))<1e-14,"net force norms differ");
+  auto biased=balanced;biased[1]=-0.5;
+  const auto nonzero=rpmd_ja_reference_math::net_force_stats(biased,2);
+  check(nonzero.finite && !nonzero.within_limit && nonzero.net[0]==0.5,"net force guard missed bias");
+  for (const double invalid:{std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::infinity()}) {
+    auto values=balanced;values[0]=invalid;
+    check(!rpmd_ja_reference_math::net_force_stats(values,2).finite,"non-finite net force accepted");
+  }
+  bool rejected=false;
+  try { (void)rpmd_ja_reference_math::net_force_stats({1.0,2.0},1); }
+  catch(const std::invalid_argument&) { rejected=true; }
+  check(rejected,"invalid net force dimensions accepted");
+
+  const double masses[2]={1.0,4.0}, sqrt_total=std::sqrt(masses[0]+masses[1]);
+  for (int axis=0;axis<3;++axis) {
+    double directional_derivative=0.0;
+    for (int i=0;i<2;++i) {
+      const double t=std::sqrt(masses[i]/(masses[0]+masses[1]));
+      const double physical_direction=t/std::sqrt(masses[i]);
+      directional_derivative+=biased[axis*2+i]*physical_direction;
+    }
+    const double converted=sqrt_total*directional_derivative;
+    check(std::abs(converted-nonzero.net[axis])<1e-14,"mass-normalized translation conversion differs");
+  }
 }
 
 long double direct_g(const long double x)
@@ -291,6 +323,7 @@ void check_fourth_order_finite_difference()
 
 int main()
 {
+  test_net_force_stats();
   check_fock_oracle();
   check_complete_large_b_kernel();
   check_nonsymmetric_row_major_layout();
