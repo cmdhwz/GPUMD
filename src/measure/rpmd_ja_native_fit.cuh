@@ -18,6 +18,7 @@ struct RpmdJANativeFitOptions
   double response_tolerance = 0.0;
   double fd_step = 0.0;
   int sample_interval = 0;
+  int max_stability_rounds = 160;
   bool internal_mass_com = false;
 };
 

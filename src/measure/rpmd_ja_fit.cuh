@@ -58,6 +58,7 @@ private:
   std::string spool_path_;
   std::string lock_path_;
   int sample_interval_ = 0;
+  int max_stability_rounds_ = 160;
   double cutoff_ = 0.0;
   double epsilon_ = 0.0;
   double response_tolerance_ = 0.0;

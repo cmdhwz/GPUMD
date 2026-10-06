@@ -12,6 +12,7 @@ def source(path):
 run = source("src/main_gpumd/run.cu")
 measure = source("src/measure/measure.cu")
 sampler = source("src/measure/rpmd_ja_fit.cu")
+sampler_header = source("src/measure/rpmd_ja_fit.cuh")
 sampling = source("src/measure/rpmd_ja_fit_sampling.cuh")
 native_header = source("src/measure/rpmd_ja_native_fit.cuh")
 native_fit = source("src/measure/rpmd_ja_native_fit.cu")
@@ -55,8 +56,26 @@ assert "stream limits" in sampler
 assert "fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_)" in sampler
 assert "struct RpmdJANativeFitOptions" in native_header
 assert "std::uint64_t frame_count" in native_header
+assert "int max_stability_rounds = 160;" in native_header
+assert "int max_stability_rounds_ = 160;" in sampler_header
+assert "tokens.size() != 9 && tokens.size() != 11" in sampler
+assert 'tokens[9] != "max_rounds"' in sampler
+assert "errno = 0;" in sampler and "errno == ERANGE" in sampler and "rounds > INT_MAX" in sampler
+assert "end == tokens[10].c_str() || *end != '\\0' || rounds <= 0" in sampler
+assert "max_stability_rounds_ = static_cast<int>(rounds);" in sampler
+assert "options.max_stability_rounds = max_stability_rounds_;" in sampler_fit
 assert 'if (tokens[1] == "fit_samples")' in run
 assert "fit_rpmd_ja_native_reference_from_samples(options, tokens[2], atom, box, force)" in run
+fit_samples_start = run.index('if (tokens[1] == "fit_samples")')
+fit_samples_end = run.index('if (tokens[1] == "prepare")', fit_samples_start)
+fit_samples_parser = run[fit_samples_start:fit_samples_end]
+assert 'tokens[argument_count - 2] == "max_rounds"' in fit_samples_parser
+assert "argument_count != 9 && argument_count != 10" in fit_samples_parser
+assert "options.max_stability_rounds = max_stability_rounds;" in fit_samples_parser
+assert "if (argument_count == 10) options.raw_input_path = tokens[9];" in fit_samples_parser
+assert "errno = 0;" in fit_samples_parser and "errno == ERANGE" in fit_samples_parser and "rounds > INT_MAX" in fit_samples_parser
+assert "end == tokens.back().c_str() || *end != '\\0' || rounds <= 0" in fit_samples_parser
+assert "max_rounds <N>" in fit_samples_parser and "[<qraw>] [max_rounds <N>]" in run
 assert "derived.temperature=header.temperature" in native_fit and "derived.sample_interval=static_cast<int>(std::llround(sample_interval))" in native_fit
 assert "fit_rpmd_ja_native_reference_checked(derived,spool_path,header.frame_count,atom,box,force,true)" in native_fit
 assert "raw_model!=expected_model||raw_config!=expected_config" in native_fit
@@ -103,6 +122,16 @@ assert "result.polish_attempts<2" in native_fit and "4*(m+static_cast<std::size_
 assert 'method="active_set_polish"' in native_fit and '<<" polish_attempts="' in native_fit
 assert "polish_failure_reason" in native_fit and "ACTIVE_FULL_KKT_NOT_ACCEPTED" in native_fit
 assert (ROOT / "tests/data/ja_reference_resample.bin.qp_state.txt").stat().st_size > 1_000_000
+assert "options.max_stability_rounds<=0" in native_fit
+assert "const int max_rounds=options.max_stability_rounds;" in native_fit
+assert 'printf("rpmd_ja fit stability round limit=%d\\n",max_rounds)' in native_fit
+assert 'required\\nrpmd_ja fit stability round limit=' in native_fit
+round_loop_start = native_fit.index("for(int outer=0;outer<max_rounds;++outer)")
+round_loop_end = native_fit.index("double compressed_residual2=", round_loop_start)
+round_loop = native_fit[round_loop_start:round_loop_end]
+assert round_loop.count("outer==max_rounds-1") == 2
+assert round_loop.count("to_string(max_rounds)+\" rounds\"") == 3
+assert "80 rounds" not in round_loop and "outer==79" not in round_loop
 assert "POTRF_diagonal_shift_eV_per_A2_per_amu" in source("src/measure/rpmd_ja_qnep_prepare.cu")
 
 pre_run_start = sampler_fit.index("void RpmdJA_Fit::pre_run(")

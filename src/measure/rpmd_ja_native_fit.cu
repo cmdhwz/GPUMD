@@ -879,7 +879,9 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   if(options.output_path.empty()||options.kernel_table.empty()||spool_path.empty()||!std::isfinite(options.temperature)||options.temperature<=0.0||
      !std::isfinite(options.cutoff)||options.cutoff<=0.0||!std::isfinite(options.epsilon)||options.epsilon<=0.0||
      !std::isfinite(options.response_tolerance)||options.response_tolerance<0.0||!std::isfinite(options.fd_step)||options.fd_step<=0.0||
-     options.sample_interval<=0||frame_count<3)throw std::invalid_argument("invalid native rpmd_ja fit options");
+     options.sample_interval<=0||options.max_stability_rounds<=0||frame_count<3)throw std::invalid_argument("invalid native rpmd_ja fit options");
+  const int max_rounds=options.max_stability_rounds;
+  std::printf("rpmd_ja fit stability round limit=%d\n",max_rounds);
   const int n=atom.number_of_atoms;
   if(frame_count>static_cast<std::uint64_t>(std::numeric_limits<int>::max())||n>std::numeric_limits<int>::max()/3)throw std::runtime_error("native fit dimensions exceed indexing limits");
   const int d=3*n,train=static_cast<int>(2*frame_count/3),validation=static_cast<int>(frame_count)-train;
@@ -998,7 +1000,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   }
   const SmallSVD fit_svd=svd_small(qr.solver,rmat,z,static_cast<int>(psize));
   std::vector<std::vector<double>> cut_rows;std::vector<double> cut_rhs,qp_lambda;std::vector<double> theta=theta_from_eta(fit_svd,fit_svd.eta);
-  std::ofstream trace(trace_path,std::ios::out|std::ios::trunc);if(!trace)throw std::runtime_error("cannot create native fit trace: "+trace_path);trace<<std::setprecision(17)<<"evidence SAMPLED; QP_PASS is current finite cut-set only; Ritz/CG, response/IBP and final stored-D Cholesky checks still required\n";
+  std::ofstream trace(trace_path,std::ios::out|std::ios::trunc);if(!trace)throw std::runtime_error("cannot create native fit trace: "+trace_path);trace<<std::setprecision(17)<<"evidence SAMPLED; QP_PASS is current finite cut-set only; Ritz/CG, response/IBP and final stored-D Cholesky checks still required\nrpmd_ja fit stability round limit="<<max_rounds<<'\n';
   bool fit_converged=false;ResponseCheck response;
   auto add_cut=[&](const std::vector<double>& v,const double base_value,const int outer,const char* source){
     const auto row=spectral_row(graph,v,sqrt_mass,n,static_cast<int>(psize));const double row_norm=std::sqrt(std::inner_product(row.begin(),row.end(),row.begin(),0.0));const double rhs=options.epsilon-base_value;const double value=std::inner_product(row.begin(),row.end(),theta.begin(),0.0)+base_value;
@@ -1021,7 +1023,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::vector<double> previous_low_ritz,cg_witness_seed;
   const int max_search_depth=std::min(384,d-3);
   auto deepen_search=[&](){if(search_depth<max_search_depth)search_depth=std::min(max_search_depth,2*search_depth);};
-  for(int outer=0;outer<80;++outer){
+  for(int outer=0;outer<max_rounds;++outer){
     const int steps=std::min(search_depth,d-3);
     const std::string seed_source=!cg_witness_seed.empty()?"CG_WITNESS":(!previous_low_ritz.empty()?"LOWEST_RITZ":"FIXED_SEED");
     const std::vector<double> initial_vector=!cg_witness_seed.empty()?cg_witness_seed:previous_low_ritz;
@@ -1055,7 +1057,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     const bool residual_large=ritz_residual>std::max(1e-12,options.epsilon/4.0);
     if(near_boundary&&residual_large)deepen_search();
     trace<<"outer "<<outer<<" sampled_min_ritz "<<min_ritz<<" ritz_residual "<<ritz_residual<<" ritz_residual_kind actual_Dv_minus_lambda_v lanczos_steps "<<steps<<" next_lanczos_steps "<<search_depth<<" observed_directions "<<modes.size()<<" constraints "<<cut_rows.size()<<" cg_feedback none status "<<(observed_violation?"RETRY":"CHECK_CG")<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit trace: "+trace_path);
-    if(observed_violation){consecutive_cg_feedback=0;if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==79)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after 80 rounds");theta=solve_qp_and_trace(outer);continue;}
+    if(observed_violation){consecutive_cg_feedback=0;if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==max_rounds-1)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after "+std::to_string(max_rounds)+" rounds");theta=solve_qp_and_trace(outer);continue;}
     ResponseCheck response_progress;
     try{response=validate_probes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,options.sample_interval,options.temperature,modes,options.epsilon,&response_progress);}catch(const std::exception& e){trace<<"outer "<<outer<<" status PROBE_VALIDATION_FAIL detail "<<e.what()<<" ";write_response_stats(trace,response_progress);trace<<'\n';trace.flush();throw;}
     if(response.witness.classification.empty()){const bool response_pass=response.response<=options.response_tolerance&&response.ibp<=options.response_tolerance;std::printf("    rpmd_ja fit RESPONSE_CHECK %s: response=%.6g IBP=%.6g limit=%.6g; CG true residual=%.3g; frames=%llu probes=%d covariance condition observed/predicted=%.3g/%.3g block variance delta=%.3g; FULL_CERTIFICATE PENDING\n",response_pass?"PASS":"FAIL",response.response,response.ibp,options.response_tolerance,response.cg,static_cast<unsigned long long>(response.validation_frames),response.probes,response.observed_cov_condition,response.predicted_cov_condition,response.block_variance_max_relative_delta);trace<<"outer "<<outer<<" status CG_PASS response_check "<<(response_pass?"PASS":"FAIL")<<" constraints "<<cut_rows.size()<<" ";write_response_stats(trace,response);trace<<" response_tolerance "<<options.response_tolerance<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!response_pass)throw std::runtime_error("RESPONSE_CHECK_FAIL: native fit held-out probe response or force-position IBP exceeds declared tolerance");fit_converged=true;break;}
@@ -1065,9 +1067,9 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(!added)throw std::runtime_error("STABILITY_CUT_STALLED: CG witness did not add a new violated constraint");
     cg_witness_seed=response.witness.direction;++consecutive_cg_feedback;if(consecutive_cg_feedback>=2)deepen_search();
     trace<<"outer "<<outer<<" cg_feedback "<<response.witness.classification<<" probe "<<response.witness.probe<<" iteration "<<response.witness.iteration<<" rayleigh "<<response.witness.rayleigh<<" lanczos_steps "<<steps<<" next_lanczos_steps "<<search_depth<<" consecutive_cg_feedback "<<consecutive_cg_feedback<<" constraints "<<cut_rows.size()<<" status RETRY ";write_response_stats(trace,response);trace<<'\n';trace.flush();
-    if(outer==79)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted 80 rounds");theta=solve_qp_and_trace(outer);
+    if(outer==max_rounds-1)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted "+std::to_string(max_rounds)+" rounds");theta=solve_qp_and_trace(outer);
   }
-  if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within 80 rounds");
+  if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within "+std::to_string(max_rounds)+" rounds");
   double compressed_residual2=discarded2;for(int i=0;i<static_cast<int>(psize);++i){double v=-z[i];for(int j=i;j<static_cast<int>(psize);++j)v+=rmat[static_cast<std::size_t>(i)*psize+j]*theta[j];compressed_residual2+=v*v;}
   if(!std::isfinite(compressed_residual2)||!std::isfinite(training_force2)||training_force2<0.0)throw std::runtime_error("native fit training force residual is non-finite");const double training_force_residual=training_force2>0.0?std::sqrt(compressed_residual2/training_force2):(compressed_residual2==0.0?0.0:std::numeric_limits<double>::infinity());if(!std::isfinite(training_force_residual))throw std::runtime_error("native fit training residual is nonzero at zero physical-force scale");
   if(response.response>options.response_tolerance||response.ibp>options.response_tolerance)

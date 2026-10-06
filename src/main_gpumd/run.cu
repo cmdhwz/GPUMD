@@ -94,6 +94,8 @@ Run simulation according to the inputs in the run.in file.
 #include "velocity.cuh"
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <exception>
 #include <string>
@@ -723,7 +725,7 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
@@ -733,8 +735,21 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     return;
   }
   if (tokens[1] == "fit_samples") {
-    if (tokens.size() != 9 && tokens.size() != 10)
-      PRINT_INPUT_ERROR("rpmd_ja fit_samples requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>].");
+    std::size_t argument_count = tokens.size();
+    int max_stability_rounds = 160;
+    if (argument_count >= 2 && tokens[argument_count - 2] == "max_rounds") {
+      errno = 0;
+      char* end = nullptr;
+      const long long rounds = std::strtoll(tokens.back().c_str(), &end, 10);
+      if (errno == ERANGE || end == tokens.back().c_str() || *end != '\0' || rounds <= 0 || rounds > INT_MAX)
+        PRINT_INPUT_ERROR("rpmd_ja fit_samples max_rounds must be a positive integer.");
+      max_stability_rounds = static_cast<int>(rounds);
+      argument_count -= 2;
+    } else if (!tokens.empty() && tokens.back() == "max_rounds") {
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples max_rounds requires an integer value.");
+    }
+    if (argument_count != 9 && argument_count != 10)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>].");
     if (global_time != 0.0)
       PRINT_INPUT_ERROR("rpmd_ja fit_samples must appear before any run.");
     if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
@@ -748,10 +763,11 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     RpmdJANativeFitOptions options;
     options.output_path = tokens[3];
     options.kernel_table = tokens[8];
-    if (tokens.size() == 10) options.raw_input_path = tokens[9];
+    options.max_stability_rounds = max_stability_rounds;
+    if (argument_count == 10) options.raw_input_path = tokens[9];
     options.internal_mass_com = integrate.get_pimd_fix_com();
     if (tokens[2].empty() || options.output_path.empty() || options.kernel_table.empty() ||
-        (tokens.size() == 10 && options.raw_input_path.empty()) ||
+        (argument_count == 10 && options.raw_input_path.empty()) ||
         tokens[2] == options.output_path || (!options.raw_input_path.empty() &&
         (options.raw_input_path == options.output_path || options.raw_input_path == tokens[2])))
       PRINT_INPUT_ERROR("rpmd_ja fit_samples paths must be nonempty and the output must differ from its inputs.");

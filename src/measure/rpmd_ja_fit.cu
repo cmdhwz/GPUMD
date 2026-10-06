@@ -9,6 +9,7 @@
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -58,10 +59,10 @@ void write_or_throw(std::ofstream& out, const void* data, const std::size_t byte
 RpmdJA_Fit::RpmdJA_Fit(const std::vector<std::string>& tokens)
 {
   action_name = "rpmd_ja_fit";
-  if (tokens.size() != 9 || tokens[0] != "rpmd_ja" || tokens[1] != "fit") {
+  if ((tokens.size() != 9 && tokens.size() != 11) || tokens[0] != "rpmd_ja" || tokens[1] != "fit") {
     throw std::invalid_argument(
       "rpmd_ja fit requires <outfile> <sample_interval> <cutoff> <epsilon> "
-      "<response_tolerance> <fd_step> <kernel_table>");
+      "<response_tolerance> <fd_step> <kernel_table> [max_rounds <N>]");
   }
   output_path_ = tokens[2];
   char* end = nullptr;
@@ -70,6 +71,17 @@ RpmdJA_Fit::RpmdJA_Fit(const std::vector<std::string>& tokens)
     throw std::invalid_argument("rpmd_ja fit sample_interval must be a positive integer");
   }
   sample_interval_ = static_cast<int>(interval);
+  if (tokens.size() == 11) {
+    if (tokens[9] != "max_rounds") {
+      throw std::invalid_argument("rpmd_ja fit optional tail must be max_rounds <N>");
+    }
+    errno = 0;
+    const long long rounds = std::strtoll(tokens[10].c_str(), &end, 10);
+    if (errno == ERANGE || end == tokens[10].c_str() || *end != '\0' || rounds <= 0 || rounds > INT_MAX) {
+      throw std::invalid_argument("rpmd_ja fit max_rounds must be a positive integer");
+    }
+    max_stability_rounds_ = static_cast<int>(rounds);
+  }
   cutoff_ = parse_positive(tokens[4], "cutoff");
   epsilon_ = parse_positive(tokens[5], "epsilon");
   response_tolerance_ = parse_positive(tokens[6], "response_tolerance");
@@ -401,6 +413,7 @@ void RpmdJA_Fit::post_run(
   options.response_tolerance = response_tolerance_;
   options.fd_step = fd_step_;
   options.sample_interval = sample_interval_;
+  options.max_stability_rounds = max_stability_rounds_;
   options.internal_mass_com = integrate.get_pimd_fix_com();
   try {
     fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_);
