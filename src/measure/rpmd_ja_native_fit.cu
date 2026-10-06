@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -217,6 +218,40 @@ __global__ void project_internal(double* k, const double* t, const double* kt, c
   k[q]=v;
 }
 
+__global__ void lanczos_translation_coefficients(const double* v,const double* sqrt_atom,double* coefficient,
+  const int n,const double inverse_mass_sum)
+{
+  __shared__ double partial[256];
+  const int axis=static_cast<int>(blockIdx.x);double sum=0.0;
+  for(int i=threadIdx.x;i<n;i+=blockDim.x)sum+=sqrt_atom[i]*v[axis*n+i];
+  partial[threadIdx.x]=sum;__syncthreads();
+  for(int stride=blockDim.x/2;stride>0;stride>>=1){if(threadIdx.x<stride)partial[threadIdx.x]+=partial[threadIdx.x+stride];__syncthreads();}
+  if(threadIdx.x==0)coefficient[axis]=partial[0]*inverse_mass_sum;
+}
+
+__global__ void lanczos_remove_translation(double* v,const double* sqrt_atom,const double* coefficient,const int d,const int n)
+{
+  const int q=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;if(q>=d)return;
+  v[q]-=sqrt_atom[q%n]*coefficient[q/n];
+}
+
+__global__ void lanczos_additive_action(const double* q,double* result,const double* sqrt_mass,const double* theta,
+  const int* offsets,const int* neighbors,const int* groups,const signed char* signs,const int n,const int d)
+{
+  const int index=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;if(index>=d)return;
+  const int axis=index/n,atom=index-axis*n;double value=0.0;
+  for(int edge=offsets[atom];edge<offsets[atom+1];++edge){
+    const int neighbor=neighbors[edge],group=groups[edge],i=signs[edge]>0?atom:neighbor,j=signs[edge]>0?neighbor:atom;
+    const std::size_t p=6*static_cast<std::size_t>(group);const double c0=theta[p],c1=theta[p+1],c2=theta[p+2],c3=theta[p+3],c4=theta[p+4],c5=theta[p+5];
+    const double dx0=q[j]/sqrt_mass[j]-q[i]/sqrt_mass[i];
+    const double dx1=q[n+j]/sqrt_mass[n+j]-q[n+i]/sqrt_mass[n+i];
+    const double dx2=q[2*n+j]/sqrt_mass[2*n+j]-q[2*n+i]/sqrt_mass[2*n+i];
+    const double y=axis==0?c0*dx0+c1*dx1+c2*dx2:(axis==1?c1*dx0+c3*dx1+c4*dx2:c2*dx0+c4*dx1+c5*dx2);
+    value-=static_cast<double>(signs[edge])*y/sqrt_mass[index];
+  }
+  result[index]=value;
+}
+
 struct DeviceBaseline
 {
   double* k=nullptr; double* q=nullptr; double* out=nullptr; double* t=nullptr; double* kt=nullptr;double* g=nullptr;int* error=nullptr;
@@ -251,12 +286,58 @@ struct DeviceBaseline
   }
   void apply(const std::vector<double>& input,std::vector<double>& result)
   {
-    const double one=1.0,zero=0.0;
     if(cudaMemcpy(q,input.data(),static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
-       cublasDgemv(blas,CUBLAS_OP_T,d,d,&one,k,d,q,1,&zero,out,1)!=CUBLAS_STATUS_SUCCESS||
+       apply_device(q,out)!=CUBLAS_STATUS_SUCCESS||
        cudaMemcpy(result.data(),out,static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)
       throw std::runtime_error("native fit Hessian matvec failed");
   }
+  cublasStatus_t apply_device(const double* input,double* result)
+  {
+    const double one=1.0,zero=0.0;
+    return cublasDgemv(blas,CUBLAS_OP_T,d,d,&one,k,d,input,1,&zero,result,1);
+  }
+};
+
+struct DeviceLanczosWorkspace
+{
+  double *basis=nullptr,*v=nullptr,*previous=nullptr,*w=nullptr,*add=nullptr,*ritz=nullptr,*coefficient=nullptr,*theta=nullptr,*sqrt_mass=nullptr,*sqrt_atom=nullptr,*translation=nullptr;
+  int *offsets=nullptr,*neighbors=nullptr,*groups=nullptr; signed char* signs=nullptr;
+  int d=0,n=0,p=0,max_steps=0;double inverse_mass_sum=0.0;
+  void release(){double** values[]={&basis,&v,&previous,&w,&add,&ritz,&coefficient,&theta,&sqrt_mass,&sqrt_atom,&translation};for(double** value:values)if(*value){cudaFree(*value);*value=nullptr;}if(offsets){cudaFree(offsets);offsets=nullptr;}if(neighbors){cudaFree(neighbors);neighbors=nullptr;}if(groups){cudaFree(groups);groups=nullptr;}if(signs){cudaFree(signs);signs=nullptr;}d=n=p=max_steps=0;inverse_mass_sum=0.0;}
+  ~DeviceLanczosWorkspace(){release();}
+  void initialize(const Graph& graph,const std::vector<double>& sqrt_mass_host,const std::vector<double>& sqrt_atom_host,
+                  const int steps,const std::size_t parameter_count)
+  {
+    if(sqrt_atom_host.empty()||sqrt_atom_host.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()/3)||parameter_count>static_cast<std::size_t>(std::numeric_limits<int>::max())||steps<=0||graph.edges.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()/2))
+      throw std::runtime_error("native fit Lanczos workspace dimensions are invalid");
+    d=static_cast<int>(sqrt_mass_host.size());n=static_cast<int>(sqrt_atom_host.size());p=static_cast<int>(parameter_count);max_steps=steps;
+    if(d!=3*n)throw std::runtime_error("native fit Lanczos workspace dimensions are invalid");
+    std::vector<int> host_offsets(static_cast<std::size_t>(n)+1,0);
+    for(const auto& edge:graph.edges){if(edge.i<0||edge.i>=n||edge.j<0||edge.j>=n||edge.group<0||6ULL*static_cast<std::size_t>(edge.group)+5>=parameter_count)throw std::runtime_error("native fit Lanczos graph edge is invalid");++host_offsets[edge.i+1];++host_offsets[edge.j+1];}
+    for(int i=0;i<n;++i)host_offsets[i+1]+=host_offsets[i];
+    std::vector<int> host_neighbors(graph.edges.size()*2),host_groups(graph.edges.size()*2),cursor=host_offsets;
+    std::vector<signed char> host_signs(graph.edges.size()*2);
+    for(const auto& edge:graph.edges){int at=cursor[edge.i]++;host_neighbors[at]=edge.j;host_groups[at]=edge.group;host_signs[at]=1;at=cursor[edge.j]++;host_neighbors[at]=edge.i;host_groups[at]=edge.group;host_signs[at]=-1;}
+    std::size_t free_bytes=0,total_bytes=0;if(cudaMemGetInfo(&free_bytes,&total_bytes)!=cudaSuccess)throw std::runtime_error("native fit Lanczos workspace cudaMemGetInfo failed");
+    const std::size_t basis_bytes=static_cast<std::size_t>(d)*steps*sizeof(double);
+    const std::size_t vector_bytes=(7ULL*static_cast<std::size_t>(d)+steps+std::max(1,p)+static_cast<std::size_t>(n)+3)*sizeof(double);
+    const std::size_t graph_bytes=(host_offsets.size()+std::max<std::size_t>(1,host_neighbors.size())+std::max<std::size_t>(1,host_groups.size()))*sizeof(int)+std::max<std::size_t>(1,host_signs.size())*sizeof(signed char);
+    if(basis_bytes>free_bytes||vector_bytes>free_bytes-basis_bytes||graph_bytes>free_bytes-basis_bytes-vector_bytes||free_bytes-basis_bytes-vector_bytes-graph_bytes<128ULL*1024*1024)
+      throw std::runtime_error("native fit Lanczos workspace preflight leaves less than 128 MiB safety margin");
+    auto alloc_double=[](double** pointer,const std::size_t count){if(cudaMalloc(reinterpret_cast<void**>(pointer),std::max<std::size_t>(1,count)*sizeof(double))!=cudaSuccess)throw std::runtime_error("native fit Lanczos GPU allocation failed");};
+    alloc_double(&basis,static_cast<std::size_t>(d)*steps);alloc_double(&v,d);alloc_double(&previous,d);alloc_double(&w,d);alloc_double(&add,d);alloc_double(&ritz,d);alloc_double(&coefficient,steps);alloc_double(&theta,parameter_count);alloc_double(&sqrt_mass,d);alloc_double(&sqrt_atom,n);alloc_double(&translation,3);
+    if(cudaMalloc(reinterpret_cast<void**>(&offsets),host_offsets.size()*sizeof(int))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&neighbors),std::max<std::size_t>(1,host_neighbors.size())*sizeof(int))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&groups),std::max<std::size_t>(1,host_groups.size())*sizeof(int))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&signs),std::max<std::size_t>(1,host_signs.size())*sizeof(signed char))!=cudaSuccess)
+      throw std::runtime_error("native fit Lanczos graph allocation failed");
+    if(cudaMemcpy(offsets,host_offsets.data(),host_offsets.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(sqrt_mass,sqrt_mass_host.data(),sqrt_mass_host.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(sqrt_atom,sqrt_atom_host.data(),sqrt_atom_host.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)
+      throw std::runtime_error("native fit Lanczos static data upload failed");
+    if(!host_neighbors.empty()&&(cudaMemcpy(neighbors,host_neighbors.data(),host_neighbors.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(groups,host_groups.data(),host_groups.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(signs,host_signs.data(),host_signs.size()*sizeof(signed char),cudaMemcpyHostToDevice)!=cudaSuccess))
+      throw std::runtime_error("native fit Lanczos graph upload failed");
+    inverse_mass_sum=1.0/std::inner_product(sqrt_atom_host.begin(),sqrt_atom_host.end(),sqrt_atom_host.begin(),0.0);
+    if(!std::isfinite(inverse_mass_sum)||!(inverse_mass_sum>0.0))throw std::runtime_error("native fit Lanczos translation norm is invalid");
+  }
+  void set_theta(const std::vector<double>& values){if(values.size()!=static_cast<std::size_t>(p))throw std::runtime_error("native fit Lanczos parameter dimension changed");if(p&&cudaMemcpy(theta,values.data(),values.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)throw std::runtime_error("native fit Lanczos parameter upload failed");}
+  void project(double* x){lanczos_translation_coefficients<<<3,256>>>(x,sqrt_atom,translation,n,inverse_mass_sum);lanczos_remove_translation<<<static_cast<unsigned>((static_cast<std::size_t>(d)+255)/256),256>>>(x,sqrt_atom,translation,d,n);if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native fit Lanczos translation projection kernel failed");}
+  void additive_action(const double* input){lanczos_additive_action<<<static_cast<unsigned>((static_cast<std::size_t>(d)+255)/256),256>>>(input,add,sqrt_mass,theta,offsets,neighbors,groups,signs,n,d);if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native fit Lanczos additive-action kernel failed");project(add);}
 };
 
 struct DeviceQR
@@ -362,6 +443,7 @@ struct QPSolution
   QPCertificate certificate;
   int iterations=0;
   double last_multiplier_change=0.0;
+  double coordinate_seconds=0.0,polish_seconds=0.0;
   const char* method="coordinate";
   int polish_attempts=0;
   std::size_t polish_updates=0;
@@ -380,6 +462,7 @@ void write_cut_qp_state(const std::string& path,const int outer,const QPSolution
   out<<std::setprecision(17)<<"outer_index "<<outer<<"\niterations "<<solution.iterations<<"\nmethod "<<solution.method
     <<"\npolish_attempts "<<solution.polish_attempts<<"\nactive_constraints "<<solution.active_constraints
     <<"\npolish_updates "<<solution.polish_updates<<"\npolish_failure_reason "<<solution.polish_failure_reason
+    <<"\ncoordinate_seconds "<<solution.coordinate_seconds<<"\npolish_seconds "<<solution.polish_seconds
     <<"\nparameters "<<svd.p<<"\nconstraints "<<rows.size()
     <<"\nprimal_tolerance "<<primal_tolerance<<"\ncomplementarity_tolerance "<<qp_complementarity_tolerance<<"\nstationarity_tolerance "<<qp_stationarity_tolerance
     <<"\nlast_multiplier_change "<<solution.last_multiplier_change<<"\nmax_primal_violation "<<solution.certificate.max_primal_violation
@@ -491,15 +574,17 @@ QPSolution solve_cut_qp(cusolverDnHandle_t solver,const SmallSVD& svd,const std:
   for(std::size_t i=0;i<rows.size();++i)for(std::size_t j=0;j<rows.size();++j){gram[i*rows.size()+j]=std::inner_product(a[i].begin(),a[i].end(),a[j].begin(),0.0);if(!std::isfinite(gram[i*rows.size()+j]))throw std::runtime_error("native fit stability QP Gram matrix is non-finite");}
   std::vector<double> diag(rows.size());for(std::size_t i=0;i<rows.size();++i){diag[i]=gram[i*rows.size()+i];if(!(diag[i]>1e-24)||!std::isfinite(diag[i]))throw std::runtime_error("native fit stability cut is singular or non-finite");}
   for(double value:lambda)if(!std::isfinite(value)||value<0.0)throw std::runtime_error("native fit stability QP warm start is non-finite or negative");
-  const std::vector<double> initial_lambda_full=lambda;QPSolution result;result.lambda=std::move(lambda);constexpr int check_interval=32,max_iterations=200000,first_polish_iteration=4096;
+  const std::vector<double> initial_lambda_full=lambda;QPSolution result;result.lambda=std::move(lambda);constexpr int check_interval=32,max_iterations=200000,first_polish_iteration=64,retry_polish_iteration=4096;
   auto check_current=[&](){result.xi=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)result.xi[k]+=a[i][k]*result.lambda[i];result.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,result.lambda,result.xi,primal_tolerance);};
+  auto coordinate_started=std::chrono::steady_clock::now();
+  auto record_coordinate_time=[&](){const auto now=std::chrono::steady_clock::now();result.coordinate_seconds+=std::chrono::duration<double>(now-coordinate_started).count();coordinate_started=now;};
   auto try_polish=[&](){++result.polish_attempts;ActiveSetPolishResult polished;try{polished=polish_cut_qp(solver,svd,rows,rhs,a,b,result.lambda,primal_tolerance);}catch(...){polished.failure_reason="ACTIVE_INTERNAL_FAILURE";}
     result.active_constraints=polished.active_constraints;result.polish_updates+=polished.updates;result.polish_failure_reason=polished.failure_reason;
     if(!polished.accepted)return false;result.lambda=std::move(polished.lambda);result.xi=std::move(polished.xi);result.certificate=std::move(polished.certificate);result.method="active_set_polish";return true;};
   for(int it=0;it<max_iterations;++it){double change=0.0;for(std::size_t i=0;i<rows.size();++i){double residual=b[i];for(std::size_t j=0;j<rows.size();++j)residual-=gram[i*rows.size()+j]*result.lambda[j];const double next=std::max(0.0,result.lambda[i]+residual/diag[i]);if(!std::isfinite(next))throw std::runtime_error("native fit stability QP iterate is non-finite");change=std::max(change,std::abs(next-result.lambda[i]));result.lambda[i]=next;}result.iterations=it+1;result.last_multiplier_change=change;
     if(result.iterations%check_interval==0||result.iterations==max_iterations){check_current();if(result.certificate.accepted)break;
-      if((result.iterations==first_polish_iteration||result.iterations==max_iterations)&&result.polish_attempts<2&&try_polish())break;}}
-  check_current();
+      if((result.iterations==first_polish_iteration||result.iterations==retry_polish_iteration||result.iterations==max_iterations)&&result.polish_attempts<3){record_coordinate_time();const auto polish_started=std::chrono::steady_clock::now();const bool accepted=try_polish();result.polish_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-polish_started).count();coordinate_started=std::chrono::steady_clock::now();if(accepted)break;}}}
+  record_coordinate_time();const auto final_check_started=std::chrono::steady_clock::now();check_current();result.coordinate_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-final_check_started).count();
   if(!result.certificate.accepted){write_cut_qp_state(qp_state_path,outer,result,primal_tolerance,svd,rows,rhs,a,b,gram,initial_lambda_full);throw std::runtime_error("native fit stability QP failed primal, dual, or complementary-slackness check after "+std::to_string(result.iterations)+" iterations"+(qp_state_path.empty()?std::string():"; inspect "+qp_state_path));}
   return result;
 }
@@ -601,50 +686,63 @@ void apply_additive(const Graph& graph,const std::vector<double>& q,const std::v
 }
 
 struct SmallEigen{int n=0;std::vector<double> values,vectors;};
-SmallEigen eigen_small(cusolverDnHandle_t solver,const std::vector<double>& rowmajor,const int n)
+SmallEigen eigen_small(cusolverDnHandle_t solver,const std::vector<double>& rowmajor,const int n,const int requested=-1)
 {
   if(!std::all_of(rowmajor.begin(),rowmajor.end(),[](double v){return std::isfinite(v);}))throw std::runtime_error("native fit eigensolver input is non-finite");
+  const int returned=requested>0?std::min(requested,n):n;
   SmallEigen out;out.n=n;std::vector<double>a(rowmajor.size());for(int i=0;i<n;++i)for(int j=0;j<n;++j)a[i+static_cast<std::size_t>(j)*n]=rowmajor[static_cast<std::size_t>(i)*n+j];
   double *da=nullptr,*dw=nullptr,*work=nullptr;int *info=nullptr,lwork=0;auto cleanup=[&](){if(da)cudaFree(da);if(dw)cudaFree(dw);if(work)cudaFree(work);if(info)cudaFree(info);};
   try{if(cudaMalloc(reinterpret_cast<void**>(&da),a.size()*sizeof(double))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&dw),static_cast<std::size_t>(n)*sizeof(double))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&info),sizeof(int))!=cudaSuccess)throw std::runtime_error("native fit small-eigen allocation failed");
     if(cusolverDnDsyevd_bufferSize(solver,CUSOLVER_EIG_MODE_VECTOR,CUBLAS_FILL_MODE_LOWER,n,da,n,dw,&lwork)!=CUSOLVER_STATUS_SUCCESS||lwork<=0||cudaMalloc(reinterpret_cast<void**>(&work),static_cast<std::size_t>(lwork)*sizeof(double))!=cudaSuccess)throw std::runtime_error("native fit small-eigen workspace failed");
     if(cudaMemcpy(da,a.data(),a.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||cusolverDnDsyevd(solver,CUSOLVER_EIG_MODE_VECTOR,CUBLAS_FILL_MODE_LOWER,n,da,n,dw,work,lwork,info)!=CUSOLVER_STATUS_SUCCESS)throw std::runtime_error("native fit small symmetric eigensolve failed");
     int host_info=0;if(cudaMemcpy(&host_info,info,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess||host_info)throw std::runtime_error("native fit small symmetric eigensolve did not converge");
-     out.values.resize(n);out.vectors.resize(a.size());if(cudaMemcpy(out.values.data(),dw,static_cast<std::size_t>(n)*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess||cudaMemcpy(out.vectors.data(),da,a.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native fit small eigen readback failed");if(!std::all_of(out.values.begin(),out.values.end(),[](double v){return std::isfinite(v);})||!std::all_of(out.vectors.begin(),out.vectors.end(),[](double v){return std::isfinite(v);}))throw std::runtime_error("native fit small eigensolver returned non-finite values");
+     out.values.resize(returned);out.vectors.resize(static_cast<std::size_t>(n)*returned);if(cudaMemcpy(out.values.data(),dw,static_cast<std::size_t>(returned)*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess||cudaMemcpy(out.vectors.data(),da,out.vectors.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native fit small eigen readback failed");if(!std::all_of(out.values.begin(),out.values.end(),[](double v){return std::isfinite(v);})||!std::all_of(out.vectors.begin(),out.vectors.end(),[](double v){return std::isfinite(v);}))throw std::runtime_error("native fit small eigensolver returned non-finite values");
   }catch(...){cleanup();throw;}cleanup();return out;
 }
 
-struct RitzMode{double value=0.0,residual=0.0;std::vector<double> vector,base_action,additive_action;};
+struct RitzMode{double value=0.0,residual=0.0,base_rayleigh=0.0,additive_rayleigh=0.0;std::vector<double> vector;};
 std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline& baseline,const Graph& graph,
   const std::vector<double>& theta,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const int n,const int max_steps,const int wanted,
-  const std::vector<double>& initial_vector=std::vector<double>{})
+  const std::vector<double>& initial_vector=std::vector<double>{},DeviceLanczosWorkspace* workspace=nullptr)
 {
   const int d=3*n;const int steps=std::min(max_steps,d-3);if(steps<=0)throw std::runtime_error("native fit Lanczos has no internal dimensions");
-  std::vector<std::vector<double>> basis;basis.reserve(steps);std::vector<double> v(d),w(d),raw(d),add(d);
-  if(initial_vector.empty()){for(int i=0;i<d;++i)v[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);}
-  else{if(initial_vector.size()!=static_cast<std::size_t>(d))throw std::runtime_error("native fit Lanczos initial vector has an invalid dimension");v=initial_vector;}
-  project_translation(v,sqrt_atom,n);
-  double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(!std::isfinite(norm)||!(norm>0.0))throw std::runtime_error("native fit Lanczos initial vector vanished or is non-finite");for(double&x:v)x/=norm;
-  std::vector<double> alpha,beta;double beta_prev=0.0;std::vector<double> previous(d,0.0);
-  for(int k=0;k<steps;++k){basis.push_back(v);baseline.apply(v,raw);apply_additive(graph,v,sqrt_mass,sqrt_atom,theta,n,add);for(int i=0;i<d;++i)w[i]=raw[i]+add[i];
-    const double av_norm=std::sqrt(std::inner_product(w.begin(),w.end(),w.begin(),0.0));if(!std::isfinite(av_norm))throw std::runtime_error("native fit Lanczos operator norm is non-finite");
-    if(k)for(int i=0;i<d;++i)w[i]-=beta_prev*previous[i];const double a=std::inner_product(v.begin(),v.end(),w.begin(),0.0);if(!std::isfinite(a))throw std::runtime_error("native fit Lanczos diagonal is non-finite");alpha.push_back(a);for(int i=0;i<d;++i)w[i]-=a*v[i];
-    project_translation(w,sqrt_atom,n);
-    for(int pass=0;pass<2;++pass)for(const auto&u:basis){const double dot=std::inner_product(u.begin(),u.end(),w.begin(),0.0);for(int i=0;i<d;++i)w[i]-=dot*u[i];}
-    project_translation(w,sqrt_atom,n);
-    const double b=std::sqrt(std::inner_product(w.begin(),w.end(),w.begin(),0.0));if(!std::isfinite(b))throw std::runtime_error("native fit Lanczos residual norm is non-finite");beta.push_back(b);
+  DeviceLanczosWorkspace local_workspace;if(workspace==nullptr){local_workspace.initialize(graph,sqrt_mass,sqrt_atom,steps,theta.size());workspace=&local_workspace;}
+  if(workspace->d!=d||workspace->n!=n||workspace->max_steps<steps||workspace->p!=static_cast<int>(theta.size()))throw std::runtime_error("native fit Lanczos workspace does not match search dimensions");
+  auto blas_check=[](const cublasStatus_t status,const char* what){if(status!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error(what);};
+  auto dot=[&](const double* x,const double* y){double value=0.0;blas_check(cublasDdot(baseline.blas,d,x,1,y,1,&value),"native fit Lanczos dot product failed");return value;};
+  auto norm=[&](const double* x){double value=0.0;blas_check(cublasDnrm2(baseline.blas,d,x,1,&value),"native fit Lanczos norm failed");return value;};
+  auto axpy=[&](const double scale,const double* x,double* y){blas_check(cublasDaxpy(baseline.blas,d,&scale,x,1,y,1),"native fit Lanczos vector update failed");};
+  const double one=1.0,zero=0.0;workspace->set_theta(theta);
+  std::vector<double> initial(d);
+  if(initial_vector.empty()){for(int i=0;i<d;++i)initial[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);}
+  else{if(initial_vector.size()!=static_cast<std::size_t>(d))throw std::runtime_error("native fit Lanczos initial vector has an invalid dimension");initial=initial_vector;}
+  if(cudaMemcpy(workspace->v,initial.data(),static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)throw std::runtime_error("native fit Lanczos initial vector upload failed");
+  workspace->project(workspace->v);double initial_norm=norm(workspace->v);if(!std::isfinite(initial_norm)||!(initial_norm>0.0))throw std::runtime_error("native fit Lanczos initial vector vanished or is non-finite");
+  const double inverse_initial_norm=1.0/initial_norm;blas_check(cublasDscal(baseline.blas,d,&inverse_initial_norm,workspace->v,1),"native fit Lanczos initial vector normalization failed");
+  std::vector<double> alpha,beta;double beta_prev=0.0;
+  for(int k=0;k<steps;++k){
+    if(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->basis+static_cast<std::size_t>(k)*d,1)!=CUBLAS_STATUS_SUCCESS||baseline.apply_device(workspace->v,baseline.out)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos basis or Hessian operation failed");
+    workspace->additive_action(workspace->v);blas_check(cublasDcopy(baseline.blas,d,baseline.out,1,workspace->w,1),"native fit Lanczos operator copy failed");axpy(one,workspace->add,workspace->w);
+    const double av_norm=norm(workspace->w);if(!std::isfinite(av_norm))throw std::runtime_error("native fit Lanczos operator norm is non-finite");
+    if(k)axpy(-beta_prev,workspace->previous,workspace->w);const double a=dot(workspace->v,workspace->w);if(!std::isfinite(a))throw std::runtime_error("native fit Lanczos diagonal is non-finite");alpha.push_back(a);axpy(-a,workspace->v,workspace->w);
+    workspace->project(workspace->w);
+    for(int pass=0;pass<2;++pass){blas_check(cublasDgemv(baseline.blas,CUBLAS_OP_T,d,k+1,&one,workspace->basis,d,workspace->w,1,&zero,workspace->coefficient,1),"native fit Lanczos basis projection failed");
+      const double minus_one=-1.0;blas_check(cublasDgemv(baseline.blas,CUBLAS_OP_N,d,k+1,&minus_one,workspace->basis,d,workspace->coefficient,1,&one,workspace->w,1),"native fit Lanczos reorthogonalization failed");}
+    workspace->project(workspace->w);
+    const double b=norm(workspace->w);if(!std::isfinite(b))throw std::runtime_error("native fit Lanczos residual norm is non-finite");beta.push_back(b);
     const double operator_scale=std::max({av_norm,std::abs(a),std::abs(beta_prev)});
     const double breakdown=64.0*std::numeric_limits<double>::epsilon()*operator_scale;
-    if(b<=breakdown||k==steps-1)break;previous=std::move(v);v.resize(d);for(int i=0;i<d;++i)v[i]=w[i]/b;beta_prev=b;
+    if(b<=breakdown||k==steps-1)break;
+    blas_check(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->previous,1),"native fit Lanczos previous-vector copy failed");blas_check(cublasDcopy(baseline.blas,d,workspace->w,1,workspace->v,1),"native fit Lanczos next-vector copy failed");const double inverse_b=1.0/b;blas_check(cublasDscal(baseline.blas,d,&inverse_b,workspace->v,1),"native fit Lanczos next-vector normalization failed");beta_prev=b;
   }
   const int m=static_cast<int>(alpha.size());std::vector<double> t(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i){t[static_cast<std::size_t>(i)*m+i]=alpha[i];if(i+1<m)t[static_cast<std::size_t>(i)*m+i+1]=t[static_cast<std::size_t>(i+1)*m+i]=beta[i];}
-  const SmallEigen eig=eigen_small(solver,t,m);std::vector<RitzMode> out;
-  for(int mode=0;mode<std::min(wanted,m);++mode){RitzMode r;r.value=eig.values[mode];r.vector.assign(d,0.0);
-    for(int k=0;k<m;++k){const double c=eig.vectors[static_cast<std::size_t>(k)+static_cast<std::size_t>(mode)*m];for(int i=0;i<d;++i)r.vector[i]+=c*basis[k][i];}
-    project_translation(r.vector,sqrt_atom,n);const double rnorm=std::sqrt(std::inner_product(r.vector.begin(),r.vector.end(),r.vector.begin(),0.0));if(!std::isfinite(rnorm)||!(rnorm>0.0))throw std::runtime_error("native fit Lanczos Ritz vector is non-finite or translation-only");for(double&x:r.vector)x/=rnorm;
-    r.base_action.resize(d);r.additive_action.resize(d);baseline.apply(r.vector,r.base_action);apply_additive(graph,r.vector,sqrt_mass,sqrt_atom,theta,n,r.additive_action);
-    double residual2=0.0;for(int i=0;i<d;++i){const double residual=r.base_action[i]+r.additive_action[i]-r.value*r.vector[i];residual2+=residual*residual;}
-    r.residual=std::sqrt(residual2);if(!std::isfinite(r.residual))throw std::runtime_error("native fit Lanczos actual Ritz residual is non-finite");out.push_back(std::move(r));}
+  const SmallEigen eig=eigen_small(solver,t,m,wanted);std::vector<RitzMode> out;
+  for(int mode=0;mode<static_cast<int>(eig.values.size());++mode){RitzMode r;r.value=eig.values[mode];std::vector<double> coefficients(m);for(int k=0;k<m;++k)coefficients[k]=eig.vectors[static_cast<std::size_t>(k)+static_cast<std::size_t>(mode)*m];
+    if(cudaMemcpy(workspace->coefficient,coefficients.data(),coefficients.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||cublasDgemv(baseline.blas,CUBLAS_OP_N,d,m,&one,workspace->basis,d,workspace->coefficient,1,&zero,workspace->ritz,1)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos Ritz reconstruction failed");
+    workspace->project(workspace->ritz);const double rnorm=norm(workspace->ritz);if(!std::isfinite(rnorm)||!(rnorm>0.0))throw std::runtime_error("native fit Lanczos Ritz vector is non-finite or translation-only");const double inverse_rnorm=1.0/rnorm;blas_check(cublasDscal(baseline.blas,d,&inverse_rnorm,workspace->ritz,1),"native fit Lanczos Ritz normalization failed");
+    if(baseline.apply_device(workspace->ritz,baseline.out)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos Ritz Hessian action failed");workspace->additive_action(workspace->ritz);r.base_rayleigh=dot(workspace->ritz,baseline.out);r.additive_rayleigh=dot(workspace->ritz,workspace->add);
+    axpy(one,workspace->add,baseline.out);axpy(-r.value,workspace->ritz,baseline.out);r.residual=norm(baseline.out);
+    if(!std::isfinite(r.residual)||!std::isfinite(r.base_rayleigh)||!std::isfinite(r.additive_rayleigh))throw std::runtime_error("native fit Lanczos actual Ritz residual is non-finite");r.vector.resize(d);if(cudaMemcpy(r.vector.data(),workspace->ritz,static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native fit Lanczos Ritz vector readback failed");out.push_back(std::move(r));}
   return out;
 }
 
@@ -1014,6 +1112,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     const std::size_t warm_start=qp_lambda.size();auto qp=solve_cut_qp(qr.solver,fit_svd,cut_rows,cut_rhs,options.epsilon/4.0,qp_lambda,qp_state_path,outer);qp_lambda=std::move(qp.lambda);
     trace<<"QP_PASS outer="<<outer<<" constraints="<<cut_rows.size()<<" iterations="<<qp.iterations<<" warm_start="<<warm_start<<" method="<<qp.method
       <<" polish_attempts="<<qp.polish_attempts<<" active_constraints="<<qp.active_constraints<<" polish_updates="<<qp.polish_updates<<" polish_failure_reason="<<qp.polish_failure_reason
+      <<" coordinate_seconds="<<qp.coordinate_seconds<<" polish_seconds="<<qp.polish_seconds
       <<" primal_excess="<<qp.certificate.max_primal_excess<<" complementarity="<<qp.certificate.max_complementarity
       <<" stationarity="<<qp.certificate.max_stationarity<<" lambda_change="<<qp.last_multiplier_change<<'\n';trace.flush();
     if(!trace)throw std::runtime_error("failed writing native fit QP trace: "+trace_path);
@@ -1022,12 +1121,15 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   int search_depth=std::min(96,d-3),consecutive_cg_feedback=0;
   std::vector<double> previous_low_ritz,cg_witness_seed;
   const int max_search_depth=std::min(384,d-3);
+  DeviceLanczosWorkspace lanczos_workspace;lanczos_workspace.initialize(graph,sqrt_mass,sqrt_mass_atom,max_search_depth,psize);
   auto deepen_search=[&](){if(search_depth<max_search_depth)search_depth=std::min(max_search_depth,2*search_depth);};
   for(int outer=0;outer<max_rounds;++outer){
     const int steps=std::min(search_depth,d-3);
     const std::string seed_source=!cg_witness_seed.empty()?"CG_WITNESS":(!previous_low_ritz.empty()?"LOWEST_RITZ":"FIXED_SEED");
     const std::vector<double> initial_vector=!cg_witness_seed.empty()?cg_witness_seed:previous_low_ritz;
-    auto primary_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,initial_vector);
+    const auto warm_search_started=std::chrono::steady_clock::now();
+    auto primary_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,initial_vector,&lanczos_workspace);
+    const double warm_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-warm_search_started).count();
     cg_witness_seed.clear();
     if(primary_modes.empty())throw std::runtime_error("native fit Lanczos returned no Ritz modes");
     auto record_search=[&](const std::string& source,const std::vector<RitzMode>& found){
@@ -1037,13 +1139,18 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     };
     record_search(seed_source,primary_modes);
     std::vector<RitzMode> independent_modes;
+    double independent_seconds=0.0;
     if(!initial_vector.empty()){
-      independent_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4);
+      const auto independent_search_started=std::chrono::steady_clock::now();
+      independent_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,{},&lanczos_workspace);
+      independent_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-independent_search_started).count();
       record_search("FIXED_INDEPENDENT",independent_modes);
       if(independent_modes.empty())throw std::runtime_error("native fit independent-seed Lanczos returned no Ritz modes");
     }
+    trace<<"outer "<<outer<<" SEARCH warm_seconds="<<warm_seconds<<" independent_seconds="<<independent_seconds<<'\n';trace.flush();
+    if(!trace)throw std::runtime_error("failed writing native fit search timing: "+trace_path);
     auto inspect_modes=[&](const std::vector<RitzMode>& candidates,const std::string& source,bool& observed_violation,bool& added_cut){
-      for(const auto& mode:candidates){const auto& base_mode=mode.base_action;const auto& add_mode=mode.additive_action;const double base_value=std::inner_product(mode.vector.begin(),mode.vector.end(),base_mode.begin(),0.0),rayleigh=base_value+std::inner_product(mode.vector.begin(),mode.vector.end(),add_mode.begin(),0.0);const auto row=spectral_row(graph,mode.vector,sqrt_mass,n,static_cast<int>(psize));double scale=std::max(1.0,std::abs(base_value));for(int i=0;i<static_cast<int>(psize);++i)scale+=std::abs(row[i]*theta[i]);if(!std::isfinite(base_value)||!std::isfinite(rayleigh)||!std::isfinite(scale)||!std::all_of(base_mode.begin(),base_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(add_mode.begin(),add_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: sampled Ritz evidence is non-finite");const double mode_tolerance=std::min(options.epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);if(rayleigh>=options.epsilon-mode_tolerance)continue;observed_violation=true;added_cut|=add_cut(mode.vector,base_value,outer,("RITZ_"+source).c_str());}
+      for(const auto& mode:candidates){const double base_value=mode.base_rayleigh,rayleigh=base_value+mode.additive_rayleigh;const auto row=spectral_row(graph,mode.vector,sqrt_mass,n,static_cast<int>(psize));double scale=std::max(1.0,std::abs(base_value));for(int i=0;i<static_cast<int>(psize);++i)scale+=std::abs(row[i]*theta[i]);if(!std::isfinite(base_value)||!std::isfinite(mode.additive_rayleigh)||!std::isfinite(rayleigh)||!std::isfinite(scale)||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: sampled Ritz evidence is non-finite");const double mode_tolerance=std::min(options.epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);if(rayleigh>=options.epsilon-mode_tolerance)continue;observed_violation=true;added_cut|=add_cut(mode.vector,base_value,outer,("RITZ_"+source).c_str());}
     };
     bool observed_violation=false,added_cut=false;
     inspect_modes(primary_modes,seed_source,observed_violation,added_cut);
@@ -1069,7 +1176,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     trace<<"outer "<<outer<<" cg_feedback "<<response.witness.classification<<" probe "<<response.witness.probe<<" iteration "<<response.witness.iteration<<" rayleigh "<<response.witness.rayleigh<<" lanczos_steps "<<steps<<" next_lanczos_steps "<<search_depth<<" consecutive_cg_feedback "<<consecutive_cg_feedback<<" constraints "<<cut_rows.size()<<" status RETRY ";write_response_stats(trace,response);trace<<'\n';trace.flush();
     if(outer==max_rounds-1)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted "+std::to_string(max_rounds)+" rounds");theta=solve_qp_and_trace(outer);
   }
-  if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within "+std::to_string(max_rounds)+" rounds");
+  if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within "+std::to_string(max_rounds)+" rounds");lanczos_workspace.release();
   double compressed_residual2=discarded2;for(int i=0;i<static_cast<int>(psize);++i){double v=-z[i];for(int j=i;j<static_cast<int>(psize);++j)v+=rmat[static_cast<std::size_t>(i)*psize+j]*theta[j];compressed_residual2+=v*v;}
   if(!std::isfinite(compressed_residual2)||!std::isfinite(training_force2)||training_force2<0.0)throw std::runtime_error("native fit training force residual is non-finite");const double training_force_residual=training_force2>0.0?std::sqrt(compressed_residual2/training_force2):(compressed_residual2==0.0?0.0:std::numeric_limits<double>::infinity());if(!std::isfinite(training_force_residual))throw std::runtime_error("native fit training residual is nonzero at zero physical-force scale");
   if(response.response>options.response_tolerance||response.ibp>options.response_tolerance)

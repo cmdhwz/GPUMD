@@ -85,7 +85,8 @@ assert "generate_raw&&std::remove(generated_raw_path.c_str())" in native_fit
 assert "options.raw_input_path.empty()?generated_raw_path:options.raw_input_path" in native_fit
 assert '#include "force/nep_charge.cuh"' in native_fit
 assert 'record_search("FIXED_INDEPENDENT"' in native_fit
-assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4)' in native_fit
+assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,initial_vector,&lanczos_workspace)' in native_fit
+assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,{},&lanczos_workspace)' in native_fit
 assert "write_response_stats(trace,response_progress)" in native_fit
 assert "observed_cov_condition" in native_fit and "predicted_cov_condition" in native_fit
 assert "candidate_direction_original_mass_weighted" in source("src/measure/rpmd_ja_qnep_prepare.cu")
@@ -117,10 +118,27 @@ assert "if(da){cudaFree(da);da=nullptr;}" in active_svd and "if(info){cudaFree(i
 assert "rounded_alpha" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "rounded_exit.accepted" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "dimension_rank_failure.failure_reason" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
-assert "first_polish_iteration=4096" in native_fit and "max_iterations=200000" in native_fit
-assert "result.polish_attempts<2" in native_fit and "4*(m+static_cast<std::size_t>(svd.p))" in native_fit
+assert "first_polish_iteration=64,retry_polish_iteration=4096" in native_fit and "max_iterations=200000" in native_fit
+assert "result.polish_attempts<3" in native_fit and "4*(m+static_cast<std::size_t>(svd.p))" in native_fit
 assert 'method="active_set_polish"' in native_fit and '<<" polish_attempts="' in native_fit
 assert "polish_failure_reason" in native_fit and "ACTIVE_FULL_KKT_NOT_ACCEPTED" in native_fit
+assert '<<" coordinate_seconds="<<qp.coordinate_seconds<<" polish_seconds="<<qp.polish_seconds' in native_fit
+assert ' SEARCH warm_seconds=' in native_fit and 'independent_seconds=' in native_fit
+assert 'const int max_search_depth=std::min(384,d-3);' in native_fit
+assert 'DeviceLanczosWorkspace lanczos_workspace;lanczos_workspace.initialize(graph,sqrt_mass,sqrt_mass_atom,max_search_depth,psize);' in native_fit
+assert 'lanczos_translation_coefficients<<<3,256>>>' in native_fit and 'lanczos_additive_action<<<' in native_fit
+assert 'for(int pass=0;pass<2;++pass)' in native_fit and 'CUBLAS_OP_T,d,k+1' in native_fit and 'CUBLAS_OP_N,d,k+1' in native_fit
+assert 'r.residual=norm(baseline.out)' in native_fit and 'cudaMemcpy(r.vector.data(),workspace->ritz' in native_fit
+assert 'eigen_small(solver,t,m,wanted)' in native_fit and 'out.vectors.resize(static_cast<std::size_t>(n)*returned)' in native_fit
+cuda_test = source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert 'check_close(modes[k].residual,std::sqrt(residual2),2e-7)' in cuda_test
+assert 'check_close(std::inner_product(v.begin(),v.end(),modes[prior].vector.begin(),0.0),0.0,2e-7)' in cuda_test
+assert 'check_close(modes[k].value,exact.values[k],2e-7)' in cuda_test
+assert 'workspace.initialize(graph,sqrt_mass,sqrt_atom,8,0)' in cuda_test
+assert 'qp_state.find("polish_attempts 3")' in cuda_test
+assert 'replay.iterations==64&&replay.polish_attempts==1' in cuda_test
+assert 'replay.iterations==4096&&replay.polish_attempts==2' in cuda_test
+assert 'replay.iterations==200000&&replay.polish_attempts==3' in cuda_test
 assert (ROOT / "tests/data/ja_reference_resample.bin.qp_state.txt").stat().st_size > 1_000_000
 assert "options.max_stability_rounds<=0" in native_fit
 assert "const int max_rounds=options.max_stability_rounds;" in native_fit

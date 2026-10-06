@@ -366,7 +366,7 @@ void test_padded_qr_svd_and_cut_qp(cusolverDnHandle_t solver)
   const std::string qp_state((std::istreambuf_iterator<char>(qp_state_file)),std::istreambuf_iterator<char>());
   assert(qp_state.find("outer_index 7")!=std::string::npos);
   assert(qp_state.find("iterations 200000")!=std::string::npos);
-  assert(qp_state.find("method coordinate")!=std::string::npos&&qp_state.find("polish_attempts 2")!=std::string::npos);
+  assert(qp_state.find("method coordinate")!=std::string::npos&&qp_state.find("polish_attempts 3")!=std::string::npos);
   assert(qp_state.find("active_constraints ")!=std::string::npos&&qp_state.find("polish_updates ")!=std::string::npos&&qp_state.find("polish_failure_reason ACTIVE_")!=std::string::npos);
   assert(qp_state.find("primal_tolerance 1e-08")!=std::string::npos);
   assert(qp_state.find("svd_singular")!=std::string::npos&&qp_state.find("svd_vt")!=std::string::npos&&qp_state.find("svd_eta")!=std::string::npos);
@@ -432,7 +432,9 @@ void test_active_set_qp_snapshot_and_rejection(cusolverDnHandle_t solver)
   std::string fixture_path="tests/data/ja_reference_resample.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
   const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);
   const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
-  assert(replay.method==std::string("active_set_polish"));assert(replay.iterations==4096&&replay.polish_attempts==1&&replay.polish_updates>0);
+  assert(replay.method==std::string("active_set_polish"));
+  assert(((replay.iterations==64&&replay.polish_attempts==1)||(replay.iterations==4096&&replay.polish_attempts==2)||
+    (replay.iterations==200000&&replay.polish_attempts==3))&&replay.polish_updates>0);
   assert(replay.certificate.accepted&&replay.certificate.primal_constraints_pass&&replay.certificate.finite);
   assert(replay.certificate.primal_slack.size()==233&&replay.lambda.size()==233&&replay.certificate.max_primal_excess==0.0);
   assert(replay.certificate.max_complementarity<=qp_complementarity_tolerance&&replay.certificate.max_stationarity<=qp_stationarity_tolerance);
@@ -473,45 +475,53 @@ void test_read_frame_rejects_invalid_data()
   }
 }
 
-std::vector<std::vector<double>> internal_basis(const int n)
+std::vector<std::vector<double>> internal_basis(const std::vector<double>& sqrt_atom)
 {
-  const int d=3*n;std::vector<double> sqrt_atom(n,1.0);std::vector<std::vector<double>> basis;
+  const int n=static_cast<int>(sqrt_atom.size()),d=3*n;std::vector<std::vector<double>> basis;
   for(int i=0;i<d&&basis.size()<static_cast<std::size_t>(d-3);++i){std::vector<double> v(d,0.0);v[i]=1.0;project_translation(v,sqrt_atom,n);
     for(const auto& u:basis){const double dot=std::inner_product(v.begin(),v.end(),u.begin(),0.0);for(int k=0;k<d;++k)v[k]-=dot*u[k];}
     const double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(norm>1e-10){for(double& x:v)x/=norm;basis.push_back(std::move(v));}}
   assert(basis.size()==static_cast<std::size_t>(d-3));return basis;
 }
 
+std::vector<std::vector<double>> internal_basis(const int n){return internal_basis(std::vector<double>(n,1.0));}
+
 void test_lanczos_finite_internal_space(cusolverDnHandle_t solver)
 {
   for(const int n:{2,3}){
-    const int d=3*n;const auto basis=internal_basis(n);const int internal=static_cast<int>(basis.size());
-    const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);Graph graph;
+    const int d=3*n;std::vector<double> masses(n),sqrt_atom(n),sqrt_mass(d);for(int i=0;i<n;++i){masses[i]=i+1.0;sqrt_atom[i]=std::sqrt(masses[i]);}for(int axis=0;axis<3;++axis)for(int i=0;i<n;++i)sqrt_mass[axis*n+i]=sqrt_atom[i];
+    const auto basis=internal_basis(sqrt_atom);const int internal=static_cast<int>(basis.size());Graph graph;graph.edges.push_back({0,1,0,{0,0,0}});
+    const std::vector<double> theta={0.2,0.03,-0.02,0.25,0.04,0.3};
     for(const double scale:{1.0,1.0e4,1.0e8}){
       std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);
       for(int k=0;k<internal;++k)for(int i=0;i<d;++i)for(int j=0;j<d;++j)
-        raw[static_cast<std::size_t>(i)*d+j]+=scale*(k+1)*basis[k][i]*basis[k][j];
+        raw[static_cast<std::size_t>(i)*d+j]+=scale*(k+1)*basis[k][i]*basis[k][j]*sqrt_mass[i]*sqrt_mass[j];
       std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);
       stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));stream.seekg(0);
       DeviceBaseline baseline;baseline.initialize(stream,0,d,n,masses,sqrt_mass);
       std::vector<double> restricted(static_cast<std::size_t>(internal)*internal);
-      for(int j=0;j<internal;++j){std::vector<double> product(d);baseline.apply(basis[j],product);
+      for(int j=0;j<internal;++j){std::vector<double> product(d),add(d);baseline.apply(basis[j],product);apply_additive(graph,basis[j],sqrt_mass,sqrt_atom,theta,n,add);
+        for(int q=0;q<d;++q)product[q]+=add[q];
         for(int i=0;i<internal;++i)restricted[static_cast<std::size_t>(i)*internal+j]=
           std::inner_product(basis[i].begin(),basis[i].end(),product.begin(),0.0);}
       const SmallEigen exact=eigen_small(solver,restricted,internal);
-      const auto modes=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,96,4);
+      const auto modes=lanczos_low_modes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,n,96,4);
       assert(modes.size()==static_cast<std::size_t>(std::min(4,internal)));
       for(int k=0;k<static_cast<int>(modes.size());++k){
         const auto& v=modes[k].vector;double norm2=0.0;
         for(double x:v)norm2+=x*x;
         check_close(norm2,1.0,2e-8);
-        for(int axis=0;axis<3;++axis){double translation=0.0;for(int i=0;i<n;++i)translation+=v[axis*n+i];assert(std::abs(translation)<2e-10);}
-        std::vector<double> product(d);baseline.apply(v,product);
+        for(int axis=0;axis<3;++axis){double translation=0.0;for(int i=0;i<n;++i)translation+=sqrt_atom[i]*v[axis*n+i];assert(std::abs(translation)<2e-10);}
+        for(int prior=0;prior<k;++prior)check_close(std::inner_product(v.begin(),v.end(),modes[prior].vector.begin(),0.0),0.0,2e-7);
+        std::vector<double> product(d),add(d);baseline.apply(v,product);const double base_rayleigh=std::inner_product(v.begin(),v.end(),product.begin(),0.0);apply_additive(graph,v,sqrt_mass,sqrt_atom,theta,n,add);
+        double residual2=0.0;for(int i=0;i<d;++i){product[i]+=add[i];const double residual=product[i]-modes[k].value*v[i];residual2+=residual*residual;}
+        check_close(modes[k].residual,std::sqrt(residual2),2e-7);
         const double rayleigh=std::inner_product(v.begin(),v.end(),product.begin(),0.0);
+        check_close(modes[k].base_rayleigh,base_rayleigh,2e-7);
+        check_close(modes[k].additive_rayleigh,rayleigh-base_rayleigh,2e-7);
         check_close(rayleigh,modes[k].value,2e-7);
         check_close(modes[k].value,exact.values[k],2e-7);
       }
-      for(int k=0;k<static_cast<int>(modes.size());++k)check_close(exact.values[k],scale*(k+1),2e-8);
     }
   }
 }
@@ -542,7 +552,8 @@ void test_lanczos_independent_seed_escapes_invariant_subspace(cusolverDnHandle_t
   constexpr int n=2,d=6;const auto basis=internal_basis(n);const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> raw(d*d,0.0);
   const double eigenvalues[3]={1.0,-2.0,3.0};for(int k=0;k<3;++k)for(int i=0;i<d;++i)for(int j=0;j<d;++j)raw[static_cast<std::size_t>(i)*d+j]+=eigenvalues[k]*basis[k][i]*basis[k][j];
   std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));stream.seekg(0);DeviceBaseline baseline;baseline.initialize(stream,0,d,n,masses,sqrt_mass);Graph graph;
-  const auto warm=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,basis[0]);const auto independent=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3);
+  DeviceLanczosWorkspace workspace;workspace.initialize(graph,sqrt_mass,sqrt_atom,8,0);
+  const auto warm=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,basis[0],&workspace);const auto independent=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,{},&workspace);
   assert(warm.size()==1&&warm.front().residual<1e-12);check_close(warm.front().value,1.0,1e-12);assert(independent.front().value<-1.99&&independent.front().residual<1e-10);
 }
 
