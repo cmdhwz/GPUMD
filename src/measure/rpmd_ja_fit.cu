@@ -161,7 +161,8 @@ void RpmdJA_Fit::pre_run(
   }
   const std::string outputs[] = {output_path_, spool_path_, output_path_ + ".stability",
     output_path_ + ".qraw", output_path_ + ".additive.tmp", output_path_ + ".fit.txt",
-    output_path_ + ".fit.txt.tmp", output_path_ + ".failure.txt", output_path_ + ".tmp",
+    output_path_ + ".fit.txt.tmp", output_path_ + ".fit_trace.txt", output_path_ + ".cg_witness.txt",
+    output_path_ + ".failure.txt", output_path_ + ".tmp",
     output_path_ + ".stability.tmp"};
   for (const auto& path : outputs) {
     if (file_exists(path)) PRINT_INPUT_ERROR("rpmd_ja fit will not overwrite an existing output or temporary file.");
