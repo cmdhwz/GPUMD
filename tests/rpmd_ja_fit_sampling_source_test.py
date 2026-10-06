@@ -23,6 +23,31 @@ assert "tokens, number_of_types, integrate, group, atom, box, force, first_poten
 assert "rpmd_ja fit requires a fixed integration time step" in run
 assert "rpmd_ja fit currently supports exactly one qNEP potential in charge mode 1 or 2 with PPPM" in run
 assert 'tokens[1] == "fit"' in measure and "new RpmdJA_Fit(tokens)" in measure
+assert 'if (tokens[1] == "check_samples")' in run
+assert 'check_rpmd_ja_native_fit_samples(tokens[2], tokens[3], atom, box)' in run
+assert "void check_rpmd_ja_native_fit_samples(" in native_header
+check_samples_start = native_fit.index("void check_rpmd_ja_native_fit_samples(")
+check_samples_end = native_fit.index("#else", check_samples_start)
+check_samples_body = native_fit[check_samples_start:check_samples_end]
+assert "read_header(in,0,atom,box,0.0,true)" in check_samples_body
+assert "read_training_r0" in check_samples_body and "validate_fit_branches" in check_samples_body
+assert "collect_fixed_probe_statistics" in check_samples_body and "format_fixed_probe_report" in check_samples_body
+assert "qraw" not in check_samples_body and "make_graph" not in check_samples_body and "lanczos" not in check_samples_body
+assert "cannot replace final response validation" in native_fit
+assert "ProbeMoments" in native_fit and "moments.ibp_matrix" in native_fit
+assert "moments.covariance_fq()" in native_fit and "lag_autocorrelation lags=1,2,5,10" in native_fit
+assert "std::vector<std::vector<double>> history" in native_fit and "history.size()>10" in native_fit
+assert "if(collect_lags){result.lags[0].add(qp)" in native_fit
+assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0);" in native_fit
+assert "collect_fixed_probe_statistics(in,header,header.frame_count,train,r0,true)" in native_fit
+assert "probe_sample_status" in native_fit and "INSUFFICIENT_SAMPLES" in native_fit
+assert "collect_fixed_probe_statistics(in,header,frame_count" in native_fit
+assert 'response_state_path=options.output_path+".response_state.txt"' in native_fit
+assert "write_response_state(response_state_path,response,theta" in native_fit
+assert "response_probe_basis_coefficients(invroot,re.vectors,m,worst_response)" in native_fit
+assert '"IBP_residual_nonsymmetric"' in native_fit and '"whitened_response_difference"' in native_fit
+assert "worst_IBP_right_singular_probe_basis_coefficients (from eigenvector of E^T E)" in native_fit
+assert 'std::fopen(path.c_str(),"wx")' in native_fit
 
 force_call = run.index("compute_force();", run.index("for (int step = 0; step < number_of_steps"))
 sample_call = run.index("measure.post_force(", force_call)
@@ -95,7 +120,7 @@ assert 'preserve_candidate_package_on_full_spd_failure(e.what(),own_scratch.pack
 assert 'qNEP translation-complement Hessian is not positive definite' in source("src/measure/rpmd_ja_qnep_prepare.cu")
 assert 'qNEP translation-complement Hessian is not positive definite' in native_fit
 assert 'std::sort(modes.begin(),modes.end()' in native_fit
-assert 'low_mode_probes<4' in native_fit and 'if(add(soft[i].vector))++low_mode_probes' in native_fit
+assert 'low_mode_probes<4' in native_fit and 'if(add(soft[i].vector,"LOW_RITZ"))++low_mode_probes' in native_fit
 assert 'observed_cov_status=' in native_fit and 'predicted_cov_status=' in native_fit
 assert 'response_ibp_status=' in native_fit and 'NOT_COMPUTED' in native_fit
 spectral_start = native_fit.index("std::vector<double> spectral_row(")
@@ -106,6 +131,9 @@ assert "test_fit_samples_entry_preserves_inputs" in source("tests/rpmd_ja_native
 assert "test_full_spd_failure_keeps_candidate_pack" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_response_uncomputed_values_are_explicit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_probe_moments_centering_and_small_segments" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_check_samples_is_read_only" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_response_snapshot_preserves_recomputable_matrices" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_active_set_qp_snapshot_and_rejection" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "tests/data/ja_reference_resample.bin.qp_state.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "solve_active_equalities" in native_fit and "cusolverDnDgesvd(solver,'S','S',p,n" in native_fit

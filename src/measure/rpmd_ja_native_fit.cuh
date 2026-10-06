@@ -44,3 +44,9 @@ void diagnose_rpmd_ja_native_fit_samples(
   Box& box,
   Force& force,
   bool full = false);
+
+void check_rpmd_ja_native_fit_samples(
+  const std::string& spool_path,
+  const std::string& report_path,
+  Atom& atom,
+  Box& box);

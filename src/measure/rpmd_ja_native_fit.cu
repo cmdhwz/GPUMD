@@ -826,14 +826,147 @@ CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const st
 }
 
 std::vector<std::vector<double>> make_probes(const std::vector<RitzMode>& soft,const std::vector<double>& sqrt_mass,
-  const std::vector<int>& types,const int n)
+  const std::vector<int>& types,const int n,std::vector<std::string>* sources=nullptr)
 {
   const int d=3*n,internal=d-3;std::vector<std::vector<double>> probes;probes.reserve(std::min(24,internal));std::uint64_t state=0x243f6a8885a308d3ULL;
-  auto add=[&](std::vector<double> v){project_translation(v,sqrt_mass,n);for(const auto&w:probes){const double c=std::inner_product(v.begin(),v.end(),w.begin(),0.0);for(int i=0;i<d;++i)v[i]-=c*w[i];}const double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(norm>1e-10){for(double&x:v)x/=norm;probes.push_back(std::move(v));return true;}return false;};
-  for(int k=0;k<std::min(16,internal);++k){std::vector<double> v(d);for(double&x:v){state^=state>>12;state^=state<<25;state^=state>>27;x=(static_cast<double>((state*2685821657736338717ULL)>>11)/9007199254740992.0)-0.5;}add(std::move(v));}
-  std::set<int> seen_types;for(int atom=0;atom<n&&seen_types.size()<4&&static_cast<int>(probes.size())<internal;++atom)if(seen_types.insert(types[atom]).second){std::vector<double> v(d);for(int a=0;a<3;++a)v[a*n+atom]=sqrt_mass[atom];add(std::move(v));}
-  int low_mode_probes=0;for(std::size_t i=0;i<soft.size()&&low_mode_probes<4&&static_cast<int>(probes.size())<internal;++i)if(add(soft[i].vector))++low_mode_probes;
+  auto add=[&](std::vector<double> v,const char* source){project_translation(v,sqrt_mass,n);for(const auto&w:probes){const double c=std::inner_product(v.begin(),v.end(),w.begin(),0.0);for(int i=0;i<d;++i)v[i]-=c*w[i];}const double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(norm>1e-10){for(double&x:v)x/=norm;probes.push_back(std::move(v));if(sources)sources->emplace_back(source);return true;}return false;};
+  for(int k=0;k<std::min(16,internal);++k){std::vector<double> v(d);for(double&x:v){state^=state>>12;state^=state<<25;state^=state>>27;x=(static_cast<double>((state*2685821657736338717ULL)>>11)/9007199254740992.0)-0.5;}add(std::move(v),"FIXED_RANDOM");}
+  std::set<int> seen_types;for(int atom=0;atom<n&&seen_types.size()<4&&static_cast<int>(probes.size())<internal;++atom)if(seen_types.insert(types[atom]).second){std::vector<double> v(d);for(int a=0;a<3;++a)v[a*n+atom]=sqrt_mass[atom];add(std::move(v),"TYPE_LOCAL");}
+  int low_mode_probes=0;for(std::size_t i=0;i<soft.size()&&low_mode_probes<4&&static_cast<int>(probes.size())<internal;++i)if(add(soft[i].vector,"LOW_RITZ"))++low_mode_probes;
   if(probes.empty())throw std::runtime_error("native fit could not construct an independent response probe");return probes;
+}
+
+struct ProbeMoments
+{
+  int m=0;
+  std::uint64_t frames=0;
+  std::vector<double> sum_q,sum_f,sum_qq,sum_fq;
+  explicit ProbeMoments(const int count=0):m(count),sum_q(count,0.0),sum_f(count,0.0),sum_qq(static_cast<std::size_t>(count)*count,0.0),sum_fq(sum_qq.size(),0.0){}
+  void add(const std::vector<double>& q,const std::vector<double>& f)
+  {
+    ++frames;
+    for(int i=0;i<m;++i){sum_q[i]+=q[i];sum_f[i]+=f[i];}
+    for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;sum_qq[ij]+=q[i]*q[j];sum_fq[ij]+=f[i]*q[j];}
+  }
+  std::vector<double> covariance_q() const
+  {
+    std::vector<double> out(sum_qq.size());if(!frames)return out;const double count=static_cast<double>(frames);
+    for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;out[ij]=sum_qq[ij]/count-(sum_q[i]/count)*(sum_q[j]/count);}return out;
+  }
+  std::vector<double> covariance_fq() const
+  {
+    std::vector<double> out(sum_fq.size());if(!frames)return out;const double count=static_cast<double>(frames);
+    for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;out[ij]=sum_fq[ij]/count-(sum_f[i]/count)*(sum_q[j]/count);}return out;
+  }
+  std::vector<double> ibp_matrix(const double kbt) const
+  {
+    std::vector<double> out(sum_fq.size());if(!frames)return out;const double count=static_cast<double>(frames);
+    for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;out[ij]=sum_fq[ij]/(count*kbt)-(sum_f[i]/count)*(sum_q[j]/count)/kbt+(i==j?1.0:0.0);}return out;
+  }
+};
+
+struct FixedProbeStatistics
+{
+  std::vector<std::vector<double>> probes;
+  std::vector<std::string> sources;
+  std::vector<ProbeMoments> segments;
+  struct LagMoments
+  {
+    std::array<int,4> lag_steps{{1,2,5,10}};
+    int m=0;
+    std::array<std::uint64_t,4> pairs{};
+    std::vector<double> sum_product,sum_current,sum_previous;
+    std::vector<std::vector<double>> history;
+    explicit LagMoments(const int count=0):m(count),sum_product(static_cast<std::size_t>(4)*count,0.0),sum_current(sum_product.size(),0.0),sum_previous(sum_product.size(),0.0){}
+    void add(const std::vector<double>& q)
+    {
+      for(int k=0;k<4;++k)if(history.size()>=static_cast<std::size_t>(lag_steps[k])){
+        const auto& previous=history[history.size()-lag_steps[k]];++pairs[k];
+        for(int i=0;i<m;++i){const std::size_t ik=static_cast<std::size_t>(k)*m+i;sum_product[ik]+=q[i]*previous[i];sum_current[ik]+=q[i];sum_previous[ik]+=previous[i];}
+      }
+      history.push_back(q);if(history.size()>10)history.erase(history.begin());
+    }
+    std::array<double,4> autocorrelation(const ProbeMoments& moments,const std::vector<double>& covariance,const int probe) const
+    {
+      std::array<double,4> result;result.fill(std::numeric_limits<double>::quiet_NaN());const double variance=covariance[static_cast<std::size_t>(probe)*m+probe];
+      if(!(variance>0.0)||!moments.frames)return result;const double mean=moments.sum_q[probe]/static_cast<double>(moments.frames);
+      for(int k=0;k<4;++k)if(pairs[k]){const double count=static_cast<double>(pairs[k]);const std::size_t ik=static_cast<std::size_t>(k)*m+probe;const double lag_covariance=sum_product[ik]/count-mean*(sum_current[ik]+sum_previous[ik])/count+mean*mean;result[k]=lag_covariance/variance;}
+      return result;
+    }
+  };
+  std::vector<LagMoments> lags;
+};
+
+FixedProbeStatistics collect_fixed_probe_statistics(std::istream& spool,const SampleHeader& header,
+  const std::uint64_t frames,const std::uint64_t train,const std::vector<double>& r0,const bool collect_lags=false)
+{
+  const int n=header.n,d=3*n;std::vector<double> sqrt_atom(n),sqrt_mass(d);
+  for(int i=0;i<n;++i){sqrt_atom[i]=std::sqrt(header.masses[i]);for(int a=0;a<3;++a)sqrt_mass[a*n+i]=sqrt_atom[i];}
+  FixedProbeStatistics result;result.probes=make_probes({},sqrt_atom,header.types,n,&result.sources);const int m=static_cast<int>(result.probes.size());
+  result.segments.reserve(7);for(int i=0;i<7;++i)result.segments.emplace_back(m);if(collect_lags){result.lags.reserve(7);for(int i=0;i<7;++i)result.lags.emplace_back(m);}
+  std::vector<double> x(d),force(d),q(d),f(d);std::vector<double> qp(m),fp(m);spool.clear();spool.seekg(header.frames);
+  for(std::uint64_t frame=0;frame<frames;++frame){double step=0.0;read_frame(spool,x,force,step);
+    for(int i=0;i<d;++i){q[i]=sqrt_mass[i]*(x[i]-r0[i]);f[i]=force[i]/sqrt_mass[i];}
+    project_translation(q,sqrt_atom,n);project_translation(f,sqrt_atom,n);
+    for(int p=0;p<m;++p){qp[p]=std::inner_product(result.probes[p].begin(),result.probes[p].end(),q.begin(),0.0);fp[p]=std::inner_product(result.probes[p].begin(),result.probes[p].end(),f.begin(),0.0);}
+    const int block=std::min(3,static_cast<int>(frame*4/frames));const int train_segment=frame<train?1:2;
+    result.segments[0].add(qp,fp);result.segments[train_segment].add(qp,fp);result.segments[3+block].add(qp,fp);
+    if(collect_lags){result.lags[0].add(qp);result.lags[train_segment].add(qp);result.lags[3+block].add(qp);}
+  }
+  return result;
+}
+
+const char* probe_sample_status(const std::uint64_t frames,const int probes)
+{return frames<=static_cast<std::uint64_t>(probes)?"INSUFFICIENT_SAMPLES":"INCONCLUSIVE";}
+
+double ibp_max_abs(const ProbeMoments& moments,const double kbt)
+{double maximum=0.0;for(double value:moments.ibp_matrix(kbt))maximum=std::max(maximum,std::abs(value));return maximum;}
+
+void write_matrix(std::ostream& out,const char* name,const std::vector<double>& matrix,const int n)
+{
+  out<<name<<"\n"<<std::setprecision(17);for(int i=0;i<n;++i){for(int j=0;j<n;++j)out<<(j?" ":"")<<matrix[static_cast<std::size_t>(i)*n+j];out<<'\n';}
+}
+
+void write_text_exclusive(const std::string& path,const std::string& contents,const char* description)
+{
+  std::FILE* file=std::fopen(path.c_str(),"wx");if(!file)throw std::runtime_error(std::string("cannot create ")+description+" without overwriting existing evidence: "+path);
+  const std::size_t written=std::fwrite(contents.data(),1,contents.size(),file);const int close_status=std::fclose(file);const bool failed=written!=contents.size()||close_status!=0;
+  if(failed){std::remove(path.c_str());throw std::runtime_error(std::string("failed writing ")+description+": "+path);}
+}
+
+void print_fixed_probe_summary(const FixedProbeStatistics& stats,const SampleHeader& header,const double interval,
+  const std::uint64_t train)
+{
+  const double kbt=K_B*header.temperature;const ProbeMoments& tr=stats.segments[1];const ProbeMoments& va=stats.segments[2];
+  const auto tr_cov=tr.covariance_q(),va_cov=va.covariance_q();double variance_delta=0.0;
+  for(int i=0;i<tr.m;++i){const double a=tr_cov[static_cast<std::size_t>(i)*tr.m+i],b=va_cov[static_cast<std::size_t>(i)*tr.m+i];variance_delta=std::max(variance_delta,a>0.0?std::abs(b/a-1.0):std::numeric_limits<double>::infinity());}
+  std::printf("SAMPLE_STATISTICS: frames=%llu train=%llu validation=%llu P=%d T=%.9g K interval=%.9g probes=%d\n",
+    static_cast<unsigned long long>(header.frame_count),static_cast<unsigned long long>(train),static_cast<unsigned long long>(header.frame_count-train),header.beads,header.temperature,interval,tr.m);
+  std::printf("fixed-probe IBP max_abs_entry: all=%.6g train=%.6g validation=%.6g\n",ibp_max_abs(stats.segments[0],kbt),ibp_max_abs(tr,kbt),ibp_max_abs(va,kbt));
+  std::printf("train/validation variance comparison: max_relative_delta=%.6g; sampling evidence: INCONCLUSIVE (diagnostic only)\n",variance_delta);
+}
+
+std::string format_fixed_probe_report(const FixedProbeStatistics& stats,const SampleHeader& header,const double interval,
+  const std::uint64_t train)
+{
+  const int m=static_cast<int>(stats.probes.size());const double kbt=K_B*header.temperature;const char* names[]={"all","train","validation","block0","block1","block2","block3"};
+  std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja fixed-probe sample statistics\nframes "<<header.frame_count<<"\ntrain_frames "<<train<<"\nvalidation_frames "<<header.frame_count-train
+    <<"\nbeads "<<header.beads<<"\ntemperature_K "<<header.temperature<<"\nsample_interval "<<interval<<"\nprobe_count "<<m
+    <<"\nprobe_policy fixed random plus type-local only\nLIMITATION: excludes the four low-frequency Ritz probes generated during fitting; this report cannot replace final response validation.\n"
+    <<"IBP definition: Cov(f_probe,q_probe)/(kB*T)+I; each segment uses its own means.\n";
+  for(int s=0;s<7;++s){const ProbeMoments& moments=stats.segments[s];const auto cov=moments.covariance_q(),ibp=moments.ibp_matrix(kbt);
+    out<<"\nSEGMENT "<<names[s]<<" frames="<<moments.frames<<" status="<<probe_sample_status(moments.frames,m)<<'\n';
+    out<<"probe index source mean_q_probe variance_q_probe mean_f_probe ibp_diagonal\n";
+    for(int i=0;i<m;++i){const double count=static_cast<double>(moments.frames);out<<i<<' '<<stats.sources[i]<<' '<<(moments.frames?moments.sum_q[i]/count:0.0)<<' '<<cov[static_cast<std::size_t>(i)*m+i]<<' '<<(moments.frames?moments.sum_f[i]/count:0.0)<<' '<<ibp[static_cast<std::size_t>(i)*m+i]<<'\n';}
+    write_matrix(out,"displacement_covariance",cov,m);write_matrix(out,"force_displacement_covariance",moments.covariance_fq(),m);
+    write_matrix(out,"IBP_residual",ibp,m);
+    out<<"lag_autocorrelation lags=1,2,5,10\n";
+    for(int i=0;i<m;++i){out<<i;for(double rho:stats.lags[s].autocorrelation(moments,cov,i))out<<' '<<rho;out<<'\n';}
+  }
+  const auto overall=stats.segments[0].covariance_q();
+  out<<"\nblock_variance_relative_delta_vs_all\nprobe";for(int b=0;b<4;++b)out<<" block"<<b;out<<'\n';
+  for(int i=0;i<m;++i){out<<i;for(int b=0;b<4;++b){const auto cov=stats.segments[3+b].covariance_q();const double base=overall[static_cast<std::size_t>(i)*m+i],value=cov[static_cast<std::size_t>(i)*m+i];out<<' '<<(base>0.0?value/base-1.0:std::numeric_limits<double>::infinity());}out<<'\n';}
+  return out.str();
 }
 
 struct ResponseCheck{
@@ -843,11 +976,21 @@ struct ResponseCheck{
   double block_variance_max_relative_delta=std::numeric_limits<double>::quiet_NaN();
   std::array<double,4> block_variance_relative_delta={std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN()};
   std::array<int,4> block_frames{};
-  std::uint64_t validation_frames=0;
+  std::uint64_t total_frames=0,validation_frames=0;
   int probes=0,cg_residual_restarts=0;
   bool observed_cov_available=false,predicted_cov_available=false,cg_residual_available=false,response_ibp_available=false,force_residual_available=false;
+  std::vector<std::string> probe_sources;
+  std::vector<double> observed_matrix,predicted_matrix,ibp_matrix,whitened_matrix,worst_response_coefficients,worst_ibp_coefficients;
   CGWitness witness;
 };
+std::vector<double> response_probe_basis_coefficients(const std::vector<double>& invroot,
+  const std::vector<double>& whitened_eigenvectors,const int m,const int eigenvector)
+{
+  std::vector<double> coefficients(m,0.0);
+  for(int i=0;i<m;++i)for(int j=0;j<m;++j)
+    coefficients[i]+=invroot[static_cast<std::size_t>(i)*m+j]*whitened_eigenvectors[static_cast<std::size_t>(j)+static_cast<std::size_t>(eigenvector)*m];
+  return coefficients;
+}
 void write_response_stats(std::ostream& out,const ResponseCheck& r)
 {
   out<<"validation_frames="<<r.validation_frames<<" probes="<<r.probes
@@ -868,22 +1011,20 @@ ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline
   const std::vector<double>& r0,std::ifstream& spool,const std::streamoff frame_start,const std::uint64_t frame_count,const int train,
   const int sample_interval,const double temperature,const std::vector<RitzMode>& soft,const double epsilon=0.0,ResponseCheck* progress=nullptr)
 {
-  const int d=3*n;const auto probes=make_probes(soft,sqrt_atom,types,n);const int m=static_cast<int>(probes.size());ResponseCheck result;result.probes=m;
+  const int d=3*n;std::vector<std::string> probe_sources;const auto probes=make_probes(soft,sqrt_atom,types,n,&probe_sources);const int m=static_cast<int>(probes.size());ResponseCheck result;result.probes=m;result.probe_sources=probe_sources;
   if(frame_count<static_cast<std::uint64_t>(train))throw std::runtime_error("native fit held-out frame count is invalid");
-  result.validation_frames=frame_count-train;if(progress)*progress=result;
+  result.total_frames=frame_count;result.validation_frames=frame_count-train;if(progress)*progress=result;
   if(result.validation_frames<=static_cast<std::uint64_t>(m))throw std::runtime_error("native fit held-out frames must exceed the fixed probe count");
   std::vector<double> predicted(static_cast<std::size_t>(m)*m),rhs(d);double max_cg=0.0;
   for(int j=0;j<m;++j){const CGResult cg=solve_projected_cg(baseline,graph,probes[j],sqrt_mass,sqrt_atom,theta,n,j,epsilon);result.cg_residual_restarts+=cg.residual_restarts;if(!cg.witness.classification.empty()){result.cg=cg.relative_residual;result.cg_residual_available=true;result.witness=cg.witness;if(progress)*progress=result;return result;}max_cg=std::max(max_cg,cg.relative_residual);for(int i=0;i<m;++i)predicted[static_cast<std::size_t>(i)*m+j]=K_B*temperature*std::inner_product(probes[i].begin(),probes[i].end(),cg.x.begin(),0.0);}
   result.cg=max_cg;result.cg_residual_available=true;if(progress)*progress=result;
-  const int nv=static_cast<int>(result.validation_frames);std::vector<double> sumq(m,0.0),sumf(m,0.0),q2(static_cast<std::size_t>(m)*m,0.0),fq(static_cast<std::size_t>(m)*m,0.0),block_q(static_cast<std::size_t>(4)*m,0.0),block_q2(block_q.size(),0.0),x(d),f(d),q(d),fw(d),base(d),add(d),target(d);double residual2=0.0,force2=0.0;spool.clear();spool.seekg(frame_start);double step=0.0,previous=-std::numeric_limits<double>::infinity();
+  ProbeMoments validation_moments(m);std::vector<double> block_q(static_cast<std::size_t>(4)*m,0.0),block_q2(block_q.size(),0.0),x(d),f(d),q(d),fw(d),base(d),add(d),target(d);double residual2=0.0,force2=0.0;spool.clear();spool.seekg(frame_start);double step=0.0,previous=-std::numeric_limits<double>::infinity();
   for(std::uint64_t frame=0;frame<frame_count;++frame){read_frame(spool,x,f,step);if(!(step>previous)||(frame&&std::abs((step-previous)-sample_interval)>1e-9))throw std::runtime_error("native fit validation steps do not match sample_interval");previous=step;if(frame<static_cast<std::uint64_t>(train))continue;
      for(int i=0;i<d;++i){q[i]=sqrt_mass[i]*(x[i]-r0[i]);fw[i]=f[i]/sqrt_mass[i];}
-     project_translation(q,sqrt_atom,n);project_translation(fw,sqrt_atom,n);baseline.apply(q,base);apply_additive(graph,q,sqrt_mass,sqrt_atom,theta,n,add);for(int i=0;i<d;++i){target[i]=fw[i]+base[i];residual2+=(target[i]+add[i])*(target[i]+add[i]);force2+=fw[i]*fw[i];}std::vector<double> qp(m),fp(m);for(int a=0;a<m;++a){qp[a]=std::inner_product(probes[a].begin(),probes[a].end(),q.begin(),0.0);fp[a]=std::inner_product(probes[a].begin(),probes[a].end(),fw.begin(),0.0);sumq[a]+=qp[a];sumf[a]+=fp[a];}
+     project_translation(q,sqrt_atom,n);project_translation(fw,sqrt_atom,n);baseline.apply(q,base);apply_additive(graph,q,sqrt_mass,sqrt_atom,theta,n,add);for(int i=0;i<d;++i){target[i]=fw[i]+base[i];residual2+=(target[i]+add[i])*(target[i]+add[i]);force2+=fw[i]*fw[i];}std::vector<double> qp(m),fp(m);for(int a=0;a<m;++a){qp[a]=std::inner_product(probes[a].begin(),probes[a].end(),q.begin(),0.0);fp[a]=std::inner_product(probes[a].begin(),probes[a].end(),fw.begin(),0.0);}validation_moments.add(qp,fp);
     const int block=std::min(3,static_cast<int>((frame-train)*4/result.validation_frames));++result.block_frames[block];for(int a=0;a<m;++a){const std::size_t ba=static_cast<std::size_t>(block)*m+a;block_q[ba]+=qp[a];block_q2[ba]+=qp[a]*qp[a];}
-    for(int a=0;a<m;++a)for(int b=0;b<m;++b){q2[static_cast<std::size_t>(a)*m+b]+=qp[a]*qp[b];fq[static_cast<std::size_t>(a)*m+b]+=fp[a]*qp[b];}
   }
-  std::vector<double> observed(q2.size()),ibp(q2.size());
-  for(int a=0;a<m;++a)for(int b=0;b<m;++b){const std::size_t ij=static_cast<std::size_t>(a)*m+b;observed[ij]=q2[ij]/nv-(sumq[a]/nv)*(sumq[b]/nv);ibp[ij]=fq[ij]/(nv*K_B*temperature)-(sumf[a]/nv)*(sumq[b]/nv)/(K_B*temperature)+(a==b?1.0:0.0);}
+  std::vector<double> observed=validation_moments.covariance_q(),ibp=validation_moments.ibp_matrix(K_B*temperature);
   // Symmetric whitening on the finite, declared probe subspace.
   for(int i=0;i<m;++i)for(int j=i+1;j<m;++j){const double v=.5*predicted[static_cast<std::size_t>(i)*m+j]+.5*predicted[static_cast<std::size_t>(j)*m+i];predicted[static_cast<std::size_t>(i)*m+j]=predicted[static_cast<std::size_t>(j)*m+i]=v;}
   for(int i=0;i<m;++i)for(int j=i+1;j<m;++j){const double v=.5*observed[static_cast<std::size_t>(i)*m+j]+.5*observed[static_cast<std::size_t>(j)*m+i];observed[static_cast<std::size_t>(i)*m+j]=observed[static_cast<std::size_t>(j)*m+i]=v;}
@@ -895,11 +1036,28 @@ ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline
   if(!(pe.values.front()>0.0)||pe.values.front()<=pe.values.back()*1e-12)throw std::runtime_error("native fit predicted probe response is non-positive or ill-conditioned");
   std::vector<double> invroot(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i)for(int j=0;j<m;++j)for(int k=0;k<m;++k)invroot[static_cast<std::size_t>(i)*m+j]+=pe.vectors[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*m]*pe.vectors[static_cast<std::size_t>(j)+static_cast<std::size_t>(k)*m]/std::sqrt(pe.values[k]);
   std::vector<double> whitened(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i)for(int j=0;j<m;++j){for(int a=0;a<m;++a)for(int b=0;b<m;++b)whitened[static_cast<std::size_t>(i)*m+j]+=invroot[static_cast<std::size_t>(i)*m+a]*(observed[static_cast<std::size_t>(a)*m+b]-predicted[static_cast<std::size_t>(a)*m+b])*invroot[static_cast<std::size_t>(b)*m+j];}
-  const SmallEigen re=eigen_small(solver,whitened,m);double response=0.0;for(double e:re.values)response=std::max(response,std::abs(e));
+  const SmallEigen re=eigen_small(solver,whitened,m);double response=0.0;int worst_response=0;for(int i=0;i<m;++i)if(std::abs(re.values[i])>response){response=std::abs(re.values[i]);worst_response=i;}
   std::vector<double> gram(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i)for(int j=0;j<m;++j)for(int k=0;k<m;++k)gram[static_cast<std::size_t>(i)*m+j]+=ibp[static_cast<std::size_t>(k)*m+i]*ibp[static_cast<std::size_t>(k)*m+j];
-  const SmallEigen ie=eigen_small(solver,gram,m);const double ibp_error=std::sqrt(std::max(0.0,ie.values.back()));result.response=response;result.ibp=ibp_error;result.response_ibp_available=true;if(progress)*progress=result;if(!std::isfinite(response)||!std::isfinite(ibp_error)||!std::isfinite(max_cg))throw std::runtime_error("native fit response diagnostics are non-finite");
+  const SmallEigen ie=eigen_small(solver,gram,m);const int worst_ibp=m-1;const double ibp_error=std::sqrt(std::max(0.0,ie.values.back()));result.response=response;result.ibp=ibp_error;result.response_ibp_available=true;result.observed_matrix=observed;result.predicted_matrix=predicted;result.ibp_matrix=ibp;result.whitened_matrix=whitened;result.worst_response_coefficients=response_probe_basis_coefficients(invroot,re.vectors,m,worst_response);result.worst_ibp_coefficients.resize(m);for(int i=0;i<m;++i)result.worst_ibp_coefficients[i]=ie.vectors[static_cast<std::size_t>(i)+static_cast<std::size_t>(worst_ibp)*m];if(progress)*progress=result;if(!std::isfinite(response)||!std::isfinite(ibp_error)||!std::isfinite(max_cg))throw std::runtime_error("native fit response diagnostics are non-finite");
   if(!std::isfinite(residual2)||!std::isfinite(force2)||force2<0.0)throw std::runtime_error("native fit held-out force residual is non-finite");const double heldout_residual=force2>0.0?std::sqrt(residual2/force2):(residual2==0.0?0.0:std::numeric_limits<double>::infinity());if(!std::isfinite(heldout_residual))throw std::runtime_error("native fit held-out residual is nonzero at zero physical-force scale");
   result.force_residual=heldout_residual;result.force_residual_available=true;if(progress)*progress=result;return result;
+}
+
+void write_response_state(const std::string& path,const ResponseCheck& response,const std::vector<double>& theta,
+  const double temperature,const double tolerance)
+{
+  const int m=response.probes;std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja response failure state\nstatus RESPONSE_CHECK_FAIL\ntemperature_K "<<temperature
+    <<"\ntotal_frames "<<response.total_frames<<"\nvalidation_frames "<<response.validation_frames<<"\nprobe_count "<<m<<"\nresponse_tolerance "<<tolerance<<"\nresponse_error "<<response.response<<"\nibp_error "<<response.ibp<<"\ntheta";
+  for(double value:theta)out<<' '<<value;out<<"\nprobe_sources\n";
+  for(int i=0;i<m;++i)out<<i<<' '<<(i<static_cast<int>(response.probe_sources.size())?response.probe_sources[i]:"UNKNOWN")<<'\n';
+  out<<"probe_variances index observed predicted observed_over_predicted\n";
+  for(int i=0;i<m;++i){const double observed=response.observed_matrix[static_cast<std::size_t>(i)*m+i],predicted=response.predicted_matrix[static_cast<std::size_t>(i)*m+i];out<<i<<' '<<observed<<' '<<predicted<<' '<<(predicted!=0.0?observed/predicted:std::numeric_limits<double>::infinity())<<'\n';}
+  write_matrix(out,"observed_covariance",response.observed_matrix,m);write_matrix(out,"predicted_covariance",response.predicted_matrix,m);
+  write_matrix(out,"IBP_residual_nonsymmetric",response.ibp_matrix,m);write_matrix(out,"whitened_response_difference",response.whitened_matrix,m);
+  out<<"worst_response_direction_mapping c=P^(-1/2)*u, where u is the whitened eigenvector\n";
+  out<<"worst_response_probe_basis_coefficients\n";for(int i=0;i<m;++i)out<<i<<' '<<response.worst_response_coefficients[i]<<'\n';
+  out<<"worst_IBP_right_singular_probe_basis_coefficients (from eigenvector of E^T E)\n";for(int i=0;i<m;++i)out<<i<<' '<<response.worst_ibp_coefficients[i]<<'\n';
+  write_text_exclusive(path,out.str(),"response state snapshot");
 }
 
 void householder_compress(std::vector<double>& a, std::vector<double>& y, const int rows, const int cols,
@@ -993,6 +1151,8 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::vector<double> position(3*n),force_frame(3*n),r0(3*n,0.0);double step=0.0,previous=-std::numeric_limits<double>::infinity();
   read_training_r0(in,header,frame_count,static_cast<double>(options.sample_interval),r0);
   validate_fit_branches(in,header,frame_count,box,r0);
+  const FixedProbeStatistics sample_statistics=collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0);
+  print_fixed_probe_summary(sample_statistics,header,static_cast<double>(options.sample_interval),static_cast<std::uint64_t>(train));
   // Rewind to the first frame for streaming block-QR fitting.
   in.clear();in.seekg(header.frames);
   previous=-std::numeric_limits<double>::infinity();
@@ -1009,14 +1169,14 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::printf("    rpmd_ja native fit family: fixed cutoff graph, %zu unordered type pairs, %zu shared lab-frame symmetric parameters; training=%d validation=%d; frame design %.3f MiB\n",
     graph.type_pairs.size(),psize,train,validation,static_cast<double>(design_bytes)/(1024*1024));
   const std::string generated_raw_path=options.output_path+".qraw",raw_path=options.raw_input_path.empty()?generated_raw_path:options.raw_input_path;
-  const std::string pack_path=options.output_path+".additive.tmp",fit_path=options.output_path+".fit.txt",fit_tmp=fit_path+".tmp",trace_path=options.output_path+".fit_trace.txt",witness_path=options.output_path+".cg_witness.txt",qp_state_path=options.output_path+".qp_state.txt";
+  const std::string pack_path=options.output_path+".additive.tmp",fit_path=options.output_path+".fit.txt",fit_tmp=fit_path+".tmp",trace_path=options.output_path+".fit_trace.txt",witness_path=options.output_path+".cg_witness.txt",qp_state_path=options.output_path+".qp_state.txt",response_state_path=options.output_path+".response_state.txt";
   const bool generate_raw=options.raw_input_path.empty();
   std::vector<double> saved;
   struct Restore { Atom& atom; std::vector<double>& x; bool active; ~Restore(){if(active)atom.position_per_atom.copy_from_host(x.data());} };
   if(generate_raw){if(atom.position_per_atom.size()!=static_cast<std::size_t>(d))throw std::runtime_error("native fit raw generation requires an initialized centroid position array");saved.resize(static_cast<std::size_t>(d));atom.position_per_atom.copy_to_host(saved.data());atom.position_per_atom.copy_from_host(r0.data());}
   Restore restore{atom,saved,generate_raw};
-  {std::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(generated_raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),qp_state_old(qp_state_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
-    if(!kernel)throw std::runtime_error("native fit cannot read its qNEP kernel table");kernel.seekg(0,std::ios::end);const auto kernel_bytes=kernel.tellg();if(kernel_bytes<=0||kernel_bytes>std::numeric_limits<std::streamoff>::max())throw std::runtime_error("native fit qNEP kernel table has invalid or overflowing byte length");if(old.good()||side.good()||raw_old.good()||pack_old.good()||fit_old.good()||fit_tmp_old.good()||trace_old.good()||witness_old.good()||qp_state_old.good()||failure.good()||tmp.good()||side_tmp.good())throw std::runtime_error("native fit refuses to overwrite an existing output or scratch artifact");}
+  {std::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(generated_raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),qp_state_old(qp_state_path),response_state_old(response_state_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
+    if(!kernel)throw std::runtime_error("native fit cannot read its qNEP kernel table");kernel.seekg(0,std::ios::end);const auto kernel_bytes=kernel.tellg();if(kernel_bytes<=0||kernel_bytes>std::numeric_limits<std::streamoff>::max())throw std::runtime_error("native fit qNEP kernel table has invalid or overflowing byte length");if(old.good()||side.good()||raw_old.good()||pack_old.good()||fit_old.good()||fit_tmp_old.good()||trace_old.good()||witness_old.good()||qp_state_old.good()||response_state_old.good()||failure.good()||tmp.good()||side_tmp.good())throw std::runtime_error("native fit refuses to overwrite an existing output or scratch artifact");}
   const std::uint64_t d64=static_cast<std::uint64_t>(d),n64=static_cast<std::uint64_t>(n),dd64=d64*d64,vd64=d64*n64;
   if(dd64>(std::numeric_limits<std::uint64_t>::max()-18)/7||vd64>(std::numeric_limits<std::uint64_t>::max()-7*dd64-18)/2)throw std::runtime_error("native fit qraw size estimate overflows");
   const std::uint64_t raw_elements=2*vd64+7*dd64+18;if(raw_elements>std::numeric_limits<std::uint64_t>::max()/sizeof(double))throw std::runtime_error("native fit qraw byte estimate overflows");
@@ -1167,7 +1327,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(observed_violation){consecutive_cg_feedback=0;if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==max_rounds-1)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after "+std::to_string(max_rounds)+" rounds");theta=solve_qp_and_trace(outer);continue;}
     ResponseCheck response_progress;
     try{response=validate_probes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,options.sample_interval,options.temperature,modes,options.epsilon,&response_progress);}catch(const std::exception& e){trace<<"outer "<<outer<<" status PROBE_VALIDATION_FAIL detail "<<e.what()<<" ";write_response_stats(trace,response_progress);trace<<'\n';trace.flush();throw;}
-    if(response.witness.classification.empty()){const bool response_pass=response.response<=options.response_tolerance&&response.ibp<=options.response_tolerance;std::printf("    rpmd_ja fit RESPONSE_CHECK %s: response=%.6g IBP=%.6g limit=%.6g; CG true residual=%.3g; frames=%llu probes=%d covariance condition observed/predicted=%.3g/%.3g block variance delta=%.3g; FULL_CERTIFICATE PENDING\n",response_pass?"PASS":"FAIL",response.response,response.ibp,options.response_tolerance,response.cg,static_cast<unsigned long long>(response.validation_frames),response.probes,response.observed_cov_condition,response.predicted_cov_condition,response.block_variance_max_relative_delta);trace<<"outer "<<outer<<" status CG_PASS response_check "<<(response_pass?"PASS":"FAIL")<<" constraints "<<cut_rows.size()<<" ";write_response_stats(trace,response);trace<<" response_tolerance "<<options.response_tolerance<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!response_pass)throw std::runtime_error("RESPONSE_CHECK_FAIL: native fit held-out probe response or force-position IBP exceeds declared tolerance");fit_converged=true;break;}
+    if(response.witness.classification.empty()){const bool response_pass=response.response<=options.response_tolerance&&response.ibp<=options.response_tolerance;std::printf("    rpmd_ja fit RESPONSE_CHECK %s: response=%.6g IBP=%.6g limit=%.6g; CG true residual=%.3g; frames=%llu probes=%d covariance condition observed/predicted=%.3g/%.3g block variance delta=%.3g; FULL_CERTIFICATE PENDING\n",response_pass?"PASS":"FAIL",response.response,response.ibp,options.response_tolerance,response.cg,static_cast<unsigned long long>(response.validation_frames),response.probes,response.observed_cov_condition,response.predicted_cov_condition,response.block_variance_max_relative_delta);trace<<"outer "<<outer<<" status CG_PASS response_check "<<(response_pass?"PASS":"FAIL")<<" constraints "<<cut_rows.size()<<" ";write_response_stats(trace,response);trace<<" response_tolerance "<<options.response_tolerance<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!response_pass){write_response_state(response_state_path,response,theta,options.temperature,options.response_tolerance);std::printf("    RESPONSE_CHECK_FAIL response=%.6g IBP=%.6g; snapshot=%s\n",response.response,response.ibp,response_state_path.c_str());throw std::runtime_error("RESPONSE_CHECK_FAIL: native fit held-out probe response or force-position IBP exceeds declared tolerance; inspect "+response_state_path);}fit_converged=true;break;}
     write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,options.internal_mass_com);const bool feedback_eligible=response.witness.finite&&(response.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION"||response.witness.classification=="UNRESOLVED_SOFT_DIRECTION");std::printf("    rpmd_ja fit CG_FEEDBACK %s: %s probe=%d iteration=%d lambda=%.17g base=%.17g add=%.17g tol=%.3g repeat_delta=%.3g; witness=%s\n",feedback_eligible?"RETRY":"FAIL",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.rayleigh,response.witness.base_rayleigh,response.witness.add_rayleigh,response.witness.curvature_tolerance,response.witness.repeat_diff_norm,witness_path.c_str());
     if(!feedback_eligible)throw std::runtime_error("CG stability feedback failed with classification "+response.witness.classification+"; inspect "+witness_path);
     const double base_value=std::inner_product(response.witness.direction.begin(),response.witness.direction.end(),response.witness.base.begin(),0.0);if(response.witness.rayleigh>=options.epsilon-response.witness.curvature_tolerance)throw std::runtime_error("NUMERICAL_BREAKDOWN: normalized CG witness is not below the declared curvature threshold; inspect "+witness_path);const bool added=add_cut(response.witness.direction,base_value,outer,response.witness.classification.c_str());
@@ -1289,6 +1449,22 @@ void diagnose_rpmd_ja_native_fit_samples(const std::string& spool_path, const do
   atom.position_per_atom.copy_from_host(r0.data());
   diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force, full);
 }
+
+void check_rpmd_ja_native_fit_samples(const std::string& spool_path,const std::string& report_path,Atom& atom,Box& box)
+{
+  if(spool_path.empty()||report_path.empty()||spool_path==report_path)
+    throw std::invalid_argument("rpmd_ja check_samples requires distinct nonempty input and report paths");
+  std::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
+  const SampleHeader header=read_header(in,0,atom,box,0.0,true);
+  const std::uint64_t train=2*header.frame_count/3;std::vector<double> r0(static_cast<std::size_t>(3)*header.n,0.0);
+  const double interval=read_training_r0(in,header,header.frame_count,std::numeric_limits<double>::quiet_NaN(),r0);
+  validate_fit_branches(in,header,header.frame_count,box,r0);
+  const FixedProbeStatistics stats=collect_fixed_probe_statistics(in,header,header.frame_count,train,r0,true);
+  write_text_exclusive(report_path,format_fixed_probe_report(stats,header,interval,train),"sample statistics report");
+  print_fixed_probe_summary(stats,header,interval,train);
+  std::printf("sampling evidence: INCONCLUSIVE; report=%s\n",report_path.c_str());
+  std::printf("  fixed probes omit four low-frequency Ritz probes; this report cannot replace final response validation.\n");
+}
 #else
 #include <stdexcept>
 void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions&, const std::string&,
@@ -1304,5 +1480,9 @@ void fit_rpmd_ja_native_reference_from_samples(const RpmdJANativeFitOptions&, co
 void diagnose_rpmd_ja_native_fit_samples(const std::string&, double, Atom&, Box&, Force&, bool)
 {
   throw std::runtime_error("native rpmd_ja sample diagnostics require CUDA");
+}
+void check_rpmd_ja_native_fit_samples(const std::string&,const std::string&,Atom&,Box&)
+{
+  throw std::runtime_error("native rpmd_ja sample checks require CUDA");
 }
 #endif

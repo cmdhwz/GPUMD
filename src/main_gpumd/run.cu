@@ -725,13 +725,31 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, check_samples <samples_file> <report_file>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
           tokens, number_of_types, integrate, group, atom, box, force, first_potential_filename_)) {
       PRINT_INPUT_ERROR("Could not register rpmd_ja fit sampler.");
     }
+    return;
+  }
+  if (tokens[1] == "check_samples") {
+    if (tokens.size() != 4)
+      PRINT_INPUT_ERROR("rpmd_ja check_samples requires <samples_file> <report_file>.");
+    if (integrate.has_ensemble() || global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja check_samples must appear before any ensemble or run.");
+    if (atom.number_of_atoms < 2 || atom.cpu_mass.size() != static_cast<std::size_t>(atom.number_of_atoms) ||
+        atom.cpu_type.size() != static_cast<std::size_t>(atom.number_of_atoms))
+      PRINT_INPUT_ERROR("rpmd_ja check_samples requires initialized model.xyz atom, mass, and type data.");
+    if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+      PRINT_INPUT_ERROR("rpmd_ja check_samples requires fully periodic boundaries.");
+    if (tokens[2].empty() || tokens[3].empty() || tokens[2] == tokens[3])
+      PRINT_INPUT_ERROR("rpmd_ja check_samples paths must be nonempty and distinct.");
+#ifdef USE_HIP
+    PRINT_INPUT_ERROR("rpmd_ja check_samples native sample analysis is currently unavailable in HIP builds.");
+#endif
+    check_rpmd_ja_native_fit_samples(tokens[2], tokens[3], atom, box);
     return;
   }
   if (tokens[1] == "fit_samples") {

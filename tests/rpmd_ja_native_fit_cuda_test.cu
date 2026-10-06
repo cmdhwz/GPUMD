@@ -149,6 +149,81 @@ void test_response_uncomputed_values_are_explicit()
   assert(summary.str().find("force_residual_status=NOT_COMPUTED")!=std::string::npos);
 }
 
+void test_probe_moments_centering_and_small_segments()
+{
+  ProbeMoments moments(1),shifted(1),wrong_force(1);
+  const double amplitude=std::sqrt(0.5),kbt=1.0;
+  for(const double delta:{amplitude,-amplitude}){
+    const std::vector<double> q={delta},f={-2.0*delta},q_shifted={delta+17.0},f_wrong={-3.0*delta};
+    moments.add(q,f);shifted.add(q_shifted,f);wrong_force.add(q,f_wrong);
+  }
+  assert(std::abs(moments.covariance_q()[0]-0.5)<1e-14);
+  assert(std::abs(shifted.covariance_q()[0]-moments.covariance_q()[0])<1e-14);
+  assert(std::abs(moments.ibp_matrix(kbt)[0])<1e-14);
+  assert(std::abs(shifted.ibp_matrix(kbt)[0]-moments.ibp_matrix(kbt)[0])<1e-14);
+  assert(std::abs(wrong_force.ibp_matrix(kbt)[0])>0.4);
+  assert(std::string(probe_sample_status(2,3))=="INSUFFICIENT_SAMPLES");
+}
+
+void test_check_samples_is_read_only()
+{
+  const std::string spool=write_sample_spool(".check",3),report=spool+".txt";
+  RemoveTestFile remove_spool{spool};RemoveTestFile remove_report{report};const std::string before=read_test_file(spool);
+  Atom atom;atom.number_of_atoms=2;atom.cpu_mass={1.0,2.0};atom.cpu_type={0,1};atom.number_of_beads=0;atom.position_per_atom.resize(6);
+  const std::vector<double> position={0.7,0.8,0.9,1.0,1.1,1.2};atom.position_per_atom.copy_from_host(position.data());
+  Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;
+  check_rpmd_ja_native_fit_samples(spool,report,atom,box);
+  std::vector<double> after(6);atom.position_per_atom.copy_to_host(after.data());
+  const std::string text=read_test_file(report);
+  assert(before==read_test_file(spool)&&after==position&&atom.number_of_beads==0);
+  assert(text.find("INSUFFICIENT_SAMPLES")!=std::string::npos);
+  assert(text.find("cannot replace final response validation")!=std::string::npos);
+  assert(text.find("lag_autocorrelation")!=std::string::npos&&text.find("IBP_residual")!=std::string::npos);
+}
+
+std::vector<double> snapshot_matrix(const std::string& text,const std::string& name,const int n)
+{
+  const std::string marker=name+"\n";const auto start=text.find(marker);assert(start!=std::string::npos);
+  std::istringstream input(text.substr(start+marker.size()));std::vector<double> values(static_cast<std::size_t>(n)*n);
+  for(double& value:values)if(!(input>>value))throw std::runtime_error("truncated response snapshot matrix");return values;
+}
+
+double snapshot_scalar(const std::string& text,const std::string& name)
+{
+  const std::string marker=name+" ";const auto start=text.find(marker);assert(start!=std::string::npos);
+  std::istringstream input(text.substr(start+marker.size()));double value=0.0;if(!(input>>value))throw std::runtime_error("invalid response snapshot scalar");return value;
+}
+
+std::vector<double> snapshot_vector(const std::string& text,const std::string& name,const int n)
+{
+  const std::string marker=name+"\n";const auto start=text.find(marker);assert(start!=std::string::npos);
+  std::istringstream input(text.substr(start+marker.size()));std::vector<double> values(n);
+  for(int i=0;i<n;++i){int index=-1;if(!(input>>index>>values[i])||index!=i)throw std::runtime_error("invalid response snapshot vector");}return values;
+}
+
+void test_response_snapshot_preserves_recomputable_matrices()
+{
+  const std::string path="rpmd_ja_response_state_test_"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
+  ResponseCheck response;response.probes=2;response.total_frames=12;response.validation_frames=8;response.response=0.5;response.ibp=std::sqrt(0.5*(0.14+std::sqrt(0.016)));response.probe_sources={"FIXED_RANDOM","TYPE_LOCAL"};
+  response.observed_matrix={5.2,0.4,0.4,1.3};response.predicted_matrix={4.0,0.0,0.0,1.0};response.ibp_matrix={0.1,0.2,0.0,0.3};response.whitened_matrix={0.3,0.2,0.2,0.3};
+  const double inverse_sqrt_two=1.0/std::sqrt(2.0);const std::vector<double> whitened_vectors={inverse_sqrt_two,inverse_sqrt_two,0.0,0.0};
+  response.worst_response_coefficients=response_probe_basis_coefficients({0.5,0.0,0.0,1.0},whitened_vectors,2,0);response.worst_ibp_coefficients={0.0,1.0};
+  write_response_state(path,response,{1.0,2.0},300.0,0.15);const std::string state=read_test_file(path);
+  const auto ibp=snapshot_matrix(state,"IBP_residual_nonsymmetric",2),white=snapshot_matrix(state,"whitened_response_difference",2),observed=snapshot_matrix(state,"observed_covariance",2),predicted=snapshot_matrix(state,"predicted_covariance",2);
+  const double e00=ibp[0]*ibp[0]+ibp[2]*ibp[2],e01=ibp[0]*ibp[1]+ibp[2]*ibp[3],e11=ibp[1]*ibp[1]+ibp[3]*ibp[3];
+  const double lambda_max=0.5*(e00+e11+std::hypot(e00-e11,2.0*e01));
+  const double response_lambda=0.5*(white[0]+white[3]+std::hypot(white[0]-white[3],2.0*white[1]));
+  const double response_lambda_min=0.5*(white[0]+white[3]-std::hypot(white[0]-white[3],2.0*white[1]));
+  assert(std::abs(std::max(std::abs(response_lambda),std::abs(response_lambda_min))-snapshot_scalar(state,"response_error"))<1e-14);
+  assert(std::abs(std::sqrt(lambda_max)-snapshot_scalar(state,"ibp_error"))<1e-14);
+  const auto coefficients=snapshot_vector(state,"worst_response_probe_basis_coefficients",2);double numerator=0.0,denominator=0.0,direct_numerator=0.0,direct_denominator=0.0;
+  const std::vector<double> difference={observed[0]-predicted[0],observed[1]-predicted[1],observed[2]-predicted[2],observed[3]-predicted[3]},direct={inverse_sqrt_two,inverse_sqrt_two};
+  for(int i=0;i<2;++i)for(int j=0;j<2;++j){numerator+=coefficients[i]*difference[2*i+j]*coefficients[j];denominator+=coefficients[i]*predicted[2*i+j]*coefficients[j];direct_numerator+=direct[i]*difference[2*i+j]*direct[j];direct_denominator+=direct[i]*predicted[2*i+j]*direct[j];}
+  assert(std::abs(numerator/denominator-snapshot_scalar(state,"response_error"))<1e-14);
+  assert(std::abs(direct_numerator/direct_denominator-snapshot_scalar(state,"response_error"))>1e-3);
+  assert(state.find("FIXED_RANDOM")!=std::string::npos&&state.find("TYPE_LOCAL")!=std::string::npos);
+}
+
 void test_saved_sample_diagnostic()
 {
   const std::string path = write_sample_spool(".bin", 3);
@@ -630,6 +705,9 @@ int main()
   test_fit_samples_entry_preserves_inputs();
   test_full_spd_failure_keeps_candidate_pack();
   test_response_uncomputed_values_are_explicit();
+  test_probe_moments_centering_and_small_segments();
+  test_check_samples_is_read_only();
+  test_response_snapshot_preserves_recomputable_matrices();
   test_saved_sample_diagnostic();
   test_design_and_edge_operator();
   test_pap_baseline();
