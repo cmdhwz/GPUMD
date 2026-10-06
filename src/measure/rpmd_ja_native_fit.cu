@@ -310,22 +310,101 @@ std::vector<double> theta_from_eta(const SmallSVD& svd,const std::vector<double>
 
 std::vector<double> unconstrained_eta(const SmallSVD& svd){return svd.eta;}
 
-std::vector<double> solve_cut_qp(const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
-  const double primal_tolerance=1e-8)
+struct QPCertificate
+{
+  std::vector<double> theta,primal_slack,allowed_error,dual_slack;
+  double max_primal_violation=0.0,max_primal_excess=0.0,max_complementarity=0.0,max_stationarity=0.0;
+  double minimum_primal_slack=std::numeric_limits<double>::infinity(),minimum_slack_allowed_error=0.0;
+  std::size_t minimum_slack_constraint_index=0,worst_primal_excess_index=0;
+  bool finite=true,primal_constraints_pass=true,accepted=false;
+};
+
+constexpr double qp_complementarity_tolerance=1e-7,qp_stationarity_tolerance=1e-9;
+
+QPCertificate check_cut_qp_kkt(const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
+  const std::vector<std::vector<double>>& a,const std::vector<double>& b,const std::vector<double>& lambda,
+  const std::vector<double>& xi,const double primal_tolerance)
+{
+  if(rows.size()!=rhs.size()||rows.size()!=a.size()||rows.size()!=b.size()||rows.size()!=lambda.size()||xi.size()!=static_cast<std::size_t>(svd.p))
+    throw std::runtime_error("native fit stability QP certificate dimensions do not match");
+  QPCertificate out;out.theta=theta_from_eta(svd,xi);out.primal_slack.resize(rows.size());out.allowed_error.resize(rows.size());out.dual_slack.resize(rows.size());
+  bool multipliers_nonnegative=true;
+  for(double value:lambda)if(!std::isfinite(value)||value<0.0){out.finite=false;multipliers_nonnegative=false;}
+  for(std::size_t i=0;i<rows.size();++i){
+    if(rows[i].size()!=static_cast<std::size_t>(svd.p)||a[i].size()!=static_cast<std::size_t>(svd.p))throw std::runtime_error("native fit stability QP certificate row width does not match");
+    const double primal=std::inner_product(rows[i].begin(),rows[i].end(),out.theta.begin(),0.0)-rhs[i];
+    double scale=std::max(1.0,std::abs(rhs[i]));for(int k=0;k<svd.p;++k)scale+=std::abs(rows[i][k]*out.theta[k]);
+    const double allowed=std::min(primal_tolerance,256.0*std::numeric_limits<double>::epsilon()*scale);
+    double shifted=0.0;for(int k=0;k<svd.p;++k)shifted+=a[i][k]*(xi[k]-svd.eta[k]);
+    const double slack=shifted-b[i],complementarity=lambda[i]*slack;
+    out.primal_slack[i]=primal;out.allowed_error[i]=allowed;out.dual_slack[i]=slack;
+    if(!std::isfinite(primal)||!std::isfinite(allowed)){out.finite=false;out.primal_constraints_pass=false;}
+    if(!std::isfinite(slack)||!std::isfinite(complementarity))out.finite=false;
+    out.max_primal_violation=std::max(out.max_primal_violation,std::max(0.0,-primal));
+    const double excess=std::max(0.0,-primal-allowed);
+    if(excess>out.max_primal_excess){out.max_primal_excess=excess;out.worst_primal_excess_index=i;}
+    out.max_complementarity=std::max(out.max_complementarity,std::abs(complementarity));
+    if(i==0||primal<out.minimum_primal_slack){out.minimum_slack_constraint_index=i;out.minimum_primal_slack=primal;out.minimum_slack_allowed_error=allowed;}
+    if(primal < -allowed)out.primal_constraints_pass=false;
+  }
+  for(int k=0;k<svd.p;++k){double stationarity=xi[k]-svd.eta[k];for(std::size_t i=0;i<rows.size();++i)stationarity-=a[i][k]*lambda[i];if(!std::isfinite(stationarity))out.finite=false;out.max_stationarity=std::max(out.max_stationarity,std::abs(stationarity));}
+  out.accepted=out.finite&&multipliers_nonnegative&&out.primal_constraints_pass&&out.max_primal_violation<=primal_tolerance&&
+    out.max_complementarity<=qp_complementarity_tolerance&&out.max_stationarity<=qp_stationarity_tolerance;
+  return out;
+}
+
+struct QPSolution
+{
+  std::vector<double> xi,lambda;
+  QPCertificate certificate;
+  int iterations=0;
+  double last_multiplier_change=0.0;
+};
+
+void write_cut_qp_state(const std::string& path,const int outer,const int iterations,const double last_change,const double primal_tolerance,
+  const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
+  const std::vector<std::vector<double>>& a,const std::vector<double>& b,const std::vector<double>& gram,
+  const std::vector<double>& initial_lambda,const std::vector<double>& lambda,const std::vector<double>& xi,const QPCertificate& certificate)
+{
+  if(path.empty())return;
+  std::ifstream existing(path,std::ios::binary);if(existing.good())throw std::runtime_error("native fit refuses to overwrite an existing QP state snapshot: "+path);
+  std::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("native fit cannot create QP state snapshot: "+path);
+  out<<std::setprecision(17)<<"outer_index "<<outer<<"\niterations "<<iterations<<"\nparameters "<<svd.p<<"\nconstraints "<<rows.size()
+    <<"\nprimal_tolerance "<<primal_tolerance<<"\ncomplementarity_tolerance "<<qp_complementarity_tolerance<<"\nstationarity_tolerance "<<qp_stationarity_tolerance
+    <<"\nlast_multiplier_change "<<last_change<<"\nmax_primal_violation "<<certificate.max_primal_violation
+    <<"\nmax_complementarity "<<certificate.max_complementarity<<"\nmax_stationarity "<<certificate.max_stationarity
+    <<"\nprimal_constraints_pass "<<(certificate.primal_constraints_pass?1:0)<<"\nmax_primal_excess "<<certificate.max_primal_excess
+    <<"\nworst_primal_excess_index "<<certificate.worst_primal_excess_index
+    <<"\nminimum_slack_constraint_index "<<certificate.minimum_slack_constraint_index<<"\nminimum_primal_slack "<<certificate.minimum_primal_slack
+    <<"\nminimum_slack_allowed_error "<<certificate.minimum_slack_allowed_error<<"\nkkt_accepted 0\n";
+  auto write_vector=[&](const char* name,const std::vector<double>& values){out<<name<<' '<<values.size();for(double value:values)out<<' '<<value;out<<'\n';};
+  write_vector("svd_singular",svd.singular);write_vector("svd_eta",svd.eta);write_vector("initial_lambda",initial_lambda);write_vector("lambda",lambda);write_vector("xi",xi);write_vector("theta",certificate.theta);
+  out<<"svd_vt "<<svd.p<<' '<<svd.p<<'\n';for(int i=0;i<svd.p;++i){for(int j=0;j<svd.p;++j)out<<svd.vt[static_cast<std::size_t>(i)+static_cast<std::size_t>(j)*svd.p]<<(j+1==svd.p?'\n':' ');}
+  out<<"original_rows "<<rows.size()<<' '<<svd.p<<'\n';for(std::size_t i=0;i<rows.size();++i){out<<i;for(double value:rows[i])out<<' '<<value;out<<" rhs "<<rhs[i]<<'\n';}
+  out<<"transformed_a "<<a.size()<<' '<<svd.p<<'\n';for(std::size_t i=0;i<a.size();++i){out<<i;for(double value:a[i])out<<' '<<value;out<<" b "<<b[i]<<'\n';}
+  out<<"gram "<<rows.size()<<' '<<rows.size()<<'\n';for(std::size_t i=0;i<rows.size();++i){for(std::size_t j=0;j<rows.size();++j)out<<gram[i*rows.size()+j]<<(j+1==rows.size()?'\n':' ');}
+  out<<"constraint_state index primal_slack allowed_error primal_excess dual_slack lambda complementarity\n";
+  for(std::size_t i=0;i<rows.size();++i)out<<i<<' '<<certificate.primal_slack[i]<<' '<<certificate.allowed_error[i]<<' '<<std::max(0.0,-certificate.primal_slack[i]-certificate.allowed_error[i])<<' '<<certificate.dual_slack[i]<<' '<<lambda[i]<<' '<<lambda[i]*certificate.dual_slack[i]<<'\n';
+  out.close();if(!out)throw std::runtime_error("native fit failed writing QP state snapshot: "+path);
+}
+
+QPSolution solve_cut_qp(const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
+  const double primal_tolerance=1e-8,const std::vector<double>& initial_lambda={},const std::string& qp_state_path={},const int outer=-1)
 {
   if(!std::isfinite(primal_tolerance)||primal_tolerance<0.0)throw std::runtime_error("native fit stability QP has an invalid primal tolerance");
-  std::vector<std::vector<double>> a(rows.size(),std::vector<double>(svd.p));
-  std::vector<double> b=rhs;
+  std::vector<std::vector<double>> a(rows.size(),std::vector<double>(svd.p));std::vector<double> b=rhs;
   for(std::size_t c=0;c<rows.size();++c){for(int k=0;k<svd.p;++k){for(int j=0;j<svd.p;++j)a[c][k]+=rows[c][j]*svd.vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*svd.p]/svd.singular[k];}if(!std::all_of(a[c].begin(),a[c].end(),[](double x){return std::isfinite(x);})||!std::isfinite(b[c]))throw std::runtime_error("native fit stability cut is non-finite");for(int k=0;k<svd.p;++k)b[c]-=a[c][k]*svd.eta[k];}
-  std::vector<double> gram(rows.size()*rows.size()),lambda(rows.size(),0.0);for(std::size_t i=0;i<rows.size();++i)for(std::size_t j=0;j<rows.size();++j){gram[i*rows.size()+j]=std::inner_product(a[i].begin(),a[i].end(),a[j].begin(),0.0);if(!std::isfinite(gram[i*rows.size()+j]))throw std::runtime_error("native fit stability QP Gram matrix is non-finite");}
+  std::vector<double> gram(rows.size()*rows.size()),lambda(rows.size(),0.0);if(initial_lambda.size()>rows.size())throw std::runtime_error("native fit stability QP warm start has more multipliers than constraints");std::copy(initial_lambda.begin(),initial_lambda.end(),lambda.begin());
+  for(std::size_t i=0;i<rows.size();++i)for(std::size_t j=0;j<rows.size();++j){gram[i*rows.size()+j]=std::inner_product(a[i].begin(),a[i].end(),a[j].begin(),0.0);if(!std::isfinite(gram[i*rows.size()+j]))throw std::runtime_error("native fit stability QP Gram matrix is non-finite");}
   std::vector<double> diag(rows.size());for(std::size_t i=0;i<rows.size();++i){diag[i]=gram[i*rows.size()+i];if(!(diag[i]>1e-24)||!std::isfinite(diag[i]))throw std::runtime_error("native fit stability cut is singular or non-finite");}
-  auto primal_ok=[&](const std::vector<double>& theta){for(std::size_t i=0;i<rows.size();++i){const double value=std::inner_product(rows[i].begin(),rows[i].end(),theta.begin(),0.0);double scale=std::max(1.0,std::abs(rhs[i]));for(int k=0;k<svd.p;++k)scale+=std::abs(rows[i][k]*theta[k]);if(!std::isfinite(value)||value-rhs[i]<-std::min(primal_tolerance,256.0*std::numeric_limits<double>::epsilon()*scale))return false;}return true;};
-  for(int it=0;it<200000;++it){double change=0.0;for(std::size_t i=0;i<rows.size();++i){double residual=b[i];for(std::size_t j=0;j<rows.size();++j)residual-=gram[i*rows.size()+j]*lambda[j];const double next=std::max(0.0,lambda[i]+residual/diag[i]);if(!std::isfinite(next))throw std::runtime_error("native fit stability QP iterate is non-finite");change=std::max(change,std::abs(next-lambda[i]));lambda[i]=next;}if(change<1e-11){std::vector<double> trial=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)trial[k]+=a[i][k]*lambda[i];if(primal_ok(theta_from_eta(svd,trial)))break;}if(it==199999)throw std::runtime_error("native fit stability QP failed to converge");}
-  std::vector<double> xi=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)xi[k]+=a[i][k]*lambda[i];
-  double max_primal=0.0,max_comp=0.0,max_dual=0.0;const std::vector<double> theta=theta_from_eta(svd,xi);
-  for(std::size_t i=0;i<rows.size();++i){double shifted=0.0,scale=std::max(1.0,std::abs(rhs[i]));for(int k=0;k<svd.p;++k){shifted+=a[i][k]*(xi[k]-svd.eta[k]);scale+=std::abs(rows[i][k]*theta[k]);}const double slack=shifted-b[i];const double primal=std::inner_product(rows[i].begin(),rows[i].end(),theta.begin(),0.0)-rhs[i],allowed=std::min(primal_tolerance,256.0*std::numeric_limits<double>::epsilon()*scale);if(!std::isfinite(slack)||!std::isfinite(primal)||!std::isfinite(lambda[i]))throw std::runtime_error("native fit stability QP produced a non-finite certificate");if(primal < -allowed)throw std::runtime_error("native fit stability QP failed curvature-unit primal tolerance");max_primal=std::max(max_primal,std::max(0.0,-primal));max_comp=std::max(max_comp,std::abs(lambda[i]*slack));}
-  for(int k=0;k<svd.p;++k){double stationarity=xi[k]-svd.eta[k];for(std::size_t i=0;i<rows.size();++i)stationarity-=a[i][k]*lambda[i];max_dual=std::max(max_dual,std::abs(stationarity));}if(!std::isfinite(max_dual)||!std::isfinite(primal_tolerance)||primal_tolerance<0.0||max_primal>primal_tolerance||max_comp>1e-7||max_dual>1e-9)throw std::runtime_error("native fit stability QP failed primal, dual, or complementary-slackness check");
-  return xi;
+  for(double value:lambda)if(!std::isfinite(value)||value<0.0)throw std::runtime_error("native fit stability QP warm start is non-finite or negative");
+  const std::vector<double> initial_lambda_full=lambda;QPSolution result;result.lambda=std::move(lambda);QPCertificate certificate;constexpr int check_interval=32;
+  for(int it=0;it<200000;++it){double change=0.0;for(std::size_t i=0;i<rows.size();++i){double residual=b[i];for(std::size_t j=0;j<rows.size();++j)residual-=gram[i*rows.size()+j]*result.lambda[j];const double next=std::max(0.0,result.lambda[i]+residual/diag[i]);if(!std::isfinite(next))throw std::runtime_error("native fit stability QP iterate is non-finite");change=std::max(change,std::abs(next-result.lambda[i]));result.lambda[i]=next;}result.iterations=it+1;result.last_multiplier_change=change;
+    if(result.iterations%check_interval==0||result.iterations==200000){result.xi=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)result.xi[k]+=a[i][k]*result.lambda[i];certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,result.lambda,result.xi,primal_tolerance);if(certificate.accepted)break;}}
+  result.xi=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)result.xi[k]+=a[i][k]*result.lambda[i];
+  result.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,result.lambda,result.xi,primal_tolerance);
+  if(!result.certificate.accepted){write_cut_qp_state(qp_state_path,outer,result.iterations,result.last_multiplier_change,primal_tolerance,svd,rows,rhs,a,b,gram,initial_lambda_full,result.lambda,result.xi,result.certificate);throw std::runtime_error("native fit stability QP failed primal, dual, or complementary-slackness check after "+std::to_string(result.iterations)+" iterations"+(qp_state_path.empty()?std::string():"; inspect "+qp_state_path));}
+  return result;
 }
 
 void project_translation(std::vector<double>& v,const std::vector<double>& sqrt_mass,const int n)
@@ -682,9 +761,9 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::vector<double> saved(static_cast<std::size_t>(d));atom.position_per_atom.copy_to_host(saved.data());
   struct Restore { Atom& atom; std::vector<double>& x; ~Restore(){atom.position_per_atom.copy_from_host(x.data());} } restore{atom,saved};
   atom.position_per_atom.copy_from_host(r0.data());
-  const std::string raw_path=options.output_path+".qraw",pack_path=options.output_path+".additive.tmp",fit_path=options.output_path+".fit.txt",fit_tmp=fit_path+".tmp",trace_path=options.output_path+".fit_trace.txt",witness_path=options.output_path+".cg_witness.txt";
-  {std::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
-    if(!kernel)throw std::runtime_error("native fit cannot read its qNEP kernel table");kernel.seekg(0,std::ios::end);const auto kernel_bytes=kernel.tellg();if(kernel_bytes<=0||kernel_bytes>std::numeric_limits<std::streamoff>::max())throw std::runtime_error("native fit qNEP kernel table has invalid or overflowing byte length");if(old.good()||side.good()||raw_old.good()||pack_old.good()||fit_old.good()||fit_tmp_old.good()||trace_old.good()||witness_old.good()||failure.good()||tmp.good()||side_tmp.good())throw std::runtime_error("native fit refuses to overwrite an existing output or scratch artifact");}
+  const std::string raw_path=options.output_path+".qraw",pack_path=options.output_path+".additive.tmp",fit_path=options.output_path+".fit.txt",fit_tmp=fit_path+".tmp",trace_path=options.output_path+".fit_trace.txt",witness_path=options.output_path+".cg_witness.txt",qp_state_path=options.output_path+".qp_state.txt";
+  {std::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),qp_state_old(qp_state_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
+    if(!kernel)throw std::runtime_error("native fit cannot read its qNEP kernel table");kernel.seekg(0,std::ios::end);const auto kernel_bytes=kernel.tellg();if(kernel_bytes<=0||kernel_bytes>std::numeric_limits<std::streamoff>::max())throw std::runtime_error("native fit qNEP kernel table has invalid or overflowing byte length");if(old.good()||side.good()||raw_old.good()||pack_old.good()||fit_old.good()||fit_tmp_old.good()||trace_old.good()||witness_old.good()||qp_state_old.good()||failure.good()||tmp.good()||side_tmp.good())throw std::runtime_error("native fit refuses to overwrite an existing output or scratch artifact");}
   const std::uint64_t d64=static_cast<std::uint64_t>(d),n64=static_cast<std::uint64_t>(n),dd64=d64*d64,vd64=d64*n64;
   if(dd64>(std::numeric_limits<std::uint64_t>::max()-18)/7||vd64>(std::numeric_limits<std::uint64_t>::max()-7*dd64-18)/2)throw std::runtime_error("native fit qraw size estimate overflows");
   const std::uint64_t raw_elements=2*vd64+7*dd64+18;if(raw_elements>std::numeric_limits<std::uint64_t>::max()/sizeof(double))throw std::runtime_error("native fit qraw byte estimate overflows");
@@ -748,8 +827,8 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(frame==0){rmat=std::move(R);z=std::move(zblock);}else merge_qr(rmat,z,R,zblock,static_cast<int>(psize),discarded2);
   }
   const SmallSVD fit_svd=svd_small(qr.solver,rmat,z,static_cast<int>(psize));
-  std::vector<std::vector<double>> cut_rows;std::vector<double> cut_rhs;std::vector<double> theta=theta_from_eta(fit_svd,fit_svd.eta);
-  std::ofstream trace(trace_path,std::ios::out|std::ios::trunc);if(!trace)throw std::runtime_error("cannot create native fit trace: "+trace_path);trace<<std::setprecision(17)<<"evidence SAMPLED; final stored-D Cholesky certificate required\n";
+  std::vector<std::vector<double>> cut_rows;std::vector<double> cut_rhs,qp_lambda;std::vector<double> theta=theta_from_eta(fit_svd,fit_svd.eta);
+  std::ofstream trace(trace_path,std::ios::out|std::ios::trunc);if(!trace)throw std::runtime_error("cannot create native fit trace: "+trace_path);trace<<std::setprecision(17)<<"evidence SAMPLED; QP_PASS is current finite cut-set only; Ritz/CG, response/IBP and final stored-D Cholesky checks still required\n";
   bool fit_converged=false;ResponseCheck response;
   auto add_cut=[&](const std::vector<double>& v,const double base_value,const int outer,const char* source){
     const auto row=spectral_row(graph,v,sqrt_mass,n,static_cast<int>(psize));const double row_norm=std::sqrt(std::inner_product(row.begin(),row.end(),row.begin(),0.0));const double rhs=options.epsilon-base_value;const double value=std::inner_product(row.begin(),row.end(),theta.begin(),0.0)+base_value;
@@ -759,17 +838,25 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       if(difference<=64.0*std::numeric_limits<double>::epsilon()*std::max(row_norm,prior_norm)&&std::abs(rhs-cut_rhs[c])<=curvature_tolerance){if(value<options.epsilon-curvature_tolerance)throw std::runtime_error("STABILITY_CUT_STALLED: identical constraint remains violated; inspect fit_trace and cg_witness");return false;}}
     cut_rows.push_back(row);cut_rhs.push_back(rhs);trace<<"outer "<<outer<<" status RETRY source "<<source<<" cuts "<<cut_rows.size()<<" curvature "<<value<<" rhs "<<rhs<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';return true;
   };
+  auto solve_qp_and_trace=[&](const int outer){
+    const std::size_t warm_start=qp_lambda.size();auto qp=solve_cut_qp(fit_svd,cut_rows,cut_rhs,options.epsilon/4.0,qp_lambda,qp_state_path,outer);qp_lambda=std::move(qp.lambda);
+    trace<<"QP_PASS outer="<<outer<<" constraints="<<cut_rows.size()<<" iterations="<<qp.iterations<<" warm_start="<<warm_start
+      <<" primal_excess="<<qp.certificate.max_primal_excess<<" complementarity="<<qp.certificate.max_complementarity
+      <<" stationarity="<<qp.certificate.max_stationarity<<" lambda_change="<<qp.last_multiplier_change<<'\n';trace.flush();
+    if(!trace)throw std::runtime_error("failed writing native fit QP trace: "+trace_path);
+    return std::move(qp.certificate.theta);
+  };
   for(int outer=0;outer<40;++outer){
     const int steps=std::min(96,d-3);const auto modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4);if(modes.empty())throw std::runtime_error("native fit Lanczos returned no Ritz modes");const double min_ritz=modes.front().value,ritz_residual=modes.front().residual;bool observed_violation=false,added_cut=false;
     for(const auto& mode:modes){std::vector<double> base_mode(d),add_mode(d);baseline.apply(mode.vector,base_mode);apply_additive(graph,mode.vector,sqrt_mass,sqrt_mass_atom,theta,n,add_mode);const double base_value=std::inner_product(mode.vector.begin(),mode.vector.end(),base_mode.begin(),0.0),rayleigh=base_value+std::inner_product(mode.vector.begin(),mode.vector.end(),add_mode.begin(),0.0);const auto row=spectral_row(graph,mode.vector,sqrt_mass,n,static_cast<int>(psize));double scale=std::max(1.0,std::abs(base_value));for(int i=0;i<static_cast<int>(psize);++i)scale+=std::abs(row[i]*theta[i]);if(!std::isfinite(base_value)||!std::isfinite(rayleigh)||!std::isfinite(scale)||!std::all_of(base_mode.begin(),base_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(add_mode.begin(),add_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: sampled Ritz evidence is non-finite");const double mode_tolerance=std::min(options.epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);if(rayleigh>=options.epsilon-mode_tolerance)continue;observed_violation=true;added_cut|=add_cut(mode.vector,base_value,outer,"RITZ");}
     trace<<"outer "<<outer<<" sampled_min_ritz "<<min_ritz<<" ritz_residual "<<ritz_residual<<" lanczos_steps "<<steps<<" observed_directions "<<modes.size()<<" constraints "<<cut_rows.size()<<" cg_feedback none status "<<(observed_violation?"RETRY":"CHECK_CG")<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit trace: "+trace_path);
-    if(observed_violation){if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==39)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after 40 rounds");theta=theta_from_eta(fit_svd,solve_cut_qp(fit_svd,cut_rows,cut_rhs,options.epsilon/4.0));continue;}
+    if(observed_violation){if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==39)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after 40 rounds");theta=solve_qp_and_trace(outer);continue;}
     try{response=validate_probes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,options.sample_interval,options.temperature,modes,options.epsilon);}catch(const std::exception& e){trace<<"outer "<<outer<<" status PROBE_VALIDATION_FAIL detail "<<e.what()<<"\n";trace.flush();throw;}
     if(response.witness.classification.empty()){const bool response_pass=response.response<=options.response_tolerance&&response.ibp<=options.response_tolerance;std::printf("    rpmd_ja fit RESPONSE_CHECK %s: response=%.6g IBP=%.6g limit=%.6g; CG true residual=%.3g; FULL_CERTIFICATE PENDING\n",response_pass?"PASS":"FAIL",response.response,response.ibp,options.response_tolerance,response.cg);trace<<"outer "<<outer<<" status CG_PASS response_check "<<(response_pass?"PASS":"FAIL")<<" cg_true_residual "<<response.cg<<" response "<<response.response<<" ibp "<<response.ibp<<" response_tolerance "<<options.response_tolerance<<" constraints "<<cut_rows.size()<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!response_pass)throw std::runtime_error("RESPONSE_CHECK_FAIL: native fit held-out probe response or force-position IBP exceeds declared tolerance");fit_converged=true;break;}
     write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,options.internal_mass_com);const bool feedback_eligible=response.witness.finite&&(response.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION"||response.witness.classification=="UNRESOLVED_SOFT_DIRECTION");std::printf("    rpmd_ja fit CG_FEEDBACK %s: %s probe=%d iteration=%d lambda=%.17g base=%.17g add=%.17g tol=%.3g repeat_delta=%.3g; witness=%s\n",feedback_eligible?"RETRY":"FAIL",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.rayleigh,response.witness.base_rayleigh,response.witness.add_rayleigh,response.witness.curvature_tolerance,response.witness.repeat_diff_norm,witness_path.c_str());
     if(!feedback_eligible)throw std::runtime_error("CG stability feedback failed with classification "+response.witness.classification+"; inspect "+witness_path);
      const double base_value=std::inner_product(response.witness.direction.begin(),response.witness.direction.end(),response.witness.base.begin(),0.0);if(response.witness.rayleigh>=options.epsilon-response.witness.curvature_tolerance)throw std::runtime_error("NUMERICAL_BREAKDOWN: normalized CG witness is not below the declared curvature threshold; inspect "+witness_path);const bool added=add_cut(response.witness.direction,base_value,outer,response.witness.classification.c_str());trace<<"outer "<<outer<<" cg_feedback "<<response.witness.classification<<" probe "<<response.witness.probe<<" iteration "<<response.witness.iteration<<" rayleigh "<<response.witness.rayleigh<<" constraints "<<cut_rows.size()<<" status RETRY\n";trace.flush();
-    if(!added)throw std::runtime_error("STABILITY_CUT_STALLED: CG witness did not add a new violated constraint");if(outer==39)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted 40 rounds");theta=theta_from_eta(fit_svd,solve_cut_qp(fit_svd,cut_rows,cut_rhs,options.epsilon/4.0));
+    if(!added)throw std::runtime_error("STABILITY_CUT_STALLED: CG witness did not add a new violated constraint");if(outer==39)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted 40 rounds");theta=solve_qp_and_trace(outer);
   }
   if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within 40 rounds");
   double compressed_residual2=discarded2;for(int i=0;i<static_cast<int>(psize);++i){double v=-z[i];for(int j=i;j<static_cast<int>(psize);++j)v+=rmat[static_cast<std::size_t>(i)*psize+j]*theta[j];compressed_residual2+=v*v;}
@@ -806,7 +893,7 @@ void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options,const st
     if(!options.output_path.empty()){
       const std::string failure=options.output_path+".failure.txt";std::ifstream exists(failure);
       if(!exists.good()){std::ofstream out(failure,std::ios::out|std::ios::trunc);if(out)out<<"native finite-temperature reference fit failed\n"<<e.what()<<'\n';}
-      std::ifstream trace_exists(options.output_path+".fit_trace.txt"),raw_exists(options.output_path+".qraw",std::ios::binary),samples_exist(spool_path,std::ios::binary);const std::string trace_path=options.output_path+".fit_trace.txt",raw_path=options.output_path+".qraw";std::printf("    rpmd_ja fit FAIL: %s; failure=%s trace=%s qraw=%s samples=%s\n",e.what(),failure.c_str(),trace_exists.good()?trace_path.c_str():"unavailable",raw_exists.good()?raw_path.c_str():"unavailable",samples_exist.good()?spool_path.c_str():"unavailable");
+      std::ifstream trace_exists(options.output_path+".fit_trace.txt"),raw_exists(options.output_path+".qraw",std::ios::binary),qp_state_exists(options.output_path+".qp_state.txt",std::ios::binary),samples_exist(spool_path,std::ios::binary);const std::string trace_path=options.output_path+".fit_trace.txt",raw_path=options.output_path+".qraw",qp_state_path=options.output_path+".qp_state.txt";std::printf("    rpmd_ja fit FAIL: %s; failure=%s trace=%s qraw=%s qp_state=%s samples=%s\n",e.what(),failure.c_str(),trace_exists.good()?trace_path.c_str():"unavailable",raw_exists.good()?raw_path.c_str():"unavailable",qp_state_exists.good()?qp_state_path.c_str():"unavailable",samples_exist.good()?spool_path.c_str():"unavailable");
     }
     throw;
   }
