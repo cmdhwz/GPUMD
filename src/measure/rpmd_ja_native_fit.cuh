@@ -11,6 +11,7 @@ struct RpmdJANativeFitOptions
 {
   std::string output_path;
   std::string kernel_table;
+  std::string raw_input_path;
   double temperature = 0.0;
   double cutoff = 0.0;
   double epsilon = 0.0;
@@ -24,6 +25,13 @@ void fit_rpmd_ja_native_reference(
   const RpmdJANativeFitOptions& options,
   const std::string& spool_path,
   std::uint64_t frame_count,
+  Atom& atom,
+  Box& box,
+  Force& force);
+
+void fit_rpmd_ja_native_reference_from_samples(
+  const RpmdJANativeFitOptions& options,
+  const std::string& spool_path,
   Atom& atom,
   Box& box,
   Force& force);

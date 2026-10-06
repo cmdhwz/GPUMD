@@ -15,6 +15,8 @@ static std::vector<double> diagnostic_expected_r0;
 static bool diagnostic_should_throw = false;
 
 Force::Force(void) {}
+int Force::get_number_of_potentials() const { return 0; }
+Potential& Force::get_potential(const int) { throw std::runtime_error("unexpected potential lookup in native fit regression"); }
 void diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&, bool)
 {
   std::vector<double> x(diagnostic_expected_r0.size());
@@ -27,10 +29,11 @@ void prepare_rpmd_ja_qnep_reference(const std::string&, const std::string&, cons
                                     const RpmdJAModeValidator&, const std::string&) {}
 RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom&, Box&, Force&) { return {}; }
 std::uint64_t rpmd_ja_model_fingerprint(const std::string&) { return 0; }
+std::uint64_t rpmd_ja_qnep_config_fingerprint(Force&) { return 0; }
 
 namespace
 {
-std::string write_sample_spool(const std::string& suffix, const int frames)
+std::string write_sample_spool(const std::string& suffix, const int frames, const double interval=2.5)
 {
   const std::string path = "rpmd_ja_native_samples_test_" +
     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + suffix;
@@ -52,7 +55,7 @@ std::string write_sample_spool(const std::string& suffix, const int frames)
   out.write(reinterpret_cast<const char*>(masses), sizeof(masses));
   out.write(reinterpret_cast<const char*>(types), sizeof(types));
   for (int frame = 0; frame < frames; ++frame) {
-    const double step = 5.0 + 2.5 * frame;
+    const double step = 5.0 + interval * frame;
     double x[6], f[6];
     for (int i = 0; i < 6; ++i) { x[i] = 0.1 + 0.01 * frame; f[i] = -0.2; }
     out.write(reinterpret_cast<const char*>(&step), sizeof(step));
@@ -64,6 +67,56 @@ std::string write_sample_spool(const std::string& suffix, const int frames)
 }
 
 struct RemoveTestFile { std::string path; ~RemoveTestFile() { std::remove(path.c_str()); } };
+
+std::string read_test_file(const std::string& path)
+{
+  std::ifstream in(path,std::ios::binary);return std::string(std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>());
+}
+
+void test_fit_samples_entry_preserves_inputs()
+{
+  const std::string spool=write_sample_spool(".fit_samples",3,2.0),raw=spool+".qraw",output=spool+".out";
+  RemoveTestFile clean_spool{spool},clean_raw{raw},clean_failure{output+".failure.txt"},clean_lock{output+".fit.lock"};
+  {std::ofstream out(raw,std::ios::binary);out<<"external qraw sentinel";assert(out.good());}
+  const std::string saved_spool=read_test_file(spool),saved_raw=read_test_file(raw);
+  Atom atom;atom.number_of_atoms=2;atom.cpu_mass={1.0,2.0};atom.cpu_type={0,1};atom.number_of_beads=0;atom.position_per_atom.resize(6);
+  const std::vector<double> original_position={0.7,0.8,0.9,1.0,1.1,1.2};atom.position_per_atom.copy_from_host(original_position.data());
+  Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;Force force;
+  RpmdJANativeFitOptions options;options.output_path=output;options.kernel_table="unused-before-validation";options.raw_input_path=raw;options.cutoff=2.0;options.epsilon=1e-3;options.response_tolerance=0.15;options.fd_step=1e-3;
+  atom.cpu_mass[0]=3.0;bool identity_rejected=false;
+  try{fit_rpmd_ja_native_reference_from_samples(options,spool,atom,box,force);}catch(const std::runtime_error&){identity_rejected=true;}
+  assert(identity_rejected&&read_test_file(spool)==saved_spool&&read_test_file(raw)==saved_raw);
+  atom.cpu_mass[0]=1.0;bool early_fit_failure=false;
+  try{fit_rpmd_ja_native_reference_from_samples(options,spool,atom,box,force);}catch(const std::runtime_error& e){early_fit_failure=std::string(e.what()).find("held-out frames")!=std::string::npos;}
+  assert(early_fit_failure&&read_test_file(spool)==saved_spool&&read_test_file(raw)==saved_raw);
+  assert(atom.number_of_beads==0);std::vector<double> after(6);atom.position_per_atom.copy_to_host(after.data());assert(after==original_position);
+}
+
+void test_full_spd_failure_keeps_candidate_pack()
+{
+  const std::string path="rpmd_ja_candidate_pack_test_"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".bin";
+  {std::ofstream out(path,std::ios::binary);out<<"candidate package";assert(out.good());}
+  bool pack_owned=true;
+  struct RemoveIfOwned{std::string path;bool& owned;~RemoveIfOwned(){if(owned)std::remove(path.c_str());}} cleanup{path,pack_owned};
+  const std::string prepare_error="qNEP translation-complement Hessian is not positive definite (POTRF leading minor 2 of dimension 3, raw: test.qraw)";
+  try{throw std::runtime_error(prepare_error);}
+  catch(const std::exception& error){assert(preserve_candidate_package_on_full_spd_failure(error.what(),pack_owned));}
+  assert(!pack_owned);{std::ifstream candidate(path,std::ios::binary);assert(candidate.good());}
+  assert(!preserve_candidate_package_on_full_spd_failure("cuSOLVER Cholesky parameter failure",pack_owned));
+  std::remove(path.c_str());
+}
+
+void test_response_uncomputed_values_are_explicit()
+{
+  const ResponseCheck response;
+  assert(std::isnan(response.response)&&std::isnan(response.ibp)&&std::isnan(response.cg)&&std::isnan(response.force_residual));
+  assert(!response.observed_cov_available&&!response.predicted_cov_available&&!response.cg_residual_available&&!response.response_ibp_available&&!response.force_residual_available);
+  std::ostringstream summary;write_response_stats(summary,response);
+  assert(summary.str().find("observed_cov_status=NOT_COMPUTED")!=std::string::npos);
+  assert(summary.str().find("predicted_cov_status=NOT_COMPUTED")!=std::string::npos);
+  assert(summary.str().find("response_ibp_status=NOT_COMPUTED")!=std::string::npos);
+  assert(summary.str().find("force_residual_status=NOT_COMPUTED")!=std::string::npos);
+}
 
 void test_saved_sample_diagnostic()
 {
@@ -178,6 +231,9 @@ void test_design_and_edge_operator()
     const double fd=(energy(graph,plus,sqrt_mass,n,theta)-energy(graph,minus,sqrt_mass,n,theta))/(2*h);
     check_close(fd,product[i],2e-8);
   }
+  const auto direct=spectral_row(graph,q,sqrt_mass,n,p);std::vector<double> design_based(p,0.0);
+  for(int c=0;c<p;++c)for(int i=0;i<d;++i)design_based[c]-=q[i]*design[static_cast<std::size_t>(c)*d+i];
+  for(int c=0;c<p;++c)check_close(direct[c],design_based[c],2e-12);
 }
 
 void test_pap_baseline()
@@ -415,9 +471,18 @@ void test_lanczos_blindspot_cg_cut_feedback(cusolverDnHandle_t solver)
   constexpr int n=40,d=3*n,p=6;const double epsilon=1e-3;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> w(d);
   w[0]=1.0-1.0/n;for(int i=1;i<n;++i)w[i]=-1.0/n;std::vector<double> start(d);for(int i=0;i<d;++i)start[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);project_translation(start,sqrt_atom,n);double norm=std::sqrt(std::inner_product(start.begin(),start.end(),start.begin(),0.0));for(double& x:start)x/=norm;const double overlap=std::inner_product(w.begin(),w.end(),start.begin(),0.0);double start_x2=0.0;for(int i=0;i<n;++i)start_x2+=start[i]*start[i];for(int i=0;i<n;++i)w[i]-=(overlap/start_x2)*start[i];norm=std::sqrt(std::inner_product(w.begin(),w.end(),w.begin(),0.0));for(double& x:w)x/=norm;assert(std::abs(std::inner_product(w.begin(),w.end(),start.begin(),0.0))<1e-12);
   std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=1.0;for(int i=0;i<d;++i)for(int j=0;j<d;++j)raw[static_cast<std::size_t>(i)*d+j]-=2.0*w[i]*w[j];std::stringstream input(std::ios::in|std::ios::out|std::ios::binary);input.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));input.seekg(0);DeviceBaseline baseline;baseline.initialize(input,0,d,n,masses,sqrt_mass);Graph graph;for(int i=0;i<n;++i)for(int j=i+1;j<n;++j)graph.edges.push_back({i,j,0,{0,0,0}});
-  const auto modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,96,4);assert(modes.front().value>0.99&&modes.front().residual<1e-10);std::vector<double> zero(p,0.0);const CGResult cg=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,zero,n,0,epsilon);assert(cg.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION");assert(cg.witness.rayleigh<0.0);
+  const auto modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,96,4);assert(modes.front().value>0.99&&modes.front().residual<1e-10);std::vector<double> zero(p,0.0);const CGResult cg=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,zero,n,0,epsilon);assert(cg.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION");assert(cg.witness.rayleigh<0.0);const auto witness_modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,16,4,cg.witness.direction);assert(witness_modes.front().value<-0.99&&witness_modes.front().residual<1e-10);
   SmallSVD identity;identity.p=p;identity.singular.assign(p,1.0);identity.eta.assign(p,0.0);identity.vt.assign(p*p,0.0);for(int i=0;i<p;++i)identity.vt[static_cast<std::size_t>(i)*p+i]=1.0;const auto row=spectral_row(graph,w,sqrt_mass,n,p);const double base=std::inner_product(w.begin(),w.end(),cg.witness.base.begin(),0.0);const auto qp=solve_cut_qp(identity,{row},{epsilon-base},epsilon/4.0);const auto theta=theta_from_eta(identity,qp.xi);
   const auto basis=internal_basis(n);const int internal=static_cast<int>(basis.size());std::vector<double> restricted(static_cast<std::size_t>(internal)*internal);for(int j=0;j<internal;++j){std::vector<double> image(d);apply_total(baseline,graph,basis[j],sqrt_mass,sqrt_atom,theta,n,image);for(int i=0;i<internal;++i)restricted[static_cast<std::size_t>(i)*internal+j]=std::inner_product(basis[i].begin(),basis[i].end(),image.begin(),0.0);}const auto exact=eigen_small(solver,restricted,internal);assert(exact.values.front()>=epsilon-2e-10);const CGResult repaired=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,theta,n,0,epsilon);assert(repaired.witness.classification.empty());assert(repaired.relative_residual<=1e-8);
+}
+
+void test_lanczos_independent_seed_escapes_invariant_subspace(cusolverDnHandle_t solver)
+{
+  constexpr int n=2,d=6;const auto basis=internal_basis(n);const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> raw(d*d,0.0);
+  const double eigenvalues[3]={1.0,-2.0,3.0};for(int k=0;k<3;++k)for(int i=0;i<d;++i)for(int j=0;j<d;++j)raw[static_cast<std::size_t>(i)*d+j]+=eigenvalues[k]*basis[k][i]*basis[k][j];
+  std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));stream.seekg(0);DeviceBaseline baseline;baseline.initialize(stream,0,d,n,masses,sqrt_mass);Graph graph;
+  const auto warm=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,basis[0]);const auto independent=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3);
+  assert(warm.size()==1&&warm.front().residual<1e-12);check_close(warm.front().value,1.0,1e-12);assert(independent.front().value<-1.99&&independent.front().residual<1e-10);
 }
 
 void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
@@ -447,7 +512,7 @@ void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
   }
   std::ifstream spool(path,std::ios::binary);assert(spool.good());
   const ResponseCheck result=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,21,1,temperature,{});
-  assert(result.probes>=20);assert(result.cg<=1e-8);assert(result.response<=2e-8);assert(result.ibp<=2e-8);assert(result.force_residual<=2e-8);
+  assert(result.probes>=20);assert(result.validation_frames==validation);assert(result.observed_cov_available&&result.predicted_cov_available&&result.cg_residual_available&&result.response_ibp_available&&result.force_residual_available);assert(result.observed_cov_min>0.0&&result.observed_cov_max>=result.observed_cov_min&&result.observed_cov_condition>=1.0);assert(result.predicted_cov_min>0.0&&result.predicted_cov_max>=result.predicted_cov_min&&result.predicted_cov_condition>=1.0);assert(result.block_frames[0]+result.block_frames[1]+result.block_frames[2]+result.block_frames[3]==validation);assert(std::isfinite(result.block_variance_max_relative_delta));assert(result.cg<=1e-8);assert(result.response<=2e-8);assert(result.ibp<=2e-8);assert(result.force_residual<=2e-8);
 
   spool.close();
   {
@@ -475,10 +540,24 @@ void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
   const ResponseCheck zero_result=validate_probes(solver,baseline,graph,zero_theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,21,1,temperature,{});
   assert(zero_result.force_residual<=2e-8);assert(zero_result.response<=2e-8);assert(zero_result.ibp<=2e-8);
 }
+
+void test_probe_selection_skips_duplicate_low_modes()
+{
+  const int n=40,d=3*n;std::vector<double> sqrt_atom(n,1.0);std::vector<int> types(n);
+  for(int i=0;i<n;++i)types[i]=i%4;
+  const std::vector<RitzMode> none;const auto base=make_probes(none,sqrt_atom,types,n);assert(base.size()>=16);
+  std::vector<RitzMode> candidates(6);for(auto& mode:candidates)mode.vector=base.front();
+  for(int k=0;k<8;++k){RitzMode mode;mode.vector.assign(d,0.0);mode.vector[50+k]=1.0;candidates.push_back(std::move(mode));}
+  const auto selected=make_probes(candidates,sqrt_atom,types,n);assert(selected.size()==base.size()+4);
+  for(std::size_t i=0;i<selected.size();++i)for(std::size_t j=0;j<i;++j)assert(std::abs(std::inner_product(selected[i].begin(),selected[i].end(),selected[j].begin(),0.0))<1e-10);
+}
 } // namespace
 
 int main()
 {
+  test_fit_samples_entry_preserves_inputs();
+  test_full_spd_failure_keeps_candidate_pack();
+  test_response_uncomputed_values_are_explicit();
   test_saved_sample_diagnostic();
   test_design_and_edge_operator();
   test_pap_baseline();
@@ -488,5 +567,7 @@ int main()
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
   test_lanczos_blindspot_cg_cut_feedback(qr.solver);
+  test_lanczos_independent_seed_escapes_invariant_subspace(qr.solver);
+  test_probe_selection_skips_duplicate_low_modes();
   test_probe_covariance_and_ibp(qr.solver);
 }

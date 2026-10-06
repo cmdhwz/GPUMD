@@ -14,6 +14,7 @@ measure = source("src/measure/measure.cu")
 sampler = source("src/measure/rpmd_ja_fit.cu")
 sampling = source("src/measure/rpmd_ja_fit_sampling.cuh")
 native_header = source("src/measure/rpmd_ja_native_fit.cuh")
+native_fit = source("src/measure/rpmd_ja_native_fit.cu")
 sampler_fit = source("src/measure/rpmd_ja_fit.cu")
 
 assert 'if (tokens[1] == "fit")' in run
@@ -54,6 +55,38 @@ assert "stream limits" in sampler
 assert "fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_)" in sampler
 assert "struct RpmdJANativeFitOptions" in native_header
 assert "std::uint64_t frame_count" in native_header
+assert 'if (tokens[1] == "fit_samples")' in run
+assert "fit_rpmd_ja_native_reference_from_samples(options, tokens[2], atom, box, force)" in run
+assert "derived.temperature=header.temperature" in native_fit and "derived.sample_interval=static_cast<int>(std::llround(sample_interval))" in native_fit
+assert "fit_rpmd_ja_native_reference_checked(derived,spool_path,header.frame_count,atom,box,force,true)" in native_fit
+assert "raw_model!=expected_model||raw_config!=expected_config" in native_fit
+assert "raw_types[i]==header.types[i]&&raw_masses[i]==header.masses[i]" in native_fit
+assert "raw_positions[i]-r0[i]" in native_fit
+assert "generate_raw&&std::remove(generated_raw_path.c_str())" in native_fit
+assert "options.raw_input_path.empty()?generated_raw_path:options.raw_input_path" in native_fit
+assert '#include "force/nep_charge.cuh"' in native_fit
+assert 'record_search("FIXED_INDEPENDENT"' in native_fit
+assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4)' in native_fit
+assert "write_response_stats(trace,response_progress)" in native_fit
+assert "observed_cov_condition" in native_fit and "predicted_cov_condition" in native_fit
+assert "candidate_direction_original_mass_weighted" in source("src/measure/rpmd_ja_qnep_prepare.cu")
+assert "pack_owned=false;return true;" in native_fit and "no automatic stability cut was added" in native_fit
+assert 'preserve_candidate_package_on_full_spd_failure(e.what(),own_scratch.pack_owned)' in native_fit
+assert 'qNEP translation-complement Hessian is not positive definite' in source("src/measure/rpmd_ja_qnep_prepare.cu")
+assert 'qNEP translation-complement Hessian is not positive definite' in native_fit
+assert 'std::sort(modes.begin(),modes.end()' in native_fit
+assert 'low_mode_probes<4' in native_fit and 'if(add(soft[i].vector))++low_mode_probes' in native_fit
+assert 'observed_cov_status=' in native_fit and 'predicted_cov_status=' in native_fit
+assert 'response_ibp_status=' in native_fit and 'NOT_COMPUTED' in native_fit
+spectral_start = native_fit.index("std::vector<double> spectral_row(")
+spectral_end = native_fit.index("void apply_total(", spectral_start)
+assert "make_design(" not in native_fit[spectral_start:spectral_end]
+assert "block_variance_relative_delta" in native_fit
+assert "test_fit_samples_entry_preserves_inputs" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_full_spd_failure_keeps_candidate_pack" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_response_uncomputed_values_are_explicit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "POTRF_diagonal_shift_eV_per_A2_per_amu" in source("src/measure/rpmd_ja_qnep_prepare.cu")
 
 pre_run_start = sampler_fit.index("void RpmdJA_Fit::pre_run(")
 pre_run_end = sampler_fit.index("void RpmdJA_Fit::post_force(", pre_run_start)

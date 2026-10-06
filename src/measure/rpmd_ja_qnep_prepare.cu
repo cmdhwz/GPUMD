@@ -794,12 +794,12 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     dim3 pgrid((r+15)/16,(r+15)/16);
     compact_physical<<<pgrid,block>>>(a,physical,d,r,n);
     cuda_check(cudaGetLastError(),"compact translation complement"); cuda_check(cudaDeviceSynchronize(),"compact translation complement");
+    const double potrf_shift=use_additive?0.5*additive.epsilon:0.0;
     if (use_additive) {
-      const double shift = 0.5 * additive.epsilon;
       cuda_check(cudaMalloc(reinterpret_cast<void**>(&shifted), rr*sizeof(double)), "allocate shifted D certificate reference");
       cuda_check(cudaMemcpy(shifted, physical, rr*sizeof(double), cudaMemcpyDeviceToDevice), "save shifted D certificate reference");
-      subtract_diagonal<<<(r+255)/256,256>>>(shifted,r,shift);
-      subtract_diagonal<<<(r+255)/256,256>>>(physical,r,shift);
+      subtract_diagonal<<<(r+255)/256,256>>>(shifted,r,potrf_shift);
+      subtract_diagonal<<<(r+255)/256,256>>>(physical,r,potrf_shift);
       cuda_check(cudaGetLastError(), "apply additive epsilon/2 stability shift"); cuda_check(cudaDeviceSynchronize(), "apply additive epsilon/2 stability shift");
     }
     // Save exact D operator probes before POTRF; the stored D remains lossless.
@@ -828,6 +828,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         std::ofstream report(failure_path,std::ios::out|std::ios::trunc);
         if(report){
           report<<std::setprecision(17)<<"qNEP rpmd_ja Cholesky failure\nraw_path: "<<raw_path<<"\nleading_minor_1based: "<<info<<"\ndimension: "<<r
+            <<"\nPOTRF_operator: unshifted projected D minus diagonal shift\nPOTRF_diagonal_shift_eV_per_A2_per_amu: "<<potrf_shift
             <<"\noriginal_projected_diagonal: "<<original_diagonal<<"\ncholesky_failure_slot_value: "<<failed_slot
             <<"\nhessian_symmetry_relative_error: "<<ref.hessian_symmetry_relative_error<<"\nprojection_relative_change: "<<ref.projection_relative_change<<"\nraw_stats:";
           for(int i=0;i<18;++i)report<<"\n  ["<<i<<"] "<<raw.stats[i];
@@ -864,8 +865,11 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
             std::vector<int> dominant;for(int i=0;i<d;++i)dominant.push_back(i);std::partial_sort(dominant.begin(),dominant.begin()+std::min(8,d),dominant.end(),[&](int x,int y){return std::abs(direction[x])>std::abs(direction[y]);});
             report<<"candidate_direction_status: available\nrho_eV_per_A2_per_amu: "<<rho<<"\ncandidate_direction_residual_norm: "<<candidate_residual
               <<"\noperator_product_norm: "<<std::sqrt(product2)<<"\nnormalization: unit Euclidean norm in translation-complement mass-weighted coordinates\n"
+              <<"candidate_curvature_operator: "<<(use_additive?"unshifted projected D = raw Hessian plus additive fit":"unshifted projected D = raw Hessian")<<"; Householder-coordinate Rayleigh quotient, invariant under the orthogonal back-transform\n"
               <<"rho is the Rayleigh quotient of this candidate; residual is not an eigenvalue certificate.\n"
-              <<"negative rho indicates a negative direction in the generated projected Hessian; it does not establish instability of the physical structure.\ndominant_original_mass_weighted_components:";
+              <<"negative rho indicates a negative direction in the generated projected Hessian; it does not establish instability of the physical structure.\ncandidate_direction_original_mass_weighted "<<direction.size();
+            for(double x:direction)report<<' '<<x;
+            report<<"\ndominant_original_mass_weighted_components:";
             for(int q=0;q<std::min(8,d);++q){const int index=dominant[q];report<<"\n  atom "<<index%n<<" type "<<ref.types[index%n]<<" axis "<<"xyz"[index/n]<<" value "<<direction[index];}
           }catch(const std::exception& e){report<<"candidate_direction_status: unavailable ("<<e.what()<<")\n";}
           report.flush();

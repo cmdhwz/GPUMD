@@ -7,6 +7,7 @@
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "force/force.cuh"
+#include "force/nep_charge.cuh"
 #include "utilities/common.cuh"
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -67,7 +69,8 @@ struct SampleHeader
 };
 
 SampleHeader read_header(std::istream& in, const std::uint64_t frame_count, const Atom& atom, const Box& box,
-                         const double temperature, const bool diagnostic = false)
+                         const double temperature, const bool diagnostic = false,
+                         const bool sample_beads_from_header = false)
 {
   char magic[8]; in.read(magic, sizeof(magic));
   const auto version = read<std::uint32_t>(in, "version");
@@ -76,8 +79,8 @@ SampleHeader read_header(std::istream& in, const std::uint64_t frame_count, cons
   h.n = read<std::int32_t>(in, "atom count");
   h.beads = read<std::int32_t>(in, "bead count");
   h.temperature = read<double>(in, "temperature");
-  if (h.n != atom.number_of_atoms || h.n < 2 || h.n > std::numeric_limits<int>::max()/3 ||
-      (diagnostic ? h.beads < 1 : h.beads != atom.number_of_beads))
+  if (h.n != atom.number_of_atoms || h.n < 2 || h.n > std::numeric_limits<int>::max()/3 || h.beads < 1 ||
+      (!diagnostic && !sample_beads_from_header && h.beads != atom.number_of_beads))
     throw std::runtime_error("native fit spool has invalid atom or bead count");
   read_array(in, h.cell, 9, "cell");
   h.masses.resize(h.n); h.types.resize(h.n);
@@ -85,7 +88,7 @@ SampleHeader read_header(std::istream& in, const std::uint64_t frame_count, cons
   read_array(in, h.types.data(), h.types.size(), "types");
   h.frames = in.tellg();
   if (std::memcmp(magic, sample_magic, sizeof(magic)) || version != 1 || endian != native_endian || h.n != atom.number_of_atoms ||
-      h.n < 2 || (diagnostic ? h.beads < 1 : h.beads != atom.number_of_beads) || !std::isfinite(h.temperature) || h.temperature <= 0.0 ||
+      h.n < 2 || h.beads < 1 || (!diagnostic && !sample_beads_from_header && h.beads != atom.number_of_beads) || !std::isfinite(h.temperature) || h.temperature <= 0.0 ||
       (!diagnostic && std::abs(h.temperature - temperature) > 1.0e-10 * temperature) ||
       h.masses != atom.cpu_mass || h.types != atom.cpu_type || (!diagnostic && frame_count < 3))
     throw std::runtime_error("native fit spool identity, temperature, or dimensions do not match the initialized system");
@@ -517,13 +520,15 @@ SmallEigen eigen_small(cusolverDnHandle_t solver,const std::vector<double>& rowm
   }catch(...){cleanup();throw;}cleanup();return out;
 }
 
-struct RitzMode{double value=0.0,residual=0.0;std::vector<double> vector;};
+struct RitzMode{double value=0.0,residual=0.0;std::vector<double> vector,base_action,additive_action;};
 std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline& baseline,const Graph& graph,
-  const std::vector<double>& theta,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const int n,const int max_steps,const int wanted)
+  const std::vector<double>& theta,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const int n,const int max_steps,const int wanted,
+  const std::vector<double>& initial_vector=std::vector<double>{})
 {
   const int d=3*n;const int steps=std::min(max_steps,d-3);if(steps<=0)throw std::runtime_error("native fit Lanczos has no internal dimensions");
   std::vector<std::vector<double>> basis;basis.reserve(steps);std::vector<double> v(d),w(d),raw(d),add(d);
-  for(int i=0;i<d;++i)v[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);
+  if(initial_vector.empty()){for(int i=0;i<d;++i)v[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);}
+  else{if(initial_vector.size()!=static_cast<std::size_t>(d))throw std::runtime_error("native fit Lanczos initial vector has an invalid dimension");v=initial_vector;}
   project_translation(v,sqrt_atom,n);
   double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(!std::isfinite(norm)||!(norm>0.0))throw std::runtime_error("native fit Lanczos initial vector vanished or is non-finite");for(double&x:v)x/=norm;
   std::vector<double> alpha,beta;double beta_prev=0.0;std::vector<double> previous(d,0.0);
@@ -539,19 +544,30 @@ std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline
     if(b<=breakdown||k==steps-1)break;previous=std::move(v);v.resize(d);for(int i=0;i<d;++i)v[i]=w[i]/b;beta_prev=b;
   }
   const int m=static_cast<int>(alpha.size());std::vector<double> t(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i){t[static_cast<std::size_t>(i)*m+i]=alpha[i];if(i+1<m)t[static_cast<std::size_t>(i)*m+i+1]=t[static_cast<std::size_t>(i+1)*m+i]=beta[i];}
-  const SmallEigen eig=eigen_small(solver,t,m);std::vector<RitzMode> out;const double tail=beta[m-1];
+  const SmallEigen eig=eigen_small(solver,t,m);std::vector<RitzMode> out;
   for(int mode=0;mode<std::min(wanted,m);++mode){RitzMode r;r.value=eig.values[mode];r.vector.assign(d,0.0);
     for(int k=0;k<m;++k){const double c=eig.vectors[static_cast<std::size_t>(k)+static_cast<std::size_t>(mode)*m];for(int i=0;i<d;++i)r.vector[i]+=c*basis[k][i];}
     project_translation(r.vector,sqrt_atom,n);const double rnorm=std::sqrt(std::inner_product(r.vector.begin(),r.vector.end(),r.vector.begin(),0.0));if(!std::isfinite(rnorm)||!(rnorm>0.0))throw std::runtime_error("native fit Lanczos Ritz vector is non-finite or translation-only");for(double&x:r.vector)x/=rnorm;
-    r.residual=tail*std::abs(eig.vectors[static_cast<std::size_t>(m-1)+static_cast<std::size_t>(mode)*m])/rnorm;out.push_back(std::move(r));}
+    r.base_action.resize(d);r.additive_action.resize(d);baseline.apply(r.vector,r.base_action);apply_additive(graph,r.vector,sqrt_mass,sqrt_atom,theta,n,r.additive_action);
+    double residual2=0.0;for(int i=0;i<d;++i){const double residual=r.base_action[i]+r.additive_action[i]-r.value*r.vector[i];residual2+=residual*residual;}
+    r.residual=std::sqrt(residual2);if(!std::isfinite(r.residual))throw std::runtime_error("native fit Lanczos actual Ritz residual is non-finite");out.push_back(std::move(r));}
   return out;
 }
 
 std::vector<double> spectral_row(const Graph& graph,const std::vector<double>& v,const std::vector<double>& sqrt_mass,
   const int n,const int p)
 {
-  std::vector<double> design(static_cast<std::size_t>(3*n)*p);make_design(graph,v,sqrt_mass,n,p,design);std::vector<double> row(p,0.0);
-  for(int c=0;c<p;++c)for(int i=0;i<3*n;++i)row[c]-=v[i]*design[static_cast<std::size_t>(c)*3*n+i];return row;
+  std::vector<double> row(p,0.0);
+  for(const auto& e:graph.edges){
+    if(e.group<0||6*static_cast<std::size_t>(e.group)+5>=row.size())throw std::runtime_error("native fit spectral edge has an invalid type-pair group");
+    const double dx[3]={v[e.j]/sqrt_mass[e.j]-v[e.i]/sqrt_mass[e.i],
+      v[n+e.j]/sqrt_mass[n+e.j]-v[n+e.i]/sqrt_mass[n+e.i],
+      v[2*n+e.j]/sqrt_mass[2*n+e.j]-v[2*n+e.i]/sqrt_mass[2*n+e.i]};
+    const std::size_t c=6*static_cast<std::size_t>(e.group);
+    row[c]+=dx[0]*dx[0];row[c+1]+=2.0*dx[0]*dx[1];row[c+2]+=2.0*dx[0]*dx[2];
+    row[c+3]+=dx[1]*dx[1];row[c+4]+=2.0*dx[1]*dx[2];row[c+5]+=dx[2]*dx[2];
+  }
+  return row;
 }
 
 void apply_total(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& q,const std::vector<double>& sqrt_mass,
@@ -568,12 +584,17 @@ struct CGWitness {
   bool finite=false;
   std::vector<double> direction,action,base,add;
 };
-struct CGResult{std::vector<double> x;double relative_residual=0.0;CGWitness witness;};
+struct CGResult{std::vector<double> x;double relative_residual=0.0;int residual_restarts=0;CGWitness witness;};
 void write_cg_witness(const std::string& path,const CGWitness& w,const std::vector<double>& theta,
   const std::string& raw_path,const std::string& spool_path,const bool internal_mass_com)
 {
   std::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("cannot write native fit CG witness: "+path);out<<std::setprecision(17)<<"status NOT_ACCEPTED_REFERENCE\nclassification "<<w.classification<<"\nprobe "<<w.probe<<"\niteration "<<w.iteration<<"\np2 "<<w.p2<<"\npAp "<<w.pap<<"\nrayleigh_quotient "<<w.rayleigh<<"\nbase_rayleigh "<<w.base_rayleigh<<"\nadditive_rayleigh "<<w.add_rayleigh<<"\ncurvature_tolerance "<<w.curvature_tolerance<<"\nrepeat_rayleigh "<<w.repeat_rayleigh<<"\nrepeat_diff_norm "<<w.repeat_diff_norm<<"\ntranslation_overlap "<<w.translation_overlap<<"\nrelative_residual "<<w.relative_residual<<"\nfinite "<<w.finite<<"\nqraw_source "<<raw_path<<"\nsample_spool "<<spool_path<<"\nprobe_source fixed_seeded_random16_then_type_local_then_low_ritz; CG probe index above\ncoordinate_convention "<<(internal_mass_com?"internal mass-COM projected mass-weighted xyz-SoA":"raw mass-weighted xyz-SoA")<<"\ntheta "<<theta.size();for(double x:theta)out<<' '<<x;out<<"\n";
   auto vector=[&](const char* label,const std::vector<double>& x){out<<label<<' '<<x.size();for(double v:x)out<<' '<<v;out<<'\n';};vector("v_xyz_soa",w.direction);vector("Dv_xyz_soa",w.action);vector("base_Dv_xyz_soa",w.base);vector("additive_Dv_xyz_soa",w.add);out.close();if(!out)throw std::runtime_error("failed closing native fit CG witness: "+path);
+}
+bool preserve_candidate_package_on_full_spd_failure(const std::string& message,bool& pack_owned)
+{
+  if(message.find("qNEP translation-complement Hessian is not positive definite")!=0)return false;
+  pack_owned=false;return true;
 }
 CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
   const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<double>& theta,const int n,const int probe=-1,const double epsilon=0.0)
@@ -606,7 +627,7 @@ CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const st
        else {if(w.finite&&w.rayleigh>0.0&&w.rayleigh>=epsilon-w.curvature_tolerance)w.classification="NUMERICAL_BREAKDOWN";return out;}
     }
     const double alpha=rr/pap;for(std::size_t i=0;i<r.size();++i){out.x[i]+=alpha*p[i];r[i]-=alpha*ap[i];}project_translation(r,sqrt_atom,n);
-     const double next=std::inner_product(r.begin(),r.end(),r.begin(),0.0);out.relative_residual=std::sqrt(next)/initial;if(!std::isfinite(out.relative_residual)||!std::isfinite(alpha)||!std::isfinite(next))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG arithmetic became non-finite");if(out.relative_residual<=1e-8){apply_total(baseline,graph,out.x,sqrt_mass,sqrt_atom,theta,n,ap);for(std::size_t i=0;i<r.size();++i)r[i]=projected_rhs[i]-ap[i];project_translation(r,sqrt_atom,n);out.relative_residual=std::sqrt(std::inner_product(r.begin(),r.end(),r.begin(),0.0))/initial;if(!std::isfinite(out.relative_residual)||out.relative_residual>1e-8)throw std::runtime_error("NUMERICAL_BREAKDOWN: native fit response CG true residual exceeds tolerance");return out;}
+     const double next=std::inner_product(r.begin(),r.end(),r.begin(),0.0);out.relative_residual=std::sqrt(next)/initial;if(!std::isfinite(out.relative_residual)||!std::isfinite(alpha)||!std::isfinite(next))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG arithmetic became non-finite");if(out.relative_residual<=1e-8){apply_total(baseline,graph,out.x,sqrt_mass,sqrt_atom,theta,n,ap);for(std::size_t i=0;i<r.size();++i)r[i]=projected_rhs[i]-ap[i];project_translation(r,sqrt_atom,n);const double true2=std::inner_product(r.begin(),r.end(),r.begin(),0.0);out.relative_residual=std::sqrt(true2)/initial;if(!std::isfinite(out.relative_residual))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG true residual is non-finite");if(out.relative_residual<=1e-8)return out;if(out.residual_restarts>=2)throw std::runtime_error("NUMERICAL_BREAKDOWN: native fit response CG true residual exceeds tolerance after two restarts");rr=true2;p=r;++out.residual_restarts;continue;}
     const double beta=next/rr;for(std::size_t i=0;i<p.size();++i)p[i]=r[i]+beta*p[i];project_translation(p,sqrt_atom,n);rr=next;
   }
   throw std::runtime_error("NUMERICAL_BREAKDOWN: native fit response CG failed its 1e-8 residual tolerance");
@@ -616,42 +637,77 @@ std::vector<std::vector<double>> make_probes(const std::vector<RitzMode>& soft,c
   const std::vector<int>& types,const int n)
 {
   const int d=3*n,internal=d-3;std::vector<std::vector<double>> probes;probes.reserve(std::min(24,internal));std::uint64_t state=0x243f6a8885a308d3ULL;
-  auto add=[&](std::vector<double> v){project_translation(v,sqrt_mass,n);for(const auto&w:probes){const double c=std::inner_product(v.begin(),v.end(),w.begin(),0.0);for(int i=0;i<d;++i)v[i]-=c*w[i];}const double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(norm>1e-10){for(double&x:v)x/=norm;probes.push_back(std::move(v));}};
+  auto add=[&](std::vector<double> v){project_translation(v,sqrt_mass,n);for(const auto&w:probes){const double c=std::inner_product(v.begin(),v.end(),w.begin(),0.0);for(int i=0;i<d;++i)v[i]-=c*w[i];}const double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(norm>1e-10){for(double&x:v)x/=norm;probes.push_back(std::move(v));return true;}return false;};
   for(int k=0;k<std::min(16,internal);++k){std::vector<double> v(d);for(double&x:v){state^=state>>12;state^=state<<25;state^=state>>27;x=(static_cast<double>((state*2685821657736338717ULL)>>11)/9007199254740992.0)-0.5;}add(std::move(v));}
   std::set<int> seen_types;for(int atom=0;atom<n&&seen_types.size()<4&&static_cast<int>(probes.size())<internal;++atom)if(seen_types.insert(types[atom]).second){std::vector<double> v(d);for(int a=0;a<3;++a)v[a*n+atom]=sqrt_mass[atom];add(std::move(v));}
-  for(std::size_t i=0;i<soft.size()&&i<4&&static_cast<int>(probes.size())<internal;++i)add(soft[i].vector);
+  int low_mode_probes=0;for(std::size_t i=0;i<soft.size()&&low_mode_probes<4&&static_cast<int>(probes.size())<internal;++i)if(add(soft[i].vector))++low_mode_probes;
   if(probes.empty())throw std::runtime_error("native fit could not construct an independent response probe");return probes;
 }
 
-struct ResponseCheck{double response=0.0,ibp=0.0,cg=0.0,force_residual=0.0;int probes=0;CGWitness witness;};
+struct ResponseCheck{
+  double response=std::numeric_limits<double>::quiet_NaN(),ibp=std::numeric_limits<double>::quiet_NaN(),cg=std::numeric_limits<double>::quiet_NaN(),force_residual=std::numeric_limits<double>::quiet_NaN();
+  double observed_cov_min=std::numeric_limits<double>::quiet_NaN(),observed_cov_max=std::numeric_limits<double>::quiet_NaN(),observed_cov_condition=std::numeric_limits<double>::quiet_NaN();
+  double predicted_cov_min=std::numeric_limits<double>::quiet_NaN(),predicted_cov_max=std::numeric_limits<double>::quiet_NaN(),predicted_cov_condition=std::numeric_limits<double>::quiet_NaN();
+  double block_variance_max_relative_delta=std::numeric_limits<double>::quiet_NaN();
+  std::array<double,4> block_variance_relative_delta={std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN()};
+  std::array<int,4> block_frames{};
+  std::uint64_t validation_frames=0;
+  int probes=0,cg_residual_restarts=0;
+  bool observed_cov_available=false,predicted_cov_available=false,cg_residual_available=false,response_ibp_available=false,force_residual_available=false;
+  CGWitness witness;
+};
+void write_response_stats(std::ostream& out,const ResponseCheck& r)
+{
+  out<<"validation_frames="<<r.validation_frames<<" probes="<<r.probes
+    <<" observed_cov_status="<<(r.observed_cov_available?"AVAILABLE":"NOT_COMPUTED")<<" observed_cov_min="<<r.observed_cov_min
+    <<" observed_cov_max="<<r.observed_cov_max<<" observed_cov_condition="<<r.observed_cov_condition
+    <<" predicted_cov_status="<<(r.predicted_cov_available?"AVAILABLE":"NOT_COMPUTED")<<" predicted_cov_min="<<r.predicted_cov_min<<" predicted_cov_max="<<r.predicted_cov_max
+    <<" predicted_cov_condition="<<r.predicted_cov_condition<<" block_frames=";
+  for(int i=0;i<4;++i)out<<(i?",":"")<<r.block_frames[i];
+  out<<" block_variance_relative_delta=";
+  for(int i=0;i<4;++i)out<<(i?",":"")<<r.block_variance_relative_delta[i];
+  out<<" block_variance_max_relative_delta="<<r.block_variance_max_relative_delta
+    <<" cg_residual_restarts="<<r.cg_residual_restarts<<" cg_residual_status="<<(r.cg_residual_available?"AVAILABLE":"NOT_COMPUTED")
+    <<" cg_true_residual="<<r.cg<<" response_ibp_status="<<(r.response_ibp_available?"AVAILABLE":"NOT_COMPUTED")<<" response="<<r.response<<" ibp="<<r.ibp
+    <<" force_residual_status="<<(r.force_residual_available?"AVAILABLE":"NOT_COMPUTED")<<" heldout_force_residual="<<r.force_residual;
+}
 ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& theta,
   const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<int>& types,const int n,
   const std::vector<double>& r0,std::ifstream& spool,const std::streamoff frame_start,const std::uint64_t frame_count,const int train,
-  const int sample_interval,const double temperature,const std::vector<RitzMode>& soft,const double epsilon=0.0)
+  const int sample_interval,const double temperature,const std::vector<RitzMode>& soft,const double epsilon=0.0,ResponseCheck* progress=nullptr)
 {
-  const int d=3*n;const auto probes=make_probes(soft,sqrt_atom,types,n);const int m=static_cast<int>(probes.size());if(frame_count-train<=static_cast<std::uint64_t>(m))throw std::runtime_error("native fit held-out frames must exceed the fixed probe count");
+  const int d=3*n;const auto probes=make_probes(soft,sqrt_atom,types,n);const int m=static_cast<int>(probes.size());ResponseCheck result;result.probes=m;
+  if(frame_count<static_cast<std::uint64_t>(train))throw std::runtime_error("native fit held-out frame count is invalid");
+  result.validation_frames=frame_count-train;if(progress)*progress=result;
+  if(result.validation_frames<=static_cast<std::uint64_t>(m))throw std::runtime_error("native fit held-out frames must exceed the fixed probe count");
   std::vector<double> predicted(static_cast<std::size_t>(m)*m),rhs(d);double max_cg=0.0;
-  for(int j=0;j<m;++j){const CGResult cg=solve_projected_cg(baseline,graph,probes[j],sqrt_mass,sqrt_atom,theta,n,j,epsilon);if(!cg.witness.classification.empty()){ResponseCheck failed;failed.probes=m;failed.witness=cg.witness;return failed;}max_cg=std::max(max_cg,cg.relative_residual);for(int i=0;i<m;++i)predicted[static_cast<std::size_t>(i)*m+j]=K_B*temperature*std::inner_product(probes[i].begin(),probes[i].end(),cg.x.begin(),0.0);}
-  std::vector<double> sumq(m,0.0),sumf(m,0.0),q2(static_cast<std::size_t>(m)*m,0.0),fq(static_cast<std::size_t>(m)*m,0.0),x(d),f(d),q(d),fw(d),base(d),add(d),target(d);double residual2=0.0,force2=0.0;spool.clear();spool.seekg(frame_start);double step=0.0,previous=-std::numeric_limits<double>::infinity();
+  for(int j=0;j<m;++j){const CGResult cg=solve_projected_cg(baseline,graph,probes[j],sqrt_mass,sqrt_atom,theta,n,j,epsilon);result.cg_residual_restarts+=cg.residual_restarts;if(!cg.witness.classification.empty()){result.cg=cg.relative_residual;result.cg_residual_available=true;result.witness=cg.witness;if(progress)*progress=result;return result;}max_cg=std::max(max_cg,cg.relative_residual);for(int i=0;i<m;++i)predicted[static_cast<std::size_t>(i)*m+j]=K_B*temperature*std::inner_product(probes[i].begin(),probes[i].end(),cg.x.begin(),0.0);}
+  result.cg=max_cg;result.cg_residual_available=true;if(progress)*progress=result;
+  const int nv=static_cast<int>(result.validation_frames);std::vector<double> sumq(m,0.0),sumf(m,0.0),q2(static_cast<std::size_t>(m)*m,0.0),fq(static_cast<std::size_t>(m)*m,0.0),block_q(static_cast<std::size_t>(4)*m,0.0),block_q2(block_q.size(),0.0),x(d),f(d),q(d),fw(d),base(d),add(d),target(d);double residual2=0.0,force2=0.0;spool.clear();spool.seekg(frame_start);double step=0.0,previous=-std::numeric_limits<double>::infinity();
   for(std::uint64_t frame=0;frame<frame_count;++frame){read_frame(spool,x,f,step);if(!(step>previous)||(frame&&std::abs((step-previous)-sample_interval)>1e-9))throw std::runtime_error("native fit validation steps do not match sample_interval");previous=step;if(frame<static_cast<std::uint64_t>(train))continue;
      for(int i=0;i<d;++i){q[i]=sqrt_mass[i]*(x[i]-r0[i]);fw[i]=f[i]/sqrt_mass[i];}
      project_translation(q,sqrt_atom,n);project_translation(fw,sqrt_atom,n);baseline.apply(q,base);apply_additive(graph,q,sqrt_mass,sqrt_atom,theta,n,add);for(int i=0;i<d;++i){target[i]=fw[i]+base[i];residual2+=(target[i]+add[i])*(target[i]+add[i]);force2+=fw[i]*fw[i];}std::vector<double> qp(m),fp(m);for(int a=0;a<m;++a){qp[a]=std::inner_product(probes[a].begin(),probes[a].end(),q.begin(),0.0);fp[a]=std::inner_product(probes[a].begin(),probes[a].end(),fw.begin(),0.0);sumq[a]+=qp[a];sumf[a]+=fp[a];}
+    const int block=std::min(3,static_cast<int>((frame-train)*4/result.validation_frames));++result.block_frames[block];for(int a=0;a<m;++a){const std::size_t ba=static_cast<std::size_t>(block)*m+a;block_q[ba]+=qp[a];block_q2[ba]+=qp[a]*qp[a];}
     for(int a=0;a<m;++a)for(int b=0;b<m;++b){q2[static_cast<std::size_t>(a)*m+b]+=qp[a]*qp[b];fq[static_cast<std::size_t>(a)*m+b]+=fp[a]*qp[b];}
   }
-  const int nv=static_cast<int>(frame_count-train);std::vector<double> observed(q2.size()),ibp(q2.size());
+  std::vector<double> observed(q2.size()),ibp(q2.size());
   for(int a=0;a<m;++a)for(int b=0;b<m;++b){const std::size_t ij=static_cast<std::size_t>(a)*m+b;observed[ij]=q2[ij]/nv-(sumq[a]/nv)*(sumq[b]/nv);ibp[ij]=fq[ij]/(nv*K_B*temperature)-(sumf[a]/nv)*(sumq[b]/nv)/(K_B*temperature)+(a==b?1.0:0.0);}
   // Symmetric whitening on the finite, declared probe subspace.
   for(int i=0;i<m;++i)for(int j=i+1;j<m;++j){const double v=.5*predicted[static_cast<std::size_t>(i)*m+j]+.5*predicted[static_cast<std::size_t>(j)*m+i];predicted[static_cast<std::size_t>(i)*m+j]=predicted[static_cast<std::size_t>(j)*m+i]=v;}
   for(int i=0;i<m;++i)for(int j=i+1;j<m;++j){const double v=.5*observed[static_cast<std::size_t>(i)*m+j]+.5*observed[static_cast<std::size_t>(j)*m+i];observed[static_cast<std::size_t>(i)*m+j]=observed[static_cast<std::size_t>(j)*m+i]=v;}
-  const SmallEigen oe=eigen_small(solver,observed,m);if(!(oe.values.front()>0.0)||oe.values.front()<=oe.values.back()*1e-12)throw std::runtime_error("native fit held-out probe covariance is rank deficient or too small to validate");
-  const SmallEigen pe=eigen_small(solver,predicted,m);if(!(pe.values.front()>0.0)||pe.values.front()<=pe.values.back()*1e-12)throw std::runtime_error("native fit predicted probe response is non-positive or ill-conditioned");
+  const SmallEigen oe=eigen_small(solver,observed,m);result.observed_cov_min=oe.values.front();result.observed_cov_max=oe.values.back();result.observed_cov_condition=oe.values.front()>0.0?oe.values.back()/oe.values.front():std::numeric_limits<double>::infinity();
+  result.block_variance_relative_delta.fill(0.0);result.block_variance_max_relative_delta=0.0;for(int b=0;b<4;++b){for(int a=0;a<m;++a){const double overall=observed[static_cast<std::size_t>(a)*m+a];const std::size_t ba=static_cast<std::size_t>(b)*m+a;const double count=result.block_frames[b];const double block_variance=count>0.0?block_q2[ba]/count-(block_q[ba]/count)*(block_q[ba]/count):0.0;const double delta=overall>0.0?std::abs(block_variance/overall-1.0):std::numeric_limits<double>::infinity();result.block_variance_relative_delta[b]=std::max(result.block_variance_relative_delta[b],delta);}result.block_variance_max_relative_delta=std::max(result.block_variance_max_relative_delta,result.block_variance_relative_delta[b]);}
+  result.observed_cov_available=true;if(progress)*progress=result;
+  if(!(oe.values.front()>0.0)||oe.values.front()<=oe.values.back()*1e-12)throw std::runtime_error("native fit held-out probe covariance is rank deficient or too small to validate");
+  const SmallEigen pe=eigen_small(solver,predicted,m);result.predicted_cov_min=pe.values.front();result.predicted_cov_max=pe.values.back();result.predicted_cov_condition=pe.values.front()>0.0?pe.values.back()/pe.values.front():std::numeric_limits<double>::infinity();result.predicted_cov_available=true;if(progress)*progress=result;
+  if(!(pe.values.front()>0.0)||pe.values.front()<=pe.values.back()*1e-12)throw std::runtime_error("native fit predicted probe response is non-positive or ill-conditioned");
   std::vector<double> invroot(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i)for(int j=0;j<m;++j)for(int k=0;k<m;++k)invroot[static_cast<std::size_t>(i)*m+j]+=pe.vectors[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*m]*pe.vectors[static_cast<std::size_t>(j)+static_cast<std::size_t>(k)*m]/std::sqrt(pe.values[k]);
   std::vector<double> whitened(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i)for(int j=0;j<m;++j){for(int a=0;a<m;++a)for(int b=0;b<m;++b)whitened[static_cast<std::size_t>(i)*m+j]+=invroot[static_cast<std::size_t>(i)*m+a]*(observed[static_cast<std::size_t>(a)*m+b]-predicted[static_cast<std::size_t>(a)*m+b])*invroot[static_cast<std::size_t>(b)*m+j];}
   const SmallEigen re=eigen_small(solver,whitened,m);double response=0.0;for(double e:re.values)response=std::max(response,std::abs(e));
   std::vector<double> gram(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i)for(int j=0;j<m;++j)for(int k=0;k<m;++k)gram[static_cast<std::size_t>(i)*m+j]+=ibp[static_cast<std::size_t>(k)*m+i]*ibp[static_cast<std::size_t>(k)*m+j];
-  const SmallEigen ie=eigen_small(solver,gram,m);const double ibp_error=std::sqrt(std::max(0.0,ie.values.back()));if(!std::isfinite(response)||!std::isfinite(ibp_error)||!std::isfinite(max_cg))throw std::runtime_error("native fit response diagnostics are non-finite");
+  const SmallEigen ie=eigen_small(solver,gram,m);const double ibp_error=std::sqrt(std::max(0.0,ie.values.back()));result.response=response;result.ibp=ibp_error;result.response_ibp_available=true;if(progress)*progress=result;if(!std::isfinite(response)||!std::isfinite(ibp_error)||!std::isfinite(max_cg))throw std::runtime_error("native fit response diagnostics are non-finite");
   if(!std::isfinite(residual2)||!std::isfinite(force2)||force2<0.0)throw std::runtime_error("native fit held-out force residual is non-finite");const double heldout_residual=force2>0.0?std::sqrt(residual2/force2):(residual2==0.0?0.0:std::numeric_limits<double>::infinity());if(!std::isfinite(heldout_residual))throw std::runtime_error("native fit held-out residual is nonzero at zero physical-force scale");
-  return {response,ibp_error,max_cg,heldout_residual,m};
+  result.force_residual=heldout_residual;result.force_residual_available=true;if(progress)*progress=result;return result;
 }
 
 void householder_compress(std::vector<double>& a, std::vector<double>& y, const int rows, const int cols,
@@ -724,7 +780,7 @@ void make_edge_linear(const Graph& graph,const std::vector<double>& raw_gradient
 } // namespace
 
 static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& options,const std::string& spool_path,
-  const std::uint64_t frame_count,Atom& atom,Box& box,Force& force)
+  const std::uint64_t frame_count,Atom& atom,Box& box,Force& force,const bool sample_beads_from_header=false)
 {
   if(options.output_path.empty()||options.kernel_table.empty()||spool_path.empty()||!std::isfinite(options.temperature)||options.temperature<=0.0||
      !std::isfinite(options.cutoff)||options.cutoff<=0.0||!std::isfinite(options.epsilon)||options.epsilon<=0.0||
@@ -736,7 +792,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   if(n<2||atom.cpu_mass.size()!=static_cast<std::size_t>(n)||atom.cpu_type.size()!=static_cast<std::size_t>(n)||validation<1)
     throw std::runtime_error("native rpmd_ja fit requires initialized atom masses/types and at least three frames");
   std::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
-  const SampleHeader header=read_header(in,frame_count,atom,box,options.temperature);
+  const SampleHeader header=read_header(in,frame_count,atom,box,options.temperature,false,sample_beads_from_header);
   std::set<int> unique_types(header.types.begin(),header.types.end());
   const int expected_probes=std::min(3*n-3,16+std::min(4,static_cast<int>(unique_types.size()))+4);
   if(validation<=expected_probes)throw std::runtime_error("native fit requires at least " + std::to_string(expected_probes+1) + " held-out frames for its fixed probe policy");
@@ -758,11 +814,14 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   if(design_bytes>std::numeric_limits<std::size_t>::max()-qr_bytes)throw std::runtime_error("native fit actual host/GPU frame storage estimate overflows");
   std::printf("    rpmd_ja native fit family: fixed cutoff graph, %zu unordered type pairs, %zu shared lab-frame symmetric parameters; training=%d validation=%d; frame design %.3f MiB\n",
     graph.type_pairs.size(),psize,train,validation,static_cast<double>(design_bytes)/(1024*1024));
-  std::vector<double> saved(static_cast<std::size_t>(d));atom.position_per_atom.copy_to_host(saved.data());
-  struct Restore { Atom& atom; std::vector<double>& x; ~Restore(){atom.position_per_atom.copy_from_host(x.data());} } restore{atom,saved};
-  atom.position_per_atom.copy_from_host(r0.data());
-  const std::string raw_path=options.output_path+".qraw",pack_path=options.output_path+".additive.tmp",fit_path=options.output_path+".fit.txt",fit_tmp=fit_path+".tmp",trace_path=options.output_path+".fit_trace.txt",witness_path=options.output_path+".cg_witness.txt",qp_state_path=options.output_path+".qp_state.txt";
-  {std::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),qp_state_old(qp_state_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
+  const std::string generated_raw_path=options.output_path+".qraw",raw_path=options.raw_input_path.empty()?generated_raw_path:options.raw_input_path;
+  const std::string pack_path=options.output_path+".additive.tmp",fit_path=options.output_path+".fit.txt",fit_tmp=fit_path+".tmp",trace_path=options.output_path+".fit_trace.txt",witness_path=options.output_path+".cg_witness.txt",qp_state_path=options.output_path+".qp_state.txt";
+  const bool generate_raw=options.raw_input_path.empty();
+  std::vector<double> saved;
+  struct Restore { Atom& atom; std::vector<double>& x; bool active; ~Restore(){if(active)atom.position_per_atom.copy_from_host(x.data());} };
+  if(generate_raw){if(atom.position_per_atom.size()!=static_cast<std::size_t>(d))throw std::runtime_error("native fit raw generation requires an initialized centroid position array");saved.resize(static_cast<std::size_t>(d));atom.position_per_atom.copy_to_host(saved.data());atom.position_per_atom.copy_from_host(r0.data());}
+  Restore restore{atom,saved,generate_raw};
+  {std::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(generated_raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),qp_state_old(qp_state_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
     if(!kernel)throw std::runtime_error("native fit cannot read its qNEP kernel table");kernel.seekg(0,std::ios::end);const auto kernel_bytes=kernel.tellg();if(kernel_bytes<=0||kernel_bytes>std::numeric_limits<std::streamoff>::max())throw std::runtime_error("native fit qNEP kernel table has invalid or overflowing byte length");if(old.good()||side.good()||raw_old.good()||pack_old.good()||fit_old.good()||fit_tmp_old.good()||trace_old.good()||witness_old.good()||qp_state_old.good()||failure.good()||tmp.good()||side_tmp.good())throw std::runtime_error("native fit refuses to overwrite an existing output or scratch artifact");}
   const std::uint64_t d64=static_cast<std::uint64_t>(d),n64=static_cast<std::uint64_t>(n),dd64=d64*d64,vd64=d64*n64;
   if(dd64>(std::numeric_limits<std::uint64_t>::max()-18)/7||vd64>(std::numeric_limits<std::uint64_t>::max()-7*dd64-18)/2)throw std::runtime_error("native fit qraw size estimate overflows");
@@ -772,26 +831,43 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::size_t free_before=0,total_before=0;if(cudaMemGetInfo(&free_before,&total_before)!=cudaSuccess)throw std::runtime_error("native fit CUDA memory preflight failed");
   std::printf("    rpmd_ja native fit preflight: qraw %.2f GiB, GPU baseline %.2f GiB, free GPU %.2f GiB, host design+QR %.2f MiB\n",static_cast<double>(raw_bytes)/(1024.0*1024.0*1024.0),static_cast<double>(dd64*sizeof(double))/(1024.0*1024.0*1024.0),static_cast<double>(free_before)/(1024.0*1024.0*1024.0),static_cast<double>(design_bytes+qr_bytes)/(1024.0*1024.0));
   if(dd64*sizeof(double)>free_before||free_before-dd64*sizeof(double)<256ULL*1024*1024)throw std::runtime_error("native fit baseline matrix does not fit current GPU memory with a 256 MiB safety margin");
-  struct OwnScratch{std::string raw,pack,output,sidecar,fit,fit_tmp;bool raw_owned=false,pack_owned=false,output_owned=false,sidecar_owned=false,fit_owned=false,fit_tmp_owned=false;~OwnScratch(){if(raw_owned)std::remove(raw.c_str());if(pack_owned)std::remove(pack.c_str());if(output_owned)std::remove(output.c_str());if(sidecar_owned)std::remove(sidecar.c_str());if(fit_owned)std::remove(fit.c_str());if(fit_tmp_owned)std::remove(fit_tmp.c_str());}} own_scratch{raw_path,pack_path,options.output_path,options.output_path+".stability",fit_path,fit_tmp};
+  struct OwnScratch{std::string raw,pack,output,sidecar,fit,fit_tmp;bool raw_owned=false,pack_owned=false,output_owned=false,sidecar_owned=false,fit_owned=false,fit_tmp_owned=false;~OwnScratch(){if(raw_owned)std::remove(raw.c_str());if(pack_owned)std::remove(pack.c_str());if(output_owned)std::remove(output.c_str());if(sidecar_owned)std::remove(sidecar.c_str());if(fit_owned)std::remove(fit.c_str());if(fit_tmp_owned)std::remove(fit_tmp.c_str());}} own_scratch{generated_raw_path,pack_path,options.output_path,options.output_path+".stability",fit_path,fit_tmp};
   std::printf("    rpmd_ja fit reference policy: %s; raw qraw remains the unmodified native derivative source\n",
     options.internal_mass_com?"internal_mass_com_pullback_v1 (raw net force diagnostic only)":"strict raw zero-net gradient");
-  generate_rpmd_ja_qnep_raw(raw_path,options.temperature,options.fd_step,options.kernel_table,atom,box,force,!options.internal_mass_com);
-  own_scratch.raw_owned=true;
-  std::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("native fit did not find generated qNEP raw reference");
+  if(generate_raw){generate_rpmd_ja_qnep_raw(generated_raw_path,options.temperature,options.fd_step,options.kernel_table,atom,box,force,!options.internal_mass_com);own_scratch.raw_owned=true;}
+  std::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("native fit cannot read qNEP raw reference: "+raw_path);
   char rawmagic[8];raw.read(rawmagic,8);const auto rawver=read<std::uint32_t>(raw,"qraw version");const auto endian=read<std::uint32_t>(raw,"qraw byte order");const int raw_n=read<std::int32_t>(raw,"qraw atom count"),raw_d=read<std::int32_t>(raw,"qraw dimension");
-  const double rawT=read<double>(raw,"qraw temperature");const double rawfd=read<double>(raw,"qraw fd step");(void)read<std::uint64_t>(raw,"qraw model fingerprint");(void)read<std::uint64_t>(raw,"qraw config fingerprint");
-  (void)read<std::int32_t>(raw,"qraw charge mode");(void)read<std::int32_t>(raw,"qraw kspace flag");(void)read<double>(raw,"qraw mesh spacing");
+  const double rawT=read<double>(raw,"qraw temperature");const double rawfd=read<double>(raw,"qraw fd step");const auto raw_model=read<std::uint64_t>(raw,"qraw model fingerprint");const auto raw_config=read<std::uint64_t>(raw,"qraw config fingerprint");
+  const int raw_charge=read<std::int32_t>(raw,"qraw charge mode"),raw_kspace=read<std::int32_t>(raw,"qraw kspace flag");const double raw_mesh=read<double>(raw,"qraw mesh spacing");
   char layout[sizeof("xyz_soa;derivative_input_rows_output_columns")];raw.read(layout,sizeof(layout));
-  raw.seekg(18*sizeof(double)+3*sizeof(std::int32_t),std::ios::cur);
-  raw.seekg(static_cast<std::streamoff>(n)*(sizeof(std::int32_t)+sizeof(double))+static_cast<std::streamoff>(d)*sizeof(double),std::ios::cur);
+  if(!raw||std::memcmp(rawmagic,"GPJQRAW\0",8)||rawver!=3||endian!=native_endian||raw_n!=n||raw_d!=d||
+     rawT!=options.temperature||rawfd!=options.fd_step||std::memcmp(layout,"xyz_soa;derivative_input_rows_output_columns",sizeof(layout)))
+    throw std::runtime_error("qraw version, dimensions, temperature, fd step, or matrix layout does not match native fit assumptions");
+  double raw_cell[18];raw.read(reinterpret_cast<char*>(raw_cell),sizeof(raw_cell));int raw_pbc[3];raw.read(reinterpret_cast<char*>(raw_pbc),sizeof(raw_pbc));
+  std::vector<std::int32_t> raw_types(n);std::vector<double> raw_masses(n),raw_positions(d);
+  read_array(raw,raw_types.data(),raw_types.size(),"qraw atom types");read_array(raw,raw_masses.data(),raw_masses.size(),"qraw atom masses");read_array(raw,raw_positions.data(),raw_positions.size(),"qraw reference positions");
   raw.seekg(sizeof(double)+static_cast<std::streamoff>(n)*sizeof(double)+static_cast<std::streamoff>(d)*sizeof(double)+static_cast<std::streamoff>(9*n)*sizeof(double),std::ios::cur);
   const std::streamoff data=raw.tellg();const std::uint64_t dd=static_cast<std::uint64_t>(d)*d,vd=static_cast<std::uint64_t>(d)*n;
   const std::streamoff k_offset=data+static_cast<std::streamoff>(vd+3*dd)*sizeof(double);
-  if(!raw||std::memcmp(rawmagic,"GPJQRAW\0",8)||rawver!=3||endian!=native_endian||raw_n!=n||raw_d!=d||rawT!=options.temperature||rawfd!=options.fd_step||
-     std::memcmp(layout,"xyz_soa;derivative_input_rows_output_columns",sizeof(layout)))throw std::runtime_error("generated qNEP raw header does not match native fit assumptions");
+  auto* active_qnep=force.get_number_of_potentials()==1?dynamic_cast<NEP_Charge*>(&force.get_potential(0)):nullptr;
+  if(active_qnep==nullptr||!active_qnep->uses_pppm())throw std::runtime_error("native fit qraw validation requires exactly one qNEP potential using PPPM");
+  const double active_mesh=active_qnep->get_pppm_mesh_spacing();
+  const auto expected_model=rpmd_ja_model_fingerprint(force.primary_nep_model_path());
+  const auto expected_config=rpmd_ja_qnep_config_fingerprint(force);
+  bool raw_geometry_matches=std::all_of(raw_cell,raw_cell+18,[](double x){return std::isfinite(x);})&&
+    std::all_of(raw_positions.begin(),raw_positions.end(),[](double x){return std::isfinite(x);});
+  for(int i=0;i<18&&raw_geometry_matches;++i)raw_geometry_matches=std::abs(raw_cell[i]-box.cpu_h[i])<=1e-10*std::max(1.0,std::abs(box.cpu_h[i]));
+  for(int i=0;i<9&&raw_geometry_matches;++i)raw_geometry_matches=std::abs(raw_cell[i]-header.cell[i])<=1e-10*std::max(1.0,std::abs(header.cell[i]));
+  for(int i=0;i<3&&raw_geometry_matches;++i)raw_geometry_matches=raw_pbc[i]==1;
+  for(int i=0;i<n&&raw_geometry_matches;++i)raw_geometry_matches=raw_types[i]==header.types[i]&&raw_masses[i]==header.masses[i];
+  for(int i=0;i<d&&raw_geometry_matches;++i)raw_geometry_matches=std::abs(raw_positions[i]-r0[i])<=1e-10*std::max(1.0,std::abs(r0[i]));
+  if(!raw||raw_model!=expected_model||raw_config!=expected_config||raw_charge!=active_qnep->get_charge_mode()||raw_kspace!=1||
+     !std::isfinite(raw_mesh)||std::abs(raw_mesh-active_mesh)>1e-12*std::max(1.0,std::abs(active_mesh))||
+     !raw_geometry_matches)
+    throw std::runtime_error("qNEP qraw model, PPPM configuration, temperature, step, atom identity, cell, or sampled training R0 does not match current fit inputs");
   raw.seekg(0,std::ios::end);const std::streamoff raw_end=raw.tellg();const std::uint64_t raw_expected=static_cast<std::uint64_t>(data)+((2*vd+7*dd+18)*sizeof(double));
-  if(raw_expected>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())||raw_end!=static_cast<std::streamoff>(raw_expected))throw std::runtime_error("generated qNEP raw file byte length is invalid");
-  double raw_stats[18];raw.seekg(static_cast<std::streamoff>(data)+static_cast<std::streamoff>(2*vd+7*dd)*sizeof(double));raw.read(reinterpret_cast<char*>(raw_stats),sizeof(raw_stats));const bool finite_stats=std::all_of(raw_stats,raw_stats+18,[](double v){return std::isfinite(v)&&v>=0.0;});const bool raw_v1=raw_stats[17]==1.0&&raw_stats[1]<=1e-4&&std::max({raw_stats[2],raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;const bool raw_v2=raw_stats[17]==2.0&&raw_stats[1]<=1e-4&&raw_stats[3]<=1e-4&&std::max({raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;const bool raw_v3=raw_stats[17]==3.0&&raw_stats[1]<=1e-4&&raw_stats[3]<=1e-4&&std::max({raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;if(!raw||!finite_stats||raw_stats[16]!=options.fd_step||(rawver==1?!raw_v1:(rawver==2?!raw_v2:!raw_v3)))throw std::runtime_error("generated qNEP raw diagnostics fail accepted limits");raw.clear();
+  if(raw_expected>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())||raw_end!=static_cast<std::streamoff>(raw_expected))throw std::runtime_error("qNEP raw file byte length is invalid");
+  double raw_stats[18];raw.seekg(static_cast<std::streamoff>(data)+static_cast<std::streamoff>(2*vd+7*dd)*sizeof(double));raw.read(reinterpret_cast<char*>(raw_stats),sizeof(raw_stats));const bool finite_stats=std::all_of(raw_stats,raw_stats+18,[](double v){return std::isfinite(v)&&v>=0.0;});const bool raw_v1=raw_stats[17]==1.0&&raw_stats[1]<=1e-4&&std::max({raw_stats[2],raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;const bool raw_v2=raw_stats[17]==2.0&&raw_stats[1]<=1e-4&&raw_stats[3]<=1e-4&&std::max({raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;const bool raw_v3=raw_stats[17]==3.0&&raw_stats[1]<=1e-4&&raw_stats[3]<=1e-4&&std::max({raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;if(!raw||!finite_stats||raw_stats[16]!=options.fd_step||(rawver==1?!raw_v1:(rawver==2?!raw_v2:!raw_v3)))throw std::runtime_error("qNEP raw diagnostics fail accepted limits");raw.clear();
   std::vector<double> raw_gradient(d),site(n);for(int a=0;a<d;++a){raw.clear();raw.seekg(data+static_cast<std::streamoff>(a)*n*sizeof(double));read_array(raw,site.data(),n,"raw qNEP site gradient");if(!std::all_of(site.begin(),site.end(),[](double v){return std::isfinite(v);}))throw std::runtime_error("native fit qNEP site gradient contains non-finite values");raw_gradient[a]=std::accumulate(site.begin(),site.end(),0.0);if(!std::isfinite(raw_gradient[a]))throw std::runtime_error("native fit qNEP reference gradient is non-finite");}
    own_scratch.raw_owned=false;
    const auto raw_net=rpmd_ja_reference_math::net_force_stats(raw_gradient,n);
@@ -846,19 +922,57 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(!trace)throw std::runtime_error("failed writing native fit QP trace: "+trace_path);
     return std::move(qp.certificate.theta);
   };
-  for(int outer=0;outer<40;++outer){
-    const int steps=std::min(96,d-3);const auto modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4);if(modes.empty())throw std::runtime_error("native fit Lanczos returned no Ritz modes");const double min_ritz=modes.front().value,ritz_residual=modes.front().residual;bool observed_violation=false,added_cut=false;
-    for(const auto& mode:modes){std::vector<double> base_mode(d),add_mode(d);baseline.apply(mode.vector,base_mode);apply_additive(graph,mode.vector,sqrt_mass,sqrt_mass_atom,theta,n,add_mode);const double base_value=std::inner_product(mode.vector.begin(),mode.vector.end(),base_mode.begin(),0.0),rayleigh=base_value+std::inner_product(mode.vector.begin(),mode.vector.end(),add_mode.begin(),0.0);const auto row=spectral_row(graph,mode.vector,sqrt_mass,n,static_cast<int>(psize));double scale=std::max(1.0,std::abs(base_value));for(int i=0;i<static_cast<int>(psize);++i)scale+=std::abs(row[i]*theta[i]);if(!std::isfinite(base_value)||!std::isfinite(rayleigh)||!std::isfinite(scale)||!std::all_of(base_mode.begin(),base_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(add_mode.begin(),add_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: sampled Ritz evidence is non-finite");const double mode_tolerance=std::min(options.epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);if(rayleigh>=options.epsilon-mode_tolerance)continue;observed_violation=true;added_cut|=add_cut(mode.vector,base_value,outer,"RITZ");}
-    trace<<"outer "<<outer<<" sampled_min_ritz "<<min_ritz<<" ritz_residual "<<ritz_residual<<" lanczos_steps "<<steps<<" observed_directions "<<modes.size()<<" constraints "<<cut_rows.size()<<" cg_feedback none status "<<(observed_violation?"RETRY":"CHECK_CG")<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit trace: "+trace_path);
-    if(observed_violation){if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==39)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after 40 rounds");theta=solve_qp_and_trace(outer);continue;}
-    try{response=validate_probes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,options.sample_interval,options.temperature,modes,options.epsilon);}catch(const std::exception& e){trace<<"outer "<<outer<<" status PROBE_VALIDATION_FAIL detail "<<e.what()<<"\n";trace.flush();throw;}
-    if(response.witness.classification.empty()){const bool response_pass=response.response<=options.response_tolerance&&response.ibp<=options.response_tolerance;std::printf("    rpmd_ja fit RESPONSE_CHECK %s: response=%.6g IBP=%.6g limit=%.6g; CG true residual=%.3g; FULL_CERTIFICATE PENDING\n",response_pass?"PASS":"FAIL",response.response,response.ibp,options.response_tolerance,response.cg);trace<<"outer "<<outer<<" status CG_PASS response_check "<<(response_pass?"PASS":"FAIL")<<" cg_true_residual "<<response.cg<<" response "<<response.response<<" ibp "<<response.ibp<<" response_tolerance "<<options.response_tolerance<<" constraints "<<cut_rows.size()<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!response_pass)throw std::runtime_error("RESPONSE_CHECK_FAIL: native fit held-out probe response or force-position IBP exceeds declared tolerance");fit_converged=true;break;}
+  int search_depth=std::min(96,d-3),consecutive_cg_feedback=0;
+  std::vector<double> previous_low_ritz,cg_witness_seed;
+  const int max_search_depth=std::min(384,d-3);
+  auto deepen_search=[&](){if(search_depth<max_search_depth)search_depth=std::min(max_search_depth,2*search_depth);};
+  for(int outer=0;outer<80;++outer){
+    const int steps=std::min(search_depth,d-3);
+    const std::string seed_source=!cg_witness_seed.empty()?"CG_WITNESS":(!previous_low_ritz.empty()?"LOWEST_RITZ":"FIXED_SEED");
+    const std::vector<double> initial_vector=!cg_witness_seed.empty()?cg_witness_seed:previous_low_ritz;
+    auto primary_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,initial_vector);
+    cg_witness_seed.clear();
+    if(primary_modes.empty())throw std::runtime_error("native fit Lanczos returned no Ritz modes");
+    auto record_search=[&](const std::string& source,const std::vector<RitzMode>& found){
+      trace<<"outer "<<outer<<" SEARCH seed_source "<<source<<" lanczos_steps "<<steps<<" returned_directions "<<found.size()<<" actual_residuals";
+      for(const auto& mode:found)trace<<' '<<mode.residual;
+      trace<<'\n';
+    };
+    record_search(seed_source,primary_modes);
+    std::vector<RitzMode> independent_modes;
+    if(!initial_vector.empty()){
+      independent_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4);
+      record_search("FIXED_INDEPENDENT",independent_modes);
+      if(independent_modes.empty())throw std::runtime_error("native fit independent-seed Lanczos returned no Ritz modes");
+    }
+    auto inspect_modes=[&](const std::vector<RitzMode>& candidates,const std::string& source,bool& observed_violation,bool& added_cut){
+      for(const auto& mode:candidates){const auto& base_mode=mode.base_action;const auto& add_mode=mode.additive_action;const double base_value=std::inner_product(mode.vector.begin(),mode.vector.end(),base_mode.begin(),0.0),rayleigh=base_value+std::inner_product(mode.vector.begin(),mode.vector.end(),add_mode.begin(),0.0);const auto row=spectral_row(graph,mode.vector,sqrt_mass,n,static_cast<int>(psize));double scale=std::max(1.0,std::abs(base_value));for(int i=0;i<static_cast<int>(psize);++i)scale+=std::abs(row[i]*theta[i]);if(!std::isfinite(base_value)||!std::isfinite(rayleigh)||!std::isfinite(scale)||!std::all_of(base_mode.begin(),base_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(add_mode.begin(),add_mode.end(),[](double x){return std::isfinite(x);})||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: sampled Ritz evidence is non-finite");const double mode_tolerance=std::min(options.epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);if(rayleigh>=options.epsilon-mode_tolerance)continue;observed_violation=true;added_cut|=add_cut(mode.vector,base_value,outer,("RITZ_"+source).c_str());}
+    };
+    bool observed_violation=false,added_cut=false;
+    inspect_modes(primary_modes,seed_source,observed_violation,added_cut);
+    inspect_modes(independent_modes,"FIXED_INDEPENDENT",observed_violation,added_cut);
+    std::vector<RitzMode> modes=std::move(primary_modes);modes.insert(modes.end(),std::make_move_iterator(independent_modes.begin()),std::make_move_iterator(independent_modes.end()));
+    std::sort(modes.begin(),modes.end(),[](const RitzMode& a,const RitzMode& b){return a.value<b.value;});
+    if(modes.empty())throw std::runtime_error("native fit Lanczos returned no Ritz modes");
+    previous_low_ritz=modes.front().vector;
+    const double min_ritz=modes.front().value,ritz_residual=modes.front().residual;
+    const bool near_boundary=std::abs(min_ritz-options.epsilon)<=std::max(options.epsilon,2.0*ritz_residual);
+    const bool residual_large=ritz_residual>std::max(1e-12,options.epsilon/4.0);
+    if(near_boundary&&residual_large)deepen_search();
+    trace<<"outer "<<outer<<" sampled_min_ritz "<<min_ritz<<" ritz_residual "<<ritz_residual<<" ritz_residual_kind actual_Dv_minus_lambda_v lanczos_steps "<<steps<<" next_lanczos_steps "<<search_depth<<" observed_directions "<<modes.size()<<" constraints "<<cut_rows.size()<<" cg_feedback none status "<<(observed_violation?"RETRY":"CHECK_CG")<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit trace: "+trace_path);
+    if(observed_violation){consecutive_cg_feedback=0;if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==79)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after 80 rounds");theta=solve_qp_and_trace(outer);continue;}
+    ResponseCheck response_progress;
+    try{response=validate_probes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,options.sample_interval,options.temperature,modes,options.epsilon,&response_progress);}catch(const std::exception& e){trace<<"outer "<<outer<<" status PROBE_VALIDATION_FAIL detail "<<e.what()<<" ";write_response_stats(trace,response_progress);trace<<'\n';trace.flush();throw;}
+    if(response.witness.classification.empty()){const bool response_pass=response.response<=options.response_tolerance&&response.ibp<=options.response_tolerance;std::printf("    rpmd_ja fit RESPONSE_CHECK %s: response=%.6g IBP=%.6g limit=%.6g; CG true residual=%.3g; frames=%llu probes=%d covariance condition observed/predicted=%.3g/%.3g block variance delta=%.3g; FULL_CERTIFICATE PENDING\n",response_pass?"PASS":"FAIL",response.response,response.ibp,options.response_tolerance,response.cg,static_cast<unsigned long long>(response.validation_frames),response.probes,response.observed_cov_condition,response.predicted_cov_condition,response.block_variance_max_relative_delta);trace<<"outer "<<outer<<" status CG_PASS response_check "<<(response_pass?"PASS":"FAIL")<<" constraints "<<cut_rows.size()<<" ";write_response_stats(trace,response);trace<<" response_tolerance "<<options.response_tolerance<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!response_pass)throw std::runtime_error("RESPONSE_CHECK_FAIL: native fit held-out probe response or force-position IBP exceeds declared tolerance");fit_converged=true;break;}
     write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,options.internal_mass_com);const bool feedback_eligible=response.witness.finite&&(response.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION"||response.witness.classification=="UNRESOLVED_SOFT_DIRECTION");std::printf("    rpmd_ja fit CG_FEEDBACK %s: %s probe=%d iteration=%d lambda=%.17g base=%.17g add=%.17g tol=%.3g repeat_delta=%.3g; witness=%s\n",feedback_eligible?"RETRY":"FAIL",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.rayleigh,response.witness.base_rayleigh,response.witness.add_rayleigh,response.witness.curvature_tolerance,response.witness.repeat_diff_norm,witness_path.c_str());
     if(!feedback_eligible)throw std::runtime_error("CG stability feedback failed with classification "+response.witness.classification+"; inspect "+witness_path);
-     const double base_value=std::inner_product(response.witness.direction.begin(),response.witness.direction.end(),response.witness.base.begin(),0.0);if(response.witness.rayleigh>=options.epsilon-response.witness.curvature_tolerance)throw std::runtime_error("NUMERICAL_BREAKDOWN: normalized CG witness is not below the declared curvature threshold; inspect "+witness_path);const bool added=add_cut(response.witness.direction,base_value,outer,response.witness.classification.c_str());trace<<"outer "<<outer<<" cg_feedback "<<response.witness.classification<<" probe "<<response.witness.probe<<" iteration "<<response.witness.iteration<<" rayleigh "<<response.witness.rayleigh<<" constraints "<<cut_rows.size()<<" status RETRY\n";trace.flush();
-    if(!added)throw std::runtime_error("STABILITY_CUT_STALLED: CG witness did not add a new violated constraint");if(outer==39)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted 40 rounds");theta=solve_qp_and_trace(outer);
+    const double base_value=std::inner_product(response.witness.direction.begin(),response.witness.direction.end(),response.witness.base.begin(),0.0);if(response.witness.rayleigh>=options.epsilon-response.witness.curvature_tolerance)throw std::runtime_error("NUMERICAL_BREAKDOWN: normalized CG witness is not below the declared curvature threshold; inspect "+witness_path);const bool added=add_cut(response.witness.direction,base_value,outer,response.witness.classification.c_str());
+    if(!added)throw std::runtime_error("STABILITY_CUT_STALLED: CG witness did not add a new violated constraint");
+    cg_witness_seed=response.witness.direction;++consecutive_cg_feedback;if(consecutive_cg_feedback>=2)deepen_search();
+    trace<<"outer "<<outer<<" cg_feedback "<<response.witness.classification<<" probe "<<response.witness.probe<<" iteration "<<response.witness.iteration<<" rayleigh "<<response.witness.rayleigh<<" lanczos_steps "<<steps<<" next_lanczos_steps "<<search_depth<<" consecutive_cg_feedback "<<consecutive_cg_feedback<<" constraints "<<cut_rows.size()<<" status RETRY ";write_response_stats(trace,response);trace<<'\n';trace.flush();
+    if(outer==79)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted 80 rounds");theta=solve_qp_and_trace(outer);
   }
-  if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within 40 rounds");
+  if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within 80 rounds");
   double compressed_residual2=discarded2;for(int i=0;i<static_cast<int>(psize);++i){double v=-z[i];for(int j=i;j<static_cast<int>(psize);++j)v+=rmat[static_cast<std::size_t>(i)*psize+j]*theta[j];compressed_residual2+=v*v;}
   if(!std::isfinite(compressed_residual2)||!std::isfinite(training_force2)||training_force2<0.0)throw std::runtime_error("native fit training force residual is non-finite");const double training_force_residual=training_force2>0.0?std::sqrt(compressed_residual2/training_force2):(compressed_residual2==0.0?0.0:std::numeric_limits<double>::infinity());if(!std::isfinite(training_force_residual))throw std::runtime_error("native fit training residual is nonzero at zero physical-force scale");
   if(response.response>options.response_tolerance||response.ibp>options.response_tolerance)
@@ -877,26 +991,62 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     out.close();if(!out)throw std::runtime_error("failed closing native additive package");
   }
   std::printf("    rpmd_ja fit/probe validation complete; preparing reference: family=shared_lab_frame_typepair_edge_blocks parameters=%zu; restricted family, probes=%d seed=0x243f6a8885a308d3; train/heldout force residual=%.6g/%.6g response=%.6g IBP=%.6g CG residual=%.3g; stability cuts=%zu; estimated additive bytes=%llu\n",psize,response.probes,training_force_residual,response.force_residual,response.response,response.ibp,response.cg,cut_rows.size(),static_cast<unsigned long long>(estimated));
-  qr.release();baseline.release();prepare_rpmd_ja_qnep_reference(raw_path,options.output_path,options.kernel_table,make_rpmd_ja_qnep_mode_validator(atom,box,force),pack_path);own_scratch.output_owned=true;own_scratch.sidecar_owned=true;
+  qr.release();baseline.release();
+  try{prepare_rpmd_ja_qnep_reference(raw_path,options.output_path,options.kernel_table,make_rpmd_ja_qnep_mode_validator(atom,box,force),pack_path);}
+  catch(const std::exception& e){
+    if(preserve_candidate_package_on_full_spd_failure(e.what(),own_scratch.pack_owned)){
+      trace<<"FULL_CERTIFICATE FAIL reason stored_D_cholesky candidate_additive_package "<<pack_path<<" qraw "<<raw_path<<"; full candidate direction and unshifted-D curvature are in "<<options.output_path<<".failure.txt; no automatic stability cut was added\n";trace.flush();
+    }
+    throw;
+  }
+  own_scratch.output_owned=true;own_scratch.sidecar_owned=true;
   double certificate_epsilon=0.0,certificate_eta=0.0;{std::ifstream stability(options.output_path+".stability");std::string key;while(stability>>key){if(key=="epsilon_num")stability>>certificate_epsilon;else if(key=="reconstruction_bound")stability>>certificate_eta;else{std::string value;stability>>value;}}if(!stability.eof()||!std::isfinite(certificate_epsilon)||!std::isfinite(certificate_eta)||!(certificate_epsilon>0.0)||!(certificate_eta<0.5*certificate_epsilon))throw std::runtime_error("native fit could not read a valid stored-D Cholesky certificate");}trace<<"FULL_CERTIFICATE PASS stored_D_cholesky epsilon_num "<<certificate_epsilon<<" reconstruction_bound "<<certificate_eta<<"\n";trace.flush();std::printf("    rpmd_ja fit FULL_CERTIFICATE PASS: stored-D Cholesky epsilon_num=%.6g reconstruction_bound=%.6g\n",certificate_epsilon,certificate_eta);
-  {std::ofstream fitout(fit_tmp,std::ios::out|std::ios::trunc);if(!fitout)throw std::runtime_error("cannot create native fit diagnostics");own_scratch.fit_tmp_owned=true;fitout<<std::setprecision(17)<<"family shared_lab_frame_symmetric_typepair_edge_blocks\ncoordinate_convention "<<(options.internal_mass_com?"x=R-R0; raw_eval=R0+A*x; U0(x)=Taylor_raw(A*x)+Uadd(x); P=I-tt^T internal mass-COM coordinates":"raw Cartesian coordinates")<<"\ntransport_convention "<<(options.internal_mass_com?"Bt_internal=P(Bt_raw+Bt_add)P; ambient H tiles retained and interpreted by internal E^T Bt E":"raw native reference transport")<<"\nmechanical_policy "<<(options.internal_mass_com?"native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1":"native_reference_transport;finite_temperature_additive_v1")<<";beads="<<header.beads<<";derivative="<<rawver<<"\nraw_gradient_net_xyz "<<raw_net.net[0]<<' '<<raw_net.net[1]<<' '<<raw_net.net[2]<<"\nraw_gradient_net_norm "<<raw_net.net_norm<<"\ninternal_gradient_net_xyz "<<internal_net.net[0]<<' '<<internal_net.net[1]<<' '<<internal_net.net[2]<<"\ninternal_gradient_net_norm "<<internal_net.net_norm<<"\ninternal_gradient_net_limit "<<internal_net.limit<<"\ninternal_gradient_net_status "<<(internal_net.within_limit?"PASS":"FAIL")<<"\nremoved_mass_normal_norm "<<removed_normal_norm<<"\ncoordinate_scope_note finite-grid derivative errors remain; auxiliary reference definition only; pimd_fix_com removes PILE momentum and does not constrain the production Hamiltonian\nparameters "<<psize<<"\ntype_pairs "<<graph.type_pairs.size()<<"\ncutoff_A "<<options.cutoff<<"\ntraining_frames "<<train<<"\nvalidation_frames "<<validation<<"\nprobe_policy fixed_seeded_random16_type_local_up_to4_low_ritz4\nprobe_seed 0x243f6a8885a308d3\nprobe_count "<<response.probes<<"\nprobe_subspace_only 1\nforce_residual_normalization massweighted_projected_physical_force_norm\ntraining_force_residual_relative "<<training_force_residual<<"\nheldout_force_residual_relative "<<response.force_residual<<"\nprobe_response_error "<<response.response<<"\nforce_position_ibp_error "<<response.ibp<<"\nprobe_cg_max_true_relative_residual "<<response.cg<<"\nresponse_tolerance "<<options.response_tolerance<<"\nepsilon_fit "<<options.epsilon<<"\nspectral_cuts "<<cut_rows.size()<<"\ncertificate stored_D_additive_shifted_frobenius_SPD_bound\ncertificate_epsilon_num "<<certificate_epsilon<<"\ncertificate_reconstruction_bound "<<certificate_eta<<"\ncertificate_lambda_min_lower_bound "<<0.5*certificate_epsilon-certificate_eta<<"\ncertificate_note SPD lower bound only; not an epsilon eigenvalue floor\n";fitout.close();if(!fitout)throw std::runtime_error("failed closing native fit diagnostics");}
+  {std::ofstream fitout(fit_tmp,std::ios::out|std::ios::trunc);if(!fitout)throw std::runtime_error("cannot create native fit diagnostics");own_scratch.fit_tmp_owned=true;fitout<<std::setprecision(17)<<"family shared_lab_frame_symmetric_typepair_edge_blocks\ncoordinate_convention "<<(options.internal_mass_com?"x=R-R0; raw_eval=R0+A*x; U0(x)=Taylor_raw(A*x)+Uadd(x); P=I-tt^T internal mass-COM coordinates":"raw Cartesian coordinates")<<"\ntransport_convention "<<(options.internal_mass_com?"Bt_internal=P(Bt_raw+Bt_add)P; ambient H tiles retained and interpreted by internal E^T Bt E":"raw native reference transport")<<"\nmechanical_policy "<<(options.internal_mass_com?"native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1":"native_reference_transport;finite_temperature_additive_v1")<<";beads="<<header.beads<<";derivative="<<rawver<<"\nraw_gradient_net_xyz "<<raw_net.net[0]<<' '<<raw_net.net[1]<<' '<<raw_net.net[2]<<"\nraw_gradient_net_norm "<<raw_net.net_norm<<"\ninternal_gradient_net_xyz "<<internal_net.net[0]<<' '<<internal_net.net[1]<<' '<<internal_net.net[2]<<"\ninternal_gradient_net_norm "<<internal_net.net_norm<<"\ninternal_gradient_net_limit "<<internal_net.limit<<"\ninternal_gradient_net_status "<<(internal_net.within_limit?"PASS":"FAIL")<<"\nremoved_mass_normal_norm "<<removed_normal_norm<<"\ncoordinate_scope_note finite-grid derivative errors remain; auxiliary reference definition only; pimd_fix_com removes PILE momentum and does not constrain the production Hamiltonian\nparameters "<<psize<<"\ntype_pairs "<<graph.type_pairs.size()<<"\ncutoff_A "<<options.cutoff<<"\ntraining_frames "<<train<<"\nvalidation_frames "<<validation<<"\nprobe_policy fixed_seeded_random16_type_local_up_to4_low_ritz4\nprobe_seed 0x243f6a8885a308d3\nprobe_count "<<response.probes<<"\nprobe_subspace_only 1\nforce_residual_normalization massweighted_projected_physical_force_norm\ntraining_force_residual_relative "<<training_force_residual<<"\nheldout_force_residual_relative "<<response.force_residual<<"\nprobe_response_error "<<response.response<<"\nforce_position_ibp_error "<<response.ibp<<"\nprobe_cg_max_true_relative_residual "<<response.cg<<"\n";write_response_stats(fitout,response);fitout<<"\nresponse_tolerance "<<options.response_tolerance<<"\nepsilon_fit "<<options.epsilon<<"\nspectral_cuts "<<cut_rows.size()<<"\ncertificate stored_D_additive_shifted_frobenius_SPD_bound\ncertificate_epsilon_num "<<certificate_epsilon<<"\ncertificate_reconstruction_bound "<<certificate_eta<<"\ncertificate_lambda_min_lower_bound "<<0.5*certificate_epsilon-certificate_eta<<"\ncertificate_note SPD lower bound only; not an epsilon eigenvalue floor\n";fitout.close();if(!fitout)throw std::runtime_error("failed closing native fit diagnostics");}
   if(std::rename(fit_tmp.c_str(),fit_path.c_str())!=0)throw std::runtime_error("native fit could not publish its diagnostics");own_scratch.fit_tmp_owned=false;own_scratch.fit_owned=true;
-  in.close();raw.close();if(std::remove(pack_path.c_str())!=0||std::remove(raw_path.c_str())!=0)throw std::runtime_error("native fit succeeded but could not remove its own additive/qraw scratch files");own_scratch.pack_owned=false;own_scratch.raw_owned=false;own_scratch.output_owned=false;own_scratch.sidecar_owned=false;own_scratch.fit_owned=false;trace<<"FIT_STATUS ACCEPTED_REFERENCE\n";trace.flush();trace.close();if(!trace)throw std::runtime_error("failed finalizing native fit trace: "+trace_path);
+  in.close();raw.close();if(std::remove(pack_path.c_str())!=0||(generate_raw&&std::remove(generated_raw_path.c_str())!=0))throw std::runtime_error("native fit succeeded but could not remove its own additive/qraw scratch files");own_scratch.pack_owned=false;own_scratch.raw_owned=false;own_scratch.output_owned=false;own_scratch.sidecar_owned=false;own_scratch.fit_owned=false;trace<<"FIT_STATUS ACCEPTED_REFERENCE\n";trace.flush();trace.close();if(!trace)throw std::runtime_error("failed finalizing native fit trace: "+trace_path);
   std::printf("    rpmd_ja native reference ACCEPTED_REFERENCE; RESPONSE_CHECK and FULL_CERTIFICATE passed; stability sidecar and fit diagnostics published.\n");
+}
+
+static void fit_rpmd_ja_native_reference_checked(const RpmdJANativeFitOptions& options,const std::string& spool_path,
+  const std::uint64_t frame_count,Atom& atom,Box& box,Force& force,const bool sample_beads_from_header)
+{
+  try{fit_rpmd_ja_native_reference_impl(options,spool_path,frame_count,atom,box,force,sample_beads_from_header);}
+  catch(const std::exception& e){
+    if(!options.output_path.empty()){
+      const std::string failure=options.output_path+".failure.txt";std::ifstream exists(failure);
+      if(!exists.good()){std::ofstream out(failure,std::ios::out|std::ios::trunc);if(out)out<<"native finite-temperature reference fit failed\n"<<e.what()<<'\n';}
+      const std::string raw_path=options.raw_input_path.empty()?options.output_path+".qraw":options.raw_input_path;std::ifstream trace_exists(options.output_path+".fit_trace.txt"),raw_exists(raw_path,std::ios::binary),qp_state_exists(options.output_path+".qp_state.txt",std::ios::binary),samples_exist(spool_path,std::ios::binary);const std::string trace_path=options.output_path+".fit_trace.txt",qp_state_path=options.output_path+".qp_state.txt";std::printf("    rpmd_ja fit FAIL: %s; failure=%s trace=%s qraw=%s qp_state=%s samples=%s\n",e.what(),failure.c_str(),trace_exists.good()?trace_path.c_str():"unavailable",raw_exists.good()?raw_path.c_str():"unavailable",qp_state_exists.good()?qp_state_path.c_str():"unavailable",samples_exist.good()?spool_path.c_str():"unavailable");
+    }
+    throw;
+  }
 }
 
 void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options,const std::string& spool_path,
   const std::uint64_t frame_count,Atom& atom,Box& box,Force& force)
 {
-  try{fit_rpmd_ja_native_reference_impl(options,spool_path,frame_count,atom,box,force);}
-  catch(const std::exception& e){
-    if(!options.output_path.empty()){
-      const std::string failure=options.output_path+".failure.txt";std::ifstream exists(failure);
-      if(!exists.good()){std::ofstream out(failure,std::ios::out|std::ios::trunc);if(out)out<<"native finite-temperature reference fit failed\n"<<e.what()<<'\n';}
-      std::ifstream trace_exists(options.output_path+".fit_trace.txt"),raw_exists(options.output_path+".qraw",std::ios::binary),qp_state_exists(options.output_path+".qp_state.txt",std::ios::binary),samples_exist(spool_path,std::ios::binary);const std::string trace_path=options.output_path+".fit_trace.txt",raw_path=options.output_path+".qraw",qp_state_path=options.output_path+".qp_state.txt";std::printf("    rpmd_ja fit FAIL: %s; failure=%s trace=%s qraw=%s qp_state=%s samples=%s\n",e.what(),failure.c_str(),trace_exists.good()?trace_path.c_str():"unavailable",raw_exists.good()?raw_path.c_str():"unavailable",qp_state_exists.good()?qp_state_path.c_str():"unavailable",samples_exist.good()?spool_path.c_str():"unavailable");
-    }
-    throw;
-  }
+  fit_rpmd_ja_native_reference_checked(options,spool_path,frame_count,atom,box,force,false);
+}
+
+void fit_rpmd_ja_native_reference_from_samples(const RpmdJANativeFitOptions& options,const std::string& spool_path,
+  Atom& atom,Box& box,Force& force)
+{
+  if(options.output_path.empty())throw std::invalid_argument("native fit_samples requires an output path");
+  const std::string lock_path=options.output_path+".fit.lock";
+  std::FILE* lock=std::fopen(lock_path.c_str(),"wx");
+  if(!lock)throw std::runtime_error("rpmd_ja fit_samples could not acquire its output lock: "+lock_path);
+  struct ReleaseLock{std::FILE* file;std::string path;~ReleaseLock(){std::fclose(file);std::remove(path.c_str());}} release{lock,lock_path};
+  std::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
+  const SampleHeader header=read_header(in,0,atom,box,0.0,true);
+  std::vector<double> position(static_cast<std::size_t>(3)*header.n),force_frame(position.size());double first_step=0.0,next_step=0.0;
+  read_frame(in,position,force_frame,first_step);read_frame(in,position,force_frame,next_step);
+  const double sample_interval=next_step-first_step;
+  if(!std::isfinite(sample_interval)||!(sample_interval>0.0)||sample_interval>std::numeric_limits<int>::max()||
+     std::abs(sample_interval-std::round(sample_interval))>1e-9)
+    throw std::runtime_error("fit_samples could not infer a positive integer sample interval from GPJASMP1");
+  RpmdJANativeFitOptions derived=options;derived.temperature=header.temperature;derived.sample_interval=static_cast<int>(std::llround(sample_interval));
+  std::printf("rpmd_ja fit_samples: frames=%llu P=%d T=%.17g K sample_interval=%d; GPJASMP1 has no potential/PPPM fingerprint, so confirm its sampling configuration is unchanged\n",
+    static_cast<unsigned long long>(header.frame_count),header.beads,header.temperature,derived.sample_interval);
+  fit_rpmd_ja_native_reference_checked(derived,spool_path,header.frame_count,atom,box,force,true);
 }
 
 void diagnose_rpmd_ja_native_fit_samples(const std::string& spool_path, const double fd_step,
@@ -939,6 +1089,11 @@ void diagnose_rpmd_ja_native_fit_samples(const std::string& spool_path, const do
 #include <stdexcept>
 void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions&, const std::string&,
   const std::uint64_t, Atom&, Box&, Force&)
+{
+  throw std::runtime_error("native rpmd_ja reference fitting requires CUDA");
+}
+void fit_rpmd_ja_native_reference_from_samples(const RpmdJANativeFitOptions&, const std::string&,
+  Atom&, Box&, Force&)
 {
   throw std::runtime_error("native rpmd_ja reference fitting requires CUDA");
 }

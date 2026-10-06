@@ -723,13 +723,49 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
           tokens, number_of_types, integrate, group, atom, box, force, first_potential_filename_)) {
       PRINT_INPUT_ERROR("Could not register rpmd_ja fit sampler.");
     }
+    return;
+  }
+  if (tokens[1] == "fit_samples") {
+    if (tokens.size() != 9 && tokens.size() != 10)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>].");
+    if (global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples must appear before any run.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples requires exactly one qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    if (active_qnep == nullptr || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+        !active_qnep->uses_pppm())
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples supports qNEP charge mode 1 or 2 with PPPM only.");
+    if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples requires fully periodic boundaries.");
+    RpmdJANativeFitOptions options;
+    options.output_path = tokens[3];
+    options.kernel_table = tokens[8];
+    if (tokens.size() == 10) options.raw_input_path = tokens[9];
+    options.internal_mass_com = integrate.get_pimd_fix_com();
+    if (tokens[2].empty() || options.output_path.empty() || options.kernel_table.empty() ||
+        (tokens.size() == 10 && options.raw_input_path.empty()) ||
+        tokens[2] == options.output_path || (!options.raw_input_path.empty() &&
+        (options.raw_input_path == options.output_path || options.raw_input_path == tokens[2])))
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples paths must be nonempty and the output must differ from its inputs.");
+    double* values[] = {&options.cutoff, &options.epsilon, &options.response_tolerance, &options.fd_step};
+    for (int i = 0; i < 4; ++i) {
+      char* end = nullptr;
+      *values[i] = std::strtod(tokens[4 + i].c_str(), &end);
+      if (end == tokens[4 + i].c_str() || *end != '\0' || !std::isfinite(*values[i]) || *values[i] <= 0.0)
+        PRINT_INPUT_ERROR("rpmd_ja fit_samples numeric arguments must be positive finite numbers.");
+    }
+#ifdef USE_HIP
+    PRINT_INPUT_ERROR("rpmd_ja fit_samples native reference preparation is currently unavailable in HIP builds.");
+#endif
+    fit_rpmd_ja_native_reference_from_samples(options, tokens[2], atom, box, force);
     return;
   }
   if (tokens[1] == "prepare") {
