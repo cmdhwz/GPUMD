@@ -237,7 +237,9 @@ void HAC::pre_run_rpmd_ja_(
         rpmd_ja_reference_.mechanical_config_fingerprint !=
           rpmd_ja_qnep_config_fingerprint(force) ||
         (rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) > 0 &&
-         rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) != atom.number_of_beads)) {
+         rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) != atom.number_of_beads) ||
+        (rpmd_ja_reference_policy_requires_pimd_fix_com(rpmd_ja_reference_.mechanical_policy) &&
+         !integrate.get_pimd_fix_com())) {
       PRINT_INPUT_ERROR(
         "rpmd_ja qNEP v3 reference charge settings, native transport policy, or mechanical configuration do not match.");
     }

@@ -86,6 +86,7 @@ public:
   bool get_use_eco_pimd() const;
   bool pimd_restart_read_this_run() const;
   bool pimd_reseed_from_centroid() const;
+  bool get_pimd_fix_com() const;
   bool pimd_previous_run_was_pimd() const;
   bool ring_polymer_temperature_is_set() const;
   bool ring_polymer_temperature_is_explicit() const;

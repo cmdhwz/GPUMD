@@ -111,6 +111,8 @@ def demo():
     assert "# additional_qnep_full_a_correction 0" in hac
     assert 'rpmd_ja_reference_.backend != 2' in ja_source
     assert 'rpmd_ja_reference_.mechanical_policy != "native_reference_transport"' in ja_source
+    assert "rpmd_ja_reference_policy_requires_pimd_fix_com" in ja_source
+    assert "!integrate.get_pimd_fix_com()" in ja_source
     assert 'rpmd_ja_qnep_config_fingerprint(force)' in ja_source
     assert 'generate_rpmd_ja_qnep_reference(' in run_source
     assert 'rpmd_ja_reference_.backend == 2' in ja_source

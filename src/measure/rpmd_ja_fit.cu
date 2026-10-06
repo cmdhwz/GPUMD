@@ -368,7 +368,7 @@ void RpmdJA_Fit::post_force(
 void RpmdJA_Fit::post_run(
   Atom& atom,
   Box& box,
-  Integrate&,
+  Integrate& integrate,
   const int,
   const double,
   const double)
@@ -400,6 +400,7 @@ void RpmdJA_Fit::post_run(
   options.response_tolerance = response_tolerance_;
   options.fd_step = fd_step_;
   options.sample_interval = sample_interval_;
+  options.internal_mass_com = integrate.get_pimd_fix_com();
   try {
     fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_);
   } catch (...) {

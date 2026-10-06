@@ -323,6 +323,27 @@ void check_fourth_order_finite_difference()
 
 int main()
 {
+  {
+    const std::vector<double> masses{1.0, 3.0, 6.0};
+    const std::vector<double> g{1.0, 2.0, 7.0, -2.0, 4.0, 8.0, 5.0, -1.0, 3.0};
+    const auto pulled=rpmd_ja_reference_math::mass_com_covector_pullback(g,masses);
+    for(int axis=0;axis<3;++axis){
+      double net=0.0;for(int i=0;i<3;++i)net+=pulled[3*axis+i];
+      check(std::abs(net)<1e-14,"unequal-mass pullback did not remove the COM normal");
+    }
+    const auto arithmetic=rpmd_ja_reference_math::mass_com_covector_pullback(g,{1.0,1.0,1.0});
+    check(std::abs(pulled[0]-arithmetic[0])>1e-3,"unequal masses were treated as equal");
+    const std::vector<double> displacement{.2,-.5,1.1, .7,.3,-.2, -.4,.9,.6};
+    double raw_dot=0.0,pulled_dot=0.0;
+    for(int axis=0;axis<3;++axis){
+      double center_shift=0.0;for(int i=0;i<3;++i)center_shift+=masses[i]*displacement[axis*3+i]/10.0;
+      for(int i=0;i<3;++i){raw_dot+=g[axis*3+i]*(displacement[axis*3+i]-center_shift);pulled_dot+=pulled[axis*3+i]*displacement[axis*3+i];}
+    }
+    check(std::abs(raw_dot-pulled_dot)<1e-14,"pullback disagrees with the internal-coordinate directional derivative");
+    bool bad_mass=false;try{(void)rpmd_ja_reference_math::mass_com_covector_pullback(g,{1.0,0.0,2.0});}
+    catch(const std::invalid_argument&){bad_mass=true;}
+    check(bad_mass,"invalid mass accepted by pullback");
+  }
   test_net_force_stats();
   check_fock_oracle();
   check_complete_large_b_kernel();

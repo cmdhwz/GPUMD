@@ -43,6 +43,39 @@ inline NetForceStats net_force_stats(const std::vector<double>& gradient, const 
   return result;
 }
 
+inline std::vector<double> mass_com_covector_pullback(
+  const std::vector<double>& gradient, const std::vector<double>& masses)
+{
+  if (masses.empty() || masses.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() / 3))
+    throw std::invalid_argument("invalid RPMD-JA mass-COM covector dimensions");
+  const int n = static_cast<int>(masses.size());
+  if (n < 1 ||
+      gradient.size() != static_cast<std::size_t>(3) * n)
+    throw std::invalid_argument("invalid RPMD-JA mass-COM covector dimensions");
+  double total_mass = 0.0;
+  for (double mass : masses) {
+    if (!std::isfinite(mass) || !(mass > 0.0))
+      throw std::invalid_argument("invalid RPMD-JA mass-COM mass");
+    total_mass += mass;
+  }
+  if (!std::isfinite(total_mass) || !(total_mass > 0.0))
+    throw std::invalid_argument("invalid RPMD-JA total mass");
+  std::vector<double> result(gradient.size());
+  for (int axis = 0; axis < 3; ++axis) {
+    double net = 0.0;
+    for (int i = 0; i < n; ++i) {
+      const double value = gradient[static_cast<std::size_t>(axis) * n + i];
+      if (!std::isfinite(value)) throw std::invalid_argument("non-finite RPMD-JA raw gradient");
+      net += value;
+    }
+    if (!std::isfinite(net)) throw std::invalid_argument("non-finite RPMD-JA raw gradient net");
+    for (int i = 0; i < n; ++i)
+      result[static_cast<std::size_t>(axis) * n + i] = gradient[static_cast<std::size_t>(axis) * n + i] -
+        masses[i] / total_mass * net;
+  }
+  return result;
+}
+
 inline double central_difference_2nd(const double plus, const double minus, const double h)
 {
   return (plus - minus) / (2.0 * h);

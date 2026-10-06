@@ -63,8 +63,9 @@ constexpr char kAnalyticSiteFd4Policy[] = "native_reference_transport;analytic_s
 
 bool parse_additive_policy(const std::string& policy, int& beads, int& derivative)
 {
-  constexpr char prefix[] = "native_reference_transport;finite_temperature_additive_v1;beads=";
-  const std::string p(prefix);
+  const std::string p = policy.rfind("native_reference_transport;internal_mass_com_pullback_v1;", 0) == 0 ?
+    "native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1;beads=" :
+    "native_reference_transport;finite_temperature_additive_v1;beads=";
   if (policy.compare(0, p.size(), p) != 0) return false;
   const std::size_t split = policy.find(";derivative=", p.size());
   if (split == std::string::npos) return false;
@@ -1119,6 +1120,12 @@ int rpmd_ja_reference_policy_beads(const std::string& policy)
 {
   int beads=0, derivative=0;
   return parse_additive_policy(policy, beads, derivative) ? beads : 0;
+}
+
+bool rpmd_ja_reference_policy_requires_pimd_fix_com(const std::string& policy)
+{
+  return policy.rfind("native_reference_transport;internal_mass_com_pullback_v1;", 0) == 0 &&
+    rpmd_ja_reference_policy_beads(policy) > 0;
 }
 
 std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference)

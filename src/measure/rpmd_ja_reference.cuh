@@ -87,6 +87,7 @@ struct RpmdJAReference
 
 RpmdJAReference read_rpmd_ja_reference(const std::string& path);
 int rpmd_ja_reference_policy_beads(const std::string& policy);
+bool rpmd_ja_reference_policy_requires_pimd_fix_com(const std::string& policy);
 void load_rpmd_ja_kernel_table(const std::string& path, RpmdJAReference& reference);
 std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference);
 void generate_rpmd_ja_reference(

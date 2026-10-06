@@ -39,7 +39,7 @@ def read_additive(path, expected_n=None):
     with path.open("rb") as f:
         header = _exact(f, 32)
         magic, version, endian, n, beads, _source = struct.unpack("<8sIIiiQ", header)
-        if magic != b"GPJAADD1" or version != 1 or endian != ENDIAN or n < 2 or beads < 1 or \
+        if magic != b"GPJAADD1" or version not in (1, 2) or endian != ENDIAN or n < 2 or beads < 1 or \
            (expected_n is not None and n != expected_n):
             raise ValueError("GPJAADD1 magic, version, dimensions, or atom count do not match")
         _exact(f, 48)
@@ -395,6 +395,13 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, a
         assembled = prepare_additive(additive, m["positions"].reshape(3, n).T, m["cell"][:9].reshape(3, 3))
         raw_v = _read_matrix(raw_path, m["start"], (d,n))
         raw_gradient = np.asarray(raw_v).sum(axis=1).reshape(3,n).T
+        if additive.get("internal_mass_com", False):
+            masses = np.asarray(m["masses"], dtype=float)
+            total_mass = float(np.sum(masses))
+            if masses.shape != (n,) or not np.isfinite(masses).all() or np.any(masses <= 0) or \
+               not math.isfinite(total_mass) or total_mass <= 0:
+                raise ValueError("invalid masses for internal mass-COM gradient pullback")
+            raw_gradient -= masses[:, None] / total_mass * raw_gradient.sum(axis=0)[None, :]
         assembled_gradient = assembled["linear_gradient"]
         residual = raw_gradient + assembled_gradient
         if not np.isfinite(raw_gradient).all() or not np.isfinite(assembled_gradient).all() or not np.isfinite(residual).all():
@@ -525,7 +532,7 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, a
             if required>kernel["u"]*(1+32*np.finfo(float).eps):
                 raise ValueError(f"kernel U={kernel['u']:.8g} does not cover lossless block bound {required:.8g}")
 
-        policy = (f"native_reference_transport;finite_temperature_additive_v1;beads={additive['beads']};derivative={raw_version}"
+        policy = (f"native_reference_transport;{'internal_mass_com_pullback_v1;' if additive.get('internal_mass_com', False) else ''}finite_temperature_additive_v1;beads={additive['beads']};derivative={raw_version}"
                   if additive is not None else "native_reference_transport")
         tmp=work/"reference.tmp"
         with tmp.open("xb") as out:

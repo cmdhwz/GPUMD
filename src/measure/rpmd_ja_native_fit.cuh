@@ -17,6 +17,7 @@ struct RpmdJANativeFitOptions
   double response_tolerance = 0.0;
   double fd_step = 0.0;
   int sample_interval = 0;
+  bool internal_mass_com = false;
 };
 
 void fit_rpmd_ja_native_reference(

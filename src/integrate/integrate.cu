@@ -148,6 +148,11 @@ bool Integrate::pimd_reseed_from_centroid() const
   return pimd_reseed_from_centroid_;
 }
 
+bool Integrate::get_pimd_fix_com() const
+{
+  return pimd_fix_com_;
+}
+
 bool Integrate::pimd_previous_run_was_pimd() const
 {
   return pimd_previous_run_was_pimd_;

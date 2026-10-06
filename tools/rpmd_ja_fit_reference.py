@@ -156,7 +156,7 @@ def write_additive(path, data):
     try:
         with tmp.open("wb") as f:
             f.write(ADD_MAGIC)
-            f.write(struct.pack("<IIiiQ",1,ENDIAN,data["n"],data["beads"],data["source_fingerprint"]))
+            f.write(struct.pack("<IIiiQ",2 if data.get("internal_mass_com", False) else 1,ENDIAN,data["n"],data["beads"],data["source_fingerprint"]))
             f.write(struct.pack("<ddddQQ",data["temperature"],data["epsilon"],data["response_max"],data["response_tolerance"],data["training_frames"],data["validation_frames"]))
             for s in data["sites"]:
                 z=len(s["neighbors"]); f.write(struct.pack("<i",z))
@@ -173,7 +173,7 @@ def read_additive(path):
     with Path(path).open("rb") as f:
         if _exact(f,8)!=ADD_MAGIC: raise ValueError("wrong GPJAADD1 magic")
         version,endian,n,p,fp=struct.unpack("<IIiiQ",_exact(f,24))
-        if (version,endian)!=(1,ENDIAN): raise ValueError("unsupported additive package version")
+        if version not in (1,2) or endian != ENDIAN: raise ValueError("unsupported additive package version")
         temp,eps,rmax,rtol,ntrain,nval=struct.unpack("<ddddQQ",_exact(f,48))
         sites=[]
         for i in range(n):
@@ -185,6 +185,7 @@ def read_additive(path):
             sites.append(dict(i=i,neighbors=[(x[0],tuple(x[1:])) for x in neigh],ell=ell,B=b))
         if f.read(1): raise ValueError("trailing data in additive package")
     a=dict(n=n,beads=p,source_fingerprint=fp,temperature=temp,epsilon=eps,response_max=rmax,
+           internal_mass_com=version==2,
            response_tolerance=rtol,training_frames=ntrain,validation_frames=nval,sites=sites)
     _validate_additive(a); return a
 

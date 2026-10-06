@@ -54,6 +54,22 @@ def _read_tiles(stream, d):
     return matrix
 
 
+def _read_prepared_v3(path, n):
+    d = 3*n
+    with Path(path).open("rb") as f:
+        assert f.read(8) == qprep.MAGIC
+        version, endian, atoms, temperature, fd_step, _ = struct.unpack("<IIiddQ", f.read(36))
+        assert (version, endian, atoms) == (3, qprep.ENDIAN, n)
+        f.read(len(qprep.UNITS) + len(qprep.LAYOUT) + 72 + 12 + n*4 + n*8 + d*8)
+        config, charge, pppm, spacing, policy_len = struct.unpack("<Qiidi", f.read(28))
+        policy = f.read(policy_len).decode("ascii")
+        f.read(21*8 + 2*8 + 2*8 + 2*8)
+        degree, prank, qrank = struct.unpack("<iii", f.read(12))
+        f.read((prank + qrank + (degree+1)*prank + (degree+1)*qrank)*8)
+        matrices = [_read_tiles(f, d)] + [_read_tiles(f, d) for _ in range(3)]
+    return {"policy": policy, "matrices": matrices}
+
+
 def _fixture(directory):
     fitter_spec = importlib.util.spec_from_file_location("fit_additive_fixture", ROOT / "tools" / "rpmd_ja_fit_reference.py")
     fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
@@ -285,6 +301,91 @@ def test_cli_additive_prepare_accumulates_actual_v3_k_and_h_and_certificate():
         assert "beads=8;derivative=3" in sidecar
 
 
+def test_internal_mass_com_v2_pulls_back_nonzero_net_and_preserves_raw_transport():
+    with tempfile.TemporaryDirectory() as name:
+        raw, kernel, pack_path, output, pack, positions, _ = _fixture(Path(name))
+        fitter_spec = importlib.util.spec_from_file_location("fit_additive_internal", ROOT / "tools" / "rpmd_ja_fit_reference.py")
+        fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
+        pack["source_fingerprint"] = qprep._fnv64(raw)
+        pack["internal_mass_com"] = True
+        pack_path.unlink()
+        fitter.write_additive(pack_path, pack)
+        meta = qprep._read_raw(raw)
+        raw_v = np.zeros((meta["d"], meta["n"]))
+        assembled = fitter.assemble_additive(pack, positions, np.array([[10.,.4,0.],[0.,11.,.3],[0.,0.,12.]]))
+        target = -assembled["linear_gradient"].copy()
+        masses = meta["masses"]
+        target += masses[:,None] / masses.sum() * np.array([.6,-.3,1.2])[None,:]
+        graw = target.T.reshape(-1)
+        for coordinate, value in enumerate(graw): raw_v[coordinate, coordinate % meta["n"]] = value
+        raw_c = []
+        for alpha in range(3):
+            c = np.arange(meta["d"]**2, dtype=float).reshape(meta["d"],meta["d"])*(.001*(alpha+1))
+            c[0,1] += .37
+            raw_c.append(c)
+        with raw.open("r+b") as f:
+            f.seek(meta["start"]); f.write(raw_v.astype("<f8").tobytes())
+            f.seek(meta["coarse_v"]); f.write(raw_v.astype("<f8").tobytes())
+            for alpha, c in enumerate(raw_c):
+                f.seek(meta["start"] + meta["vb"] + alpha*meta["d"]**2*8)
+                f.write(c.astype("<f8").tobytes())
+                f.seek(meta["coarse_c"] + alpha*meta["d"]**2*8)
+                f.write(c.astype("<f8").tobytes())
+        pack["source_fingerprint"] = qprep._fnv64(raw)
+        pack_path.unlink(); fitter.write_additive(pack_path, pack)
+        result = subprocess.run([sys.executable, str(ROOT / "tools" / "rpmd_ja_qnep_prepare.py"),
+                                 str(raw), str(pack_path), "--kernel-table", str(kernel), "--output", str(output)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        parsed = _read_prepared_v3(output, meta["n"])
+        assert parsed["policy"] == "native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1;beads=8;derivative=3"
+        d, n = meta["d"], meta["n"]
+        mass_scale = np.sqrt(np.tile(masses,3)[:,None]*np.tile(masses,3)[None,:])
+        translation = np.zeros((d,3))
+        for axis in range(3): translation[axis*n:(axis+1)*n,axis] = np.sqrt(masses/masses.sum())
+        internal = np.linalg.svd(translation.T, full_matrices=True)[2][3:].T
+        rng = np.random.default_rng(219)
+        q = rng.normal(size=d); v = rng.normal(size=d)
+        q_internal = internal.T @ q; v_internal = internal.T @ v
+        q_projected = internal @ q_internal; v_projected = internal @ v_internal
+        asymmetry = 0.0
+        for alpha in range(3):
+            h_internal = parsed["matrices"][alpha+1]
+            raw_h = raw_c[alpha].T / mass_scale
+            additive_h = assembled["Hadd"][alpha].T / mass_scale
+            np.testing.assert_allclose(h_internal, raw_h + additive_h, atol=2e-12, rtol=2e-12)
+            raw_h_actual = h_internal - additive_h
+            np.testing.assert_allclose(raw_h_actual, raw_h, atol=2e-12)
+            reduced = internal.T @ h_internal @ internal
+            np.testing.assert_allclose(v_projected @ h_internal @ q_projected,
+                                       v_internal @ reduced @ q_internal, atol=2e-12, rtol=2e-12)
+            asymmetry = max(asymmetry, np.linalg.norm(h_internal-h_internal.T))
+        assert asymmetry > 0
+        old_output = Path(name) / "out_v1.rpmdja"
+        with pack_path.open("r+b") as f:
+            f.seek(8); f.write(struct.pack("<I", 1))
+        old = subprocess.run([sys.executable, str(ROOT / "tools" / "rpmd_ja_qnep_prepare.py"),
+                              str(raw), str(pack_path), "--kernel-table", str(kernel), "--output", str(old_output)],
+                             capture_output=True, text=True)
+        assert old.returncode != 0 and "does not cancel raw reference gradient" in old.stderr
+        assert not old_output.exists()
+        raw_fenergy = -raw_v.sum(axis=1)
+        internal_gradient = target - masses[:,None] / masses.sum() * target.sum(axis=0)[None,:]
+        internal_fenergy = -internal_gradient.T.reshape(-1)
+        for alpha in range(3):
+            raw_formula = np.zeros((d,d)); projected_formula = np.zeros((d,d))
+            for cidx in range(d):
+                atom, axis = cidx % n, cidx // n
+                if axis != alpha: continue
+                selected = np.arange(d) % n == atom
+                raw_formula[cidx] = -raw_v[:,atom]
+                raw_formula[cidx,selected] -= raw_fenergy[selected]
+                projected_formula[cidx] = -raw_v[:,atom]
+                projected_formula[cidx,selected] -= internal_fenergy[selected]
+            np.testing.assert_allclose(raw_formula, 0.0, atol=1e-14)
+            assert np.linalg.norm(projected_formula) > 0
+
+
 def test_additive_prepare_rejects_wrong_source_and_truncated_pack():
     with tempfile.TemporaryDirectory() as name:
         raw, kernel, pack_path, output, pack, _, _ = _fixture(Path(name))
@@ -437,6 +538,7 @@ def test_failed_prepare_closes_first_h_mapping_if_second_open_fails():
 if __name__ == "__main__":
     test_additive_assembly_contract_is_available_from_prepare_module()
     test_cli_additive_prepare_accumulates_actual_v3_k_and_h_and_certificate()
+    test_internal_mass_com_v2_pulls_back_nonzero_net_and_preserves_raw_transport()
     test_additive_prepare_rejects_wrong_source_and_truncated_pack()
     test_gradient_gate_uses_stable_norm_and_accepts_large_cancellation()
     test_additive_assembly_rejects_overflow_from_finite_geometry()

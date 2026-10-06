@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rpmd_ja_reference.cuh"
+#include "rpmd_ja_reference_math.cuh"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -22,6 +23,7 @@ struct RpmdJASparseRows
 struct RpmdJAAdditiveData
 {
   int beads = 0;
+  bool internal_mass_com = false;
   double epsilon = 0.0;
   RpmdJASparseRows k;
   RpmdJASparseRows h[3]; // Stored as H^T for the existing prepare tile orientation.
@@ -82,7 +84,7 @@ inline RpmdJAAdditiveData read_rpmd_ja_additive(
   const double budget = rpmd_ja_additive_read<double>(in);
   const auto training = rpmd_ja_additive_read<std::uint64_t>(in);
   const auto validation = rpmd_ja_additive_read<std::uint64_t>(in);
-  if (std::string(magic, sizeof(magic)) != "GPJAADD1" || version != 1 || endian != 0x01020304 ||
+  if (std::string(magic, sizeof(magic)) != "GPJAADD1" || (version != 1 && version != 2) || endian != 0x01020304 ||
       n < 2 || n != ref.number_of_atoms || p < 1 || (beads > 0 && p != beads) || !(temperature > 0.0) ||
       !std::isfinite(temperature) || temperature != ref.temperature ||
       !(epsilon > 0.0) || !std::isfinite(epsilon) || !(response >= 0.0) || !(budget >= response) ||
@@ -94,7 +96,7 @@ inline RpmdJAAdditiveData read_rpmd_ja_additive(
     throw std::runtime_error("raw qNEP gradient length does not match additive dimensions");
   if (source != rpmd_ja_model_fingerprint(raw_path))
     throw std::runtime_error("GPJAADD1 source qNEP raw fingerprint does not match");
-  RpmdJAAdditiveData out; out.beads = p; out.epsilon = epsilon;
+  RpmdJAAdditiveData out; out.beads = p; out.epsilon = epsilon; out.internal_mass_com = version == 2;
   out.linear_gradient.assign(static_cast<std::size_t>(d), 0.0);
   std::vector<RpmdJAAdditiveEntry> k_entries;
   std::vector<RpmdJAAdditiveEntry> h_entries[3];
@@ -200,8 +202,10 @@ inline RpmdJAAdditiveData read_rpmd_ja_additive(
     std::vector<RpmdJAAdditiveEntry>().swap(h_entries[alpha]);
   }
   for(double x:out.linear_gradient)if(!std::isfinite(x))throw std::runtime_error("non-finite assembled GPJAADD1 gradient");
+  const std::vector<double> target_gradient = out.internal_mass_com ?
+    rpmd_ja_reference_math::mass_com_covector_pullback(raw_gradient, ref.masses) : raw_gradient;
   double residual=0.0, norm=0.0;
-  for(int i=0;i<d;++i){if(!std::isfinite(raw_gradient[i]))throw std::runtime_error("non-finite raw qNEP reference gradient");residual=std::hypot(residual,raw_gradient[i]+out.linear_gradient[i]);norm=std::hypot(norm,raw_gradient[i]);}
+  for(int i=0;i<d;++i){if(!std::isfinite(target_gradient[i]))throw std::runtime_error("non-finite raw qNEP reference gradient");residual=std::hypot(residual,target_gradient[i]+out.linear_gradient[i]);norm=std::hypot(norm,target_gradient[i]);}
   if(!std::isfinite(residual)||!std::isfinite(norm)||residual>1.0e-8*std::max(1.0,norm))
     throw std::runtime_error("GPJAADD1 linear term does not cancel raw reference gradient");
   return out;

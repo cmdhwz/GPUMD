@@ -72,7 +72,7 @@ raw_generation = text[text.index("static void generate_rpmd_ja_qnep_raw_referenc
 assert raw_generation.index("exact full-column V gradient net xyz=") < raw_generation.index("if (require_zero_net_gradient && !net_stats.within_limit)") < raw_generation.index("const auto kc_phase_start")
 assert "bool require_zero_net_gradient = false" in header
 fit_impl = native[native.index("static void fit_rpmd_ja_native_reference_impl("):native.index("void fit_rpmd_ja_native_reference(")]
-assert "force,true);" in fit_impl
+assert "force,!options.internal_mass_com);" in fit_impl
 assert "rpmd_ja_reference_math::net_force_stats(raw_gradient,n)" in native
 
 

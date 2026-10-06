@@ -648,7 +648,9 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         raw_gradient[coordinate] = std::accumulate(site_energy.begin(), site_energy.end(), 0.0);
       }
       additive = read_rpmd_ja_additive(additive_path, raw_path, ref, -1, raw_gradient);
-      ref.mechanical_policy = "native_reference_transport;finite_temperature_additive_v1;beads=" +
+      ref.mechanical_policy = std::string("native_reference_transport;") +
+        (additive.internal_mass_com ? "internal_mass_com_pullback_v1;" : "") +
+        "finite_temperature_additive_v1;beads=" +
         std::to_string(additive.beads) + ";derivative=" + std::to_string(raw.version);
       ref.additive_beads = additive.beads;
       ref.additive_epsilon = additive.epsilon;
@@ -1081,6 +1083,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       const int atom_start=std::max(0,j-alpha*n),atom_end=std::min(n,j+nc-alpha*n);
       const int atom_width=std::max(0,atom_end-atom_start);
       std::vector<double> vrows(static_cast<std::size_t>(tile_size)*atom_width), vcrows(vrows.size());
+      // Internal policy keeps raw ambient Bt/fenergy; cached E^T Bt E realizes the P pullback.
       for(int i=0;i<d;i+=tile_size){const int nr=std::min(tile_size,d-i);
         if(atom_width>0){vf.clear();vf.seekg(vstart+static_cast<std::streamoff>(i)*n*sizeof(double)+static_cast<std::streamoff>(atom_start)*sizeof(double));for(int x=0;x<nr;++x){vf.read(reinterpret_cast<char*>(vrows.data()+static_cast<std::size_t>(x)*atom_width),static_cast<std::streamsize>(atom_width)*sizeof(double));if(!vf)throw std::runtime_error("read H fine V slice");vf.seekg(static_cast<std::streamoff>(n-atom_width)*sizeof(double),std::ios::cur);}vcf.clear();vcf.seekg(vcstart+static_cast<std::streamoff>(i)*n*sizeof(double)+static_cast<std::streamoff>(atom_start)*sizeof(double));for(int x=0;x<nr;++x){vcf.read(reinterpret_cast<char*>(vcrows.data()+static_cast<std::size_t>(x)*atom_width),static_cast<std::streamsize>(atom_width)*sizeof(double));if(!vcf)throw std::runtime_error("read H coarse V slice");vcf.seekg(static_cast<std::streamoff>(n-atom_width)*sizeof(double),std::ios::cur);}h_v_bytes+=static_cast<std::uint64_t>(2)*nr*atom_width*sizeof(double);}
         std::vector<double> h(static_cast<std::size_t>(nr)*nc),hc(h.size());

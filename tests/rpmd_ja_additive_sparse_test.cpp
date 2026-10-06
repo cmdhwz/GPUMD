@@ -35,6 +35,7 @@ int main()
   b[0*q+4]=b[4*q+0]=0.35; b[1*q+5]=b[5*q+1]=-0.27; b[2*q+3]=b[3*q+2]=0.19;
 
   RpmdJAReference ref;ref.number_of_atoms=n;ref.temperature=300.0;
+  ref.masses={1.0,2.0,5.0};
   ref.positions.assign(positions,positions+d);std::copy(cell,cell+9,ref.cell);
   std::vector<double> dense_k(d*d),dense_h[3],gradient(d);
   for(auto& h:dense_h)h.assign(d*d,0.0);
@@ -94,6 +95,31 @@ int main()
   }
   compare(actual.linear_gradient,gradient);
   assert(dense_h[0][1*d+5]!=dense_h[0][5*d+1]);
+
+  std::vector<double> internal_raw_gradient=raw_gradient;
+  for(int axis=0;axis<3;++axis){
+    const double net=3.0+axis;
+    for(int i=0;i<n;++i)internal_raw_gradient[axis*n+i]+=ref.masses[i]/10.0*net;
+  }
+  {
+    std::fstream out(package,std::ios::binary|std::ios::in|std::ios::out);
+    out.seekp(8);put(out,std::uint32_t(2));
+  }
+  const auto internal=read_rpmd_ja_additive(package,"stub.raw",ref,-1,internal_raw_gradient);
+  assert(internal.internal_mass_com);
+  compare(internal.linear_gradient,gradient);
+  {
+    std::fstream out(package,std::ios::binary|std::ios::in|std::ios::out);
+    out.seekp(8);put(out,std::uint32_t(1));
+  }
+  bool legacy_rejected=false;
+  try { (void)read_rpmd_ja_additive(package,"stub.raw",ref,-1,internal_raw_gradient); }
+  catch(const std::runtime_error&) { legacy_rejected=true; }
+  assert(legacy_rejected);
+  {
+    std::fstream out(package,std::ios::binary|std::ios::in|std::ios::out);
+    out.seekp(8);put(out,std::uint32_t(2));
+  }
 
   ref.cell[0]=std::numeric_limits<double>::infinity();
   bool rejected=false;
