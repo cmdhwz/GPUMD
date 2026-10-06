@@ -73,6 +73,37 @@ std::string read_test_file(const std::string& path)
   std::ifstream in(path,std::ios::binary);return std::string(std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>());
 }
 
+struct CutQPFixture
+{
+  SmallSVD svd;
+  std::vector<std::vector<double>> rows,a;
+  std::vector<double> rhs,b,initial_lambda;
+  double primal_tolerance=0.0;
+};
+
+CutQPFixture read_cut_qp_fixture(const std::string& path)
+{
+  std::ifstream in(path);if(!in)throw std::runtime_error("cannot open QP regression fixture: "+path);CutQPFixture fixture;std::string line;
+  auto read_vector=[](std::istringstream& fields,std::vector<double>& values){std::size_t count=0;if(!(fields>>count))throw std::runtime_error("invalid QP fixture vector header");values.resize(count);for(double& value:values)if(!(fields>>value))throw std::runtime_error("truncated QP fixture vector");};
+  while(std::getline(in,line)){std::istringstream fields(line);std::string key;fields>>key;
+    if(key=="parameters")fields>>fixture.svd.p;
+    else if(key=="primal_tolerance")fields>>fixture.primal_tolerance;
+    else if(key=="svd_singular")read_vector(fields,fixture.svd.singular);
+    else if(key=="svd_eta")read_vector(fields,fixture.svd.eta);
+    else if(key=="initial_lambda")read_vector(fields,fixture.initial_lambda);
+    else if(key=="svd_vt"){
+      int rows=0,cols=0;fields>>rows>>cols;if(rows!=fixture.svd.p||cols!=fixture.svd.p)throw std::runtime_error("invalid QP fixture SVD dimensions");fixture.svd.vt.resize(static_cast<std::size_t>(rows)*cols);
+      for(int i=0;i<rows;++i){if(!std::getline(in,line))throw std::runtime_error("truncated QP fixture SVD vectors");std::istringstream row(line);for(int j=0;j<cols;++j)if(!(row>>fixture.svd.vt[static_cast<std::size_t>(i)+static_cast<std::size_t>(j)*rows]))throw std::runtime_error("invalid QP fixture SVD row");}}
+    else if(key=="original_rows"||key=="transformed_a"){
+      std::size_t count=0;int cols=0;fields>>count>>cols;if(cols!=fixture.svd.p)throw std::runtime_error("invalid QP fixture row width");auto& matrix=key=="original_rows"?fixture.rows:fixture.a;auto& values=key=="original_rows"?fixture.rhs:fixture.b;matrix.assign(count,std::vector<double>(cols));values.resize(count);
+      for(std::size_t i=0;i<count;++i){if(!std::getline(in,line))throw std::runtime_error("truncated QP fixture rows");std::istringstream row(line);std::size_t index=0;std::string tag;if(!(row>>index)||index!=i)throw std::runtime_error("invalid QP fixture row index");for(double& value:matrix[i])if(!(row>>value))throw std::runtime_error("invalid QP fixture row data");if(!(row>>tag>>values[i])||tag!=(key=="original_rows"?"rhs":"b"))throw std::runtime_error("invalid QP fixture row right hand side");}}
+  }
+  if(!in.eof()||fixture.svd.p!=60||fixture.rows.size()!=233||fixture.a.size()!=fixture.rows.size()||fixture.initial_lambda.size()!=fixture.rows.size()||
+     fixture.svd.singular.size()!=static_cast<std::size_t>(fixture.svd.p)||fixture.svd.eta.size()!=static_cast<std::size_t>(fixture.svd.p)||fixture.svd.vt.size()!=static_cast<std::size_t>(fixture.svd.p)*fixture.svd.p||!(fixture.primal_tolerance>0.0))
+    throw std::runtime_error("QP regression fixture dimensions or metadata are invalid");
+  return fixture;
+}
+
 void test_fit_samples_entry_preserves_inputs()
 {
   const std::string spool=write_sample_spool(".fit_samples",3,2.0),raw=spool+".qraw",output=spool+".out";
@@ -287,14 +318,14 @@ void test_padded_qr_svd_and_cut_qp(cusolverDnHandle_t solver)
   SmallSVD identity;identity.p=2;identity.singular={1.0,1.0};identity.eta={0.0,0.0};identity.vt={1.0,0.0,0.0,1.0};
   const std::vector<std::vector<double>> constraints={{1.0,0.0},{-1.0,0.0},{1.0,0.0}};
   identity.eta={2.0,0.0};
-  const auto qp=solve_cut_qp(identity,constraints,{0.5,-1.0,0.75});
+  const auto qp=solve_cut_qp(solver,identity,constraints,{0.5,-1.0,0.75});
   const auto& xi=qp.xi;
   check_close(xi[0],1.0,2e-8);check_close(xi[1],0.0,2e-8);
 
   identity.eta={0.0,0.0};
   const double delta=1e-4;
   const std::vector<std::vector<double>> near_parallel={{1.0,0.0},{1.0,delta}};
-  const auto slow_qp=solve_cut_qp(identity,near_parallel,{2.0,2.0+0.25*delta*delta});
+  const auto slow_qp=solve_cut_qp(solver,identity,near_parallel,{2.0,2.0+0.25*delta*delta});
   assert(slow_qp.certificate.accepted);
   assert(slow_qp.last_multiplier_change>1e-11);
 
@@ -314,27 +345,29 @@ void test_padded_qr_svd_and_cut_qp(cusolverDnHandle_t solver)
   assert(unequal_tolerance.minimum_slack_allowed_error==1e-8&&unequal_tolerance.allowed_error[1]<2e-13);
   assert(!unequal_tolerance.primal_constraints_pass);
 
-  const auto first_qp=solve_cut_qp(identity,{{1.0,0.0}},{0.25});
+  const auto first_qp=solve_cut_qp(solver,identity,{{1.0,0.0}},{0.25});
   const std::vector<std::vector<double>> extended={{1.0,0.0},{0.0,1.0},{1.0,1.0}};
   const std::vector<double> extended_rhs={0.25,0.75,1.2};
-  const auto warm_qp=solve_cut_qp(identity,extended,extended_rhs,1e-8,first_qp.lambda);
-  const auto cold_qp=solve_cut_qp(identity,extended,extended_rhs);
+  const auto warm_qp=solve_cut_qp(solver,identity,extended,extended_rhs,1e-8,first_qp.lambda);
+  const auto cold_qp=solve_cut_qp(solver,identity,extended,extended_rhs);
   assert(warm_qp.certificate.accepted==cold_qp.certificate.accepted);
   assert(warm_qp.certificate.accepted);
   check_close(std::inner_product(warm_qp.xi.begin(),warm_qp.xi.end(),warm_qp.xi.begin(),0.0),
     std::inner_product(cold_qp.xi.begin(),cold_qp.xi.end(),cold_qp.xi.begin(),0.0),2e-8);
 
-  const auto previous_qp=solve_cut_qp(identity,{{1.0,0.0},{0.0,1.0}},{1.0,1.0});
+  const auto previous_qp=solve_cut_qp(solver,identity,{{1.0,0.0},{0.0,1.0}},{1.0,1.0});
   const std::string qp_state_path="rpmd_ja_qp_state_test_"+
     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";
   bool infeasible_rejected=false;
-  try { (void)solve_cut_qp(identity,{{1.0,0.0},{0.0,1.0},{-1.0,0.0},{0.0,-1.0}},{1.0,1.0,1.0,1.0},1e-8,previous_qp.lambda,qp_state_path,7); }
+  try { (void)solve_cut_qp(solver,identity,{{1.0,0.0},{0.0,1.0},{-1.0,0.0},{0.0,-1.0}},{1.0,1.0,1.0,1.0},1e-8,previous_qp.lambda,qp_state_path,7); }
   catch(const std::runtime_error&) { infeasible_rejected=true; }
   assert(infeasible_rejected);
   std::ifstream qp_state_file(qp_state_path);
   const std::string qp_state((std::istreambuf_iterator<char>(qp_state_file)),std::istreambuf_iterator<char>());
   assert(qp_state.find("outer_index 7")!=std::string::npos);
   assert(qp_state.find("iterations 200000")!=std::string::npos);
+  assert(qp_state.find("method coordinate")!=std::string::npos&&qp_state.find("polish_attempts 2")!=std::string::npos);
+  assert(qp_state.find("active_constraints ")!=std::string::npos&&qp_state.find("polish_updates ")!=std::string::npos&&qp_state.find("polish_failure_reason ACTIVE_")!=std::string::npos);
   assert(qp_state.find("primal_tolerance 1e-08")!=std::string::npos);
   assert(qp_state.find("svd_singular")!=std::string::npos&&qp_state.find("svd_vt")!=std::string::npos&&qp_state.find("svd_eta")!=std::string::npos);
   assert(qp_state.find("original_rows")!=std::string::npos&&qp_state.find("transformed_a")!=std::string::npos&&qp_state.find("gram")!=std::string::npos);
@@ -392,6 +425,34 @@ void test_padded_qr_svd_and_cut_qp(cusolverDnHandle_t solver)
   try { (void)svd_small(solver,{std::numeric_limits<double>::quiet_NaN(),0.0,0.0,1.0},{0.0,0.0},2); }
   catch(const std::runtime_error&) { rejected=true; }
   assert(rejected);
+}
+
+void test_active_set_qp_snapshot_and_rejection(cusolverDnHandle_t solver)
+{
+  std::string fixture_path="tests/data/ja_reference_resample.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);
+  const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
+  assert(replay.method==std::string("active_set_polish"));assert(replay.iterations==4096&&replay.polish_attempts==1&&replay.polish_updates>0);
+  assert(replay.certificate.accepted&&replay.certificate.primal_constraints_pass&&replay.certificate.finite);
+  assert(replay.certificate.primal_slack.size()==233&&replay.lambda.size()==233&&replay.certificate.max_primal_excess==0.0);
+  assert(replay.certificate.max_complementarity<=qp_complementarity_tolerance&&replay.certificate.max_stationarity<=qp_stationarity_tolerance);
+
+  SmallSVD identity;identity.p=2;identity.singular={1.0,1.0};identity.eta={0.0,0.0};identity.vt={1.0,0.0,0.0,1.0};
+  const std::vector<std::vector<double>> rows={{1.0,0.0},{0.0,1.0}};const std::vector<double> rhs={1.0,-0.7};
+  const ActiveSetPolishResult negative=polish_cut_qp(solver,identity,rows,rhs,rows,rhs,{1.0,1.0},1e-8);
+  const double rounded_alpha=0.1/(0.1-(-0.7));assert(0.1+rounded_alpha*(-0.7-0.1)<0.0);
+  const ActiveSetPolishResult rounded_exit=polish_cut_qp(solver,identity,rows,rhs,rows,rhs,{1.0,0.1},1e-8);
+  assert(negative.accepted&&negative.lambda[0]>=0.0&&negative.lambda[1]==0.0&&negative.updates>0);
+  assert(rounded_exit.accepted&&rounded_exit.lambda[0]>=0.0&&rounded_exit.lambda[1]==0.0&&rounded_exit.updates>0);
+  assert(negative.certificate.primal_slack.size()==rows.size()&&negative.certificate.primal_slack[1]>0.0);
+  assert(rounded_exit.certificate.primal_slack.size()==rows.size()&&rounded_exit.certificate.primal_slack[1]>0.0);
+
+  const std::vector<std::vector<double>> dependent={{1.0,0.0},{2.0,0.0}};const std::vector<double> dependent_rhs={1.0,2.0};
+  const ActiveSetPolishResult rank_failure=polish_cut_qp(solver,identity,dependent,dependent_rhs,dependent,dependent_rhs,{1.0,1.0},1e-8);
+  assert(!rank_failure.accepted&&rank_failure.failure_reason=="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT");
+  const std::vector<std::vector<double>> too_many_active={{1.0,0.0},{0.0,1.0},{1.0,1.0}};const std::vector<double> too_many_rhs={1.0,1.0,2.0};
+  const ActiveSetPolishResult dimension_rank_failure=polish_cut_qp(solver,identity,too_many_active,too_many_rhs,too_many_active,too_many_rhs,{1.0,1.0,1.0},1e-8);
+  assert(!dimension_rank_failure.accepted&&dimension_rank_failure.failure_reason=="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT");
 }
 
 void test_read_frame_rejects_invalid_data()
@@ -472,7 +533,7 @@ void test_lanczos_blindspot_cg_cut_feedback(cusolverDnHandle_t solver)
   w[0]=1.0-1.0/n;for(int i=1;i<n;++i)w[i]=-1.0/n;std::vector<double> start(d);for(int i=0;i<d;++i)start[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);project_translation(start,sqrt_atom,n);double norm=std::sqrt(std::inner_product(start.begin(),start.end(),start.begin(),0.0));for(double& x:start)x/=norm;const double overlap=std::inner_product(w.begin(),w.end(),start.begin(),0.0);double start_x2=0.0;for(int i=0;i<n;++i)start_x2+=start[i]*start[i];for(int i=0;i<n;++i)w[i]-=(overlap/start_x2)*start[i];norm=std::sqrt(std::inner_product(w.begin(),w.end(),w.begin(),0.0));for(double& x:w)x/=norm;assert(std::abs(std::inner_product(w.begin(),w.end(),start.begin(),0.0))<1e-12);
   std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=1.0;for(int i=0;i<d;++i)for(int j=0;j<d;++j)raw[static_cast<std::size_t>(i)*d+j]-=2.0*w[i]*w[j];std::stringstream input(std::ios::in|std::ios::out|std::ios::binary);input.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));input.seekg(0);DeviceBaseline baseline;baseline.initialize(input,0,d,n,masses,sqrt_mass);Graph graph;for(int i=0;i<n;++i)for(int j=i+1;j<n;++j)graph.edges.push_back({i,j,0,{0,0,0}});
   const auto modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,96,4);assert(modes.front().value>0.99&&modes.front().residual<1e-10);std::vector<double> zero(p,0.0);const CGResult cg=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,zero,n,0,epsilon);assert(cg.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION");assert(cg.witness.rayleigh<0.0);const auto witness_modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,16,4,cg.witness.direction);assert(witness_modes.front().value<-0.99&&witness_modes.front().residual<1e-10);
-  SmallSVD identity;identity.p=p;identity.singular.assign(p,1.0);identity.eta.assign(p,0.0);identity.vt.assign(p*p,0.0);for(int i=0;i<p;++i)identity.vt[static_cast<std::size_t>(i)*p+i]=1.0;const auto row=spectral_row(graph,w,sqrt_mass,n,p);const double base=std::inner_product(w.begin(),w.end(),cg.witness.base.begin(),0.0);const auto qp=solve_cut_qp(identity,{row},{epsilon-base},epsilon/4.0);const auto theta=theta_from_eta(identity,qp.xi);
+  SmallSVD identity;identity.p=p;identity.singular.assign(p,1.0);identity.eta.assign(p,0.0);identity.vt.assign(p*p,0.0);for(int i=0;i<p;++i)identity.vt[static_cast<std::size_t>(i)*p+i]=1.0;const auto row=spectral_row(graph,w,sqrt_mass,n,p);const double base=std::inner_product(w.begin(),w.end(),cg.witness.base.begin(),0.0);const auto qp=solve_cut_qp(solver,identity,{row},{epsilon-base},epsilon/4.0);const auto theta=theta_from_eta(identity,qp.xi);
   const auto basis=internal_basis(n);const int internal=static_cast<int>(basis.size());std::vector<double> restricted(static_cast<std::size_t>(internal)*internal);for(int j=0;j<internal;++j){std::vector<double> image(d);apply_total(baseline,graph,basis[j],sqrt_mass,sqrt_atom,theta,n,image);for(int i=0;i<internal;++i)restricted[static_cast<std::size_t>(i)*internal+j]=std::inner_product(basis[i].begin(),basis[i].end(),image.begin(),0.0);}const auto exact=eigen_small(solver,restricted,internal);assert(exact.values.front()>=epsilon-2e-10);const CGResult repaired=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,theta,n,0,epsilon);assert(repaired.witness.classification.empty());assert(repaired.relative_residual<=1e-8);
 }
 
@@ -563,6 +624,7 @@ int main()
   test_pap_baseline();
   DeviceQR qr;qr.initialize(2,3);
   test_padded_qr_svd_and_cut_qp(qr.solver);
+  test_active_set_qp_snapshot_and_rejection(qr.solver);
   test_read_frame_rejects_invalid_data();
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();

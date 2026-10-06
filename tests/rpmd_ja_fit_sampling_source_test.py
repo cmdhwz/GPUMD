@@ -86,6 +86,23 @@ assert "test_fit_samples_entry_preserves_inputs" in source("tests/rpmd_ja_native
 assert "test_full_spd_failure_keeps_candidate_pack" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_response_uncomputed_values_are_explicit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_active_set_qp_snapshot_and_rejection" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "tests/data/ja_reference_resample.bin.qp_state.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "solve_active_equalities" in native_fit and "cusolverDnDgesvd(solver,'S','S',p,n" in native_fit
+assert "ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT" in native_fit and "ACTIVE_EQUALITY_UNRELIABLE" in native_fit
+active_svd_start = native_fit.index("bool solve_active_equalities(")
+active_svd_end = native_fit.index("ActiveSetPolishResult polish_cut_qp(", active_svd_start)
+active_svd = native_fit[active_svd_start:active_svd_end]
+assert "if(q>static_cast<std::size_t>(p)){failure_reason=\"ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT\";return false;}" in active_svd
+assert "if(da){cudaFree(da);da=nullptr;}" in active_svd and "if(info){cudaFree(info);info=nullptr;}" in active_svd
+assert "rounded_alpha" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "rounded_exit.accepted" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "dimension_rank_failure.failure_reason" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "first_polish_iteration=4096" in native_fit and "max_iterations=200000" in native_fit
+assert "result.polish_attempts<2" in native_fit and "4*(m+static_cast<std::size_t>(svd.p))" in native_fit
+assert 'method="active_set_polish"' in native_fit and '<<" polish_attempts="' in native_fit
+assert "polish_failure_reason" in native_fit and "ACTIVE_FULL_KKT_NOT_ACCEPTED" in native_fit
+assert (ROOT / "tests/data/ja_reference_resample.bin.qp_state.txt").stat().st_size > 1_000_000
 assert "POTRF_diagonal_shift_eV_per_A2_per_amu" in source("src/measure/rpmd_ja_qnep_prepare.cu")
 
 pre_run_start = sampler_fit.index("void RpmdJA_Fit::pre_run(")

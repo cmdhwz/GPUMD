@@ -362,36 +362,126 @@ struct QPSolution
   QPCertificate certificate;
   int iterations=0;
   double last_multiplier_change=0.0;
+  const char* method="coordinate";
+  int polish_attempts=0;
+  std::size_t polish_updates=0;
+  std::size_t active_constraints=0;
+  std::string polish_failure_reason="none";
 };
 
-void write_cut_qp_state(const std::string& path,const int outer,const int iterations,const double last_change,const double primal_tolerance,
+void write_cut_qp_state(const std::string& path,const int outer,const QPSolution& solution,const double primal_tolerance,
   const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
   const std::vector<std::vector<double>>& a,const std::vector<double>& b,const std::vector<double>& gram,
-  const std::vector<double>& initial_lambda,const std::vector<double>& lambda,const std::vector<double>& xi,const QPCertificate& certificate)
+  const std::vector<double>& initial_lambda)
 {
   if(path.empty())return;
   std::ifstream existing(path,std::ios::binary);if(existing.good())throw std::runtime_error("native fit refuses to overwrite an existing QP state snapshot: "+path);
   std::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("native fit cannot create QP state snapshot: "+path);
-  out<<std::setprecision(17)<<"outer_index "<<outer<<"\niterations "<<iterations<<"\nparameters "<<svd.p<<"\nconstraints "<<rows.size()
+  out<<std::setprecision(17)<<"outer_index "<<outer<<"\niterations "<<solution.iterations<<"\nmethod "<<solution.method
+    <<"\npolish_attempts "<<solution.polish_attempts<<"\nactive_constraints "<<solution.active_constraints
+    <<"\npolish_updates "<<solution.polish_updates<<"\npolish_failure_reason "<<solution.polish_failure_reason
+    <<"\nparameters "<<svd.p<<"\nconstraints "<<rows.size()
     <<"\nprimal_tolerance "<<primal_tolerance<<"\ncomplementarity_tolerance "<<qp_complementarity_tolerance<<"\nstationarity_tolerance "<<qp_stationarity_tolerance
-    <<"\nlast_multiplier_change "<<last_change<<"\nmax_primal_violation "<<certificate.max_primal_violation
-    <<"\nmax_complementarity "<<certificate.max_complementarity<<"\nmax_stationarity "<<certificate.max_stationarity
-    <<"\nprimal_constraints_pass "<<(certificate.primal_constraints_pass?1:0)<<"\nmax_primal_excess "<<certificate.max_primal_excess
-    <<"\nworst_primal_excess_index "<<certificate.worst_primal_excess_index
-    <<"\nminimum_slack_constraint_index "<<certificate.minimum_slack_constraint_index<<"\nminimum_primal_slack "<<certificate.minimum_primal_slack
-    <<"\nminimum_slack_allowed_error "<<certificate.minimum_slack_allowed_error<<"\nkkt_accepted 0\n";
+    <<"\nlast_multiplier_change "<<solution.last_multiplier_change<<"\nmax_primal_violation "<<solution.certificate.max_primal_violation
+    <<"\nmax_complementarity "<<solution.certificate.max_complementarity<<"\nmax_stationarity "<<solution.certificate.max_stationarity
+    <<"\nprimal_constraints_pass "<<(solution.certificate.primal_constraints_pass?1:0)<<"\nmax_primal_excess "<<solution.certificate.max_primal_excess
+    <<"\nworst_primal_excess_index "<<solution.certificate.worst_primal_excess_index
+    <<"\nminimum_slack_constraint_index "<<solution.certificate.minimum_slack_constraint_index<<"\nminimum_primal_slack "<<solution.certificate.minimum_primal_slack
+    <<"\nminimum_slack_allowed_error "<<solution.certificate.minimum_slack_allowed_error<<"\nkkt_accepted 0\n";
   auto write_vector=[&](const char* name,const std::vector<double>& values){out<<name<<' '<<values.size();for(double value:values)out<<' '<<value;out<<'\n';};
-  write_vector("svd_singular",svd.singular);write_vector("svd_eta",svd.eta);write_vector("initial_lambda",initial_lambda);write_vector("lambda",lambda);write_vector("xi",xi);write_vector("theta",certificate.theta);
+  write_vector("svd_singular",svd.singular);write_vector("svd_eta",svd.eta);write_vector("initial_lambda",initial_lambda);write_vector("lambda",solution.lambda);write_vector("xi",solution.xi);write_vector("theta",solution.certificate.theta);
   out<<"svd_vt "<<svd.p<<' '<<svd.p<<'\n';for(int i=0;i<svd.p;++i){for(int j=0;j<svd.p;++j)out<<svd.vt[static_cast<std::size_t>(i)+static_cast<std::size_t>(j)*svd.p]<<(j+1==svd.p?'\n':' ');}
   out<<"original_rows "<<rows.size()<<' '<<svd.p<<'\n';for(std::size_t i=0;i<rows.size();++i){out<<i;for(double value:rows[i])out<<' '<<value;out<<" rhs "<<rhs[i]<<'\n';}
   out<<"transformed_a "<<a.size()<<' '<<svd.p<<'\n';for(std::size_t i=0;i<a.size();++i){out<<i;for(double value:a[i])out<<' '<<value;out<<" b "<<b[i]<<'\n';}
   out<<"gram "<<rows.size()<<' '<<rows.size()<<'\n';for(std::size_t i=0;i<rows.size();++i){for(std::size_t j=0;j<rows.size();++j)out<<gram[i*rows.size()+j]<<(j+1==rows.size()?'\n':' ');}
   out<<"constraint_state index primal_slack allowed_error primal_excess dual_slack lambda complementarity\n";
-  for(std::size_t i=0;i<rows.size();++i)out<<i<<' '<<certificate.primal_slack[i]<<' '<<certificate.allowed_error[i]<<' '<<std::max(0.0,-certificate.primal_slack[i]-certificate.allowed_error[i])<<' '<<certificate.dual_slack[i]<<' '<<lambda[i]<<' '<<lambda[i]*certificate.dual_slack[i]<<'\n';
+  for(std::size_t i=0;i<rows.size();++i)out<<i<<' '<<solution.certificate.primal_slack[i]<<' '<<solution.certificate.allowed_error[i]<<' '<<std::max(0.0,-solution.certificate.primal_slack[i]-solution.certificate.allowed_error[i])<<' '<<solution.certificate.dual_slack[i]<<' '<<solution.lambda[i]<<' '<<solution.lambda[i]*solution.certificate.dual_slack[i]<<'\n';
   out.close();if(!out)throw std::runtime_error("native fit failed writing QP state snapshot: "+path);
 }
 
-QPSolution solve_cut_qp(const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
+struct ActiveSetPolishResult
+{
+  std::vector<double> lambda,xi;
+  QPCertificate certificate;
+  std::size_t active_constraints=0,updates=0;
+  bool accepted=false;
+  std::string failure_reason="none";
+};
+
+bool solve_active_equalities(cusolverDnHandle_t solver,const std::vector<std::vector<double>>& a,const std::vector<double>& b,
+  const std::vector<std::size_t>& active,const int p,std::vector<double>& y,std::vector<double>& lambda_star,std::string& failure_reason)
+{
+  const std::size_t q=active.size();
+  if(q==0||p<=0||q>static_cast<std::size_t>(std::numeric_limits<int>::max())||static_cast<std::size_t>(p)>std::numeric_limits<std::size_t>::max()/q){failure_reason="ACTIVE_MATRIX_DIMENSION";return false;}
+  if(q>static_cast<std::size_t>(p)){failure_reason="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT";return false;}
+  const int n=static_cast<int>(q),rank=std::min(p,n);std::vector<double> matrix(static_cast<std::size_t>(p)*q);
+  for(int j=0;j<n;++j){const std::size_t row=active[j];if(row>=a.size()||row>=b.size()||a[row].size()!=static_cast<std::size_t>(p)){failure_reason="ACTIVE_MATRIX_DIMENSION";return false;}for(int i=0;i<p;++i)matrix[static_cast<std::size_t>(i)+static_cast<std::size_t>(j)*p]=a[row][i];}
+  double *da=nullptr,*ds=nullptr,*du=nullptr,*dvt=nullptr,*work=nullptr,*rwork=nullptr;int* info=nullptr;int lwork=0;
+  auto cleanup=[&](){if(da){cudaFree(da);da=nullptr;}if(ds){cudaFree(ds);ds=nullptr;}if(du){cudaFree(du);du=nullptr;}if(dvt){cudaFree(dvt);dvt=nullptr;}if(work){cudaFree(work);work=nullptr;}if(rwork){cudaFree(rwork);rwork=nullptr;}if(info){cudaFree(info);info=nullptr;}};
+  try{
+    if(cudaMalloc(reinterpret_cast<void**>(&da),matrix.size()*sizeof(double))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&ds),static_cast<std::size_t>(rank)*sizeof(double))!=cudaSuccess||
+       cudaMalloc(reinterpret_cast<void**>(&du),static_cast<std::size_t>(p)*rank*sizeof(double))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&dvt),static_cast<std::size_t>(rank)*q*sizeof(double))!=cudaSuccess||
+       cudaMalloc(reinterpret_cast<void**>(&rwork),static_cast<std::size_t>(5)*rank*sizeof(double))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&info),sizeof(int))!=cudaSuccess)
+      throw std::runtime_error("allocation");
+    if(cusolverDnDgesvd_bufferSize(solver,p,n,&lwork)!=CUSOLVER_STATUS_SUCCESS||lwork<=0||
+       cudaMalloc(reinterpret_cast<void**>(&work),static_cast<std::size_t>(lwork)*sizeof(double))!=cudaSuccess)throw std::runtime_error("workspace");
+    if(cudaMemcpy(da,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
+       cusolverDnDgesvd(solver,'S','S',p,n,da,p,ds,du,p,dvt,rank,work,lwork,rwork,info)!=CUSOLVER_STATUS_SUCCESS)
+      throw std::runtime_error("factorization");
+    int host_info=0;if(cudaMemcpy(&host_info,info,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess||host_info)throw std::runtime_error("convergence");
+    std::vector<double> singular(rank),u(static_cast<std::size_t>(p)*rank),vt(static_cast<std::size_t>(rank)*q);
+    if(cudaMemcpy(singular.data(),ds,singular.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess||
+       cudaMemcpy(u.data(),du,u.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess||
+       cudaMemcpy(vt.data(),dvt,vt.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("readback");
+    cleanup();
+    if(!std::all_of(singular.begin(),singular.end(),[](double x){return std::isfinite(x);})||
+       !std::all_of(u.begin(),u.end(),[](double x){return std::isfinite(x);})||
+       !std::all_of(vt.begin(),vt.end(),[](double x){return std::isfinite(x);})) {failure_reason="ACTIVE_SVD_NONFINITE";return false;}
+    if(!(singular.front()>0.0)||singular.back()<=singular.front()*1e-12){failure_reason="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT";return false;}
+    std::vector<double> projected_b(rank,0.0);for(int k=0;k<rank;++k)for(int j=0;j<n;++j)projected_b[k]+=vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank]*b[active[j]];
+    y.assign(p,0.0);lambda_star.assign(q,0.0);
+    for(int k=0;k<rank;++k){const double scaled=projected_b[k]/singular[k];for(int i=0;i<p;++i)y[i]+=u[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*p]*scaled;}
+    for(int j=0;j<n;++j)for(int k=0;k<rank;++k)lambda_star[j]+=vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank]*(projected_b[k]/singular[k])/singular[k];
+    if(!std::all_of(y.begin(),y.end(),[](double x){return std::isfinite(x);})||
+       !std::all_of(lambda_star.begin(),lambda_star.end(),[](double x){return std::isfinite(x);})) {failure_reason="ACTIVE_SVD_NONFINITE";return false;}
+    for(int j=0;j<n;++j){const std::size_t row=active[j];const double residual=std::inner_product(a[row].begin(),a[row].end(),y.begin(),0.0)-b[row];double scale=std::max(1.0,std::abs(b[row]));for(int k=0;k<p;++k)scale+=std::abs(a[row][k]*y[k]);const double tolerance=256.0*std::numeric_limits<double>::epsilon()*scale;if(!std::isfinite(residual)||!std::isfinite(scale)||!std::isfinite(tolerance)||std::abs(residual)>tolerance){failure_reason="ACTIVE_EQUALITY_UNRELIABLE";return false;}}
+    return true;
+  }catch(...){cleanup();failure_reason="ACTIVE_SVD_FAILURE";return false;}
+}
+
+ActiveSetPolishResult polish_cut_qp(cusolverDnHandle_t solver,const SmallSVD& svd,const std::vector<std::vector<double>>& rows,
+  const std::vector<double>& rhs,const std::vector<std::vector<double>>& a,const std::vector<double>& b,
+  const std::vector<double>& initial_lambda,const double primal_tolerance)
+{
+  ActiveSetPolishResult out;out.lambda=initial_lambda;const std::size_t m=rows.size();
+  if(initial_lambda.size()!=m){out.failure_reason="ACTIVE_INITIAL_MULTIPLIER_DIMENSION";return out;}
+  if(m>std::numeric_limits<std::size_t>::max()-static_cast<std::size_t>(svd.p)||(m+static_cast<std::size_t>(svd.p))>std::numeric_limits<std::size_t>::max()/4){out.failure_reason="ACTIVE_UPDATE_LIMIT_OVERFLOW";return out;}
+  const std::size_t update_limit=4*(m+static_cast<std::size_t>(svd.p));std::vector<std::size_t> active;std::vector<char> is_active(m,0);
+  for(std::size_t i=0;i<m;++i){if(!std::isfinite(out.lambda[i])||out.lambda[i]<0.0){out.failure_reason="ACTIVE_INITIAL_MULTIPLIER_INVALID";return out;}if(out.lambda[i]>0.0){active.push_back(i);is_active[i]=1;}}
+  for(;;){out.active_constraints=active.size();std::vector<double> candidate_y(static_cast<std::size_t>(svd.p),0.0),lambda_star;
+    if(!active.empty()&&!solve_active_equalities(solver,a,b,active,svd.p,candidate_y,lambda_star,out.failure_reason))return out;
+    bool has_negative=false;for(double value:lambda_star)has_negative=has_negative||value<0.0;
+    if(has_negative){double alpha=1.0;std::vector<double> ratios(active.size(),std::numeric_limits<double>::infinity());
+      for(std::size_t j=0;j<active.size();++j)if(lambda_star[j]<0.0){const double current=out.lambda[active[j]],denominator=current-lambda_star[j];if(!(current>0.0)||!(denominator>0.0)||!std::isfinite(denominator)){out.failure_reason="ACTIVE_NEGATIVE_MULTIPLIER_STEP_INVALID";return out;}ratios[j]=current/denominator;if(!std::isfinite(ratios[j])||ratios[j]<0.0||ratios[j]>1.0){out.failure_reason="ACTIVE_NEGATIVE_MULTIPLIER_STEP_INVALID";return out;}alpha=std::min(alpha,ratios[j]);}
+      std::vector<std::size_t> remaining,leaving;remaining.reserve(active.size());
+      for(std::size_t j=0;j<active.size();++j){const std::size_t row=active[j];
+        if(lambda_star[j]<0.0&&ratios[j]<=alpha+64.0*std::numeric_limits<double>::epsilon()*std::max(1.0,std::abs(alpha))){out.lambda[row]=0.0;is_active[row]=0;leaving.push_back(row);}
+        else{const double updated=out.lambda[row]+alpha*(lambda_star[j]-out.lambda[row]);if(!std::isfinite(updated)||updated<0.0){out.failure_reason="ACTIVE_NEGATIVE_MULTIPLIER_STEP_INVALID";return out;}out.lambda[row]=updated;remaining.push_back(row);}}
+      if(leaving.empty()||out.updates>update_limit-leaving.size()){out.failure_reason=leaving.empty()?"ACTIVE_NEGATIVE_MULTIPLIER_NO_EXIT":"ACTIVE_UPDATE_LIMIT";return out;}
+      out.updates+=leaving.size();active=std::move(remaining);continue;
+    }
+    std::fill(out.lambda.begin(),out.lambda.end(),0.0);for(std::size_t j=0;j<active.size();++j)out.lambda[active[j]]=lambda_star[j];
+    std::vector<std::size_t> remaining;remaining.reserve(active.size());for(std::size_t j=0;j<active.size();++j){const std::size_t row=active[j];if(lambda_star[j]==0.0){is_active[row]=0;if(out.updates==update_limit){out.failure_reason="ACTIVE_UPDATE_LIMIT";return out;}++out.updates;}else remaining.push_back(row);}active=std::move(remaining);
+    out.xi=svd.eta;for(std::size_t i=0;i<m;++i)for(int k=0;k<svd.p;++k)out.xi[k]+=a[i][k]*out.lambda[i];
+    out.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,out.lambda,out.xi,primal_tolerance);if(out.certificate.accepted){out.accepted=true;out.failure_reason="none";out.active_constraints=active.size();return out;}
+    std::size_t worst=m;double worst_excess=0.0;
+    for(std::size_t i=0;i<m;++i){const double excess=std::max(0.0,-out.certificate.primal_slack[i]-out.certificate.allowed_error[i]);if(excess<=0.0)continue;if(is_active[i]){out.failure_reason="ACTIVE_EQUALITY_KKT_MISMATCH";return out;}if(excess>worst_excess){worst=i;worst_excess=excess;}}
+    if(worst<m){if(out.updates==update_limit){out.failure_reason="ACTIVE_UPDATE_LIMIT";return out;}active.push_back(worst);is_active[worst]=1;++out.updates;continue;}
+    out.failure_reason=out.certificate.finite?"ACTIVE_FULL_KKT_NOT_ACCEPTED":"ACTIVE_KKT_NONFINITE";return out;
+  }
+}
+
+QPSolution solve_cut_qp(cusolverDnHandle_t solver,const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
   const double primal_tolerance=1e-8,const std::vector<double>& initial_lambda={},const std::string& qp_state_path={},const int outer=-1)
 {
   if(!std::isfinite(primal_tolerance)||primal_tolerance<0.0)throw std::runtime_error("native fit stability QP has an invalid primal tolerance");
@@ -401,12 +491,16 @@ QPSolution solve_cut_qp(const SmallSVD& svd,const std::vector<std::vector<double
   for(std::size_t i=0;i<rows.size();++i)for(std::size_t j=0;j<rows.size();++j){gram[i*rows.size()+j]=std::inner_product(a[i].begin(),a[i].end(),a[j].begin(),0.0);if(!std::isfinite(gram[i*rows.size()+j]))throw std::runtime_error("native fit stability QP Gram matrix is non-finite");}
   std::vector<double> diag(rows.size());for(std::size_t i=0;i<rows.size();++i){diag[i]=gram[i*rows.size()+i];if(!(diag[i]>1e-24)||!std::isfinite(diag[i]))throw std::runtime_error("native fit stability cut is singular or non-finite");}
   for(double value:lambda)if(!std::isfinite(value)||value<0.0)throw std::runtime_error("native fit stability QP warm start is non-finite or negative");
-  const std::vector<double> initial_lambda_full=lambda;QPSolution result;result.lambda=std::move(lambda);QPCertificate certificate;constexpr int check_interval=32;
-  for(int it=0;it<200000;++it){double change=0.0;for(std::size_t i=0;i<rows.size();++i){double residual=b[i];for(std::size_t j=0;j<rows.size();++j)residual-=gram[i*rows.size()+j]*result.lambda[j];const double next=std::max(0.0,result.lambda[i]+residual/diag[i]);if(!std::isfinite(next))throw std::runtime_error("native fit stability QP iterate is non-finite");change=std::max(change,std::abs(next-result.lambda[i]));result.lambda[i]=next;}result.iterations=it+1;result.last_multiplier_change=change;
-    if(result.iterations%check_interval==0||result.iterations==200000){result.xi=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)result.xi[k]+=a[i][k]*result.lambda[i];certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,result.lambda,result.xi,primal_tolerance);if(certificate.accepted)break;}}
-  result.xi=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)result.xi[k]+=a[i][k]*result.lambda[i];
-  result.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,result.lambda,result.xi,primal_tolerance);
-  if(!result.certificate.accepted){write_cut_qp_state(qp_state_path,outer,result.iterations,result.last_multiplier_change,primal_tolerance,svd,rows,rhs,a,b,gram,initial_lambda_full,result.lambda,result.xi,result.certificate);throw std::runtime_error("native fit stability QP failed primal, dual, or complementary-slackness check after "+std::to_string(result.iterations)+" iterations"+(qp_state_path.empty()?std::string():"; inspect "+qp_state_path));}
+  const std::vector<double> initial_lambda_full=lambda;QPSolution result;result.lambda=std::move(lambda);constexpr int check_interval=32,max_iterations=200000,first_polish_iteration=4096;
+  auto check_current=[&](){result.xi=svd.eta;for(std::size_t i=0;i<rows.size();++i)for(int k=0;k<svd.p;++k)result.xi[k]+=a[i][k]*result.lambda[i];result.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,result.lambda,result.xi,primal_tolerance);};
+  auto try_polish=[&](){++result.polish_attempts;ActiveSetPolishResult polished;try{polished=polish_cut_qp(solver,svd,rows,rhs,a,b,result.lambda,primal_tolerance);}catch(...){polished.failure_reason="ACTIVE_INTERNAL_FAILURE";}
+    result.active_constraints=polished.active_constraints;result.polish_updates+=polished.updates;result.polish_failure_reason=polished.failure_reason;
+    if(!polished.accepted)return false;result.lambda=std::move(polished.lambda);result.xi=std::move(polished.xi);result.certificate=std::move(polished.certificate);result.method="active_set_polish";return true;};
+  for(int it=0;it<max_iterations;++it){double change=0.0;for(std::size_t i=0;i<rows.size();++i){double residual=b[i];for(std::size_t j=0;j<rows.size();++j)residual-=gram[i*rows.size()+j]*result.lambda[j];const double next=std::max(0.0,result.lambda[i]+residual/diag[i]);if(!std::isfinite(next))throw std::runtime_error("native fit stability QP iterate is non-finite");change=std::max(change,std::abs(next-result.lambda[i]));result.lambda[i]=next;}result.iterations=it+1;result.last_multiplier_change=change;
+    if(result.iterations%check_interval==0||result.iterations==max_iterations){check_current();if(result.certificate.accepted)break;
+      if((result.iterations==first_polish_iteration||result.iterations==max_iterations)&&result.polish_attempts<2&&try_polish())break;}}
+  check_current();
+  if(!result.certificate.accepted){write_cut_qp_state(qp_state_path,outer,result,primal_tolerance,svd,rows,rhs,a,b,gram,initial_lambda_full);throw std::runtime_error("native fit stability QP failed primal, dual, or complementary-slackness check after "+std::to_string(result.iterations)+" iterations"+(qp_state_path.empty()?std::string():"; inspect "+qp_state_path));}
   return result;
 }
 
@@ -915,8 +1009,9 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     cut_rows.push_back(row);cut_rhs.push_back(rhs);trace<<"outer "<<outer<<" status RETRY source "<<source<<" cuts "<<cut_rows.size()<<" curvature "<<value<<" rhs "<<rhs<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';return true;
   };
   auto solve_qp_and_trace=[&](const int outer){
-    const std::size_t warm_start=qp_lambda.size();auto qp=solve_cut_qp(fit_svd,cut_rows,cut_rhs,options.epsilon/4.0,qp_lambda,qp_state_path,outer);qp_lambda=std::move(qp.lambda);
-    trace<<"QP_PASS outer="<<outer<<" constraints="<<cut_rows.size()<<" iterations="<<qp.iterations<<" warm_start="<<warm_start
+    const std::size_t warm_start=qp_lambda.size();auto qp=solve_cut_qp(qr.solver,fit_svd,cut_rows,cut_rhs,options.epsilon/4.0,qp_lambda,qp_state_path,outer);qp_lambda=std::move(qp.lambda);
+    trace<<"QP_PASS outer="<<outer<<" constraints="<<cut_rows.size()<<" iterations="<<qp.iterations<<" warm_start="<<warm_start<<" method="<<qp.method
+      <<" polish_attempts="<<qp.polish_attempts<<" active_constraints="<<qp.active_constraints<<" polish_updates="<<qp.polish_updates<<" polish_failure_reason="<<qp.polish_failure_reason
       <<" primal_excess="<<qp.certificate.max_primal_excess<<" complementarity="<<qp.certificate.max_complementarity
       <<" stationarity="<<qp.certificate.max_stationarity<<" lambda_change="<<qp.last_multiplier_change<<'\n';trace.flush();
     if(!trace)throw std::runtime_error("failed writing native fit QP trace: "+trace_path);
