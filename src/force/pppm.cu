@@ -2950,10 +2950,10 @@ bool PPPM::diagnose_reference_translation_energy(
   size_t free_after_plan = 0, total_after_plan = 0;
 #ifdef USE_HIP
   const bool post_plan_memory_ok =
-    hipMemGetInfo(&free_after_plan, &total_after_plan) == hipSuccess && free_after_plan >= fp64_mesh_bytes;
+    hipMemGetInfo(&free_after_plan, &total_after_plan) == hipSuccess && free_after_plan >= 2 * fp64_mesh_bytes;
 #else
   const bool post_plan_memory_ok =
-    cudaMemGetInfo(&free_after_plan, &total_after_plan) == cudaSuccess && free_after_plan >= fp64_mesh_bytes;
+    cudaMemGetInfo(&free_after_plan, &total_after_plan) == cudaSuccess && free_after_plan >= 2 * fp64_mesh_bytes;
 #endif
   if (!post_plan_memory_ok) {
     report.status = PPPMReferenceTranslationStatus::inconclusive;
@@ -2961,28 +2961,88 @@ bool PPPM::diagnose_reference_translation_energy(
     return true;
   }
   GPU_Vector<PPPMDoubleComplex> fp64_mesh(static_cast<size_t>(M));
+  GPU_Vector<PPPMDoubleComplex> fp64_dot_mesh(static_cast<size_t>(M));
   std::vector<PPPMDoubleComplex> host_mesh(static_cast<size_t>(M));
+  std::vector<PPPMDoubleComplex> host_dot_mesh(static_cast<size_t>(M));
   std::vector<double> base_charge_mesh(static_cast<size_t>(M));
   bool oracle_fft_ok = true;
-  auto fp64_energy = [&](const int translate_axis, const double shift, double* assignment_error) {
+  constexpr double exact_W[5][5] = {
+    {1.0 / 384.0, -1.0 / 48.0, 1.0 / 16.0, -1.0 / 12.0, 1.0 / 24.0},
+    {19.0 / 96.0, -11.0 / 24.0, 1.0 / 4.0, 1.0 / 6.0, -1.0 / 6.0},
+    {115.0 / 192.0, 0.0, -5.0 / 8.0, 0.0, 1.0 / 4.0},
+    {19.0 / 96.0, 11.0 / 24.0, 1.0 / 4.0, -1.0 / 6.0, -1.0 / 6.0},
+    {1.0 / 384.0, 1.0 / 48.0, 1.0 / 16.0, 1.0 / 12.0, 1.0 / 24.0}
+  };
+  auto exact_G_at = [&](const int index) {
+    int nk[3] = {index % K0, (index / K0) % K1, index / (K0 * K1)};
+    double u[3], sine[3], denominator[3];
+    for (int d = 0; d < 3; ++d) {
+      if (nk[d] >= para.K_half[d]) nk[d] -= para.K[d];
+      u[d] = 0.5 * static_cast<double>(para.two_pi_over_K[d]) * nk[d];
+      sine[d] = std::sin(u[d]);
+      const double z = sine[d] * sine[d];
+      denominator[d] = 1.0 - (5.0 / 3.0) * z + (7.0 / 9.0) * z * z -
+        (17.0 / 189.0) * z * z * z + (2.0 / 2835.0) * z * z * z * z;
+    }
+    const double kx = nk[0] * static_cast<double>(para.b[0][0]) + nk[1] * para.b[1][0] + nk[2] * para.b[2][0];
+    const double ky = nk[0] * static_cast<double>(para.b[0][1]) + nk[1] * para.b[1][1] + nk[2] * para.b[2][1];
+    const double kz = nk[0] * static_cast<double>(para.b[0][2]) + nk[1] * para.b[1][2] + nk[2] * para.b[2][2];
+    const double ksq = kx * kx + ky * ky + kz * kz;
+    if (ksq == 0.0) return 0.0;
+    double sinc_product = 1.0;
+    for (int d = 0; d < 3; ++d) sinc_product *= u[d] == 0.0 ? 1.0 : sine[d] / u[d];
+    const double sinc_fifth = sinc_product * sinc_product * sinc_product * sinc_product * sinc_product;
+    return sinc_fifth * sinc_fifth * static_cast<double>(para.two_pi_over_V) / ksq *
+      std::exp(-ksq * static_cast<double>(para.alpha_factor)) /
+      (denominator[0] * denominator[0] * denominator[1] * denominator[1] * denominator[2] * denominator[2]);
+  };
+  std::vector<double> exact_G(M);
+  for (int i = 0; i < M; ++i) {
+    exact_G[i] = exact_G_at(i);
+    if (!std::isfinite(exact_G[i])) {
+      report.status = PPPMReferenceTranslationStatus::inconclusive;
+      report.reason = PPPMReferenceTranslationReason::nonfinite_input;
+      return true;
+    }
+  }
+  auto fp64_energy = [&](const int translate_axis, const double shift, double* assignment_error,
+                         const int source, double* c_energy, double* derivative, double* c_derivative) {
     std::fill(host_mesh.begin(), host_mesh.end(), PPPMDoubleComplex{0.0, 0.0});
+    if (derivative != nullptr || c_derivative != nullptr)
+      std::fill(host_dot_mesh.begin(), host_dot_mesh.end(), PPPMDoubleComplex{0.0, 0.0});
     for (int atom = 0; atom < N; ++atom) {
       double r[3] = {host_r[atom] + (translate_axis == 0 ? shift : 0.0),
                      host_r[atom + N] + (translate_axis == 1 ? shift : 0.0),
                      host_r[atom + 2 * N] + (translate_axis == 2 ? shift : 0.0)};
-      double s[3]; int center[3]; double w[3][5];
+      double s[3]; int center[3]; double w[3][5], dw[3][5];
       for (int a = 0; a < 3; ++a) {
         s[a] = (inverse[3 * a] * r[0] + inverse[3 * a + 1] * r[1] + inverse[3 * a + 2] * r[2]) * para.K[a];
         center[a] = static_cast<int>(std::floor(s[a] + 0.5));
         const double delta = s[a] - center[a];
         for (int j = 0; j < 5; ++j) {
-          const float* coeff = host_W_coeff[j];
-          w[a][j] = (((static_cast<double>(coeff[4]) * delta + coeff[3]) * delta + coeff[2]) * delta + coeff[1]) * delta + coeff[0];
+          const double* coeff = source == 1 ? exact_W[j] : nullptr;
+          const double c0 = coeff != nullptr ? coeff[0] : static_cast<double>(host_W_coeff[j][0]);
+          const double c1 = coeff != nullptr ? coeff[1] : static_cast<double>(host_W_coeff[j][1]);
+          const double c2 = coeff != nullptr ? coeff[2] : static_cast<double>(host_W_coeff[j][2]);
+          const double c3 = coeff != nullptr ? coeff[3] : static_cast<double>(host_W_coeff[j][3]);
+          const double c4 = coeff != nullptr ? coeff[4] : static_cast<double>(host_W_coeff[j][4]);
+          w[a][j] = (((c4 * delta + c3) * delta + c2) * delta + c1) * delta + c0;
+          dw[a][j] = ((4.0 * c4 * delta + 3.0 * c3) * delta + 2.0 * c2) * delta + c1;
         }
       }
       for (int a = -2; a <= 2; ++a) for (int b = -2; b <= 2; ++b) for (int c = -2; c <= 2; ++c) {
         const int index = wrap_index(center[0] + a, K0) + K0 * (wrap_index(center[1] + b, K1) + K1 * wrap_index(center[2] + c, K2));
-        host_mesh[index].x += static_cast<double>(host_q[atom]) * w[0][a + 2] * w[1][b + 2] * w[2][c + 2];
+        const double q = static_cast<double>(host_q[atom]);
+        const double weight = w[0][a + 2] * w[1][b + 2] * w[2][c + 2];
+        host_mesh[index].x += q * weight;
+        if ((derivative != nullptr || c_derivative != nullptr) && translate_axis >= 0) {
+          const int selected = translate_axis == 0 ? a + 2 : translate_axis == 1 ? b + 2 : c + 2;
+          const double dweight = (translate_axis == 0 ? dw[0][selected] * w[1][b + 2] * w[2][c + 2] :
+            translate_axis == 1 ? w[0][a + 2] * dw[1][selected] * w[2][c + 2] :
+                                  w[0][a + 2] * w[1][b + 2] * dw[2][selected]) *
+            static_cast<double>(para.K[translate_axis]) * inverse[3 * translate_axis + translate_axis];
+          host_dot_mesh[index].x += q * dweight;
+        }
       }
     }
     if (assignment_error != nullptr) {
@@ -3011,14 +3071,39 @@ bool PPPM::diagnose_reference_translation_energy(
       return std::numeric_limits<double>::quiet_NaN();
     }
     fp64_mesh.copy_to_host(host_mesh.data());
-    double sum = 0.0, correction = 0.0;
+    if (derivative != nullptr || c_derivative != nullptr) {
+      fp64_dot_mesh.copy_from_host(host_dot_mesh.data());
+      if (!pppm_forward_double(double_plan.handle, fp64_dot_mesh.data())) {
+        oracle_fft_ok = false;
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      fp64_dot_mesh.copy_to_host(host_dot_mesh.data());
+    }
+    double sum = 0.0, correction = 0.0, csum = 0.0, ccorr = 0.0;
+    double dsum = 0.0, dcorr = 0.0, dcsum = 0.0, dccorr = 0.0;
     for (int i = 0; i < M; ++i) {
       const double re = host_mesh[i].x, im = host_mesh[i].y;
-      compensated_add(static_cast<double>(K_C_SP) * host_G[i] * (re * re + im * im), sum, correction);
+      const double g = (c_energy != nullptr || c_derivative != nullptr) && source == 1
+        ? exact_G[i] : static_cast<double>(host_G[i]);
+      const double prefactor = static_cast<double>(K_C_SP);
+      compensated_add(prefactor * static_cast<double>(host_G[i]) * (re * re + im * im), sum, correction);
+      if (c_energy != nullptr && source == 1)
+        compensated_add(prefactor * g * (re * re + im * im), csum, ccorr);
+      if (derivative != nullptr || c_derivative != nullptr) {
+        const double dre = host_dot_mesh[i].x, dim = host_dot_mesh[i].y;
+        const double product = re * dre + im * dim;
+        if (derivative != nullptr)
+          compensated_add(2.0 * prefactor * static_cast<double>(host_G[i]) * product, dsum, dcorr);
+        if (c_derivative != nullptr)
+          compensated_add(2.0 * prefactor * g * product, dcsum, dccorr);
+      }
     }
+    if (c_energy != nullptr) *c_energy = csum + ccorr;
+    if (derivative != nullptr) *derivative = dsum + dcorr;
+    if (c_derivative != nullptr) *c_derivative = dcsum + dccorr;
     return sum + correction;
   };
-  report.fp64_forward_energy = fp64_energy(-1, 0.0, &report.assignment_charge_error);
+  report.fp64_forward_energy = fp64_energy(-1, 0.0, &report.assignment_charge_error, -1, nullptr, nullptr, nullptr);
   if (!std::isfinite(report.fp64_forward_energy)) {
     report.status = PPPMReferenceTranslationStatus::inconclusive;
     report.reason = PPPMReferenceTranslationReason::fft_execute_failed;
@@ -3028,22 +3113,25 @@ bool PPPM::diagnose_reference_translation_energy(
 
   constexpr double steps[3] = {0.01, 0.005, 0.0025};
   bool all_fd_platforms_ok = true;
+  bool source_checks_pass = true;
+  bool source_checks_fail = false;
+  bool source_checks_inconclusive = false;
   bool native_comparison_inconclusive = false;
   bool native_precision_limited = false;
   for (int axis = 0; axis < 3; ++axis) {
     const double lattice_length = box.cpu_h[axis * 3 + axis];
     const double grid_shift = lattice_length / para.K[axis];
-    const double integer_energy = fp64_energy(axis, grid_shift, &report.axis[axis].integer_shift_assignment_error);
+    const double integer_energy = fp64_energy(axis, grid_shift, &report.axis[axis].integer_shift_assignment_error, -1, nullptr, nullptr, nullptr);
     report.axis[axis].integer_shift_energy_error = std::abs(integer_energy - report.fp64_forward_energy);
-    const double half_energy = fp64_energy(axis, 0.5 * grid_shift, nullptr);
+    const double half_energy = fp64_energy(axis, 0.5 * grid_shift, nullptr, -1, nullptr, nullptr, nullptr);
     report.axis[axis].half_shift_energy_change = half_energy - report.fp64_forward_energy;
     for (int phase = 0; phase < 2; ++phase) {
       const double origin = phase == 0 ? 0.0 : 0.5 * grid_shift;
       double terms_abs = 0.0;
       for (int step_id = 0; step_id < 3; ++step_id) {
         const double h = steps[step_id];
-        const double plus = fp64_energy(axis, origin + h, nullptr);
-        const double minus = fp64_energy(axis, origin - h, nullptr);
+        const double plus = fp64_energy(axis, origin + h, nullptr, 0, nullptr, nullptr, nullptr);
+        const double minus = fp64_energy(axis, origin - h, nullptr, 0, nullptr, nullptr, nullptr);
         terms_abs += std::abs(plus) + std::abs(minus);
         report.axis[axis].fd_derivative[phase][step_id] = (plus - minus) / (2.0 * h);
       }
@@ -3073,6 +3161,52 @@ bool PPPM::diagnose_reference_translation_energy(
           native_precision_limited = true;
         }
       }
+
+      double analytic[3] = {};
+      fp64_energy(axis, origin, nullptr, 0, nullptr, &analytic[0], nullptr);
+      double analytic_b = 0.0, analytic_c = 0.0;
+      fp64_energy(axis, origin, nullptr, 1, nullptr, &analytic_b, &analytic_c);
+      analytic[1] = analytic_b;
+      analytic[2] = analytic_c;
+      double source_fd[3][3] = {};
+      double source_abs[3] = {};
+      for (int step_id = 0; step_id < 3; ++step_id) {
+        source_fd[0][step_id] = report.axis[axis].fd_derivative[phase][step_id];
+        source_abs[0] += terms_abs / 3.0;
+        const double h = steps[step_id];
+        double cplus = 0.0, cminus = 0.0;
+        const double plus_b = fp64_energy(axis, origin + h, nullptr, 1, &cplus, nullptr, nullptr);
+        const double minus_b = fp64_energy(axis, origin - h, nullptr, 1, &cminus, nullptr, nullptr);
+        source_fd[1][step_id] = (plus_b - minus_b) / (2.0 * h);
+        source_fd[2][step_id] = (cplus - cminus) / (2.0 * h);
+        source_abs[1] += std::abs(plus_b) + std::abs(minus_b);
+        source_abs[2] += std::abs(cplus) + std::abs(cminus);
+      }
+      const double fft_roundoff_factor = 64.0 * (1.0 + std::log2(static_cast<double>(M)));
+      for (int source = 0; source < 3; ++source) {
+        auto& result = report.axis[axis].source[source].phase[phase];
+        const double* d = source_fd[source];
+        const double d4_coarse = (4.0 * d[1] - d[0]) / 3.0;
+        const double d4_fine = (4.0 * d[2] - d[1]) / 3.0;
+        result.analytic_derivative = analytic[source];
+        result.fd_derivative = d4_fine;
+        result.fd_uncertainty = std::abs(d4_fine - d4_coarse);
+        result.roundoff = std::numeric_limits<double>::epsilon() * fft_roundoff_factor *
+          source_abs[source] / (2.0 * steps[2]);
+        result.analytic_fd_difference = std::abs(result.analytic_derivative - result.fd_derivative);
+        const double total_uncertainty = result.fd_uncertainty + result.roundoff;
+        const bool finite = std::isfinite(result.analytic_derivative) && std::isfinite(result.fd_derivative) &&
+          std::isfinite(result.fd_uncertainty) && std::isfinite(result.roundoff) &&
+          std::isfinite(result.analytic_fd_difference);
+        result.valid = finite;
+        result.signal_resolved = finite && std::abs(result.fd_derivative) > 3.0 * total_uncertainty;
+        result.pass = finite && total_uncertainty <= precision_target &&
+          result.analytic_fd_difference <= total_uncertainty;
+        source_checks_pass = source_checks_pass && result.pass;
+        source_checks_fail = source_checks_fail ||
+          (finite && total_uncertainty <= precision_target && result.analytic_fd_difference > total_uncertainty);
+        source_checks_inconclusive = source_checks_inconclusive || !finite || total_uncertainty > precision_target;
+      }
     }
   }
   if (!oracle_fft_ok) {
@@ -3095,12 +3229,14 @@ bool PPPM::diagnose_reference_translation_energy(
       report.axis[axis].integer_shift_energy_error <= energy_tol;
   }
   report.fd_platform_pass = all_fd_platforms_ok;
+  report.source_log_confirmation = true;
   report.native_derivative_comparison_inconclusive = native_comparison_inconclusive || !all_fd_platforms_ok;
   report.native_derivative_precision_limited = native_precision_limited;
   report.native_derivative_comparison_pass = !native_precision_limited && !report.native_derivative_comparison_inconclusive;
-  if (!report.mesh_invariant_pass)
+  if (!report.mesh_invariant_pass || source_checks_fail)
     report.status = PPPMReferenceTranslationStatus::fail;
-  else if (!report.fd_platform_pass || report.native_derivative_comparison_inconclusive || native_precision_limited)
+  else if (!report.fd_platform_pass || !source_checks_pass || source_checks_inconclusive ||
+           report.native_derivative_comparison_inconclusive || native_precision_limited)
     report.status = PPPMReferenceTranslationStatus::inconclusive;
   else
     report.status = PPPMReferenceTranslationStatus::pass;

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace
@@ -64,6 +65,23 @@ void require(bool condition, const char* message)
 int main()
 {
   try {
+    const double exact_w[5][5] = {
+      {1.0 / 384.0, -1.0 / 48.0, 1.0 / 16.0, -1.0 / 12.0, 1.0 / 24.0},
+      {19.0 / 96.0, -11.0 / 24.0, 1.0 / 4.0, 1.0 / 6.0, -1.0 / 6.0},
+      {115.0 / 192.0, 0.0, -5.0 / 8.0, 0.0, 1.0 / 4.0},
+      {19.0 / 96.0, 11.0 / 24.0, 1.0 / 4.0, -1.0 / 6.0, -1.0 / 6.0},
+      {1.0 / 384.0, 1.0 / 48.0, 1.0 / 16.0, 1.0 / 12.0, 1.0 / 24.0}
+    };
+    for (const double delta : {-0.47, -0.13, 0.0, 0.29, 0.47}) {
+      double sum_w = 0.0, sum_dw = 0.0;
+      for (int j = 0; j < 5; ++j) {
+        const double* c = exact_w[j];
+        sum_w += (((c[4] * delta + c[3]) * delta + c[2]) * delta + c[1]) * delta + c[0];
+        sum_dw += ((4.0 * c[4] * delta + 3.0 * c[3]) * delta + 2.0 * c[2]) * delta + c[1];
+      }
+      require(std::abs(sum_w - 1.0) < 2.0e-15 && std::abs(sum_dw) < 2.0e-15,
+        "exact quartic assignment coefficients failed partition-of-unity closure");
+    }
     Box box;
     for (int i = 0; i < 18; ++i) box.cpu_h[i] = 0.0;
     box.cpu_h[0] = 8.0;
@@ -124,8 +142,20 @@ int main()
         for (int step = 0; step < 3; ++step)
           require(std::isfinite(translation_report.axis[axis].fd_derivative[phase][step]),
             "reference translation oracle produced a non-finite finite difference");
+        for (int source = 0; source < 3; ++source) {
+          const auto& model = translation_report.axis[axis].source[source].phase[phase];
+          require(model.valid && model.pass && std::isfinite(model.analytic_derivative) &&
+                  std::isfinite(model.fd_derivative) && std::isfinite(model.fd_uncertainty) &&
+                  std::isfinite(model.roundoff) && std::isfinite(model.analytic_fd_difference),
+            "reference translation source model failed its per-phase analytic/FD check");
+          require(model.analytic_fd_difference <= model.fd_uncertainty + model.roundoff,
+            "reference translation source model exceeded its conservative AD/FD bound");
+        }
       }
     }
+    require(translation_report.source_log_confirmation &&
+            std::string(translation_report.source_protocol_version) == "pppm_translation_decomposition_v1",
+      "reference translation report did not confirm its source protocol");
 
     GPU_Vector<double> repeated_site;
     require(pppm.compute_reference_energy_tangent(

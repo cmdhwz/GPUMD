@@ -2793,20 +2793,20 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
   Box observer_box = box;
   observer_box.get_inverse();
   observer_box.set_is_orthogonal();
+  if (full) std::printf("[mesh initialization: active target %.6g A; external model initialization output follows]\n",
+    active_qnep->get_pppm_mesh_spacing());
   QEvaluator evaluator(force.primary_nep_model_path(), n, force.get_run_input(), observer_box,
     atom.cpu_type, active_qnep->get_pppm_mesh_spacing());
+  if (full) std::printf("[1/4] reference/net + exact V\n");
   std::printf("rpmd_ja diagnose only: qNEP charge mode %d, PPPM mesh spacing %.6g A, N=%d, sampled coordinates=%zu; no reference will be produced.\n",
     active_qnep->get_charge_mode(), active_qnep->get_pppm_mesh_spacing(), n, coordinates.size());
-  if (!full)
+  if (!full) {
     std::printf("  This quick diagnose does not evaluate the exact full-column V sum; uniform-translation JVPs below are directional proxies only.\n");
-  else
-    std::printf("  Full diagnose adds exact all-coordinate V columns and independent translation-energy oracle diagnostics; sampled K/C checks remain unchanged.\n");
-  std::printf("  full mode includes q(R), charge chain, real-space and PPPM terms; short-range/no-electrostatic mode uses the qNEP ANN and short-range corrections via compute_non_electro.\n");
-  std::printf("  Differences between their errors are electrostatic-related and do not isolate PPPM alone.\n");
-  std::printf("  For full-qNEP, analytic gradient + native force equals the discrete PPPM explicit-gradient plus IK-force residual; it is diagnostic, not a reason to relax generation thresholds.\n");
-  std::printf("  Existing generation thresholds (display only; not applied to these sampled diagnostics): gradient abs RMS %.3g, h/h2 relative %.3g.\n",
-    kForceTolerance, kDifferenceTolerance);
-  std::printf("  Analytic checks use the current single-frame force data: summed site JVP versus analytic gradient, and analytic gradient versus native force; these are reported separately from the existing h/h2 checks.\n");
+  } else {
+    std::printf("  Full includes q/charge, real-space, and PPPM terms; shortmode=diagnostic label excludes electrostatics. Their error difference does not isolate PPPM.\n");
+    std::printf("  Displayed thresholds: gradient abs RMS %.3g eV/A, K/C relative %.3g; sampled precheck PASS is not reference acceptance.\n",
+      kForceTolerance, kDifferenceTolerance);
+  }
 
   const auto total_energy = [](const QEvaluation& evaluation) {
     double total = 0.0;
@@ -2817,6 +2817,74 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
   std::uint64_t evaluations = 0;
   const bool include_electro[2] = {true, false};
   const char* mode_name[2] = {"full-qNEP", "short-range/no-electrostatic"};
+  PPPMReferenceTranslationReport active_translation_oracle;
+  bool active_translation_oracle_frame = false;
+  double active_pppm_explicit_xyz[3] = {}, active_pppm_ik_xyz[3] = {}, active_native_force_xyz[3] = {};
+  double active_uniform_jvp_xyz[3] = {};
+  double active_full_v_net_norm = 0.0, active_full_v_limit = 0.0, active_identity_rms = 0.0;
+  bool active_full_v_within_limit = false;
+  const auto print_translation_sources = [&](const char* block, const PPPMReferenceTranslationReport& report,
+                                               const bool frame_valid, const double explicit_xyz[3],
+                                               const double site_jvp_xyz[3], const double ik_xyz[3],
+                                               const double native_xyz[3]) {
+    std::printf("  %s translation oracle (eV/A); A=frozen float coefficients, B=exact W/frozen G, C=exact W/FP64 evaluation of production G formula (not true Ewald).\n", block);
+    std::printf("    FD validation: mesh axis phase model AD FD |AD-FD| FD-unc roundoff limit result; source FD steps fixed at 0.01/0.005/0.0025 A (input h controls sampled stencil checks).\n");
+    if (frame_valid && report.source_log_confirmation) {
+      std::printf("    oracle values: max|G-even error|=%.3e G0=%.3e charge-closure-error=%.3e.\n",
+        report.max_even_G_error, report.mesh_zero_mode_value, report.assignment_charge_error);
+      std::printf("    axis integer-grid energy delta (eV) / assignment-cycle error (charge) / half-grid energy delta (eV):\n");
+      for (int axis = 0; axis < 3; ++axis) {
+        const auto& a = report.axis[axis];
+        std::printf("      %c % .3e / % .3e / % .3e\n", "xyz"[axis], a.integer_shift_energy_error,
+          a.integer_shift_assignment_error, a.half_shift_energy_change);
+      }
+    } else {
+      std::printf("    oracle values: N/A (frame or source log not confirmed); max|G-even error| G0 charge-closure-error=N/A.\n");
+      std::printf("    axis integer-grid energy delta (eV) / assignment-cycle error (charge) / half-grid energy delta (eV): N/A\n");
+    }
+    if (!frame_valid || !report.source_log_confirmation || !report.mesh_invariant_pass) {
+      std::printf("    source stages NOT_RUN/INCONCLUSIVE (frame=%s reason=%s shared-mesh-invariants=%s).\n",
+        frame_valid ? "valid" : "invalid", oracle_reason_name(report.reason),
+        report.mesh_invariant_pass ? "PASS" : report.source_log_confirmation ? "FAIL" : "NOT_RUN");
+      return;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      const auto& a = report.axis[axis];
+      for (int phase = 0; phase < 2; ++phase) {
+        for (int model = 0; model < 3; ++model) {
+          const auto& p = a.source[model].phase[phase];
+          const char* state = !p.valid || p.fd_uncertainty + p.roundoff > report.precision_target
+            ? "INCONCLUSIVE" : p.pass ? "PASS" : "MISMATCH";
+          std::printf("    %-7s %c %-5s %c ", block, "xyz"[axis], phase == 0 ? "orig" : "half", "ABC"[model]);
+          if (!p.valid) std::printf("%10s %10s %10s %10s %10s %10.2e %s\n", "N/A", "N/A", "N/A", "N/A", "N/A", report.precision_target, state);
+          else std::printf("%10.3e %10.3e %10.3e %10.3e %10.3e %10.2e %s\n",
+            p.analytic_derivative, p.fd_derivative, std::abs(p.analytic_fd_difference),
+            p.fd_uncertainty, p.roundoff, report.precision_target, state);
+        }
+      }
+    }
+    std::printf("    Signed contributions: mesh axis phase native-A(host/FP32 proxy) A-B B-C C-residual(resolved only)\n");
+    for (int axis = 0; axis < 3; ++axis) for (int phase = 0; phase < 2; ++phase) {
+      const auto& a = report.axis[axis];
+      const auto& A = a.source[0].phase[phase];
+      const auto& B = a.source[1].phase[phase];
+      const auto& C = a.source[2].phase[phase];
+      std::printf("    %-7s %c %-5s ", block, "xyz"[axis], phase == 0 ? "orig" : "half");
+      if (phase == 0 && A.valid) std::printf("%10.3e", a.native_energy_derivative - A.analytic_derivative); else std::printf("%10s", "N/A");
+      if (A.valid && B.valid) std::printf(" %10.3e", A.analytic_derivative - B.analytic_derivative); else std::printf(" %10s", "N/A");
+      if (B.valid && C.valid) std::printf(" %10.3e", B.analytic_derivative - C.analytic_derivative); else std::printf(" %10s", "N/A");
+      if (C.valid) std::printf(" %10.3e ", C.analytic_derivative); else std::printf(" %10s ", "N/A");
+      if (C.valid && C.pass && std::abs(C.analytic_derivative) > report.precision_target +
+          3.0 * (C.fd_uncertainty + C.roundoff + C.analytic_fd_difference))
+        std::printf("NONZERO_ABOVE_LIMIT\n");
+      else if (C.valid && C.pass) std::printf("BELOW_RESOLUTION_OR_LIMIT\n");
+      else std::printf("INCONCLUSIVE\n");
+    }
+    std::printf("    GPU tangent components (original phase only; eV/A): mesh axis explicit-gradient site-JVP IK native-force\n");
+    for (int axis = 0; axis < 3; ++axis)
+      std::printf("    %-7s %c %12.4e %12.4e %12.4e %12.4e\n", block, "xyz"[axis],
+        explicit_xyz[axis], site_jvp_xyz[axis], ik_xyz[axis], native_xyz[axis]);
+  };
   std::vector<double> full_r0_gradient;
   double r0_gradient_native_abs = 0.0, r0_site_jvp_abs = 0.0;
   bool r0_jvp_pass = false;
@@ -2871,8 +2939,6 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
         double component_diff2 = 0.0, component_max = 0.0;
         double ordered_compensated_diff2 = 0.0, ordered_extended_diff2 = 0.0;
         double ordered_compensated_max = 0.0, ordered_extended_max = 0.0;
-        double raw_charge_jvp_rms_max = 0.0, projected_charge_jvp_rms_max = 0.0;
-        double raw_charge_jvp_abs_max = 0.0, projected_charge_jvp_abs_max = 0.0;
         double pppm_ik_xyz[3] = {}, pppm_explicit_xyz[3] = {}, native_force_xyz[3] = {};
         double local_xyz[3] = {}, real_xyz[3] = {}, pppm_site_xyz[3] = {};
         QNEPReferenceTangentReduction raw_charge_qdot[3], projected_charge_qdot[3];
@@ -2930,10 +2996,6 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           const std::vector<double>& direct = site_values;
           raw_charge_qdot[axis] = tangent.raw_charge_direction;
           projected_charge_qdot[axis] = tangent.projected_charge_direction;
-          raw_charge_jvp_rms_max = std::max(raw_charge_jvp_rms_max, tangent.raw_charge_direction.rms);
-          projected_charge_jvp_rms_max = std::max(projected_charge_jvp_rms_max, tangent.projected_charge_direction.rms);
-          raw_charge_jvp_abs_max = std::max(raw_charge_jvp_abs_max, tangent.raw_charge_direction.max_abs);
-          projected_charge_jvp_abs_max = std::max(projected_charge_jvp_abs_max, tangent.projected_charge_direction.max_abs);
           pppm_ik_xyz[axis] = tangent.pppm_ik_force_sum[axis];
           pppm_explicit_xyz[axis] = tangent.pppm_explicit_gradient_sum[axis];
           native_force_xyz[axis] = tangent.native_force_sum[axis];
@@ -2956,6 +3018,9 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           for (int i = 0; i < n; ++i) uniform_direction[axis * n + i] = 0.0;
         }
         const auto full_net = rpmd_ja_reference_math::net_force_stats(full_v_gradient, n);
+        active_full_v_net_norm = full_net.net_norm;
+        active_full_v_limit = full_net.limit;
+        active_full_v_within_limit = full_net.within_limit;
         PPPMReferenceTranslationReport oracle;
         const bool oracle_frame_valid = evaluator.qnep.diagnose_reference_translation_energy(
           observer_box, evaluator.type, evaluator.position, evaluator.force, oracle, full_net.limit);
@@ -2963,74 +3028,40 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           oracle.status = PPPMReferenceTranslationStatus::inconclusive;
           oracle.reason = PPPMReferenceTranslationReason::invalid_frame;
         }
-        const char* oracle_status = !oracle_frame_valid || oracle.status == PPPMReferenceTranslationStatus::inconclusive ? "INCONCLUSIVE" :
-          oracle.status == PPPMReferenceTranslationStatus::pass ? "PASS" :
-          oracle.status == PPPMReferenceTranslationStatus::fail ? "FAIL" :
-          "NOT_RUN";
-        const char* oracle_calc_status = oracle.reason != PPPMReferenceTranslationReason::none ||
-          oracle.status == PPPMReferenceTranslationStatus::not_run ? "NOT_RUN" : nullptr;
-        const char* native_precision_status = oracle.native_derivative_precision_limited ? "INCONCLUSIVE" :
-          oracle.native_derivative_comparison_inconclusive ? "INCONCLUSIVE" :
-          oracle.native_derivative_comparison_pass ? "PASS" :
-          oracle_calc_status ? "NOT_RUN" : "FAIL";
-        std::printf("  ENERGY_ORACLE: independent FP64 mesh oracle frame=%s status=%s reason=%s precision_target=%.9g eV/A; |FP64-native reciprocal energy difference| %.9g eV; even_G=%s max_even_G_error=%.9g zero_mode=%s G0=%.9g; assignment closure %s, max charge error %.9g; mesh invariants=%s finite_difference_platform=%s native_derivative_comparison=%s%s.\n",
-          oracle_frame_valid ? "valid" : "invalid", oracle_status, oracle_reason_name(oracle.reason), oracle.precision_target,
-          std::abs(oracle.native_vs_fp64_energy_error), oracle.even_G ? "yes" : "no", oracle.max_even_G_error,
-          oracle.mesh_zero_mode ? "yes" : "no", oracle.mesh_zero_mode_value,
-          oracle_calc_status ? oracle_calc_status : oracle.assignment_closure_pass ? "PASS" : "FAIL",
-          oracle.assignment_charge_error,
-          oracle_calc_status ? oracle_calc_status : oracle.mesh_invariant_pass ? "PASS" : "FAIL",
-          oracle_calc_status ? oracle_calc_status : oracle.fd_platform_pass ? "PASS" : "FAIL",
-          native_precision_status,
-          oracle.native_derivative_precision_limited || oracle.native_derivative_comparison_inconclusive
-            ? " (mixed FP32-vs-FP64 difference is platform evidence and is not by itself a mathematical error)" : "");
+        active_translation_oracle = oracle;
+        active_translation_oracle_frame = oracle_frame_valid;
         for (int axis = 0; axis < 3; ++axis) {
-          const auto& a = oracle.axis[axis];
-          const bool resolved_nonzero = oracle_frame_valid && oracle.mesh_invariant_pass && oracle.fd_platform_pass &&
-            a.fd_signal_resolved[0] && std::abs(a.fp64_forward_energy_derivative[0]) -
-            3.0 * a.fd_plateau_error[0] > oracle.precision_target;
-          std::printf("    ENERGY_ORACLE %c eV/A: active native derivative %.9g; FP64 forward original/half-shift %.9g/%.9g; Richardson original %.9g/%.9g; FD plateau original/half-shift %.9g/%.9g; signal resolved original/half-shift %s/%s; native-vs-FP64 active %.9g; integer-grid energy difference %.9g eV (assignment error %.9g); half-grid energy change %.9g eV; half-shift native comparison NOT_COMPARED; classification=%s; roundoff estimates %.9g/%.9g.\n",
-            "xyz"[axis], a.native_energy_derivative, a.fp64_forward_energy_derivative[0],
-            a.fp64_forward_energy_derivative[1], a.richardson_derivative[0][0], a.richardson_derivative[0][1],
-            a.fd_plateau_error[0], a.fd_plateau_error[1], a.fd_signal_resolved[0] ? "yes" : "no",
-            a.fd_signal_resolved[1] ? "yes" : "no", a.native_vs_fp64_error[0],
-            a.integer_shift_energy_error, a.integer_shift_assignment_error, a.half_shift_energy_change,
-            resolved_nonzero ? "resolved nonzero fixed-grid energy translation derivative; incompatible with exact translation-invariant graph affine reference" :
-              "INCONCLUSIVE",
-            a.fd_roundoff_estimate[0], a.fd_roundoff_estimate[1]);
+          active_pppm_explicit_xyz[axis] = pppm_explicit_xyz[axis];
+          active_pppm_ik_xyz[axis] = pppm_ik_xyz[axis];
+          active_native_force_xyz[axis] = native_force_xyz[axis];
+          active_uniform_jvp_xyz[axis] = uniform_net[axis];
         }
         const double gradient_rms = std::sqrt(gradient_diff2 / d);
         const double component_rms = std::sqrt(component_diff2 / d);
         const double uniform_rms = std::sqrt(uniform_diff2 / d);
-        std::printf("  CODE_INVARIANT: full V column sum vs baseline analytic gradient RMS %.9g max %.9g eV/A, limit %.3g %s; local+real+PPPM uniform-site decomposition RMS %.9g max %.9g eV/A, limit %.3g %s.\n",
-          gradient_rms, gradient_max, kForceTolerance, gradient_rms <= kForceTolerance ? "PASS" : "FAIL",
-          component_rms, component_max, kForceTolerance, component_rms <= kForceTolerance ? "PASS" : "FAIL");
-        std::printf("  CODE_INVARIANT: axis column-site sums vs direct uniform JVP RMS %.9g max %.9g eV/A, limit %.3g %s; direct uniform net xyz=(%.9g, %.9g, %.9g). These are shared algebraic identities, not independent oracle evidence.\n",
-          uniform_rms, uniform_max, kForceTolerance, uniform_rms <= kForceTolerance ? "PASS" : "FAIL",
+        active_identity_rms = uniform_rms;
+        std::printf("  CODE_INVARIANT: full V column sum vs baseline analytic gradient RMS %.9g max %.9g eV/A (%s); local+real+PPPM uniform-site decomposition RMS %.9g max %.9g (%s).\n",
+          gradient_rms, gradient_max, gradient_rms <= kForceTolerance ? "PASS" : "FAIL",
+          component_rms, component_max, component_rms <= kForceTolerance ? "PASS" : "FAIL");
+        std::printf("  CODE_INVARIANT: axis column-site sums vs direct uniform JVP RMS %.9g max %.9g eV/A; direct net xyz=(%.9g, %.9g, %.9g). Shared algebraic identities are not independent oracle proof.\n",
+          uniform_rms, uniform_max,
           uniform_net[0], uniform_net[1], uniform_net[2]);
-        std::printf("  PRECISION: production-order site sum vs Neumaier RMS %.9g max %.9g eV/A; vs long-double (%s) RMS %.9g max %.9g eV/A; max |raw/projected charge JVP| %.9g/%.9g, max RMS %.9g/%.9g.\n",
+        std::printf("  PRECISION reductions (RMS/max eV/A): ordered-Neumaier %.3e/%.3e; ordered-long-double(%s) %.3e/%.3e.\n",
           std::sqrt(ordered_compensated_diff2 / d), ordered_compensated_max,
-          std::numeric_limits<long double>::digits > std::numeric_limits<double>::digits ? "extended" : "same precision as double",
-          std::sqrt(ordered_extended_diff2 / d), ordered_extended_max,
-          raw_charge_jvp_abs_max, projected_charge_jvp_abs_max,
-          raw_charge_jvp_rms_max, projected_charge_jvp_rms_max);
-        std::printf("    PRECISION: signed PPPM IK force sum by translation axis xyz=(%.9g, %.9g, %.9g), explicit-gradient sum=(%.9g, %.9g, %.9g), native-force sum=(%.9g, %.9g, %.9g) eV/A.\n",
-          pppm_ik_xyz[0], pppm_ik_xyz[1], pppm_ik_xyz[2], pppm_explicit_xyz[0], pppm_explicit_xyz[1],
-          pppm_explicit_xyz[2], native_force_xyz[0], native_force_xyz[1], native_force_xyz[2]);
+          std::numeric_limits<long double>::digits > std::numeric_limits<double>::digits ? "extended" : "double",
+          std::sqrt(ordered_extended_diff2 / d), ordered_extended_max);
+        std::printf("  signed tangent components (energy columns eV/A; qdot columns charge/A): axis local real PPPM direct site-res -F+IK+explicit force-res raw-qdot(sum/max/RMS) projected-qdot(sum/max/RMS)\n");
         for (int axis = 0; axis < 3; ++axis) {
           const double reconstructed = -native_force_xyz[axis] + pppm_ik_xyz[axis] + pppm_explicit_xyz[axis];
-          const double component_closure = local_xyz[axis] + real_xyz[axis] + pppm_site_xyz[axis] - uniform_net[axis];
-          const double force_closure = reconstructed - uniform_net[axis];
-          std::printf("    CODE_INVARIANT %c signed net eV/A: local %.9g real+self %.9g PPPM-site %.9g direct-uniform %.9g; -F+IK+explicit %.9g, site-component closure %.9g, force/IK/explicit closure %.9g.\n",
-            "xyz"[axis], local_xyz[axis], real_xyz[axis], pppm_site_xyz[axis], uniform_net[axis], reconstructed,
-            component_closure, force_closure);
-          const auto& rq = raw_charge_qdot[axis];
-          const auto& pq = projected_charge_qdot[axis];
-          std::printf("    PRECISION %c charge JVP: raw sum %.9g compensated %.9g extended %.9Lg max %.9g RMS %.9g; projected sum %.9g compensated %.9g extended %.9Lg max %.9g RMS %.9g.\n",
-            "xyz"[axis], rq.ordered_sum, rq.compensated_sum, rq.extended_sum, rq.max_abs, rq.rms,
-            pq.ordered_sum, pq.compensated_sum, pq.extended_sum, pq.max_abs, pq.rms);
+          const auto& raw = raw_charge_qdot[axis];
+          const auto& projected = projected_charge_qdot[axis];
+          std::printf("    %c %.3e %.3e %.3e %.3e %.3e %.3e %.3e %.3e/%.3e/%.3e %.3e/%.3e/%.3e\n",
+            "xyz"[axis], local_xyz[axis], real_xyz[axis], pppm_site_xyz[axis], uniform_net[axis],
+            local_xyz[axis] + real_xyz[axis] + pppm_site_xyz[axis] - uniform_net[axis],
+            reconstructed, reconstructed - uniform_net[axis],
+            raw.ordered_sum, raw.max_abs, raw.rms, projected.ordered_sum, projected.max_abs, projected.rms);
         }
-        std::printf("  EXACT_V_NET: full V net xyz=(%.17g, %.17g, %.17g), norm=%.17g, vector_norm=%.17g, exact-fit helper limit=%.17g, status=%s; report only, diagnostic continues.\n",
+        std::printf("  EXACT_V_NET: xyz=(%.9g, %.9g, %.9g) norm=%.9g vector_norm=%.9g limit=%.9g status=%s.\n",
           full_net.net[0], full_net.net[1], full_net.net[2], full_net.net_norm, full_net.vector_norm,
           full_net.limit, full_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE");
         std::fflush(stdout);
@@ -3068,17 +3099,17 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
         jvp_analytic_diff2 += jvp_error * jvp_error;
         native_gradient_net_diff2 += net_force_residual * net_force_residual;
       }
-      std::printf("  full-qNEP net-force quick diagnostic (eV/A): native force xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; analytic gradient xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s.\n",
+        if (!full) std::printf("  full-qNEP net-force quick diagnostic (eV/A): native force xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; analytic gradient xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s.\n",
         native_net.net[0], native_net.net[1], native_net.net[2], native_net.net_norm, native_net.vector_norm,
         native_net.limit, native_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
         gradient_net.net[0], gradient_net.net[1], gradient_net.net[2], gradient_net.net_norm,
         gradient_net.vector_norm, gradient_net.limit,
         gradient_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE");
-      std::printf("    uniform physical translation JVP direction=1 xyz net=(%.9g, %.9g, %.9g) eV/A; mass-weighted translation direction=1/sqrt(total_mass), converted back to xyz net=(%.9g, %.9g, %.9g) eV/A; JVP-analytic net difference norm=%.9g; native_F+gradient net difference norm=%.9g. These directional derivatives are proxies, not the full-column V sum.\n",
+      if (!full) std::printf("    uniform physical translation JVP direction=1 xyz net=(%.9g, %.9g, %.9g) eV/A; mass-weighted translation direction=1/sqrt(total_mass), converted back to xyz net=(%.9g, %.9g, %.9g) eV/A; JVP-analytic net difference norm=%.9g; native_F+gradient net difference norm=%.9g. These directional derivatives are proxies, not the full-column V sum.\n",
         uniform_jvp_net[0], uniform_jvp_net[1], uniform_jvp_net[2], mass_translation_jvp_net[0],
         mass_translation_jvp_net[1], mass_translation_jvp_net[2], std::sqrt(jvp_analytic_diff2),
         std::sqrt(native_gradient_net_diff2));
-      for (int repeat = 0; repeat < 3; ++repeat) {
+      for (int repeat = 0; !full && repeat < 3; ++repeat) {
         const auto repeat_net = rpmd_ja_reference_math::net_force_stats(repeated_reference[repeat].force, n);
         std::printf("    baseline repeated force net[%d] xyz=(%.9g, %.9g, %.9g), norm=%.9g eV/A.\n",
           repeat + 1, repeat_net.net[0], repeat_net.net[1], repeat_net.net[2], repeat_net.net_norm);
@@ -3157,13 +3188,14 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       if (!std::isfinite(jvp_identity_abs) || !std::isfinite(jvp_identity_relative) ||
           !std::isfinite(force_gradient_abs) || !std::isfinite(force_gradient_relative))
         throw std::runtime_error("qNEP rpmd_ja analytic diagnostic produced non-finite RMS values");
-      std::printf("  full-qNEP analytic checks: JVP-gradient identity abs RMS %.6g, relative %.6g; sampled analytic-gradient/native-force difference RMS %.6g eV/A, relative %.6g.\n",
+      if (!full) std::printf("  full-qNEP analytic checks: JVP-gradient identity abs RMS %.6g, relative %.6g; sampled analytic-gradient/native-force difference RMS %.6g eV/A, relative %.6g.\n",
         jvp_identity_abs, jvp_identity_relative, force_gradient_abs, force_gradient_relative);
-      std::printf("    R0 site-JVP identity max|e| %.6g eV/A at atom %d type %d axis %s; limit %.3g %s.\n",
+      if (!full) std::printf("    R0 site-JVP identity max|e| %.6g eV/A at atom %d type %d axis %s; limit %.3g %s.\n",
         jvp_identity_max_abs, r0_jvp_worst_coordinate % n,
         atom.cpu_type[r0_jvp_worst_coordinate % n], axis_name[r0_jvp_worst_coordinate / n],
         kForceTolerance, r0_jvp_pass ? "PASS" : "FAIL");
       for (const auto& entry : first_atom_by_type) {
+        if (full) break;
         const int type = entry.first;
         double diff2 = 0.0, force2 = 0.0, max_error = 0.0;
         int max_coordinate = entry.second;
@@ -3182,6 +3214,12 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
       std::fflush(stdout);
     }
 
+    if (full) {
+      if (mode == 0) std::printf("[2/4] stencil compact/short; * marks requested fd_step\n");
+      std::printf(mode == 0
+        ? "  full-qNEP h table (5 rows): h* grad-native site-JVP K/Cx/Cy/Cz Vfinite gate | energyFD(abs/rel) nativeK\n"
+        : "  shortmode=diagnostic label h table (5 rows): h* energyFD(abs/rel) V K Cx/Cy/Cz nativeK [no generation gate]\n");
+    }
     for (const double step_scale : {0.5, 1.0, 2.0, 5.0, 10.0}) {
       const double h = fd_step * step_scale;
       if (!(h > 0.0) || !std::isfinite(h))
@@ -3310,26 +3348,32 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           !std::isfinite(k_relative) || !std::isfinite(c_relative[0]) ||
           !std::isfinite(c_relative[1]) || !std::isfinite(c_relative[2]))
         throw std::runtime_error("qNEP rpmd_ja diagnose produced a non-finite finite-difference diagnostic");
-      std::printf("  %s h=%.6g A: energy-gradient abs RMS %.6g, relative to sampled |F0| norm %.6g; V %.6g K %.6g Cxyz %.6g %.6g %.6g\n",
-        mode_name[mode], h, grad_abs, grad_rel, v_relative, k_relative,
-        c_relative[0], c_relative[1], c_relative[2]);
       const double native_k_abs = std::sqrt(native_k_delta2 / (d * coordinates.size()));
       const double native_k_relative = std::sqrt(native_k_delta2 / std::max(native_k_d4_norm2, 1.0e-300));
-      std::printf("    %s native-force K D4 norm %.6g eV/A2, D2(h)-D2(2h) abs RMS %.6g eV/A2, relative %.6g (limit %.3g) %s.\n",
-        mode_name[mode], std::sqrt(native_k_d4_norm2), native_k_abs, native_k_relative,
-        kDifferenceTolerance, std::isfinite(native_k_relative) && native_k_relative <= kDifferenceTolerance ? "PASS" : "FAIL");
-      std::printf("    virial C D2(h)-D2(2h), D4 denominator; Cxyz: ");
-      for (int alpha = 0; alpha < 3; ++alpha) {
-        const double c_abs = std::sqrt(c_delta2[alpha] / (d * coordinates.size()));
-        const double c_rel = std::sqrt(c_delta2[alpha] / std::max(c_d4_norm2[alpha], 1.0e-300));
-        const int ci = c_worst_input[alpha], co = c_worst_output[alpha];
-        std::printf("%s%c D4norm %.6g eV/A absRMS %.6g eV/A rel %.6g %s worst input %d type %d axis %s -> output %d type %d axis %s (column %.5g)", alpha ? ", " : "", "xyz"[alpha],
-          std::sqrt(c_d4_norm2[alpha]), c_abs, c_rel,
-          std::isfinite(c_rel) && c_rel <= kDifferenceTolerance ? "PASS" : "FAIL",
-          ci % n, atom.cpu_type[ci % n], axis_name[ci / n], co % n, atom.cpu_type[co % n],
-          axis_name[co / n], c_worst_column[alpha]);
+      if (full && mode == 1)
+        std::printf("    h=%.6g%s energyFD=%.3e/%.3e V=%.3e K=%.3e Cxyz=%.3e/%.3e/%.3e nativeK=%.3e diagnostic-only\n",
+          h, h == fd_step ? "*" : "", grad_abs, grad_rel, v_relative, k_relative,
+          c_relative[0], c_relative[1], c_relative[2], native_k_relative);
+      if (!full) {
+        std::printf("  %s h=%.6g A: energy-gradient abs RMS %.6g, relative to sampled |F0| norm %.6g; V %.6g K %.6g Cxyz %.6g %.6g %.6g\n",
+          mode_name[mode], h, grad_abs, grad_rel, v_relative, k_relative,
+          c_relative[0], c_relative[1], c_relative[2]);
+        std::printf("    %s native-force K D4 norm %.6g eV/A2, D2(h)-D2(2h) abs RMS %.6g eV/A2, relative %.6g (limit %.3g) %s.\n",
+          mode_name[mode], std::sqrt(native_k_d4_norm2), native_k_abs, native_k_relative,
+          kDifferenceTolerance, std::isfinite(native_k_relative) && native_k_relative <= kDifferenceTolerance ? "PASS" : "FAIL");
+        std::printf("    virial C D2(h)-D2(2h), D4 denominator; Cxyz: ");
+        for (int alpha = 0; alpha < 3; ++alpha) {
+          const double c_abs = std::sqrt(c_delta2[alpha] / (d * coordinates.size()));
+          const double c_rel = std::sqrt(c_delta2[alpha] / std::max(c_d4_norm2[alpha], 1.0e-300));
+          const int ci = c_worst_input[alpha], co = c_worst_output[alpha];
+          std::printf("%s%c D4norm %.6g eV/A absRMS %.6g eV/A rel %.6g %s worst input %d type %d axis %s -> output %d type %d axis %s (column %.5g)", alpha ? ", " : "", "xyz"[alpha],
+            std::sqrt(c_d4_norm2[alpha]), c_abs, c_rel,
+            std::isfinite(c_rel) && c_rel <= kDifferenceTolerance ? "PASS" : "FAIL",
+            ci % n, atom.cpu_type[ci % n], axis_name[ci / n], co % n, atom.cpu_type[co % n],
+            axis_name[co / n], c_worst_column[alpha]);
+        }
+        std::printf("\n");
       }
-      std::printf("\n");
       if (mode == 0) {
         const double abs_rms = std::sqrt(analytic_delta2 / (d * coordinates.size()));
         const double relative = std::sqrt(analytic_delta2 / std::max(analytic_d4_norm2, 1.0e-300));
@@ -3349,52 +3393,42 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
           std::isfinite(precheck_c_relative[2]) && precheck_c_relative[2] <= kDifferenceTolerance};
         const bool precheck_failed = !gradient_pass || !jvp_pass || !k_pass || !c_pass[0] || !c_pass[1] ||
           !c_pass[2] || !v_stencil_finite;
-        print_qnep_precheck_table(h, "full-qNEP", r0_gradient_native_abs, gradient_pass,
-          r0_site_jvp_abs, jvp_pass, precheck_k_relative, k_pass, precheck_c_relative, c_pass,
-          v_stencil_finite, precheck_failed, h == fd_step);
         ++precheck_steps_total;
         if (!precheck_failed) ++precheck_steps_passed;
         if (h == fd_step) { requested_h_seen = true; requested_h_pass = !precheck_failed; }
+        if (full) {
+          std::printf("    h=%.6g%s grad-native=%.3e site-JVP=%.3e K=%.3e Cxyz=%.3e/%.3e/%.3e Vfinite=%s gate=%s | energyFD=%.3e/%.3e nativeK=%.3e\n",
+            h, h == fd_step ? "*" : "", r0_gradient_native_abs, r0_site_jvp_abs,
+            precheck_k_relative, precheck_c_relative[0], precheck_c_relative[1], precheck_c_relative[2],
+            v_stencil_finite ? "yes" : "no", precheck_failed ? "FAIL" : "PASS",
+            grad_abs, grad_rel, native_k_relative);
+        }
         const int ia = worst_input % n, ix = worst_input / n, oa = worst_output % n, ox = worst_output / n;
-        std::printf("    analytic-gradient Hessian sampled D4 norm %.6g eV/A2; D2(h)-D2(2h) abs RMS %.6g eV/A2, relative-to-D4 %.6g (limit %.3g) %s; worst analytic column input atom %d type %d axis %s -> output atom %d type %d axis %s, column-relative %.6g.\n",
-          std::sqrt(analytic_d4_norm2), abs_rms, relative, kDifferenceTolerance,
-          std::isfinite(relative) && relative <= kDifferenceTolerance ? "PASS" : "FAIL",
-          ia, atom.cpu_type[ia], axis_name[ix], oa, atom.cpu_type[oa], axis_name[ox], worst_column_relative);
-        std::ostringstream summary;
-        summary << "    precheck-matched summary h=" << h << ": gradient_native_force=" << r0_gradient_native_abs
-          << " site_jvp_gradient=" << r0_site_jvp_abs << " K=" << precheck_k_relative
-          << " Cx=" << precheck_c_relative[0] << " Cy=" << precheck_c_relative[1]
-          << " Cz=" << precheck_c_relative[2] << " Vfinite=" << (v_stencil_finite ? "yes" : "no")
-          << "; limits gradient/JVP=" << kForceTolerance << " K/C=" << kDifferenceTolerance << "; FAIL=";
-        bool first_fail = true;
-        const auto fail = [&](const char* item) {
-          if (!first_fail) summary << ',';
-          summary << item; first_fail = false;
-        };
-        if (!gradient_pass) fail("gradient_native_force");
-        if (!jvp_pass) fail("site_jvp_gradient");
-        if (!k_pass) fail("K");
-        for (int alpha = 0; alpha < 3; ++alpha)
-          if (!c_pass[alpha])
-            fail(alpha == 0 ? "Cx" : alpha == 1 ? "Cy" : "Cz");
-        if (!v_stencil_finite) fail("V_non_finite");
-        if (first_fail) summary << "none";
-        summary << " (diagnostic only; PASS is sampled-column evidence, not full-matrix acceptance)";
-        std::printf("%s\n", summary.str().c_str());
+        if (!full || precheck_failed || !std::isfinite(relative) || relative > kDifferenceTolerance)
+          std::printf("    detail: analytic Hessian sampled D4 norm %.6g, D2 delta abs RMS %.6g, relative-to-D4 %.6g (limit %.3g); worst input %d type %d axis %s -> output %d type %d axis %s, column-relative %.6g.\n",
+            std::sqrt(analytic_d4_norm2), abs_rms, relative, kDifferenceTolerance,
+            ia, atom.cpu_type[ia], axis_name[ix], oa, atom.cpu_type[oa], axis_name[ox], worst_column_relative);
+        if (!full || precheck_failed)
+          std::printf("    precheck detail: h=%.6g gradient/native=%.6g JVP/gradient=%.6g K=%.6g Cxyz=%.6g/%.6g/%.6g Vfinite=%s; generation limits gradient/JVP=%.3g K/C=%.3g; PASS is sampled-column evidence only.\n",
+            h, r0_gradient_native_abs, r0_site_jvp_abs, precheck_k_relative,
+            precheck_c_relative[0], precheck_c_relative[1], precheck_c_relative[2], v_stencil_finite ? "yes" : "no",
+            kForceTolerance, kDifferenceTolerance);
       }
       std::fflush(stdout);
     }
   }
   const double spacing = active_qnep->get_pppm_mesh_spacing();
+  if (full) std::printf("[3/4] mesh translation oracle; compare mesh targets first and the saved active oracle last\n");
   for (const double factor : {0.75, 0.5}) {
     const double target_spacing = spacing * factor;
+    if (full) std::printf("[mesh initialization: target %.6g A; external model initialization output follows]\n", target_spacing);
     QEvaluator mesh_evaluator(force.primary_nep_model_path(), n, force.get_run_input(), observer_box,
       atom.cpu_type, target_spacing);
     const QEvaluation mesh_eval = mesh_evaluator.evaluate(positions, true); ++evaluations;
     const std::vector<double> mesh_gradient = mesh_evaluator.analytic_gradient();
     if (full) {
-      std::printf("  Full translation components and energy oracle at mesh spacing %.6g A:\n", target_spacing);
       std::vector<double> direction(static_cast<std::size_t>(d), 0.0), site(n);
+      double mesh_explicit_xyz[3] = {}, mesh_ik_xyz[3] = {}, mesh_native_xyz[3] = {}, mesh_site_jvp_xyz[3] = {};
       GPU_Vector<double> device_direction(d), device_site(n), device_gradient(d);
       for (int axis = 0; axis < 3; ++axis) {
         for (int i = 0; i < n; ++i) direction[axis * n + i] = 1.0;
@@ -3416,19 +3450,17 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
         const double explicit_gradient = tangent.pppm_explicit_gradient_sum[axis];
         const double native_force = tangent.native_force_sum[axis];
         const double direct = std::accumulate(site.begin(), site.end(), 0.0);
-        const double component_residual = local + real + pppm - direct;
-        const double force_residual = -native_force + ik + explicit_gradient - direct;
-        std::printf("    CODE_INVARIANT %c: local %.9g real+self %.9g PPPM-site %.9g direct %.9g, component residual %.9g, -F+IK+explicit %.9g residual %.9g, translation closure %s (RMS criterion %.3g eV/A; max is diagnostic).\n",
-          "xyz"[axis], local, real, pppm, direct, local + real + pppm - direct,
-          -native_force + ik + explicit_gradient, force_residual,
-          std::abs(component_residual) <= kForceTolerance && std::abs(force_residual) <= kForceTolerance ? "PASS" : "FAIL",
-          kForceTolerance);
-        const auto& raw = tangent.raw_charge_direction;
-        const auto& projected = tangent.projected_charge_direction;
-        std::printf("    PRECISION %c qdot raw sum %.9g compensated %.9g extended %.9Lg max %.9g RMS %.9g; projected sum %.9g compensated %.9g extended %.9Lg max %.9g RMS %.9g; IK %.9g explicit %.9g native_F %.9g eV/A.\n",
-          "xyz"[axis], raw.ordered_sum, raw.compensated_sum, raw.extended_sum, raw.max_abs, raw.rms,
-          projected.ordered_sum, projected.compensated_sum, projected.extended_sum,
-          projected.max_abs, projected.rms, ik, explicit_gradient, native_force);
+        mesh_explicit_xyz[axis] = explicit_gradient;
+        mesh_ik_xyz[axis] = ik;
+        mesh_native_xyz[axis] = native_force;
+        mesh_site_jvp_xyz[axis] = direct;
+        const auto& raw_qdot = tangent.raw_charge_direction;
+        const auto& projected_qdot = tangent.projected_charge_direction;
+        std::printf("    components %c local=%.3e real=%.3e PPPM=%.3e siteJVP=%.3e site-res=%.3e IK=%.3e explicit=%.3e nativeF=%.3e force-res=%.3e; qdot raw(sum/max/RMS)=%.3e/%.3e/%.3e projected=%.3e/%.3e/%.3e\n",
+          "xyz"[axis], local, real, pppm, direct, local + real + pppm - direct, ik, explicit_gradient,
+          native_force, -native_force + ik + explicit_gradient - direct,
+          raw_qdot.ordered_sum, raw_qdot.max_abs, raw_qdot.rms,
+          projected_qdot.ordered_sum, projected_qdot.max_abs, projected_qdot.rms);
         for (int i = 0; i < n; ++i) direction[axis * n + i] = 0.0;
       }
       const auto mesh_gradient_net_for_target = rpmd_ja_reference_math::net_force_stats(mesh_gradient, n);
@@ -3440,39 +3472,16 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
         mesh_oracle.status = PPPMReferenceTranslationStatus::inconclusive;
         mesh_oracle.reason = PPPMReferenceTranslationReason::invalid_frame;
       }
-      const char* mesh_oracle_status = !mesh_oracle_frame || mesh_oracle.status == PPPMReferenceTranslationStatus::inconclusive
-        ? "INCONCLUSIVE" : mesh_oracle.status == PPPMReferenceTranslationStatus::pass ? "PASS" :
-          mesh_oracle.status == PPPMReferenceTranslationStatus::fail ? "FAIL" : "NOT_RUN";
-      const char* mesh_calc_status = mesh_oracle.reason != PPPMReferenceTranslationReason::none ||
-        mesh_oracle.status == PPPMReferenceTranslationStatus::not_run ? "NOT_RUN" : nullptr;
-      const char* mesh_native_precision_status = mesh_oracle.native_derivative_precision_limited ? "INCONCLUSIVE" :
-        mesh_oracle.native_derivative_comparison_inconclusive ? "INCONCLUSIVE" :
-        mesh_oracle.native_derivative_comparison_pass ? "PASS" :
-        mesh_calc_status ? "NOT_RUN" : "FAIL";
-      std::printf("    ENERGY_ORACLE mesh %.6g A: frame=%s status=%s reason=%s target=%.9g eV/A |FP64-native energy difference| %.9g eV; even_G=%s max_even_G_error=%.9g zero_mode=%s G0=%.9g; assignment closure %s error %.9g; mesh invariants=%s FD platform=%s native derivative=%s.\n",
-        target_spacing, mesh_oracle_frame ? "valid" : "invalid", mesh_oracle_status,
-        oracle_reason_name(mesh_oracle.reason), mesh_oracle.precision_target,
-        std::abs(mesh_oracle.native_vs_fp64_energy_error),
-        mesh_oracle.even_G ? "yes" : "no", mesh_oracle.max_even_G_error,
-        mesh_oracle.mesh_zero_mode ? "yes" : "no", mesh_oracle.mesh_zero_mode_value,
-        mesh_calc_status ? mesh_calc_status : mesh_oracle.assignment_closure_pass ? "PASS" : "FAIL",
-        mesh_oracle.assignment_charge_error,
-        mesh_calc_status ? mesh_calc_status : mesh_oracle.mesh_invariant_pass ? "PASS" : "FAIL",
-        mesh_calc_status ? mesh_calc_status : mesh_oracle.fd_platform_pass ? "PASS" : "FAIL",
-        mesh_native_precision_status);
-      for (int axis = 0; axis < 3; ++axis) {
-        const auto& a = mesh_oracle.axis[axis];
-        const bool resolved_nonzero = mesh_oracle_frame && mesh_oracle.mesh_invariant_pass && mesh_oracle.fd_platform_pass &&
-          a.fd_signal_resolved[0] && std::abs(a.fp64_forward_energy_derivative[0]) -
-            3.0 * a.fd_plateau_error[0] > mesh_oracle.precision_target;
-        std::printf("      ENERGY_ORACLE %c: native %.9g; FP64 forward original/half-shift %.9g/%.9g; FD plateau %.9g/%.9g; resolved original/half-shift %s/%s; integer-grid energy difference %.9g eV (assignment error %.9g); half-grid energy change %.9g eV; native half-shift comparison NOT_COMPARED; classification=%s (eV/A).\n",
-          "xyz"[axis], a.native_energy_derivative, a.fp64_forward_energy_derivative[0],
-          a.fp64_forward_energy_derivative[1], a.fd_plateau_error[0], a.fd_plateau_error[1],
-          a.fd_signal_resolved[0] ? "yes" : "no", a.fd_signal_resolved[1] ? "yes" : "no",
-          a.integer_shift_energy_error, a.integer_shift_assignment_error, a.half_shift_energy_change,
-          resolved_nonzero ? "resolved nonzero fixed-grid energy translation derivative; incompatible with exact translation-invariant graph affine reference" :
-            "INCONCLUSIVE");
-      }
+      const char* oracle_calc_state = mesh_oracle.source_log_confirmation ? nullptr : "NOT_RUN";
+      std::printf("    oracle mesh=%.6g frame=%s reason=%s target=%.3e assignment=%s mesh-invariants=%s FD-platform=%s source-log=%s\n",
+        target_spacing, mesh_oracle_frame ? "valid" : "invalid", oracle_reason_name(mesh_oracle.reason),
+        mesh_oracle.precision_target,
+        oracle_calc_state ? oracle_calc_state : mesh_oracle.assignment_closure_pass ? "PASS" : "FAIL",
+        oracle_calc_state ? oracle_calc_state : mesh_oracle.mesh_invariant_pass ? "PASS" : "FAIL",
+        oracle_calc_state ? oracle_calc_state : mesh_oracle.fd_platform_pass ? "PASS" : "FAIL",
+        mesh_oracle.source_log_confirmation ? mesh_oracle.source_protocol_version : "NOT_RUN");
+      print_translation_sources("refined", mesh_oracle, mesh_oracle_frame, mesh_explicit_xyz,
+        mesh_site_jvp_xyz, mesh_ik_xyz, mesh_native_xyz);
       std::fflush(stdout);
     }
     const auto mesh_native_net = rpmd_ja_reference_math::net_force_stats(mesh_eval.force, n);
@@ -3500,21 +3509,42 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
     }
     std::printf("  R0 PPPM mesh-spacing trend configured target %.6g A: gradient delta-from-active RMS %.6g, analytic-gradient RMS %.6g, native-force mismatch RMS %.6g eV/A.\n",
       target_spacing, std::sqrt(delta2 / d), std::sqrt(gradient2 / d), std::sqrt(native_mismatch2 / d));
-    std::printf("    mesh net-force quick diagnostic (eV/A): native force xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; analytic gradient xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; uniform translation JVP xyz=(%.9g, %.9g, %.9g); JVP-analytic net difference norm=%.9g; native_F+gradient net difference norm=%.9g.\n",
-      mesh_native_net.net[0], mesh_native_net.net[1], mesh_native_net.net[2], mesh_native_net.net_norm,
-      mesh_native_net.vector_norm, mesh_native_net.limit,
-      mesh_native_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
-      mesh_gradient_net.net[0], mesh_gradient_net.net[1], mesh_gradient_net.net[2], mesh_gradient_net.net_norm,
-      mesh_gradient_net.vector_norm, mesh_gradient_net.limit,
-      mesh_gradient_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
-      mesh_uniform_jvp[0], mesh_uniform_jvp[1], mesh_uniform_jvp[2],
-      std::sqrt(mesh_jvp_analytic_diff2), std::sqrt(mesh_native_gradient_net_diff2));
+    if (!full) {
+      std::printf("    mesh net-force quick diagnostic (eV/A): native force xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; analytic gradient xyz=(%.9g, %.9g, %.9g), norm=%.9g, vector_norm=%.9g, limit=%.9g, status=PROXY_%s; uniform translation JVP xyz=(%.9g, %.9g, %.9g); JVP-analytic net difference norm=%.9g; native_F+gradient net difference norm=%.9g.\n",
+        mesh_native_net.net[0], mesh_native_net.net[1], mesh_native_net.net[2], mesh_native_net.net_norm,
+        mesh_native_net.vector_norm, mesh_native_net.limit,
+        mesh_native_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
+        mesh_gradient_net.net[0], mesh_gradient_net.net[1], mesh_gradient_net.net[2], mesh_gradient_net.net_norm,
+        mesh_gradient_net.vector_norm, mesh_gradient_net.limit,
+        mesh_gradient_net.within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE",
+        mesh_uniform_jvp[0], mesh_uniform_jvp[1], mesh_uniform_jvp[2],
+        std::sqrt(mesh_jvp_analytic_diff2), std::sqrt(mesh_native_gradient_net_diff2));
+    } else {
+      std::printf("    mesh net proxy: native=%.3e/%.3e limit=%.3e; analytic=%.3e/%.3e limit=%.3e; native-force mismatch RMS=%.3e eV/A.\n",
+        mesh_native_net.net_norm, mesh_native_net.vector_norm, mesh_native_net.limit,
+        mesh_gradient_net.net_norm, mesh_gradient_net.vector_norm, mesh_gradient_net.limit,
+        std::sqrt(native_mismatch2 / d));
+    }
     std::fflush(stdout);
   }
-  std::printf("rpmd_ja requested-h precheck: %s; sampled full-qNEP h steps PASS=%d/%d; SAMPLED PRECHECK ONLY / full reference acceptance still required.\n",
-    requested_h_seen && requested_h_pass ? "PASS" : "FAIL", precheck_steps_passed, precheck_steps_total);
+  if (full) {
+    print_translation_sources("active", active_translation_oracle, active_translation_oracle_frame,
+      active_pppm_explicit_xyz, active_uniform_jvp_xyz, active_pppm_ik_xyz, active_native_force_xyz);
+    std::printf("[4/4] final summary\n");
+    std::printf("  requested h precheck=%s; sampled full-qNEP prechecks=%d/%d; sampled PASS is not reference acceptance.\n",
+      requested_h_seen && requested_h_pass ? "PASS" : "FAIL", precheck_steps_passed, precheck_steps_total);
+    std::printf("  full V columns=%d; net norm=%.6g limit=%.6g status=%s; column-site/direct-JVP identity RMS=%.6g limit=%.3g eV/A status=%s (shared algebraic identity, not oracle proof).\n",
+      d, active_full_v_net_norm, active_full_v_limit,
+      active_full_v_within_limit ? "WITHIN_LIMIT" : "OUTSIDE_LIMIT_OR_NONFINITE", active_identity_rms,
+      kForceTolerance, active_identity_rms <= kForceTolerance ? "PASS" : "FAIL");
+    std::printf("  source diagnostic version=pppm_translation_sources_v2; active source log=%s; source contributions and refined mesh rows are above.\n",
+      active_translation_oracle.source_log_confirmation ? active_translation_oracle.source_protocol_version : "NOT_RUN");
+  } else {
+    std::printf("rpmd_ja requested-h precheck: %s; sampled full-qNEP h steps PASS=%d/%d; SAMPLED PRECHECK ONLY / full reference acceptance still required.\n",
+      requested_h_seen && requested_h_pass ? "PASS" : "FAIL", precheck_steps_passed, precheck_steps_total);
+  }
   std::fflush(stdout);
   const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  std::printf("rpmd_ja diagnose completed: evaluations=%llu, elapsed %.3f s; diagnostics only, no reference produced.\n",
-    static_cast<unsigned long long>(evaluations), elapsed);
+  std::printf("rpmd_ja diagnose completed: evaluations=%llu, elapsed %.3f s; diagnostics only, no reference produced%s.\n",
+    static_cast<unsigned long long>(evaluations), elapsed, full ? " (evaluation counter excludes the 3N JVPs)" : "");
 }

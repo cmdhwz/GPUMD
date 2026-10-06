@@ -59,6 +59,22 @@ struct PPPMReferenceTranslationAxisReport
   double fd_error_estimate[2] = {};
   double fd_roundoff_estimate[2] = {};
   bool fd_signal_resolved[2] = {};
+  struct SourcePhase {
+    double analytic_derivative = 0.0;
+    double fd_derivative = 0.0;
+    double fd_uncertainty = 0.0;
+    double roundoff = 0.0;
+    double analytic_fd_difference = 0.0;
+    bool valid = false;
+    bool signal_resolved = false;
+    bool pass = false;
+  };
+  struct Source {
+    SourcePhase phase[2] = {};
+  };
+  // A: continuous FP64 extension of frozen float W/G; B: exact W with frozen float G;
+  // C: exact W and FP64 evaluation of the production influence formula.
+  Source source[3] = {};
   double fp64_forward_energy_derivative[2] = {};
   double fd_plateau_error[2] = {};
   double native_vs_fp64_error[2] = {};
@@ -72,6 +88,8 @@ struct PPPMReferenceTranslationReport
 {
   // Oracle promotes production float W coefficients to double; it is not native-float arithmetic.
   bool continuous_fp64_extension_of_fp32_weights = true;
+  const char* source_protocol_version = "pppm_translation_decomposition_v1";
+  bool source_log_confirmation = false;
   PPPMReferenceTranslationStatus status = PPPMReferenceTranslationStatus::not_run;
   PPPMReferenceTranslationReason reason = PPPMReferenceTranslationReason::none;
   PPPMReferenceTranslationAxisReport axis[3] = {};

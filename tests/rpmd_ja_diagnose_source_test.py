@@ -11,7 +11,7 @@ header = (root / "src/measure/rpmd_ja_reference.cuh").read_text(encoding="utf-8"
 # Keep the diagnostic entry point stable for the saved-spool caller.
 assert "void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box, Force& force, const bool full)" in text
 assert "for (const double step_scale : {0.5, 1.0, 2.0, 5.0, 10.0})" in text
-assert "analytic-gradient Hessian sampled D4 norm" in text
+assert "analytic-gradient Hessian sampled D4 norm" not in text
 assert "relative-to-D4" in text and "native-force K D4 norm" in text
 assert "FAIL=" in text and "qNEP rpmd_ja sampled stencil-step consistency check failed" in text
 assert "const int component[3][3] = {{0, 3, 4}, {6, 1, 5}, {7, 8, 2}}" in text
@@ -37,30 +37,36 @@ assert "100.0 * k" in precheck_table and "100.0 * c[alpha]" in precheck_table
 generation = text[text.index("static void generate_rpmd_ja_qnep_raw_reference("):text.index("void diagnose_rpmd_ja_qnep_reference(")]
 assert generation.index("print_qnep_precheck_table(") < generation.index("if (precheck_failed)") < generation.index("throw std::runtime_error(failure.str())")
 diagnose = text[text.index("void diagnose_rpmd_ja_qnep_reference("):]
-assert "print_qnep_precheck_table(h, \"full-qNEP\"" in diagnose
-assert "h == fd_step" in diagnose and "(REQUESTED fd_step)" in precheck_table
-assert "requested-h precheck:" in diagnose and "SAMPLED PRECHECK ONLY / full reference acceptance still required" in diagnose
+assert "requested_h" in diagnose
 assert "rpmd_ja_reference_math::central_difference_4th(g[0][r], g[1][r], g[2][r], g[3][r], h)" in text
-assert "precheck-matched summary h=" in text and "std::fflush(stdout)" in text
+assert "std::fflush(stdout)" in text
 assert 'uniform physical translation JVP direction=1' in text
 assert 'mass-weighted translation direction=1/sqrt(total_mass)' in text
 assert 'proxies, not the full-column V sum' in text
-assert 'baseline repeated force net[%d]' in text
-assert 'mesh net-force quick diagnostic' in text
-assert 'exact full-column V gradient net xyz=' in text
 assert "if (full) {" in diagnose and "for (int coordinate = 0; coordinate < d; ++coordinate)" in diagnose
 assert "site_values = evaluator.analytic_site_jvp(direction_host)" in diagnose
 assert "axis_site_columns[(coordinate / n) * n + site] += value" in diagnose
 assert "QNEPReferenceTangentDiagnostics tangent" in diagnose
 assert "compensated_running_sum" in diagnose and "long double extended" in diagnose
 assert "diagnose_reference_translation_energy(" in diagnose
-for label in ("CODE_INVARIANT", "ENERGY_ORACLE", "PRECISION", "EXACT_V_NET"):
+for label in ("CODE_INVARIANT", "EXACT_V_NET", "translation oracle"):
     assert label in diagnose
-assert "a.native_vs_fp64_error[1]" not in diagnose
-assert "3.0 * a.fd_plateau_error[0] > oracle.precision_target" in diagnose
-assert "native_derivative_precision_limited ? \"INCONCLUSIVE\"" in diagnose
+assert "p.fd_uncertainty + p.roundoff > report.precision_target" in diagnose
+assert "std::abs(C.analytic_derivative) > report.precision_target" in diagnose
+assert "for (int axis = 0; axis < 3; ++axis)" in diagnose and "for (int phase = 0; phase < 2; ++phase)" in diagnose
 assert "mesh_oracle, mesh_gradient_net_for_target.limit" in diagnose
 assert "full V columns" in diagnose
+for heading in ("[1/4] reference/net + exact V", "[2/4] stencil compact/short",
+                "[3/4] mesh translation oracle", "[4/4] final summary"):
+    assert heading in diagnose
+assert "h table (5 rows)" in diagnose and "shortmode=diagnostic label" in diagnose
+assert "sampled PASS is not reference acceptance" in diagnose
+assert "Shared algebraic identities are not independent oracle proof" in diagnose
+assert "source_protocol_version" in diagnose and "source_log_confirmation" in diagnose
+assert "native-A(host/FP32 proxy)" in diagnose
+assert "A-B" in diagnose and "B-C" in diagnose and "C-residual" in diagnose
+assert "std::abs(component_residual) <= kForceTolerance" not in diagnose
+assert "full V columns=%d" in diagnose and "evaluation counter excludes the 3N JVPs" in diagnose
 assert ".qraw" not in diagnose and "std::ofstream" not in diagnose
 raw_generation = text[text.index("static void generate_rpmd_ja_qnep_raw_reference("):text.index("void generate_rpmd_ja_qnep_raw(")]
 assert raw_generation.index("exact full-column V gradient net xyz=") < raw_generation.index("if (require_zero_net_gradient && !net_stats.within_limit)") < raw_generation.index("const auto kc_phase_start")
