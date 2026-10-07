@@ -566,7 +566,8 @@ ActiveSetPolishResult polish_cut_qp(cusolverDnHandle_t solver,const SmallSVD& sv
     }
     std::fill(out.lambda.begin(),out.lambda.end(),0.0);for(std::size_t j=0;j<active.size();++j)out.lambda[active[j]]=lambda_star[j];
     std::vector<std::size_t> remaining;remaining.reserve(active.size());for(std::size_t j=0;j<active.size();++j){const std::size_t row=active[j];if(lambda_star[j]==0.0){is_active[row]=0;if(out.updates==update_limit){out.failure_reason="ACTIVE_UPDATE_LIMIT";return out;}++out.updates;}else remaining.push_back(row);}active=std::move(remaining);
-    out.xi=svd.eta;for(std::size_t i=0;i<m;++i)for(int k=0;k<svd.p;++k)out.xi[k]+=a[i][k]*out.lambda[i];
+    // Keep the SVD primal solution; large multipliers amplify reconstruction roundoff.
+    out.xi=svd.eta;for(int k=0;k<svd.p;++k)out.xi[k]+=candidate_y[k];
     out.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,out.lambda,out.xi,primal_tolerance);if(out.certificate.accepted){out.accepted=true;out.failure_reason="none";out.active_constraints=active.size();return out;}
     std::size_t worst=m;double worst_excess=0.0;
     for(std::size_t i=0;i<m;++i){const double excess=std::max(0.0,-out.certificate.primal_slack[i]-out.certificate.allowed_error[i]);if(excess<=0.0)continue;if(is_active[i]){out.failure_reason="ACTIVE_EQUALITY_KKT_MISMATCH";return out;}if(excess>worst_excess){worst=i;worst_excess=excess;}}
@@ -595,7 +596,8 @@ QPSolution solve_cut_qp(cusolverDnHandle_t solver,const SmallSVD& svd,const std:
   for(int it=0;it<max_iterations;++it){double change=0.0;for(std::size_t i=0;i<rows.size();++i){double residual=b[i];for(std::size_t j=0;j<rows.size();++j)residual-=gram[i*rows.size()+j]*result.lambda[j];const double next=std::max(0.0,result.lambda[i]+residual/diag[i]);if(!std::isfinite(next))throw std::runtime_error("native fit stability QP iterate is non-finite");change=std::max(change,std::abs(next-result.lambda[i]));result.lambda[i]=next;}result.iterations=it+1;result.last_multiplier_change=change;
     if(result.iterations%check_interval==0||result.iterations==max_iterations){check_current();if(result.certificate.accepted)break;
       if((result.iterations==first_polish_iteration||result.iterations==retry_polish_iteration||result.iterations==max_iterations)&&result.polish_attempts<3){record_coordinate_time();const auto polish_started=std::chrono::steady_clock::now();const bool accepted=try_polish();result.polish_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-polish_started).count();coordinate_started=std::chrono::steady_clock::now();if(accepted)break;}}}
-  record_coordinate_time();const auto final_check_started=std::chrono::steady_clock::now();check_current();result.coordinate_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-final_check_started).count();
+  // Recheck the full KKT certificate without overwriting a polished primal solution.
+  record_coordinate_time();const auto final_check_started=std::chrono::steady_clock::now();result.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,result.lambda,result.xi,primal_tolerance);result.coordinate_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-final_check_started).count();
   if(!result.certificate.accepted){write_cut_qp_state(qp_state_path,outer,result,primal_tolerance,svd,rows,rhs,a,b,gram,initial_lambda_full);throw std::runtime_error("native fit stability QP failed primal, dual, or complementary-slackness check after "+std::to_string(result.iterations)+" iterations"+(qp_state_path.empty()?std::string():"; inspect "+qp_state_path));}
   return result;
 }

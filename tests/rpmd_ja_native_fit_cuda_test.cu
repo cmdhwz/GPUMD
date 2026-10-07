@@ -105,7 +105,7 @@ CutQPFixture read_cut_qp_fixture(const std::string& path)
       std::size_t count=0;int cols=0;fields>>count>>cols;if(cols!=fixture.svd.p)throw std::runtime_error("invalid QP fixture row width");auto& matrix=key=="original_rows"?fixture.rows:fixture.a;auto& values=key=="original_rows"?fixture.rhs:fixture.b;matrix.assign(count,std::vector<double>(cols));values.resize(count);
       for(std::size_t i=0;i<count;++i){if(!std::getline(in,line))throw std::runtime_error("truncated QP fixture rows");std::istringstream row(line);std::size_t index=0;std::string tag;if(!(row>>index)||index!=i)throw std::runtime_error("invalid QP fixture row index");for(double& value:matrix[i])if(!(row>>value))throw std::runtime_error("invalid QP fixture row data");if(!(row>>tag>>values[i])||tag!=(key=="original_rows"?"rhs":"b"))throw std::runtime_error("invalid QP fixture row right hand side");}}
   }
-  if(!in.eof()||fixture.svd.p!=60||fixture.rows.size()!=233||fixture.a.size()!=fixture.rows.size()||fixture.initial_lambda.size()!=fixture.rows.size()||
+  if(!in.eof()||fixture.svd.p!=60||fixture.rows.empty()||fixture.a.size()!=fixture.rows.size()||fixture.initial_lambda.size()!=fixture.rows.size()||
      fixture.svd.singular.size()!=static_cast<std::size_t>(fixture.svd.p)||fixture.svd.eta.size()!=static_cast<std::size_t>(fixture.svd.p)||fixture.svd.vt.size()!=static_cast<std::size_t>(fixture.svd.p)*fixture.svd.p||!(fixture.primal_tolerance>0.0))
     throw std::runtime_error("QP regression fixture dimensions or metadata are invalid");
   return fixture;
@@ -970,6 +970,7 @@ void test_active_set_qp_snapshot_and_rejection(cusolverDnHandle_t solver)
 {
   std::string fixture_path="tests/data/ja_reference_resample.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
   const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);
+  assert(fixture.rows.size()==233);
   const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
   assert(replay.method==std::string("active_set_polish"));
   assert(((replay.iterations==64&&replay.polish_attempts==1)||(replay.iterations==4096&&replay.polish_attempts==2)||
@@ -994,6 +995,21 @@ void test_active_set_qp_snapshot_and_rejection(cusolverDnHandle_t solver)
   const std::vector<std::vector<double>> too_many_active={{1.0,0.0},{0.0,1.0},{1.0,1.0}};const std::vector<double> too_many_rhs={1.0,1.0,2.0};
   const ActiveSetPolishResult dimension_rank_failure=polish_cut_qp(solver,identity,too_many_active,too_many_rhs,too_many_active,too_many_rhs,{1.0,1.0,1.0},1e-8);
   assert(!dimension_rank_failure.accepted&&dimension_rank_failure.failure_reason=="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT");
+}
+
+void test_active_set_preserves_svd_primal(cusolverDnHandle_t solver)
+{
+  std::string fixture_path="tests/data/ja_reference_replay_v1.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);assert(fixture.rows.size()==20);
+  std::vector<double> seed(fixture.rows.size(),0.0);for(const int row:{0,1,2,3,4,5,12})seed[row]=1.0;
+  const ActiveSetPolishResult polished=polish_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,seed,fixture.primal_tolerance);
+  assert(polished.accepted&&polished.certificate.accepted&&polished.active_constraints==7);
+  assert(polished.certificate.max_primal_excess==0.0&&polished.certificate.max_complementarity<=qp_complementarity_tolerance&&polished.certificate.max_stationarity<=qp_stationarity_tolerance);
+  const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
+  assert(replay.certificate.accepted&&replay.certificate.primal_constraints_pass&&replay.certificate.finite);
+  assert(replay.certificate.max_complementarity<=qp_complementarity_tolerance&&replay.certificate.max_stationarity<=qp_stationarity_tolerance);
+  const QPCertificate rechecked=check_cut_qp_kkt(fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,replay.lambda,replay.xi,fixture.primal_tolerance);
+  assert(rechecked.accepted);
 }
 
 void test_read_frame_rejects_invalid_data()
@@ -1197,6 +1213,7 @@ int main()
   DeviceQR qr;qr.initialize(2,3);
   test_padded_qr_svd_and_cut_qp(qr.solver);
   test_active_set_qp_snapshot_and_rejection(qr.solver);
+  test_active_set_preserves_svd_primal(qr.solver);
   test_read_frame_rejects_invalid_data();
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
