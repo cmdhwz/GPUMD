@@ -224,7 +224,7 @@ assert "if(q>static_cast<std::size_t>(p)){failure_reason=\"ACTIVE_MATRIX_NUMERIC
 assert "if(da){cudaFree(da);da=nullptr;}" in active_svd and "if(info){cudaFree(info);info=nullptr;}" in active_svd
 assert "rounded_alpha" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "rounded_exit.accepted" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
-assert "dimension_rank_failure.failure_reason" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "dimension_rank_failure.accepted" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "first_polish_iteration=64,retry_polish_iteration=4096" in native_fit and "max_iterations=200000" in native_fit
 assert "result.polish_attempts<3" in native_fit and "4*(m+static_cast<std::size_t>(svd.p))" in native_fit
 assert 'method="active_set_polish"' in native_fit and '<<" polish_attempts="' in native_fit

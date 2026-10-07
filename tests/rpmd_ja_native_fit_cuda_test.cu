@@ -991,10 +991,13 @@ void test_active_set_qp_snapshot_and_rejection(cusolverDnHandle_t solver)
 
   const std::vector<std::vector<double>> dependent={{1.0,0.0},{2.0,0.0}};const std::vector<double> dependent_rhs={1.0,2.0};
   const ActiveSetPolishResult rank_failure=polish_cut_qp(solver,identity,dependent,dependent_rhs,dependent,dependent_rhs,{1.0,1.0},1e-8);
-  assert(!rank_failure.accepted&&rank_failure.failure_reason=="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT");
+  assert(rank_failure.accepted&&rank_failure.certificate.primal_slack.size()==2&&rank_failure.certificate.accepted);
+  std::vector<double> equality_y,equality_lambda;std::string equality_failure;
+  assert(!solve_active_equalities(solver,dependent,dependent_rhs,{0,1},identity.p,identity.eta,equality_y,equality_lambda,equality_failure));
+  assert(equality_failure=="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT");
   const std::vector<std::vector<double>> too_many_active={{1.0,0.0},{0.0,1.0},{1.0,1.0}};const std::vector<double> too_many_rhs={1.0,1.0,2.0};
   const ActiveSetPolishResult dimension_rank_failure=polish_cut_qp(solver,identity,too_many_active,too_many_rhs,too_many_active,too_many_rhs,{1.0,1.0,1.0},1e-8);
-  assert(!dimension_rank_failure.accepted&&dimension_rank_failure.failure_reason=="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT");
+  assert(dimension_rank_failure.accepted&&dimension_rank_failure.certificate.primal_slack.size()==3&&dimension_rank_failure.certificate.accepted);
 }
 
 void test_active_set_preserves_svd_primal(cusolverDnHandle_t solver)
@@ -1024,6 +1027,18 @@ void test_active_set_refines_kkt_residual(cusolverDnHandle_t solver)
   const QPCertificate rechecked=check_cut_qp_kkt(fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,replay.lambda,replay.xi,fixture.primal_tolerance);
   assert(rechecked.accepted&&rechecked.max_primal_excess==0.0);
   assert(rechecked.max_complementarity<=qp_complementarity_tolerance&&rechecked.max_stationarity<=qp_stationarity_tolerance);
+}
+
+void test_active_set_rank_deficient_warm_start(cusolverDnHandle_t solver)
+{
+  std::string fixture_path="tests/data/ja_reference_replay_v4.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);assert(fixture.rows.size()==42);
+  std::vector<double> seed(fixture.rows.size(),0.0);for(const int row:{0,1,2,3,5,6,20,22,24,27,28,30,35,38,39})seed[row]=1.0;
+  const ActiveSetPolishResult polished=polish_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,seed,fixture.primal_tolerance);
+  assert(polished.accepted&&polished.certificate.accepted&&polished.certificate.primal_slack.size()==42);
+  const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
+  const QPCertificate rechecked=check_cut_qp_kkt(fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,replay.lambda,replay.xi,fixture.primal_tolerance);
+  assert(replay.certificate.accepted&&rechecked.accepted&&rechecked.primal_slack.size()==42);
 }
 
 void test_read_frame_rejects_invalid_data()
@@ -1229,6 +1244,7 @@ int main()
   test_active_set_qp_snapshot_and_rejection(qr.solver);
   test_active_set_preserves_svd_primal(qr.solver);
   test_active_set_refines_kkt_residual(qr.solver);
+  test_active_set_rank_deficient_warm_start(qr.solver);
   test_read_frame_rejects_invalid_data();
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();

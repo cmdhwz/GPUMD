@@ -571,10 +571,16 @@ ActiveSetPolishResult polish_cut_qp(cusolverDnHandle_t solver,const SmallSVD& sv
   ActiveSetPolishResult out;out.lambda=initial_lambda;const std::size_t m=rows.size();
   if(initial_lambda.size()!=m){out.failure_reason="ACTIVE_INITIAL_MULTIPLIER_DIMENSION";return out;}
   if(m>std::numeric_limits<std::size_t>::max()-static_cast<std::size_t>(svd.p)||(m+static_cast<std::size_t>(svd.p))>std::numeric_limits<std::size_t>::max()/4){out.failure_reason="ACTIVE_UPDATE_LIMIT_OVERFLOW";return out;}
-  const std::size_t update_limit=4*(m+static_cast<std::size_t>(svd.p));std::vector<std::size_t> active;std::vector<char> is_active(m,0);
+  const std::size_t update_limit=4*(m+static_cast<std::size_t>(svd.p));std::vector<std::size_t> active;std::vector<char> is_active(m,0);bool rank_restart_used=false;
   for(std::size_t i=0;i<m;++i){if(!std::isfinite(out.lambda[i])||out.lambda[i]<0.0){out.failure_reason="ACTIVE_INITIAL_MULTIPLIER_INVALID";return out;}if(out.lambda[i]>0.0){active.push_back(i);is_active[i]=1;}}
   for(;;){out.active_constraints=active.size();std::vector<double> candidate_y(static_cast<std::size_t>(svd.p),0.0),lambda_star;
-    if(!active.empty()&&!solve_active_equalities(solver,a,b,active,svd.p,svd.eta,candidate_y,lambda_star,out.failure_reason))return out;
+    if(!active.empty()&&!solve_active_equalities(solver,a,b,active,svd.p,svd.eta,candidate_y,lambda_star,out.failure_reason)){
+      if(rank_restart_used||out.failure_reason!="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT")return out;
+      // Rebuild a dependent working set once; retain every cut for the full KKT check.
+      if(out.updates>update_limit-active.size()){out.failure_reason="ACTIVE_UPDATE_LIMIT";return out;}
+      out.updates+=active.size();active.clear();std::fill(out.lambda.begin(),out.lambda.end(),0.0);std::fill(is_active.begin(),is_active.end(),0);
+      rank_restart_used=true;continue;
+    }
     bool has_negative=false;for(double value:lambda_star)has_negative=has_negative||value<0.0;
     if(has_negative){double alpha=1.0;std::vector<double> ratios(active.size(),std::numeric_limits<double>::infinity());
       for(std::size_t j=0;j<active.size();++j)if(lambda_star[j]<0.0){const double current=out.lambda[active[j]],denominator=current-lambda_star[j];if(!(current>0.0)||!(denominator>0.0)||!std::isfinite(denominator)){out.failure_reason="ACTIVE_NEGATIVE_MULTIPLIER_STEP_INVALID";return out;}ratios[j]=current/denominator;if(!std::isfinite(ratios[j])||ratios[j]<0.0||ratios[j]>1.0){out.failure_reason="ACTIVE_NEGATIVE_MULTIPLIER_STEP_INVALID";return out;}alpha=std::min(alpha,ratios[j]);}
