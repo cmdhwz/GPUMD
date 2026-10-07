@@ -725,12 +725,21 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, check_samples <samples_file> <report_file>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
           tokens, number_of_types, integrate, group, atom, box, force, first_potential_filename_)) {
       PRINT_INPUT_ERROR("Could not register rpmd_ja fit sampler.");
+    }
+    return;
+  }
+  if (tokens[1] == "sample") {
+    if (tokens.size() != 4)
+      PRINT_INPUT_ERROR("rpmd_ja sample requires <basename> <sample_interval>.");
+    if (!measure.parse_action(
+          tokens, number_of_types, integrate, group, atom, box, force, first_potential_filename_)) {
+      PRINT_INPUT_ERROR("Could not register rpmd_ja sample sampler.");
     }
     return;
   }

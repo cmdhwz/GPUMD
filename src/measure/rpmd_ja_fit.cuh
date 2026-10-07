@@ -85,4 +85,5 @@ private:
   double cell_[9] = {};
   int pbc_[3] = {};
   bool has_previous_centroid_ = false;
+  bool sample_only_ = false;
 };

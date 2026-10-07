@@ -176,6 +176,51 @@ void test_probe_moments_centering_and_small_segments()
   assert(std::string(probe_sample_status(2,3))=="INSUFFICIENT_SAMPLES");
 }
 
+void test_ibp_diagnostic_status_is_not_a_numerical_gate()
+{
+  BootstrapBand band;band.estimate=0.8;
+  band.status="IBP_PASS";assert(!ibp_statistics_numerically_invalid(band));
+  band.status="IBP_FAIL";assert(!ibp_statistics_numerically_invalid(band));
+  band.status="IBP_INCONCLUSIVE";assert(!ibp_statistics_numerically_invalid(band));
+  band.status="NUMERICAL_FAILURE";assert(ibp_statistics_numerically_invalid(band));
+  band.status="IBP_INCONCLUSIVE";band.estimate=std::numeric_limits<double>::quiet_NaN();
+  assert(ibp_statistics_numerically_invalid(band));
+  band.estimate=1.0;band.diagnostic_stage="INTERVAL_CHECK";band.upper=std::numeric_limits<double>::infinity();
+  assert(ibp_statistics_numerically_invalid(band));
+}
+
+void test_type_local_source_and_motion_diagnostics()
+{
+  constexpr int n=40;std::vector<double> sqrt_mass(n,1.0);std::vector<int> types(n);
+  for(int i=0;i<n;++i)types[i]=i%4;
+  std::vector<std::string> sources;std::vector<ProbeOrigin> origins;
+  const auto probes=make_probes({},sqrt_mass,types,n,&sources,&origins);
+  assert(probes.size()==sources.size()&&probes.size()==origins.size());
+  int type_local_count=0;
+  for(std::size_t i=0;i<sources.size();++i)if(sources[i]=="TYPE_LOCAL"){
+    ++type_local_count;assert(origins[i].seed_atom_index>=0&&origins[i].seed_atom_index<4);
+    assert(origins[i].type_index==types[origins[i].seed_atom_index]&&origins[i].mass==1.0);}
+  assert(type_local_count==4);
+
+  SourceAtomMotion motion;motion.atom_index=7;motion.type_index=2;motion.mass=5.0;std::vector<double> reference(24,0.0),position(24,0.0);
+  position[7]=1.0;motion.add(position,reference,8,0);position[7]=3.0;motion.add(position,reference,8,0);
+  position[7]=7.0;motion.add(position,reference,8,1);
+  assert(motion.frames==3&&motion.block_frames[0]==2&&motion.block_frames[1]==1);
+  assert(motion.mean_square_displacement()==59.0/3.0&&motion.maximum_adjacent_sampled_frame_displacement==4.0);
+  const auto block0=motion.mean_displacement(0),block1=motion.mean_displacement(1);
+  assert(block0[0]==2.0&&block0[1]==0.0&&block0[2]==0.0&&block1[0]==7.0);
+  const auto local=std::find(sources.begin(),sources.end(),"TYPE_LOCAL");assert(local!=sources.end());
+  const std::size_t local_index=static_cast<std::size_t>(std::distance(sources.begin(),local));
+  std::ostringstream final_probe_report;write_probe_origin_table(final_probe_report,sources,origins);
+  assert(final_probe_report.str().find("16 TYPE_LOCAL 0 0 1")!=std::string::npos);
+  FixedProbeStatistics stats;stats.sources={sources[local_index]};stats.origins={origins[local_index]};stats.source_atom_motion.push_back(motion);
+  std::ostringstream report;write_probe_origin_diagnostics(report,stats);
+  assert(report.str().find("probe_index source seed_atom_index type_index mass")!=std::string::npos);
+  assert(report.str().find("SOURCE_ATOM_MOTION")!=std::string::npos);
+  assert(report.str().find("maximum_adjacent_sampled_frame_displacement")!=std::string::npos);
+  assert(report.str().find("type-local seed vectors are translation-projected and orthogonalized")!=std::string::npos);
+}
+
 void test_ibp_noise_channel_selection_and_force_variance()
 {
   ProbeMoments direct(1),left(1),right(1),shifted(1);
@@ -462,6 +507,38 @@ void test_bootstrap_nonfinite_is_numerical_failure()
   assert(band.diagnostic_stage=="INPUT_CHECK"&&band.rejection_reason=="NONFINITE_INPUT_MOMENTS"&&!band.bootstrap_started);
 }
 
+void test_nonfinite_tail_product_is_numerical_failure()
+{
+  ProbeMoments full(1);std::vector<ProbeMoments> blocks;blocks.reserve(64);
+  for(int b=0;b<64;++b){const double q=b%4<2?1.0e100:-1.0e100,f=b%2==0?1.0e100:-1.0e100;ProbeMoments block(1);block.add({q},{f});full.merge(block);blocks.push_back(std::move(block));}
+  const BootstrapBand band=bootstrap_ibp_band(full,blocks,1,1.0,0.15,9);
+  assert(std::isfinite(band.estimate)&&std::abs(band.estimate-1.0)<1e-14);
+  assert(band.status=="NUMERICAL_FAILURE"&&band.rejection_reason=="NONFINITE_PRODUCT_STATISTICS");
+  assert(band.diagnostic_stage=="TAIL_CHECK"&&!band.bootstrap_started);
+}
+
+void test_response_bootstrap_ignores_force_position_tail()
+{
+  ProbeMoments baseline(1),changed(1);std::vector<ProbeMoments> baseline_blocks,changed_blocks;std::uint32_t state=36;
+  for(int b=0;b<512;++b){state=1664525U*state+1013904223U;const double q=2.0*static_cast<double>(state)/4294967296.0-1.0;
+    const double f0=-q,f1=(((b/128)%2)?1.0:-1.0)*q;ProbeMoments a(1),c(1);a.add({q},{f0});c.add({q},{f1});
+    baseline.merge(a);changed.merge(c);baseline_blocks.push_back(std::move(a));changed_blocks.push_back(std::move(c));}
+  assert(block_product_tail_covered(baseline_blocks,baseline,nullptr,false,true));
+  assert(block_product_tail_covered(changed_blocks,changed,nullptr,false,true));
+  assert(!block_product_tail_covered(changed_blocks,changed,nullptr,true,true));
+  const auto metric=[](const ProbeMoments& moments){return moments.covariance_q();};
+  const auto norm=[](const std::vector<double>& value){return std::abs(value[0]);};
+  const auto distance=[](const std::vector<double>& a,const std::vector<double>& b){return std::abs(a[0]-b[0]);};
+  const BootstrapBand a=bootstrap_metric_band(baseline,baseline_blocks,1,10.0,29,metric,norm,distance,
+    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE",false,true);
+  const BootstrapBand b=bootstrap_metric_band(changed,changed_blocks,1,10.0,29,metric,norm,distance,
+    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE",false,true);
+  assert(a.bootstrap_started&&b.bootstrap_started&&a.status==b.status&&a.rejection_reason==b.rejection_reason);
+  assert(a.estimate==b.estimate&&a.level_radii==b.level_radii);
+  const BootstrapBand ibp=bootstrap_ibp_band(changed,changed_blocks,1,1.0,10.0,29);
+  assert(ibp.status=="IBP_INCONCLUSIVE"&&ibp.diagnostic_stage=="TAIL_CHECK");
+}
+
 void test_bootstrap_rejection_diagnostics()
 {
   const BootstrapBand empty=bootstrap_ibp_band(ProbeMoments(1),{},1,1.0,0.15,1);
@@ -528,6 +605,28 @@ void test_check_samples_is_read_only()
   assert(text.find("lag_autocorrelation")!=std::string::npos&&text.find("IBP_residual")!=std::string::npos);
   assert(text.find("IBP_GAUSSIAN_VARIANCE_PROXY")!=std::string::npos&&text.find("IBP_FIXED_CHANNEL_VALIDATION")!=std::string::npos);
   assert(text.find("selection_source TRAIN_ONLY")!=std::string::npos&&text.find("ADJACENT_SEGMENT_INTERNAL_CHECK")!=std::string::npos);
+}
+
+void test_sample_spool_minimum_frame_boundary()
+{
+  Atom atom;atom.number_of_atoms=2;atom.number_of_beads=4;atom.cpu_mass={1.0,2.0};atom.cpu_type={0,1};
+  Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;
+  for(const int frames:{1,2}){const std::string path=write_sample_spool(".min_frames_"+std::to_string(frames),frames);RemoveTestFile cleanup{path};
+    std::ifstream in(path,std::ios::binary);bool rejected=false;try{(void)read_header(in,frames,atom,box,300.0);}catch(const std::runtime_error&){rejected=true;}assert(rejected);}
+  const std::string path=write_sample_spool(".min_frames_3",3);RemoveTestFile cleanup{path};std::ifstream in(path,std::ios::binary);
+  assert(read_header(in,3,atom,box,300.0).frame_count==3);
+}
+
+void test_fixed_probe_collection_checks_reference_branches()
+{
+  const std::string path=write_sample_spool(".branch",3,1.0,true,6.0);RemoveTestFile cleanup{path};
+  Atom atom;atom.number_of_atoms=2;atom.cpu_mass={1.0,2.0};atom.cpu_type={0,1};Box box{};
+  box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;
+  std::ifstream in(path,std::ios::binary);const SampleHeader header=read_header(in,0,atom,box,0.0,true);
+  std::vector<double> r0(6,0.0);read_training_r0(in,header,header.frame_count,std::numeric_limits<double>::quiet_NaN(),r0);
+  bool rejected=false;try{(void)collect_fixed_probe_statistics(in,header,header.frame_count,2,r0,false,0.15,&box);}
+  catch(const std::runtime_error& error){rejected=std::string(error.what()).find("branch limit 0.45")!=std::string::npos;}
+  assert(rejected);
 }
 
 std::vector<double> snapshot_matrix(const std::string& text,const std::string& name,const int n)
@@ -722,6 +821,20 @@ void test_pap_baseline()
     expected[static_cast<std::size_t>(i)*d+j]+=translation_projection[static_cast<std::size_t>(i)*d+a]*k[static_cast<std::size_t>(a)*d+b]*translation_projection[static_cast<std::size_t>(b)*d+j];
   for(int i=0;i<d;++i)v[i]=std::cos(0.23*(i+1));baseline.apply(v,out);
   for(int i=0;i<d;++i){double x=0.0;for(int j=0;j<d;++j)x+=expected[static_cast<std::size_t>(i)*d+j]*v[j];check_close(out[i],x,2e-8);}
+}
+
+void test_baseline_batch_matches_gemv()
+{
+  constexpr int n=3,d=3*n,columns=32;std::vector<double> masses={1.0,2.5,7.0},sqrt_mass(d);
+  for(int axis=0;axis<3;++axis)for(int i=0;i<n;++i)sqrt_mass[axis*n+i]=std::sqrt(masses[i]);
+  std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=2.0;
+  std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));stream.seekg(0);
+  DeviceBaseline baseline;baseline.initialize(stream,0,d,n,masses,sqrt_mass);
+  std::vector<double> input(static_cast<std::size_t>(d)*columns),batch_output(input.size()),single(d),single_output(d);
+  for(int column=0;column<columns;++column)for(int i=0;i<d;++i)input[static_cast<std::size_t>(column)*d+i]=std::sin(0.17*(i+1)*(column+1));
+  baseline.apply_batch(input,columns,batch_output);
+  for(int column=0;column<columns;++column){std::copy_n(input.begin()+static_cast<std::size_t>(column)*d,d,single.begin());baseline.apply(single,single_output);
+    for(int i=0;i<d;++i)check_close(batch_output[static_cast<std::size_t>(column)*d+i],single_output[i],2e-10);}
 }
 
 void test_padded_qr_svd_and_cut_qp(cusolverDnHandle_t solver)
@@ -985,7 +1098,7 @@ void test_lanczos_independent_seed_escapes_invariant_subspace(cusolverDnHandle_t
 
 void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
 {
-  constexpr int n=8,d=3*n,train=21,validation=42,frames=train+validation;
+  constexpr int n=8,d=3*n,train=21,validation=33,frames=train+validation;
   const double temperature=300.0,kbt=K_B*temperature;
   const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0),r0(d,0.0);
   std::vector<double> raw(d*d,0.0);for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=1.0;
@@ -1005,19 +1118,19 @@ void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
     std::ofstream out(path,std::ios::binary|std::ios::trunc);assert(out.good());
     auto frame=[&](double step,const std::vector<double>& x){out.write(reinterpret_cast<const char*>(&step),sizeof(step));out.write(reinterpret_cast<const char*>(x.data()),d*sizeof(double));std::vector<double> add(d),f(d);apply_additive(graph,x,sqrt_mass,sqrt_atom,theta,n,add);for(int i=0;i<d;++i)f[i]=-x[i]-add[i];out.write(reinterpret_cast<const char*>(f.data()),d*sizeof(double));};
     std::vector<double> zero(d);double step=0.0;for(int i=0;i<train;++i)frame(step++,zero);
-    for(int k=0;k<r;++k){const double amplitude=std::sqrt(r*kbt/eig.values[k]);std::vector<double> x(d);for(int i=0;i<d;++i)x[i]=amplitude*modes[k][i]+0.4*basis[0][i];frame(step++,x);for(int i=0;i<d;++i)x[i]=-amplitude*modes[k][i]+0.4*basis[0][i];frame(step++,x);}
+    for(int t=0;t<validation;++t){std::vector<double> x(d);for(int k=0;k<r;++k){const int frequency=k/2+1;const double phase=2.0*std::acos(-1.0)*frequency*t/validation;const double value=std::sqrt(2.0*kbt/eig.values[k])*(k%2?std::sin(phase):std::cos(phase));for(int i=0;i<d;++i)x[i]+=value*modes[k][i];}frame(step++,x);}
     assert(out.good());
   }
   std::ifstream spool(path,std::ios::binary);assert(spool.good());
   const ResponseCheck result=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,21,1,temperature,{});
-  assert(result.probes>=20);assert(result.validation_frames==validation);assert(result.observed_cov_available&&result.predicted_cov_available&&result.cg_residual_available&&result.response_ibp_available&&result.force_residual_available);assert(result.observed_cov_min>0.0&&result.observed_cov_max>=result.observed_cov_min&&result.observed_cov_condition>=1.0);assert(result.predicted_cov_min>0.0&&result.predicted_cov_max>=result.predicted_cov_min&&result.predicted_cov_condition>=1.0);assert(result.block_frames[0]+result.block_frames[1]+result.block_frames[2]+result.block_frames[3]==validation);assert(std::isfinite(result.block_variance_max_relative_delta));assert(result.cg<=1e-8);assert(result.response<=2e-8);assert(result.ibp<=2e-8);assert(result.force_residual<=2e-8);
+  assert(result.probes>=20);assert(result.validation_frames==validation&&result.statistical_frames==33);assert(result.observed_cov_available&&result.predicted_cov_available&&result.cg_residual_available&&result.response_ibp_available&&result.force_residual_available);assert(result.observed_cov_min>0.0&&result.observed_cov_max>=result.observed_cov_min&&result.observed_cov_condition>=1.0);assert(result.predicted_cov_min>0.0&&result.predicted_cov_max>=result.predicted_cov_min&&result.predicted_cov_condition>=1.0);assert(result.block_frames[0]+result.block_frames[1]+result.block_frames[2]+result.block_frames[3]==validation);assert(std::isfinite(result.block_variance_max_relative_delta));assert(result.cg<=1e-8);assert(result.response<=2e-8);assert(result.ibp<=2e-8);assert(result.force_residual<=2e-8);
 
   spool.close();
   {
     std::ofstream out(path,std::ios::binary|std::ios::trunc);assert(out.good());
     auto frame=[&](double step,const std::vector<double>& x){out.write(reinterpret_cast<const char*>(&step),sizeof(step));out.write(reinterpret_cast<const char*>(x.data()),d*sizeof(double));std::vector<double> add(d),f(d);apply_additive(graph,x,sqrt_mass,sqrt_atom,theta,n,add);for(int i=0;i<d;++i)f[i]=-x[i]-add[i];out.write(reinterpret_cast<const char*>(f.data()),d*sizeof(double));};
     std::vector<double> zero(d);double step=0.0;for(int i=0;i<train;++i)frame(step++,zero);
-    for(int k=0;k<r;++k){double amplitude=std::sqrt(r*kbt/eig.values[k]);if(k==0)amplitude*=1e-7;std::vector<double> x(d);for(int i=0;i<d;++i)x[i]=amplitude*modes[k][i];frame(step++,x);for(int i=0;i<d;++i)x[i]=-amplitude*modes[k][i];frame(step++,x);}
+    for(int i=0;i<validation;++i)frame(step++,zero);
     assert(out.good());
   }
   spool.open(path,std::ios::binary);assert(spool.good());
@@ -1031,7 +1144,7 @@ void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
     std::ofstream out(path,std::ios::binary|std::ios::trunc);assert(out.good());
     auto frame=[&](double step,const std::vector<double>& x){out.write(reinterpret_cast<const char*>(&step),sizeof(step));out.write(reinterpret_cast<const char*>(x.data()),d*sizeof(double));std::vector<double> f(d);for(int i=0;i<d;++i)f[i]=-x[i];out.write(reinterpret_cast<const char*>(f.data()),d*sizeof(double));};
     std::vector<double> zero(d);double step=0.0;for(int i=0;i<train;++i)frame(step++,zero);
-    for(const auto& mode:basis){const double amplitude=std::sqrt(r*kbt);std::vector<double> x(d);for(int i=0;i<d;++i)x[i]=amplitude*mode[i];frame(step++,x);for(double& value:x)value=-value;frame(step++,x);}
+    for(int t=0;t<validation;++t){std::vector<double> x(d);for(int k=0;k<r;++k){const int frequency=k/2+1;const double phase=2.0*std::acos(-1.0)*frequency*t/validation;const double value=std::sqrt(2.0*kbt)*(k%2?std::sin(phase):std::cos(phase));for(int i=0;i<d;++i)x[i]+=value*basis[k][i];}frame(step++,x);}
     assert(out.good());
   }
   spool.open(path,std::ios::binary);assert(spool.good());
@@ -1057,6 +1170,8 @@ int main()
   test_full_spd_failure_keeps_candidate_pack();
   test_response_uncomputed_values_are_explicit();
   test_probe_moments_centering_and_small_segments();
+  test_ibp_diagnostic_status_is_not_a_numerical_gate();
+  test_type_local_source_and_motion_diagnostics();
   test_ibp_noise_channel_selection_and_force_variance();
   test_validation_noise_blocks_start_at_split_boundary();
   test_omitted_validation_tail_does_not_change_channel_interval();
@@ -1066,14 +1181,19 @@ int main()
   test_bootstrap_block_factor_candidates_and_terminal_level();
   test_block_product_tail_uses_segment_centering();
   test_bootstrap_nonfinite_is_numerical_failure();
+  test_nonfinite_tail_product_is_numerical_failure();
+  test_response_bootstrap_ignores_force_position_tail();
   test_bootstrap_rejection_diagnostics();
   test_slow_product_correlation_is_inconclusive();
   test_block_bootstrap_harmonic_coverage();
   test_check_samples_is_read_only();
+  test_sample_spool_minimum_frame_boundary();
+  test_fixed_probe_collection_checks_reference_branches();
   test_response_snapshot_preserves_recomputable_matrices();
   test_saved_sample_diagnostic();
   test_design_and_edge_operator();
   test_pap_baseline();
+  test_baseline_batch_matches_gemv();
   DeviceQR qr;qr.initialize(2,3);
   test_padded_qr_svd_and_cut_qp(qr.solver);
   test_active_set_qp_snapshot_and_rejection(qr.solver);

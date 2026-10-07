@@ -59,7 +59,15 @@ void write_or_throw(std::ofstream& out, const void* data, const std::size_t byte
 RpmdJA_Fit::RpmdJA_Fit(const std::vector<std::string>& tokens)
 {
   action_name = "rpmd_ja_fit";
-  if ((tokens.size() != 9 && tokens.size() != 11) || tokens[0] != "rpmd_ja" || tokens[1] != "fit") {
+  if (tokens.size() < 2 || tokens[0] != "rpmd_ja") {
+    throw std::invalid_argument("rpmd_ja fit requires valid command tokens");
+  }
+  sample_only_ = tokens[1] == "sample";
+  if (sample_only_) {
+    if (tokens.size() != 4) {
+      throw std::invalid_argument("rpmd_ja sample requires <basename> <sample_interval>");
+    }
+  } else if ((tokens.size() != 9 && tokens.size() != 11) || tokens[1] != "fit") {
     throw std::invalid_argument(
       "rpmd_ja fit requires <outfile> <sample_interval> <cutoff> <epsilon> "
       "<response_tolerance> <fd_step> <kernel_table> [max_rounds <N>]");
@@ -68,10 +76,10 @@ RpmdJA_Fit::RpmdJA_Fit(const std::vector<std::string>& tokens)
   char* end = nullptr;
   const long long interval = std::strtoll(tokens[3].c_str(), &end, 10);
   if (end == tokens[3].c_str() || *end != '\0' || interval <= 0 || interval > INT_MAX) {
-    throw std::invalid_argument("rpmd_ja fit sample_interval must be a positive integer");
+    throw std::invalid_argument("rpmd_ja sample_interval must be a positive integer");
   }
   sample_interval_ = static_cast<int>(interval);
-  if (tokens.size() == 11) {
+  if (!sample_only_ && tokens.size() == 11) {
     if (tokens[9] != "max_rounds") {
       throw std::invalid_argument("rpmd_ja fit optional tail must be max_rounds <N>");
     }
@@ -82,13 +90,15 @@ RpmdJA_Fit::RpmdJA_Fit(const std::vector<std::string>& tokens)
     }
     max_stability_rounds_ = static_cast<int>(rounds);
   }
-  cutoff_ = parse_positive(tokens[4], "cutoff");
-  epsilon_ = parse_positive(tokens[5], "epsilon");
-  response_tolerance_ = parse_positive(tokens[6], "response_tolerance");
-  fd_step_ = parse_positive(tokens[7], "fd_step");
-  kernel_table_ = tokens[8];
-  if (output_path_.empty() || kernel_table_.empty()) {
-    throw std::invalid_argument("rpmd_ja fit output and kernel table paths must be nonempty");
+  if (!sample_only_) {
+    cutoff_ = parse_positive(tokens[4], "cutoff");
+    epsilon_ = parse_positive(tokens[5], "epsilon");
+    response_tolerance_ = parse_positive(tokens[6], "response_tolerance");
+    fd_step_ = parse_positive(tokens[7], "fd_step");
+    kernel_table_ = tokens[8];
+  }
+  if (output_path_.empty() || (!sample_only_ && kernel_table_.empty())) {
+    throw std::invalid_argument("rpmd_ja output and kernel table paths must be nonempty");
   }
   spool_path_ = output_path_ + ".samples.tmp";
   lock_path_ = output_path_ + ".fit.lock";
@@ -156,7 +166,10 @@ void RpmdJA_Fit::pre_run(
   const long long expected_probes = std::min<long long>(coordinate_count - 3,
     16 + std::min<std::size_t>(unique_types.size(), 4) + 4);
   const long long holdout_count = frame_count - 2 * frame_count / 3;
-  if (frame_count < 3 || holdout_count <= expected_probes) {
+  if (sample_only_ && frame_count < 3) {
+    PRINT_INPUT_ERROR("rpmd_ja sample needs at least three sampled frames.");
+  }
+  if (!sample_only_ && (frame_count < 3 || holdout_count <= expected_probes)) {
     const std::string message = "rpmd_ja fit needs at least " +
       std::to_string(3 * expected_probes + 1) +
       " sampled frames for its 2/3 training split and " +
@@ -171,23 +184,25 @@ void RpmdJA_Fit::pre_run(
   if (pbc_[0] != 1 || pbc_[1] != 1 || pbc_[2] != 1) {
     PRINT_INPUT_ERROR("rpmd_ja fit currently requires periodic boundaries in all three directions.");
   }
-  const std::string outputs[] = {output_path_, spool_path_, output_path_ + ".stability",
-    output_path_ + ".qraw", output_path_ + ".additive.tmp", output_path_ + ".fit.txt",
-    output_path_ + ".fit.txt.tmp", output_path_ + ".fit_trace.txt", output_path_ + ".cg_witness.txt",
-    output_path_ + ".qp_state.txt", output_path_ + ".failure.txt", output_path_ + ".tmp",
-    output_path_ + ".stability.tmp"};
+  const std::vector<std::string> outputs = sample_only_ ? std::vector<std::string>{spool_path_} :
+    std::vector<std::string>{output_path_, spool_path_, output_path_ + ".stability", output_path_ + ".qraw",
+      output_path_ + ".additive.tmp", output_path_ + ".fit.txt", output_path_ + ".fit.txt.tmp",
+      output_path_ + ".fit_trace.txt", output_path_ + ".cg_witness.txt", output_path_ + ".qp_state.txt",
+      output_path_ + ".failure.txt", output_path_ + ".tmp", output_path_ + ".stability.tmp"};
   for (const auto& path : outputs) {
     if (file_exists(path)) PRINT_INPUT_ERROR("rpmd_ja fit will not overwrite an existing output or temporary file.");
   }
-  try {
-    RpmdJAReference kernel_check;
-    load_rpmd_ja_kernel_table(kernel_table_, kernel_check);
-  } catch (const std::exception& error) {
-    const std::string message = std::string("rpmd_ja fit kernel table is invalid: ") + error.what();
-    PRINT_INPUT_ERROR(message.c_str());
+  if (!sample_only_) {
+    try {
+      RpmdJAReference kernel_check;
+      load_rpmd_ja_kernel_table(kernel_table_, kernel_check);
+    } catch (const std::exception& error) {
+      const std::string message = std::string("rpmd_ja fit kernel table is invalid: ") + error.what();
+      PRINT_INPUT_ERROR(message.c_str());
+    }
   }
 #ifdef USE_HIP
-  PRINT_INPUT_ERROR("rpmd_ja fit native reference preparation is currently unavailable in HIP builds.");
+  if (!sample_only_) PRINT_INPUT_ERROR("rpmd_ja fit native reference preparation is currently unavailable in HIP builds.");
 #endif
   for (const double mass : atom.cpu_mass) {
     if (!(mass > 0.0) || !std::isfinite(mass)) PRINT_INPUT_ERROR("rpmd_ja fit requires positive finite masses.");
@@ -246,8 +261,8 @@ void RpmdJA_Fit::pre_run(
     release_lock_();
     throw;
   }
-  printf("rpmd_ja fit sampling current physical bead forces at %g K, P=%d; spool %s\n",
-    temperature_, number_of_beads_, spool_path_.c_str());
+  printf("rpmd_ja %s sampling current physical bead forces at %g K, P=%d; spool %s\n",
+    sample_only_ ? "sample" : "fit", temperature_, number_of_beads_, spool_path_.c_str());
 }
 
 void RpmdJA_Fit::post_force(
@@ -386,7 +401,10 @@ void RpmdJA_Fit::post_run(
   const double,
   const double)
 {
-  if (frame_count_ < 3) {
+  if (sample_only_ && frame_count_ < 3) {
+    PRINT_INPUT_ERROR("rpmd_ja sample requires at least three sampled frames; sample spool retained.");
+  }
+  if (!sample_only_ && frame_count_ < 3) {
     PRINT_INPUT_ERROR("rpmd_ja fit requires at least three sampled frames; sample spool retained.");
   }
   spool_.flush();
@@ -404,6 +422,12 @@ void RpmdJA_Fit::post_run(
   size_stream.close();
   if (size_stream.fail()) PRINT_INPUT_ERROR("rpmd_ja fit could not close its sample spool size reader.");
   const std::uint64_t bytes = static_cast<std::uint64_t>(spool_end);
+  if (sample_only_) {
+    release_lock_();
+    std::printf("rpmd_ja sample saved %llu frames (%llu spool bytes) to %s; fitting was not run.\n",
+      static_cast<unsigned long long>(frame_count_), static_cast<unsigned long long>(bytes), spool_path_.c_str());
+    return;
+  }
   RpmdJANativeFitOptions options;
   options.output_path = output_path_;
   options.kernel_table = kernel_table_;

@@ -23,6 +23,30 @@ assert "tokens, number_of_types, integrate, group, atom, box, force, first_poten
 assert "rpmd_ja fit requires a fixed integration time step" in run
 assert "rpmd_ja fit currently supports exactly one qNEP potential in charge mode 1 or 2 with PPPM" in run
 assert 'tokens[1] == "fit"' in measure and "new RpmdJA_Fit(tokens)" in measure
+assert 'if (tokens[1] == "sample")' in run and 'tokens[1] == "sample"' in measure
+assert "sample_only_" in sampler_fit and "sample spool retained" in sampler_fit
+assert "if (sample_only_ && frame_count < 3)" in sampler_fit
+assert "if (sample_only_ && frame_count_ < 3)" in sampler_fit
+assert 'tokens[1] == "sample"' in sampler_fit and 'tokens.size() != 4' in sampler_fit
+assert "candidate_identity" in native_fit and "sample_IBP_status" in native_fit
+assert "candidate_parameters cutoff_A=" in native_fit and 'write_bootstrap_diagnostic(trace,"sample_IBP_DIAGNOSTIC"' in native_fit
+assert "ibp_statistics_numerically_invalid" in native_fit
+assert 'sample_statistics.ibp_band.status!="IBP_PASS"' not in native_fit
+assert "response.ibp<=options.ibp_tolerance" not in native_fit
+assert 'if(ibp_statistics_numerically_invalid(sample_statistics.ibp_band))' in native_fit
+assert 'if(response.response>options.response_tolerance||response.response_band.status!="RESPONSE_PASS")' in native_fit
+assert 'FIT_STATUS ACCEPTED_REFERENCE response=PASS full_spd=PASS sample_IBP_DIAGNOSTIC=' in native_fit
+assert 'response_IBP_DIAGNOSTIC=' in native_fit and 'IBP_acceptance_role DIAGNOSTIC_ONLY' in native_fit
+fit_impl_start = native_fit.index("static void fit_rpmd_ja_native_reference_impl(")
+fit_impl = native_fit[fit_impl_start:]
+assert fit_impl.index("collect_fixed_probe_statistics(in,header") < fit_impl.index("std::ofstream trace(trace_path")
+assert fit_impl.index("std::ofstream trace(trace_path") < fit_impl.index("generate_rpmd_ja_qnep_raw(")
+assert "PREFLIGHT_NUMERICAL_FAILURE sample_IBP_status" in fit_impl
+assert "type-local seed vectors are translation-projected and orthogonalized" in native_fit
+assert "SOURCE_ATOM_MOTION" in native_fit and "maximum_adjacent_sampled_frame_displacement" in native_fit
+assert "write_probe_origin_table(out,response.probe_sources,response.probe_origins)" in native_fit
+assert "write_probe_origin_table(fitout,response.probe_sources,response.probe_origins)" in native_fit
+assert "test_type_local_source_and_motion_diagnostics" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert 'if (tokens[1] == "check_samples")' in run
 assert 'check_rpmd_ja_native_fit_samples(tokens[2], tokens[3], atom, box)' in run
 assert "void check_rpmd_ja_native_fit_samples(" in native_header
@@ -30,7 +54,8 @@ check_samples_start = native_fit.index("void check_rpmd_ja_native_fit_samples(")
 check_samples_end = native_fit.index("#else", check_samples_start)
 check_samples_body = native_fit[check_samples_start:check_samples_end]
 assert "read_header(in,0,atom,box,0.0,true)" in check_samples_body
-assert "read_training_r0" in check_samples_body and "validate_fit_branches" in check_samples_body
+assert "read_training_r0" in check_samples_body and "collect_fixed_probe_statistics" in check_samples_body
+assert "train,r0,true,0.15,&box" in check_samples_body
 assert "collect_fixed_probe_statistics" in check_samples_body and "format_fixed_probe_report" in check_samples_body
 assert "qraw" not in check_samples_body and "make_graph" not in check_samples_body and "lanczos" not in check_samples_body
 assert "cannot replace final response validation" in native_fit
@@ -48,23 +73,28 @@ assert "tail_probe_scope ALL_FQ_AND_QQ_PRODUCTS_IN_SELECTED_PROBE_SUBSPACE" in n
 assert "moments.covariance_fq()" in native_fit and "lag_autocorrelation lags=1,2,5,10" in native_fit
 assert "std::vector<std::vector<double>> history" in native_fit and "history.size()>10" in native_fit
 assert "if(collect_lags){result.lags[0].add(qp)" in native_fit
-assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance)" in native_fit
-assert "sample_statistics.ibp_band.status!=\"IBP_PASS\"" in native_fit
+assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance,&box)" in native_fit
+assert 'if(ibp_statistics_numerically_invalid(sample_statistics.ibp_band))' in native_fit
 assert "bootstrap_metric_band" in native_fit and "nonsymmetric_matrix_distance" in native_fit
 assert "std::vector<int> bootstrap_block_factors(const std::size_t block_count)" in native_fit
 assert "const std::vector<int> factors=bootstrap_block_factors(blocks.size());" in native_fit
 assert "for(const int factor:bootstrap_block_factors(blocks.size()))" in native_fit
 assert "mean_f[i]*moment.sum_q[j]" in native_fit and "mean_q[j]*moment.sum_f[i]" in native_fit
 assert "blocks[(start+k)%count]" in native_fit and "result.frames=covered.frames" in native_fit
-assert "if(!block_product_tail_covered(blocks,covered,&result))return result;" in native_fit
+assert "if(!block_product_tail_covered(blocks,covered,&result,check_fq,check_qq))return result;" in native_fit
+assert 'if(std::strcmp(reason,"NONFINITE_PRODUCT_STATISTICS")==0)diagnostic->status="NUMERICAL_FAILURE";' in native_fit
+assert 'const bool check_fq=true,const bool check_qq=true' in native_fit
+assert '"RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE",false,true' in native_fit
+assert '"IBP_PASS","IBP_FAIL","IBP_INCONCLUSIVE",true,true' in native_fit
 assert 'result.diagnostic_stage="TAIL_CHECK"' in native_fit
 assert 'result.diagnostic_stage="BOOTSTRAP";result.bootstrap_started=true;' in native_fit
 assert 'write_bootstrap_diagnostic(out,"IBP_DIAGNOSTIC",stats.ibp_band)' in native_fit
 assert 'write_bootstrap_diagnostic(out,"RESPONSE_DIAGNOSTIC",response.response_band)' in native_fit
 assert 'write_bootstrap_diagnostic(out,"response_diagnostic",r.response_band,false)' in native_fit
 assert 'std::printf("sampling evidence: %s; report=%s' in native_fit
-assert "response_band.status==\"RESPONSE_PASS\"" in native_fit and "ibp_band.status==\"IBP_PASS\"" in native_fit
-assert "collect_fixed_probe_statistics(in,header,header.frame_count,train,r0,true)" in native_fit
+assert 'response.response<=options.response_tolerance&&response.response_band.status=="RESPONSE_PASS"' in native_fit
+assert 'response.ibp_band.status=="IBP_PASS"' not in native_fit
+assert "collect_fixed_probe_statistics(in,header,header.frame_count,train,r0,true,0.15,&box)" in native_fit
 assert "probe_sample_status" in native_fit and "INSUFFICIENT_SAMPLES" in native_fit
 assert "collect_fixed_probe_statistics(in,header,frame_count" in native_fit
 assert 'response_state_path=options.output_path+".response_state.txt"' in native_fit
@@ -138,6 +168,24 @@ assert 'record_search("FIXED_INDEPENDENT"' in native_fit
 assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,initial_vector,&lanczos_workspace)' in native_fit
 assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,{},&lanczos_workspace)' in native_fit
 assert "write_response_stats(trace,response_progress)" in native_fit
+assert "cublasDgemm(blas,CUBLAS_OP_T,CUBLAS_OP_N,d,columns,d" in native_fit
+assert "baseline.apply_batch(q_batch,columns,base_batch)" in native_fit
+assert "baseline_apply_seconds=" in native_fit
+baseline_init_start = native_fit.index("void initialize(std::istream& raw")
+baseline_apply_start = native_fit.index("void apply(const std::vector<double>& input", baseline_init_start)
+baseline_init_body = native_fit[baseline_init_start:baseline_apply_start]
+assert "const std::size_t dim_size=static_cast<std::size_t>(d)" in baseline_init_body
+assert "const std::size_t dimension=static_cast<std::size_t>(d)" not in baseline_init_body
+assert "test_nonfinite_tail_product_is_numerical_failure" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "columns=32" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "validation=33,frames=train+validation" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+validation_start = native_fit.index("ResponseCheck validate_probes(")
+validation_end = native_fit.index("void write_response_state(", validation_start)
+validation_body = native_fit[validation_start:validation_end]
+assert "std::vector<double> qp(m),fp(m)" not in validation_body
+assert "baseline.apply_batch(q_batch,columns,base_batch)" in validation_body
+assert "validate_fit_frame_branch(x,n,*branch_check_box,r0)" in native_fit
+assert "options.ibp_tolerance,&box" in native_fit
 assert "observed_cov_condition" in native_fit and "predicted_cov_condition" in native_fit
 assert "candidate_direction_original_mass_weighted" in source("src/measure/rpmd_ja_qnep_prepare.cu")
 assert "pack_owned=false;return true;" in native_fit and "no automatic stability cut was added" in native_fit
@@ -145,7 +193,7 @@ assert 'preserve_candidate_package_on_full_spd_failure(e.what(),own_scratch.pack
 assert 'qNEP translation-complement Hessian is not positive definite' in source("src/measure/rpmd_ja_qnep_prepare.cu")
 assert 'qNEP translation-complement Hessian is not positive definite' in native_fit
 assert 'std::sort(modes.begin(),modes.end()' in native_fit
-assert 'low_mode_probes<4' in native_fit and 'if(add(soft[i].vector,"LOW_RITZ"))++low_mode_probes' in native_fit
+assert 'low_mode_probes<4' in native_fit and 'if(add(soft[i].vector,"LOW_RITZ",-1))++low_mode_probes' in native_fit
 assert 'observed_cov_status=' in native_fit and 'predicted_cov_status=' in native_fit
 assert 'response_ibp_status=' in native_fit and 'NOT_COMPUTED' in native_fit
 spectral_start = native_fit.index("std::vector<double> spectral_row(")
@@ -158,6 +206,12 @@ assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja
 assert "test_response_uncomputed_values_are_explicit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_probe_moments_centering_and_small_segments" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_check_samples_is_read_only" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_nonfinite_tail_product_is_numerical_failure" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_response_bootstrap_ignores_force_position_tail" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_sample_spool_minimum_frame_boundary" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_fixed_probe_collection_checks_reference_branches" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_baseline_batch_matches_gemv" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "source_atom_slot" not in native_fit
 assert "test_response_snapshot_preserves_recomputable_matrices" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_active_set_qp_snapshot_and_rejection" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "tests/data/ja_reference_resample.bin.qp_state.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
@@ -196,7 +250,7 @@ assert (ROOT / "tests/data/ja_reference_resample.bin.qp_state.txt").stat().st_si
 assert "options.max_stability_rounds<=0" in native_fit
 assert "const int max_rounds=options.max_stability_rounds;" in native_fit
 assert 'printf("rpmd_ja fit stability round limit=%d\\n",max_rounds)' in native_fit
-assert 'required\\nrpmd_ja fit stability round limit=' in native_fit
+assert 'required; IBP is diagnostic only\\nrpmd_ja fit stability round limit=' in native_fit
 round_loop_start = native_fit.index("for(int outer=0;outer<max_rounds;++outer)")
 round_loop_end = native_fit.index("double compressed_residual2=", round_loop_start)
 round_loop = native_fit[round_loop_start:round_loop_end]
@@ -223,8 +277,16 @@ assert "RpmdJA_Fit::~RpmdJA_Fit() { release_lock_(); }" in sampler_fit
 
 post_run_start = sampler_fit.index("void RpmdJA_Fit::post_run(")
 post_run_body = sampler_fit[post_run_start:]
-assert post_run_body.index("catch (...) {") < post_run_body.index("release_lock_();") < post_run_body.index("throw;")
-assert post_run_body.rindex("release_lock_();") > post_run_body.index("fit_rpmd_ja_native_reference(")
+sample_only_return = post_run_body.index("if (sample_only_) {")
+native_fit_call = post_run_body.index("fit_rpmd_ja_native_reference(")
+sample_only_branch = post_run_body[sample_only_return:native_fit_call]
+assert "release_lock_();" in sample_only_branch and "return;" in sample_only_branch
+assert "std::remove(spool_path_.c_str())" not in sample_only_branch
+assert post_run_body.index("spool_.close();") < sample_only_return < native_fit_call
+assert "std::printf(\"rpmd_ja sample saved" in sample_only_branch and "fitting was not run" in sample_only_branch
+fit_post_body = post_run_body[native_fit_call:]
+assert fit_post_body.index("catch (...) {") < fit_post_body.index("release_lock_();") < fit_post_body.index("throw;")
+assert fit_post_body.rindex("release_lock_();") > 0
 
 assert "__host__ __device__ inline bool rpmd_ja_fit_mic(" in sampling
 assert "nearbyint(sx)" in sampling and "nearbyint(sy)" in sampling and "nearbyint(sz)" in sampling

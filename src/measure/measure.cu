@@ -131,7 +131,7 @@ bool Measure::parse_action(
   const std::string& first_potential_filename)
 {
   auto params = get_token_pointers(tokens);
-  if (tokens[0] == "rpmd_ja" && tokens.size() > 1 && tokens[1] == "fit") {
+  if (tokens[0] == "rpmd_ja" && tokens.size() > 1 && (tokens[1] == "fit" || tokens[1] == "sample")) {
     try {
       actions_.emplace_back(new RpmdJA_Fit(tokens));
     } catch (const std::exception& error) {
