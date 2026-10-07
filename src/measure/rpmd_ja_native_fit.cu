@@ -503,7 +503,8 @@ struct ActiveSetPolishResult
 };
 
 bool solve_active_equalities(cusolverDnHandle_t solver,const std::vector<std::vector<double>>& a,const std::vector<double>& b,
-  const std::vector<std::size_t>& active,const int p,std::vector<double>& y,std::vector<double>& lambda_star,std::string& failure_reason)
+  const std::vector<std::size_t>& active,const int p,const std::vector<double>& eta,
+  std::vector<double>& y,std::vector<double>& lambda_star,std::string& failure_reason)
 {
   const std::size_t q=active.size();
   if(q==0||p<=0||q>static_cast<std::size_t>(std::numeric_limits<int>::max())||static_cast<std::size_t>(p)>std::numeric_limits<std::size_t>::max()/q){failure_reason="ACTIVE_MATRIX_DIMENSION";return false;}
@@ -538,6 +539,26 @@ bool solve_active_equalities(cusolverDnHandle_t solver,const std::vector<std::ve
     for(int j=0;j<n;++j)for(int k=0;k<rank;++k)lambda_star[j]+=vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank]*(projected_b[k]/singular[k])/singular[k];
     if(!std::all_of(y.begin(),y.end(),[](double x){return std::isfinite(x);})||
        !std::all_of(lambda_star.begin(),lambda_star.end(),[](double x){return std::isfinite(x);})) {failure_reason="ACTIVE_SVD_NONFINITE";return false;}
+    if(std::all_of(lambda_star.begin(),lambda_star.end(),[](double x){return x>=0.0;})){
+      // Reuse the SVD for at most three corrections, including rounding in xi=eta+y.
+      std::vector<double> best_y=y,best_lambda=lambda_star,residual(q),projected_residual(rank);double best_error=std::numeric_limits<double>::infinity();
+      for(int pass=0;pass<=3;++pass){double error=0.0;
+        if(!std::all_of(y.begin(),y.end(),[](double x){return std::isfinite(x);})||
+           !std::all_of(lambda_star.begin(),lambda_star.end(),[](double x){return std::isfinite(x)&&x>=0.0;}))break;
+        for(int j=0;j<n;++j){const std::size_t row=active[j];double shifted=0.0;for(int k=0;k<p;++k)shifted+=a[row][k]*((eta[k]+y[k])-eta[k]);residual[j]=b[row]-shifted;
+          if(!std::isfinite(residual[j])||!std::isfinite(lambda_star[j]*residual[j])){error=std::numeric_limits<double>::infinity();break;}
+          error=std::max(error,std::abs(lambda_star[j]*residual[j]));}
+        if(!std::isfinite(error))break;
+        if(error<best_error){best_error=error;best_y=y;best_lambda=lambda_star;}
+        if(error<=qp_complementarity_tolerance||pass==3)break;
+        std::fill(projected_residual.begin(),projected_residual.end(),0.0);
+        for(int k=0;k<rank;++k)for(int j=0;j<n;++j)projected_residual[k]+=vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank]*residual[j];
+        for(int k=0;k<rank;++k){const double scaled=projected_residual[k]/singular[k];
+          for(int i=0;i<p;++i)y[i]+=u[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*p]*scaled;
+          for(int j=0;j<n;++j)lambda_star[j]+=vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank]*scaled/singular[k];}
+      }
+      y=std::move(best_y);lambda_star=std::move(best_lambda);
+    }
     for(int j=0;j<n;++j){const std::size_t row=active[j];const double residual=std::inner_product(a[row].begin(),a[row].end(),y.begin(),0.0)-b[row];double scale=std::max(1.0,std::abs(b[row]));for(int k=0;k<p;++k)scale+=std::abs(a[row][k]*y[k]);const double tolerance=256.0*std::numeric_limits<double>::epsilon()*scale;if(!std::isfinite(residual)||!std::isfinite(scale)||!std::isfinite(tolerance)||std::abs(residual)>tolerance){failure_reason="ACTIVE_EQUALITY_UNRELIABLE";return false;}}
     return true;
   }catch(...){cleanup();failure_reason="ACTIVE_SVD_FAILURE";return false;}
@@ -553,7 +574,7 @@ ActiveSetPolishResult polish_cut_qp(cusolverDnHandle_t solver,const SmallSVD& sv
   const std::size_t update_limit=4*(m+static_cast<std::size_t>(svd.p));std::vector<std::size_t> active;std::vector<char> is_active(m,0);
   for(std::size_t i=0;i<m;++i){if(!std::isfinite(out.lambda[i])||out.lambda[i]<0.0){out.failure_reason="ACTIVE_INITIAL_MULTIPLIER_INVALID";return out;}if(out.lambda[i]>0.0){active.push_back(i);is_active[i]=1;}}
   for(;;){out.active_constraints=active.size();std::vector<double> candidate_y(static_cast<std::size_t>(svd.p),0.0),lambda_star;
-    if(!active.empty()&&!solve_active_equalities(solver,a,b,active,svd.p,candidate_y,lambda_star,out.failure_reason))return out;
+    if(!active.empty()&&!solve_active_equalities(solver,a,b,active,svd.p,svd.eta,candidate_y,lambda_star,out.failure_reason))return out;
     bool has_negative=false;for(double value:lambda_star)has_negative=has_negative||value<0.0;
     if(has_negative){double alpha=1.0;std::vector<double> ratios(active.size(),std::numeric_limits<double>::infinity());
       for(std::size_t j=0;j<active.size();++j)if(lambda_star[j]<0.0){const double current=out.lambda[active[j]],denominator=current-lambda_star[j];if(!(current>0.0)||!(denominator>0.0)||!std::isfinite(denominator)){out.failure_reason="ACTIVE_NEGATIVE_MULTIPLIER_STEP_INVALID";return out;}ratios[j]=current/denominator;if(!std::isfinite(ratios[j])||ratios[j]<0.0||ratios[j]>1.0){out.failure_reason="ACTIVE_NEGATIVE_MULTIPLIER_STEP_INVALID";return out;}alpha=std::min(alpha,ratios[j]);}

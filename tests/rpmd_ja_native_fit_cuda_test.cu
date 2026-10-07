@@ -1012,6 +1012,20 @@ void test_active_set_preserves_svd_primal(cusolverDnHandle_t solver)
   assert(rechecked.accepted);
 }
 
+void test_active_set_refines_kkt_residual(cusolverDnHandle_t solver)
+{
+  std::string fixture_path="tests/data/ja_reference_replay_v2.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);assert(fixture.rows.size()==28);
+  std::vector<double> seed(fixture.rows.size(),0.0);for(const int row:{0,1,2,3,4,5,6,20,22,25,27})seed[row]=1.0;
+  const ActiveSetPolishResult polished=polish_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,seed,fixture.primal_tolerance);
+  assert(polished.accepted&&polished.certificate.accepted&&polished.active_constraints==11);
+  const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
+  assert(replay.certificate.accepted&&replay.certificate.primal_constraints_pass&&replay.certificate.finite);
+  const QPCertificate rechecked=check_cut_qp_kkt(fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,replay.lambda,replay.xi,fixture.primal_tolerance);
+  assert(rechecked.accepted&&rechecked.max_primal_excess==0.0);
+  assert(rechecked.max_complementarity<=qp_complementarity_tolerance&&rechecked.max_stationarity<=qp_stationarity_tolerance);
+}
+
 void test_read_frame_rejects_invalid_data()
 {
   for(const int invalid:{0,1,2,3}){
@@ -1214,6 +1228,7 @@ int main()
   test_padded_qr_svd_and_cut_qp(qr.solver);
   test_active_set_qp_snapshot_and_rejection(qr.solver);
   test_active_set_preserves_svd_primal(qr.solver);
+  test_active_set_refines_kkt_residual(qr.solver);
   test_read_frame_rejects_invalid_data();
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
