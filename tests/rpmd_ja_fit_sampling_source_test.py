@@ -43,7 +43,12 @@ assert "sample_statistics.ibp_band.status!=\"IBP_PASS\"" in native_fit
 assert "bootstrap_metric_band" in native_fit and "nonsymmetric_matrix_distance" in native_fit
 assert "mean_f[i]*moment.sum_q[j]" in native_fit and "mean_q[j]*moment.sum_f[i]" in native_fit
 assert "blocks[(start+k)%count]" in native_fit and "result.frames=covered.frames" in native_fit
-assert "if(!block_product_tail_covered(blocks,covered))return result;" in native_fit
+assert "if(!block_product_tail_covered(blocks,covered,&result))return result;" in native_fit
+assert 'result.diagnostic_stage="TAIL_CHECK"' in native_fit
+assert 'result.diagnostic_stage="BOOTSTRAP";result.bootstrap_started=true;' in native_fit
+assert 'write_bootstrap_diagnostic(out,"IBP_DIAGNOSTIC",stats.ibp_band)' in native_fit
+assert 'write_bootstrap_diagnostic(out,"RESPONSE_DIAGNOSTIC",response.response_band)' in native_fit
+assert 'write_bootstrap_diagnostic(out,"response_diagnostic",r.response_band,false)' in native_fit
 assert 'std::printf("sampling evidence: %s; report=%s' in native_fit
 assert "response_band.status==\"RESPONSE_PASS\"" in native_fit and "ibp_band.status==\"IBP_PASS\"" in native_fit
 assert "collect_fixed_probe_statistics(in,header,header.frame_count,train,r0,true)" in native_fit

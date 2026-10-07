@@ -149,6 +149,8 @@ void test_response_uncomputed_values_are_explicit()
   assert(summary.str().find("predicted_cov_status=NOT_COMPUTED")!=std::string::npos);
   assert(summary.str().find("response_uncertainty_status=NOT_COMPUTED")!=std::string::npos);
   assert(summary.str().find("ibp_uncertainty_status=NOT_COMPUTED")!=std::string::npos);
+  assert(summary.str().find("response_diagnostic stage=NOT_COMPUTED bootstrap_started=0")!=std::string::npos);
+  assert(summary.str().find('\n')==std::string::npos);
   assert(summary.str().find("response_ibp_status=NOT_COMPUTED")!=std::string::npos);
   assert(summary.str().find("force_residual_status=NOT_COMPUTED")!=std::string::npos);
 }
@@ -185,10 +187,13 @@ void test_block_bootstrap_uses_matrix_error_radius()
   };
   auto correct=make_blocks(-1.0);const BootstrapBand pass=bootstrap_ibp_band(correct.first,correct.second,2,2.0,0.15,7);
   assert(pass.status=="IBP_PASS"&&pass.block_lengths_stable&&std::abs(pass.estimate)<1e-14);
+  assert(pass.bootstrap_started&&pass.diagnostic_stage=="INTERVAL_CHECK"&&pass.rejection_reason=="NONE");
   auto biased=make_blocks(-2.0);const BootstrapBand fail=bootstrap_ibp_band(biased.first,biased.second,2,2.0,0.15,7);
   assert(fail.status=="IBP_FAIL"&&fail.lower>0.15);
+  assert(fail.bootstrap_started&&fail.rejection_reason=="LOWER_BOUND_EXCEEDS_TOLERANCE");
   biased.second.resize(8);const BootstrapBand insufficient=bootstrap_ibp_band(biased.first,biased.second,2,2.0,0.15,7);
   assert(insufficient.status=="IBP_INCONCLUSIVE"&&!insufficient.block_lengths_stable);
+  assert(!insufficient.bootstrap_started&&insufficient.diagnostic_stage=="TAIL_CHECK"&&insufficient.rejection_reason!="NOT_COMPUTED");
 
   const BootstrapBand response=bootstrap_metric_band(correct.first,biased.second,2,0.15,7,
     [](const ProbeMoments& moments){return moments.covariance_q();},
@@ -216,6 +221,10 @@ void test_bootstrap_uses_matching_complete_frames_and_circular_blocks()
     [](const std::vector<double>& a,const std::vector<double>& b){return symmetric_matrix_distance(a,b,1);},
     "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE");
   assert(band.frames==192&&full.frames==194&&band.estimate==0.0&&band.status=="RESPONSE_INCONCLUSIVE");
+  assert(band.rejection_reason=="ZERO_PRODUCT_VARIANCE"&&std::string(bootstrap_block_length_status(band))=="NOT_COMPUTED");
+  std::ostringstream diagnostic;write_bootstrap_diagnostic(diagnostic,"IBP_DIAGNOSTIC",band);
+  assert(diagnostic.str().find("stage=TAIL_CHECK bootstrap_started=0 configured_replicates=500 completed_levels=0 reason=ZERO_PRODUCT_VARIANCE")!=std::string::npos);
+  assert(diagnostic.str().find("product=fq probe_i=0 probe_j=0")!=std::string::npos);
 
   ProbeMoments tail_base(1),tail_changed(1);std::vector<ProbeMoments> tail_blocks;std::uint32_t state=36;
   for(int b=0;b<512;++b){state=1664525U*state+1013904223U;const double q=2.0*static_cast<double>(state)/4294967296.0-1.0;
@@ -223,6 +232,9 @@ void test_bootstrap_uses_matching_complete_frames_and_circular_blocks()
   tail_base.add({0.0},{0.0});tail_changed.add({2000.0},{300.0});
   assert(block_product_tail_covered(tail_blocks,tail_base));
   assert(!block_product_tail_covered(tail_blocks,tail_changed));
+  BootstrapBand tail_diagnostic;
+  assert(block_product_tail_covered(tail_blocks,tail_changed,&tail_diagnostic)==block_product_tail_covered(tail_blocks,tail_changed));
+  assert(tail_diagnostic.rejection_reason!="NOT_COMPUTED"&&tail_diagnostic.rejection_detail.find("base_blocks=512")!=std::string::npos);
   const BootstrapBand base_ibp_band=bootstrap_ibp_band(tail_base,tail_blocks,4,1.0,0.15,41);
   const BootstrapBand changed_ibp_band=bootstrap_ibp_band(tail_changed,tail_blocks,4,1.0,0.15,41);
   assert(base_ibp_band.estimate==changed_ibp_band.estimate&&base_ibp_band.status==changed_ibp_band.status);
@@ -235,6 +247,9 @@ void test_bootstrap_uses_matching_complete_frames_and_circular_blocks()
     "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE");
   assert(base_tail_band.frames==2048&&changed_tail_band.frames==2048);
   assert(base_tail_band.estimate==changed_tail_band.estimate&&base_tail_band.status=="RESPONSE_PASS"&&changed_tail_band.status==base_tail_band.status);
+  assert(base_tail_band.rejection_reason=="NONE"&&base_tail_band.bootstrap_started&&base_tail_band.level_radii.size()>=3);
+  const auto equal_or_uncomputed=[](double a,double b){return a==b||(std::isnan(a)&&std::isnan(b));};
+  assert(equal_or_uncomputed(base_ibp_band.radius,changed_ibp_band.radius)&&equal_or_uncomputed(base_ibp_band.lower,changed_ibp_band.lower)&&equal_or_uncomputed(base_ibp_band.upper,changed_ibp_band.upper));
 }
 
 void test_block_product_tail_uses_segment_centering()
@@ -262,6 +277,20 @@ void test_bootstrap_nonfinite_is_numerical_failure()
   ProbeMoments overflow(1);overflow.add({1.0e200},{1.0e200});
   const BootstrapBand band=bootstrap_ibp_band(overflow,{overflow},1,1.0,0.15,9);
   assert(band.status=="NUMERICAL_FAILURE"&&!std::isfinite(band.estimate));
+  assert(band.diagnostic_stage=="INPUT_CHECK"&&band.rejection_reason=="NONFINITE_INPUT_MOMENTS"&&!band.bootstrap_started);
+}
+
+void test_bootstrap_rejection_diagnostics()
+{
+  const BootstrapBand empty=bootstrap_ibp_band(ProbeMoments(1),{},1,1.0,0.15,1);
+  assert(empty.status=="IBP_INCONCLUSIVE"&&empty.diagnostic_stage=="INPUT_CHECK"&&empty.rejection_reason=="EMPTY_BLOCKS"&&!empty.bootstrap_started);
+  ProbeMoments full(20);std::vector<ProbeMoments> blocks;std::uint32_t state=36;
+  for(int b=0;b<128;++b){state=1664525U*state+1013904223U;const double q=2.0*static_cast<double>(state)/4294967296.0-1.0;
+    ProbeMoments block(20);block.add(std::vector<double>(20,q),std::vector<double>(20,-q));full.merge(block);blocks.push_back(std::move(block));}
+  const BootstrapBand noise=bootstrap_ibp_band(full,blocks,1,1.0,0.15,1);
+  assert(noise.status=="IBP_INCONCLUSIVE"&&noise.diagnostic_stage=="TAIL_CHECK"&&noise.rejection_reason=="ACF_NOISE_TOO_LARGE");
+  assert(!noise.bootstrap_started&&noise.level_radii.empty()&&noise.rejection_detail.find("product=fq probe_i=0 probe_j=0")!=std::string::npos);
+  assert(block_product_tail_covered(blocks,full)==false);
 }
 
 void test_slow_product_correlation_is_inconclusive()
@@ -276,6 +305,9 @@ void test_slow_product_correlation_is_inconclusive()
       if(++count==block_length){blocks.push_back(std::move(pending));pending=ProbeMoments(1);count=0;}}
     const BootstrapBand band=bootstrap_ibp_band(full,blocks,block_length,1.0,0.15,static_cast<std::uint64_t>(rho*1000));
     assert(band.status=="IBP_INCONCLUSIVE"&&!band.block_lengths_stable);
+    assert(band.diagnostic_stage=="TAIL_CHECK"&&!band.bootstrap_started&&band.level_radii.empty());
+    assert(band.rejection_reason=="TAIL_UNRESOLVED"||band.rejection_reason=="BLOCK_TOO_SHORT"||band.rejection_reason=="TOO_FEW_EFFECTIVE_BLOCKS");
+    assert(band.rejection_detail.find("estimated_iat_blocks=")!=std::string::npos&&band.rejection_detail.find("effective_blocks=")!=std::string::npos);
   }
 }
 
@@ -308,6 +340,8 @@ void test_check_samples_is_read_only()
   const std::string text=read_test_file(report);
   assert(before==read_test_file(spool)&&after==position&&atom.number_of_beads==0);
   assert(text.find("INSUFFICIENT_SAMPLES")!=std::string::npos);
+  assert(text.find("IBP_DIAGNOSTIC stage=TAIL_CHECK bootstrap_started=0")!=std::string::npos);
+  assert(text.find("block_length_stability NOT_COMPUTED")!=std::string::npos);
   assert(text.find("cannot replace final response validation")!=std::string::npos);
   assert(text.find("lag_autocorrelation")!=std::string::npos&&text.find("IBP_residual")!=std::string::npos);
 }
@@ -339,7 +373,9 @@ void test_response_snapshot_preserves_recomputable_matrices()
   response.observed_matrix={5.2,0.4,0.4,1.3};response.predicted_matrix={4.0,0.0,0.0,1.0};response.ibp_matrix={0.1,0.2,0.0,0.3};response.whitened_matrix={0.3,0.2,0.2,0.3};
   const double inverse_sqrt_two=1.0/std::sqrt(2.0);const std::vector<double> whitened_vectors={inverse_sqrt_two,inverse_sqrt_two,0.0,0.0};
   response.worst_response_coefficients=response_probe_basis_coefficients({0.5,0.0,0.0,1.0},whitened_vectors,2,0);response.worst_ibp_coefficients={0.0,1.0};
+  response.ibp_band.diagnostic_stage="TAIL_CHECK";response.ibp_band.rejection_reason="BLOCK_TOO_SHORT";response.ibp_band.rejection_detail="product=fq probe_i=0 probe_j=1";
   write_response_state(path,response,{1.0,2.0},300.0,0.15);const std::string state=read_test_file(path);
+  assert(state.find("IBP_DIAGNOSTIC stage=TAIL_CHECK bootstrap_started=0 configured_replicates=500 completed_levels=0 reason=BLOCK_TOO_SHORT product=fq probe_i=0 probe_j=1")!=std::string::npos);
   const auto ibp=snapshot_matrix(state,"IBP_residual_nonsymmetric",2),white=snapshot_matrix(state,"whitened_response_difference",2),observed=snapshot_matrix(state,"observed_covariance",2),predicted=snapshot_matrix(state,"predicted_covariance",2);
   const double e00=ibp[0]*ibp[0]+ibp[2]*ibp[2],e01=ibp[0]*ibp[1]+ibp[2]*ibp[3],e11=ibp[1]*ibp[1]+ibp[3]*ibp[3];
   const double lambda_max=0.5*(e00+e11+std::hypot(e00-e11,2.0*e01));
@@ -841,6 +877,7 @@ int main()
   test_bootstrap_uses_matching_complete_frames_and_circular_blocks();
   test_block_product_tail_uses_segment_centering();
   test_bootstrap_nonfinite_is_numerical_failure();
+  test_bootstrap_rejection_diagnostics();
   test_slow_product_correlation_is_inconclusive();
   test_block_bootstrap_harmonic_coverage();
   test_check_samples_is_read_only();

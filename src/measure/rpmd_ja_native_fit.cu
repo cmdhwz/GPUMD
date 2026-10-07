@@ -921,47 +921,75 @@ struct BootstrapBand
   std::uint64_t frames=0;
   bool block_lengths_stable=false;
   std::string status="STATISTICS_INCONCLUSIVE";
+  std::string diagnostic_stage="NOT_COMPUTED",rejection_reason="NOT_COMPUTED",rejection_detail;
+  bool bootstrap_started=false;
   std::vector<std::pair<int,double>> level_radii;
 };
 
-bool block_product_tail_covered(const std::vector<ProbeMoments>& blocks,const ProbeMoments& segment)
+bool block_product_tail_covered(const std::vector<ProbeMoments>& blocks,const ProbeMoments& segment,BootstrapBand* diagnostic=nullptr)
 {
-  if(blocks.empty())return false;const int n=static_cast<int>(blocks.size()),m=blocks.front().m;int max_factor=1;
+  const int n=static_cast<int>(blocks.size()),m=blocks.empty()?segment.m:blocks.front().m;int max_factor=1;
+  int product=-1,element=-1,lag=-1,last_correlated_lag=-1,quiet_lags=-1;
+  const double uncomputed=std::numeric_limits<double>::quiet_NaN();double variance=uncomputed,noise_bound=uncomputed,integrated_correlation=uncomputed;
+  const auto reject=[&](const char* reason){
+    if(diagnostic){diagnostic->rejection_reason=reason;std::ostringstream out;out<<std::setprecision(17)
+      <<"product="<<(product<0?"NOT_COMPUTED":(product==0?"fq":"qq"))<<" probe_i="<<(element<0||m<=0?-1:element/m)<<" probe_j="<<(element<0||m<=0?-1:element%m)
+      <<" base_blocks="<<n<<" base_block_frames="<<(blocks.empty()?0:blocks.front().frames)<<" available_factor="<<max_factor
+      <<" product_variance="<<variance<<" lag_blocks="<<std::min(lag,max_factor)<<" acf_noise_bound="<<noise_bound
+      <<" last_correlated_lag_blocks="<<last_correlated_lag<<" quiet_lags="<<quiet_lags<<" estimated_iat_blocks="<<integrated_correlation
+      <<" required_factor="<<(last_correlated_lag>=0&&std::isfinite(integrated_correlation)?4*std::max(static_cast<double>(last_correlated_lag),integrated_correlation):uncomputed)<<" effective_blocks="<<static_cast<double>(n)/integrated_correlation;
+      diagnostic->rejection_detail=out.str();}return false;};
+  if(blocks.empty())return reject("EMPTY_BLOCKS");
   while(max_factor<=128&&n/max_factor>=16)max_factor*=2;
   max_factor/=2;
   const bool enough_resolution=n>=64&&max_factor>=8;
   const double family=2.0*m*m*max_factor;
-  for(const ProbeMoments& block:blocks)if(block.frames!=blocks.front().frames)return false;
-  if(!segment.frames)return false;
+  for(const ProbeMoments& block:blocks)if(block.frames!=blocks.front().frames)return reject("NONUNIFORM_BLOCKS");
+  if(!segment.frames)return reject("EMPTY_SEGMENT");
   const double count=static_cast<double>(segment.frames);std::vector<double> mean_q(m),mean_f(m);
   for(int i=0;i<m;++i){mean_q[i]=segment.sum_q[i]/count;mean_f[i]=segment.sum_f[i]/count;}
   std::vector<double> values(static_cast<std::size_t>(n));
-  for(int product=0;product<2;++product)for(int element=0;element<m*m;++element){
+  for(product=0;product<2;++product)for(element=0;element<m*m;++element){
+    variance=noise_bound=integrated_correlation=uncomputed;lag=last_correlated_lag=quiet_lags=-1;
     const int i=element/m,j=element%m;double mean=0.0;
-    for(int b=0;b<n;++b){const ProbeMoments& moment=blocks[b];if(!moment.frames)return false;
+    for(int b=0;b<n;++b){const ProbeMoments& moment=blocks[b];if(!moment.frames)return reject("EMPTY_BLOCK");
       const double block_count=static_cast<double>(moment.frames);
       const double raw=product==0?
         (moment.sum_fq[element]-mean_f[i]*moment.sum_q[j]-mean_q[j]*moment.sum_f[i]+block_count*mean_f[i]*mean_q[j])/block_count:
         (moment.sum_qq[element]-mean_q[i]*moment.sum_q[j]-mean_q[j]*moment.sum_q[i]+block_count*mean_q[i]*mean_q[j])/block_count;
-      if(!std::isfinite(raw))return false;values[b]=raw;mean+=raw/static_cast<double>(n);}
-    double variance=0.0;for(double value:values){const double centered=value-mean;variance+=centered*centered/static_cast<double>(n);}
-    if(!std::isfinite(variance)||variance==0.0)return false;
-    if(!enough_resolution)return false;
-    int last_correlated_lag=0,quiet_lags=0;double integrated_correlation=1.0;
-    for(int lag=1;lag<=max_factor;++lag){
-      const double pairs=static_cast<double>(n-lag);const double noise_bound=std::sqrt(2.0*std::log(2.0*family/0.05)/pairs);
-      if(noise_bound>0.25)return false;
+      if(!std::isfinite(raw))return reject("NONFINITE_PRODUCT_STATISTICS");values[b]=raw;mean+=raw/static_cast<double>(n);}
+    variance=0.0;for(double value:values){const double centered=value-mean;variance+=centered*centered/static_cast<double>(n);}
+    if(!std::isfinite(variance))return reject("NONFINITE_PRODUCT_STATISTICS");
+    if(variance==0.0)return reject("ZERO_PRODUCT_VARIANCE");
+    if(!enough_resolution)return reject("INSUFFICIENT_BLOCKS");
+    last_correlated_lag=quiet_lags=0;integrated_correlation=1.0;
+    for(lag=1;lag<=max_factor;++lag){
+      const double pairs=static_cast<double>(n-lag);noise_bound=std::sqrt(2.0*std::log(2.0*family/0.05)/pairs);
+      if(noise_bound>0.25)return reject("ACF_NOISE_TOO_LARGE");
       double covariance=0.0;for(int b=lag;b<n;++b)covariance+=(values[b]-mean)*(values[b-lag]-mean)/pairs;
-      const double rho=covariance/variance;if(!std::isfinite(rho))return false;integrated_correlation+=2.0*std::max(0.0,rho);
+      const double rho=covariance/variance;if(!std::isfinite(rho))return reject("NONFINITE_PRODUCT_STATISTICS");integrated_correlation+=2.0*std::max(0.0,rho);
       if(std::abs(rho)>noise_bound){last_correlated_lag=lag;quiet_lags=0;}else ++quiet_lags;
     }
     // Require a resolved tail, four estimated correlation lengths per longest block,
     // and at least sixteen effective independent product blocks.
-    if(quiet_lags<3||!std::isfinite(integrated_correlation)||
-       max_factor<4*std::max(static_cast<double>(last_correlated_lag),integrated_correlation)||
-       static_cast<double>(n)/integrated_correlation<16.0)return false;
+    if(quiet_lags<3)return reject("TAIL_UNRESOLVED");
+    if(!std::isfinite(integrated_correlation))return reject("NONFINITE_PRODUCT_STATISTICS");
+    if(max_factor<4*std::max(static_cast<double>(last_correlated_lag),integrated_correlation))return reject("BLOCK_TOO_SHORT");
+    if(static_cast<double>(n)/integrated_correlation<16.0)return reject("TOO_FEW_EFFECTIVE_BLOCKS");
   }
-  return enough_resolution;
+  if(!enough_resolution)return reject("INSUFFICIENT_BLOCKS");
+  return true;
+}
+
+const char* bootstrap_block_length_status(const BootstrapBand& band)
+{return band.block_lengths_stable?"PASS":(band.bootstrap_started?"INCONCLUSIVE":"NOT_COMPUTED");}
+
+void write_bootstrap_diagnostic(std::ostream& out,const char* label,const BootstrapBand& band,const bool newline=true)
+{
+  out<<label<<" stage="<<band.diagnostic_stage<<" bootstrap_started="<<band.bootstrap_started
+    <<" configured_replicates=500 completed_levels="<<band.level_radii.size()<<" reason="<<band.rejection_reason;
+  if(!band.rejection_detail.empty())out<<' '<<band.rejection_detail;
+  if(newline)out<<'\n';
 }
 
 template <typename MatrixMetric,typename Distance>
@@ -982,41 +1010,54 @@ BootstrapBand bootstrap_metric_band(const ProbeMoments& full,const std::vector<P
   const int base_block_length,const double tolerance,const std::uint64_t seed,MatrixMetric matrix_metric,
   Norm norm,Distance distance,const char* pass,const char* fail,const char* inconclusive)
 {
-  BootstrapBand result;result.status=inconclusive;ProbeMoments covered(full.m);for(const ProbeMoments& block:blocks)covered.merge(block);result.frames=covered.frames;
-  if(covered.frames>full.frames){result.status="NUMERICAL_FAILURE";return result;}
+  BootstrapBand result;result.status=inconclusive;result.diagnostic_stage="INPUT_CHECK";
+  const auto stop=[&](const char* reason){result.rejection_reason=reason;return result;};
+  ProbeMoments covered(full.m);for(const ProbeMoments& block:blocks)covered.merge(block);result.frames=covered.frames;
+  if(covered.frames>full.frames){result.status="NUMERICAL_FAILURE";return stop("COVERED_FRAMES_EXCEED_TOTAL");}
   const auto finite=[](const std::vector<double>& values){return std::all_of(values.begin(),values.end(),[](double value){return std::isfinite(value);});};
   if(!finite(full.sum_q)||!finite(full.sum_f)||!finite(full.sum_qq)||!finite(full.sum_fq)){
-    result.status="NUMERICAL_FAILURE";return result;
+    result.status="NUMERICAL_FAILURE";return stop("NONFINITE_INPUT_MOMENTS");
   }
+  result.diagnostic_stage="POINT_ESTIMATE";
   const std::vector<double> center=matrix_metric(covered);
   if(!std::all_of(center.begin(),center.end(),[](double value){return std::isfinite(value);})){
-    result.status="NUMERICAL_FAILURE";return result;
+    result.status="NUMERICAL_FAILURE";return stop("NONFINITE_POINT_MATRIX");
   }
   result.estimate=norm(center);
-  if(!std::isfinite(result.estimate)){result.status="NUMERICAL_FAILURE";return result;}
+  if(!std::isfinite(result.estimate)){result.status="NUMERICAL_FAILURE";return stop("NONFINITE_POINT_NORM");}
+  result.diagnostic_stage="INPUT_CHECK";
   for(const ProbeMoments& block:blocks){
     if(!finite(block.sum_q)||!finite(block.sum_f)||!finite(block.sum_qq)||!finite(block.sum_fq)){
-      result.status="NUMERICAL_FAILURE";return result;
+      result.status="NUMERICAL_FAILURE";return stop("NONFINITE_BLOCK_MOMENTS");
     }
   }
-  if(std::any_of(blocks.begin(),blocks.end(),[&](const ProbeMoments& block){return block.frames!=static_cast<std::uint64_t>(base_block_length);} ))return result;
-  if(blocks.empty()||base_block_length<=0||!(tolerance>=0.0)||!std::isfinite(tolerance))return result;
-  if(!block_product_tail_covered(blocks,covered))return result;
+  if(std::any_of(blocks.begin(),blocks.end(),[&](const ProbeMoments& block){return block.frames!=static_cast<std::uint64_t>(base_block_length);} ))return stop("BLOCK_LENGTH_MISMATCH");
+  if(blocks.empty())return stop("EMPTY_BLOCKS");
+  if(base_block_length<=0||!(tolerance>=0.0)||!std::isfinite(tolerance))return stop("INVALID_BOOTSTRAP_ARGUMENTS");
+  result.diagnostic_stage="TAIL_CHECK";
+  if(!block_product_tail_covered(blocks,covered,&result))return result;
+  result.diagnostic_stage="BOOTSTRAP";result.bootstrap_started=true;
   constexpr int replicates=500,min_blocks=16;int factor=1;
   while(factor<=128&&static_cast<int>(blocks.size())/factor>=min_blocks){
     auto deviations=resample_percentile_deviations(blocks,factor,center,replicates,seed,matrix_metric,distance);
-    if(deviations.empty()||!std::isfinite(deviations.back())){result.status="NUMERICAL_FAILURE";return result;}
+    if(deviations.empty()||!std::isfinite(deviations.back())){result.status="NUMERICAL_FAILURE";return stop("NONFINITE_BOOTSTRAP_DEVIATION");}
     // The raw 95th percentile under-covered correlated harmonic samples with this finite block count.
     const std::size_t q=static_cast<std::size_t>(std::ceil(0.99*replicates))-1;
     result.level_radii.emplace_back(base_block_length*factor,deviations[q]);factor*=2;
   }
-  if(result.level_radii.size()<3)return result;
+  result.diagnostic_stage="BLOCK_LENGTH_CHECK";
+  if(result.level_radii.size()<3)return stop("BOOTSTRAP_LEVELS_TOO_FEW");
   const std::size_t first=result.level_radii.size()-3;
   for(std::size_t i=first+1;i<result.level_radii.size();++i){const double a=result.level_radii[i-1].second,b=result.level_radii[i].second;
-    if(std::abs(a-b)>0.25*std::max({a,b,1.0e-12}))return result;}
+    if(std::abs(a-b)>0.25*std::max({a,b,1.0e-12})){
+      std::ostringstream detail;detail<<std::setprecision(17)<<"previous_block_frames="<<result.level_radii[i-1].first<<" current_block_frames="<<result.level_radii[i].first
+        <<" previous_radius="<<a<<" current_radius="<<b<<" radius_difference="<<std::abs(a-b)<<" allowed_difference="<<0.25*std::max({a,b,1.0e-12});
+      result.rejection_detail=detail.str();return stop("BLOCK_RADIUS_UNSTABLE");}}
   result.block_lengths_stable=true;result.radius=result.level_radii.back().second;
   result.lower=std::max(0.0,result.estimate-result.radius);result.upper=result.estimate+result.radius;
+  result.diagnostic_stage="INTERVAL_CHECK";
   result.status=result.upper<=tolerance?pass:(result.lower>tolerance?fail:inconclusive);
+  result.rejection_reason=result.upper<=tolerance?"NONE":(result.lower>tolerance?"LOWER_BOUND_EXCEEDS_TOLERANCE":"INTERVAL_OVERLAPS_TOLERANCE");
   return result;
 }
 
@@ -1128,8 +1169,9 @@ void print_fixed_probe_summary(const FixedProbeStatistics& stats,const SampleHea
   std::printf("fixed-probe IBP bootstrap: frames_used=%llu omitted=%llu ||E||2=%.6g q99_radius=%.6g interval=[%.6g, %.6g] status=%s\n",
     static_cast<unsigned long long>(stats.ibp_band.frames),static_cast<unsigned long long>(header.frame_count-stats.ibp_band.frames),
     stats.ibp_band.estimate,stats.ibp_band.radius,stats.ibp_band.lower,stats.ibp_band.upper,stats.ibp_band.status.c_str());
-  std::printf("sampling evidence: %s; tolerance=%.6g (500 block-bootstrap replicates; block-length stability=%s)\n",
-    stats.ibp_band.status.c_str(),ibp_tolerance,stats.ibp_band.block_lengths_stable?"PASS":"INCONCLUSIVE");
+  std::printf("sampling evidence: %s; tolerance=%.6g (configured_bootstrap_replicates=500; block-length stability=%s)\n",
+    stats.ibp_band.status.c_str(),ibp_tolerance,bootstrap_block_length_status(stats.ibp_band));
+  std::ostringstream diagnostic;write_bootstrap_diagnostic(diagnostic,"IBP_DIAGNOSTIC",stats.ibp_band);std::printf("%s",diagnostic.str().c_str());
   std::printf("sample_statistics_seconds=%.6f\n",elapsed_seconds);
 }
 
@@ -1144,7 +1186,9 @@ std::string format_fixed_probe_report(const FixedProbeStatistics& stats,const Sa
     <<"ibp_tolerance "<<ibp_tolerance<<"\nIBP_frames_used "<<stats.ibp_band.frames<<"\nIBP_frames_omitted "<<(header.frame_count-stats.ibp_band.frames)
     <<"\nIBP_estimate_spectral_norm "<<stats.ibp_band.estimate<<"\nIBP_bootstrap_q99_radius "<<stats.ibp_band.radius
     <<"\nIBP_interval "<<stats.ibp_band.lower<<' '<<stats.ibp_band.upper<<"\nIBP_status "<<stats.ibp_band.status
-    <<"\nblock_length_stability "<<(stats.ibp_band.block_lengths_stable?"PASS":"INCONCLUSIVE")<<"\nsample_statistics_seconds "<<elapsed_seconds<<"\nbootstrap_levels block_length_frames q99_radius\n";
+    <<"\nblock_length_stability "<<bootstrap_block_length_status(stats.ibp_band)<<"\nsample_statistics_seconds "<<elapsed_seconds<<'\n';
+  write_bootstrap_diagnostic(out,"IBP_DIAGNOSTIC",stats.ibp_band);
+  out<<"bootstrap_levels block_length_frames q99_radius\n";
   for(const auto& level:stats.ibp_band.level_radii)out<<level.first<<' '<<level.second<<'\n';
   for(int s=0;s<7;++s){const ProbeMoments& moments=stats.segments[s];const auto cov=moments.covariance_q(),ibp=moments.ibp_matrix(kbt);
     out<<"\nSEGMENT "<<names[s]<<" frames="<<moments.frames<<" status="<<probe_sample_status(moments.frames,m)<<'\n';
@@ -1221,6 +1265,8 @@ void write_response_stats(std::ostream& out,const ResponseCheck& r)
     <<" cg_residual_restarts="<<r.cg_residual_restarts<<" cg_residual_status="<<(r.cg_residual_available?"AVAILABLE":"NOT_COMPUTED")
     <<" cg_true_residual="<<r.cg<<" response_ibp_status="<<(r.response_ibp_available?"AVAILABLE":"NOT_COMPUTED")<<" response="<<r.response<<" ibp="<<r.ibp
     <<" force_residual_status="<<(r.force_residual_available?"AVAILABLE":"NOT_COMPUTED")<<" heldout_force_residual="<<r.force_residual;
+  out<<' ';write_bootstrap_diagnostic(out,"response_diagnostic",r.response_band,false);
+  out<<' ';write_bootstrap_diagnostic(out,"ibp_diagnostic",r.ibp_band,false);
 }
 ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& theta,
   const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<int>& types,const int n,
@@ -1282,6 +1328,8 @@ void write_response_state(const std::string& path,const ResponseCheck& response,
   for(double value:theta)out<<' '<<value;
   out<<"\nresponse_uncertainty "<<response.response_band.status<<' '<<response.response_band.lower<<' '<<response.response_band.upper<<' '<<response.response_band.radius
     <<"\nibp_uncertainty "<<response.ibp_band.status<<' '<<response.ibp_band.lower<<' '<<response.ibp_band.upper<<' '<<response.ibp_band.radius<<"\nuncertainty_radius_method upper_0.99_block_bootstrap_percentile; coverage_is_not_universally_calibrated\n";
+  write_bootstrap_diagnostic(out,"RESPONSE_DIAGNOSTIC",response.response_band);
+  write_bootstrap_diagnostic(out,"IBP_DIAGNOSTIC",response.ibp_band);
   out<<"response_bootstrap_levels block_length_frames q99_radius\n";for(const auto& level:response.response_band.level_radii)out<<level.first<<' '<<level.second<<'\n';
   out<<"ibp_bootstrap_levels block_length_frames q99_radius\n";for(const auto& level:response.ibp_band.level_radii)out<<level.first<<' '<<level.second<<'\n';
   out<<"probe_sources\n";
