@@ -890,6 +890,16 @@ void test_padded_qr_svd_and_cut_qp(cusolverDnHandle_t solver)
   std::ostringstream overflow_fields;write_qp_certificate_fields(overflow_fields,diagnostic_scale_overflow,1e-8);
   assert(overflow_fields.str().find("finite=1 diagnostic_finite=0")!=std::string::npos);
   assert(overflow_fields.str().find("accepted=1")!=std::string::npos);
+  SmallSVD scalar_identity;scalar_identity.p=1;scalar_identity.singular={1.0};scalar_identity.eta={0.0};scalar_identity.vt={1.0};
+  const double two_to_54=18014398509481984.0;
+  const auto compensated_stationarity=check_cut_qp_kkt(scalar_identity,{{1.0},{1.0}},{two_to_54,two_to_54},
+    {{1.0},{1.0}},{two_to_54,two_to_54},{1.0,two_to_54},{two_to_54},1e-8);
+  assert(compensated_stationarity.worst_stationarity_residual==-1.0&&compensated_stationarity.max_stationarity==1.0);
+  const double product_offset=std::ldexp(1.0,-27),product_left=1.0+product_offset,product_right=1.0-product_offset;
+  const double rounded_product=product_left*product_right;
+  assert(rounded_product==1.0);
+  const double product_roundoff_residual=compensated_constraint_residual({product_left},{product_right},1.0);
+  assert(product_roundoff_residual==std::ldexp(1.0,-54));
 
   const std::vector<std::vector<double>> unequal_tolerance_rows={{1.0,0.0},{0.0,1.0}};
   const std::vector<double> unequal_tolerance_rhs={100000.0+1.048e-9,1.0+1e-12};
@@ -1112,6 +1122,19 @@ void test_active_set_rank_deficient_warm_start(cusolverDnHandle_t solver)
   assert(replay.certificate.accepted&&rechecked.accepted&&rechecked.primal_slack.size()==42);
 }
 
+void test_outer128_stationarity_joint_polish(cusolverDnHandle_t solver)
+{
+  std::string fixture_path="tests/data/ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);
+  assert(fixture.svd.p==60&&fixture.rows.size()==766&&fixture.a.size()==766&&fixture.rhs.size()==766&&fixture.b.size()==766&&fixture.initial_lambda.size()==766);
+  const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
+  assert(replay.method==std::string("active_set_polish")&&replay.polish_attempts>0&&replay.polish_attempts<=3);
+  assert(replay.certificate.accepted&&replay.certificate.finite&&replay.certificate.primal_constraints_pass);
+  assert(replay.certificate.primal_slack.size()==766&&replay.lambda.size()==766);
+  assert(replay.certificate.max_primal_excess==0.0&&replay.certificate.max_complementarity<=qp_complementarity_tolerance);
+  assert(replay.certificate.max_stationarity<=qp_stationarity_tolerance);
+}
+
 void test_read_frame_rejects_invalid_data()
 {
   for(const int invalid:{0,1,2,3}){
@@ -1316,6 +1339,7 @@ int main()
   test_active_set_preserves_svd_primal(qr.solver);
   test_active_set_refines_kkt_residual(qr.solver);
   test_active_set_rank_deficient_warm_start(qr.solver);
+  test_outer128_stationarity_joint_polish(qr.solver);
   test_read_frame_rejects_invalid_data();
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();

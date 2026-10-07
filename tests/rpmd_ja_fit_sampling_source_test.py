@@ -215,11 +215,19 @@ assert "source_atom_slot" not in native_fit
 assert "test_response_snapshot_preserves_recomputable_matrices" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_active_set_qp_snapshot_and_rejection" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "tests/data/ja_reference_resample.bin.qp_state.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_outer128_stationarity_joint_polish" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert (ROOT / "tests/data/ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt").stat().st_size > 1_000_000
 assert "solve_active_equalities" in native_fit and "cusolverDnDgesvd(solver,'S','S',p,n" in native_fit
 assert "ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT" in native_fit and "ACTIVE_EQUALITY_UNRELIABLE" in native_fit
 active_svd_start = native_fit.index("bool solve_active_equalities(")
 active_svd_end = native_fit.index("ActiveSetPolishResult polish_cut_qp(", active_svd_start)
 active_svd = native_fit[active_svd_start:active_svd_end]
+assert "NeumaierAccumulator" in native_fit and "compensated_stationarity_residual" in native_fit
+assert "std::fma(left,right,-product)" in native_fit and "compensated_constraint_residual" in native_fit
+assert "const double score=std::max({max_complementarity/qp_complementarity_tolerance,max_stationarity/qp_stationarity_tolerance,max_scaled_equality});" in active_svd
+assert "h[k]=projected_c.value()/singular[k]+projected_s.value();" in active_svd
+assert "trial_lambda[j]<0.0" in active_svd and "y=std::move(best_y);lambda_star=std::move(best_lambda);" in active_svd
 assert "if(q>static_cast<std::size_t>(p)){failure_reason=\"ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT\";return false;}" in active_svd
 assert "if(da){cudaFree(da);da=nullptr;}" in active_svd and "if(info){cudaFree(info);info=nullptr;}" in active_svd
 assert "rounded_alpha" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
@@ -237,6 +245,9 @@ assert "diagnostic_scale_overflow.accepted&&diagnostic_scale_overflow.finite&&!d
 assert '<<"finite="<<(certificate.finite?1:0)' in native_fit
 assert '<<" diagnostic_finite="<<(certificate.diagnostic_finite?1:0)' in native_fit
 assert "worst_complementarity_residual" not in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "compensated_stationarity.worst_stationarity_residual==-1.0" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "two_to_54=18014398509481984.0" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "product_roundoff_residual==std::ldexp(1.0,-54)" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "saw_not_computed" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert '<<" coordinate_seconds="<<qp.coordinate_seconds<<" polish_seconds="<<qp.polish_seconds' in native_fit
 assert ' SEARCH warm_seconds=' in native_fit and 'independent_seconds=' in native_fit

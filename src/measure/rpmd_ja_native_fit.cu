@@ -405,6 +405,44 @@ std::vector<double> theta_from_eta(const SmallSVD& svd,const std::vector<double>
   std::vector<double> theta(svd.p,0.0);for(int k=0;k<svd.p;++k){const double c=xi[k]/svd.singular[k];for(int i=0;i<svd.p;++i)theta[i]+=svd.vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(i)*svd.p]*c;}return theta;
 }
 
+struct NeumaierAccumulator
+{
+  double sum=0.0,correction=0.0;
+  void add(const double value)
+  {
+    const double next=sum+value;
+    if(std::abs(sum)>=std::abs(value))correction+=(sum-next)+value;
+    else correction+=(value-next)+sum;
+    sum=next;
+  }
+  void add_product(const double left,const double right,const double sign=1.0)
+  {
+    const double product=left*right;
+    add(sign*product);
+    add(sign*std::fma(left,right,-product));
+  }
+  double value() const { return sum+correction; }
+};
+
+double compensated_stationarity_residual(const double z,const int component,const std::vector<std::vector<double>>& a,
+  const std::vector<double>& lambda,const std::vector<std::size_t>* active=nullptr)
+{
+  NeumaierAccumulator sum;sum.add(z);
+  for(std::size_t i=0;i<lambda.size();++i){const std::size_t row=active?(*active)[i]:i;sum.add_product(a[row][component],lambda[i],-1.0);}
+  return sum.value();
+}
+
+double compensated_constraint_residual(const std::vector<double>& row,const std::vector<double>& z,const double rhs)
+{
+  NeumaierAccumulator sum;sum.add(rhs);for(std::size_t k=0;k<row.size();++k)sum.add_product(row[k],z[k],-1.0);return sum.value();
+}
+
+double qp_equality_tolerance(const std::vector<double>& row,const std::vector<double>& z,const double rhs,double& scale)
+{
+  scale=std::max(1.0,std::abs(rhs));for(std::size_t k=0;k<row.size();++k)scale+=std::abs(row[k]*z[k]);
+  return 256.0*std::numeric_limits<double>::epsilon()*scale;
+}
+
 struct QPCertificateSummary
 {
   double max_primal_violation=0.0,max_primal_excess=0.0,max_complementarity=0.0,max_stationarity=0.0;
@@ -470,6 +508,7 @@ QPCertificate check_cut_qp_kkt(const SmallSVD& svd,const std::vector<std::vector
   if(rows.size()!=rhs.size()||rows.size()!=a.size()||rows.size()!=b.size()||rows.size()!=lambda.size()||xi.size()!=static_cast<std::size_t>(svd.p))
     throw std::runtime_error("native fit stability QP certificate dimensions do not match");
   QPCertificate out;out.theta=theta_from_eta(svd,xi);out.primal_slack.resize(rows.size());out.allowed_error.resize(rows.size());out.dual_slack.resize(rows.size());
+  std::vector<double> z(static_cast<std::size_t>(svd.p));for(int k=0;k<svd.p;++k)z[k]=xi[k]-svd.eta[k];
   for(std::size_t i=0;i<lambda.size();++i){const double value=lambda[i];if(!std::isfinite(value)||value<0.0){out.finite=false;out.multipliers_nonnegative=false;}
     if(std::isfinite(value)&&value>out.max_lambda){out.max_lambda=value;out.max_lambda_index=i;}}
   bool diagnostic_finite=true,have_worst_complementarity=false,worst_complementarity_nonfinite=false;
@@ -479,8 +518,7 @@ QPCertificate check_cut_qp_kkt(const SmallSVD& svd,const std::vector<std::vector
     double scale=std::max(1.0,std::abs(rhs[i]));for(int k=0;k<svd.p;++k)scale+=std::abs(rows[i][k]*out.theta[k]);
     if(!std::isfinite(scale))diagnostic_finite=false;
     const double allowed=std::min(primal_tolerance,256.0*std::numeric_limits<double>::epsilon()*scale);
-    double shifted=0.0;for(int k=0;k<svd.p;++k)shifted+=a[i][k]*(xi[k]-svd.eta[k]);
-    const double slack=shifted-b[i],complementarity=lambda[i]*slack;
+    const double slack=-compensated_constraint_residual(a[i],z,b[i]),complementarity=lambda[i]*slack;
     out.primal_slack[i]=primal;out.allowed_error[i]=allowed;out.dual_slack[i]=slack;
     if(!std::isfinite(primal)||!std::isfinite(allowed)){out.finite=false;out.primal_constraints_pass=false;}
     if(!std::isfinite(slack)||!std::isfinite(complementarity))out.finite=false;
@@ -500,7 +538,7 @@ QPCertificate check_cut_qp_kkt(const SmallSVD& svd,const std::vector<std::vector
     if(primal < -allowed)out.primal_constraints_pass=false;
   }
   bool have_worst_stationarity=false,worst_stationarity_nonfinite=false;
-  for(int k=0;k<svd.p;++k){double stationarity=xi[k]-svd.eta[k];for(std::size_t i=0;i<rows.size();++i)stationarity-=a[i][k]*lambda[i];if(!std::isfinite(stationarity))out.finite=false;out.max_stationarity=std::max(out.max_stationarity,std::abs(stationarity));
+  for(int k=0;k<svd.p;++k){const double stationarity=compensated_stationarity_residual(z[k],k,a,lambda);if(!std::isfinite(stationarity))out.finite=false;out.max_stationarity=std::max(out.max_stationarity,std::abs(stationarity));
     if(!std::isfinite(stationarity)){if(!worst_stationarity_nonfinite){out.worst_stationarity_index=k;out.worst_stationarity_residual=stationarity;have_worst_stationarity=true;worst_stationarity_nonfinite=true;}}
     else if(!worst_stationarity_nonfinite&&(!have_worst_stationarity||std::abs(stationarity)>std::abs(out.worst_stationarity_residual))){out.worst_stationarity_index=k;out.worst_stationarity_residual=stationarity;have_worst_stationarity=true;}}
   out.diagnostic_finite=out.finite&&diagnostic_finite;
@@ -613,26 +651,44 @@ bool solve_active_equalities(cusolverDnHandle_t solver,const std::vector<std::ve
     if(!std::all_of(y.begin(),y.end(),[](double x){return std::isfinite(x);})||
        !std::all_of(lambda_star.begin(),lambda_star.end(),[](double x){return std::isfinite(x);})) {failure_reason="ACTIVE_SVD_NONFINITE";return false;}
     if(std::all_of(lambda_star.begin(),lambda_star.end(),[](double x){return x>=0.0;})){
-      // Reuse the SVD for at most three corrections, including rounding in xi=eta+y.
-      std::vector<double> best_y=y,best_lambda=lambda_star,residual(q),projected_residual(rank);double best_error=std::numeric_limits<double>::infinity();
-      for(int pass=0;pass<=3;++pass){double error=0.0;
+      // Reuse this SVD to jointly reduce active equalities, complementarity, and stationarity.
+      std::vector<double> xi(p),z(p),stationarity(p),equality(q),equality_tolerance(q),h(rank),delta_y(p),delta_lambda(q),trial_y(p),trial_lambda(q),best_y,best_lambda;
+      bool have_best=false;double best_score=std::numeric_limits<double>::infinity();
+      for(int pass=0;pass<=3;++pass){
         if(!std::all_of(y.begin(),y.end(),[](double x){return std::isfinite(x);})||
            !std::all_of(lambda_star.begin(),lambda_star.end(),[](double x){return std::isfinite(x)&&x>=0.0;}))break;
-        for(int j=0;j<n;++j){const std::size_t row=active[j];double shifted=0.0;for(int k=0;k<p;++k)shifted+=a[row][k]*((eta[k]+y[k])-eta[k]);residual[j]=b[row]-shifted;
-          if(!std::isfinite(residual[j])||!std::isfinite(lambda_star[j]*residual[j])){error=std::numeric_limits<double>::infinity();break;}
-          error=std::max(error,std::abs(lambda_star[j]*residual[j]));}
-        if(!std::isfinite(error))break;
-        if(error<best_error){best_error=error;best_y=y;best_lambda=lambda_star;}
-        if(error<=qp_complementarity_tolerance||pass==3)break;
-        std::fill(projected_residual.begin(),projected_residual.end(),0.0);
-        for(int k=0;k<rank;++k)for(int j=0;j<n;++j)projected_residual[k]+=vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank]*residual[j];
-        for(int k=0;k<rank;++k){const double scaled=projected_residual[k]/singular[k];
-          for(int i=0;i<p;++i)y[i]+=u[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*p]*scaled;
-          for(int j=0;j<n;++j)lambda_star[j]+=vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank]*scaled/singular[k];}
+        for(int k=0;k<p;++k){xi[k]=eta[k]+y[k];z[k]=xi[k]-eta[k];}
+        if(!std::all_of(xi.begin(),xi.end(),[](double x){return std::isfinite(x);})||!std::all_of(z.begin(),z.end(),[](double x){return std::isfinite(x);}))break;
+        double max_complementarity=0.0,max_stationarity=0.0,max_scaled_equality=0.0;bool residuals_finite=true;
+        for(int k=0;k<p;++k){stationarity[k]=compensated_stationarity_residual(z[k],k,a,lambda_star,&active);if(!std::isfinite(stationarity[k]))residuals_finite=false;else max_stationarity=std::max(max_stationarity,std::abs(stationarity[k]));}
+        for(int j=0;j<n;++j){const std::size_t row=active[j];equality[j]=compensated_constraint_residual(a[row],z,b[row]);double scale=0.0;
+          equality_tolerance[j]=qp_equality_tolerance(a[row],z,b[row],scale);
+          const double product=lambda_star[j]*equality[j];
+          if(!std::isfinite(equality[j])||!std::isfinite(scale)||!std::isfinite(equality_tolerance[j])||!(equality_tolerance[j]>0.0)||!std::isfinite(product)){residuals_finite=false;continue;}
+          max_complementarity=std::max(max_complementarity,std::abs(product));max_scaled_equality=std::max(max_scaled_equality,std::abs(equality[j])/equality_tolerance[j]);}
+        if(!residuals_finite)break;
+        const double score=std::max({max_complementarity/qp_complementarity_tolerance,max_stationarity/qp_stationarity_tolerance,max_scaled_equality});
+        if(!have_best||score<best_score){best_score=score;best_y=y;best_lambda=lambda_star;have_best=true;}
+        if(score<=1.0||pass==3)break;
+        bool correction_finite=true;
+        for(int k=0;k<rank;++k){NeumaierAccumulator projected_c,projected_s;
+          for(int j=0;j<n;++j)projected_c.add_product(vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank],equality[j]);
+          for(int i=0;i<p;++i)projected_s.add_product(u[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*p],stationarity[i]);
+          h[k]=projected_c.value()/singular[k]+projected_s.value();if(!std::isfinite(h[k]))correction_finite=false;}
+        if(!correction_finite)break;
+        for(int i=0;i<p;++i){NeumaierAccumulator correction;correction.add(-stationarity[i]);for(int k=0;k<rank;++k)correction.add_product(u[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*p],h[k]);delta_y[i]=correction.value();if(!std::isfinite(delta_y[i]))correction_finite=false;}
+        for(int j=0;j<n;++j){NeumaierAccumulator correction;for(int k=0;k<rank;++k)correction.add_product(vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(j)*rank],h[k]/singular[k]);delta_lambda[j]=correction.value();if(!std::isfinite(delta_lambda[j]))correction_finite=false;}
+        if(!correction_finite)break;
+        for(int i=0;i<p;++i){NeumaierAccumulator updated;updated.add(y[i]);updated.add(delta_y[i]);trial_y[i]=updated.value();if(!std::isfinite(trial_y[i]))correction_finite=false;}
+        for(int j=0;j<n;++j){NeumaierAccumulator updated;updated.add(lambda_star[j]);updated.add(delta_lambda[j]);trial_lambda[j]=updated.value();if(!std::isfinite(trial_lambda[j])||trial_lambda[j]<0.0)correction_finite=false;}
+        if(!correction_finite)break;
+        y=trial_y;lambda_star=trial_lambda;
       }
+      if(!have_best){failure_reason="ACTIVE_SVD_NONFINITE";return false;}
       y=std::move(best_y);lambda_star=std::move(best_lambda);
     }
-    for(int j=0;j<n;++j){const std::size_t row=active[j];const double residual=std::inner_product(a[row].begin(),a[row].end(),y.begin(),0.0)-b[row];double scale=std::max(1.0,std::abs(b[row]));for(int k=0;k<p;++k)scale+=std::abs(a[row][k]*y[k]);const double tolerance=256.0*std::numeric_limits<double>::epsilon()*scale;if(!std::isfinite(residual)||!std::isfinite(scale)||!std::isfinite(tolerance)||std::abs(residual)>tolerance){failure_reason="ACTIVE_EQUALITY_UNRELIABLE";return false;}}
+    std::vector<double> xi(p),z(p);for(int k=0;k<p;++k){xi[k]=eta[k]+y[k];z[k]=xi[k]-eta[k];}
+    for(int j=0;j<n;++j){const std::size_t row=active[j];const double residual=compensated_constraint_residual(a[row],z,b[row]);double scale=0.0;const double tolerance=qp_equality_tolerance(a[row],z,b[row],scale);if(!std::isfinite(residual)||!std::isfinite(scale)||!std::isfinite(tolerance)||std::abs(residual)>tolerance){failure_reason="ACTIVE_EQUALITY_UNRELIABLE";return false;}}
     return true;
   }catch(...){cleanup();failure_reason="ACTIVE_SVD_FAILURE";return false;}
 }
