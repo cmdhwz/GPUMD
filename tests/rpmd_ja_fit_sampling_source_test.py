@@ -35,6 +35,16 @@ assert "collect_fixed_probe_statistics" in check_samples_body and "format_fixed_
 assert "qraw" not in check_samples_body and "make_graph" not in check_samples_body and "lanczos" not in check_samples_body
 assert "cannot replace final response validation" in native_fit
 assert "ProbeMoments" in native_fit and "moments.ibp_matrix" in native_fit
+assert "sum_q,sum_f,sum_f2,sum_qq,sum_fq" in native_fit
+assert "select_ibp_noise_channels" in native_fit and "IBP_GAUSSIAN_VARIANCE_PROXY" in native_fit
+assert "IBP_FIXED_CHANNEL_VALIDATION" in native_fit and "ADJACENT_SEGMENT_INTERNAL_CHECK" in native_fit
+assert "sum_f2[i]+=f[i]*f[i]" in native_fit and "sum_f2[i]+=other.sum_f2[i]" in native_fit
+assert "if(collect_lags&&frame>=train)" in native_fit and "validation_pending_frames==result.validation_base_block_length" in native_fit
+assert "diagnose_fixed_ibp_channels(result.segments[1],result.validation_blocks" in native_fit
+assert "signed_channel_interval(channel.validation_entry,fixed.band.radius)" in native_fit
+assert "tail_probe_index_space LOCAL_SELECTED_PROBES" in native_fit
+assert "tail_probe_original_indices" in native_fit
+assert "tail_probe_scope ALL_FQ_AND_QQ_PRODUCTS_IN_SELECTED_PROBE_SUBSPACE" in native_fit
 assert "moments.covariance_fq()" in native_fit and "lag_autocorrelation lags=1,2,5,10" in native_fit
 assert "std::vector<std::vector<double>> history" in native_fit and "history.size()>10" in native_fit
 assert "if(collect_lags){result.lags[0].add(qp)" in native_fit

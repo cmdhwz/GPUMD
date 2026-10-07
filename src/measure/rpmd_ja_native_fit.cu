@@ -824,19 +824,19 @@ struct ProbeMoments
 {
   int m=0;
   std::uint64_t frames=0;
-  std::vector<double> sum_q,sum_f,sum_qq,sum_fq;
-  explicit ProbeMoments(const int count=0):m(count),sum_q(count,0.0),sum_f(count,0.0),sum_qq(static_cast<std::size_t>(count)*count,0.0),sum_fq(sum_qq.size(),0.0){}
+  std::vector<double> sum_q,sum_f,sum_f2,sum_qq,sum_fq;
+  explicit ProbeMoments(const int count=0):m(count),sum_q(count,0.0),sum_f(count,0.0),sum_f2(count,0.0),sum_qq(static_cast<std::size_t>(count)*count,0.0),sum_fq(sum_qq.size(),0.0){}
   void add(const std::vector<double>& q,const std::vector<double>& f)
   {
     ++frames;
-    for(int i=0;i<m;++i){sum_q[i]+=q[i];sum_f[i]+=f[i];}
+    for(int i=0;i<m;++i){sum_q[i]+=q[i];sum_f[i]+=f[i];sum_f2[i]+=f[i]*f[i];}
     for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;sum_qq[ij]+=q[i]*q[j];sum_fq[ij]+=f[i]*q[j];}
   }
   void merge(const ProbeMoments& other)
   {
     if(m!=other.m)throw std::runtime_error("native fit bootstrap moment dimensions do not match");
     frames+=other.frames;
-    for(std::size_t i=0;i<sum_q.size();++i){sum_q[i]+=other.sum_q[i];sum_f[i]+=other.sum_f[i];}
+    for(std::size_t i=0;i<sum_q.size();++i){sum_q[i]+=other.sum_q[i];sum_f[i]+=other.sum_f[i];sum_f2[i]+=other.sum_f2[i];}
     for(std::size_t i=0;i<sum_qq.size();++i){sum_qq[i]+=other.sum_qq[i];sum_fq[i]+=other.sum_fq[i];}
   }
   std::vector<double> covariance_q() const
@@ -849,12 +849,96 @@ struct ProbeMoments
     std::vector<double> out(sum_fq.size());if(!frames)return out;const double count=static_cast<double>(frames);
     for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;out[ij]=sum_fq[ij]/count-(sum_f[i]/count)*(sum_q[j]/count);}return out;
   }
+  double centered_variance(const double sum_square,const double sum) const
+  {
+    if(!frames||!std::isfinite(sum_square)||!std::isfinite(sum))return std::numeric_limits<double>::quiet_NaN();
+    const double count=static_cast<double>(frames),mean=sum/count,second=sum_square/count;
+    if(!std::isfinite(mean)||!std::isfinite(second))return std::numeric_limits<double>::quiet_NaN();
+    const double value=second-mean*mean,scale=std::abs(second)+mean*mean;
+    if(!std::isfinite(value)||!std::isfinite(scale))return std::numeric_limits<double>::quiet_NaN();
+    const double roundoff=64.0*std::numeric_limits<double>::epsilon()*scale;
+    return value<0.0?(value>=-roundoff?0.0:std::numeric_limits<double>::quiet_NaN()):value;
+  }
+  std::vector<double> variance_f() const
+  {
+    std::vector<double> result(m,std::numeric_limits<double>::quiet_NaN());
+    for(int i=0;i<m;++i)result[i]=centered_variance(sum_f2[i],sum_f[i]);return result;
+  }
+  std::vector<double> variance_q() const
+  {
+    std::vector<double> result(m,std::numeric_limits<double>::quiet_NaN());
+    for(int i=0;i<m;++i)result[i]=centered_variance(sum_qq[static_cast<std::size_t>(i)*m+i],sum_q[i]);return result;
+  }
   std::vector<double> ibp_matrix(const double kbt) const
   {
     std::vector<double> out(sum_fq.size());if(!frames)return out;const double count=static_cast<double>(frames);
     for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;out[ij]=sum_fq[ij]/(count*kbt)-(sum_f[i]/count)*(sum_q[j]/count)/kbt+(i==j?1.0:0.0);}return out;
   }
 };
+
+struct IBPNoiseChannel
+{
+  int i=0,j=0;
+  std::string selection_reason;
+  double training_entry=std::numeric_limits<double>::quiet_NaN();
+  double validation_entry=std::numeric_limits<double>::quiet_NaN();
+  double training_variance_proxy=std::numeric_limits<double>::quiet_NaN();
+  double validation_variance_proxy=std::numeric_limits<double>::quiet_NaN();
+};
+
+double gaussian_variance_proxy(const double variance_f,const double variance_q,const double covariance,const double kbt)
+{
+  if(!(kbt>0.0)||!std::isfinite(kbt)||!std::isfinite(variance_f)||!std::isfinite(variance_q)||!std::isfinite(covariance))
+    return std::numeric_limits<double>::quiet_NaN();
+  const double numerator=variance_f*variance_q+covariance*covariance,denominator=kbt*kbt;
+  if(!std::isfinite(numerator)||!std::isfinite(denominator)||denominator==0.0)return std::numeric_limits<double>::quiet_NaN();
+  const double proxy=numerator/denominator;return std::isfinite(proxy)?proxy:std::numeric_limits<double>::quiet_NaN();
+}
+
+double gaussian_variance_proxy(const ProbeMoments& moments,const int i,const int j,const double kbt)
+{
+  if(i<0||j<0||i>=moments.m||j>=moments.m||!moments.frames)return std::numeric_limits<double>::quiet_NaN();
+  const double count=static_cast<double>(moments.frames),mean_f=moments.sum_f[i]/count,mean_q=moments.sum_q[j]/count;
+  const double covariance=moments.sum_fq[static_cast<std::size_t>(i)*moments.m+j]/count-mean_f*mean_q;
+  const double variance_f=moments.centered_variance(moments.sum_f2[i],moments.sum_f[i]);
+  const double variance_q=moments.centered_variance(moments.sum_qq[static_cast<std::size_t>(j)*moments.m+j],moments.sum_q[j]);
+  return gaussian_variance_proxy(variance_f,variance_q,covariance,kbt);
+}
+
+std::vector<IBPNoiseChannel> select_ibp_noise_channels(const ProbeMoments& training,const double kbt)
+{
+  if(!training.frames||!(kbt>0.0)||!std::isfinite(kbt))return {};
+  struct Candidate{int i,j;double score;};std::vector<Candidate> proxy_candidates,entry_candidates;
+  const std::vector<double> ibp=training.ibp_matrix(kbt);
+  for(int i=0;i<training.m;++i)for(int j=0;j<training.m;++j){const std::size_t ij=static_cast<std::size_t>(i)*training.m+j;
+    const double proxy=gaussian_variance_proxy(training,i,j,kbt),entry=ibp[ij];
+    if(i!=j&&std::isfinite(proxy))proxy_candidates.push_back({i,j,proxy});
+    if(std::isfinite(entry))entry_candidates.push_back({i,j,std::abs(entry)});
+  }
+  const auto order=[](const Candidate& a,const Candidate& b){return a.score!=b.score?a.score>b.score:(a.i!=b.i?a.i<b.i:a.j<b.j);};
+  std::sort(proxy_candidates.begin(),proxy_candidates.end(),order);std::sort(entry_candidates.begin(),entry_candidates.end(),order);
+  std::vector<IBPNoiseChannel> selected;
+  const auto append=[&](const Candidate& candidate,const char* reason){
+    auto found=std::find_if(selected.begin(),selected.end(),[&](const IBPNoiseChannel& channel){return channel.i==candidate.i&&channel.j==candidate.j;});
+    if(found==selected.end()){IBPNoiseChannel channel;channel.i=candidate.i;channel.j=candidate.j;channel.selection_reason=reason;selected.push_back(std::move(channel));}
+    else if(found->selection_reason.find(reason)==std::string::npos)found->selection_reason+="+"+std::string(reason);
+  };
+  for(std::size_t k=0;k<std::min<std::size_t>(3,proxy_candidates.size());++k)append(proxy_candidates[k],"TOP3_GAUSSIAN_VARIANCE_PROXY");
+  for(std::size_t k=0;k<std::min<std::size_t>(3,entry_candidates.size());++k)append(entry_candidates[k],"TOP3_ABS_TRAIN_IBP_ENTRY");
+  return selected;
+}
+
+ProbeMoments select_probe_moments(const ProbeMoments& moments,const std::vector<int>& probes)
+{
+  ProbeMoments selected(static_cast<int>(probes.size()));selected.frames=moments.frames;
+  for(std::size_t i=0;i<probes.size();++i){const int source_i=probes[i];if(source_i<0||source_i>=moments.m)throw std::runtime_error("native fit selected noise probe index is invalid");
+    selected.sum_q[i]=moments.sum_q[source_i];selected.sum_f[i]=moments.sum_f[source_i];selected.sum_f2[i]=moments.sum_f2[source_i];
+    for(std::size_t j=0;j<probes.size();++j){const int source_j=probes[j];const std::size_t dst=i*probes.size()+j,src=static_cast<std::size_t>(source_i)*moments.m+source_j;selected.sum_qq[dst]=moments.sum_qq[src];selected.sum_fq[dst]=moments.sum_fq[src];}}
+  return selected;
+}
+
+std::pair<double,double> signed_channel_interval(const double estimate,const double radius)
+{return {estimate-radius,estimate+radius};}
 
 double max_abs_symmetric_eigenvalue(std::vector<double> a,const int n)
 {
@@ -1070,6 +1154,60 @@ BootstrapBand bootstrap_ibp_band(const ProbeMoments& full,const std::vector<Prob
     "IBP_PASS","IBP_FAIL","IBP_INCONCLUSIVE");
 }
 
+struct FixedChannelNoiseDiagnostic
+{
+  int validation_base_block_length=0;
+  std::uint64_t validation_frames_total=0,validation_frames_used=0,validation_frames_omitted=0;
+  std::vector<IBPNoiseChannel> channels;
+  std::vector<int> tail_probe_original_indices;
+  BootstrapBand band;
+  std::string status="NOT_COMPUTED";
+  std::string variance_status="AVAILABLE";
+};
+
+FixedChannelNoiseDiagnostic diagnose_fixed_ibp_channels(const ProbeMoments& training,const std::vector<ProbeMoments>& validation_blocks,
+  const int base_block_length,const std::uint64_t validation_frames,const double kbt)
+{
+  FixedChannelNoiseDiagnostic result;result.validation_base_block_length=base_block_length;result.validation_frames_total=validation_frames;
+  ProbeMoments validation(training.m);for(const ProbeMoments& block:validation_blocks)validation.merge(block);
+  result.validation_frames_used=validation.frames;result.validation_frames_omitted=validation_frames>=validation.frames?validation_frames-validation.frames:0;
+  const auto finite=[](const std::vector<double>& values){return std::all_of(values.begin(),values.end(),[](double value){return std::isfinite(value);});};
+  const auto variance_diagnostic_bad=[&](const ProbeMoments& moments){if(!moments.frames)return false;
+    if(!finite(moments.variance_f())||!finite(moments.variance_q()))return true;
+    for(int i=0;i<moments.m;++i)for(int j=0;j<moments.m;++j)if(!std::isfinite(gaussian_variance_proxy(moments,i,j,kbt)))return true;return false;};
+  const bool train_variance_bad=variance_diagnostic_bad(training),validation_variance_bad=variance_diagnostic_bad(validation);
+  if(train_variance_bad||validation_variance_bad)result.variance_status=train_variance_bad&&validation_variance_bad?"NUMERICAL_FAILURE_TRAIN_AND_VALIDATION":(train_variance_bad?"NUMERICAL_FAILURE_TRAIN":"NUMERICAL_FAILURE_VALIDATION");
+  result.channels=select_ibp_noise_channels(training,kbt);
+  const std::vector<double> train_ibp=training.ibp_matrix(kbt),validation_ibp=validation.ibp_matrix(kbt);
+  for(IBPNoiseChannel& channel:result.channels){const std::size_t ij=static_cast<std::size_t>(channel.i)*training.m+channel.j;
+    channel.training_entry=training.frames?train_ibp[ij]:std::numeric_limits<double>::quiet_NaN();
+    channel.validation_entry=validation.frames?validation_ibp[ij]:std::numeric_limits<double>::quiet_NaN();
+    channel.training_variance_proxy=gaussian_variance_proxy(training,channel.i,channel.j,kbt);
+    channel.validation_variance_proxy=gaussian_variance_proxy(validation,channel.i,channel.j,kbt);}
+  if(result.channels.empty()){result.status=result.variance_status=="AVAILABLE"?"NO_FINITE_TRAIN_CHANNELS":result.variance_status;result.band.rejection_reason=result.status;return result;}
+
+  std::set<int> probe_set;for(const IBPNoiseChannel& channel:result.channels){probe_set.insert(channel.i);probe_set.insert(channel.j);}
+  const std::vector<int> selected_probes(probe_set.begin(),probe_set.end());result.tail_probe_original_indices=selected_probes;std::vector<int> local_index(training.m,-1);
+  for(std::size_t i=0;i<selected_probes.size();++i)local_index[selected_probes[i]]=static_cast<int>(i);
+  ProbeMoments selected_validation=select_probe_moments(validation,selected_probes);std::vector<ProbeMoments> selected_blocks;selected_blocks.reserve(validation_blocks.size());
+  for(const ProbeMoments& block:validation_blocks)selected_blocks.push_back(select_probe_moments(block,selected_probes));
+  const auto channel_entries=[channels=result.channels,local_index,kbt](const ProbeMoments& moments){
+    const std::vector<double> covariance=moments.covariance_fq();std::vector<double> entries;entries.reserve(channels.size());
+    for(const IBPNoiseChannel& channel:channels){const int i=local_index[channel.i],j=local_index[channel.j];
+      entries.push_back(covariance[static_cast<std::size_t>(i)*moments.m+j]/kbt+(channel.i==channel.j?1.0:0.0));}
+    return entries;};
+  const auto norm=[](const std::vector<double>& values){double maximum=0.0;for(double value:values){if(!std::isfinite(value))return std::numeric_limits<double>::quiet_NaN();maximum=std::max(maximum,std::abs(value));}return maximum;};
+  const auto distance=[norm](const std::vector<double>& a,const std::vector<double>& b){if(a.size()!=b.size())return std::numeric_limits<double>::quiet_NaN();std::vector<double> difference(a.size());for(std::size_t i=0;i<a.size();++i)difference[i]=a[i]-b[i];return norm(difference);};
+  result.band=bootstrap_metric_band(selected_validation,selected_blocks,base_block_length,std::numeric_limits<double>::max(),
+    0xa54ff53a5f1d36f1ULL,channel_entries,norm,distance,
+    "CHANNEL_INTERVAL_DIAGNOSTIC","CHANNEL_INTERVAL_DIAGNOSTIC","CHANNEL_INTERVAL_NOT_COMPUTED");
+  const bool interval_available=result.band.block_lengths_stable&&std::isfinite(result.band.radius)&&
+    std::isfinite(result.band.lower)&&std::isfinite(result.band.upper);
+  if(result.band.block_lengths_stable&&!interval_available)result.band.rejection_reason="NONFINITE_CHANNEL_INTERVAL";
+  result.status=interval_available?"COMPUTED_BLOCK_BOOTSTRAP_INTERVAL":"NOT_COMPUTED:"+result.band.rejection_reason;
+  return result;
+}
+
 struct FixedProbeStatistics
 {
   std::vector<std::vector<double>> probes;
@@ -1078,6 +1216,10 @@ struct FixedProbeStatistics
   int all_base_block_length=0;
   std::vector<ProbeMoments> all_blocks;
   BootstrapBand ibp_band;
+  int validation_base_block_length=0;
+  std::vector<ProbeMoments> validation_blocks;
+  ProbeMoments validation_complete_moments;
+  FixedChannelNoiseDiagnostic fixed_channel_noise;
   struct LagMoments
   {
     std::array<int,4> lag_steps{{1,2,5,10}};
@@ -1114,7 +1256,9 @@ FixedProbeStatistics collect_fixed_probe_statistics(std::istream& spool,const Sa
   FixedProbeStatistics result;result.probes=make_probes({},sqrt_atom,header.types,n,&result.sources);const int m=static_cast<int>(result.probes.size());
   result.segments.reserve(7);for(int i=0;i<7;++i)result.segments.emplace_back(m);if(collect_lags){result.lags.reserve(7);for(int i=0;i<7;++i)result.lags.emplace_back(m);}
   result.all_base_block_length=static_cast<int>(std::max<std::uint64_t>(1,(frames+1023)/1024));
-  ProbeMoments all_pending(m);int all_pending_frames=0;
+  const std::uint64_t validation_frames=frames-train;
+  if(collect_lags){result.validation_base_block_length=static_cast<int>(std::max<std::uint64_t>(1,(validation_frames+1023)/1024));result.validation_complete_moments=ProbeMoments(m);}
+  ProbeMoments all_pending(m),validation_pending(m);int all_pending_frames=0,validation_pending_frames=0;
   std::vector<double> x(d),force(d),q(d),f(d);std::vector<double> qp(m),fp(m);spool.clear();spool.seekg(header.frames);
   for(std::uint64_t frame=0;frame<frames;++frame){double step=0.0;read_frame(spool,x,force,step);
     for(int i=0;i<d;++i){q[i]=sqrt_mass[i]*(x[i]-r0[i]);f[i]=force[i]/sqrt_mass[i];}
@@ -1123,10 +1267,14 @@ FixedProbeStatistics collect_fixed_probe_statistics(std::istream& spool,const Sa
     const int block=std::min(3,static_cast<int>(frame*4/frames));const int train_segment=frame<train?1:2;
     result.segments[0].add(qp,fp);result.segments[train_segment].add(qp,fp);result.segments[3+block].add(qp,fp);
     all_pending.add(qp,fp);if(++all_pending_frames==result.all_base_block_length){result.all_blocks.push_back(std::move(all_pending));all_pending=ProbeMoments(m);all_pending_frames=0;}
+    if(collect_lags&&frame>=train){validation_pending.add(qp,fp);if(++validation_pending_frames==result.validation_base_block_length){result.validation_blocks.push_back(std::move(validation_pending));validation_pending=ProbeMoments(m);validation_pending_frames=0;}}
     if(collect_lags){result.lags[0].add(qp);result.lags[train_segment].add(qp);result.lags[3+block].add(qp);}
   }
   result.ibp_band=bootstrap_ibp_band(result.segments[0],result.all_blocks,result.all_base_block_length,
     K_B*header.temperature,ibp_tolerance,0x6a09e667f3bcc909ULL);
+  if(collect_lags){for(const ProbeMoments& block:result.validation_blocks)result.validation_complete_moments.merge(block);
+    result.fixed_channel_noise=diagnose_fixed_ibp_channels(result.segments[1],result.validation_blocks,
+      result.validation_base_block_length,validation_frames,K_B*header.temperature);}
   return result;
 }
 
@@ -1182,6 +1330,32 @@ std::string format_fixed_probe_report(const FixedProbeStatistics& stats,const Sa
   write_bootstrap_diagnostic(out,"IBP_DIAGNOSTIC",stats.ibp_band);
   out<<"bootstrap_levels block_length_frames q99_radius\n";
   for(const auto& level:stats.ibp_band.level_radii)out<<level.first<<' '<<level.second<<'\n';
+  const auto write_proxy_segment=[&](const char* segment,const ProbeMoments& moments){
+    const std::vector<double> variance_f=moments.variance_f(),variance_q=moments.variance_q(),covariance=moments.covariance_fq();
+    for(int i=0;i<m;++i)for(int j=0;j<m;++j){const double cfq=covariance[static_cast<std::size_t>(i)*m+j];const double proxy=gaussian_variance_proxy(variance_f[i],variance_q[j],cfq,kbt);
+      out<<segment<<' '<<i<<' '<<j<<' '<<variance_f[i]<<' '<<variance_q[j]<<' '<<cfq<<' '<<proxy<<'\n';}
+  };
+  out<<"\nIBP_GAUSSIAN_VARIANCE_PROXY\n";
+  out<<"proxy_is_diagnostic_only_not_a_Gaussian_assumption_or_acceptance_gate\n";
+  out<<"segment i j variance_f variance_q covariance_fq variance_proxy\n";
+  write_proxy_segment("train",stats.segments[1]);write_proxy_segment("validation_complete_blocks",stats.validation_complete_moments);
+  const FixedChannelNoiseDiagnostic& fixed=stats.fixed_channel_noise;
+  out<<"\nIBP_FIXED_CHANNEL_VALIDATION\nselection_source TRAIN_ONLY\nvalidation_evidence ADJACENT_SEGMENT_INTERNAL_CHECK\n";
+  out<<"validation_total_frames "<<fixed.validation_frames_total<<"\nvalidation_base_block_length_frames "<<fixed.validation_base_block_length<<"\nvalidation_frames_used "<<fixed.validation_frames_used
+    <<"\nvalidation_frames_omitted "<<fixed.validation_frames_omitted<<"\nvalidation_q99_radius "<<fixed.band.radius
+    <<"\nuncertainty_radius_method upper_0.99_block_bootstrap_percentile_coverage_not_universally_calibrated"
+    <<"\nvariance_diagnostic_status "<<fixed.variance_status<<"\ndiagnostic_status "<<fixed.status<<"\n";
+  write_bootstrap_diagnostic(out,"fixed_channel_bootstrap_diagnostic",fixed.band);
+  out<<"tail_probe_index_space LOCAL_SELECTED_PROBES\ntail_probe_original_indices";
+  for(const int original_index:fixed.tail_probe_original_indices)out<<' '<<original_index;
+  out<<"\ntail_probe_scope ALL_FQ_AND_QQ_PRODUCTS_IN_SELECTED_PROBE_SUBSPACE\n";
+  out<<"i j selection_reason train_entry validation_entry train_variance_proxy validation_variance_proxy validation_frames_used validation_frames_omitted signed_lower signed_upper variance_diagnostic_status diagnostic_status\n";
+  const double uncomputed=std::numeric_limits<double>::quiet_NaN();
+  for(const IBPNoiseChannel& channel:fixed.channels){const auto interval=fixed.status=="COMPUTED_BLOCK_BOOTSTRAP_INTERVAL"?
+      signed_channel_interval(channel.validation_entry,fixed.band.radius):std::make_pair(uncomputed,uncomputed);
+    out<<channel.i<<' '<<channel.j<<' '<<channel.selection_reason<<' '<<channel.training_entry<<' '<<channel.validation_entry<<' '
+      <<channel.training_variance_proxy<<' '<<channel.validation_variance_proxy<<' '<<fixed.validation_frames_used<<' '
+      <<fixed.validation_frames_omitted<<' '<<interval.first<<' '<<interval.second<<' '<<fixed.variance_status<<' '<<fixed.status<<'\n';}
   for(int s=0;s<7;++s){const ProbeMoments& moments=stats.segments[s];const auto cov=moments.covariance_q(),ibp=moments.ibp_matrix(kbt);
     out<<"\nSEGMENT "<<names[s]<<" frames="<<moments.frames<<" status="<<probe_sample_status(moments.frames,m)<<'\n';
     out<<"probe index source mean_q_probe variance_q_probe mean_f_probe ibp_diagonal\n";
@@ -1734,6 +1908,13 @@ void check_rpmd_ja_native_fit_samples(const std::string& spool_path,const std::s
   const double sample_statistics_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-sample_statistics_started).count();
   write_text_exclusive(report_path,format_fixed_probe_report(stats,header,interval,train,0.15,sample_statistics_seconds),"sample statistics report");
   print_fixed_probe_summary(stats,header,interval,train,0.15,sample_statistics_seconds);
+  std::printf("training-selected IBP noise channels:");for(const IBPNoiseChannel& channel:stats.fixed_channel_noise.channels)std::printf(" (%d,%d)",channel.i,channel.j);if(stats.fixed_channel_noise.channels.empty())std::printf(" none");std::printf("\n");
+  std::printf("fixed-channel validation=%s variance_diagnostic=%s q99_radius=%.6g frames_used=%llu omitted=%llu reason=%s\n",
+    stats.fixed_channel_noise.status.c_str(),stats.fixed_channel_noise.variance_status.c_str(),stats.fixed_channel_noise.band.radius,
+    static_cast<unsigned long long>(stats.fixed_channel_noise.validation_frames_used),
+    static_cast<unsigned long long>(stats.fixed_channel_noise.validation_frames_omitted),
+    stats.fixed_channel_noise.band.rejection_reason.c_str());
+  std::printf("sample statistics report=%s\n",report_path.c_str());
   std::printf("sampling evidence: %s; report=%s\n",stats.ibp_band.status.c_str(),report_path.c_str());
   std::printf("  fixed probes omit four low-frequency Ritz probes; this report cannot replace final response validation.\n");
 }
