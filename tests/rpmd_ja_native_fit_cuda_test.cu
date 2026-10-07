@@ -252,6 +252,38 @@ void test_bootstrap_uses_matching_complete_frames_and_circular_blocks()
   assert(equal_or_uncomputed(base_ibp_band.radius,changed_ibp_band.radius)&&equal_or_uncomputed(base_ibp_band.lower,changed_ibp_band.lower)&&equal_or_uncomputed(base_ibp_band.upper,changed_ibp_band.upper));
 }
 
+void test_bootstrap_block_factor_candidates_and_terminal_level()
+{
+  const std::vector<std::pair<std::size_t,std::vector<int>>> cases={
+    {0,{}},{15,{}},{16,{1}},{999,{1,2,4,8,16,32,62}},{1000,{1,2,4,8,16,32,62}},
+    {1023,{1,2,4,8,16,32,63}},{1024,{1,2,4,8,16,32,64}}};
+  for(const auto& test:cases){const std::vector<int> factors=bootstrap_block_factors(test.first);assert(factors==test.second);
+    for(std::size_t i=0;i<factors.size();++i){assert(factors[i]>0&&test.first/static_cast<std::size_t>(factors[i])>=16);if(i)assert(factors[i]>factors[i-1]);}}
+
+  ProbeMoments full(1);std::vector<ProbeMoments> blocks;blocks.reserve(1000);std::uint32_t state=36;
+  for(int b=0;b<1000;++b){state=1664525U*state+1013904223U;const double q=2.0*static_cast<double>(state)/4294967296.0-1.0;
+    ProbeMoments block(1);block.add({q},{-q});block.add({q},{-q});full.merge(block);blocks.push_back(std::move(block));}
+  assert(block_product_tail_covered(blocks,full));
+  const double kbt=1.0;const auto ibp_matrix=[=](const ProbeMoments& moments){return moments.ibp_matrix(kbt);};
+  const auto ibp_norm=[](const std::vector<double>& matrix){return nonsymmetric_spectral_norm(matrix,1);};
+  const auto ibp_distance=[](const std::vector<double>& a,const std::vector<double>& b){return nonsymmetric_matrix_distance(a,b,1);};
+  const double expected_estimate=ibp_norm(ibp_matrix(full));
+  const BootstrapBand band=bootstrap_ibp_band(full,blocks,2,kbt,0.15,41);
+  assert(band.frames==2000&&band.estimate==expected_estimate&&band.bootstrap_started&&band.level_radii.size()==7);
+  assert(band.level_radii[4].first==32&&band.level_radii[5].first==64&&band.level_radii[6].first==124);
+
+  const auto frame_metric=[](const ProbeMoments& moments){return std::vector<double>{static_cast<double>(moments.frames)};};
+  const auto frame_distance=[](const std::vector<double>& a,const std::vector<double>& b){return std::abs(a[0]-b[0]);};
+  const std::vector<double> frame_deviations=resample_percentile_deviations(blocks,62,{2000.0},32,41,frame_metric,frame_distance);
+  assert(frame_deviations.size()==32&&std::all_of(frame_deviations.begin(),frame_deviations.end(),[](double value){return value==0.0;}));
+
+  const std::vector<double> center=ibp_matrix(full);
+  const std::vector<double> first=resample_percentile_deviations(blocks,62,center,500,41,ibp_matrix,ibp_distance);
+  const std::vector<double> second=resample_percentile_deviations(blocks,62,center,500,41,ibp_matrix,ibp_distance);
+  const std::size_t q99=static_cast<std::size_t>(std::ceil(0.99*500))-1;
+  assert(first.size()==500&&first==second&&first[q99]==band.level_radii.back().second);
+}
+
 void test_block_product_tail_uses_segment_centering()
 {
   constexpr int frames=4096,block_length=4;const double rho=0.98;std::mt19937_64 random(0x9b05688c2b3e6c1fULL);std::normal_distribution<double> normal;
@@ -875,6 +907,7 @@ int main()
   test_probe_moments_centering_and_small_segments();
   test_block_bootstrap_uses_matrix_error_radius();
   test_bootstrap_uses_matching_complete_frames_and_circular_blocks();
+  test_bootstrap_block_factor_candidates_and_terminal_level();
   test_block_product_tail_uses_segment_centering();
   test_bootstrap_nonfinite_is_numerical_failure();
   test_bootstrap_rejection_diagnostics();

@@ -41,6 +41,9 @@ assert "if(collect_lags){result.lags[0].add(qp)" in native_fit
 assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance)" in native_fit
 assert "sample_statistics.ibp_band.status!=\"IBP_PASS\"" in native_fit
 assert "bootstrap_metric_band" in native_fit and "nonsymmetric_matrix_distance" in native_fit
+assert "std::vector<int> bootstrap_block_factors(const std::size_t block_count)" in native_fit
+assert "const std::vector<int> factors=bootstrap_block_factors(blocks.size());" in native_fit
+assert "for(const int factor:bootstrap_block_factors(blocks.size()))" in native_fit
 assert "mean_f[i]*moment.sum_q[j]" in native_fit and "mean_q[j]*moment.sum_f[i]" in native_fit
 assert "blocks[(start+k)%count]" in native_fit and "result.frames=covered.frames" in native_fit
 assert "if(!block_product_tail_covered(blocks,covered,&result))return result;" in native_fit

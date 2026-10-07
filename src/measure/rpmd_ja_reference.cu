@@ -2437,6 +2437,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   const std::uint64_t k_count = static_cast<std::uint64_t>(d) * d;
   const std::streamoff v_bytes = static_cast<std::streamoff>(v_count * sizeof(double));
   const std::streamoff c_bytes = static_cast<std::streamoff>(c_count * sizeof(double));
+  const std::streamoff c_matrix_bytes = c_bytes / 3;
   const std::streamoff k_bytes = static_cast<std::streamoff>(k_count * sizeof(double));
   const std::streamoff stats_bytes = static_cast<std::streamoff>(18 * sizeof(double));
   if (data_start < 0 || 2 * v_bytes > std::numeric_limits<std::streamoff>::max() - 2 * c_bytes ||
@@ -2445,7 +2446,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   const std::streampos coarse_v_start = data_start + v_bytes + c_bytes + k_bytes;
   const std::streampos coarse_c_start = coarse_v_start + v_bytes;
   const std::streampos stats_start = coarse_c_start + c_bytes;
-  out.seekp(stats_start + stats_bytes - 1);
+  out.seekp(stats_start + (stats_bytes - std::streamoff{1}));
   out.put('\0');
   out.flush();
   if (!out) throw std::runtime_error("cannot reserve qNEP rpmd_ja raw matrix storage");
@@ -2491,7 +2492,8 @@ static void generate_rpmd_ja_qnep_raw_reference(
   std::uint64_t next_decile = 1;
   const auto v_phase_start = std::chrono::steady_clock::now();
   const auto save_row = [&](const std::streampos start, const int row, const int width, const std::vector<double>& values) {
-    out.seekp(start + static_cast<std::streamoff>(row) * width * sizeof(double));
+    const std::streamoff row_offset = static_cast<std::streamoff>(row) * static_cast<std::streamoff>(width) * static_cast<std::streamoff>(sizeof(double));
+    out.seekp(start + row_offset);
     write_vector(out, values);
   };
   std::fill(unit_direction.begin(), unit_direction.end(), 0.0);
@@ -2595,10 +2597,10 @@ static void generate_rpmd_ja_qnep_raw_reference(
         c_fine2[alpha] += c_fine[alpha][r] * c_fine[alpha][r];
       }
       const std::streampos c_start = data_start + v_bytes +
-        static_cast<std::streamoff>(alpha) * d * d * sizeof(double);
+        static_cast<std::streamoff>(alpha) * c_matrix_bytes;
       save_row(c_start, coordinate, d, c_fine[alpha]);
       const std::streampos coarse_c_matrix_start = coarse_c_start +
-        static_cast<std::streamoff>(alpha) * d * d * sizeof(double);
+        static_cast<std::streamoff>(alpha) * c_matrix_bytes;
       save_row(coarse_c_matrix_start, coordinate, d, c_coarse[alpha]);
     }
     save_row(data_start + v_bytes + c_bytes, coordinate, d, k_fine);
@@ -2765,6 +2767,7 @@ void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box,
     case PPPMReferenceTranslationReason::coefficient_copy_failed: return "coefficient_copy_failed";
     case PPPMReferenceTranslationReason::fft_plan_failed: return "fft_plan_failed";
     case PPPMReferenceTranslationReason::fft_execute_failed: return "fft_execute_failed";
+    default: break;
     }
     return "unknown";
   };

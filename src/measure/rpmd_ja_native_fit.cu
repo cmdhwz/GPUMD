@@ -393,8 +393,6 @@ std::vector<double> theta_from_eta(const SmallSVD& svd,const std::vector<double>
   std::vector<double> theta(svd.p,0.0);for(int k=0;k<svd.p;++k){const double c=xi[k]/svd.singular[k];for(int i=0;i<svd.p;++i)theta[i]+=svd.vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(i)*svd.p]*c;}return theta;
 }
 
-std::vector<double> unconstrained_eta(const SmallSVD& svd){return svd.eta;}
-
 struct QPCertificate
 {
   std::vector<double> theta,primal_slack,allowed_error,dual_slack;
@@ -641,21 +639,6 @@ Graph make_graph(const std::vector<double>& r, const std::vector<int>& types, co
   while (!todo.empty()) { const int i=todo.back(); todo.pop_back(); for (const auto& e:g.sites[i]) if(!seen[e.j]) { seen[e.j]=1; todo.push_back(e.j); } }
   if (std::find(seen.begin(),seen.end(),0)!=seen.end()) throw std::runtime_error("native fit cutoff graph is disconnected");
   return g;
-}
-
-void apply_group(const Graph& graph, const std::vector<double>& q, const int n, const int parameters,
-                 const double* theta, double* result)
-{
-  std::fill(result,result+3*n,0.0);
-  for (const auto& e : graph.edges) {
-    const std::size_t p = static_cast<std::size_t>(6*e.group);
-    const double dx[3] = {q[e.j]-q[e.i],q[n+e.j]-q[n+e.i],q[2*n+e.j]-q[2*n+e.i]};
-    const double c[6] = {theta[p],theta[p+1],theta[p+2],theta[p+3],theta[p+4],theta[p+5]};
-    const double y[3] = {c[0]*dx[0]+c[1]*dx[1]+c[2]*dx[2],
-                         c[1]*dx[0]+c[3]*dx[1]+c[4]*dx[2],
-                         c[2]*dx[0]+c[4]*dx[1]+c[5]*dx[2]};
-    for(int a=0;a<3;++a){result[a*n+e.i]-=y[a];result[a*n+e.j]+=y[a];}
-  }
 }
 
 void make_design(const Graph& graph,const std::vector<double>& q,const std::vector<double>& sqrt_mass,
@@ -926,9 +909,20 @@ struct BootstrapBand
   std::vector<std::pair<int,double>> level_radii;
 };
 
+std::vector<int> bootstrap_block_factors(const std::size_t block_count)
+{
+  const int limit=static_cast<int>(std::min<std::size_t>(128,block_count/16));
+  std::vector<int> factors;
+  for(int factor=1;factor<=limit;factor*=2)factors.push_back(factor);
+  if(!factors.empty()&&factors.back()!=limit)factors.push_back(limit);
+  return factors;
+}
+
 bool block_product_tail_covered(const std::vector<ProbeMoments>& blocks,const ProbeMoments& segment,BootstrapBand* diagnostic=nullptr)
 {
-  const int n=static_cast<int>(blocks.size()),m=blocks.empty()?segment.m:blocks.front().m;int max_factor=1;
+  const int n=static_cast<int>(blocks.size()),m=blocks.empty()?segment.m:blocks.front().m;
+  const std::vector<int> factors=bootstrap_block_factors(blocks.size());
+  const int max_factor=factors.empty()?0:factors.back();
   int product=-1,element=-1,lag=-1,last_correlated_lag=-1,quiet_lags=-1;
   const double uncomputed=std::numeric_limits<double>::quiet_NaN();double variance=uncomputed,noise_bound=uncomputed,integrated_correlation=uncomputed;
   const auto reject=[&](const char* reason){
@@ -940,8 +934,6 @@ bool block_product_tail_covered(const std::vector<ProbeMoments>& blocks,const Pr
       <<" required_factor="<<(last_correlated_lag>=0&&std::isfinite(integrated_correlation)?4*std::max(static_cast<double>(last_correlated_lag),integrated_correlation):uncomputed)<<" effective_blocks="<<static_cast<double>(n)/integrated_correlation;
       diagnostic->rejection_detail=out.str();}return false;};
   if(blocks.empty())return reject("EMPTY_BLOCKS");
-  while(max_factor<=128&&n/max_factor>=16)max_factor*=2;
-  max_factor/=2;
   const bool enough_resolution=n>=64&&max_factor>=8;
   const double family=2.0*m*m*max_factor;
   for(const ProbeMoments& block:blocks)if(block.frames!=blocks.front().frames)return reject("NONUNIFORM_BLOCKS");
@@ -1037,13 +1029,13 @@ BootstrapBand bootstrap_metric_band(const ProbeMoments& full,const std::vector<P
   result.diagnostic_stage="TAIL_CHECK";
   if(!block_product_tail_covered(blocks,covered,&result))return result;
   result.diagnostic_stage="BOOTSTRAP";result.bootstrap_started=true;
-  constexpr int replicates=500,min_blocks=16;int factor=1;
-  while(factor<=128&&static_cast<int>(blocks.size())/factor>=min_blocks){
+  constexpr int replicates=500;
+  for(const int factor:bootstrap_block_factors(blocks.size())){
     auto deviations=resample_percentile_deviations(blocks,factor,center,replicates,seed,matrix_metric,distance);
     if(deviations.empty()||!std::isfinite(deviations.back())){result.status="NUMERICAL_FAILURE";return stop("NONFINITE_BOOTSTRAP_DEVIATION");}
     // The raw 95th percentile under-covered correlated harmonic samples with this finite block count.
     const std::size_t q=static_cast<std::size_t>(std::ceil(0.99*replicates))-1;
-    result.level_radii.emplace_back(base_block_length*factor,deviations[q]);factor*=2;
+    result.level_radii.emplace_back(base_block_length*factor,deviations[q]);
   }
   result.diagnostic_stage="BLOCK_LENGTH_CHECK";
   if(result.level_radii.size()<3)return stop("BOOTSTRAP_LEVELS_TOO_FEW");
@@ -1370,16 +1362,6 @@ void merge_qr(std::vector<double>& total_r, std::vector<double>& total_z, const 
   std::vector<double> a(static_cast<std::size_t>(2*p)*p,0.0), y(2*p,0.0);
   for(int i=0;i<p;++i){y[i]=total_z[i];y[p+i]=next_z[i];for(int j=i;j<p;++j){a[static_cast<std::size_t>(i)*p+j]=total_r[static_cast<std::size_t>(i)*p+j];a[static_cast<std::size_t>(p+i)*p+j]=next_r[static_cast<std::size_t>(i)*p+j];}}
   householder_compress(a,y,2*p,p,total_r,total_z,discarded2);
-}
-
-std::vector<double> solve_upper(const std::vector<double>& r,const std::vector<double>& z,const int p)
-{
-  std::vector<double> x=z;
-  double largest=0.0,smallest=std::numeric_limits<double>::infinity();
-  for(int i=0;i<p;++i){largest=std::max(largest,std::abs(r[static_cast<std::size_t>(i)*p+i]));smallest=std::min(smallest,std::abs(r[static_cast<std::size_t>(i)*p+i]));}
-  if (!(smallest>largest*1.0e-12)) throw std::runtime_error("native fit parameter family is rank deficient on training frames");
-  for(int i=p-1;i>=0;--i){for(int j=i+1;j<p;++j)x[i]-=r[static_cast<std::size_t>(i)*p+j]*x[j];x[i]/=r[static_cast<std::size_t>(i)*p+i];}
-  return x;
 }
 
 void make_edge_linear(const Graph& graph,const std::vector<double>& raw_gradient,const int n,

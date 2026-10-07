@@ -528,7 +528,6 @@ __global__ void probe_product(const double* a, const double* x, double* y, int n
 
 void write_value(std::ostream& out, const int value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
 void write_value(std::ostream& out, const std::uint64_t value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
-void write_value(std::ostream& out, const double value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
 
 void write_tile(std::ostream& out, const RpmdJAMatrixTile& tile)
 {
