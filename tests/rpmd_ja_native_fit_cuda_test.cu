@@ -7,8 +7,10 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <random>
 #include <sstream>
 
 static std::vector<double> diagnostic_expected_r0;
@@ -145,6 +147,8 @@ void test_response_uncomputed_values_are_explicit()
   std::ostringstream summary;write_response_stats(summary,response);
   assert(summary.str().find("observed_cov_status=NOT_COMPUTED")!=std::string::npos);
   assert(summary.str().find("predicted_cov_status=NOT_COMPUTED")!=std::string::npos);
+  assert(summary.str().find("response_uncertainty_status=NOT_COMPUTED")!=std::string::npos);
+  assert(summary.str().find("ibp_uncertainty_status=NOT_COMPUTED")!=std::string::npos);
   assert(summary.str().find("response_ibp_status=NOT_COMPUTED")!=std::string::npos);
   assert(summary.str().find("force_residual_status=NOT_COMPUTED")!=std::string::npos);
 }
@@ -152,17 +156,144 @@ void test_response_uncomputed_values_are_explicit()
 void test_probe_moments_centering_and_small_segments()
 {
   ProbeMoments moments(1),shifted(1),wrong_force(1);
-  const double amplitude=std::sqrt(0.5),kbt=1.0;
-  for(const double delta:{amplitude,-amplitude}){
-    const std::vector<double> q={delta},f={-2.0*delta},q_shifted={delta+17.0},f_wrong={-3.0*delta};
+  const double kbt=1.0;
+  for(const double delta:{1.0,-1.0}){
+    const std::vector<double> q={delta},f={-delta},q_shifted={delta+17.0},f_wrong={-2.0*delta};
     moments.add(q,f);shifted.add(q_shifted,f);wrong_force.add(q,f_wrong);
   }
-  assert(std::abs(moments.covariance_q()[0]-0.5)<1e-14);
+  assert(moments.covariance_q()[0]==1.0);
   assert(std::abs(shifted.covariance_q()[0]-moments.covariance_q()[0])<1e-14);
   assert(std::abs(moments.ibp_matrix(kbt)[0])<1e-14);
   assert(std::abs(shifted.ibp_matrix(kbt)[0]-moments.ibp_matrix(kbt)[0])<1e-14);
   assert(std::abs(wrong_force.ibp_matrix(kbt)[0])>0.4);
   assert(std::string(probe_sample_status(2,3))=="INSUFFICIENT_SAMPLES");
+}
+
+void test_block_bootstrap_uses_matrix_error_radius()
+{
+  const std::vector<double> first={1.0,0.0,0.0,0.0},second={0.0,0.0,0.0,1.0};
+  assert(nonsymmetric_spectral_norm(first,2)==nonsymmetric_spectral_norm(second,2));
+  assert(std::abs(symmetric_matrix_distance(first,second,2)-1.0)<1e-12);
+
+  auto make_blocks=[](const double force_scale){
+    std::vector<ProbeMoments> blocks;ProbeMoments full(1);
+    std::vector<double> amplitudes(512,1.0);std::fill(amplitudes.begin()+256,amplitudes.end(),std::sqrt(3.0));
+    std::mt19937_64 random(7);std::shuffle(amplitudes.begin(),amplitudes.end(),random);
+    for(double q:amplitudes){ProbeMoments moment(1);
+      moment.add({q},{force_scale*q});moment.add({-q},{-force_scale*q});full.merge(moment);blocks.push_back(std::move(moment));}
+    return std::make_pair(std::move(full),std::move(blocks));
+  };
+  auto correct=make_blocks(-1.0);const BootstrapBand pass=bootstrap_ibp_band(correct.first,correct.second,2,2.0,0.15,7);
+  assert(pass.status=="IBP_PASS"&&pass.block_lengths_stable&&std::abs(pass.estimate)<1e-14);
+  auto biased=make_blocks(-2.0);const BootstrapBand fail=bootstrap_ibp_band(biased.first,biased.second,2,2.0,0.15,7);
+  assert(fail.status=="IBP_FAIL"&&fail.lower>0.15);
+  biased.second.resize(8);const BootstrapBand insufficient=bootstrap_ibp_band(biased.first,biased.second,2,2.0,0.15,7);
+  assert(insufficient.status=="IBP_INCONCLUSIVE"&&!insufficient.block_lengths_stable);
+
+  const BootstrapBand response=bootstrap_metric_band(correct.first,biased.second,2,0.15,7,
+    [](const ProbeMoments& moments){return moments.covariance_q();},
+    [](const std::vector<double>& matrix){return max_abs_symmetric_eigenvalue(matrix,1);},
+    [](const std::vector<double>& a,const std::vector<double>& b){return symmetric_matrix_distance(a,b,1);},
+    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE");
+  assert(response.status=="RESPONSE_INCONCLUSIVE");
+}
+
+void test_bootstrap_uses_matching_complete_frames_and_circular_blocks()
+{
+  std::vector<ProbeMoments> blocks;
+  for(int i=0;i<5;++i){ProbeMoments block(1);block.add({static_cast<double>(i)},{-static_cast<double>(i)});blocks.push_back(std::move(block));}
+  const auto deviations=resample_percentile_deviations(blocks,2,{5.0},32,17,
+    [](const ProbeMoments& moments){return std::vector<double>{static_cast<double>(moments.frames)};},
+    [](const std::vector<double>& sample,const std::vector<double>& center){return std::abs(sample[0]-center[0]);});
+  assert(deviations.size()==32&&std::all_of(deviations.begin(),deviations.end(),[](double value){return value==0.0;}));
+
+  ProbeMoments full(1);std::vector<ProbeMoments> complete_blocks;
+  for(int b=0;b<64;++b){ProbeMoments block(1);for(int i=0;i<3;++i)block.add({1.0},{-1.0});full.merge(block);complete_blocks.push_back(std::move(block));}
+  full.add({100.0},{-100.0});full.add({101.0},{-101.0});
+  const BootstrapBand band=bootstrap_metric_band(full,complete_blocks,3,0.15,23,
+    [](const ProbeMoments& moments){return moments.covariance_q();},
+    [](const std::vector<double>& matrix){return max_abs_symmetric_eigenvalue(matrix,1);},
+    [](const std::vector<double>& a,const std::vector<double>& b){return symmetric_matrix_distance(a,b,1);},
+    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE");
+  assert(band.frames==192&&full.frames==194&&band.estimate==0.0&&band.status=="RESPONSE_INCONCLUSIVE");
+
+  ProbeMoments tail_base(1),tail_changed(1);std::vector<ProbeMoments> tail_blocks;std::uint32_t state=36;
+  for(int b=0;b<512;++b){state=1664525U*state+1013904223U;const double q=2.0*static_cast<double>(state)/4294967296.0-1.0;
+    ProbeMoments block(1);for(int i=0;i<4;++i)block.add({q},{-q});tail_base.merge(block);tail_changed.merge(block);tail_blocks.push_back(std::move(block));}
+  tail_base.add({0.0},{0.0});tail_changed.add({2000.0},{300.0});
+  assert(block_product_tail_covered(tail_blocks,tail_base));
+  assert(!block_product_tail_covered(tail_blocks,tail_changed));
+  const BootstrapBand base_ibp_band=bootstrap_ibp_band(tail_base,tail_blocks,4,1.0,0.15,41);
+  const BootstrapBand changed_ibp_band=bootstrap_ibp_band(tail_changed,tail_blocks,4,1.0,0.15,41);
+  assert(base_ibp_band.estimate==changed_ibp_band.estimate&&base_ibp_band.status==changed_ibp_band.status);
+  const auto frame_metric=[](const ProbeMoments& moments){return std::vector<double>{static_cast<double>(moments.frames)};};
+  const auto frame_norm=[](const std::vector<double>& value){return std::abs(value[0]);};
+  const auto frame_distance=[](const std::vector<double>& a,const std::vector<double>& b){return std::abs(a[0]-b[0]);};
+  const BootstrapBand base_tail_band=bootstrap_metric_band(tail_base,tail_blocks,4,3000.0,41,frame_metric,frame_norm,frame_distance,
+    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE");
+  const BootstrapBand changed_tail_band=bootstrap_metric_band(tail_changed,tail_blocks,4,3000.0,41,frame_metric,frame_norm,frame_distance,
+    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE");
+  assert(base_tail_band.frames==2048&&changed_tail_band.frames==2048);
+  assert(base_tail_band.estimate==changed_tail_band.estimate&&base_tail_band.status=="RESPONSE_PASS"&&changed_tail_band.status==base_tail_band.status);
+}
+
+void test_block_product_tail_uses_segment_centering()
+{
+  constexpr int frames=4096,block_length=4;const double rho=0.98;std::mt19937_64 random(0x9b05688c2b3e6c1fULL);std::normal_distribution<double> normal;
+  ProbeMoments full(1),shifted_full(1),pending(1),shifted_pending(1);std::vector<ProbeMoments> blocks,shifted_blocks;
+  double q=normal(random);int count=0;
+  for(int frame=0;frame<frames;++frame){if(frame)q=rho*q+std::sqrt(1.0-rho*rho)*normal(random);
+    full.add({q},{-q});shifted_full.add({q+17.0},{-q});pending.add({q},{-q});shifted_pending.add({q+17.0},{-q});
+    if(++count==block_length){blocks.push_back(std::move(pending));shifted_blocks.push_back(std::move(shifted_pending));pending=ProbeMoments(1);shifted_pending=ProbeMoments(1);count=0;}}
+  const bool original_tail=block_product_tail_covered(blocks,full),shifted_tail=block_product_tail_covered(shifted_blocks,shifted_full);
+  assert(original_tail&&shifted_tail);
+  const BootstrapBand original=bootstrap_ibp_band(full,blocks,block_length,1.0,0.15,31);
+  const BootstrapBand shifted=bootstrap_ibp_band(shifted_full,shifted_blocks,block_length,1.0,0.15,31);
+  assert(original.frames==frames&&shifted.frames==frames);
+  assert(std::abs(original.estimate-shifted.estimate)<1e-12&&original.status==shifted.status);
+}
+
+void test_bootstrap_nonfinite_is_numerical_failure()
+{
+  const double nan=std::numeric_limits<double>::quiet_NaN(),inf=std::numeric_limits<double>::infinity();
+  assert(!std::isfinite(max_abs_symmetric_eigenvalue({nan},1)));
+  assert(!std::isfinite(nonsymmetric_spectral_norm({inf},1)));
+  assert(!std::isfinite(nonsymmetric_spectral_norm({1.0e308},1)));
+  ProbeMoments overflow(1);overflow.add({1.0e200},{1.0e200});
+  const BootstrapBand band=bootstrap_ibp_band(overflow,{overflow},1,1.0,0.15,9);
+  assert(band.status=="NUMERICAL_FAILURE"&&!std::isfinite(band.estimate));
+}
+
+void test_slow_product_correlation_is_inconclusive()
+{
+  constexpr int frames=4096,block_length=4;std::normal_distribution<double> normal;
+  for(const double rho:{0.99,0.999}){
+    std::mt19937_64 random(0x1f83d9abfb41bd6bULL+static_cast<std::uint64_t>(rho*1000));
+    ProbeMoments full(1),pending(1);std::vector<ProbeMoments> blocks;blocks.reserve(frames/block_length);
+    double q=normal(random);int count=0;
+    for(int frame=0;frame<frames;++frame){if(frame)q=rho*q+std::sqrt(1.0-rho*rho)*normal(random);
+      full.add({q},{-q});pending.add({q},{-q});
+      if(++count==block_length){blocks.push_back(std::move(pending));pending=ProbeMoments(1);count=0;}}
+    const BootstrapBand band=bootstrap_ibp_band(full,blocks,block_length,1.0,0.15,static_cast<std::uint64_t>(rho*1000));
+    assert(band.status=="IBP_INCONCLUSIVE"&&!band.block_lengths_stable);
+  }
+}
+
+void test_block_bootstrap_harmonic_coverage()
+{
+  constexpr int frames=512,block_length=1,replicates=80,probes=2;const double rho=0.25;
+  std::mt19937_64 random(0x510e527fade682d1ULL);std::normal_distribution<double> normal;int stable=0,covered=0;
+  for(int trial=0;trial<replicates;++trial){ProbeMoments full(probes),pending(probes);std::vector<ProbeMoments> blocks;blocks.reserve(frames/block_length);
+    std::array<double,probes> q{};for(double& value:q)value=normal(random);
+    for(int frame=0;frame<frames;++frame){if(frame)for(double& value:q)value=rho*value+std::sqrt(1.0-rho*rho)*normal(random);
+      const std::vector<double> qv(q.begin(),q.end()),fv={-q[0],-q[1]};full.add(qv,fv);pending.add(qv,fv);
+      if((frame+1)%block_length==0){blocks.push_back(std::move(pending));pending=ProbeMoments(probes);}}
+    const BootstrapBand band=bootstrap_ibp_band(full,blocks,block_length,1.0,0.15,static_cast<std::uint64_t>(trial+1));
+    if(band.block_lengths_stable){++stable;if(band.lower<=0.0&&band.upper>=0.0)++covered;}
+  }
+  constexpr double declared_coverage=0.95,z_score=2.0;
+  assert(stable>=72);
+  assert(static_cast<double>(covered)/stable>=declared_coverage-z_score*std::sqrt(declared_coverage*(1.0-declared_coverage)/stable));
 }
 
 void test_check_samples_is_read_only()
@@ -706,6 +837,12 @@ int main()
   test_full_spd_failure_keeps_candidate_pack();
   test_response_uncomputed_values_are_explicit();
   test_probe_moments_centering_and_small_segments();
+  test_block_bootstrap_uses_matrix_error_radius();
+  test_bootstrap_uses_matching_complete_frames_and_circular_blocks();
+  test_block_product_tail_uses_segment_centering();
+  test_bootstrap_nonfinite_is_numerical_failure();
+  test_slow_product_correlation_is_inconclusive();
+  test_block_bootstrap_harmonic_coverage();
   test_check_samples_is_read_only();
   test_response_snapshot_preserves_recomputable_matrices();
   test_saved_sample_diagnostic();

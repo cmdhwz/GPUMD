@@ -16,6 +16,7 @@ struct RpmdJANativeFitOptions
   double cutoff = 0.0;
   double epsilon = 0.0;
   double response_tolerance = 0.0;
+  double ibp_tolerance = 0.15;
   double fd_step = 0.0;
   int sample_interval = 0;
   int max_stability_rounds = 160;

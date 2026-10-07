@@ -38,7 +38,14 @@ assert "ProbeMoments" in native_fit and "moments.ibp_matrix" in native_fit
 assert "moments.covariance_fq()" in native_fit and "lag_autocorrelation lags=1,2,5,10" in native_fit
 assert "std::vector<std::vector<double>> history" in native_fit and "history.size()>10" in native_fit
 assert "if(collect_lags){result.lags[0].add(qp)" in native_fit
-assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0);" in native_fit
+assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance)" in native_fit
+assert "sample_statistics.ibp_band.status!=\"IBP_PASS\"" in native_fit
+assert "bootstrap_metric_band" in native_fit and "nonsymmetric_matrix_distance" in native_fit
+assert "mean_f[i]*moment.sum_q[j]" in native_fit and "mean_q[j]*moment.sum_f[i]" in native_fit
+assert "blocks[(start+k)%count]" in native_fit and "result.frames=covered.frames" in native_fit
+assert "if(!block_product_tail_covered(blocks,covered))return result;" in native_fit
+assert 'std::printf("sampling evidence: %s; report=%s' in native_fit
+assert "response_band.status==\"RESPONSE_PASS\"" in native_fit and "ibp_band.status==\"IBP_PASS\"" in native_fit
 assert "collect_fixed_probe_statistics(in,header,header.frame_count,train,r0,true)" in native_fit
 assert "probe_sample_status" in native_fit and "INSUFFICIENT_SAMPLES" in native_fit
 assert "collect_fixed_probe_statistics(in,header,frame_count" in native_fit
