@@ -405,16 +405,63 @@ std::vector<double> theta_from_eta(const SmallSVD& svd,const std::vector<double>
   std::vector<double> theta(svd.p,0.0);for(int k=0;k<svd.p;++k){const double c=xi[k]/svd.singular[k];for(int i=0;i<svd.p;++i)theta[i]+=svd.vt[static_cast<std::size_t>(k)+static_cast<std::size_t>(i)*svd.p]*c;}return theta;
 }
 
-struct QPCertificate
+struct QPCertificateSummary
 {
-  std::vector<double> theta,primal_slack,allowed_error,dual_slack;
   double max_primal_violation=0.0,max_primal_excess=0.0,max_complementarity=0.0,max_stationarity=0.0;
   double minimum_primal_slack=std::numeric_limits<double>::infinity(),minimum_slack_allowed_error=0.0;
-  std::size_t minimum_slack_constraint_index=0,worst_primal_excess_index=0;
-  bool finite=true,primal_constraints_pass=true,accepted=false;
+  double worst_primal_slack=0.0,worst_primal_allowed_error=0.0;
+  double worst_complementarity_value=0.0,worst_complementarity_lambda=0.0,worst_complementarity_primal_slack=0.0,worst_complementarity_dual_slack=0.0;
+  double worst_stationarity_residual=0.0,max_lambda=0.0;
+  std::size_t minimum_slack_constraint_index=0,worst_primal_excess_index=0,worst_complementarity_index=0,worst_stationarity_index=0,max_lambda_index=0;
+  bool finite=true,diagnostic_finite=true,multipliers_nonnegative=true,primal_constraints_pass=true,accepted=false;
+};
+
+struct QPCertificate:QPCertificateSummary
+{
+  std::vector<double> theta,primal_slack,allowed_error,dual_slack;
 };
 
 constexpr double qp_complementarity_tolerance=1e-7,qp_stationarity_tolerance=1e-9;
+
+struct QPPolishDiagnostic
+{
+  int iteration=0;
+  std::size_t active_constraints=0,updates=0;
+  std::string failure_reason="none";
+  bool certificate_computed=false;
+  QPCertificateSummary certificate;
+};
+
+void write_qp_certificate_fields(std::ostream& out,const QPCertificateSummary& certificate,const double primal_tolerance)
+{
+  out<<"finite="<<(certificate.finite?1:0)
+    <<" diagnostic_finite="<<(certificate.diagnostic_finite?1:0)
+    <<" primal_pass="<<((certificate.primal_constraints_pass&&certificate.max_primal_violation<=primal_tolerance)?1:0)
+    <<" multipliers_pass="<<(certificate.multipliers_nonnegative?1:0)
+    <<" complementarity_pass="<<((std::isfinite(certificate.worst_complementarity_value)&&certificate.max_complementarity<=qp_complementarity_tolerance)?1:0)
+    <<" stationarity_pass="<<((std::isfinite(certificate.worst_stationarity_residual)&&certificate.max_stationarity<=qp_stationarity_tolerance)?1:0)
+    <<" accepted="<<(certificate.accepted?1:0)
+    <<" max_primal_violation="<<certificate.max_primal_violation
+    <<" max_primal_excess="<<certificate.max_primal_excess
+    <<" worst_primal_constraint="<<certificate.worst_primal_excess_index
+    <<" worst_primal_slack="<<certificate.worst_primal_slack
+    <<" worst_primal_allowed_error="<<certificate.worst_primal_allowed_error
+    <<" max_complementarity="<<certificate.max_complementarity
+    <<" worst_complementarity_constraint="<<certificate.worst_complementarity_index
+    <<" worst_complementarity_value="<<certificate.worst_complementarity_value
+    <<" worst_complementarity_lambda="<<certificate.worst_complementarity_lambda
+    <<" worst_complementarity_primal_slack="<<certificate.worst_complementarity_primal_slack
+    <<" worst_complementarity_dual_slack="<<certificate.worst_complementarity_dual_slack
+    <<" max_stationarity="<<certificate.max_stationarity
+    <<" worst_stationarity_component="<<certificate.worst_stationarity_index
+    <<" worst_stationarity_residual="<<certificate.worst_stationarity_residual
+    <<" max_lambda="<<certificate.max_lambda<<" max_lambda_index="<<certificate.max_lambda_index;
+}
+
+void write_uncomputed_qp_certificate_fields(std::ostream& out)
+{
+  out<<"finite=NOT_COMPUTED diagnostic_finite=NOT_COMPUTED primal_pass=NOT_COMPUTED multipliers_pass=NOT_COMPUTED complementarity_pass=NOT_COMPUTED stationarity_pass=NOT_COMPUTED";
+}
 
 QPCertificate check_cut_qp_kkt(const SmallSVD& svd,const std::vector<std::vector<double>>& rows,const std::vector<double>& rhs,
   const std::vector<std::vector<double>>& a,const std::vector<double>& b,const std::vector<double>& lambda,
@@ -423,12 +470,14 @@ QPCertificate check_cut_qp_kkt(const SmallSVD& svd,const std::vector<std::vector
   if(rows.size()!=rhs.size()||rows.size()!=a.size()||rows.size()!=b.size()||rows.size()!=lambda.size()||xi.size()!=static_cast<std::size_t>(svd.p))
     throw std::runtime_error("native fit stability QP certificate dimensions do not match");
   QPCertificate out;out.theta=theta_from_eta(svd,xi);out.primal_slack.resize(rows.size());out.allowed_error.resize(rows.size());out.dual_slack.resize(rows.size());
-  bool multipliers_nonnegative=true;
-  for(double value:lambda)if(!std::isfinite(value)||value<0.0){out.finite=false;multipliers_nonnegative=false;}
+  for(std::size_t i=0;i<lambda.size();++i){const double value=lambda[i];if(!std::isfinite(value)||value<0.0){out.finite=false;out.multipliers_nonnegative=false;}
+    if(std::isfinite(value)&&value>out.max_lambda){out.max_lambda=value;out.max_lambda_index=i;}}
+  bool diagnostic_finite=true,have_worst_complementarity=false,worst_complementarity_nonfinite=false;
   for(std::size_t i=0;i<rows.size();++i){
     if(rows[i].size()!=static_cast<std::size_t>(svd.p)||a[i].size()!=static_cast<std::size_t>(svd.p))throw std::runtime_error("native fit stability QP certificate row width does not match");
     const double primal=std::inner_product(rows[i].begin(),rows[i].end(),out.theta.begin(),0.0)-rhs[i];
     double scale=std::max(1.0,std::abs(rhs[i]));for(int k=0;k<svd.p;++k)scale+=std::abs(rows[i][k]*out.theta[k]);
+    if(!std::isfinite(scale))diagnostic_finite=false;
     const double allowed=std::min(primal_tolerance,256.0*std::numeric_limits<double>::epsilon()*scale);
     double shifted=0.0;for(int k=0;k<svd.p;++k)shifted+=a[i][k]*(xi[k]-svd.eta[k]);
     const double slack=shifted-b[i],complementarity=lambda[i]*slack;
@@ -437,13 +486,25 @@ QPCertificate check_cut_qp_kkt(const SmallSVD& svd,const std::vector<std::vector
     if(!std::isfinite(slack)||!std::isfinite(complementarity))out.finite=false;
     out.max_primal_violation=std::max(out.max_primal_violation,std::max(0.0,-primal));
     const double excess=std::max(0.0,-primal-allowed);
-    if(excess>out.max_primal_excess){out.max_primal_excess=excess;out.worst_primal_excess_index=i;}
+    if(i==0||excess>out.max_primal_excess){out.worst_primal_excess_index=i;out.worst_primal_slack=primal;out.worst_primal_allowed_error=allowed;}
+    if(excess>out.max_primal_excess)out.max_primal_excess=excess;
     out.max_complementarity=std::max(out.max_complementarity,std::abs(complementarity));
+    const double complementarity_abs=std::abs(complementarity);
+    if(!std::isfinite(complementarity_abs)){
+      if(!worst_complementarity_nonfinite){out.worst_complementarity_index=i;out.worst_complementarity_value=complementarity;out.worst_complementarity_lambda=lambda[i];
+        out.worst_complementarity_primal_slack=primal;out.worst_complementarity_dual_slack=slack;have_worst_complementarity=true;worst_complementarity_nonfinite=true;}
+    }else if(!worst_complementarity_nonfinite&&(!have_worst_complementarity||complementarity_abs>std::abs(out.worst_complementarity_value))){
+      out.worst_complementarity_index=i;out.worst_complementarity_value=complementarity;out.worst_complementarity_lambda=lambda[i];
+      out.worst_complementarity_primal_slack=primal;out.worst_complementarity_dual_slack=slack;have_worst_complementarity=true;}
     if(i==0||primal<out.minimum_primal_slack){out.minimum_slack_constraint_index=i;out.minimum_primal_slack=primal;out.minimum_slack_allowed_error=allowed;}
     if(primal < -allowed)out.primal_constraints_pass=false;
   }
-  for(int k=0;k<svd.p;++k){double stationarity=xi[k]-svd.eta[k];for(std::size_t i=0;i<rows.size();++i)stationarity-=a[i][k]*lambda[i];if(!std::isfinite(stationarity))out.finite=false;out.max_stationarity=std::max(out.max_stationarity,std::abs(stationarity));}
-  out.accepted=out.finite&&multipliers_nonnegative&&out.primal_constraints_pass&&out.max_primal_violation<=primal_tolerance&&
+  bool have_worst_stationarity=false,worst_stationarity_nonfinite=false;
+  for(int k=0;k<svd.p;++k){double stationarity=xi[k]-svd.eta[k];for(std::size_t i=0;i<rows.size();++i)stationarity-=a[i][k]*lambda[i];if(!std::isfinite(stationarity))out.finite=false;out.max_stationarity=std::max(out.max_stationarity,std::abs(stationarity));
+    if(!std::isfinite(stationarity)){if(!worst_stationarity_nonfinite){out.worst_stationarity_index=k;out.worst_stationarity_residual=stationarity;have_worst_stationarity=true;worst_stationarity_nonfinite=true;}}
+    else if(!worst_stationarity_nonfinite&&(!have_worst_stationarity||std::abs(stationarity)>std::abs(out.worst_stationarity_residual))){out.worst_stationarity_index=k;out.worst_stationarity_residual=stationarity;have_worst_stationarity=true;}}
+  out.diagnostic_finite=out.finite&&diagnostic_finite;
+  out.accepted=out.finite&&out.multipliers_nonnegative&&out.primal_constraints_pass&&out.max_primal_violation<=primal_tolerance&&
     out.max_complementarity<=qp_complementarity_tolerance&&out.max_stationarity<=qp_stationarity_tolerance;
   return out;
 }
@@ -460,6 +521,7 @@ struct QPSolution
   std::size_t polish_updates=0;
   std::size_t active_constraints=0;
   std::string polish_failure_reason="none";
+  std::vector<QPPolishDiagnostic> polish_diagnostics;
 };
 
 void write_cut_qp_state(const std::string& path,const int outer,const QPSolution& solution,const double primal_tolerance,
@@ -490,6 +552,16 @@ void write_cut_qp_state(const std::string& path,const int outer,const QPSolution
   out<<"gram "<<rows.size()<<' '<<rows.size()<<'\n';for(std::size_t i=0;i<rows.size();++i){for(std::size_t j=0;j<rows.size();++j)out<<gram[i*rows.size()+j]<<(j+1==rows.size()?'\n':' ');}
   out<<"constraint_state index primal_slack allowed_error primal_excess dual_slack lambda complementarity\n";
   for(std::size_t i=0;i<rows.size();++i)out<<i<<' '<<solution.certificate.primal_slack[i]<<' '<<solution.certificate.allowed_error[i]<<' '<<std::max(0.0,-solution.certificate.primal_slack[i]-solution.certificate.allowed_error[i])<<' '<<solution.certificate.dual_slack[i]<<' '<<solution.lambda[i]<<' '<<solution.lambda[i]*solution.certificate.dual_slack[i]<<'\n';
+  out<<"QP_COORDINATE_DIAGNOSTIC iteration="<<solution.iterations<<" certificate_status=COMPUTED ";
+  write_qp_certificate_fields(out,solution.certificate,primal_tolerance);out<<'\n';
+  for(const auto& diagnostic:solution.polish_diagnostics){
+    out<<"QP_POLISH_DIAGNOSTIC iteration="<<diagnostic.iteration<<" failure_reason="<<diagnostic.failure_reason
+      <<" active_constraints="<<diagnostic.active_constraints<<" updates="<<diagnostic.updates
+      <<" certificate_status="<<(diagnostic.certificate_computed?"COMPUTED":"NOT_COMPUTED")<<' ';
+    if(diagnostic.certificate_computed)write_qp_certificate_fields(out,diagnostic.certificate,primal_tolerance);
+    else write_uncomputed_qp_certificate_fields(out);
+    out<<'\n';
+  }
   out.close();if(!out)throw std::runtime_error("native fit failed writing QP state snapshot: "+path);
 }
 
@@ -498,6 +570,7 @@ struct ActiveSetPolishResult
   std::vector<double> lambda,xi;
   QPCertificate certificate;
   std::size_t active_constraints=0,updates=0;
+  bool certificate_computed=false;
   bool accepted=false;
   std::string failure_reason="none";
 };
@@ -573,7 +646,7 @@ ActiveSetPolishResult polish_cut_qp(cusolverDnHandle_t solver,const SmallSVD& sv
   if(m>std::numeric_limits<std::size_t>::max()-static_cast<std::size_t>(svd.p)||(m+static_cast<std::size_t>(svd.p))>std::numeric_limits<std::size_t>::max()/4){out.failure_reason="ACTIVE_UPDATE_LIMIT_OVERFLOW";return out;}
   const std::size_t update_limit=4*(m+static_cast<std::size_t>(svd.p));std::vector<std::size_t> active;std::vector<char> is_active(m,0);bool rank_restart_used=false;
   for(std::size_t i=0;i<m;++i){if(!std::isfinite(out.lambda[i])||out.lambda[i]<0.0){out.failure_reason="ACTIVE_INITIAL_MULTIPLIER_INVALID";return out;}if(out.lambda[i]>0.0){active.push_back(i);is_active[i]=1;}}
-  for(;;){out.active_constraints=active.size();std::vector<double> candidate_y(static_cast<std::size_t>(svd.p),0.0),lambda_star;
+  for(;;){out.certificate_computed=false;out.active_constraints=active.size();std::vector<double> candidate_y(static_cast<std::size_t>(svd.p),0.0),lambda_star;
     if(!active.empty()&&!solve_active_equalities(solver,a,b,active,svd.p,svd.eta,candidate_y,lambda_star,out.failure_reason)){
       if(rank_restart_used||out.failure_reason!="ACTIVE_MATRIX_NUMERICAL_RANK_DEFICIENT")return out;
       // Rebuild a dependent working set once; retain every cut for the full KKT check.
@@ -595,7 +668,7 @@ ActiveSetPolishResult polish_cut_qp(cusolverDnHandle_t solver,const SmallSVD& sv
     std::vector<std::size_t> remaining;remaining.reserve(active.size());for(std::size_t j=0;j<active.size();++j){const std::size_t row=active[j];if(lambda_star[j]==0.0){is_active[row]=0;if(out.updates==update_limit){out.failure_reason="ACTIVE_UPDATE_LIMIT";return out;}++out.updates;}else remaining.push_back(row);}active=std::move(remaining);
     // Keep the SVD primal solution; large multipliers amplify reconstruction roundoff.
     out.xi=svd.eta;for(int k=0;k<svd.p;++k)out.xi[k]+=candidate_y[k];
-    out.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,out.lambda,out.xi,primal_tolerance);if(out.certificate.accepted){out.accepted=true;out.failure_reason="none";out.active_constraints=active.size();return out;}
+    out.certificate=check_cut_qp_kkt(svd,rows,rhs,a,b,out.lambda,out.xi,primal_tolerance);out.certificate_computed=true;if(out.certificate.accepted){out.accepted=true;out.failure_reason="none";out.active_constraints=active.size();return out;}
     std::size_t worst=m;double worst_excess=0.0;
     for(std::size_t i=0;i<m;++i){const double excess=std::max(0.0,-out.certificate.primal_slack[i]-out.certificate.allowed_error[i]);if(excess<=0.0)continue;if(is_active[i]){out.failure_reason="ACTIVE_EQUALITY_KKT_MISMATCH";return out;}if(excess>worst_excess){worst=i;worst_excess=excess;}}
     if(worst<m){if(out.updates==update_limit){out.failure_reason="ACTIVE_UPDATE_LIMIT";return out;}active.push_back(worst);is_active[worst]=1;++out.updates;continue;}
@@ -618,6 +691,10 @@ QPSolution solve_cut_qp(cusolverDnHandle_t solver,const SmallSVD& svd,const std:
   auto coordinate_started=std::chrono::steady_clock::now();
   auto record_coordinate_time=[&](){const auto now=std::chrono::steady_clock::now();result.coordinate_seconds+=std::chrono::duration<double>(now-coordinate_started).count();coordinate_started=now;};
   auto try_polish=[&](){++result.polish_attempts;ActiveSetPolishResult polished;try{polished=polish_cut_qp(solver,svd,rows,rhs,a,b,result.lambda,primal_tolerance);}catch(...){polished.failure_reason="ACTIVE_INTERNAL_FAILURE";}
+    QPPolishDiagnostic diagnostic;diagnostic.iteration=result.iterations;diagnostic.active_constraints=polished.active_constraints;diagnostic.updates=polished.updates;
+    diagnostic.failure_reason=polished.failure_reason;diagnostic.certificate_computed=polished.certificate_computed;
+    if(diagnostic.certificate_computed)diagnostic.certificate=static_cast<const QPCertificateSummary&>(polished.certificate);
+    result.polish_diagnostics.push_back(std::move(diagnostic));
     result.active_constraints=polished.active_constraints;result.polish_updates+=polished.updates;result.polish_failure_reason=polished.failure_reason;
     if(!polished.accepted)return false;result.lambda=std::move(polished.lambda);result.xi=std::move(polished.xi);result.certificate=std::move(polished.certificate);result.method="active_set_polish";return true;};
   for(int it=0;it<max_iterations;++it){double change=0.0;for(std::size_t i=0;i<rows.size();++i){double residual=b[i];for(std::size_t j=0;j<rows.size();++j)residual-=gram[i*rows.size()+j]*result.lambda[j];const double next=std::max(0.0,result.lambda[i]+residual/diag[i]);if(!std::isfinite(next))throw std::runtime_error("native fit stability QP iterate is non-finite");change=std::max(change,std::abs(next-result.lambda[i]));result.lambda[i]=next;}result.iterations=it+1;result.last_multiplier_change=change;

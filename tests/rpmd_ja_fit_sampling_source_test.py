@@ -229,6 +229,15 @@ assert "first_polish_iteration=64,retry_polish_iteration=4096" in native_fit and
 assert "result.polish_attempts<3" in native_fit and "4*(m+static_cast<std::size_t>(svd.p))" in native_fit
 assert 'method="active_set_polish"' in native_fit and '<<" polish_attempts="' in native_fit
 assert "polish_failure_reason" in native_fit and "ACTIVE_FULL_KKT_NOT_ACCEPTED" in native_fit
+assert "QP_COORDINATE_DIAGNOSTIC" in native_fit and "QP_POLISH_DIAGNOSTIC" in native_fit
+assert 'diagnostic.certificate_computed?"COMPUTED":"NOT_COMPUTED"' in native_fit and "worst_complementarity_primal_slack" in native_fit
+assert "diagnostic_finite=out.finite&&diagnostic_finite" in native_fit
+assert "worst_stationarity_component" in native_fit and "max_lambda_index" in native_fit
+assert "diagnostic_scale_overflow.accepted&&diagnostic_scale_overflow.finite&&!diagnostic_scale_overflow.diagnostic_finite" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert '<<"finite="<<(certificate.finite?1:0)' in native_fit
+assert '<<" diagnostic_finite="<<(certificate.diagnostic_finite?1:0)' in native_fit
+assert "worst_complementarity_residual" not in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "saw_not_computed" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert '<<" coordinate_seconds="<<qp.coordinate_seconds<<" polish_seconds="<<qp.polish_seconds' in native_fit
 assert ' SEARCH warm_seconds=' in native_fit and 'independent_seconds=' in native_fit
 assert 'const int max_search_depth=std::min(384,d-3);' in native_fit
