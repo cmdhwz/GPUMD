@@ -51,13 +51,20 @@ assert 'if (tokens[1] == "check_samples")' in run
 assert 'check_rpmd_ja_native_fit_samples(tokens[2], tokens[3], atom, box)' in run
 assert "void check_rpmd_ja_native_fit_samples(" in native_header
 check_samples_start = native_fit.index("void check_rpmd_ja_native_fit_samples(")
-check_samples_end = native_fit.index("#else", check_samples_start)
+check_samples_end = native_fit.index("\n}\n\nvoid replay_rpmd_ja_native_cg", check_samples_start)
 check_samples_body = native_fit[check_samples_start:check_samples_end]
 assert "read_header(in,0,atom,box,0.0,true)" in check_samples_body
 assert "read_training_r0" in check_samples_body and "collect_fixed_probe_statistics" in check_samples_body
 assert "train,r0,true,0.15,&box" in check_samples_body
 assert "collect_fixed_probe_statistics" in check_samples_body and "format_fixed_probe_report" in check_samples_body
 assert "qraw" not in check_samples_body and "make_graph" not in check_samples_body and "lanczos" not in check_samples_body
+replay_body = native_fit[native_fit.index("void replay_rpmd_ja_native_cg("):native_fit.index("#else", native_fit.index("void replay_rpmd_ja_native_cg("))]
+assert replay_body.index("std::ifstream existing_report") < replay_body.index("read_cg_witness_paths")
+assert "validate_qraw_identity" in replay_body and "compute_cg_true_residual_compensated" in native_fit
+assert "fast_true_relative_residual" in replay_body and "compensated_true_relative_residual" in replay_body
+assert "NOT_ACCEPTED_REFERENCE" in replay_body and "write_text_exclusive" in replay_body
+assert "solve_projected_cg" in replay_body and "make_graph(r0,header.types,box,snapshot.cutoff)" in replay_body
+assert "replay_cg" in run and "replay_rpmd_ja_native_cg" in run
 assert "cannot replace final response validation" in native_fit
 assert "ProbeMoments" in native_fit and "moments.ibp_matrix" in native_fit
 assert "sum_q,sum_f,sum_f2,sum_qq,sum_fq" in native_fit
@@ -158,7 +165,8 @@ assert "end == tokens.back().c_str() || *end != '\\0' || rounds <= 0" in fit_sam
 assert "max_rounds <N>" in fit_samples_parser and "[<qraw>] [max_rounds <N>]" in run
 assert "derived.temperature=header.temperature" in native_fit and "derived.sample_interval=static_cast<int>(std::llround(sample_interval))" in native_fit
 assert "fit_rpmd_ja_native_reference_checked(derived,spool_path,header.frame_count,atom,box,force,true)" in native_fit
-assert "raw_model!=expected_model||raw_config!=expected_config" in native_fit
+assert "validate_qraw_identity(raw,options,header,r0,box,force)" in native_fit
+assert "model!=expected_model||config!=expected_config" in native_fit
 assert "raw_types[i]==header.types[i]&&raw_masses[i]==header.masses[i]" in native_fit
 assert "raw_positions[i]-r0[i]" in native_fit
 assert "generate_raw&&std::remove(generated_raw_path.c_str())" in native_fit

@@ -51,3 +51,11 @@ void check_rpmd_ja_native_fit_samples(
   const std::string& report_path,
   Atom& atom,
   Box& box);
+
+void replay_rpmd_ja_native_cg(
+  const std::string& witness_path,
+  const std::string& report_path,
+  const bool internal_mass_com,
+  Atom& atom,
+  Box& box,
+  Force& force);

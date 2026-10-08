@@ -1231,6 +1231,65 @@ void test_projected_cg_curvature_witness()
   Graph edge;edge.edges.push_back({0,1,0,{0,0,0}});const std::vector<double> nonfinite_theta(6,std::numeric_limits<double>::quiet_NaN());const CGResult nonfinite=solve_projected_cg(positive,edge,basis[0],sqrt_mass,sqrt_atom,nonfinite_theta,n,4);assert(nonfinite.witness.classification=="NONFINITE_OPERATOR");
 }
 
+void test_compensated_cg_true_residual_action()
+{
+  constexpr int n=3,d=3*n;DeviceBaseline baseline;baseline.d=d;
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.k),static_cast<std::size_t>(d)*d*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.q),d*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.out),d*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.compensated_high),d*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.compensated_low),d*sizeof(double))==cudaSuccess);
+  assert(cublasCreate(&baseline.blas)==CUBLAS_STATUS_SUCCESS);
+  std::vector<double> matrix(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=1;i<d;++i)for(int j=0;j<d;++j)matrix[static_cast<std::size_t>(i)*d+j]=0.013*(i+1)-0.021*(j+1);
+  matrix[0]=1.0e16;matrix[1]=1.0;matrix[2]=-1.0e16;
+  assert(cudaMemcpy(baseline.k,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  std::vector<double> x(d,1.0),high(d),low(d),fast(d);baseline.apply_compensated(x,high,low);baseline.apply(x,fast);
+  for(int i=0;i<d;++i){NeumaierAccumulator expected;for(int j=0;j<d;++j)expected.add_product(matrix[static_cast<std::size_t>(i)*d+j],x[j]);
+    check_close(high[i]+low[i],expected.value(),1e-12*std::max(1.0,std::abs(expected.value())));}
+  check_close(high[0]+low[0],1.0,0.0);
+  const std::vector<double> masses={1.0,2.0,3.0};std::vector<double> sqrt_atom(n),sqrt_mass(d);
+  for(int i=0;i<n;++i)sqrt_atom[i]=std::sqrt(masses[i]);for(int a=0;a<3;++a)for(int i=0;i<n;++i)sqrt_mass[a*n+i]=sqrt_atom[i];
+  Graph graph;graph.edges.push_back({0,1,0,{0,0,0}});graph.edges.push_back({1,2,0,{0,0,0}});
+  const std::vector<double> theta={2.0,0.3,-0.2,1.7,0.4,2.3},rhs={0.2,-0.1,0.4,0.3,0.5,-0.2,0.1,-0.4,0.6};
+  const CGResidualComparison comparison=compare_cg_true_residuals(baseline,graph,rhs,x,sqrt_mass,sqrt_atom,theta,n);
+  assert(std::isfinite(comparison.fast_relative)&&std::isfinite(comparison.compensated_relative)&&std::isfinite(comparison.difference_norm));
+  for(int axis=0;axis<3;++axis){double translation=0.0;for(int i=0;i<n;++i)translation+=sqrt_atom[i]*comparison.compensated[axis*n+i];assert(std::abs(translation)<1e-10);}
+  const CGResidualComparison without_graph=compare_cg_true_residuals(baseline,Graph{},rhs,x,sqrt_mass,sqrt_atom,theta,n);
+  double graph_difference=0.0;for(int i=0;i<d;++i)graph_difference=std::hypot(graph_difference,comparison.compensated[i]-without_graph.compensated[i]);
+  assert(graph_difference>1e-8);
+
+  std::fill(matrix.begin(),matrix.end(),0.0);matrix[static_cast<std::size_t>(n)*d+n]=1.0e16;
+  matrix[static_cast<std::size_t>(n)*d+n+1]=1.0;matrix[static_cast<std::size_t>(n)*d+n+2]=-1.0e16;
+  assert(cudaMemcpy(baseline.k,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  const double qi=3000000.0000000005,qj=7000000.000000001;
+  const std::vector<double> precise_x={qi,qj,0.0,1.0,1.0,1.0,0.0,0.0,0.0};
+  const std::vector<double> precise_sqrt_atom={3.0,7.0,2.0};
+  for(int axis=0;axis<3;++axis)for(int i=0;i<n;++i)sqrt_mass[axis*n+i]=precise_sqrt_atom[i];
+  Graph precise_graph;precise_graph.edges.push_back({0,1,0,{0,0,0}});
+  const std::vector<double> precise_theta={80.0,0.0,0.0,0.0,0.0,0.0};
+  std::vector<double> precise_rhs(d,0.0);precise_rhs[n]=std::nextafter(1.0,2.0);
+  assert(qj/sqrt_mass[1]-qi/sqrt_mass[0]==0.0);
+  const CGResidualComparison precise=compare_cg_true_residuals(baseline,precise_graph,precise_rhs,precise_x,
+    sqrt_mass,precise_sqrt_atom,precise_theta,n);
+  // Independent 90-digit reference, rounded to double for these exact binary inputs.
+  const double expected[]={-5.9131592039077998e-10,2.5342110873890574e-10,0.0,
+    1.8981232356494612e-16,-7.5208656506865438e-17,-2.1488187573390126e-17,0.0,0.0,0.0};
+  const double tolerances[]={5e-24,5e-24,5e-24,5e-30,5e-30,5e-30,5e-30,5e-30,5e-30};
+  for(int i=0;i<d;++i)assert(std::abs(precise.compensated[i]-expected[i])<tolerances[i]);
+}
+
+void test_replay_rejects_existing_report_before_reading_inputs()
+{
+  const std::string report="rpmd_ja_cg_replay_existing_report_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";
+  RemoveTestFile cleanup{report};{std::ofstream out(report,std::ios::binary);out<<"preserve this report";assert(out.good());}
+  Atom atom;Box box{};Force force;bool rejected_early=false;
+  try{replay_rpmd_ja_native_cg("missing_witness_for_early_report_check",report,false,atom,box,force);}
+  catch(const std::runtime_error& error){rejected_early=std::string(error.what()).find("report already exists")!=std::string::npos;}
+  assert(rejected_early&&read_test_file(report)=="preserve this report");
+}
+
 void test_cg_failure_snapshot_round_trip_replay()
 {
   const double offset=std::ldexp(1.0,-27);
@@ -1269,6 +1328,9 @@ void test_cg_failure_snapshot_round_trip_replay()
   assert(snapshot.find("qraw_model_fingerprint 11")!=std::string::npos&&snapshot.find("active_config_fingerprint 12")!=std::string::npos);
   const auto saved_rhs=read_snapshot_vector(snapshot,"rhs_input_xyz_soa"),saved_projected_rhs=read_snapshot_vector(snapshot,"rhs_projected_xyz_soa"),saved_theta=read_snapshot_vector(snapshot,"theta"),saved_x=read_snapshot_vector(snapshot,"solution_x_xyz_soa");
   assert(saved_rhs==input_rhs&&saved_projected_rhs==projected_rhs&&saved_rhs!=saved_projected_rhs&&saved_theta==theta&&saved_x==failed.x);
+  const auto parsed_snapshot=read_cg_witness(path,d,0);assert(parsed_snapshot.classification=="TRUE_RESIDUAL_FAILURE"&&parsed_snapshot.qraw_path=="qraw_fixture");
+  assert(parsed_snapshot.rhs_input==saved_rhs&&parsed_snapshot.rhs_projected==saved_projected_rhs&&parsed_snapshot.solution==saved_x);
+  const auto parsed_paths=read_cg_witness_paths(path);assert(parsed_paths.first=="qraw_fixture"&&parsed_paths.second=="samples_fixture");
   const CGResult replayed=solve_projected_cg(ill_baseline,Graph{},saved_rhs,sqrt_mass,sqrt_atom,saved_theta,n,7,saved_epsilon);
   assert(replayed.witness.classification=="TRUE_RESIDUAL_FAILURE"&&replayed.residual_restarts==2&&replayed.witness.residual_checks.size()==3);
   for(int i=0;i<3;++i){check_close(replayed.witness.residual_checks[i].recursive_relative,failed.witness.residual_checks[i].recursive_relative,1e-10);
@@ -1516,6 +1578,8 @@ int main()
   test_lanczos_deep_search_does_not_early_cut(qr.solver);
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
+  test_compensated_cg_true_residual_action();
+  test_replay_rejects_existing_report_before_reading_inputs();
   test_cg_failure_snapshot_round_trip_replay();
   test_lanczos_blindspot_cg_cut_feedback(qr.solver);
   test_lanczos_independent_seed_escapes_invariant_subspace(qr.solver);
