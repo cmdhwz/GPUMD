@@ -1231,6 +1231,65 @@ void test_projected_cg_curvature_witness()
   Graph edge;edge.edges.push_back({0,1,0,{0,0,0}});const std::vector<double> nonfinite_theta(6,std::numeric_limits<double>::quiet_NaN());const CGResult nonfinite=solve_projected_cg(positive,edge,basis[0],sqrt_mass,sqrt_atom,nonfinite_theta,n,4);assert(nonfinite.witness.classification=="NONFINITE_OPERATOR");
 }
 
+void test_bounded_cg_replay_refinement()
+{
+  constexpr int n=2,d=3*n;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);
+  const auto basis=internal_basis(n);std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=1.0;
+  std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));stream.seekg(0);
+  DeviceBaseline baseline;baseline.initialize(stream,0,d,n,masses,sqrt_mass);std::vector<double> saved_x=basis[0];for(double& value:saved_x)value*=0.9;
+  const std::vector<double> theta;const CGResidualComparison initial=compare_cg_true_residuals(baseline,Graph{},basis[0],saved_x,sqrt_mass,sqrt_atom,theta,n);
+  std::vector<double> matrix_before(raw.size());assert(cudaMemcpy(matrix_before.data(),baseline.k,raw.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  const CGReplayRefinement refined=refine_cg_replay_solution(baseline,Graph{},basis[0],saved_x,sqrt_mass,sqrt_atom,theta,n,0,initial);
+  assert(refined.status=="COMPENSATED_RESIDUAL_TARGET_REACHED"&&refined.rounds.size()==1);
+  assert(refined.residuals.compensated_relative<initial.compensated_relative&&refined.residuals.compensated_relative<=1e-8);
+  assert(refined.residuals.fast_relative<=1e-8&&refined.dense_matrix_actions<=4096);
+  for(int i=0;i<d;++i)check_close(refined.solution[i],basis[0][i],1e-8);
+  std::vector<double> matrix_after(raw.size());assert(cudaMemcpy(matrix_after.data(),baseline.k,raw.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  assert(matrix_after==matrix_before&&theta.empty());
+
+  std::fill(raw.begin(),raw.end(),0.0);std::stringstream singular_stream(std::ios::in|std::ios::out|std::ios::binary);
+  singular_stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));singular_stream.seekg(0);
+  DeviceBaseline singular;singular.initialize(singular_stream,0,d,n,masses,sqrt_mass);
+  const CGResidualComparison singular_initial=compare_cg_true_residuals(singular,Graph{},basis[0],saved_x,sqrt_mass,sqrt_atom,theta,n);
+  const CGReplayRefinement rejected=refine_cg_replay_solution(singular,Graph{},basis[0],saved_x,sqrt_mass,sqrt_atom,theta,n,0,singular_initial);
+  assert(rejected.status=="CORRECTION_NONPOSITIVE_OPERATOR_DIRECTION"&&rejected.rounds.size()==1);
+  assert(rejected.rounds[0].status=="NONPOSITIVE_OPERATOR_DIRECTION"&&rejected.solution==saved_x);
+
+  CGResidualComparison adverse_initial=initial;
+  for(double& value:adverse_initial.compensated)value=-value;
+  const CGReplayRefinement no_decrease=refine_cg_replay_solution(baseline,Graph{},basis[0],saved_x,sqrt_mass,sqrt_atom,theta,n,0,adverse_initial);
+  assert(no_decrease.status=="NO_RESIDUAL_DECREASE"&&no_decrease.rounds.size()==1);
+  assert(no_decrease.solution==saved_x&&no_decrease.residuals.compensated==adverse_initial.compensated);
+
+  std::vector<double> multi_mode_raw(static_cast<std::size_t>(d)*d,0.0);
+  const double eigenvalues[]={1.0,100.0,10000.0};
+  for(int mode=0;mode<3;++mode)for(int i=0;i<d;++i)for(int j=0;j<d;++j)
+    multi_mode_raw[static_cast<std::size_t>(i)*d+j]+=eigenvalues[mode]*basis[mode][i]*basis[mode][j];
+  std::stringstream multi_mode_stream(std::ios::in|std::ios::out|std::ios::binary);
+  multi_mode_stream.write(reinterpret_cast<const char*>(multi_mode_raw.data()),multi_mode_raw.size()*sizeof(double));multi_mode_stream.seekg(0);
+  DeviceBaseline multi_mode;multi_mode.initialize(multi_mode_stream,0,d,n,masses,sqrt_mass);
+  std::vector<double> multi_mode_rhs(d,0.0),zero_solution(d,0.0);
+  for(int mode=0;mode<3;++mode)for(int i=0;i<d;++i)multi_mode_rhs[i]+=basis[mode][i];
+  const CGResidualComparison multi_mode_initial=compare_cg_true_residuals(multi_mode,Graph{},multi_mode_rhs,zero_solution,sqrt_mass,sqrt_atom,theta,n);
+  const CGReplayRefinement budget_limited=refine_cg_replay_solution(multi_mode,Graph{},multi_mode_rhs,zero_solution,sqrt_mass,sqrt_atom,theta,n,0,multi_mode_initial,1,7);
+  assert(budget_limited.status=="MATRIX_ACTION_LIMIT"&&budget_limited.rounds.size()==1);
+  assert(budget_limited.rounds[0].status=="MATRIX_ACTION_LIMIT"&&budget_limited.rounds[0].solver_counts_available);
+  assert(budget_limited.rounds[0].iterations==2&&budget_limited.rounds[0].dense_matrix_actions==2);
+  assert(budget_limited.dense_matrix_actions==2&&budget_limited.dense_matrix_actions<=7);
+  assert(budget_limited.solution==zero_solution);
+  std::ostringstream budget_report;write_cg_replay_refinement_round(budget_report,1,budget_limited.rounds[0]);
+  assert(budget_report.str().find("iterations 2")!=std::string::npos);
+
+  DeviceBaseline unavailable;unavailable.d=d;
+  const CGReplayRefinement exception=refine_cg_replay_solution(unavailable,Graph{},basis[0],saved_x,sqrt_mass,sqrt_atom,theta,n,0,initial);
+  assert(exception.status=="CORRECTION_CG_EXCEPTION"&&exception.rounds.size()==1);
+  assert(!exception.rounds[0].solver_counts_available&&exception.solution==saved_x);
+  std::ostringstream exception_report;write_cg_replay_refinement_round(exception_report,1,exception.rounds[0]);
+  assert(exception_report.str().find("iterations NOT_AVAILABLE")!=std::string::npos);
+  assert(exception_report.str().find("restarts NOT_AVAILABLE")!=std::string::npos);
+}
+
 void test_compensated_cg_true_residual_action()
 {
   constexpr int n=3,d=3*n;DeviceBaseline baseline;baseline.d=d;
@@ -1606,6 +1665,7 @@ int main()
   test_lanczos_deep_search_does_not_early_cut(qr.solver);
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
+  test_bounded_cg_replay_refinement();
   test_compensated_cg_true_residual_action();
   test_replay_rejects_existing_report_before_reading_inputs();
   test_cg_failure_snapshot_round_trip_replay();

@@ -1308,13 +1308,16 @@ bool preserve_candidate_package_on_full_spd_failure(const std::string& message,b
   pack_owned=false;return true;
 }
 CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
-  const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<double>& theta,const int n,const int probe=-1,const double epsilon=0.0)
+  const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<double>& theta,const int n,const int probe=-1,const double epsilon=0.0,
+  const double relative_tolerance=1e-8,const int max_iterations=20000,const bool return_on_iteration_limit=false)
 {
+  if(!(relative_tolerance>0.0)||!(relative_tolerance<1.0)||!std::isfinite(relative_tolerance)||max_iterations<=0)
+    throw std::invalid_argument("native fit projected CG tolerance or iteration limit is invalid");
   CGResult out;out.x.assign(rhs.size(),0.0);std::vector<double> r=rhs,p=rhs,ap(rhs.size());project_translation(r,sqrt_atom,n);p=r;
   const std::vector<double> projected_rhs=r;double rr=compensated_dot(r,r);const double initial=std::sqrt(rr);if(!(initial>0.0)||!std::isfinite(initial))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response probe has zero or non-finite norm");
   auto record_failure=[&](const char* classification,const int it){CGWitness& w=out.witness;w.classification=classification;w.probe=probe;w.iteration=it;w.residual_restarts=out.residual_restarts;w.p2=compensated_dot(p,p);w.pap=compensated_dot(p,ap);w.relative_residual=std::sqrt(rr)/initial;w.recursive_relative_residual=w.relative_residual;out.recursive_relative_residual=w.relative_residual;if(w.p2>0.0&&std::isfinite(w.p2)){w.direction=p;for(double& x:w.direction)x/=std::sqrt(w.p2);baseline.apply(w.direction,w.base);apply_additive(graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.add);apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.action);std::vector<double> repeat(p.size());apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,repeat);w.rayleigh=compensated_dot(w.direction,w.action);w.base_rayleigh=compensated_dot(w.direction,w.base);w.add_rayleigh=compensated_dot(w.direction,w.add);w.repeat_rayleigh=compensated_dot(w.direction,repeat);for(std::size_t i=0;i<repeat.size();++i)w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,repeat[i]-w.action[i]);}w.finite=std::isfinite(w.p2)&&std::isfinite(w.pap)&&std::isfinite(w.relative_residual)&&std::all_of(w.base.begin(),w.base.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.add.begin(),w.add.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.action.begin(),w.action.end(),[](double x){return std::isfinite(x);});};
   std::vector<CGResidualCheck> residual_checks;
-  for(int it=0;it<20000;++it){out.iterations=it;project_translation(p,sqrt_atom,n);apply_total(baseline,graph,p,sqrt_mass,sqrt_atom,theta,n,ap);const double pap=compensated_dot(p,ap);if(!std::all_of(ap.begin(),ap.end(),[](double x){return std::isfinite(x);} )){
+  for(int it=0;it<max_iterations;++it){out.iterations=it;project_translation(p,sqrt_atom,n);apply_total(baseline,graph,p,sqrt_mass,sqrt_atom,theta,n,ap);const double pap=compensated_dot(p,ap);if(!std::all_of(ap.begin(),ap.end(),[](double x){return std::isfinite(x);} )){
       record_failure("NONFINITE_OPERATOR",it);return out;
     }
      if(!std::isfinite(pap)){record_failure("NONFINITE_CG_ARITHMETIC",it);return out;}
@@ -1339,10 +1342,118 @@ CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const st
        else {if(w.finite&&w.rayleigh>0.0&&w.rayleigh>=epsilon-w.curvature_tolerance)w.classification="NUMERICAL_BREAKDOWN";return out;}
     }
     const double alpha=rr/pap;for(std::size_t i=0;i<r.size();++i){out.x[i]=std::fma(alpha,p[i],out.x[i]);r[i]=std::fma(-alpha,ap[i],r[i]);}out.iterations=it+1;project_translation(r,sqrt_atom,n);
-     const double next=compensated_dot(r,r);out.relative_residual=std::sqrt(next)/initial;out.recursive_relative_residual=out.relative_residual;if(!std::isfinite(out.relative_residual)||!std::isfinite(alpha)||!std::isfinite(next))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG arithmetic became non-finite");if(out.relative_residual<=1e-8){const double recursive_relative=out.relative_residual;apply_total(baseline,graph,out.x,sqrt_mass,sqrt_atom,theta,n,ap);for(std::size_t i=0;i<r.size();++i)r[i]=std::fma(-1.0,ap[i],projected_rhs[i]);project_translation(r,sqrt_atom,n);const double true2=compensated_dot(r,r);out.relative_residual=std::sqrt(true2)/initial;if(!std::isfinite(out.relative_residual))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG true residual is non-finite");residual_checks.push_back({it+1,out.residual_restarts,recursive_relative,out.relative_residual});if(out.relative_residual<=1e-8)return out;if(out.residual_restarts>=2){set_true_residual_failure(out,probe,it+1,rhs,projected_rhs,recursive_relative,out.relative_residual,std::move(residual_checks));return out;}rr=true2;p=r;++out.residual_restarts;continue;}
+     const double next=compensated_dot(r,r);out.relative_residual=std::sqrt(next)/initial;out.recursive_relative_residual=out.relative_residual;if(!std::isfinite(out.relative_residual)||!std::isfinite(alpha)||!std::isfinite(next))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG arithmetic became non-finite");if(out.relative_residual<=relative_tolerance){const double recursive_relative=out.relative_residual;apply_total(baseline,graph,out.x,sqrt_mass,sqrt_atom,theta,n,ap);for(std::size_t i=0;i<r.size();++i)r[i]=std::fma(-1.0,ap[i],projected_rhs[i]);project_translation(r,sqrt_atom,n);const double true2=compensated_dot(r,r);out.relative_residual=std::sqrt(true2)/initial;if(!std::isfinite(out.relative_residual))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG true residual is non-finite");residual_checks.push_back({it+1,out.residual_restarts,recursive_relative,out.relative_residual});if(out.relative_residual<=relative_tolerance)return out;if(out.residual_restarts>=2){set_true_residual_failure(out,probe,it+1,rhs,projected_rhs,recursive_relative,out.relative_residual,std::move(residual_checks));return out;}rr=true2;p=r;++out.residual_restarts;continue;}
     const double beta=next/rr;for(std::size_t i=0;i<p.size();++i)p[i]=std::fma(beta,p[i],r[i]);project_translation(p,sqrt_atom,n);rr=next;
   }
-  throw std::runtime_error("NUMERICAL_BREAKDOWN: native fit response CG failed its 1e-8 residual tolerance");
+  if(return_on_iteration_limit){out.witness.classification="ITERATION_LIMIT";out.witness.probe=probe;out.witness.iteration=max_iterations;
+    out.witness.residual_restarts=out.residual_restarts;out.witness.relative_residual=out.relative_residual;
+    out.witness.recursive_relative_residual=out.recursive_relative_residual;return out;}
+  throw std::runtime_error(relative_tolerance==1e-8?
+    "NUMERICAL_BREAKDOWN: native fit response CG failed its 1e-8 residual tolerance":
+    "NUMERICAL_BREAKDOWN: native fit response CG failed its requested residual tolerance");
+}
+
+struct CGReplayRefinementRound
+{
+  std::string status,error;
+  int iterations=0,restarts=0;
+  bool solver_counts_available=false;
+  double recursive_relative=std::numeric_limits<double>::quiet_NaN();
+  double correction_relative=std::numeric_limits<double>::quiet_NaN();
+  double correction_norm=std::numeric_limits<double>::quiet_NaN();
+  double fast_relative=std::numeric_limits<double>::quiet_NaN();
+  double compensated_relative=std::numeric_limits<double>::quiet_NaN();
+  double seconds=0.0;
+  std::uint64_t dense_matrix_actions=0;
+};
+
+struct CGReplayRefinement
+{
+  std::vector<double> solution;
+  CGResidualComparison residuals;
+  std::vector<CGReplayRefinementRound> rounds;
+  std::string status;
+  std::uint64_t dense_matrix_actions=0;
+};
+
+CGReplayRefinement refine_cg_replay_solution(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
+  const std::vector<double>& saved_solution,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,
+  const std::vector<double>& theta,const int n,const int probe,const CGResidualComparison& saved_residuals,
+  const int max_rounds=3,const std::uint64_t max_dense_matrix_actions=4096)
+{
+  constexpr std::uint64_t reserved_matrix_actions=5; // Three CG checks/diagnostics plus two trial-residual actions.
+  constexpr double correction_relative_tolerance=1e-2;
+  constexpr double final_relative_tolerance=1e-8;
+  CGReplayRefinement result;result.solution=saved_solution;result.residuals=saved_residuals;
+  const std::uint64_t actions_start=baseline.dense_matrix_actions;
+  if(result.residuals.compensated_relative<=final_relative_tolerance){result.status="COMPENSATED_RESIDUAL_ALREADY_WITHIN_GATE";return result;}
+  for(int round=0;round<max_rounds;++round){
+    CGReplayRefinementRound record;const auto round_started=std::chrono::steady_clock::now();
+    const std::uint64_t used=baseline.dense_matrix_actions-actions_start;
+    if(used>max_dense_matrix_actions||max_dense_matrix_actions-used<=reserved_matrix_actions){result.status="MATRIX_ACTION_LIMIT";break;}
+    const int max_iterations=static_cast<int>(std::min<std::uint64_t>(20000,max_dense_matrix_actions-used-reserved_matrix_actions));
+    const bool matrix_action_limited=max_iterations<20000;
+    const std::uint64_t actions_before=baseline.dense_matrix_actions;
+    const std::vector<double> correction_rhs=result.residuals.compensated;
+    CGResult correction;
+    try{correction=solve_projected_cg(baseline,graph,correction_rhs,sqrt_mass,sqrt_atom,theta,n,probe,0.0,
+        correction_relative_tolerance,max_iterations,true);
+      record.status=correction.witness.classification.empty()?"CG_PASS":correction.witness.classification;
+      record.iterations=correction.iterations;record.restarts=correction.residual_restarts;record.solver_counts_available=true;
+      record.recursive_relative=correction.recursive_relative_residual;
+      if(correction.witness.classification.empty())record.correction_relative=correction.relative_residual;
+      else if(correction.witness.true_residual_computed)record.correction_relative=correction.witness.relative_residual;
+      if(record.status=="ITERATION_LIMIT"&&matrix_action_limited)record.status="MATRIX_ACTION_LIMIT";
+    }catch(const std::exception& error){record.error=error.what();record.status="CG_EXCEPTION";}
+    if(!record.status.empty()&&record.status!="CG_PASS"){
+      record.dense_matrix_actions=baseline.dense_matrix_actions-actions_before;
+      record.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-round_started).count();
+      result.rounds.push_back(std::move(record));result.status=result.rounds.back().status=="MATRIX_ACTION_LIMIT"?
+        "MATRIX_ACTION_LIMIT":"CORRECTION_"+result.rounds.back().status;break;
+    }
+    if(!std::all_of(correction.x.begin(),correction.x.end(),[](double value){return std::isfinite(value);} )){
+      record.status="NONFINITE_CORRECTION";record.dense_matrix_actions=baseline.dense_matrix_actions-actions_before;
+      record.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-round_started).count();
+      result.rounds.push_back(std::move(record));result.status="CORRECTION_NONFINITE";break;
+    }
+    record.correction_norm=std::sqrt(compensated_dot(correction.x,correction.x));
+    if(!std::isfinite(record.correction_norm)){
+      record.status="NONFINITE_CORRECTION_NORM";record.dense_matrix_actions=baseline.dense_matrix_actions-actions_before;
+      record.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-round_started).count();
+      result.rounds.push_back(std::move(record));result.status="CORRECTION_NONFINITE";break;
+    }
+    std::vector<double> trial_solution=result.solution;
+    for(std::size_t i=0;i<trial_solution.size();++i)trial_solution[i]=std::fma(1.0,correction.x[i],trial_solution[i]);
+    CGResidualComparison trial_residuals;
+    try{trial_residuals=compare_cg_true_residuals(baseline,graph,rhs,trial_solution,sqrt_mass,sqrt_atom,theta,n);}
+    catch(const std::exception& error){record.status="RESIDUAL_CHECK_EXCEPTION";record.error=error.what();
+      record.dense_matrix_actions=baseline.dense_matrix_actions-actions_before;record.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-round_started).count();
+      result.rounds.push_back(std::move(record));result.status="CORRECTION_RESIDUAL_CHECK_FAILED";break;}
+    record.fast_relative=trial_residuals.fast_relative;record.compensated_relative=trial_residuals.compensated_relative;
+    record.dense_matrix_actions=baseline.dense_matrix_actions-actions_before;
+    record.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-round_started).count();
+    if(!(trial_residuals.compensated_relative<result.residuals.compensated_relative)){
+      record.status="NO_RESIDUAL_DECREASE";result.rounds.push_back(std::move(record));result.status="NO_RESIDUAL_DECREASE";break;
+    }
+    result.solution=std::move(trial_solution);result.residuals=std::move(trial_residuals);result.rounds.push_back(std::move(record));
+    if(result.residuals.compensated_relative<=final_relative_tolerance){result.status="COMPENSATED_RESIDUAL_TARGET_REACHED";break;}
+  }
+  if(result.status.empty())result.status=result.rounds.size()>=static_cast<std::size_t>(max_rounds)?"ROUND_LIMIT":"STOPPED";
+  result.dense_matrix_actions=baseline.dense_matrix_actions-actions_start;
+  return result;
+}
+
+void write_cg_replay_refinement_round(std::ostream& report,const std::size_t index,const CGReplayRefinementRound& round)
+{
+  const auto write_value=[&](const double value){if(std::isfinite(value))report<<value;else report<<"NOT_COMPUTED";};
+  report<<"correction_round "<<index<<" status "<<round.status<<" iterations ";
+  if(round.solver_counts_available)report<<round.iterations;else report<<"NOT_AVAILABLE";
+  report<<" restarts ";if(round.solver_counts_available)report<<round.restarts;else report<<"NOT_AVAILABLE";
+  report<<" recursive_relative ";write_value(round.recursive_relative);
+  report<<" correction_relative ";write_value(round.correction_relative);report<<" correction_norm ";write_value(round.correction_norm);
+  report<<" fast_relative ";write_value(round.fast_relative);report<<" compensated_relative ";write_value(round.compensated_relative);
+  report<<" dense_matrix_actions "<<round.dense_matrix_actions<<" seconds ";write_value(round.seconds);
+  report<<" error "<<std::quoted(round.error)<<'\n';
 }
 
 struct ProbeOrigin
@@ -2633,6 +2744,10 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
   DeviceBaseline baseline;baseline.initialize(raw,identity.k_offset,d,n,header.masses,sqrt_mass);raw.close();
   const CGResidualComparison saved=compare_cg_true_residuals(baseline,candidate_graph,snapshot.rhs_input,snapshot.solution,
     sqrt_mass,sqrt_atom,snapshot.theta,n);
+  const auto refinement_started=std::chrono::steady_clock::now();
+  const CGReplayRefinement refinement=refine_cg_replay_solution(baseline,candidate_graph,snapshot.rhs_input,snapshot.solution,
+    sqrt_mass,sqrt_atom,snapshot.theta,n,snapshot.probe,saved);
+  const double refinement_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-refinement_started).count();
   const std::uint64_t actions_before=baseline.dense_matrix_actions;
   CGResult replay;std::string replay_status,replay_error;double replay_seconds=0.0;
   const auto replay_started=std::chrono::steady_clock::now();
@@ -2654,6 +2769,16 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
     <<"\nfast_true_relative_residual "<<saved.fast_relative
     <<"\ncompensated_true_relative_residual "<<saved.compensated_relative
     <<"\nresidual_vector_difference_norm "<<saved.difference_norm
+    <<"\ncorrection_refinement_status "<<refinement.status
+    <<"\ncorrection_refinement_rounds "<<refinement.rounds.size()
+    <<"\ncorrection_relative_target 0.01"
+    <<"\ncorrection_refinement_round_limit 3"
+    <<"\ncorrection_matrix_action_limit 4096"
+    <<"\ncorrection_dense_matrix_actions "<<refinement.dense_matrix_actions
+    <<"\ncorrection_seconds "<<refinement_seconds
+    <<"\nrefined_solution_fast_true_relative_residual "<<refinement.residuals.fast_relative
+    <<"\nrefined_solution_compensated_true_relative_residual "<<refinement.residuals.compensated_relative
+    <<"\nrefined_solution_vector_difference_norm "<<refinement.residuals.difference_norm
     <<"\nreplay_cg_status "<<replay_status<<"\nreplay_cg_iterations "<<replay_iterations
     <<"\nreplay_cg_residual_restarts "<<replay_restarts
     <<"\nreplay_cg_recursive_relative_residual ";
@@ -2665,12 +2790,17 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
   if(replay.witness.true_residual_computed)report<<replay.witness.relative_residual;
   else if(replay_status=="CG_PASS")report<<replay.relative_residual;
   else report<<"NOT_COMPUTED";
-  report<<"\nreplay_cg_error "<<std::quoted(replay_error)<<"\ntheta "<<snapshot.theta.size();
+  const auto write_diagnostic_value=[&](const double value){if(std::isfinite(value))report<<value;else report<<"NOT_COMPUTED";};
+  report<<"\nreplay_cg_error "<<std::quoted(replay_error)<<"\ncorrection_round_records "<<refinement.rounds.size()<<'\n';
+  for(std::size_t i=0;i<refinement.rounds.size();++i)write_cg_replay_refinement_round(report,i+1,refinement.rounds[i]);
+  report<<"refined_solution_x_xyz_soa "<<refinement.solution.size();for(double value:refinement.solution)report<<' '<<value;
+  report<<"\ntheta "<<snapshot.theta.size();
   for(double value:snapshot.theta)report<<' '<<value;
   report<<'\n';
   write_text_exclusive(report_path,report.str(),"CG replay report");
-  std::printf("rpmd_ja replay_cg: saved-x fast=%.9g compensated=%.9g vector_difference=%.9g; zero-start=%s iterations=%s actions=%llu; report=%s; NOT_ACCEPTED_REFERENCE\n",
-    saved.fast_relative,saved.compensated_relative,saved.difference_norm,replay_status.c_str(),replay_iterations.c_str(),
+  std::printf("rpmd_ja replay_cg: saved-x fast=%.9g compensated=%.9g; correction=%s fast=%.9g compensated=%.9g actions=%llu; zero-start=%s iterations=%s actions=%llu; report=%s; NOT_ACCEPTED_REFERENCE\n",
+    saved.fast_relative,saved.compensated_relative,refinement.status.c_str(),refinement.residuals.fast_relative,refinement.residuals.compensated_relative,
+    static_cast<unsigned long long>(refinement.dense_matrix_actions),replay_status.c_str(),replay_iterations.c_str(),
     static_cast<unsigned long long>(replay_actions),report_path.c_str());
 }
 #else

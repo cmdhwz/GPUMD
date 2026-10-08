@@ -244,6 +244,20 @@ assert "write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path
 assert "rhs_input_xyz_soa" in native_fit and "rhs_projected_xyz_soa" in native_fit and "solution_x_xyz_soa" in native_fit and "active_config_fingerprint" in native_fit
 assert 'true_residual_status "<<(w.true_residual_computed?"COMPUTED":"NOT_COMPUTED")' in native_fit
 assert 'cg_true_residual_status="<<(true_residual_computed?"COMPUTED":"NOT_COMPUTED")' in native_fit
+assert "CGReplayRefinement refine_cg_replay_solution(" in native_fit
+refinement_start = native_fit.index("CGReplayRefinement refine_cg_replay_solution(")
+refinement_body = native_fit[refinement_start:native_fit.index("struct ProbeOrigin", refinement_start)]
+refinement_signature = native_fit[refinement_start:native_fit.index("{", refinement_start)]
+assert "result.residuals.compensated" in refinement_body and "compare_cg_true_residuals" in refinement_body
+assert "max_rounds=3" in refinement_signature and "max_dense_matrix_actions=4096" in refinement_signature
+assert "record.iterations=max_iterations" not in refinement_body
+assert "solver_counts_available=false" in native_fit
+assert "write_cg_replay_refinement_round" in native_fit
+assert "test_bounded_cg_replay_refinement" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert '"NO_RESIDUAL_DECREASE"' in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert '"MATRIX_ACTION_LIMIT"' in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert '"iterations NOT_AVAILABLE"' in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "status NOT_ACCEPTED_REFERENCE" in native_fit[native_fit.index("void replay_rpmd_ja_native_cg("):native_fit.index("#else", native_fit.index("void replay_rpmd_ja_native_cg("))]
 assert "status CG_FAILURE classification=" in native_fit and "test_cg_failure_snapshot_round_trip_replay" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 cg_replay_test = source("tests/rpmd_ja_native_fit_cuda_test.cu").split("void test_cg_failure_snapshot_round_trip_replay()", 1)[1].split("\nvoid ", 1)[0]
 assert "solve_projected_cg(ill_baseline" in cg_replay_test and "failed.witness.residual_checks.size()==3" in cg_replay_test
