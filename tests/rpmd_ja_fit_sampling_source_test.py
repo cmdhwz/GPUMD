@@ -165,8 +165,8 @@ assert "generate_raw&&std::remove(generated_raw_path.c_str())" in native_fit
 assert "options.raw_input_path.empty()?generated_raw_path:options.raw_input_path" in native_fit
 assert '#include "force/nep_charge.cuh"' in native_fit
 assert 'record_search("FIXED_INDEPENDENT"' in native_fit
-assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,initial_vector,&lanczos_workspace)' in native_fit
-assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,{},&lanczos_workspace)' in native_fit
+assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,options.epsilon,initial_vector,&lanczos_workspace)' in native_fit
+assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,options.epsilon,{},&lanczos_workspace)' in native_fit
 assert "write_response_stats(trace,response_progress)" in native_fit
 assert "cublasDgemm(blas,CUBLAS_OP_T,CUBLAS_OP_N,d,columns,d" in native_fit
 assert "baseline.apply_batch(q_batch,columns,base_batch)" in native_fit
@@ -200,6 +200,24 @@ spectral_start = native_fit.index("std::vector<double> spectral_row(")
 spectral_end = native_fit.index("void apply_total(", spectral_start)
 assert "make_design(" not in native_fit[spectral_start:spectral_end]
 assert "block_variance_relative_delta" in native_fit
+assert "stability_cut_guard_fraction=1.0e-3" in native_fit
+assert "cut_target=options.epsilon+cut_guard" in native_fit
+assert "const double rhs=cut_target-base_value" in native_fit
+assert "used==32||used==64||used==128||used==256" in native_fit
+assert "actual_rayleigh" in native_fit and "curvature_scale" in native_fit and "dense_matrix_actions" in native_fit and "early_exit" in native_fit
+extract_start = native_fit.index("auto extract_modes=")
+extract_end = native_fit.index("for(int k=0;k<steps;++k)", extract_start)
+assert "r.dense_matrix_actions=dense_matrix_actions" not in native_fit[extract_start:extract_end]
+assert "for(auto& mode:out)mode.dense_matrix_actions=dense_matrix_actions" in native_fit[extract_start:extract_end]
+inspect_start = native_fit.index("auto inspect_modes=")
+inspect_end = native_fit.index("bool observed_violation=false", inspect_start)
+assert "spectral_row(" not in native_fit[inspect_start:inspect_end]
+assert "mode.curvature_tolerance" in native_fit[inspect_start:inspect_end]
+assert "stability_cut_is_violated" in native_fit
+assert "test_stability_cut_guard_reduces_rotating_mode_rounds" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_lanczos_staged_early_exit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_lanczos_continues_across_checkpoints" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_lanczos_curvature_rounding_boundary" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_fit_samples_entry_preserves_inputs" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_full_spd_failure_keeps_candidate_pack" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja_native_fit_cuda_test.cu")

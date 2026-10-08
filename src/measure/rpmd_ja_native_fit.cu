@@ -460,6 +460,7 @@ struct QPCertificate:QPCertificateSummary
 };
 
 constexpr double qp_complementarity_tolerance=1e-7,qp_stationarity_tolerance=1e-9;
+constexpr double stability_cut_guard_fraction=1.0e-3;
 
 struct QPPolishDiagnostic
 {
@@ -858,9 +859,12 @@ SmallEigen eigen_small(cusolverDnHandle_t solver,const std::vector<double>& rowm
   }catch(...){cleanup();throw;}cleanup();return out;
 }
 
-struct RitzMode{double value=0.0,residual=0.0,base_rayleigh=0.0,additive_rayleigh=0.0;std::vector<double> vector;};
+struct RitzMode{double value=0.0,actual_rayleigh=0.0,residual=0.0,base_rayleigh=0.0,additive_rayleigh=0.0,curvature_scale=0.0,curvature_tolerance=0.0;int steps_used=0,dense_matrix_actions=0;bool early_exit=false;std::vector<double> vector;};
+bool stability_cut_is_violated(const double rayleigh,const double epsilon,const double tolerance){return rayleigh<epsilon-tolerance;}
+std::vector<double> spectral_row(const Graph& graph,const std::vector<double>& v,const std::vector<double>& sqrt_mass,const int n,const int p);
+double curvature_rounding_tolerance(double epsilon,double base_rayleigh,const std::vector<double>& row,const std::vector<double>& theta,double& scale);
 std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline& baseline,const Graph& graph,
-  const std::vector<double>& theta,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const int n,const int max_steps,const int wanted,
+  const std::vector<double>& theta,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const int n,const int max_steps,const int wanted,const double epsilon,
   const std::vector<double>& initial_vector=std::vector<double>{},DeviceLanczosWorkspace* workspace=nullptr)
 {
   const int d=3*n;const int steps=std::min(max_steps,d-3);if(steps<=0)throw std::runtime_error("native fit Lanczos has no internal dimensions");
@@ -870,7 +874,7 @@ std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline
   auto dot=[&](const double* x,const double* y){double value=0.0;blas_check(cublasDdot(baseline.blas,d,x,1,y,1,&value),"native fit Lanczos dot product failed");return value;};
   auto norm=[&](const double* x){double value=0.0;blas_check(cublasDnrm2(baseline.blas,d,x,1,&value),"native fit Lanczos norm failed");return value;};
   auto axpy=[&](const double scale,const double* x,double* y){blas_check(cublasDaxpy(baseline.blas,d,&scale,x,1,y,1),"native fit Lanczos vector update failed");};
-  const double one=1.0,zero=0.0;workspace->set_theta(theta);
+  const double one=1.0,zero=0.0;workspace->set_theta(theta);int dense_matrix_actions=0;
   std::vector<double> initial(d);
   if(initial_vector.empty()){for(int i=0;i<d;++i)initial[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);}
   else{if(initial_vector.size()!=static_cast<std::size_t>(d))throw std::runtime_error("native fit Lanczos initial vector has an invalid dimension");initial=initial_vector;}
@@ -878,30 +882,38 @@ std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline
   workspace->project(workspace->v);double initial_norm=norm(workspace->v);if(!std::isfinite(initial_norm)||!(initial_norm>0.0))throw std::runtime_error("native fit Lanczos initial vector vanished or is non-finite");
   const double inverse_initial_norm=1.0/initial_norm;blas_check(cublasDscal(baseline.blas,d,&inverse_initial_norm,workspace->v,1),"native fit Lanczos initial vector normalization failed");
   std::vector<double> alpha,beta;double beta_prev=0.0;
+  auto extract_modes=[&](const int m,const bool early_exit){
+    std::vector<double> t(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i){t[static_cast<std::size_t>(i)*m+i]=alpha[i];if(i+1<m)t[static_cast<std::size_t>(i)*m+i+1]=t[static_cast<std::size_t>(i+1)*m+i]=beta[i];}
+    const SmallEigen eig=eigen_small(solver,t,m,wanted);std::vector<RitzMode> out;
+    for(int mode=0;mode<static_cast<int>(eig.values.size());++mode){RitzMode r;r.value=eig.values[mode];r.steps_used=m;r.early_exit=early_exit;std::vector<double> coefficients(m);for(int k=0;k<m;++k)coefficients[k]=eig.vectors[static_cast<std::size_t>(k)+static_cast<std::size_t>(mode)*m];
+      if(cudaMemcpy(workspace->coefficient,coefficients.data(),coefficients.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||cublasDgemv(baseline.blas,CUBLAS_OP_N,d,m,&one,workspace->basis,d,workspace->coefficient,1,&zero,workspace->ritz,1)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos Ritz reconstruction failed");
+      workspace->project(workspace->ritz);const double rnorm=norm(workspace->ritz);if(!std::isfinite(rnorm)||!(rnorm>0.0))throw std::runtime_error("native fit Lanczos Ritz vector is non-finite or translation-only");const double inverse_rnorm=1.0/rnorm;blas_check(cublasDscal(baseline.blas,d,&inverse_rnorm,workspace->ritz,1),"native fit Lanczos Ritz normalization failed");
+      if(baseline.apply_device(workspace->ritz,baseline.out)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos Ritz Hessian action failed");++dense_matrix_actions;workspace->additive_action(workspace->ritz);r.base_rayleigh=dot(workspace->ritz,baseline.out);r.additive_rayleigh=dot(workspace->ritz,workspace->add);
+      axpy(one,workspace->add,baseline.out);r.actual_rayleigh=dot(workspace->ritz,baseline.out);axpy(-r.actual_rayleigh,workspace->ritz,baseline.out);r.residual=norm(baseline.out);
+      r.vector.resize(d);if(cudaMemcpy(r.vector.data(),workspace->ritz,static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native fit Lanczos Ritz vector readback failed");const auto row=spectral_row(graph,r.vector,sqrt_mass,n,static_cast<int>(theta.size()));double scale=0.0;
+      r.curvature_tolerance=curvature_rounding_tolerance(epsilon,r.base_rayleigh,row,theta,scale);r.curvature_scale=scale;if(!std::isfinite(r.residual)||!std::isfinite(r.actual_rayleigh)||!std::isfinite(r.curvature_tolerance)||!std::isfinite(scale)||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("native fit Lanczos actual Ritz evidence is non-finite");
+      out.push_back(std::move(r));}
+    for(auto& mode:out)mode.dense_matrix_actions=dense_matrix_actions;
+    return out;
+  };
   for(int k=0;k<steps;++k){
-    if(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->basis+static_cast<std::size_t>(k)*d,1)!=CUBLAS_STATUS_SUCCESS||baseline.apply_device(workspace->v,baseline.out)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos basis or Hessian operation failed");
+    if(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->basis+static_cast<std::size_t>(k)*d,1)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos basis copy failed");
+    if(baseline.apply_device(workspace->v,baseline.out)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos basis Hessian operation failed");++dense_matrix_actions;
     workspace->additive_action(workspace->v);blas_check(cublasDcopy(baseline.blas,d,baseline.out,1,workspace->w,1),"native fit Lanczos operator copy failed");axpy(one,workspace->add,workspace->w);
     const double av_norm=norm(workspace->w);if(!std::isfinite(av_norm))throw std::runtime_error("native fit Lanczos operator norm is non-finite");
     if(k)axpy(-beta_prev,workspace->previous,workspace->w);const double a=dot(workspace->v,workspace->w);if(!std::isfinite(a))throw std::runtime_error("native fit Lanczos diagonal is non-finite");alpha.push_back(a);axpy(-a,workspace->v,workspace->w);
     workspace->project(workspace->w);
     for(int pass=0;pass<2;++pass){blas_check(cublasDgemv(baseline.blas,CUBLAS_OP_T,d,k+1,&one,workspace->basis,d,workspace->w,1,&zero,workspace->coefficient,1),"native fit Lanczos basis projection failed");
       const double minus_one=-1.0;blas_check(cublasDgemv(baseline.blas,CUBLAS_OP_N,d,k+1,&minus_one,workspace->basis,d,workspace->coefficient,1,&one,workspace->w,1),"native fit Lanczos reorthogonalization failed");}
-    workspace->project(workspace->w);
-    const double b=norm(workspace->w);if(!std::isfinite(b))throw std::runtime_error("native fit Lanczos residual norm is non-finite");beta.push_back(b);
-    const double operator_scale=std::max({av_norm,std::abs(a),std::abs(beta_prev)});
-    const double breakdown=64.0*std::numeric_limits<double>::epsilon()*operator_scale;
-    if(b<=breakdown||k==steps-1)break;
+    workspace->project(workspace->w);const double b=norm(workspace->w);if(!std::isfinite(b))throw std::runtime_error("native fit Lanczos residual norm is non-finite");beta.push_back(b);
+    const double operator_scale=std::max({av_norm,std::abs(a),std::abs(beta_prev)}),breakdown=64.0*std::numeric_limits<double>::epsilon()*operator_scale;
+    const int used=k+1;const bool search_finished=b<=breakdown||k==steps-1;
+    const bool checkpoint=search_finished||used==32||used==64||used==128||used==256;
+    if(checkpoint){auto modes=extract_modes(used,false);const bool below_threshold=std::any_of(modes.begin(),modes.end(),[&](const RitzMode& mode){return stability_cut_is_violated(mode.actual_rayleigh,epsilon,mode.curvature_tolerance);});
+      if(search_finished||below_threshold){if(!search_finished)for(auto& mode:modes)mode.early_exit=true;return modes;}}
     blas_check(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->previous,1),"native fit Lanczos previous-vector copy failed");blas_check(cublasDcopy(baseline.blas,d,workspace->w,1,workspace->v,1),"native fit Lanczos next-vector copy failed");const double inverse_b=1.0/b;blas_check(cublasDscal(baseline.blas,d,&inverse_b,workspace->v,1),"native fit Lanczos next-vector normalization failed");beta_prev=b;
   }
-  const int m=static_cast<int>(alpha.size());std::vector<double> t(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i){t[static_cast<std::size_t>(i)*m+i]=alpha[i];if(i+1<m)t[static_cast<std::size_t>(i)*m+i+1]=t[static_cast<std::size_t>(i+1)*m+i]=beta[i];}
-  const SmallEigen eig=eigen_small(solver,t,m,wanted);std::vector<RitzMode> out;
-  for(int mode=0;mode<static_cast<int>(eig.values.size());++mode){RitzMode r;r.value=eig.values[mode];std::vector<double> coefficients(m);for(int k=0;k<m;++k)coefficients[k]=eig.vectors[static_cast<std::size_t>(k)+static_cast<std::size_t>(mode)*m];
-    if(cudaMemcpy(workspace->coefficient,coefficients.data(),coefficients.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||cublasDgemv(baseline.blas,CUBLAS_OP_N,d,m,&one,workspace->basis,d,workspace->coefficient,1,&zero,workspace->ritz,1)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos Ritz reconstruction failed");
-    workspace->project(workspace->ritz);const double rnorm=norm(workspace->ritz);if(!std::isfinite(rnorm)||!(rnorm>0.0))throw std::runtime_error("native fit Lanczos Ritz vector is non-finite or translation-only");const double inverse_rnorm=1.0/rnorm;blas_check(cublasDscal(baseline.blas,d,&inverse_rnorm,workspace->ritz,1),"native fit Lanczos Ritz normalization failed");
-    if(baseline.apply_device(workspace->ritz,baseline.out)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos Ritz Hessian action failed");workspace->additive_action(workspace->ritz);r.base_rayleigh=dot(workspace->ritz,baseline.out);r.additive_rayleigh=dot(workspace->ritz,workspace->add);
-    axpy(one,workspace->add,baseline.out);axpy(-r.value,workspace->ritz,baseline.out);r.residual=norm(baseline.out);
-    if(!std::isfinite(r.residual)||!std::isfinite(r.base_rayleigh)||!std::isfinite(r.additive_rayleigh))throw std::runtime_error("native fit Lanczos actual Ritz residual is non-finite");r.vector.resize(d);if(cudaMemcpy(r.vector.data(),workspace->ritz,static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native fit Lanczos Ritz vector readback failed");out.push_back(std::move(r));}
-  return out;
+  return extract_modes(static_cast<int>(alpha.size()),false);
 }
 
 std::vector<double> spectral_row(const Graph& graph,const std::vector<double>& v,const std::vector<double>& sqrt_mass,
@@ -918,6 +930,13 @@ std::vector<double> spectral_row(const Graph& graph,const std::vector<double>& v
     row[c+3]+=dx[1]*dx[1];row[c+4]+=2.0*dx[1]*dx[2];row[c+5]+=dx[2]*dx[2];
   }
   return row;
+}
+
+double curvature_rounding_tolerance(const double epsilon,const double base_rayleigh,const std::vector<double>& row,
+  const std::vector<double>& theta,double& scale)
+{
+  scale=std::max(1.0,std::abs(base_rayleigh));for(std::size_t i=0;i<row.size();++i)scale+=std::abs(row[i]*theta[i]);
+  return std::min(epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);
 }
 
 void apply_total(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& q,const std::vector<double>& sqrt_mass,
@@ -1836,8 +1855,11 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
      !std::isfinite(options.cutoff)||options.cutoff<=0.0||!std::isfinite(options.epsilon)||options.epsilon<=0.0||
      !std::isfinite(options.response_tolerance)||options.response_tolerance<0.0||!std::isfinite(options.ibp_tolerance)||options.ibp_tolerance<0.0||!std::isfinite(options.fd_step)||options.fd_step<=0.0||
      options.sample_interval<=0||options.max_stability_rounds<=0||frame_count<3)throw std::invalid_argument("invalid native rpmd_ja fit options");
+  const double cut_guard=options.epsilon*stability_cut_guard_fraction,cut_target=options.epsilon+cut_guard;
+  if(!std::isfinite(cut_guard)||!(cut_guard>0.0)||!std::isfinite(cut_target)||!(cut_target>options.epsilon))throw std::invalid_argument("native fit epsilon cannot represent the stability cut guard");
   const int max_rounds=options.max_stability_rounds;
   std::printf("rpmd_ja fit stability round limit=%d\n",max_rounds);
+  std::printf("rpmd_ja fit stability cut epsilon=%.17g cut_guard=%.17g cut_target=%.17g\n",options.epsilon,cut_guard,cut_target);
   const int n=atom.number_of_atoms;
   if(frame_count>static_cast<std::uint64_t>(std::numeric_limits<int>::max())||n>std::numeric_limits<int>::max()/3)throw std::runtime_error("native fit dimensions exceed indexing limits");
   const int d=3*n,train=static_cast<int>(2*frame_count/3),validation=static_cast<int>(frame_count)-train;
@@ -1864,6 +1886,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     <<"\ncandidate_identity strategy native_additive_fixed_cutoff_graph output "<<std::quoted(options.output_path)<<" samples "<<std::quoted(spool_path)<<" raw "<<std::quoted(raw_path)
     <<"\ncandidate_parameters cutoff_A="<<options.cutoff<<" epsilon="<<options.epsilon<<" response_tolerance="<<options.response_tolerance
     <<" fd_step="<<options.fd_step<<" temperature_K="<<options.temperature<<" sample_interval="<<options.sample_interval
+    <<"\nstability_cut_policy epsilon="<<options.epsilon<<" cut_guard="<<cut_guard<<" cut_target="<<cut_target<<" guard_fraction="<<stability_cut_guard_fraction
     <<"\nsample_IBP_status "<<sample_statistics.ibp_band.status<<" estimate "<<sample_statistics.ibp_band.estimate<<" q99_radius "<<sample_statistics.ibp_band.radius
     <<" interval "<<sample_statistics.ibp_band.lower<<' '<<sample_statistics.ibp_band.upper<<" tolerance "<<options.ibp_tolerance<<'\n';
   write_bootstrap_diagnostic(trace,"sample_IBP_DIAGNOSTIC",sample_statistics.ibp_band);
@@ -1977,15 +2000,16 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::vector<std::vector<double>> cut_rows;std::vector<double> cut_rhs,qp_lambda;std::vector<double> theta=theta_from_eta(fit_svd,fit_svd.eta);
   bool fit_converged=false;ResponseCheck response;
   auto add_cut=[&](const std::vector<double>& v,const double base_value,const int outer,const char* source){
-    const auto row=spectral_row(graph,v,sqrt_mass,n,static_cast<int>(psize));const double row_norm=std::sqrt(std::inner_product(row.begin(),row.end(),row.begin(),0.0));const double rhs=options.epsilon-base_value;const double value=std::inner_product(row.begin(),row.end(),theta.begin(),0.0)+base_value;
-    double scale=std::max(1.0,std::abs(base_value));for(int i=0;i<static_cast<int>(psize);++i)scale+=std::abs(row[i]*theta[i]);if(!std::isfinite(row_norm)||!std::isfinite(rhs)||!std::isfinite(value)||!std::isfinite(scale)||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: stability cut row or scalar is non-finite");const double curvature_tolerance=std::min(options.epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);
-    if(row_norm<=1e-20){if(value<options.epsilon-curvature_tolerance)throw std::runtime_error("STABILITY_CUT_STALLED: unstable direction lies outside the fitted edge family");return false;}
+    const auto row=spectral_row(graph,v,sqrt_mass,n,static_cast<int>(psize));const double row_norm=std::sqrt(std::inner_product(row.begin(),row.end(),row.begin(),0.0));const double rhs=cut_target-base_value;const double value=std::inner_product(row.begin(),row.end(),theta.begin(),0.0)+base_value;
+    double scale=0.0;const double curvature_tolerance=curvature_rounding_tolerance(options.epsilon,base_value,row,theta,scale);
+    if(!std::isfinite(row_norm)||!std::isfinite(rhs)||!std::isfinite(value)||!std::isfinite(scale)||!std::isfinite(curvature_tolerance)||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: stability cut row or scalar is non-finite");
+    if(row_norm<=1e-20){if(value<options.epsilon-curvature_tolerance){trace<<"outer "<<outer<<" status STABILITY_CUT_STALLED source "<<source<<" curvature "<<value<<" epsilon "<<options.epsilon<<" cut_guard "<<cut_guard<<" cut_target "<<cut_target<<" curvature_scale "<<scale<<" curvature_tolerance "<<curvature_tolerance<<'\n';trace.flush();throw std::runtime_error("STABILITY_CUT_STALLED: unstable direction lies outside the fitted edge family");}return false;}
     for(std::size_t c=0;c<cut_rows.size();++c){double difference=0.0;for(std::size_t j=0;j<row.size();++j)difference=std::hypot(difference,row[j]-cut_rows[c][j]);const double prior_norm=std::sqrt(std::inner_product(cut_rows[c].begin(),cut_rows[c].end(),cut_rows[c].begin(),0.0));
       if(difference<=64.0*std::numeric_limits<double>::epsilon()*std::max(row_norm,prior_norm)&&std::abs(rhs-cut_rhs[c])<=curvature_tolerance){
         // The multiplier vector covers only cuts accepted by the previous QP.
-        if(c>=qp_lambda.size()){trace<<"outer "<<outer<<" status DUPLICATE_PENDING source "<<source<<" constraint_index "<<c<<" solved_constraints "<<qp_lambda.size()<<'\n';return false;}
-        if(value<options.epsilon-curvature_tolerance){trace<<"outer "<<outer<<" status STABILITY_CUT_STALLED source "<<source<<" constraint_index "<<c<<" solved_constraints "<<qp_lambda.size()<<" curvature "<<value<<" tolerance "<<curvature_tolerance<<'\n';trace.flush();throw std::runtime_error("STABILITY_CUT_STALLED: identical constraint remains violated; inspect fit_trace and cg_witness");}return false;}}
-    cut_rows.push_back(row);cut_rhs.push_back(rhs);trace<<"outer "<<outer<<" status RETRY source "<<source<<" cuts "<<cut_rows.size()<<" curvature "<<value<<" rhs "<<rhs<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';return true;
+        if(c>=qp_lambda.size()){trace<<"outer "<<outer<<" status DUPLICATE_PENDING source "<<source<<" constraint_index "<<c<<" solved_constraints "<<qp_lambda.size()<<" epsilon "<<options.epsilon<<" cut_guard "<<cut_guard<<" cut_target "<<cut_target<<" curvature_scale "<<scale<<" curvature_tolerance "<<curvature_tolerance<<'\n';return false;}
+        if(value<options.epsilon-curvature_tolerance){trace<<"outer "<<outer<<" status STABILITY_CUT_STALLED source "<<source<<" constraint_index "<<c<<" solved_constraints "<<qp_lambda.size()<<" curvature "<<value<<" epsilon "<<options.epsilon<<" cut_guard "<<cut_guard<<" cut_target "<<cut_target<<" curvature_scale "<<scale<<" curvature_tolerance "<<curvature_tolerance<<'\n';trace.flush();throw std::runtime_error("STABILITY_CUT_STALLED: identical constraint remains violated; inspect fit_trace and cg_witness");}return false;}}
+    cut_rows.push_back(row);cut_rhs.push_back(rhs);trace<<"outer "<<outer<<" status RETRY source "<<source<<" cuts "<<cut_rows.size()<<" curvature "<<value<<" epsilon "<<options.epsilon<<" cut_guard "<<cut_guard<<" cut_target "<<cut_target<<" curvature_scale "<<scale<<" curvature_tolerance "<<curvature_tolerance<<" rhs "<<rhs<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';return true;
   };
   auto solve_qp_and_trace=[&](const int outer){
     const std::size_t warm_start=qp_lambda.size();auto qp=solve_cut_qp(qr.solver,fit_svd,cut_rows,cut_rhs,options.epsilon/4.0,qp_lambda,qp_state_path,outer);qp_lambda=std::move(qp.lambda);
@@ -2007,29 +2031,41 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     const std::string seed_source=!cg_witness_seed.empty()?"CG_WITNESS":(!previous_low_ritz.empty()?"LOWEST_RITZ":"FIXED_SEED");
     const std::vector<double> initial_vector=!cg_witness_seed.empty()?cg_witness_seed:previous_low_ritz;
     const auto warm_search_started=std::chrono::steady_clock::now();
-    auto primary_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,initial_vector,&lanczos_workspace);
+    auto primary_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,options.epsilon,initial_vector,&lanczos_workspace);
     const double warm_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-warm_search_started).count();
     cg_witness_seed.clear();
     if(primary_modes.empty())throw std::runtime_error("native fit Lanczos returned no Ritz modes");
     auto record_search=[&](const std::string& source,const std::vector<RitzMode>& found){
-      trace<<"outer "<<outer<<" SEARCH seed_source "<<source<<" lanczos_steps "<<steps<<" returned_directions "<<found.size()<<" actual_residuals";
+      const RitzMode& summary=found.front();trace<<"outer "<<outer<<" SEARCH seed_source "<<source<<" lanczos_steps "<<steps<<" lanczos_steps_requested "<<steps<<" lanczos_steps_actual "<<summary.steps_used
+        <<" dense_matrix_actions "<<summary.dense_matrix_actions<<" early_exit "<<(summary.early_exit?1:0)<<" returned_directions "<<found.size()<<" actual_rayleighs";
+      for(const auto& mode:found)trace<<' '<<mode.actual_rayleigh;
+      trace<<" curvature_scales";
+      for(const auto& mode:found)trace<<' '<<mode.curvature_scale;
+      trace<<" curvature_tolerances";
+      for(const auto& mode:found)trace<<' '<<mode.curvature_tolerance;
+      trace<<" actual_residuals";
       for(const auto& mode:found)trace<<' '<<mode.residual;
       trace<<'\n';
     };
     record_search(seed_source,primary_modes);
-    std::vector<RitzMode> independent_modes;
+    const int primary_steps_used=primary_modes.front().steps_used,primary_dense_matrix_actions=primary_modes.front().dense_matrix_actions;
+    std::vector<RitzMode> independent_modes;int independent_steps_used=0,independent_dense_matrix_actions=0;
     double independent_seconds=0.0;
     if(!initial_vector.empty()){
       const auto independent_search_started=std::chrono::steady_clock::now();
-      independent_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,{},&lanczos_workspace);
+      independent_modes=lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,options.epsilon,{},&lanczos_workspace);
       independent_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-independent_search_started).count();
       record_search("FIXED_INDEPENDENT",independent_modes);
       if(independent_modes.empty())throw std::runtime_error("native fit independent-seed Lanczos returned no Ritz modes");
+      independent_steps_used=independent_modes.front().steps_used;independent_dense_matrix_actions=independent_modes.front().dense_matrix_actions;
     }
-    trace<<"outer "<<outer<<" SEARCH warm_seconds="<<warm_seconds<<" independent_seconds="<<independent_seconds<<'\n';trace.flush();
+    const int dense_matrix_actions_total=primary_dense_matrix_actions+independent_dense_matrix_actions;
+    trace<<"outer "<<outer<<" SEARCH warm_seconds="<<warm_seconds<<" independent_seconds="<<independent_seconds<<" total_seconds="<<warm_seconds+independent_seconds
+      <<" requested_steps="<<steps<<" warm_steps_actual="<<primary_steps_used<<" independent_steps_actual="<<independent_steps_used
+      <<" dense_matrix_actions_total="<<dense_matrix_actions_total<<'\n';trace.flush();
     if(!trace)throw std::runtime_error("failed writing native fit search timing: "+trace_path);
     auto inspect_modes=[&](const std::vector<RitzMode>& candidates,const std::string& source,bool& observed_violation,bool& added_cut){
-      for(const auto& mode:candidates){const double base_value=mode.base_rayleigh,rayleigh=base_value+mode.additive_rayleigh;const auto row=spectral_row(graph,mode.vector,sqrt_mass,n,static_cast<int>(psize));double scale=std::max(1.0,std::abs(base_value));for(int i=0;i<static_cast<int>(psize);++i)scale+=std::abs(row[i]*theta[i]);if(!std::isfinite(base_value)||!std::isfinite(mode.additive_rayleigh)||!std::isfinite(rayleigh)||!std::isfinite(scale)||!std::all_of(row.begin(),row.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("NONFINITE_FIT_CURVATURE: sampled Ritz evidence is non-finite");const double mode_tolerance=std::min(options.epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*scale);if(rayleigh>=options.epsilon-mode_tolerance)continue;observed_violation=true;added_cut|=add_cut(mode.vector,base_value,outer,("RITZ_"+source).c_str());}
+      for(const auto& mode:candidates){if(!std::isfinite(mode.base_rayleigh)||!std::isfinite(mode.additive_rayleigh)||!std::isfinite(mode.actual_rayleigh)||!std::isfinite(mode.curvature_scale)||!std::isfinite(mode.curvature_tolerance))throw std::runtime_error("NONFINITE_FIT_CURVATURE: sampled Ritz evidence is non-finite");if(!stability_cut_is_violated(mode.actual_rayleigh,options.epsilon,mode.curvature_tolerance))continue;observed_violation=true;added_cut|=add_cut(mode.vector,mode.base_rayleigh,outer,("RITZ_"+source).c_str());}
     };
     bool observed_violation=false,added_cut=false;
     inspect_modes(primary_modes,seed_source,observed_violation,added_cut);
@@ -2042,7 +2078,9 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     const bool near_boundary=std::abs(min_ritz-options.epsilon)<=std::max(options.epsilon,2.0*ritz_residual);
     const bool residual_large=ritz_residual>std::max(1e-12,options.epsilon/4.0);
     if(near_boundary&&residual_large)deepen_search();
-    trace<<"outer "<<outer<<" sampled_min_ritz "<<min_ritz<<" ritz_residual "<<ritz_residual<<" ritz_residual_kind actual_Dv_minus_lambda_v lanczos_steps "<<steps<<" next_lanczos_steps "<<search_depth<<" observed_directions "<<modes.size()<<" constraints "<<cut_rows.size()<<" cg_feedback none status "<<(observed_violation?"RETRY":"CHECK_CG")<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit trace: "+trace_path);
+    trace<<"outer "<<outer<<" sampled_min_ritz "<<min_ritz<<" sampled_min_rayleigh "<<modes.front().actual_rayleigh<<" ritz_residual "<<ritz_residual<<" ritz_residual_kind actual_Dv_minus_rayleigh_v lanczos_steps "<<steps
+      <<" lanczos_steps_requested "<<steps<<" warm_steps_actual "<<primary_steps_used<<" independent_steps_actual "<<independent_steps_used<<" dense_matrix_actions "<<dense_matrix_actions_total
+      <<" next_lanczos_steps "<<search_depth<<" observed_directions "<<modes.size()<<" constraints "<<cut_rows.size()<<" cg_feedback none status "<<(observed_violation?"RETRY":"CHECK_CG")<<" theta";for(double x:theta)trace<<' '<<x;trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit trace: "+trace_path);
     if(observed_violation){consecutive_cg_feedback=0;if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==max_rounds-1)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after "+std::to_string(max_rounds)+" rounds");theta=solve_qp_and_trace(outer);continue;}
     ResponseCheck response_progress;
     try{response=validate_probes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,options.sample_interval,options.temperature,modes,options.epsilon,&response_progress,options.response_tolerance,options.ibp_tolerance);}catch(const std::exception& e){trace<<"outer "<<outer<<" status PROBE_VALIDATION_FAIL detail "<<e.what()<<" ";write_response_stats(trace,response_progress);trace<<'\n';trace.flush();throw;}
@@ -2065,7 +2103,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     const double base_value=std::inner_product(response.witness.direction.begin(),response.witness.direction.end(),response.witness.base.begin(),0.0);if(response.witness.rayleigh>=options.epsilon-response.witness.curvature_tolerance)throw std::runtime_error("NUMERICAL_BREAKDOWN: normalized CG witness is not below the declared curvature threshold; inspect "+witness_path);const bool added=add_cut(response.witness.direction,base_value,outer,response.witness.classification.c_str());
     if(!added)throw std::runtime_error("STABILITY_CUT_STALLED: CG witness did not add a new violated constraint");
     cg_witness_seed=response.witness.direction;++consecutive_cg_feedback;if(consecutive_cg_feedback>=2)deepen_search();
-    trace<<"outer "<<outer<<" cg_feedback "<<response.witness.classification<<" probe "<<response.witness.probe<<" iteration "<<response.witness.iteration<<" rayleigh "<<response.witness.rayleigh<<" lanczos_steps "<<steps<<" next_lanczos_steps "<<search_depth<<" consecutive_cg_feedback "<<consecutive_cg_feedback<<" constraints "<<cut_rows.size()<<" status RETRY ";write_response_stats(trace,response);trace<<'\n';trace.flush();
+    trace<<"outer "<<outer<<" cg_feedback "<<response.witness.classification<<" probe "<<response.witness.probe<<" iteration "<<response.witness.iteration<<" rayleigh "<<response.witness.rayleigh<<" lanczos_steps "<<steps<<" lanczos_steps_requested "<<steps<<" warm_steps_actual "<<primary_steps_used<<" independent_steps_actual "<<independent_steps_used<<" dense_matrix_actions "<<dense_matrix_actions_total<<" next_lanczos_steps "<<search_depth<<" consecutive_cg_feedback "<<consecutive_cg_feedback<<" constraints "<<cut_rows.size()<<" status RETRY ";write_response_stats(trace,response);trace<<'\n';trace.flush();
     if(outer==max_rounds-1)throw std::runtime_error("STABILITY_CUT_LIMIT: CG feedback exhausted "+std::to_string(max_rounds)+" rounds");theta=solve_qp_and_trace(outer);
   }
   if(!fit_converged)throw std::runtime_error("STABILITY_CUT_LIMIT: native fit did not pass sampled Ritz and CG checks within "+std::to_string(max_rounds)+" rounds");lanczos_workspace.release();

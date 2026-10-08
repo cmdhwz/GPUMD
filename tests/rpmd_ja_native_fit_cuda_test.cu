@@ -1183,7 +1183,7 @@ void test_lanczos_finite_internal_space(cusolverDnHandle_t solver)
         for(int i=0;i<internal;++i)restricted[static_cast<std::size_t>(i)*internal+j]=
           std::inner_product(basis[i].begin(),basis[i].end(),product.begin(),0.0);}
       const SmallEigen exact=eigen_small(solver,restricted,internal);
-      const auto modes=lanczos_low_modes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,n,96,4);
+      const auto modes=lanczos_low_modes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,n,96,4,0.0);
       assert(modes.size()==static_cast<std::size_t>(std::min(4,internal)));
       for(int k=0;k<static_cast<int>(modes.size());++k){
         const auto& v=modes[k].vector;double norm2=0.0;
@@ -1192,7 +1192,7 @@ void test_lanczos_finite_internal_space(cusolverDnHandle_t solver)
         for(int axis=0;axis<3;++axis){double translation=0.0;for(int i=0;i<n;++i)translation+=sqrt_atom[i]*v[axis*n+i];assert(std::abs(translation)<2e-10);}
         for(int prior=0;prior<k;++prior)check_close(std::inner_product(v.begin(),v.end(),modes[prior].vector.begin(),0.0),0.0,2e-7);
         std::vector<double> product(d),add(d);baseline.apply(v,product);const double base_rayleigh=std::inner_product(v.begin(),v.end(),product.begin(),0.0);apply_additive(graph,v,sqrt_mass,sqrt_atom,theta,n,add);
-        double residual2=0.0;for(int i=0;i<d;++i){product[i]+=add[i];const double residual=product[i]-modes[k].value*v[i];residual2+=residual*residual;}
+        double residual2=0.0;for(int i=0;i<d;++i){product[i]+=add[i];const double residual=product[i]-modes[k].actual_rayleigh*v[i];residual2+=residual*residual;}
         check_close(modes[k].residual,std::sqrt(residual2),2e-7);
         const double rayleigh=std::inner_product(v.begin(),v.end(),product.begin(),0.0);
         check_close(modes[k].base_rayleigh,base_rayleigh,2e-7);
@@ -1220,7 +1220,7 @@ void test_lanczos_blindspot_cg_cut_feedback(cusolverDnHandle_t solver)
   constexpr int n=40,d=3*n,p=6;const double epsilon=1e-3;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> w(d);
   w[0]=1.0-1.0/n;for(int i=1;i<n;++i)w[i]=-1.0/n;std::vector<double> start(d);for(int i=0;i<d;++i)start[i]=std::sin((i+1)*1.6180339887498948)+std::cos((i+1)*0.7548776662466927);project_translation(start,sqrt_atom,n);double norm=std::sqrt(std::inner_product(start.begin(),start.end(),start.begin(),0.0));for(double& x:start)x/=norm;const double overlap=std::inner_product(w.begin(),w.end(),start.begin(),0.0);double start_x2=0.0;for(int i=0;i<n;++i)start_x2+=start[i]*start[i];for(int i=0;i<n;++i)w[i]-=(overlap/start_x2)*start[i];norm=std::sqrt(std::inner_product(w.begin(),w.end(),w.begin(),0.0));for(double& x:w)x/=norm;assert(std::abs(std::inner_product(w.begin(),w.end(),start.begin(),0.0))<1e-12);
   std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=1.0;for(int i=0;i<d;++i)for(int j=0;j<d;++j)raw[static_cast<std::size_t>(i)*d+j]-=2.0*w[i]*w[j];std::stringstream input(std::ios::in|std::ios::out|std::ios::binary);input.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));input.seekg(0);DeviceBaseline baseline;baseline.initialize(input,0,d,n,masses,sqrt_mass);Graph graph;for(int i=0;i<n;++i)for(int j=i+1;j<n;++j)graph.edges.push_back({i,j,0,{0,0,0}});
-  const auto modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,96,4);assert(modes.front().value>0.99&&modes.front().residual<1e-10);std::vector<double> zero(p,0.0);const CGResult cg=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,zero,n,0,epsilon);assert(cg.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION");assert(cg.witness.rayleigh<0.0);const auto witness_modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,16,4,cg.witness.direction);assert(witness_modes.front().value<-0.99&&witness_modes.front().residual<1e-10);
+  const auto modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,96,4,epsilon);assert(modes.front().value>0.99&&modes.front().residual<1e-10);std::vector<double> zero(p,0.0);const CGResult cg=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,zero,n,0,epsilon);assert(cg.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION");assert(cg.witness.rayleigh<0.0);const auto witness_modes=lanczos_low_modes(solver,baseline,graph,std::vector<double>(p,0.0),sqrt_mass,sqrt_atom,n,16,4,epsilon,cg.witness.direction);assert(witness_modes.front().value<-0.99&&witness_modes.front().residual<1e-10);
   SmallSVD identity;identity.p=p;identity.singular.assign(p,1.0);identity.eta.assign(p,0.0);identity.vt.assign(p*p,0.0);for(int i=0;i<p;++i)identity.vt[static_cast<std::size_t>(i)*p+i]=1.0;const auto row=spectral_row(graph,w,sqrt_mass,n,p);const double base=std::inner_product(w.begin(),w.end(),cg.witness.base.begin(),0.0);const auto qp=solve_cut_qp(solver,identity,{row},{epsilon-base},epsilon/4.0);const auto theta=theta_from_eta(identity,qp.xi);
   const auto basis=internal_basis(n);const int internal=static_cast<int>(basis.size());std::vector<double> restricted(static_cast<std::size_t>(internal)*internal);for(int j=0;j<internal;++j){std::vector<double> image(d);apply_total(baseline,graph,basis[j],sqrt_mass,sqrt_atom,theta,n,image);for(int i=0;i<internal;++i)restricted[static_cast<std::size_t>(i)*internal+j]=std::inner_product(basis[i].begin(),basis[i].end(),image.begin(),0.0);}const auto exact=eigen_small(solver,restricted,internal);assert(exact.values.front()>=epsilon-2e-10);const CGResult repaired=solve_projected_cg(baseline,graph,w,sqrt_mass,sqrt_atom,theta,n,0,epsilon);assert(repaired.witness.classification.empty());assert(repaired.relative_residual<=1e-8);
 }
@@ -1231,8 +1231,91 @@ void test_lanczos_independent_seed_escapes_invariant_subspace(cusolverDnHandle_t
   const double eigenvalues[3]={1.0,-2.0,3.0};for(int k=0;k<3;++k)for(int i=0;i<d;++i)for(int j=0;j<d;++j)raw[static_cast<std::size_t>(i)*d+j]+=eigenvalues[k]*basis[k][i]*basis[k][j];
   std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));stream.seekg(0);DeviceBaseline baseline;baseline.initialize(stream,0,d,n,masses,sqrt_mass);Graph graph;
   DeviceLanczosWorkspace workspace;workspace.initialize(graph,sqrt_mass,sqrt_atom,8,0);
-  const auto warm=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,basis[0],&workspace);const auto independent=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,{},&workspace);
+  const auto warm=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,0.0,basis[0],&workspace);const auto independent=lanczos_low_modes(solver,baseline,graph,{},sqrt_mass,sqrt_atom,n,8,3,0.0,{},&workspace);
   assert(warm.size()==1&&warm.front().residual<1e-12);check_close(warm.front().value,1.0,1e-12);assert(independent.front().value<-1.99&&independent.front().residual<1e-10);
+}
+
+struct RotatingCutResult{int qp_rounds=0;double minimum_curvature=0.0,curvature_tolerance=0.0;bool passed=false;};
+
+RotatingCutResult run_rotating_cut_case(cusolverDnHandle_t solver,const double epsilon,const double cut_target)
+{
+  const std::vector<double> base={0.9499966591319635,-0.07971285149661844,-0.07971285149661844,1.8255837324986859};
+  const std::vector<std::vector<double>> parameter_matrices={{1.5279445230841366,0.11974557011184332,0.11974557011184332,1.0465547385810312},
+    {-0.029712482020309544,-0.7990636043681327,-0.7990636043681327,0.08472964953127277}};
+  SmallSVD identity;identity.p=2;identity.singular={1.0,1.0};identity.eta={0.0,0.0};identity.vt={1.0,0.0,0.0,1.0};
+  auto quadratic=[](const std::vector<double>& matrix,const std::vector<double>& v){return v[0]*(matrix[0]*v[0]+matrix[1]*v[1])+v[1]*(matrix[2]*v[0]+matrix[3]*v[1]);};
+  std::vector<std::vector<double>> rows;std::vector<double> rhs,lambda,theta(2,0.0);RotatingCutResult result;
+  for(int round=0;round<12;++round){std::vector<double> matrix=base;for(int parameter=0;parameter<2;++parameter)for(int i=0;i<4;++i)matrix[i]+=theta[parameter]*parameter_matrices[parameter][i];
+    const SmallEigen eig=eigen_small(solver,matrix,2,1);const std::vector<double> v={eig.vectors[0],eig.vectors[1]};const double rayleigh=quadratic(matrix,v),base_rayleigh=quadratic(base,v);
+    const std::vector<double> row={quadratic(parameter_matrices[0],v),quadratic(parameter_matrices[1],v)};double scale=0.0;
+    const double curvature_tolerance=curvature_rounding_tolerance(epsilon,base_rayleigh,row,theta,scale);
+    result.minimum_curvature=rayleigh;result.curvature_tolerance=curvature_tolerance;
+    if(rayleigh>=epsilon-curvature_tolerance){result.qp_rounds=round;result.passed=true;return result;}
+    rows.push_back(row);rhs.push_back(cut_target-base_rayleigh);const QPSolution qp=solve_cut_qp(solver,identity,rows,rhs,epsilon/4.0,lambda);
+    theta=qp.certificate.theta;lambda=qp.lambda;
+  }
+  result.qp_rounds=12;return result;
+}
+
+void test_stability_cut_guard_reduces_rotating_mode_rounds(cusolverDnHandle_t solver)
+{
+  const double epsilon=1.0,cut_guard=epsilon*stability_cut_guard_fraction,cut_target=epsilon+cut_guard;
+  assert(cut_guard>0.0&&cut_target>epsilon);
+  const RotatingCutResult unguarded=run_rotating_cut_case(solver,epsilon,epsilon);
+  const RotatingCutResult guarded=run_rotating_cut_case(solver,epsilon,cut_target);
+  assert(unguarded.passed&&guarded.passed&&guarded.qp_rounds<unguarded.qp_rounds);
+  assert(unguarded.minimum_curvature>=epsilon-unguarded.curvature_tolerance);
+  assert(guarded.minimum_curvature>=epsilon-guarded.curvature_tolerance);
+}
+
+void test_lanczos_staged_early_exit(cusolverDnHandle_t solver)
+{
+  constexpr int n=12,d=3*n,steps=33;const auto basis=internal_basis(n);assert(basis.size()==static_cast<std::size_t>(steps));
+  const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> initial(d,0.0),unstable_matrix(static_cast<std::size_t>(d)*d,0.0),positive_matrix(static_cast<std::size_t>(d)*d,0.0);
+  for(int k=0;k<steps;++k){const double unstable_value=k==0?-0.5:0.5+0.1*k,positive_value=0.5+0.1*k;
+    for(int i=0;i<d;++i){initial[i]+=basis[k][i];for(int j=0;j<d;++j){const double tile=basis[k][i]*basis[k][j];unstable_matrix[static_cast<std::size_t>(i)*d+j]+=unstable_value*tile;positive_matrix[static_cast<std::size_t>(i)*d+j]+=positive_value*tile;}}}
+  auto initialize=[&](DeviceBaseline& baseline,const std::vector<double>& matrix){std::stringstream input(std::ios::in|std::ios::out|std::ios::binary);input.write(reinterpret_cast<const char*>(matrix.data()),matrix.size()*sizeof(double));input.seekg(0);baseline.initialize(input,0,d,n,masses,sqrt_mass);};
+  const Graph graph;const double epsilon=0.1;DeviceBaseline unstable;initialize(unstable,unstable_matrix);
+  const auto early=lanczos_low_modes(solver,unstable,graph,{},sqrt_mass,sqrt_atom,n,steps,4,epsilon,initial);
+  assert(early.front().early_exit&&early.front().steps_used==32&&early.front().dense_matrix_actions==early.front().steps_used+static_cast<int>(early.size()));
+  for(const auto& mode:early)assert(mode.dense_matrix_actions==early.front().dense_matrix_actions);
+  assert(early.front().actual_rayleigh<epsilon-early.front().curvature_tolerance&&early.front().residual>0.0);
+  assert(early.front().curvature_scale>=1.0&&early.front().curvature_tolerance>0.0);
+  DeviceBaseline positive;initialize(positive,positive_matrix);
+  const auto complete=lanczos_low_modes(solver,positive,graph,{},sqrt_mass,sqrt_atom,n,steps,4,epsilon,initial);
+  assert(!complete.front().early_exit&&complete.front().steps_used==steps);
+  assert(complete.front().dense_matrix_actions==complete.front().steps_used+2*static_cast<int>(complete.size()));
+  for(const auto& mode:complete)assert(mode.dense_matrix_actions==complete.front().dense_matrix_actions);
+}
+
+void test_lanczos_continues_across_checkpoints(cusolverDnHandle_t solver)
+{
+  constexpr int n=87,d=3*n,steps=d-3,wanted=4;const auto basis=internal_basis(n);assert(basis.size()==static_cast<std::size_t>(steps));
+  const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> initial(d,0.0),matrix(static_cast<std::size_t>(d)*d,0.0);
+  for(int k=0;k<steps;++k){const double eigenvalue=0.5+0.01*k;for(int i=0;i<d;++i){initial[i]+=basis[k][i];for(int j=0;j<d;++j)matrix[static_cast<std::size_t>(i)*d+j]+=eigenvalue*basis[k][i]*basis[k][j];}}
+  std::stringstream input(std::ios::in|std::ios::out|std::ios::binary);input.write(reinterpret_cast<const char*>(matrix.data()),matrix.size()*sizeof(double));input.seekg(0);DeviceBaseline baseline;baseline.initialize(input,0,d,n,masses,sqrt_mass);
+  const auto modes=lanczos_low_modes(solver,baseline,Graph{}, {},sqrt_mass,sqrt_atom,n,steps,wanted,0.1,initial);
+  const int expected_actions=steps+5*wanted;
+  assert(modes.size()==wanted&&!modes.front().early_exit&&modes.front().steps_used==steps);
+  for(const auto& mode:modes){assert(mode.steps_used==steps&&mode.dense_matrix_actions==expected_actions);assert(mode.actual_rayleigh>0.1&&mode.residual<1e-8);}
+}
+
+void test_lanczos_curvature_rounding_boundary(cusolverDnHandle_t solver)
+{
+  constexpr int n=12,d=3*n,steps=3*n-3;const double epsilon=1.0,stiffness=1.0e8;const auto basis=internal_basis(n);
+  const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);Graph graph;
+  for(int i=0;i<n;++i)for(int j=i+1;j<n;++j)graph.edges.push_back({i,j,0,{0,0,0}});
+  std::vector<double> theta(6,0.0);theta[0]=theta[3]=theta[5]=-stiffness;const auto row=spectral_row(graph,basis.front(),sqrt_mass,n,6);double reference_scale=0.0;
+  const double tolerance=curvature_rounding_tolerance(epsilon,stiffness*n+epsilon,row,theta,reference_scale);
+  assert(tolerance>0.0&&reference_scale>1.0);
+  std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0),initial(d,0.0);
+  for(int axis=0;axis<3;++axis)for(int i=0;i<n;++i)for(int j=0;j<n;++j)raw[static_cast<std::size_t>(axis*n+i)*d+axis*n+j]+=stiffness*(i==j?n-1:-1);
+  for(int k=0;k<steps;++k){const double eigenvalue=epsilon-tolerance*(0.25+0.5*static_cast<double>(k)/(steps-1));
+    for(int i=0;i<d;++i){initial[i]+=basis[k][i];for(int j=0;j<d;++j)raw[static_cast<std::size_t>(i)*d+j]+=eigenvalue*basis[k][i]*basis[k][j];}}
+  std::stringstream input(std::ios::in|std::ios::out|std::ios::binary);input.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));input.seekg(0);DeviceBaseline baseline;baseline.initialize(input,0,d,n,masses,sqrt_mass);
+  const auto modes=lanczos_low_modes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,n,steps,4,epsilon,initial);
+  assert(!modes.front().early_exit&&modes.front().steps_used==steps);
+  assert(modes.front().actual_rayleigh<epsilon&&modes.front().actual_rayleigh>=epsilon-modes.front().curvature_tolerance);
 }
 
 void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
@@ -1341,6 +1424,10 @@ int main()
   test_active_set_rank_deficient_warm_start(qr.solver);
   test_outer128_stationarity_joint_polish(qr.solver);
   test_read_frame_rejects_invalid_data();
+  test_stability_cut_guard_reduces_rotating_mode_rounds(qr.solver);
+  test_lanczos_staged_early_exit(qr.solver);
+  test_lanczos_continues_across_checkpoints(qr.solver);
+  test_lanczos_curvature_rounding_boundary(qr.solver);
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
   test_lanczos_blindspot_cg_cut_feedback(qr.solver);
