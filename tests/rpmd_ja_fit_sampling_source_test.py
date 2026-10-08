@@ -64,6 +64,14 @@ assert "validate_qraw_identity" in replay_body and "compute_cg_true_residual_com
 assert "fast_true_relative_residual" in replay_body and "compensated_true_relative_residual" in replay_body
 assert "NOT_ACCEPTED_REFERENCE" in replay_body and "write_text_exclusive" in replay_body
 assert "solve_projected_cg" in replay_body and "make_graph(r0,header.types,box,snapshot.cutoff)" in replay_body
+assert replay_body.index('if(replay_status=="TRUE_RESIDUAL_FAILURE")') > replay_body.index("replay_status=replay.witness.classification")
+assert "recover_cg_true_residual_failure(baseline,candidate_graph,snapshot.rhs_input,replay" in replay_body
+for field in ("production_recovery_attempted", "production_recovery_status", "production_verification_method",
+              "production_final_fast_residual", "production_final_compensated_residual",
+              "production_verification_actions", "production_refinement_actions", "production_recovery_seconds",
+              "production_original_witness_preserved"):
+    assert field in replay_body
+assert "production_recovery_gate_pass" in replay_body and "replay_cg_status" in replay_body
 assert "replay_cg" in run and "replay_rpmd_ja_native_cg" in run
 parser_body = native_fit[native_fit.index("CGWitnessSnapshot read_cg_witness("):native_fit.index("bool preserve_candidate_package_on_full_spd_failure(")]
 vector_body = parser_body[parser_body.index('if(key=="theta"||'):parser_body.index('}else if(key=="status")')]

@@ -2868,7 +2868,36 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
   const std::uint64_t replay_actions=baseline.dense_matrix_actions-actions_before;
   const std::string replay_iterations=replay_status=="CG_EXCEPTION"?"NOT_AVAILABLE":std::to_string(replay.iterations);
   const std::string replay_restarts=replay_status=="CG_EXCEPTION"?"NOT_AVAILABLE":std::to_string(replay.residual_restarts);
-  std::ostringstream report;report<<std::setprecision(17)
+  CGProbeRecoveryDiagnostic production_recovery;bool production_recovery_attempted=false,production_recovery_returned=false;
+  bool production_recovery_gate_pass=false,production_recovered_solution_finite=false,production_original_witness_preserved=false;
+  std::string production_recovery_status="NOT_ATTEMPTED",production_recovery_error;
+  double production_recovery_seconds=0.0,production_solution_delta_norm=std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t production_recovery_actions=0;
+  if(replay_status=="TRUE_RESIDUAL_FAILURE"){
+    production_recovery_attempted=true;const std::uint64_t actions_before_recovery=baseline.dense_matrix_actions;
+    const auto production_recovery_started=std::chrono::steady_clock::now();
+    try{production_recovery_returned=recover_cg_true_residual_failure(baseline,candidate_graph,snapshot.rhs_input,replay,
+        sqrt_mass,sqrt_atom,snapshot.theta,n,production_recovery,snapshot.probe);
+      production_recovery_status=production_recovery_returned?std::string("RECOVERED"):std::string("REJECTED_")+production_recovery.refinement_status;}
+    catch(const std::exception& error){production_recovery_status="RECOVERY_EXCEPTION";production_recovery_error=error.what();}
+    production_recovery_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-production_recovery_started).count();
+    production_recovery_actions=baseline.dense_matrix_actions-actions_before_recovery;
+    production_recovered_solution_finite=replay.x.size()==static_cast<std::size_t>(d)&&
+      std::all_of(replay.x.begin(),replay.x.end(),[](double value){return std::isfinite(value);});
+    production_original_witness_preserved=replay.witness.classification=="TRUE_RESIDUAL_FAILURE"&&
+      replay.witness.classification==production_recovery.original_witness.classification&&
+      replay.witness.solution==production_recovery.original_witness.solution;
+    if(production_original_witness_preserved&&replay.x.size()==production_recovery.original_witness.solution.size()){
+      production_solution_delta_norm=0.0;for(std::size_t i=0;i<replay.x.size();++i)
+        production_solution_delta_norm=std::hypot(production_solution_delta_norm,replay.x[i]-production_recovery.original_witness.solution[i]);}
+    production_recovery_gate_pass=production_recovery_returned&&production_recovered_solution_finite&&production_original_witness_preserved&&
+      std::isfinite(production_recovery.final_fast_residual)&&std::isfinite(production_recovery.final_compensated_residual)&&
+      production_recovery.final_compensated_residual<=1e-8;
+    if(production_recovery_status!="RECOVERY_EXCEPTION"&&production_recovery_returned&&!production_recovery_gate_pass)
+      production_recovery_status="RECOVERY_RESULT_INVALID";
+  }
+  std::ostringstream report;const auto write_diagnostic_value=[&](const double value){if(std::isfinite(value))report<<value;else report<<"NOT_COMPUTED";};
+  report<<std::setprecision(17)
     <<"status NOT_ACCEPTED_REFERENCE\nreplay_source "<<std::quoted(witness_path)<<"\nqraw_source "<<std::quoted(paths.first)
     <<"\nsample_spool "<<std::quoted(paths.second)<<"\nframes "<<header.frame_count<<"\ntraining_frames "<<train
     <<"\nprobe "<<snapshot.probe<<"\ncutoff_A "<<snapshot.cutoff<<"\ntemperature_K "<<snapshot.temperature
@@ -2876,6 +2905,25 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
     <<"\nqraw_model_fingerprint "<<identity.model<<"\nqraw_config_fingerprint "<<identity.config
     <<"\npppm_mesh_spacing "<<identity.mesh<<"\nprojected_rhs_consistency_difference_norm "<<projected_rhs_diff
     <<"\nsaved_x_translation_removed_norm "<<saved_x_translation
+    <<"\nproduction_recovery_attempted "<<(production_recovery_attempted?1:0)
+    <<"\nproduction_recovery_status "<<production_recovery_status
+    <<"\nproduction_verification_method "<<(production_recovery_attempted?production_recovery.verification_method:"NOT_ATTEMPTED")
+    <<"\nproduction_initial_fast_residual ";write_diagnostic_value(production_recovery.initial_fast_residual);
+  report<<"\nproduction_initial_compensated_residual ";write_diagnostic_value(production_recovery.initial_compensated_residual);
+  report<<"\nproduction_final_fast_residual ";write_diagnostic_value(production_recovery.final_fast_residual);
+  report<<"\nproduction_final_compensated_residual ";write_diagnostic_value(production_recovery.final_compensated_residual);
+  report<<"\nproduction_refinement_status "<<(production_recovery_attempted?production_recovery.refinement_status:"NOT_ATTEMPTED")
+    <<"\nproduction_refinement_rounds "<<(production_recovery_attempted?std::to_string(production_recovery.refinement_rounds):"NOT_ATTEMPTED")
+    <<"\nproduction_verification_actions "<<(production_recovery_attempted?std::to_string(production_recovery.verification_matrix_actions):"NOT_ATTEMPTED")
+    <<"\nproduction_refinement_actions "<<(production_recovery_attempted?std::to_string(production_recovery.refinement_matrix_actions):"NOT_ATTEMPTED")
+    <<"\nproduction_recovery_actions "<<(production_recovery_attempted?std::to_string(production_recovery_actions):"NOT_ATTEMPTED")
+    <<"\nproduction_recovery_seconds ";
+  if(production_recovery_attempted)write_diagnostic_value(production_recovery_seconds);else report<<"NOT_ATTEMPTED";
+  report<<"\nproduction_recovered_solution_finite "<<(production_recovery_attempted?(production_recovered_solution_finite?"1":"0"):"NOT_ATTEMPTED")
+    <<"\nproduction_recovery_gate_pass "<<(production_recovery_attempted?(production_recovery_gate_pass?"1":"0"):"NOT_ATTEMPTED")
+    <<"\nproduction_original_witness_preserved "<<(production_recovery_attempted?(production_original_witness_preserved?"1":"0"):"NOT_ATTEMPTED")
+    <<"\nproduction_solution_delta_norm ";write_diagnostic_value(production_solution_delta_norm);
+  report<<"\nproduction_recovery_error "<<std::quoted(production_recovery_error)
     <<"\nfast_true_relative_residual "<<saved.fast_relative
     <<"\ncompensated_true_relative_residual "<<saved.compensated_relative
     <<"\nresidual_vector_difference_norm "<<saved.difference_norm
@@ -2900,7 +2948,6 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
   if(replay.witness.true_residual_computed)report<<replay.witness.relative_residual;
   else if(replay_status=="CG_PASS")report<<replay.relative_residual;
   else report<<"NOT_COMPUTED";
-  const auto write_diagnostic_value=[&](const double value){if(std::isfinite(value))report<<value;else report<<"NOT_COMPUTED";};
   report<<"\nreplay_cg_error "<<std::quoted(replay_error)<<"\ncorrection_round_records "<<refinement.rounds.size()<<'\n';
   for(std::size_t i=0;i<refinement.rounds.size();++i)write_cg_replay_refinement_round(report,i+1,refinement.rounds[i]);
   report<<"refined_solution_x_xyz_soa "<<refinement.solution.size();for(double value:refinement.solution)report<<' '<<value;
@@ -2912,6 +2959,10 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
     saved.fast_relative,saved.compensated_relative,refinement.status.c_str(),refinement.residuals.fast_relative,refinement.residuals.compensated_relative,
     static_cast<unsigned long long>(refinement.dense_matrix_actions),replay_status.c_str(),replay_iterations.c_str(),
     static_cast<unsigned long long>(replay_actions),report_path.c_str());
+  if(production_recovery_attempted)std::printf("    production recovery=%s compensated_residual=%.9g gate_pass=%d original_witness_preserved=%d actions=%llu seconds=%.3f\n",
+    production_recovery_status.c_str(),production_recovery.final_compensated_residual,production_recovery_gate_pass?1:0,
+    production_original_witness_preserved?1:0,static_cast<unsigned long long>(production_recovery_actions),production_recovery_seconds);
+  else std::printf("    production recovery=NOT_ATTEMPTED (zero-start status %s)\n",replay_status.c_str());
 }
 #else
 #include <stdexcept>
