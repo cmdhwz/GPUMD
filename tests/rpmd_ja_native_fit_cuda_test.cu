@@ -1318,6 +1318,20 @@ void test_lanczos_curvature_rounding_boundary(cusolverDnHandle_t solver)
   assert(modes.front().actual_rayleigh<epsilon&&modes.front().actual_rayleigh>=epsilon-modes.front().curvature_tolerance);
 }
 
+void test_lanczos_deep_search_does_not_early_cut(cusolverDnHandle_t solver)
+{
+  constexpr int n=66,d=3*n,internal=d-3;const double epsilon=0.1;const auto basis=internal_basis(n);
+  const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> initial(d,0.0),matrix(static_cast<std::size_t>(d)*d,0.0);
+  for(int k=0;k<internal;++k){const double eigenvalue=k==0?-0.5:0.5+0.1*k;
+    for(int i=0;i<d;++i){initial[i]+=basis[k][i];for(int j=0;j<d;++j)matrix[static_cast<std::size_t>(i)*d+j]+=eigenvalue*basis[k][i]*basis[k][j];}}
+  std::stringstream input(std::ios::in|std::ios::out|std::ios::binary);input.write(reinterpret_cast<const char*>(matrix.data()),matrix.size()*sizeof(double));input.seekg(0);DeviceBaseline baseline;baseline.initialize(input,0,d,n,masses,sqrt_mass);
+  const auto coarse=lanczos_low_modes(solver,baseline,Graph{}, {},sqrt_mass,sqrt_atom,n,96,4,epsilon,initial);
+  assert(coarse.front().early_exit&&coarse.front().steps_used==32&&coarse.front().actual_rayleigh<epsilon-coarse.front().curvature_tolerance);
+  const auto deep=lanczos_low_modes(solver,baseline,Graph{}, {},sqrt_mass,sqrt_atom,n,192,4,epsilon,initial);
+  assert(!deep.front().early_exit&&deep.front().steps_used==192&&deep.front().actual_rayleigh<epsilon-deep.front().curvature_tolerance);
+  assert(deep.front().dense_matrix_actions==192+4*4);
+}
+
 void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
 {
   constexpr int n=8,d=3*n,train=21,validation=33,frames=train+validation;
@@ -1428,6 +1442,7 @@ int main()
   test_lanczos_staged_early_exit(qr.solver);
   test_lanczos_continues_across_checkpoints(qr.solver);
   test_lanczos_curvature_rounding_boundary(qr.solver);
+  test_lanczos_deep_search_does_not_early_cut(qr.solver);
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
   test_lanczos_blindspot_cg_cut_feedback(qr.solver);

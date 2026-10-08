@@ -910,7 +910,8 @@ std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline
     const int used=k+1;const bool search_finished=b<=breakdown||k==steps-1;
     const bool checkpoint=search_finished||used==32||used==64||used==128||used==256;
     if(checkpoint){auto modes=extract_modes(used,false);const bool below_threshold=std::any_of(modes.begin(),modes.end(),[&](const RitzMode& mode){return stability_cut_is_violated(mode.actual_rayleigh,epsilon,mode.curvature_tolerance);});
-      if(search_finished||below_threshold){if(!search_finished)for(auto& mode:modes)mode.early_exit=true;return modes;}}
+      const bool early_cut=steps<=96&&below_threshold&&!search_finished;
+      if(search_finished||early_cut){if(early_cut)for(auto& mode:modes)mode.early_exit=true;return modes;}}
     blas_check(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->previous,1),"native fit Lanczos previous-vector copy failed");blas_check(cublasDcopy(baseline.blas,d,workspace->w,1,workspace->v,1),"native fit Lanczos next-vector copy failed");const double inverse_b=1.0/b;blas_check(cublasDscal(baseline.blas,d,&inverse_b,workspace->v,1),"native fit Lanczos next-vector normalization failed");beta_prev=b;
   }
   return extract_modes(static_cast<int>(alpha.size()),false);
@@ -2035,8 +2036,9 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     const double warm_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-warm_search_started).count();
     cg_witness_seed.clear();
     if(primary_modes.empty())throw std::runtime_error("native fit Lanczos returned no Ritz modes");
+    const char* search_policy=steps<=96?"FAST_CUT":"FULL_SEARCH";
     auto record_search=[&](const std::string& source,const std::vector<RitzMode>& found){
-      const RitzMode& summary=found.front();trace<<"outer "<<outer<<" SEARCH seed_source "<<source<<" lanczos_steps "<<steps<<" lanczos_steps_requested "<<steps<<" lanczos_steps_actual "<<summary.steps_used
+      const RitzMode& summary=found.front();trace<<"outer "<<outer<<" SEARCH search_policy "<<search_policy<<" seed_source "<<source<<" lanczos_steps "<<steps<<" lanczos_steps_requested "<<steps<<" lanczos_steps_actual "<<summary.steps_used
         <<" dense_matrix_actions "<<summary.dense_matrix_actions<<" early_exit "<<(summary.early_exit?1:0)<<" returned_directions "<<found.size()<<" actual_rayleighs";
       for(const auto& mode:found)trace<<' '<<mode.actual_rayleigh;
       trace<<" curvature_scales";
@@ -2060,7 +2062,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       independent_steps_used=independent_modes.front().steps_used;independent_dense_matrix_actions=independent_modes.front().dense_matrix_actions;
     }
     const int dense_matrix_actions_total=primary_dense_matrix_actions+independent_dense_matrix_actions;
-    trace<<"outer "<<outer<<" SEARCH warm_seconds="<<warm_seconds<<" independent_seconds="<<independent_seconds<<" total_seconds="<<warm_seconds+independent_seconds
+    trace<<"outer "<<outer<<" SEARCH search_policy="<<search_policy<<" warm_seconds="<<warm_seconds<<" independent_seconds="<<independent_seconds<<" total_seconds="<<warm_seconds+independent_seconds
       <<" requested_steps="<<steps<<" warm_steps_actual="<<primary_steps_used<<" independent_steps_actual="<<independent_steps_used
       <<" dense_matrix_actions_total="<<dense_matrix_actions_total<<'\n';trace.flush();
     if(!trace)throw std::runtime_error("failed writing native fit search timing: "+trace_path);

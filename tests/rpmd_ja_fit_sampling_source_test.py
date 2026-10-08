@@ -204,6 +204,8 @@ assert "stability_cut_guard_fraction=1.0e-3" in native_fit
 assert "cut_target=options.epsilon+cut_guard" in native_fit
 assert "const double rhs=cut_target-base_value" in native_fit
 assert "used==32||used==64||used==128||used==256" in native_fit
+assert "const bool early_cut=steps<=96&&below_threshold&&!search_finished" in native_fit
+assert 'steps<=96?"FAST_CUT":"FULL_SEARCH"' in native_fit
 assert "actual_rayleigh" in native_fit and "curvature_scale" in native_fit and "dense_matrix_actions" in native_fit and "early_exit" in native_fit
 extract_start = native_fit.index("auto extract_modes=")
 extract_end = native_fit.index("for(int k=0;k<steps;++k)", extract_start)
@@ -218,6 +220,7 @@ assert "test_stability_cut_guard_reduces_rotating_mode_rounds" in source("tests/
 assert "test_lanczos_staged_early_exit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_lanczos_continues_across_checkpoints" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_lanczos_curvature_rounding_boundary" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_lanczos_deep_search_does_not_early_cut" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_fit_samples_entry_preserves_inputs" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_full_spd_failure_keeps_candidate_pack" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
@@ -268,7 +271,7 @@ assert "two_to_54=18014398509481984.0" in source("tests/rpmd_ja_native_fit_cuda_
 assert "product_roundoff_residual==std::ldexp(1.0,-54)" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "saw_not_computed" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert '<<" coordinate_seconds="<<qp.coordinate_seconds<<" polish_seconds="<<qp.polish_seconds' in native_fit
-assert ' SEARCH warm_seconds=' in native_fit and 'independent_seconds=' in native_fit
+assert ' SEARCH search_policy=' in native_fit and 'warm_seconds=' in native_fit and 'independent_seconds=' in native_fit
 assert 'const int max_search_depth=std::min(384,d-3);' in native_fit
 assert 'DeviceLanczosWorkspace lanczos_workspace;lanczos_workspace.initialize(graph,sqrt_mass,sqrt_mass_atom,max_search_depth,psize);' in native_fit
 assert 'lanczos_translation_coefficients<<<3,256>>>' in native_fit and 'lanczos_additive_action<<<' in native_fit
