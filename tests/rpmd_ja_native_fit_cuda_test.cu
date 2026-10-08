@@ -80,6 +80,22 @@ std::string read_test_file(const std::string& path)
   std::ifstream in(path,std::ios::binary);return std::string(std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>());
 }
 
+std::vector<double> read_snapshot_vector(const std::string& contents,const std::string& name)
+{
+  std::istringstream lines(contents);std::string line;
+  while(std::getline(lines,line)){std::istringstream fields(line);std::string key;std::size_t count=0;if(!(fields>>key)||key!=name)continue;
+    if(!(fields>>count))throw std::runtime_error("invalid CG snapshot vector header");std::vector<double> values(count);
+    for(double& value:values)if(!(fields>>value))throw std::runtime_error("truncated CG snapshot vector");return values;}
+  throw std::runtime_error("missing CG snapshot vector: "+name);
+}
+
+double read_snapshot_scalar(const std::string& contents,const std::string& name)
+{
+  std::istringstream lines(contents);std::string line;
+  while(std::getline(lines,line)){std::istringstream fields(line);std::string key;double value=0.0;if(fields>>key&&key==name&&fields>>value)return value;}
+  throw std::runtime_error("missing or invalid CG snapshot scalar: "+name);
+}
+
 struct CutQPFixture
 {
   SmallSVD svd;
@@ -1215,6 +1231,61 @@ void test_projected_cg_curvature_witness()
   Graph edge;edge.edges.push_back({0,1,0,{0,0,0}});const std::vector<double> nonfinite_theta(6,std::numeric_limits<double>::quiet_NaN());const CGResult nonfinite=solve_projected_cg(positive,edge,basis[0],sqrt_mass,sqrt_atom,nonfinite_theta,n,4);assert(nonfinite.witness.classification=="NONFINITE_OPERATOR");
 }
 
+void test_cg_failure_snapshot_round_trip_replay()
+{
+  const double offset=std::ldexp(1.0,-27);
+  assert(compensated_dot({1.0+offset,1.0},{1.0-offset,-1.0})==-std::ldexp(1.0,-54));
+  assert(std::fma(1.0+offset,1.0-offset,-1.0)==-std::ldexp(1.0,-54));
+  constexpr int n=2,d=3*n;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);const auto basis=internal_basis(n);
+  std::vector<double> input_rhs=basis.front();input_rhs[0]+=0.25;input_rhs[1]+=0.25;std::vector<double> projected_rhs=input_rhs;project_translation(projected_rhs,sqrt_atom,n);
+  // A fixed near-singular SPD block makes the recursive and true residuals diverge reproducibly.
+  const double off_diagonal=1.0-std::ldexp(1.0,-40);std::vector<double> ill_conditioned(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<d;++i)ill_conditioned[static_cast<std::size_t>(i)*d+i]=1.0;
+  for(int i=0;i<2;++i)for(int j=0;j<2;++j){const double value=(i==j?1.0:off_diagonal)-(i==j?1.0:0.0);
+    for(int row=0;row<d;++row)for(int column=0;column<d;++column)ill_conditioned[static_cast<std::size_t>(row)*d+column]+=value*basis[i][row]*basis[j][column];}
+  std::stringstream ill_input(std::ios::in|std::ios::out|std::ios::binary);ill_input.write(reinterpret_cast<const char*>(ill_conditioned.data()),ill_conditioned.size()*sizeof(double));ill_input.seekg(0);
+  DeviceBaseline ill_baseline;ill_baseline.initialize(ill_input,0,d,n,masses,sqrt_mass);
+  std::vector<double> zero_theta;for(int i=0;i<d;++i)input_rhs[i]+=0.9*basis[1][i];projected_rhs=input_rhs;project_translation(projected_rhs,sqrt_atom,n);
+  constexpr double failure_epsilon=0.0;
+  const CGResult failed=solve_projected_cg(ill_baseline,Graph{},input_rhs,sqrt_mass,sqrt_atom,zero_theta,n,7,failure_epsilon);
+  assert(failed.witness.classification=="TRUE_RESIDUAL_FAILURE"&&failed.witness.finite&&failed.witness.probe==7);
+  assert(failed.residual_restarts==2&&failed.witness.residual_restarts==2&&failed.witness.residual_checks.size()==3);
+  for(int i=0;i<3;++i){const auto& check=failed.witness.residual_checks[i];assert(check.restarts==i&&check.recursive_relative<=1e-8&&check.true_relative>1e-8);
+    if(i>0)assert(check.iteration>failed.witness.residual_checks[i-1].iteration);}
+  assert(failed.witness.iteration==failed.witness.residual_checks.back().iteration);
+  check_close(failed.witness.recursive_relative_residual,failed.witness.residual_checks.back().recursive_relative,0.0);
+  check_close(failed.witness.relative_residual,failed.witness.residual_checks.back().true_relative,0.0);
+  RpmdJANativeFitOptions options;options.output_path="test_candidate";options.cutoff=4.0;options.temperature=300.0;options.fd_step=1e-3;options.sample_interval=10;options.epsilon=failure_epsilon;options.internal_mass_com=true;
+  const CGReplayContext replay{options,30,11,12,11,12,1,1,0.9,0.9};
+  const std::string path="rpmd_ja_cg_replay_test_"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
+  const std::vector<double> theta=zero_theta;write_cg_witness(path,failed.witness,theta,"qraw_fixture","samples_fixture",replay);
+  const std::string snapshot=read_test_file(path);assert(snapshot.find("classification TRUE_RESIDUAL_FAILURE")!=std::string::npos);
+  assert(snapshot.find("curvature_diagnostic_status NOT_COMPUTED")!=std::string::npos);
+  assert(snapshot.find("true_residual_status COMPUTED")!=std::string::npos);
+  check_close(read_snapshot_scalar(snapshot,"true_relative_residual"),failed.witness.relative_residual,0.0);
+  const double saved_epsilon=read_snapshot_scalar(snapshot,"epsilon");check_close(saved_epsilon,failure_epsilon,0.0);
+  assert(snapshot.find("residual_restarts 2")!=std::string::npos&&snapshot.find("residual_checks 3")!=std::string::npos);
+  for(const auto& check:failed.witness.residual_checks){std::ostringstream expected;expected<<"residual_check "<<check.iteration<<' '<<check.restarts<<' ';assert(snapshot.find(expected.str())!=std::string::npos);}
+  assert(snapshot.find("qraw_model_fingerprint 11")!=std::string::npos&&snapshot.find("active_config_fingerprint 12")!=std::string::npos);
+  const auto saved_rhs=read_snapshot_vector(snapshot,"rhs_input_xyz_soa"),saved_projected_rhs=read_snapshot_vector(snapshot,"rhs_projected_xyz_soa"),saved_theta=read_snapshot_vector(snapshot,"theta"),saved_x=read_snapshot_vector(snapshot,"solution_x_xyz_soa");
+  assert(saved_rhs==input_rhs&&saved_projected_rhs==projected_rhs&&saved_rhs!=saved_projected_rhs&&saved_theta==theta&&saved_x==failed.x);
+  const CGResult replayed=solve_projected_cg(ill_baseline,Graph{},saved_rhs,sqrt_mass,sqrt_atom,saved_theta,n,7,saved_epsilon);
+  assert(replayed.witness.classification=="TRUE_RESIDUAL_FAILURE"&&replayed.residual_restarts==2&&replayed.witness.residual_checks.size()==3);
+  for(int i=0;i<3;++i){check_close(replayed.witness.residual_checks[i].recursive_relative,failed.witness.residual_checks[i].recursive_relative,1e-10);
+    check_close(replayed.witness.residual_checks[i].true_relative,failed.witness.residual_checks[i].true_relative,1e-10);}
+  for(int i=0;i<d;++i)check_close(replayed.x[i],saved_x[i],1e-10);
+  constexpr double early_epsilon=2.0;
+  const CGResult early=solve_projected_cg(ill_baseline,Graph{},input_rhs,sqrt_mass,sqrt_atom,zero_theta,n,8,early_epsilon);assert(!early.witness.true_residual_computed);
+  RpmdJANativeFitOptions early_options=options;early_options.epsilon=early_epsilon;const CGReplayContext early_replay{early_options,30,11,12,11,12,1,1,0.9,0.9};
+  const std::string early_path=path+".early";RemoveTestFile early_cleanup{early_path};write_cg_witness(early_path,early.witness,zero_theta,"qraw_fixture","samples_fixture",early_replay);
+  const std::string early_snapshot=read_test_file(early_path);assert(early_snapshot.find("recursive_relative_residual ")!=std::string::npos);
+  check_close(read_snapshot_scalar(early_snapshot,"epsilon"),early_epsilon,0.0);
+  assert(early_snapshot.find("true_residual_status NOT_COMPUTED")!=std::string::npos&&early_snapshot.find("true_relative_residual NOT_COMPUTED")!=std::string::npos);
+  ResponseCheck early_response;early_response.cg=early.relative_residual;early_response.cg_residual_status=early.witness.classification;early_response.witness=early.witness;
+  std::ostringstream early_trace;write_response_stats(early_trace,early_response);assert(early_trace.str().find("cg_true_residual_status=NOT_COMPUTED")!=std::string::npos);
+  assert(early_trace.str().find("cg_recursive_relative_residual=NOT_RECORDED")==std::string::npos);
+}
+
 void test_lanczos_blindspot_cg_cut_feedback(cusolverDnHandle_t solver)
 {
   constexpr int n=40,d=3*n,p=6;const double epsilon=1e-3;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);std::vector<double> w(d);
@@ -1445,6 +1516,7 @@ int main()
   test_lanczos_deep_search_does_not_early_cut(qr.solver);
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
+  test_cg_failure_snapshot_round_trip_replay();
   test_lanczos_blindspot_cg_cut_feedback(qr.solver);
   test_lanczos_independent_seed_escapes_invariant_subspace(qr.solver);
   test_probe_selection_skips_duplicate_low_modes();

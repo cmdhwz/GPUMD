@@ -424,6 +424,12 @@ struct NeumaierAccumulator
   double value() const { return sum+correction; }
 };
 
+double compensated_dot(const std::vector<double>& left,const std::vector<double>& right)
+{
+  if(left.size()!=right.size())throw std::runtime_error("native fit compensated dot-product dimensions do not match");
+  NeumaierAccumulator sum;for(std::size_t i=0;i<left.size();++i)sum.add_product(left[i],right[i]);return sum.value();
+}
+
 double compensated_stationarity_residual(const double z,const int component,const std::vector<std::vector<double>>& a,
   const std::vector<double>& lambda,const std::vector<std::size_t>* active=nullptr)
 {
@@ -947,19 +953,54 @@ void apply_total(DeviceBaseline& baseline,const Graph& graph,const std::vector<d
   for(std::size_t i=0;i<result.size();++i)result[i]=base[i]+add[i];project_translation(result,sqrt_atom,n);
 }
 
+struct CGResidualCheck{int iteration=0,restarts=0;double recursive_relative=0.0,true_relative=0.0;};
 struct CGWitness {
   std::string classification;
-  int probe=-1,iteration=-1;
-  double p2=0.0,pap=0.0,rayleigh=0.0,base_rayleigh=0.0,add_rayleigh=0.0,repeat_rayleigh=0.0,repeat_diff_norm=0.0,translation_overlap=0.0,relative_residual=0.0,curvature_tolerance=0.0;
-  bool finite=false;
-  std::vector<double> direction,action,base,add;
+  int probe=-1,iteration=-1,residual_restarts=0;
+  double p2=0.0,pap=0.0,rayleigh=0.0,base_rayleigh=0.0,add_rayleigh=0.0,repeat_rayleigh=0.0,repeat_diff_norm=0.0,translation_overlap=0.0,relative_residual=0.0,recursive_relative_residual=0.0,curvature_tolerance=0.0;
+  bool finite=false,true_residual_computed=false;
+  std::vector<double> direction,action,base,add,rhs_input,rhs,solution;
+  std::vector<CGResidualCheck> residual_checks;
 };
 struct CGResult{std::vector<double> x;double relative_residual=0.0;int residual_restarts=0;CGWitness witness;};
-void write_cg_witness(const std::string& path,const CGWitness& w,const std::vector<double>& theta,
-  const std::string& raw_path,const std::string& spool_path,const bool internal_mass_com)
+struct CGReplayContext
 {
-  std::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("cannot write native fit CG witness: "+path);out<<std::setprecision(17)<<"status NOT_ACCEPTED_REFERENCE\nclassification "<<w.classification<<"\nprobe "<<w.probe<<"\niteration "<<w.iteration<<"\np2 "<<w.p2<<"\npAp "<<w.pap<<"\nrayleigh_quotient "<<w.rayleigh<<"\nbase_rayleigh "<<w.base_rayleigh<<"\nadditive_rayleigh "<<w.add_rayleigh<<"\ncurvature_tolerance "<<w.curvature_tolerance<<"\nrepeat_rayleigh "<<w.repeat_rayleigh<<"\nrepeat_diff_norm "<<w.repeat_diff_norm<<"\ntranslation_overlap "<<w.translation_overlap<<"\nrelative_residual "<<w.relative_residual<<"\nfinite "<<w.finite<<"\nqraw_source "<<raw_path<<"\nsample_spool "<<spool_path<<"\nprobe_source fixed_seeded_random16_then_type_local_then_low_ritz; CG probe index above\ncoordinate_convention "<<(internal_mass_com?"internal mass-COM projected mass-weighted xyz-SoA":"raw mass-weighted xyz-SoA")<<"\ntheta "<<theta.size();for(double x:theta)out<<' '<<x;out<<"\n";
-  auto vector=[&](const char* label,const std::vector<double>& x){out<<label<<' '<<x.size();for(double v:x)out<<' '<<v;out<<'\n';};vector("v_xyz_soa",w.direction);vector("Dv_xyz_soa",w.action);vector("base_Dv_xyz_soa",w.base);vector("additive_Dv_xyz_soa",w.add);out.close();if(!out)throw std::runtime_error("failed closing native fit CG witness: "+path);
+  const RpmdJANativeFitOptions& options;
+  std::uint64_t frame_count,raw_model,raw_config,active_model,active_config;
+  int raw_charge,raw_kspace;
+  double raw_mesh,active_mesh;
+};
+void set_true_residual_failure(CGResult& result,const int probe,const int iteration,const std::vector<double>& rhs_input,const std::vector<double>& rhs,
+  const double recursive_relative,const double true_relative,std::vector<CGResidualCheck> checks)
+{
+  CGWitness& witness=result.witness;witness.classification="TRUE_RESIDUAL_FAILURE";witness.probe=probe;witness.iteration=iteration;
+  witness.residual_restarts=result.residual_restarts;witness.relative_residual=true_relative;witness.recursive_relative_residual=recursive_relative;
+  witness.true_residual_computed=true;witness.rhs_input=rhs_input;witness.rhs=rhs;witness.solution=result.x;witness.residual_checks=std::move(checks);
+  witness.finite=std::isfinite(recursive_relative)&&std::isfinite(true_relative)&&
+    std::all_of(witness.rhs_input.begin(),witness.rhs_input.end(),[](double x){return std::isfinite(x);})&&
+    std::all_of(witness.rhs.begin(),witness.rhs.end(),[](double x){return std::isfinite(x);})&&
+    std::all_of(witness.solution.begin(),witness.solution.end(),[](double x){return std::isfinite(x);})&&
+    std::all_of(witness.residual_checks.begin(),witness.residual_checks.end(),[](const CGResidualCheck& check){return std::isfinite(check.recursive_relative)&&std::isfinite(check.true_relative);});
+}
+void write_cg_witness(const std::string& path,const CGWitness& w,const std::vector<double>& theta,
+  const std::string& raw_path,const std::string& spool_path,const CGReplayContext& replay)
+{
+  std::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("cannot write native fit CG witness: "+path);
+  const auto& options=replay.options;out<<std::setprecision(17)<<"status NOT_ACCEPTED_REFERENCE\nclassification "<<w.classification<<"\nprobe "<<w.probe<<"\niteration "<<w.iteration
+    <<"\nresidual_restarts "<<w.residual_restarts<<"\nrecursive_relative_residual "<<w.recursive_relative_residual<<"\ntrue_residual_status "<<(w.true_residual_computed?"COMPUTED":"NOT_COMPUTED")<<"\ntrue_relative_residual ";
+  if(w.true_residual_computed)out<<w.relative_residual;else out<<"NOT_COMPUTED";out<<"\nresidual_checks "<<w.residual_checks.size()<<'\n';
+  for(const auto& check:w.residual_checks)out<<"residual_check "<<check.iteration<<' '<<check.restarts<<' '<<check.recursive_relative<<' '<<check.true_relative<<'\n';
+  out<<"curvature_diagnostic_status "<<(w.direction.empty()?"NOT_COMPUTED":"COMPUTED")<<"\np2 "<<w.p2<<"\npAp "<<w.pap<<"\nrayleigh_quotient "<<w.rayleigh<<"\nbase_rayleigh "<<w.base_rayleigh<<"\nadditive_rayleigh "<<w.add_rayleigh<<"\ncurvature_tolerance "<<w.curvature_tolerance<<"\nrepeat_rayleigh "<<w.repeat_rayleigh<<"\nrepeat_diff_norm "<<w.repeat_diff_norm<<"\ntranslation_overlap "<<w.translation_overlap<<"\nfinite "<<w.finite
+    <<"\nqraw_source "<<std::quoted(raw_path)<<"\nsample_spool "<<std::quoted(spool_path)<<"\nsample_frames "<<replay.frame_count<<"\ntraining_frames "<<2*replay.frame_count/3
+    <<"\ncutoff_A "<<options.cutoff<<"\ntemperature_K "<<options.temperature<<"\nfd_step "<<options.fd_step<<"\nsample_interval "<<options.sample_interval<<"\nepsilon "<<options.epsilon
+    <<"\ninternal_mass_com "<<options.internal_mass_com<<"\nqraw_model_fingerprint "<<replay.raw_model<<"\nqraw_config_fingerprint "<<replay.raw_config
+    <<"\nactive_model_fingerprint "<<replay.active_model<<"\nactive_config_fingerprint "<<replay.active_config<<"\nqraw_charge_mode "<<replay.raw_charge
+    <<"\nqraw_kspace_flag "<<replay.raw_kspace<<"\nqraw_pppm_mesh_spacing "<<replay.raw_mesh<<"\nactive_pppm_mesh_spacing "<<replay.active_mesh
+    <<"\nprobe_source fixed_seeded_random16_then_type_local_then_low_ritz; CG probe index above\ncoordinate_convention "
+    <<(options.internal_mass_com?"internal mass-COM projected mass-weighted xyz-SoA":"raw mass-weighted xyz-SoA")<<"\ntheta "<<theta.size();for(double x:theta)out<<' '<<x;out<<'\n';
+  auto vector=[&](const char* label,const std::vector<double>& x){out<<label<<' '<<x.size();for(double v:x)out<<' '<<v;out<<'\n';};
+  vector("rhs_input_xyz_soa",w.rhs_input);vector("rhs_projected_xyz_soa",w.rhs);vector("solution_x_xyz_soa",w.solution);vector("v_xyz_soa",w.direction);vector("Dv_xyz_soa",w.action);vector("base_Dv_xyz_soa",w.base);vector("additive_Dv_xyz_soa",w.add);
+  out.close();if(!out)throw std::runtime_error("failed closing native fit CG witness: "+path);
 }
 bool preserve_candidate_package_on_full_spd_failure(const std::string& message,bool& pack_owned)
 {
@@ -970,23 +1011,24 @@ CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const st
   const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<double>& theta,const int n,const int probe=-1,const double epsilon=0.0)
 {
   CGResult out;out.x.assign(rhs.size(),0.0);std::vector<double> r=rhs,p=rhs,ap(rhs.size());project_translation(r,sqrt_atom,n);p=r;
-  const std::vector<double> projected_rhs=r;double rr=std::inner_product(r.begin(),r.end(),r.begin(),0.0);const double initial=std::sqrt(rr);if(!(initial>0.0)||!std::isfinite(initial))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response probe has zero or non-finite norm");
-  auto record_failure=[&](const char* classification,const int it){CGWitness& w=out.witness;w.classification=classification;w.probe=probe;w.iteration=it;w.p2=std::inner_product(p.begin(),p.end(),p.begin(),0.0);w.pap=std::inner_product(p.begin(),p.end(),ap.begin(),0.0);w.relative_residual=std::sqrt(rr)/initial;if(w.p2>0.0&&std::isfinite(w.p2)){w.direction=p;for(double& x:w.direction)x/=std::sqrt(w.p2);baseline.apply(w.direction,w.base);apply_additive(graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.add);apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.action);std::vector<double> repeat(p.size());apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,repeat);w.rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),w.action.begin(),0.0);w.base_rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),w.base.begin(),0.0);w.add_rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),w.add.begin(),0.0);w.repeat_rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),repeat.begin(),0.0);for(std::size_t i=0;i<repeat.size();++i)w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,repeat[i]-w.action[i]);}w.finite=std::isfinite(w.p2)&&std::isfinite(w.pap)&&std::isfinite(w.relative_residual)&&std::all_of(w.base.begin(),w.base.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.add.begin(),w.add.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.action.begin(),w.action.end(),[](double x){return std::isfinite(x);});};
-  for(int it=0;it<20000;++it){project_translation(p,sqrt_atom,n);apply_total(baseline,graph,p,sqrt_mass,sqrt_atom,theta,n,ap);const double pap=std::inner_product(p.begin(),p.end(),ap.begin(),0.0);if(!std::all_of(ap.begin(),ap.end(),[](double x){return std::isfinite(x);} )){
+  const std::vector<double> projected_rhs=r;double rr=compensated_dot(r,r);const double initial=std::sqrt(rr);if(!(initial>0.0)||!std::isfinite(initial))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response probe has zero or non-finite norm");
+  auto record_failure=[&](const char* classification,const int it){CGWitness& w=out.witness;w.classification=classification;w.probe=probe;w.iteration=it;w.residual_restarts=out.residual_restarts;w.p2=compensated_dot(p,p);w.pap=compensated_dot(p,ap);w.relative_residual=std::sqrt(rr)/initial;w.recursive_relative_residual=w.relative_residual;if(w.p2>0.0&&std::isfinite(w.p2)){w.direction=p;for(double& x:w.direction)x/=std::sqrt(w.p2);baseline.apply(w.direction,w.base);apply_additive(graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.add);apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.action);std::vector<double> repeat(p.size());apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,repeat);w.rayleigh=compensated_dot(w.direction,w.action);w.base_rayleigh=compensated_dot(w.direction,w.base);w.add_rayleigh=compensated_dot(w.direction,w.add);w.repeat_rayleigh=compensated_dot(w.direction,repeat);for(std::size_t i=0;i<repeat.size();++i)w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,repeat[i]-w.action[i]);}w.finite=std::isfinite(w.p2)&&std::isfinite(w.pap)&&std::isfinite(w.relative_residual)&&std::all_of(w.base.begin(),w.base.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.add.begin(),w.add.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.action.begin(),w.action.end(),[](double x){return std::isfinite(x);});};
+  std::vector<CGResidualCheck> residual_checks;
+  for(int it=0;it<20000;++it){project_translation(p,sqrt_atom,n);apply_total(baseline,graph,p,sqrt_mass,sqrt_atom,theta,n,ap);const double pap=compensated_dot(p,ap);if(!std::all_of(ap.begin(),ap.end(),[](double x){return std::isfinite(x);} )){
       record_failure("NONFINITE_OPERATOR",it);return out;
     }
      if(!std::isfinite(pap)){record_failure("NONFINITE_CG_ARITHMETIC",it);return out;}
-     const double p2=std::inner_product(p.begin(),p.end(),p.begin(),0.0);if(!(p2>0.0)||!std::isfinite(p2)){record_failure("NONFINITE_CG_ARITHMETIC",it);return out;}
-     const double rayleigh=pap/p2,operator_scale=std::max(1.0,std::sqrt(std::inner_product(ap.begin(),ap.end(),ap.begin(),0.0))/std::sqrt(p2));const double curvature_tolerance=std::min(epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*operator_scale);
+     const double p2=compensated_dot(p,p);if(!(p2>0.0)||!std::isfinite(p2)){record_failure("NONFINITE_CG_ARITHMETIC",it);return out;}
+     const double rayleigh=pap/p2,operator_scale=std::max(1.0,std::sqrt(compensated_dot(ap,ap))/std::sqrt(p2));const double curvature_tolerance=std::min(epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*operator_scale);
      if(!(pap>0.0)||rayleigh<epsilon-curvature_tolerance){
-       CGWitness& w=out.witness;w.classification="FINITE_CURVATURE_BELOW_EPSILON";w.probe=probe;w.iteration=it;w.p2=p2;w.pap=pap;w.relative_residual=std::sqrt(rr)/initial;
+      CGWitness& w=out.witness;w.classification="FINITE_CURVATURE_BELOW_EPSILON";w.probe=probe;w.iteration=it;w.residual_restarts=out.residual_restarts;w.p2=p2;w.pap=pap;w.relative_residual=std::sqrt(rr)/initial;w.recursive_relative_residual=w.relative_residual;
       if(!(w.p2>0.0)||!std::isfinite(w.p2)){w.classification="NONFINITE_CG_ARITHMETIC";return out;}
       const double original_pap=pap;w.direction=p;for(double& x:w.direction)x/=std::sqrt(w.p2);project_translation(w.direction,sqrt_atom,n);
-      const double norm=std::sqrt(std::inner_product(w.direction.begin(),w.direction.end(),w.direction.begin(),0.0));if(!(norm>0.0)||!std::isfinite(norm)){w.classification="NONFINITE_CG_ARITHMETIC";return out;}for(double& x:w.direction)x/=norm;
+      const double norm=std::sqrt(compensated_dot(w.direction,w.direction));if(!(norm>0.0)||!std::isfinite(norm)){w.classification="NONFINITE_CG_ARITHMETIC";return out;}for(double& x:w.direction)x/=norm;
       w.base.resize(p.size());w.add.resize(p.size());w.action.resize(p.size());std::vector<double> repeat(p.size());baseline.apply(w.direction,w.base);apply_additive(graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.add);apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.action);apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,repeat);
-       w.pap=original_pap;w.rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),w.action.begin(),0.0);
+       w.pap=original_pap;w.rayleigh=compensated_dot(w.direction,w.action);
       std::vector<double> projected=w.direction;project_translation(projected,sqrt_atom,n);double removed2=0.0;for(std::size_t i=0;i<projected.size();++i){const double delta=w.direction[i]-projected[i];removed2+=delta*delta;}w.translation_overlap=std::sqrt(removed2);
-       w.base_rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),w.base.begin(),0.0);w.add_rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),w.add.begin(),0.0);w.repeat_rayleigh=std::inner_product(w.direction.begin(),w.direction.end(),repeat.begin(),0.0);for(std::size_t i=0;i<repeat.size();++i){w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,repeat[i]-w.action[i]);w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,w.action[i]-w.base[i]-w.add[i]);}double base_norm=0.0,add_norm=0.0;for(double x:w.base)base_norm=std::hypot(base_norm,x);for(double x:w.add)add_norm=std::hypot(add_norm,x);w.curvature_tolerance=std::min(epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*std::max(1.0,base_norm+add_norm));
+       w.base_rayleigh=compensated_dot(w.direction,w.base);w.add_rayleigh=compensated_dot(w.direction,w.add);w.repeat_rayleigh=compensated_dot(w.direction,repeat);for(std::size_t i=0;i<repeat.size();++i){w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,repeat[i]-w.action[i]);w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,w.action[i]-w.base[i]-w.add[i]);}double base_norm=0.0,add_norm=0.0;for(double x:w.base)base_norm=std::hypot(base_norm,x);for(double x:w.add)add_norm=std::hypot(add_norm,x);w.curvature_tolerance=std::min(epsilon/4.0,256.0*std::numeric_limits<double>::epsilon()*std::max(1.0,base_norm+add_norm));
        const bool operator_finite=std::all_of(w.base.begin(),w.base.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.add.begin(),w.add.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.action.begin(),w.action.end(),[](double x){return std::isfinite(x);})&&std::all_of(repeat.begin(),repeat.end(),[](double x){return std::isfinite(x);});const bool scalar_finite=std::isfinite(w.p2)&&std::isfinite(w.pap)&&std::isfinite(w.rayleigh)&&std::isfinite(w.base_rayleigh)&&std::isfinite(w.add_rayleigh)&&std::isfinite(w.repeat_rayleigh)&&std::isfinite(w.repeat_diff_norm)&&std::isfinite(w.translation_overlap)&&std::isfinite(w.relative_residual)&&std::isfinite(w.curvature_tolerance)&&std::isfinite(base_norm)&&std::isfinite(add_norm);w.finite=operator_finite&&scalar_finite;
        if(!operator_finite)w.classification="NONFINITE_OPERATOR";
        else if(!scalar_finite)w.classification="NONFINITE_CG_ARITHMETIC";
@@ -996,9 +1038,9 @@ CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const st
        if(w.finite&&w.rayleigh>=epsilon-w.curvature_tolerance&&original_pap>0.0&&w.classification!="NUMERICAL_BREAKDOWN")out.witness=CGWitness{};
        else {if(w.finite&&w.rayleigh>0.0&&w.rayleigh>=epsilon-w.curvature_tolerance)w.classification="NUMERICAL_BREAKDOWN";return out;}
     }
-    const double alpha=rr/pap;for(std::size_t i=0;i<r.size();++i){out.x[i]+=alpha*p[i];r[i]-=alpha*ap[i];}project_translation(r,sqrt_atom,n);
-     const double next=std::inner_product(r.begin(),r.end(),r.begin(),0.0);out.relative_residual=std::sqrt(next)/initial;if(!std::isfinite(out.relative_residual)||!std::isfinite(alpha)||!std::isfinite(next))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG arithmetic became non-finite");if(out.relative_residual<=1e-8){apply_total(baseline,graph,out.x,sqrt_mass,sqrt_atom,theta,n,ap);for(std::size_t i=0;i<r.size();++i)r[i]=projected_rhs[i]-ap[i];project_translation(r,sqrt_atom,n);const double true2=std::inner_product(r.begin(),r.end(),r.begin(),0.0);out.relative_residual=std::sqrt(true2)/initial;if(!std::isfinite(out.relative_residual))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG true residual is non-finite");if(out.relative_residual<=1e-8)return out;if(out.residual_restarts>=2)throw std::runtime_error("NUMERICAL_BREAKDOWN: native fit response CG true residual exceeds tolerance after two restarts");rr=true2;p=r;++out.residual_restarts;continue;}
-    const double beta=next/rr;for(std::size_t i=0;i<p.size();++i)p[i]=r[i]+beta*p[i];project_translation(p,sqrt_atom,n);rr=next;
+    const double alpha=rr/pap;for(std::size_t i=0;i<r.size();++i){out.x[i]=std::fma(alpha,p[i],out.x[i]);r[i]=std::fma(-alpha,ap[i],r[i]);}project_translation(r,sqrt_atom,n);
+     const double next=compensated_dot(r,r);out.relative_residual=std::sqrt(next)/initial;if(!std::isfinite(out.relative_residual)||!std::isfinite(alpha)||!std::isfinite(next))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG arithmetic became non-finite");if(out.relative_residual<=1e-8){const double recursive_relative=out.relative_residual;apply_total(baseline,graph,out.x,sqrt_mass,sqrt_atom,theta,n,ap);for(std::size_t i=0;i<r.size();++i)r[i]=std::fma(-1.0,ap[i],projected_rhs[i]);project_translation(r,sqrt_atom,n);const double true2=compensated_dot(r,r);out.relative_residual=std::sqrt(true2)/initial;if(!std::isfinite(out.relative_residual))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response CG true residual is non-finite");residual_checks.push_back({it+1,out.residual_restarts,recursive_relative,out.relative_residual});if(out.relative_residual<=1e-8)return out;if(out.residual_restarts>=2){set_true_residual_failure(out,probe,it+1,rhs,projected_rhs,recursive_relative,out.relative_residual,std::move(residual_checks));return out;}rr=true2;p=r;++out.residual_restarts;continue;}
+    const double beta=next/rr;for(std::size_t i=0;i<p.size();++i)p[i]=std::fma(beta,p[i],r[i]);project_translation(p,sqrt_atom,n);rr=next;
   }
   throw std::runtime_error("NUMERICAL_BREAKDOWN: native fit response CG failed its 1e-8 residual tolerance");
 }
@@ -1647,6 +1689,7 @@ struct ResponseCheck{
   std::array<int,4> block_frames{};
   std::uint64_t total_frames=0,validation_frames=0,statistical_frames=0;
   int probes=0,cg_residual_restarts=0;
+  std::string cg_residual_status="NOT_COMPUTED";
   bool observed_cov_available=false,predicted_cov_available=false,cg_residual_available=false,response_ibp_available=false,force_residual_available=false;
   std::vector<std::string> probe_sources;
   std::vector<ProbeOrigin> probe_origins;
@@ -1695,8 +1738,14 @@ void write_response_stats(std::ostream& out,const ResponseCheck& r)
   out<<" ibp_block_radii=";
   for(const auto& level:r.ibp_band.level_radii)out<<(level.first==r.ibp_band.level_radii.front().first?"":",")<<level.first<<':'<<level.second;
   out
-    <<" baseline_apply_seconds="<<r.baseline_apply_seconds<<" cg_residual_restarts="<<r.cg_residual_restarts<<" cg_residual_status="<<(r.cg_residual_available?"AVAILABLE":"NOT_COMPUTED")
-    <<" cg_true_residual="<<r.cg<<" response_ibp_status="<<(r.response_ibp_available?"AVAILABLE":"NOT_COMPUTED")<<" response="<<r.response<<" ibp="<<r.ibp
+    <<" baseline_apply_seconds="<<r.baseline_apply_seconds<<" cg_residual_restarts="<<r.cg_residual_restarts<<" cg_residual_status="<<r.cg_residual_status
+    <<" cg_failure_classification="<<(r.witness.classification.empty()?"NONE":r.witness.classification)<<" cg_failure_iteration="<<r.witness.iteration
+    <<" cg_recursive_relative_residual=";
+  if(r.witness.classification.empty())out<<"NOT_RECORDED";else out<<r.witness.recursive_relative_residual;
+  const bool true_residual_computed=r.cg_residual_status=="CG_PASS"||r.witness.true_residual_computed;
+  out<<" cg_true_residual_checks="<<r.witness.residual_checks.size()<<" cg_true_residual_status="<<(true_residual_computed?"COMPUTED":"NOT_COMPUTED")<<" cg_true_residual=";
+  if(true_residual_computed)out<<r.cg;else out<<"NOT_COMPUTED";
+  out<<" response_ibp_status="<<(r.response_ibp_available?"AVAILABLE":"NOT_COMPUTED")<<" response="<<r.response<<" ibp="<<r.ibp
     <<" force_residual_status="<<(r.force_residual_available?"AVAILABLE":"NOT_COMPUTED")<<" heldout_force_residual="<<r.force_residual;
   out<<' ';write_bootstrap_diagnostic(out,"response_diagnostic",r.response_band,false);
   out<<' ';write_bootstrap_diagnostic(out,"ibp_diagnostic",r.ibp_band,false);
@@ -1712,8 +1761,8 @@ ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline
   result.total_frames=frame_count;result.validation_frames=frame_count-train;if(progress)*progress=result;
   if(result.validation_frames<=static_cast<std::uint64_t>(m))throw std::runtime_error("native fit held-out frames must exceed the fixed probe count");
   std::vector<double> predicted(static_cast<std::size_t>(m)*m),rhs(d);double max_cg=0.0;
-  for(int j=0;j<m;++j){const CGResult cg=solve_projected_cg(baseline,graph,probes[j],sqrt_mass,sqrt_atom,theta,n,j,epsilon);result.cg_residual_restarts+=cg.residual_restarts;if(!cg.witness.classification.empty()){result.cg=cg.relative_residual;result.cg_residual_available=true;result.witness=cg.witness;if(progress)*progress=result;return result;}max_cg=std::max(max_cg,cg.relative_residual);for(int i=0;i<m;++i)predicted[static_cast<std::size_t>(i)*m+j]=K_B*temperature*std::inner_product(probes[i].begin(),probes[i].end(),cg.x.begin(),0.0);}
-  result.cg=max_cg;result.cg_residual_available=true;if(progress)*progress=result;
+  for(int j=0;j<m;++j){const CGResult cg=solve_projected_cg(baseline,graph,probes[j],sqrt_mass,sqrt_atom,theta,n,j,epsilon);result.cg_residual_restarts+=cg.residual_restarts;if(!cg.witness.classification.empty()){result.cg=cg.relative_residual;result.cg_residual_available=true;result.cg_residual_status=cg.witness.classification;result.witness=cg.witness;if(progress)*progress=result;return result;}max_cg=std::max(max_cg,cg.relative_residual);for(int i=0;i<m;++i)predicted[static_cast<std::size_t>(i)*m+j]=K_B*temperature*std::inner_product(probes[i].begin(),probes[i].end(),cg.x.begin(),0.0);}
+  result.cg=max_cg;result.cg_residual_available=true;result.cg_residual_status="CG_PASS";if(progress)*progress=result;
   ProbeMoments validation_moments(m);const int bootstrap_block_length=static_cast<int>(std::max<std::uint64_t>(1,(result.validation_frames+1023)/1024));std::vector<ProbeMoments> validation_bootstrap_blocks;ProbeMoments pending_block(m);int pending_count=0;std::vector<double> block_q(static_cast<std::size_t>(4)*m,0.0),block_q2(block_q.size(),0.0),x(d),f(d),q(d),fw(d),add(d),qp(m),fp(m);
   const std::size_t batch_elements=static_cast<std::size_t>(d)*DeviceBaseline::batch_capacity;std::vector<double> q_batch(batch_elements),force_batch(batch_elements),base_batch(batch_elements);
   double residual2=0.0,force2=0.0;spool.clear();spool.seekg(frame_start);double step=0.0,previous=-std::numeric_limits<double>::infinity();
@@ -1963,6 +2012,7 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   raw.seekg(0,std::ios::end);const std::streamoff raw_end=raw.tellg();const std::uint64_t raw_expected=static_cast<std::uint64_t>(data)+((2*vd+7*dd+18)*sizeof(double));
   if(raw_expected>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())||raw_end!=static_cast<std::streamoff>(raw_expected))throw std::runtime_error("qNEP raw file byte length is invalid");
   double raw_stats[18];raw.seekg(static_cast<std::streamoff>(data)+static_cast<std::streamoff>(2*vd+7*dd)*sizeof(double));raw.read(reinterpret_cast<char*>(raw_stats),sizeof(raw_stats));const bool finite_stats=std::all_of(raw_stats,raw_stats+18,[](double v){return std::isfinite(v)&&v>=0.0;});const bool raw_v1=raw_stats[17]==1.0&&raw_stats[1]<=1e-4&&std::max({raw_stats[2],raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;const bool raw_v2=raw_stats[17]==2.0&&raw_stats[1]<=1e-4&&raw_stats[3]<=1e-4&&std::max({raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;const bool raw_v3=raw_stats[17]==3.0&&raw_stats[1]<=1e-4&&raw_stats[3]<=1e-4&&std::max({raw_stats[4],raw_stats[6],raw_stats[7],raw_stats[8],raw_stats[14],raw_stats[15]})<=5e-2;if(!raw||!finite_stats||raw_stats[16]!=options.fd_step||(rawver==1?!raw_v1:(rawver==2?!raw_v2:!raw_v3)))throw std::runtime_error("qNEP raw diagnostics fail accepted limits");raw.clear();
+  const CGReplayContext cg_replay{options,frame_count,raw_model,raw_config,expected_model,expected_config,raw_charge,raw_kspace,raw_mesh,active_mesh};
   std::vector<double> raw_gradient(d),site(n);for(int a=0;a<d;++a){raw.clear();raw.seekg(data+static_cast<std::streamoff>(a)*n*sizeof(double));read_array(raw,site.data(),n,"raw qNEP site gradient");if(!std::all_of(site.begin(),site.end(),[](double v){return std::isfinite(v);}))throw std::runtime_error("native fit qNEP site gradient contains non-finite values");raw_gradient[a]=std::accumulate(site.begin(),site.end(),0.0);if(!std::isfinite(raw_gradient[a]))throw std::runtime_error("native fit qNEP reference gradient is non-finite");}
    own_scratch.raw_owned=false;
    const auto raw_net=rpmd_ja_reference_math::net_force_stats(raw_gradient,n);
@@ -2100,8 +2150,10 @@ static void fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         std::printf("    RESPONSE_CHECK_FAIL response=%.6g; IBP_DIAGNOSTIC status=%s value=%.6g; snapshot=%s\n",response.response,response.ibp_band.status.c_str(),response.ibp,response_state_path.c_str());
         throw std::runtime_error("RESPONSE_CHECK_FAIL: native fit held-out probe response exceeds its declared tolerance; inspect "+response_state_path);}
       fit_converged=true;break;}
-    write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,options.internal_mass_com);const bool feedback_eligible=response.witness.finite&&(response.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION"||response.witness.classification=="UNRESOLVED_SOFT_DIRECTION");std::printf("    rpmd_ja fit CG_FEEDBACK %s: %s probe=%d iteration=%d lambda=%.17g base=%.17g add=%.17g tol=%.3g repeat_delta=%.3g; witness=%s\n",feedback_eligible?"RETRY":"FAIL",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.rayleigh,response.witness.base_rayleigh,response.witness.add_rayleigh,response.witness.curvature_tolerance,response.witness.repeat_diff_norm,witness_path.c_str());
-    if(!feedback_eligible)throw std::runtime_error("CG stability feedback failed with classification "+response.witness.classification+"; inspect "+witness_path);
+    write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay);const bool feedback_eligible=response.witness.finite&&(response.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION"||response.witness.classification=="UNRESOLVED_SOFT_DIRECTION");
+    if(response.witness.classification=="TRUE_RESIDUAL_FAILURE")std::printf("    rpmd_ja fit CG_FEEDBACK FAIL: %s probe=%d iteration=%d recursive_residual=%.3g true_residual=%.3g restarts=%d; witness=%s\n",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.recursive_relative_residual,response.witness.relative_residual,response.witness.residual_restarts,witness_path.c_str());
+    else std::printf("    rpmd_ja fit CG_FEEDBACK %s: %s probe=%d iteration=%d lambda=%.17g base=%.17g add=%.17g tol=%.3g repeat_delta=%.3g recursive_residual=%.3g restarts=%d; witness=%s\n",feedback_eligible?"RETRY":"FAIL",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.rayleigh,response.witness.base_rayleigh,response.witness.add_rayleigh,response.witness.curvature_tolerance,response.witness.repeat_diff_norm,response.witness.recursive_relative_residual,response.witness.residual_restarts,witness_path.c_str());
+    if(!feedback_eligible){trace<<"outer "<<outer<<" status CG_FAILURE classification="<<response.witness.classification<<" probe="<<response.witness.probe<<" iteration="<<response.witness.iteration<<" restarts="<<response.witness.residual_restarts<<" snapshot="<<std::quoted(witness_path)<<' ';write_response_stats(trace,response);trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit CG failure diagnostics: "+trace_path);throw std::runtime_error("CG stability feedback failed with classification "+response.witness.classification+"; inspect "+witness_path);}
     const double base_value=std::inner_product(response.witness.direction.begin(),response.witness.direction.end(),response.witness.base.begin(),0.0);if(response.witness.rayleigh>=options.epsilon-response.witness.curvature_tolerance)throw std::runtime_error("NUMERICAL_BREAKDOWN: normalized CG witness is not below the declared curvature threshold; inspect "+witness_path);const bool added=add_cut(response.witness.direction,base_value,outer,response.witness.classification.c_str());
     if(!added)throw std::runtime_error("STABILITY_CUT_STALLED: CG witness did not add a new violated constraint");
     cg_witness_seed=response.witness.direction;++consecutive_cg_feedback;if(consecutive_cg_feedback>=2)deepen_search();

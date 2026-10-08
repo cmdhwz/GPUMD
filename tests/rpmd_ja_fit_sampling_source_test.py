@@ -221,6 +221,29 @@ assert "test_lanczos_staged_early_exit" in source("tests/rpmd_ja_native_fit_cuda
 assert "test_lanczos_continues_across_checkpoints" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_lanczos_curvature_rounding_boundary" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_lanczos_deep_search_does_not_early_cut" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "double compensated_dot(const std::vector<double>& left,const std::vector<double>& right)" in native_fit
+cg_start = native_fit.index("CGResult solve_projected_cg(")
+cg_end = native_fit.index("struct ProbeOrigin", cg_start)
+cg_body = native_fit[cg_start:cg_end]
+assert "rr=compensated_dot(r,r)" in cg_body and "pap=compensated_dot(p,ap)" in cg_body
+assert "std::fma(alpha,p[i],out.x[i])" in cg_body and "std::fma(-alpha,ap[i],r[i])" in cg_body and "std::fma(beta,p[i],r[i])" in cg_body
+assert "TRUE_RESIDUAL_FAILURE" in native_fit and "set_true_residual_failure" in cg_body
+assert "write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay)" in native_fit
+assert "rhs_input_xyz_soa" in native_fit and "rhs_projected_xyz_soa" in native_fit and "solution_x_xyz_soa" in native_fit and "active_config_fingerprint" in native_fit
+assert 'true_residual_status "<<(w.true_residual_computed?"COMPUTED":"NOT_COMPUTED")' in native_fit
+assert 'cg_true_residual_status="<<(true_residual_computed?"COMPUTED":"NOT_COMPUTED")' in native_fit
+assert "status CG_FAILURE classification=" in native_fit and "test_cg_failure_snapshot_round_trip_replay" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+cg_replay_test = source("tests/rpmd_ja_native_fit_cuda_test.cu").split("void test_cg_failure_snapshot_round_trip_replay()", 1)[1].split("\nvoid ", 1)[0]
+assert "solve_projected_cg(ill_baseline" in cg_replay_test and "failed.witness.residual_checks.size()==3" in cg_replay_test
+assert "check.true_relative>1e-8" in cg_replay_test and "check.restarts==i" in cg_replay_test
+assert 'read_snapshot_scalar(snapshot,"epsilon")' in cg_replay_test and 'read_snapshot_scalar(early_snapshot,"epsilon")' in cg_replay_test
+feedback_start = native_fit.index("const bool feedback_eligible=response.witness.finite")
+feedback_end = native_fit.index("const double base_value=", feedback_start)
+feedback_body = native_fit[feedback_start:feedback_end]
+assert 'classification=="NONPOSITIVE_OPERATOR_DIRECTION"' in feedback_body
+assert 'classification=="UNRESOLVED_SOFT_DIRECTION"' in feedback_body
+assert "if(!feedback_eligible)" in feedback_body and "throw std::runtime_error" in feedback_body
+assert native_fit.index("add_cut(", feedback_end) > feedback_end
 assert "test_fit_samples_entry_preserves_inputs" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_full_spd_failure_keeps_candidate_pack" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
