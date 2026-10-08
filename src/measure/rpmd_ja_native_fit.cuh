@@ -23,7 +23,7 @@ struct RpmdJANativeFitOptions
   bool internal_mass_com = false;
 };
 
-void fit_rpmd_ja_native_reference(
+bool fit_rpmd_ja_native_reference(
   const RpmdJANativeFitOptions& options,
   const std::string& spool_path,
   std::uint64_t frame_count,

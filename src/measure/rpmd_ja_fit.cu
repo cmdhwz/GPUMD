@@ -439,15 +439,18 @@ void RpmdJA_Fit::post_run(
   options.sample_interval = sample_interval_;
   options.max_stability_rounds = max_stability_rounds_;
   options.internal_mass_com = integrate.get_pimd_fix_com();
+  bool preserve_replay_inputs = false;
   try {
-    fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_);
+    preserve_replay_inputs = fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_);
   } catch (...) {
     release_lock_();
     std::cerr << "rpmd_ja fit failed after " << frame_count_ << " frames; sample spool retained at "
               << spool_path_ << "\n";
     throw;
   }
-  if (std::remove(spool_path_.c_str()) != 0) {
+  if (preserve_replay_inputs) {
+    std::printf("rpmd_ja fit retained sample spool for CG replay: %s\n", spool_path_.c_str());
+  } else if (std::remove(spool_path_.c_str()) != 0) {
     std::cerr << "rpmd_ja fit produced the reference but could not remove its spool: " << spool_path_ << "\n";
   }
   std::printf("rpmd_ja fit sampled %llu frames (%llu spool bytes); reference written to %s\n",

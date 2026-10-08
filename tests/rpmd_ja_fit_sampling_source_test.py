@@ -37,7 +37,7 @@ assert 'if(ibp_statistics_numerically_invalid(sample_statistics.ibp_band))' in n
 assert 'if(response.response>options.response_tolerance||response.response_band.status!="RESPONSE_PASS")' in native_fit
 assert 'FIT_STATUS ACCEPTED_REFERENCE response=PASS full_spd=PASS sample_IBP_DIAGNOSTIC=' in native_fit
 assert 'response_IBP_DIAGNOSTIC=' in native_fit and 'IBP_acceptance_role DIAGNOSTIC_ONLY' in native_fit
-fit_impl_start = native_fit.index("static void fit_rpmd_ja_native_reference_impl(")
+fit_impl_start = native_fit.index("static bool fit_rpmd_ja_native_reference_impl(")
 fit_impl = native_fit[fit_impl_start:]
 assert fit_impl.index("collect_fixed_probe_statistics(in,header") < fit_impl.index("std::ofstream trace(trace_path")
 assert fit_impl.index("std::ofstream trace(trace_path") < fit_impl.index("generate_rpmd_ja_qnep_raw(")
@@ -144,7 +144,10 @@ assert "atom.number_of_atoms > INT_MAX / 3" in sampler
 assert "pbc_[0] != 1 || pbc_[1] != 1 || pbc_[2] != 1" in sampler
 assert "size_stream.close();" in sampler
 assert "stream limits" in sampler
-assert "fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_)" in sampler
+assert "preserve_replay_inputs = fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_)" in sampler
+assert "if (preserve_replay_inputs)" in sampler and "retained sample spool for CG replay" in sampler
+assert "cg_recovery_replay_inputs_retained" in native_fit and "cg_recovery_sample_spool" in native_fit and "cg_recovery_qraw" in native_fit
+assert "saved_recovery_witness_paths.empty()&&std::remove(generated_raw_path.c_str())!=0" in native_fit
 assert "struct RpmdJANativeFitOptions" in native_header
 assert "std::uint64_t frame_count" in native_header
 assert "int max_stability_rounds = 160;" in native_header
@@ -173,7 +176,7 @@ assert "validate_qraw_identity(raw,options,header,r0,box,force)" in native_fit
 assert "model!=expected_model||config!=expected_config" in native_fit
 assert "raw_types[i]==header.types[i]&&raw_masses[i]==header.masses[i]" in native_fit
 assert "raw_positions[i]-r0[i]" in native_fit
-assert "generate_raw&&std::remove(generated_raw_path.c_str())" in native_fit
+assert "generate_raw&&saved_recovery_witness_paths.empty()&&std::remove(generated_raw_path.c_str())" in native_fit
 assert "options.raw_input_path.empty()?generated_raw_path:options.raw_input_path" in native_fit
 assert '#include "force/nep_charge.cuh"' in native_fit
 assert 'record_search("FIXED_INDEPENDENT"' in native_fit
@@ -240,6 +243,16 @@ cg_body = native_fit[cg_start:cg_end]
 assert "rr=compensated_dot(r,r)" in cg_body and "pap=compensated_dot(p,ap)" in cg_body
 assert "std::fma(alpha,p[i],out.x[i])" in cg_body and "std::fma(-alpha,ap[i],r[i])" in cg_body and "std::fma(beta,p[i],r[i])" in cg_body
 assert "TRUE_RESIDUAL_FAILURE" in native_fit and "set_true_residual_failure" in cg_body
+record_failure_body = cg_body[cg_body.index("auto record_failure="):cg_body.index("std::vector<CGResidualCheck>")]
+assert "w.base.resize(p.size())" in record_failure_body and "w.add.resize(p.size())" in record_failure_body and "w.action.resize(p.size())" in record_failure_body
+assert "bool recover_cg_true_residual_failure(" in native_fit
+probe_validation_start = native_fit.index("ResponseCheck validate_probes(")
+probe_validation_end = native_fit.index("void write_response_state(", probe_validation_start)
+probe_validation_body = native_fit[probe_validation_start:probe_validation_end]
+assert "recover_cg_true_residual_failure(" in probe_validation_body and "predicted[static_cast<std::size_t>(i)*m+j]" in probe_validation_body
+assert "cg_verification_method=" in native_fit and "cg_probe_recovery_" in native_fit
+assert "write_recovered_cg_witnesses(" in native_fit
+assert "test_production_true_residual_recovery" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay)" in native_fit
 assert "rhs_input_xyz_soa" in native_fit and "rhs_projected_xyz_soa" in native_fit and "solution_x_xyz_soa" in native_fit and "active_config_fingerprint" in native_fit
 assert 'true_residual_status "<<(w.true_residual_computed?"COMPUTED":"NOT_COMPUTED")' in native_fit
@@ -377,6 +390,9 @@ assert "std::printf(\"rpmd_ja sample saved" in sample_only_branch and "fitting w
 fit_post_body = post_run_body[native_fit_call:]
 assert fit_post_body.index("catch (...) {") < fit_post_body.index("release_lock_();") < fit_post_body.index("throw;")
 assert fit_post_body.rindex("release_lock_();") > 0
+assert "bool preserve_replay_inputs = false;" in post_run_body
+assert "preserve_replay_inputs = fit_rpmd_ja_native_reference(" in post_run_body
+assert "else if (std::remove(spool_path_.c_str()) != 0)" in fit_post_body
 
 assert "__host__ __device__ inline bool rpmd_ja_fit_mic(" in sampling
 assert "nearbyint(sx)" in sampling and "nearbyint(sy)" in sampling and "nearbyint(sz)" in sampling

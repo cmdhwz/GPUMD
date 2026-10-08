@@ -29,7 +29,7 @@ assert "bool full)" in sample_diagnostic
 assert "diagnose_rpmd_ja_qnep_reference(fd_step, atom, box, force, full)" in sample_diagnostic
 assert "bool full = false" in (root / "src/measure/rpmd_ja_native_fit.cuh").read_text(encoding="utf-8")
 assert "diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&, bool)" in (root / "tests/rpmd_ja_native_fit_cuda_test.cu").read_text(encoding="utf-8")
-fit_wrapper = native[native.index("void fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options"):native.index("void diagnose_rpmd_ja_native_fit_samples(")]
+fit_wrapper = native[native.index("bool fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options"):native.index("void diagnose_rpmd_ja_native_fit_samples(")]
 assert "diagnose_rpmd_ja_qnep_reference" not in fit_wrapper
 assert "const bool precheck_failed" in text and "throw std::runtime_error(failure.str())" in text
 precheck_table = text[text.index("void print_qnep_precheck_table("):text.index("std::uint64_t qnep_config_fingerprint(")]
@@ -71,7 +71,7 @@ assert ".qraw" not in diagnose and "std::ofstream" not in diagnose
 raw_generation = text[text.index("static void generate_rpmd_ja_qnep_raw_reference("):text.index("void generate_rpmd_ja_qnep_raw(")]
 assert raw_generation.index("exact full-column V gradient net xyz=") < raw_generation.index("if (require_zero_net_gradient && !net_stats.within_limit)") < raw_generation.index("const auto kc_phase_start")
 assert "bool require_zero_net_gradient = false" in header
-fit_impl = native[native.index("static void fit_rpmd_ja_native_reference_impl("):native.index("void fit_rpmd_ja_native_reference(")]
+fit_impl = native[native.index("static bool fit_rpmd_ja_native_reference_impl("):native.index("bool fit_rpmd_ja_native_reference(")]
 assert "force,!options.internal_mass_com);" in fit_impl
 assert "rpmd_ja_reference_math::net_force_stats(raw_gradient,n)" in native
 

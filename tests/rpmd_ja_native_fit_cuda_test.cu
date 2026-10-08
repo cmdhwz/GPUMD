@@ -1229,6 +1229,47 @@ void test_projected_cg_curvature_witness()
   const CGResult soft=solve_projected_cg(positive,Graph{},basis[0],sqrt_mass,sqrt_atom,zero_theta,n,5,1.1);assert(soft.witness.classification=="UNRESOLVED_SOFT_DIRECTION");check_close(soft.witness.rayleigh,1.0,1e-10);
   std::vector<double> zero_matrix(d*d,0.0);DeviceBaseline singular;initialize(singular,zero_matrix);const CGResult zero=solve_projected_cg(singular,Graph{},basis[0],sqrt_mass,sqrt_atom,zero_theta,n,6);assert(zero.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION");check_close(zero.witness.rayleigh,0.0,1e-12);
   Graph edge;edge.edges.push_back({0,1,0,{0,0,0}});const std::vector<double> nonfinite_theta(6,std::numeric_limits<double>::quiet_NaN());const CGResult nonfinite=solve_projected_cg(positive,edge,basis[0],sqrt_mass,sqrt_atom,nonfinite_theta,n,4);assert(nonfinite.witness.classification=="NONFINITE_OPERATOR");
+  assert(nonfinite.witness.base.size()==d&&nonfinite.witness.add.size()==d&&nonfinite.witness.action.size()==d);
+}
+
+void test_production_true_residual_recovery()
+{
+  constexpr int n=2,d=3*n;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0),theta;
+  const auto basis=internal_basis(n);std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=1.0;
+  auto initialize=[&](DeviceBaseline& baseline,const std::vector<double>& matrix){
+    std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);stream.write(reinterpret_cast<const char*>(matrix.data()),matrix.size()*sizeof(double));stream.seekg(0);
+    baseline.initialize(stream,0,d,n,masses,sqrt_mass);};
+  auto make_failure=[&](const std::vector<double>& x){CGResult failed;failed.x=x;set_true_residual_failure(failed,7,12,basis[0],basis[0],1e-8,0.1,{});return failed;};
+  std::vector<double> saved_x=basis[0];for(double& value:saved_x)value*=0.9;
+  DeviceBaseline positive;initialize(positive,raw);CGResult recovered=make_failure(saved_x);CGProbeRecoveryDiagnostic recovered_diagnostic;
+  assert(recover_cg_true_residual_failure(positive,Graph{},basis[0],recovered,sqrt_mass,sqrt_atom,theta,n,recovered_diagnostic,3));
+  assert(recovered_diagnostic.recovered&&recovered_diagnostic.initial_cg_status=="TRUE_RESIDUAL_FAILURE");
+  assert(recovered_diagnostic.verification_method=="COMPENSATED"&&recovered_diagnostic.initial_compensated_residual>1e-8);
+  assert(recovered_diagnostic.final_compensated_residual<=1e-8&&recovered_diagnostic.refinement_rounds==1);
+  assert(recovered.witness.classification=="TRUE_RESIDUAL_FAILURE"&&recovered_diagnostic.original_witness.solution==saved_x);
+  for(int i=0;i<d;++i)check_close(recovered.x[i],basis[0][i],1e-8);
+
+  std::fill(raw.begin(),raw.end(),0.0);DeviceBaseline singular;initialize(singular,raw);CGResult rejected=make_failure(saved_x);CGProbeRecoveryDiagnostic rejected_diagnostic;
+  assert(!recover_cg_true_residual_failure(singular,Graph{},basis[0],rejected,sqrt_mass,sqrt_atom,theta,n,rejected_diagnostic));
+  assert(!rejected_diagnostic.recovered&&rejected.x==saved_x&&rejected_diagnostic.original_witness.solution==saved_x);
+  assert(rejected_diagnostic.refinement_status=="CORRECTION_NONPOSITIVE_OPERATOR_DIRECTION");
+  assert(rejected.witness.classification=="TRUE_RESIDUAL_FAILURE"&&rejected_diagnostic.final_compensated_residual>1e-8);
+
+  ResponseCheck response;response.cg_residual_status="CG_PASS";response.cg_verification_method="COMPENSATED";response.cg= recovered_diagnostic.final_compensated_residual;
+  response.cg_probe_recoveries.push_back(recovered_diagnostic);std::ostringstream stats;write_response_stats(stats,response);
+  assert(stats.str().find("cg_verification_method=COMPENSATED")!=std::string::npos);
+  assert(stats.str().find("initial_cg_status=TRUE_RESIDUAL_FAILURE")!=std::string::npos);
+  assert(stats.str().find("final_compensated_residual=")!=std::string::npos);
+  RpmdJANativeFitOptions options;options.output_path="recovery_test";options.cutoff=4.0;options.temperature=300.0;options.fd_step=1e-3;options.sample_interval=10;options.epsilon=0.0;options.internal_mass_com=true;
+  const CGReplayContext replay{options,30,11,12,11,12,1,1,0.9,0.9};
+  const std::string base="rpmd_ja_recovered_witness_test_"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".cg_witness.txt";
+  const std::string expected_path=base+".outer_3.probe_7.txt";RemoveTestFile cleanup{expected_path};
+  std::vector<std::string> saved_paths;write_recovered_cg_witnesses(response,base,theta,"qraw_fixture","samples_fixture",replay,saved_paths);
+  assert(saved_paths.size()==1&&saved_paths.front()==expected_path);
+  assert(response.cg_probe_recoveries.front().witness_snapshot_path==expected_path);
+  const CGWitnessSnapshot recovered_snapshot=read_cg_witness(expected_path,d,0);
+  assert(recovered_snapshot.classification=="TRUE_RESIDUAL_FAILURE"&&recovered_snapshot.probe==7);
 }
 
 void test_bounded_cg_replay_refinement()
@@ -1551,6 +1592,18 @@ void test_lanczos_deep_search_does_not_early_cut(cusolverDnHandle_t solver)
   assert(deep.front().dense_matrix_actions==192+4*4);
 }
 
+std::vector<double> solve_dense_reference(std::vector<double> matrix,std::vector<double> rhs,const int n)
+{
+  for(int k=0;k<n;++k){int pivot=k;for(int i=k+1;i<n;++i)if(std::abs(matrix[static_cast<std::size_t>(i)*n+k])>
+      std::abs(matrix[static_cast<std::size_t>(pivot)*n+k]))pivot=i;
+    assert(std::abs(matrix[static_cast<std::size_t>(pivot)*n+k])>1e-14);
+    if(pivot!=k){for(int j=k;j<n;++j)std::swap(matrix[static_cast<std::size_t>(k)*n+j],matrix[static_cast<std::size_t>(pivot)*n+j]);std::swap(rhs[k],rhs[pivot]);}
+    for(int i=k+1;i<n;++i){const double factor=matrix[static_cast<std::size_t>(i)*n+k]/matrix[static_cast<std::size_t>(k)*n+k];
+      for(int j=k+1;j<n;++j)matrix[static_cast<std::size_t>(i)*n+j]-=factor*matrix[static_cast<std::size_t>(k)*n+j];rhs[i]-=factor*rhs[k];}}
+  for(int i=n-1;i>=0;--i){for(int j=i+1;j<n;++j)rhs[i]-=matrix[static_cast<std::size_t>(i)*n+j]*rhs[j];rhs[i]/=matrix[static_cast<std::size_t>(i)*n+i];}
+  return rhs;
+}
+
 void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
 {
   constexpr int n=8,d=3*n,train=21,validation=33,frames=train+validation;
@@ -1579,6 +1632,49 @@ void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
   std::ifstream spool(path,std::ios::binary);assert(spool.good());
   const ResponseCheck result=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,21,1,temperature,{});
   assert(result.probes>=20);assert(result.validation_frames==validation&&result.statistical_frames==33);assert(result.observed_cov_available&&result.predicted_cov_available&&result.cg_residual_available&&result.response_ibp_available&&result.force_residual_available);assert(result.observed_cov_min>0.0&&result.observed_cov_max>=result.observed_cov_min&&result.observed_cov_condition>=1.0);assert(result.predicted_cov_min>0.0&&result.predicted_cov_max>=result.predicted_cov_min&&result.predicted_cov_condition>=1.0);assert(result.block_frames[0]+result.block_frames[1]+result.block_frames[2]+result.block_frames[3]==validation);assert(std::isfinite(result.block_variance_max_relative_delta));assert(result.cg<=1e-8);assert(result.response<=2e-8);assert(result.ibp<=2e-8);assert(result.force_residual<=2e-8);
+
+  const auto response_probes=make_probes({},sqrt_atom,types,n);const int m=static_cast<int>(response_probes.size());assert(m==result.probes);
+  std::vector<double> reference_full(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<d;++i)reference_full[static_cast<std::size_t>(i)*d+i]=1.0;
+  const double edge_block[3][3]={{theta[0],theta[1],theta[2]},{theta[1],theta[3],theta[4]},{theta[2],theta[4],theta[5]}};
+  for(int a=0;a<3;++a)for(int b=0;b<3;++b){const int ai=a*n,aj=ai+1,bi=b*n,bj=bi+1;const double value=edge_block[a][b];
+    reference_full[static_cast<std::size_t>(ai)*d+bi]+=value;reference_full[static_cast<std::size_t>(ai)*d+bj]-=value;
+    reference_full[static_cast<std::size_t>(aj)*d+bi]-=value;reference_full[static_cast<std::size_t>(aj)*d+bj]+=value;}
+  std::vector<double> reference_restricted(static_cast<std::size_t>(r)*r,0.0);
+  for(int k=0;k<r;++k)for(int l=0;l<r;++l)for(int i=0;i<d;++i)for(int j=0;j<d;++j)
+    reference_restricted[static_cast<std::size_t>(k)*r+l]+=basis[k][i]*reference_full[static_cast<std::size_t>(i)*d+j]*basis[l][j];
+  for(std::size_t i=0;i<restricted.size();++i)check_close(reference_restricted[i],restricted[i],2e-12);
+  std::vector<double> expected_predicted(static_cast<std::size_t>(m)*m);
+  for(int j=0;j<m;++j){std::vector<double> rhs_coefficients(r);
+    for(int k=0;k<r;++k)rhs_coefficients[k]=std::inner_product(basis[k].begin(),basis[k].end(),response_probes[j].begin(),0.0);
+    const std::vector<double> solution_coefficients=solve_dense_reference(reference_restricted,rhs_coefficients,r);std::vector<double> solution(d,0.0);
+    for(int k=0;k<r;++k)for(int i=0;i<d;++i)solution[i]+=basis[k][i]*solution_coefficients[k];
+    for(int i=0;i<m;++i)expected_predicted[static_cast<std::size_t>(i)*m+j]=kbt*std::inner_product(response_probes[i].begin(),response_probes[i].end(),solution.begin(),0.0);}
+  std::vector<double> injected_original_solution;bool recovery_injected=false;
+  const auto solve_probe=[&](const int probe,const std::vector<double>& rhs){
+    CGResult cg=solve_projected_cg(baseline,graph,rhs,sqrt_mass,sqrt_atom,theta,n,probe,0.0);
+    if(probe==0){for(double& value:cg.x)value*=1.0-1e-6;injected_original_solution=cg.x;const auto comparison=compare_cg_true_residuals(baseline,graph,rhs,cg.x,sqrt_mass,sqrt_atom,theta,n);
+      std::vector<double> projected_rhs=rhs;project_translation(projected_rhs,sqrt_atom,n);
+      set_true_residual_failure(cg,probe,cg.iterations,rhs,projected_rhs,5e-9,comparison.fast_relative,{});recovery_injected=true;}
+    return cg;};
+  const ResponseCheck recovered_result=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,21,1,temperature,{},0.0,nullptr,0.15,0.15,42,solve_probe);
+  assert(recovery_injected&&recovered_result.cg_residual_status=="CG_PASS"&&recovered_result.cg_verification_method=="MIXED");
+  assert(recovered_result.cg_probe_recoveries.size()==1&&recovered_result.cg_probe_recoveries[0].recovered);
+  assert(recovered_result.observed_cov_available&&recovered_result.predicted_cov_available&&recovered_result.response_ibp_available&&recovered_result.force_residual_available);
+  assert(recovered_result.cg<=1e-8&&recovered_result.cg_probe_recoveries[0].original_witness.solution==injected_original_solution);
+  assert(recovered_result.predicted_matrix.size()==expected_predicted.size());
+  for(std::size_t i=0;i<expected_predicted.size();++i)check_close(recovered_result.predicted_matrix[i],expected_predicted[i],2e-8);
+  std::ostringstream recovery_stats;write_response_stats(recovery_stats,recovered_result);assert(recovery_stats.str().find("cg_verification_method=MIXED")!=std::string::npos);
+  RpmdJANativeFitOptions replay_options;replay_options.output_path="recovery_integration_test";replay_options.cutoff=4.0;replay_options.temperature=temperature;replay_options.fd_step=1e-3;replay_options.sample_interval=1;replay_options.epsilon=0.0;replay_options.internal_mass_com=true;
+  const CGReplayContext replay_context{replay_options,frames,11,12,11,12,1,1,0.9,0.9};
+  const std::string recovery_base="rpmd_ja_response_recovered_witness_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".cg_witness.txt";
+  const std::string recovery_path=recovery_base+".outer_42.probe_0.txt";RemoveTestFile remove_recovery{recovery_path};std::vector<std::string> saved_recovery_paths;
+  ResponseCheck mutable_recovered_result=recovered_result;
+  write_recovered_cg_witnesses(mutable_recovered_result,recovery_base,theta,"qraw_fixture","samples_fixture",replay_context,saved_recovery_paths);
+  assert(saved_recovery_paths.size()==1&&saved_recovery_paths[0]==recovery_path);
+  const CGWitnessSnapshot saved_recovery=read_cg_witness(recovery_path,d,static_cast<int>(theta.size()));
+  assert(saved_recovery.classification=="TRUE_RESIDUAL_FAILURE"&&saved_recovery.solution==injected_original_solution);
 
   spool.close();
   {
@@ -1665,6 +1761,7 @@ int main()
   test_lanczos_deep_search_does_not_early_cut(qr.solver);
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
+  test_production_true_residual_recovery();
   test_bounded_cg_replay_refinement();
   test_compensated_cg_true_residual_action();
   test_replay_rejects_existing_report_before_reading_inputs();
