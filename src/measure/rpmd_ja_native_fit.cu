@@ -1260,6 +1260,7 @@ CGWitnessSnapshot read_cg_witness(const std::string& path,const int dimension,co
       else if(key=="rhs_input_xyz_soa")snapshot.rhs_input=std::move(values);
       else if(key=="rhs_projected_xyz_soa")snapshot.rhs_projected=std::move(values);
       else snapshot.solution=std::move(values);
+      continue; // The trailing-data probe normally sets failbit at end of line.
     }else if(key=="status")fields>>snapshot.status;
     else if(key=="classification")fields>>snapshot.classification;
     else if(key=="true_residual_status")fields>>snapshot.true_residual_status;

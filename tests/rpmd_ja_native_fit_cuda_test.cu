@@ -1290,6 +1290,33 @@ void test_replay_rejects_existing_report_before_reading_inputs()
   assert(rejected_early&&read_test_file(report)=="preserve this report");
 }
 
+void test_cg_witness_vector_line_endings()
+{
+  constexpr int d=6;CGWitness witness;witness.classification="TRUE_RESIDUAL_FAILURE";
+  witness.probe=0;witness.iteration=1;witness.true_residual_computed=true;
+  witness.rhs_input={1.0,-1.0,2.0,-2.0,3.0,-3.0};witness.rhs=witness.rhs_input;witness.solution.assign(d,0.0);
+  const std::vector<double> theta={1.0,-2.0,0.0,3.0,-4.0,5.0};
+  RpmdJANativeFitOptions options;options.cutoff=5.0;options.temperature=300.0;options.fd_step=1e-3;
+  options.sample_interval=100;options.epsilon=1e-6;options.internal_mass_com=true;
+  const CGReplayContext replay{options,30,11,12,11,12,1,1,0.9,0.9};
+  const std::string path="rpmd_ja_cg_vector_parser_test_"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";
+  RemoveTestFile cleanup{path};write_cg_witness(path,witness,theta,"qraw_fixture","samples_fixture",replay);
+  const std::string original=read_test_file(path);
+  for(const bool trailing_space:{false,true}){
+    std::istringstream lines(original);std::string line;std::ofstream out(path);
+    while(std::getline(lines,line))out<<line<<(trailing_space?" \t\r\n":"\n");out.close();assert(out);
+    for(const int parameters:{0,d}){const auto parsed=read_cg_witness(path,d,parameters);
+      assert(parsed.theta==theta&&parsed.rhs_input==witness.rhs_input&&parsed.rhs_projected==witness.rhs&&parsed.solution==witness.solution);}
+  }
+  for(const char* key:{"theta","rhs_input_xyz_soa","rhs_projected_xyz_soa","solution_x_xyz_soa"}){
+    for(const char* invalid:{"6 1 2 3 4 5","6 1 2 3 4 5 6 extra","6 1 2 3 4 5 nan","5 1 2 3 4 5"}){
+      std::istringstream lines(original);std::string line;std::ofstream out(path);
+      while(std::getline(lines,line)){if(line.compare(0,std::strlen(key)+1,std::string(key)+" ")==0)out<<key<<' '<<invalid<<'\n';else out<<line<<'\n';}
+      out.close();assert(out);bool rejected=false;try{(void)read_cg_witness(path,d,d);}catch(const std::runtime_error&){rejected=true;}assert(rejected);
+    }
+  }
+}
+
 void test_cg_failure_snapshot_round_trip_replay()
 {
   const double offset=std::ldexp(1.0,-27);
@@ -1535,6 +1562,7 @@ void test_probe_selection_skips_duplicate_low_modes()
 
 int main()
 {
+  test_cg_witness_vector_line_endings();
   test_fit_samples_entry_preserves_inputs();
   test_full_spd_failure_keeps_candidate_pack();
   test_response_uncomputed_values_are_explicit();

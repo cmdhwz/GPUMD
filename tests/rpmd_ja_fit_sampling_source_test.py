@@ -65,6 +65,10 @@ assert "fast_true_relative_residual" in replay_body and "compensated_true_relati
 assert "NOT_ACCEPTED_REFERENCE" in replay_body and "write_text_exclusive" in replay_body
 assert "solve_projected_cg" in replay_body and "make_graph(r0,header.types,box,snapshot.cutoff)" in replay_body
 assert "replay_cg" in run and "replay_rpmd_ja_native_cg" in run
+parser_body = native_fit[native_fit.index("CGWitnessSnapshot read_cg_witness("):native_fit.index("bool preserve_candidate_package_on_full_spd_failure(")]
+vector_body = parser_body[parser_body.index('if(key=="theta"||'):parser_body.index('}else if(key=="status")')]
+assert "vector has trailing data" in vector_body and "continue;" in vector_body
+assert "test_cg_witness_vector_line_endings();" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "cannot replace final response validation" in native_fit
 assert "ProbeMoments" in native_fit and "moments.ibp_matrix" in native_fit
 assert "sum_q,sum_f,sum_f2,sum_qq,sum_fq" in native_fit
