@@ -66,6 +66,23 @@ Finite-temperature qNEP additive reference workflow
 
 The optional additive workflow fits a local finite-temperature force response from complete, fixed-cell RPMD bead samples. It produces an auxiliary coefficient package; the ordinary qNEP reference generation and measurement paths remain available. The training system must contain all mobile atoms under one Hamiltonian, with the same atom ordering, masses, cell, target temperature, and bead count as the raw reference. Do not select a subset of atoms and treat it as a smaller system. The fitting data are split chronologically into training and held-out validation frames; correlated frames may make this validation optimistic, so independent blocks and material-level uncertainty remain necessary.
 
+The native ``rpmd_ja fit_samples`` route produces a ``finite_temperature_additive`` reference, not the bare qNEP Taylor Hessian. Read its ``.fit_trace.txt`` in stage order: ``FIT_RESPONSE_PASS`` records held-out response acceptance, ``FULL_CERTIFICATE_PASS`` records the stored-matrix SPD certificate, and ``REFERENCE_WRITTEN`` confirms that the reference package and sidecar were written. ``QP_PASS`` only describes the current finite stability-cut set and does not mean the reference is ready. The ``.fit.txt`` report also records unconstrained and constrained training force residuals, the relative squared-residual cost change, design singular values, and response-ratio extrema. A failed candidate keeps diagnostic artifacts and must not be used with ``rpmd_ja on``.
+
+The separate offline ``fit_samples_covariance`` route reuses the same ``GPJASMP1`` samples, matching qraw, local additive package, ``prepare`` call, and ``J_A`` measurement chain. Its command is::
+
+  rpmd_ja fit_samples_covariance <samples> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N>
+
+This route is opt-in; ``fit_samples`` continues to use the force least-squares/QP method. The covariance method computes training statistics only from the first two thirds of frames and minimizes the Gaussian fluctuation objective with a graph-Laplacian baseline and a positive ``rho`` shrinkage prior. It searches the full feasible interval for the baseline parameter, including negative values when the raw reference is already stable. It uses exact Cholesky factors in the translation-complement space and analytic parameter gradients. BFGS coordinates are scaled from the baseline matrix and each parameter basis matrix; the reports include both the scaled KKT residual and raw parameter-gradient norm. ``max_iter`` is the BFGS iteration budget; line-search objective evaluations are reported separately. The numerical log-determinant barrier used to enforce ``D-epsilon I > 0`` is an optimizer parameter and is not the shrinkage strength. The optimizer's convergence status is separate from held-out response acceptance and the final stored-D certificate. Read ``baseline_mu``, ``baseline_epsilon_constraint_status``, objective terms, scaled KKT residual, raw gradient norm, barrier gap estimate, factorization count, solve RHS count, and elapsed time from the ``.fit.txt`` report. On optimizer or response failure, ``.covariance_state.txt`` records the baseline and candidate parameter vectors and training statistics; the method does not write an accepted reference on that path.
+
+With :math:`D(\theta)=D_t+D_{\rm add}(\theta)` and the baseline :math:`D_b=D(\theta_b)`, the fitted objective is
+
+.. math::
+
+   \mathcal L_\rho(D)=\frac{\beta}{2}\operatorname{Tr}(D\widehat C)-\frac{1}{2}\log\det D
+   +\frac{\rho}{2}\left[\operatorname{Tr}(DD_b^{-1})-\log\det(DD_b^{-1})-n\right].
+
+The prior term penalizes departures from the finite-temperature graph baseline when the sample covariance has weak or missing directions. It does not change the sampled trajectory or replace the later held-out response and full stored-D checks. A status is successful only after ``BASELINE_SPD_PASS``, ``COVARIANCE_OPTIMIZER_CONVERGED``, ``FIT_RESPONSE_PASS``, ``FULL_CERTIFICATE_PASS``, and ``REFERENCE_WRITTEN`` appear in order in ``.fit_trace.txt``.
+
 First equilibrate the beads and collect aligned centroid samples and ``mean.xyz``. List every bead file explicitly; this two-bead invocation is only a short example. Real eight-decimal ``dump_beads`` cells require ``--cell-model`` with the original full-precision structure. Omitting it is suitable only when the supplied XYZ already has enough cell precision for downstream raw-reference checks::
 
   python tools/rpmd_ja_fit_reference.py collect --bead-files bead_0.xyz bead_1.xyz --temperature 300 --output samples.npz --mean-model mean.xyz --masses 1.008 15.999 --cell-model original_model.xyz

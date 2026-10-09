@@ -725,7 +725,7 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N>, diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
@@ -831,6 +831,50 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     }
 #ifdef USE_HIP
     PRINT_INPUT_ERROR("rpmd_ja fit_samples native reference preparation is currently unavailable in HIP builds.");
+#endif
+    fit_rpmd_ja_native_reference_from_samples(options, tokens[2], atom, box, force);
+    return;
+  }
+  if (tokens[1] == "fit_samples_covariance") {
+    if (tokens.size() != 14 || tokens[10] != "shrinkage" || tokens[12] != "max_iter")
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N>.");
+    if (global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance must appear before any run.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires exactly one qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    if (active_qnep == nullptr || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+        !active_qnep->uses_pppm())
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance supports qNEP charge mode 1 or 2 with PPPM only.");
+    if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires fully periodic boundaries.");
+    RpmdJANativeFitOptions options;
+    options.method = RpmdJANativeFitMethod::GaussianCovarianceShrinkage;
+    options.output_path = tokens[3];
+    options.kernel_table = tokens[8];
+    options.raw_input_path = tokens[9];
+    options.internal_mass_com = integrate.get_pimd_fix_com();
+    double* values[] = {&options.cutoff, &options.epsilon, &options.response_tolerance, &options.fd_step,
+                        &options.covariance_shrinkage};
+    for (int i = 0; i < 5; ++i) {
+      const std::size_t token = i < 4 ? static_cast<std::size_t>(4 + i) : 11;
+      char* end = nullptr;
+      *values[i] = std::strtod(tokens[token].c_str(), &end);
+      if (end == tokens[token].c_str() || *end != '\0' || !std::isfinite(*values[i]) || *values[i] <= 0.0)
+        PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance numeric arguments must be positive finite numbers.");
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long long iterations = std::strtoll(tokens[13].c_str(), &end, 10);
+    if (errno == ERANGE || end == tokens[13].c_str() || *end != '\0' || iterations <= 0 || iterations > INT_MAX)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance max_iter must be a positive integer.");
+    options.max_covariance_iterations = static_cast<int>(iterations);
+    if (tokens[2].empty() || options.output_path.empty() || options.kernel_table.empty() || options.raw_input_path.empty() ||
+        tokens[2] == options.output_path || tokens[2] == options.raw_input_path || options.output_path == options.raw_input_path ||
+        options.output_path == options.kernel_table)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance paths must be nonempty and output must differ from its inputs.");
+#ifdef USE_HIP
+    PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance native reference preparation is currently unavailable in HIP builds.");
 #endif
     fit_rpmd_ja_native_reference_from_samples(options, tokens[2], atom, box, force);
     return;

@@ -7,6 +7,12 @@ class Atom;
 class Box;
 class Force;
 
+enum class RpmdJANativeFitMethod
+{
+  ForceLeastSquares,
+  GaussianCovarianceShrinkage
+};
+
 struct RpmdJANativeFitOptions
 {
   std::string output_path;
@@ -20,6 +26,9 @@ struct RpmdJANativeFitOptions
   double fd_step = 0.0;
   int sample_interval = 0;
   int max_stability_rounds = 160;
+  int max_covariance_iterations = 0;
+  double covariance_shrinkage = 0.0;
+  RpmdJANativeFitMethod method = RpmdJANativeFitMethod::ForceLeastSquares;
   bool internal_mass_com = false;
 };
 

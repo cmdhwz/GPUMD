@@ -178,6 +178,29 @@ assert "if (argument_count == 10) options.raw_input_path = tokens[9];" in fit_sa
 assert "errno = 0;" in fit_samples_parser and "errno == ERANGE" in fit_samples_parser and "rounds > INT_MAX" in fit_samples_parser
 assert "end == tokens.back().c_str() || *end != '\\0' || rounds <= 0" in fit_samples_parser
 assert "max_rounds <N>" in fit_samples_parser and "[<qraw>] [max_rounds <N>]" in run
+assert 'if (tokens[1] == "fit_samples_covariance")' in run
+assert 'tokens.size() != 14 || tokens[10] != "shrinkage" || tokens[12] != "max_iter"' in run
+assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
+assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
+assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
+assert "sums[p+1]+=2.0*dx[0]*dx[1]" in native_fit
+assert "build_graph_covariance_baseline" in native_fit and "D_b-epsilon I positive definite" in native_fit
+assert "negative graph-Laplacian feasibility boundary" in native_fit and "distance*=2.0" in native_fit
+left_expansion = native_fit.split("auto expand_left=[&](){", 1)[1].split("auto expand_right", 1)[0]
+right_expansion = native_fit.split("auto expand_right=[&](){", 1)[1].split("const bool left_descends", 1)[0]
+assert "lo=candidate;hi=previous" in left_expansion
+assert "lo=previous;hi=candidate" in right_expansion
+assert "parameter_basis_norms" in native_fit and "coordinate_scales" in native_fit
+assert "tau_min=std::nextafter(target_gap/static_cast<double>(system.r),0.0)" in native_fit
+assert "if(tau<=tau_min)" in native_fit and "raw_gradient_inf_norm" in native_fit
+assert "complete_covariance_fit_gradient_from_factors" in native_fit
+assert "evaluate_covariance_fit_objective" in native_fit and "0.5*(1.0+rho)*trace[i]" in native_fit
+assert "cusolverDnDpotrf" in native_fit and "cusolverDnDpotrs" in native_fit
+assert "COVARIANCE_OPTIMIZER_CONVERGED" in native_fit and "LINE_SEARCH_FAILED" in native_fit
+assert "barrier_center_condition_pass" in native_fit and "barrier_center_condition_status" in native_fit
+assert "write_covariance_state(covariance_state_path" in native_fit
+assert "objective_data" in native_fit and "baseline_epsilon_constraint_status" in native_fit
+assert "if(covariance_method){" in fit_impl and "else{\n  int search_depth=" in fit_impl
 assert "derived.temperature=header.temperature" in native_fit and "derived.sample_interval=static_cast<int>(std::llround(sample_interval))" in native_fit
 assert "fit_rpmd_ja_native_reference_checked(derived,spool_path,header.frame_count,atom,box,force,true)" in native_fit
 assert "validate_qraw_identity(raw,options,header,r0,box,force)" in native_fit
@@ -351,6 +374,10 @@ assert 'eigen_small(solver,t,m,wanted)' in native_fit and 'out.vectors.resize(st
 cuda_test = source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert 'check_close(modes[k].residual,std::sqrt(residual2),2e-7)' in cuda_test
 assert 'check_close(std::inner_product(v.begin(),v.end(),modes[prior].vector.begin(),0.0),0.0,2e-7)' in cuda_test
+assert "test_covariance_baseline_brackets_both_signs_and_zero" in cuda_test
+assert "test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_solution" in cuda_test
+assert "test_covariance_optimizer_rank_deficiency_budget_and_33_dimension_barrier" in cuda_test
+assert 'fit.iterations>0' in cuda_test and 'system.r==33' in cuda_test
 assert 'check_close(modes[k].value,exact.values[k],2e-7)' in cuda_test
 assert 'workspace.initialize(graph,sqrt_mass,sqrt_atom,8,0)' in cuda_test
 assert 'qp_state.find("polish_attempts 3")' in cuda_test
@@ -361,13 +388,25 @@ assert (ROOT / "tests/data/ja_reference_resample.bin.qp_state.txt").stat().st_si
 assert "options.max_stability_rounds<=0" in native_fit
 assert "const int max_rounds=options.max_stability_rounds;" in native_fit
 assert 'printf("rpmd_ja fit stability round limit=%d\\n",max_rounds)' in native_fit
-assert 'required; IBP is diagnostic only\\nrpmd_ja fit stability round limit=' in native_fit
+assert 'no stability-cut feedback is used; IBP is diagnostic only' in native_fit
+assert 'if(!covariance_method)trace<<"rpmd_ja fit stability round limit="' in native_fit
 round_loop_start = native_fit.index("for(int outer=0;outer<max_rounds;++outer)")
-round_loop_end = native_fit.index("double compressed_residual2=", round_loop_start)
+round_loop_end = native_fit.index("if(!fit_converged)throw", round_loop_start)
 round_loop = native_fit[round_loop_start:round_loop_end]
 assert round_loop.count("outer==max_rounds-1") == 2
-assert round_loop.count("to_string(max_rounds)+\" rounds\"") == 3
+assert round_loop.count("to_string(max_rounds)+\" rounds\"") == 2
+assert native_fit.count("to_string(max_rounds)+\" rounds\"") == 3
 assert "80 rounds" not in round_loop and "outer==79" not in round_loop
+training_residual_start = native_fit.index("double compressed_training_force_residual(")
+training_residual_end = native_fit.index("void make_edge_linear(", training_residual_start)
+training_residual = native_fit[training_residual_start:training_residual_end]
+assert "double compressed_residual2=discarded2" in training_residual
+assert "compressed_training_force_residual(rmat,z,discarded2,training_force2,theta)" in native_fit
+assert "force_fit_cost_increase=" in native_fit and "svd_sigma_min=" in native_fit and "design_condition=" in native_fit
+assert "response_ratio_min=1.0+eigen.values.front()" in native_fit and "response_ratio_max=1.0+eigen.values.back()" in native_fit
+assert "worst_underpredicted_direction_mass_weighted_internal_xyz_soa" in native_fit
+assert "worst_overpredicted_direction_mass_weighted_internal_xyz_soa" in native_fit
+assert "FIT_RESPONSE_PASS" in native_fit and "FULL_CERTIFICATE_PASS" in native_fit and "REFERENCE_WRITTEN" in native_fit
 assert "POTRF_diagonal_shift_eV_per_A2_per_amu" in source("src/measure/rpmd_ja_qnep_prepare.cu")
 
 pre_run_start = sampler_fit.index("void RpmdJA_Fit::pre_run(")
