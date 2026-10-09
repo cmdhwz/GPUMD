@@ -197,6 +197,27 @@ assert "complete_covariance_fit_gradient_from_factors" in native_fit
 assert "evaluate_covariance_fit_objective" in native_fit and "0.5*(1.0+rho)*trace[i]" in native_fit
 assert "cusolverDnDpotrf" in native_fit and "cusolverDnDpotrs" in native_fit
 assert "COVARIANCE_OPTIMIZER_CONVERGED" in native_fit and "LINE_SEARCH_FAILED" in native_fit
+assert "max_initialization_evaluations=16" in native_fit and "result.theta_start=start_theta" in native_fit
+assert "result.theta_baseline=baseline.theta" in native_fit and "baseline.trace" in native_fit
+assert "evaluate_initialization(trial_theta,false)" in native_fit and "current=evaluate_initialization(result.theta,true)" in native_fit
+assert "std::min(1.0,1.0/direction_inf_norm)" in native_fit and "next_theta!=theta" in native_fit
+assert "covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,alpha" in native_fit
+assert "covariance_directional_fd_stabilized" in native_fit and "stable_halvings>=2" in native_fit
+assert '"INCONCLUSIVE_UNSTABLE_FD"' in native_fit and "stabilized directional finite difference" in native_fit
+assert "apply_covariance_directional_diagnostic(result" in native_fit
+covariance_solver = native_fit.split("CovarianceFitResult solve_covariance_reference(", 1)[1].split("\nvoid write_covariance_state", 1)[0]
+assert "result.directional_derivative_status=" not in covariance_solver
+assert covariance_solver.count("apply_covariance_directional_diagnostic(result,") >= 3
+assert "line_search_evaluations" in native_fit and "result.line_search_evaluations" in native_fit
+assert "trial<=64" in native_fit and 'trial_status="SHIFTED_NOT_SPD"' in native_fit
+assert 'trial_status="ARMIJO_REJECT"' in native_fit and "status=STEP_UNDERFLOW" in native_fit
+assert "DIRECTIONAL_DIAGNOSTIC_RESULT" in native_fit and "GRADIENT_CONSISTENCY_SUSPECT" in native_fit
+assert "OPT_STEP iteration=" in native_fit and "max_covariance_iterations,&trace" in native_fit
+assert "test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_near_boundary_fd_requires_stable_steps" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_stable_directional_fd_consistency_and_mismatch" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_inconclusive_diagnostic_preserves_failure_status" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_scaled_trial_round_trip_underflow" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "barrier_center_condition_pass" in native_fit and "barrier_center_condition_status" in native_fit
 assert "write_covariance_state(covariance_state_path" in native_fit
 assert "objective_data" in native_fit and "baseline_epsilon_constraint_status" in native_fit
