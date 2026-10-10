@@ -725,7 +725,7 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N>, diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, diagnose_covariance <state> <report> <cutoff> <epsilon> <tau> <fd_step>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N>, diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
@@ -783,6 +783,38 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     PRINT_INPUT_ERROR("rpmd_ja replay_cg native CG replay is currently unavailable in HIP builds.");
 #endif
     replay_rpmd_ja_native_cg(tokens[2], tokens[3], integrate.get_pimd_fix_com(), atom, box, force);
+    return;
+  }
+  if (tokens[1] == "diagnose_covariance") {
+    if (tokens.size() != 8)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance requires <state> <report> <cutoff> <epsilon> <tau> <fd_step>.");
+    if (integrate.has_ensemble() || global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance must appear before any ensemble or run.");
+    if (atom.number_of_atoms < 2 || atom.cpu_mass.size() != static_cast<std::size_t>(atom.number_of_atoms) ||
+        atom.cpu_type.size() != static_cast<std::size_t>(atom.number_of_atoms))
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance requires initialized model.xyz atom, mass, and type data.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance requires exactly one qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    if (active_qnep == nullptr || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+        !active_qnep->uses_pppm())
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance supports qNEP charge mode 1 or 2 with PPPM only.");
+    if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance requires fully periodic boundaries.");
+    if (tokens[2].empty() || tokens[3].empty() || tokens[2] == tokens[3])
+      PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance state and report paths must be nonempty and distinct.");
+    double values[4] = {};
+    for (int i = 0; i < 4; ++i) {
+      char* end = nullptr;
+      values[i] = std::strtod(tokens[4 + i].c_str(), &end);
+      if (end == tokens[4 + i].c_str() || *end != '\0' || !std::isfinite(values[i]) || values[i] <= 0.0)
+        PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance numeric arguments must be positive finite numbers.");
+    }
+#ifdef USE_HIP
+    PRINT_INPUT_ERROR("rpmd_ja diagnose_covariance requires CUDA.");
+#endif
+    diagnose_rpmd_ja_native_covariance(tokens[2], tokens[3], values[0], values[1], values[2], values[3],
+      integrate.get_pimd_fix_com(), atom, box, force);
     return;
   }
   if (tokens[1] == "fit_samples") {

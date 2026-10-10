@@ -562,6 +562,11 @@ def _check_netcdf_result(result):
         f'stderr:\n{result.stderr}')
 
 
+def _skip_without_quantization(output):
+    if 'requires NetCDF-C 4.9.0 or newer' in output:
+        pytest.skip('NetCDF-C was built without quantization support')
+
+
 def test_dump_netcdf_appends_across_run_commands(
         tmp_path, structure, model_path, model_type, gpumd_command):
     """Two dump_netcdf commands writing the same file in one execution extend it, since the
@@ -824,6 +829,112 @@ def test_dump_netcdf_group_double_deflate(
         assert velocities.filters()['zlib']
         assert dataset.getncattr('gpumd_grouping_method') == 0
         assert dataset.getncattr('gpumd_group_id') == 1
+
+
+@pytest.mark.filterwarnings('ignore:.*already contains files from an earlier calculation')
+def test_dump_netcdf_quantize_and_append(
+        tmp_path, structure, model_path, model_type, gpumd_command):
+    netcdf4 = pytest.importorskip('netCDF4')
+    case = CommandIOCase(
+        name='dump_netcdf_quantize',
+        run_in_lines=[
+            ('dump_netcdf', [1, 'reference.nc', 'velocity']),
+            ('dump_netcdf', [1, 'quantized.nc', 'velocity',
+                             'compression', 'deflate', 4, 'quantize', 5]),
+            ('run', BASE_N_STEPS),
+            ('ensemble', 'nve'),
+            ('dump_netcdf', [1, 'reference.nc', 'velocity']),
+            ('dump_netcdf', [1, 'quantized.nc', 'velocity',
+                             'quantize', 5, 'compression', 'deflate', 4]),
+        ],
+        expected_output_files=['reference.nc', 'quantized.nc'],
+    )
+    result = run_command_io_case(
+        tmp_path, structure, model_path, model_type, gpumd_command, case)
+    output = result.stdout + result.stderr
+    _skip_without_quantization(output)
+    _check_netcdf_result(result)
+
+    with netcdf4.Dataset(tmp_path / 'reference.nc') as reference, \
+            netcdf4.Dataset(tmp_path / 'quantized.nc') as quantized:
+        assert len(quantized.dimensions['frame']) == 2 * BASE_N_STEPS
+        assert len(quantized.dimensions['atom']) == len(structure)
+        assert len(reference.dimensions['atom']) == len(structure)
+        assert quantized.getncattr('gpumd_quantize_digits') == 5
+        assert reference.getncattr('gpumd_quantize_digits') == 0
+        assert quantized.variables['coordinates'].dtype == np.dtype('float32')
+        assert quantized.variables['velocities'].dtype == np.dtype('float32')
+        for name in ('coordinates', 'velocities'):
+            variable = quantized.variables[name]
+            assert variable.filters()['zlib']
+            assert variable.filters()['complevel'] == 4
+            assert variable.getncattr(
+                '_QuantizeGranularBitRoundNumberOfSignificantDigits') == 5
+        assert '_QuantizeGranularBitRoundNumberOfSignificantDigits' not in \
+            quantized.variables['type'].ncattrs()
+
+        for name in ('time', 'cell_lengths', 'cell_angles', 'type'):
+            np.testing.assert_array_equal(
+                reference.variables[name][:], quantized.variables[name][:])
+        for name in ('coordinates', 'velocities'):
+            original = np.asarray(reference.variables[name][:])
+            rounded = np.asarray(quantized.variables[name][:])
+            assert np.isfinite(rounded).all()
+            assert np.max(np.abs(original - rounded)) < 1e-3
+
+
+@pytest.mark.filterwarnings('ignore:.*already contains files from an earlier calculation')
+def test_dump_netcdf_rejects_append_with_changed_quantization(
+        tmp_path, structure, model_path, model_type, gpumd_command):
+    netcdf4 = pytest.importorskip('netCDF4')
+    first = CommandIOCase(
+        name='dump_netcdf_quantize_first',
+        run_in_lines=[('dump_netcdf', [1, 'quantized.nc', 'velocity',
+                                      'compression', 'deflate', 4, 'quantize', 5])],
+        expected_output_files=['quantized.nc'])
+    result = run_command_io_case(
+        tmp_path, structure, model_path, model_type, gpumd_command, first)
+    _skip_without_quantization(result.stdout + result.stderr)
+    _check_netcdf_result(result)
+
+    with netcdf4.Dataset(tmp_path / 'quantized.nc') as dataset:
+        first_run = np.array(dataset.variables['coordinates'][:])
+
+    second = CommandIOCase(
+        name='dump_netcdf_quantize_mismatch',
+        run_in_lines=[('dump_netcdf', [1, 'quantized.nc', 'velocity',
+                                      'compression', 'deflate', 4, 'quantize', 4])],
+        expected_output_files=[])
+    result = run_command_io_case(
+        tmp_path, structure, model_path, model_type, gpumd_command, second)
+    output = result.stdout + result.stderr
+    _skip_without_netcdf(output)
+    assert result.returncode != 0, 'appending with different quantization should be refused'
+    assert 'quantized.nc' in output and 'quantization' in output, output
+
+    with netcdf4.Dataset(tmp_path / 'quantized.nc') as dataset:
+        assert len(dataset.dimensions['frame']) == BASE_N_STEPS
+        assert dataset.getncattr('gpumd_quantize_digits') == 5
+        np.testing.assert_array_equal(dataset.variables['coordinates'][:], first_run)
+
+
+def test_dump_netcdf_quantize_rejects_digits_above_library_limit(
+        tmp_path, structure, model_path, model_type, gpumd_command):
+    case = CommandIOCase(
+        name='dump_netcdf_quantize_limit',
+        run_in_lines=[('dump_netcdf', [1, 'limit.nc', 'compression', 'deflate', 4,
+                                      'quantize', 99])],
+        expected_output_files=[])
+    result = run_command_io_case(
+        tmp_path, structure, model_path, model_type, gpumd_command, case)
+    output = result.stdout + result.stderr
+    _skip_without_netcdf(output)
+    assert result.returncode != 0, 'quantize digits above the library limit should be refused'
+    if 'requires NetCDF-C 4.9.0 or newer' in output:
+        assert 'between 1 and' not in output
+    else:
+        assert 'between 1 and' in output, output
+    assert not (tmp_path / 'limit.nc').exists()
 
 
 def test_dump_netcdf_group_mass_is_the_mass_of_the_selected_atoms(
@@ -1293,6 +1404,15 @@ INVALID_DUMP_NETCDF_ARGUMENTS = [
     ([1, 'f.nc', 'velocity', 'velocity'], 'more than once'),
     ([1, 'f.nc', 'precision', 'double', 'precision', 'single'], 'more than once'),
     ([1, 'f.nc', 'compression', 'none', 'compression', 'none'], 'more than once'),
+    ([1, 'f.nc', 'quantize'], "Not enough arguments for option 'quantize'"),
+    ([1, 'f.nc', 'quantize', 'five'], 'should be an integer'),
+    ([1, 'f.nc', 'quantize', 0], 'must be positive'),
+    ([1, 'f.nc', 'quantize', 5, 'quantize', 4], 'more than once'),
+    ([1, 'f.nc', 'quantize', 5], 'level greater than 0'),
+    ([1, 'f.nc', 'compression', 'deflate', 0, 'quantize', 5],
+     'level greater than 0'),
+    ([1, 'f.nc', 'precision', 'double', 'compression', 'deflate', 4, 'quantize', 5],
+     'requires single precision'),
     ([1, 'f.nc', 'precision', 'triple'], 'Invalid precision'),
     # the old syntax used -1 to mean the whole system, which is now spelled by omitting the option
     ([1, 'f.nc', 'group', -1, 0], 'Grouping method'),

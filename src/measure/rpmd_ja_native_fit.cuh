@@ -68,3 +68,15 @@ void replay_rpmd_ja_native_cg(
   Atom& atom,
   Box& box,
   Force& force);
+
+void diagnose_rpmd_ja_native_covariance(
+  const std::string& state_path,
+  const std::string& report_path,
+  double cutoff,
+  double epsilon,
+  double tau,
+  double fd_step,
+  bool internal_mass_com,
+  Atom& atom,
+  Box& box,
+  Force& force);

@@ -159,13 +159,15 @@ The NetCDF file uses relational links rather than repeating O/H IDs: ``edge_id``
 zero-based O pair in ``/edge/oxygen``, and ``window_index`` links an edge row to the corresponding
 row in ``/window``. Attempt rows contain an explicit one-based ``attempt_id``; causal and
 chain tables refer to zero-based attempt row indices so that links remain compact and stable
-inside the file. Continuous physical values are stored as ``double``; integer IDs and counts
-are stored as integer variables; outcome, quantum-class, and flag variables use compact byte
-types. All variables are chunked with shuffle and deflate compression. NetCDF output requires a
-GPUMD build with ``USE_NETCDF=1`` and NetCDF-4/HDF5 support. It is intended for separate output
-files per sample directory and does not append across runs.
+inside the file. The ``/window/value`` and ``/edge_window/value`` variables are stored as
+single-precision floats and chunked by field. Other continuous variables, including absolute
+sampling times and event time milestones, remain double precision. Internal calculations and
+event classification use double precision. Integer IDs, counts, outcome codes, and flags retain
+their existing types. All variables are chunked with shuffle and deflate compression. NetCDF
+output requires a GPUMD build with ``USE_NETCDF=1`` and NetCDF-4/HDF5 support. It is intended
+for separate output files per sample directory and does not append across runs.
 
-The current NetCDF schema is version 8. Global attributes record the ensemble type, bead count,
+The current NetCDF schema is version 9. Global attributes record the ensemble type, bead count,
 physical time step, sampled-frame interval, all geometry/state thresholds, bead-diagnostic
 thresholds and switch, and the state/residence definition version. The ``/attempt`` group
 additionally stores the attempt-level bead probe counts and an observation-gap flag;

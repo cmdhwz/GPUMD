@@ -79,6 +79,7 @@ private:
   int interval_ = 1;
   int precision_ = 1;          // 1 = single precision, 2 = double
   int compression_level_ = -1; // -1 = classic NetCDF, 0-9 = NetCDF4 deflate
+  int quantize_digits_ = 0;    // 0 = disabled
   int number_of_atoms_to_dump_ = 0;
   int number_of_atoms_ = 0;
   int number_of_grouping_methods_ = 0;

@@ -31,6 +31,23 @@ Currently, the following optional arguments are accepted:
   Both values must identify an existing, non-empty group.
   Without this option all atoms in the system are written.
 
+* ``precision single|double``
+
+  Select the precision of per-atom floating-point variables. The default is single precision.
+  Time and cell variables remain double precision.
+
+* ``compression none|deflate <level>``
+
+  Select no compression or NetCDF-4 deflate compression with a level from 0 to 9.
+
+* ``quantize <digits>``
+
+  Apply NetCDF Granular Bit Round quantization to ``coordinates`` and, when requested,
+  ``velocities``. This lossy option is off by default and requires single precision plus deflate
+  compression with a level greater than 0. It requires NetCDF-C 4.9.0 or newer with quantization
+  support. ``digits`` is the number of significant decimal digits; its supported range follows
+  ``NC_QUANTIZE_MAX_FLOAT_NSD`` in the linked NetCDF-C library (1 to 7 with NetCDF-C 4.9.0).
+
 * Per-atom quantities
 
   Any number of the names below can be given, in any order, each adding one quantity to the
@@ -205,6 +222,17 @@ output interval, so every output file contains one independently sampled group::
 
   run 100000
 
+Granular Bit Round quantization
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+To store positions and velocities with five significant decimal digits while retaining deflate
+compression, one can add::
+
+  dump_netcdf 50 movie_quantized.nc velocity compression deflate 4 quantize 5
+
+before the :ref:`run command <kw_run>`. Time, cell, type, and other per-atom variables keep their
+existing types and values.
+
 
 Caveats
 -------
@@ -219,7 +247,8 @@ Caveats
   whether it was written by an earlier run of the same GPUMD execution or by an earlier execution.
   A different filename creates a separate trajectory file.
 * The layout of a NetCDF file is fixed when the file is created, so the group, quantity, precision,
-  and compression settings must match those the existing file was written with. If they do not,
-  GPUMD stops with an error naming the file. Remove or rename that file to start a new trajectory.
+  compression, and quantization settings must match those the existing file was written with. If
+  they do not, GPUMD stops with an error naming the file. Remove or rename that file to start a new
+  trajectory.
 * The ``time`` variable restarts at the beginning of every GPUMD execution, while ``frame`` keeps
   counting, so the times in a file appended to across executions are not monotonic.

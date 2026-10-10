@@ -2588,6 +2588,15 @@ __global__ void covariance_generate_rhs(double* rhs,const int* compact_to_full,c
   rhs[index]=(full==source?1.0:0.0)-2.0*reflection;
 }
 
+__global__ void covariance_gather_original_solve_residual(const double* product,const int* compact_to_full,
+  const double* solution,const double* rhs,const int d,const int r,const int columns,const double epsilon,double* residual)
+{
+  const std::size_t index=static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(index>=static_cast<std::size_t>(r)*columns)return;
+  const int row=static_cast<int>(index%r),column=static_cast<int>(index/r),full_row=compact_to_full[row];
+  residual[index]=product[static_cast<std::size_t>(column)*d+full_row]-epsilon*solution[index]-rhs[index];
+}
+
 __global__ void covariance_expand_solutions(const double* compact,double* ambient,const int* full_to_compact,
   const int d,const int r,const int columns)
 {
@@ -2637,16 +2646,38 @@ int covariance_parameter_count(const Graph& graph)
 int covariance_edge_count(const Graph& graph)
 {if(graph.edges.empty()||graph.edges.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))throw std::runtime_error("native covariance fit edge count is invalid");return static_cast<int>(graph.edges.size());}
 
+struct CovarianceTraceDiagnostics
+{
+  std::string matrix_kind="NOT_RUN",status="NOT_RUN";
+  int rhs_batch_start=-1,rhs_columns=0,first_failure_batch_start=-1,first_failure_columns=0;
+  double factor_solve_relative_residual=std::numeric_limits<double>::quiet_NaN();
+  double original_solve_relative_residual=std::numeric_limits<double>::quiet_NaN();
+  double worst_factor_solve_relative_residual=0.0,worst_original_solve_relative_residual=0.0;
+  int worst_factor_batch_start=-1,worst_factor_batch_columns=0,worst_original_batch_start=-1,worst_original_batch_columns=0;
+  std::uint64_t rhs_columns_checked=0;int total_rhs_columns=0;
+  bool original_residual_checked=false;
+};
+
+bool covariance_trace_diagnostics_pass(const CovarianceTraceDiagnostics& diagnostic,const int total_rhs_columns)
+{return diagnostic.status=="PASS"&&diagnostic.total_rhs_columns==total_rhs_columns&&
+  diagnostic.rhs_columns_checked==static_cast<std::uint64_t>(total_rhs_columns);}
+
+bool covariance_saved_gradient_diagnostics_pass(const CovarianceTraceDiagnostics& baseline_d,
+  const CovarianceTraceDiagnostics& saved_d,const CovarianceTraceDiagnostics& saved_shifted,const int total_rhs_columns)
+{return covariance_trace_diagnostics_pass(baseline_d,total_rhs_columns)&&covariance_trace_diagnostics_pass(saved_d,total_rhs_columns)&&
+  covariance_trace_diagnostics_pass(saved_shifted,total_rhs_columns);}
+
 struct DeviceCovarianceSystem
 {
   static constexpr int solve_batch=32;
   DeviceBaseline& baseline;const Graph& graph;int n=0,d=0,r=0,p=0,edge_count=0,lwork=0;
   std::vector<double> parameter_basis_norms;
-  double *full=nullptr,*compact=nullptr,*shifted=nullptr,*householder=nullptr,*product=nullptr,*theta_device=nullptr;
+  double *full=nullptr,*compact=nullptr,*shifted=nullptr,*householder=nullptr,*product=nullptr,*matrix_product=nullptr,*theta_device=nullptr;
   double *sqrt_mass_device=nullptr,*rhs=nullptr,*rhs_check=nullptr,*rhs_temp=nullptr,*ambient=nullptr,*dots=nullptr,*diagonal=nullptr;
   double *edge_cov_left=nullptr,*edge_cov_right=nullptr,*solver_work=nullptr;int *edge_i=nullptr,*edge_j=nullptr,*edge_group=nullptr;
   int *compact_to_full=nullptr,*full_to_compact=nullptr,*info=nullptr;cublasHandle_t blas=nullptr;cusolverDnHandle_t solver=nullptr;
   std::uint64_t factorizations=0,solve_rhs_columns=0;double worst_solve_relative_residual=0.0;
+  CovarianceTraceDiagnostics last_d_trace,last_shifted_trace;
 
   DeviceCovarianceSystem(DeviceBaseline& base,const Graph& fixed_graph,const std::vector<double>& sqrt_mass,
     const std::vector<double>& masses)
@@ -2658,7 +2689,7 @@ struct DeviceCovarianceSystem
   void release()
   {
     if(solver){cusolverDnDestroy(solver);solver=nullptr;}if(blas){cublasDestroy(blas);blas=nullptr;}
-    double** values[]={&full,&compact,&shifted,&householder,&product,&theta_device,&sqrt_mass_device,&rhs,&rhs_check,&rhs_temp,&ambient,&dots,&diagonal,&edge_cov_left,&edge_cov_right,&solver_work};
+    double** values[]={&full,&compact,&shifted,&householder,&product,&matrix_product,&theta_device,&sqrt_mass_device,&rhs,&rhs_check,&rhs_temp,&ambient,&dots,&diagonal,&edge_cov_left,&edge_cov_right,&solver_work};
     for(double** value:values)if(*value){cudaFree(*value);*value=nullptr;}
     int** indices[]={&edge_i,&edge_j,&edge_group,&compact_to_full,&full_to_compact,&info};
     for(int** value:indices)if(*value){cudaFree(*value);*value=nullptr;}
@@ -2678,7 +2709,7 @@ struct DeviceCovarianceSystem
     const std::size_t batch_bytes=static_cast<std::size_t>(d)*solve_batch*sizeof(double);
     const std::size_t edge_bytes=graph.edges.size()*9*sizeof(double);
     std::size_t required=full_bytes;
-    for(const std::size_t amount:{compact_bytes,compact_bytes,batch_bytes,batch_bytes,batch_bytes,batch_bytes,2*edge_bytes,
+    for(const std::size_t amount:{compact_bytes,compact_bytes,batch_bytes,batch_bytes,batch_bytes,batch_bytes,batch_bytes,2*edge_bytes,
         static_cast<std::size_t>(3)*d*sizeof(double),static_cast<std::size_t>(4)*d*sizeof(double),
         static_cast<std::size_t>(3)*graph.edges.size()*sizeof(int),static_cast<std::size_t>(d+r)*sizeof(int),
         static_cast<std::size_t>(p)*sizeof(double),static_cast<std::size_t>(r)*sizeof(double)}){
@@ -2706,7 +2737,7 @@ struct DeviceCovarianceSystem
     auto alloc_double=[](double** out,const std::size_t count){if(cudaMalloc(reinterpret_cast<void**>(out),std::max<std::size_t>(1,count)*sizeof(double))!=cudaSuccess)throw std::runtime_error("native covariance fit GPU allocation failed");};
     auto alloc_int=[](int** out,const std::size_t count){if(cudaMalloc(reinterpret_cast<void**>(out),std::max<std::size_t>(1,count)*sizeof(int))!=cudaSuccess)throw std::runtime_error("native covariance fit GPU allocation failed");};
     alloc_double(&full,static_cast<std::size_t>(d)*d);alloc_double(&compact,static_cast<std::size_t>(r)*r);alloc_double(&shifted,static_cast<std::size_t>(r)*r);
-    alloc_double(&householder,static_cast<std::size_t>(3)*d);alloc_double(&product,d);alloc_double(&theta_device,p);alloc_double(&sqrt_mass_device,n);
+    alloc_double(&householder,static_cast<std::size_t>(3)*d);alloc_double(&product,d);alloc_double(&matrix_product,static_cast<std::size_t>(d)*solve_batch);alloc_double(&theta_device,p);alloc_double(&sqrt_mass_device,n);
     alloc_double(&rhs,static_cast<std::size_t>(r)*solve_batch);alloc_double(&rhs_check,static_cast<std::size_t>(r)*solve_batch);alloc_double(&rhs_temp,static_cast<std::size_t>(r)*solve_batch);
     alloc_double(&ambient,static_cast<std::size_t>(d)*solve_batch);alloc_double(&dots,static_cast<std::size_t>(3)*solve_batch);alloc_double(&diagonal,r);
     alloc_double(&edge_cov_left,graph.edges.size()*9);alloc_double(&edge_cov_right,graph.edges.size()*9);
@@ -2777,8 +2808,23 @@ struct DeviceCovarianceSystem
     if(!std::isfinite(logdet))throw std::runtime_error("native covariance fit log-determinant is non-finite");return true;
   }
 
-  std::vector<double> trace_derivatives(const double* factor_matrix)
+  void original_solve_residual(const double* solution,const double* original_rhs,const int columns,const double epsilon,double* residual)
   {
+    const double one=1.0,zero=0.0;
+    if(cublasDgemm(blas,CUBLAS_OP_T,CUBLAS_OP_N,d,columns,d,&one,full,d,ambient,d,&zero,matrix_product,d)!=CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("native covariance fit original-matrix GEMM failed");
+    covariance_gather_original_solve_residual<<<static_cast<unsigned>((static_cast<std::size_t>(r)*columns+255)/256),256>>>(
+      matrix_product,compact_to_full,solution,original_rhs,d,r,columns,epsilon,residual);
+    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)
+      throw std::runtime_error("native covariance fit original-matrix residual evaluation failed");
+  }
+
+  std::vector<double> trace_derivatives(const double* factor_matrix,const char* matrix_kind,const double epsilon=0.0,
+    const bool check_original=false,const bool strict=true)
+  {
+    CovarianceTraceDiagnostics& diagnostic=std::string(matrix_kind)=="D"?last_d_trace:last_shifted_trace;
+    diagnostic=CovarianceTraceDiagnostics{};diagnostic.matrix_kind=matrix_kind;diagnostic.status="RUNNING";
+    diagnostic.original_residual_checked=check_original;diagnostic.total_rhs_columns=d;
     const std::size_t edge_values=graph.edges.size()*9;if(cudaMemset(edge_cov_left,0,edge_values*sizeof(double))!=cudaSuccess||cudaMemset(edge_cov_right,0,edge_values*sizeof(double))!=cudaSuccess)
       throw std::runtime_error("native covariance fit trace initialization failed");
     const double minus_one=-1.0,one=1.0;
@@ -2790,12 +2836,20 @@ struct DeviceCovarianceSystem
       int solve_info=0;if(cudaMemcpy(&solve_info,info,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess||solve_info!=0)throw std::runtime_error("native covariance fit multi-RHS solve returned an error");
       covariance_expand_solutions<<<static_cast<unsigned>((static_cast<std::size_t>(d)*columns+255)/256),256>>>(rhs,ambient,full_to_compact,d,r,columns);
       if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native covariance fit solution expansion failed");
+      double original_rhs_norm=0.0,original_relative=0.0;
+      if(check_original){
+        covariance_generate_rhs<<<static_cast<unsigned>((values+255)/256),256>>>(rhs_check,compact_to_full,householder,n,r,source,columns);
+        if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit original-matrix RHS generation failed");
+        original_solve_residual(rhs,rhs_check,columns,epsilon,rhs_temp);
+        double original_norm=0.0;if(cublasDnrm2(blas,static_cast<int>(values),rhs_temp,1,&original_norm)!=CUBLAS_STATUS_SUCCESS||
+          cublasDnrm2(blas,static_cast<int>(values),rhs_check,1,&original_rhs_norm)!=CUBLAS_STATUS_SUCCESS)
+          throw std::runtime_error("native covariance fit original-matrix residual norm failed");
+        original_relative=original_norm/std::max(original_rhs_norm,1e-300);
+      }
       covariance_householder_dots<<<static_cast<unsigned>((3*columns+255)/256),256>>>(ambient,householder,dots,n,d,columns);
       if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native covariance fit inverse Householder projection failed");
       covariance_apply_householder<<<static_cast<unsigned>((static_cast<std::size_t>(d)*columns+255)/256),256>>>(ambient,householder,dots,n,d,columns);
       if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native covariance fit inverse Householder projection failed");
-      covariance_capture_edge_covariance<<<static_cast<unsigned>((static_cast<std::size_t>(edge_count)*columns+255)/256),256>>>(ambient,sqrt_mass_device,edge_i,edge_j,edge_count,n,d,source,columns,edge_cov_left,edge_cov_right);
-      if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit graph trace contraction failed");
       if(cudaMemcpy(rhs_check,rhs,values*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess||
          cublasDtrmm(blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_T,CUBLAS_DIAG_NON_UNIT,r,columns,&one,factor_matrix,r,rhs_check,r,rhs_temp,r)!=CUBLAS_STATUS_SUCCESS||
          cublasDtrmm(blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_N,CUBLAS_DIAG_NON_UNIT,r,columns,&one,factor_matrix,r,rhs_temp,r,rhs_check,r)!=CUBLAS_STATUS_SUCCESS)
@@ -2805,10 +2859,24 @@ struct DeviceCovarianceSystem
         throw std::runtime_error("native covariance fit solve-residual comparison failed");
       double residual=0.0,rhs_norm=0.0;if(cublasDnrm2(blas,static_cast<int>(values),rhs_check,1,&residual)!=CUBLAS_STATUS_SUCCESS||cublasDnrm2(blas,static_cast<int>(values),rhs,1,&rhs_norm)!=CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("native covariance fit solve-residual norm failed");
-      const double relative=residual/std::max(rhs_norm,1e-300);if(!std::isfinite(relative))throw std::runtime_error("native covariance fit solve residual is non-finite");
-      worst_solve_relative_residual=std::max(worst_solve_relative_residual,relative);solve_rhs_columns+=static_cast<std::uint64_t>(columns);
+      const double relative=residual/std::max(rhs_norm,1e-300);if(!std::isfinite(relative)||!std::isfinite(original_relative))throw std::runtime_error("native covariance fit solve residual is non-finite");
+      diagnostic.rhs_batch_start=source;diagnostic.rhs_columns=columns;diagnostic.factor_solve_relative_residual=relative;
+      diagnostic.original_solve_relative_residual=check_original?original_relative:std::numeric_limits<double>::quiet_NaN();
+      diagnostic.rhs_columns_checked+=static_cast<std::uint64_t>(columns);solve_rhs_columns+=static_cast<std::uint64_t>(columns);
+      if(relative>diagnostic.worst_factor_solve_relative_residual){diagnostic.worst_factor_solve_relative_residual=relative;diagnostic.worst_factor_batch_start=source;diagnostic.worst_factor_batch_columns=columns;}
+      if(check_original&&original_relative>diagnostic.worst_original_solve_relative_residual){diagnostic.worst_original_solve_relative_residual=original_relative;diagnostic.worst_original_batch_start=source;diagnostic.worst_original_batch_columns=columns;}
+      worst_solve_relative_residual=std::max(worst_solve_relative_residual,relative);
+      if(check_original)worst_solve_relative_residual=std::max(worst_solve_relative_residual,original_relative);
+      const bool batch_valid=relative<=1e-7&&(!check_original||original_relative<=1e-7);
+      if(!batch_valid){if(diagnostic.first_failure_batch_start<0){diagnostic.first_failure_batch_start=source;diagnostic.first_failure_columns=columns;}
+        diagnostic.status="RESIDUAL_FAIL";if(strict)throw std::runtime_error("native covariance fit matrix solve residual exceeds 1e-7");}
+      else if(diagnostic.status!="RESIDUAL_FAIL")diagnostic.status="PASS";
+      if(batch_valid){covariance_capture_edge_covariance<<<static_cast<unsigned>((static_cast<std::size_t>(edge_count)*columns+255)/256),256>>>(ambient,sqrt_mass_device,edge_i,edge_j,edge_count,n,d,source,columns,edge_cov_left,edge_cov_right);
+        if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit graph trace contraction failed");}
     }
-    if(worst_solve_relative_residual>1e-7)throw std::runtime_error("native covariance fit matrix solve residual exceeds 1e-7");
+    if(diagnostic.rhs_columns_checked!=static_cast<std::uint64_t>(d))diagnostic.status="INCOMPLETE_RHS_SCOPE";
+    if(diagnostic.status=="RUNNING")diagnostic.status="PASS";
+    if(strict&&diagnostic.status!="PASS")throw std::runtime_error("native covariance fit matrix solve residual exceeds 1e-7");
     std::vector<double> left(edge_values),right(edge_values);if(cudaMemcpy(left.data(),edge_cov_left,edge_values*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess||
        cudaMemcpy(right.data(),edge_cov_right,edge_values*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native covariance fit edge trace read failed");
     std::vector<NeumaierAccumulator> sums(static_cast<std::size_t>(p));
@@ -2821,16 +2889,73 @@ struct DeviceCovarianceSystem
   }
 
   bool evaluate_factors(const std::vector<double>& parameters,const double epsilon,double& logdet,
-    double& shifted_logdet,std::vector<double>* traces,std::vector<double>* shifted_traces=nullptr)
+    double& shifted_logdet,std::vector<double>* traces,std::vector<double>* shifted_traces=nullptr,
+    const bool check_original_residual=false,const bool strict_solve=true)
   {
     assemble(parameters);const std::size_t bytes=static_cast<std::size_t>(r)*r*sizeof(double);
+    if(traces||shifted_traces){worst_solve_relative_residual=0.0;last_d_trace=CovarianceTraceDiagnostics{};last_d_trace.matrix_kind="D";
+      last_shifted_trace=CovarianceTraceDiagnostics{};last_shifted_trace.matrix_kind="D_MINUS_EPSILON_I";}
     if(cudaMemcpy(shifted,compact,bytes,cudaMemcpyDeviceToDevice)!=cudaSuccess)throw std::runtime_error("native covariance fit shifted matrix copy failed");
     covariance_subtract_diagonal<<<static_cast<unsigned>((r+255)/256),256>>>(shifted,r,epsilon);
     if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit epsilon shift failed");
     if(!factor(shifted,shifted_logdet))return false;
     if(!factor(compact,logdet))throw std::runtime_error("native covariance fit unshifted matrix is not SPD after shifted Cholesky passed");
-    if(traces||shifted_traces)worst_solve_relative_residual=0.0;
-    if(traces)*traces=trace_derivatives(compact);if(shifted_traces)*shifted_traces=trace_derivatives(shifted);return true;
+    if(traces)*traces=trace_derivatives(compact,"D",0.0,check_original_residual,strict_solve);
+    if(shifted_traces)*shifted_traces=trace_derivatives(shifted,"D_MINUS_EPSILON_I",epsilon,check_original_residual,strict_solve);return true;
+  }
+
+  std::vector<double> checked_inverse_quadratics(const std::vector<double>& parameters,
+    const std::vector<std::vector<double>>& modes,const std::vector<double>& sqrt_mass,const double epsilon,
+    double& factor_residual,double& original_residual)
+  {
+    if(sqrt_mass.size()!=static_cast<std::size_t>(d)||modes.empty()||modes.size()>static_cast<std::size_t>(solve_batch))
+      throw std::invalid_argument("native covariance fit soft-mode solve dimensions do not match");
+    assemble(parameters);const std::size_t matrix_bytes=static_cast<std::size_t>(r)*r*sizeof(double);
+    if(cudaMemcpy(shifted,compact,matrix_bytes,cudaMemcpyDeviceToDevice)!=cudaSuccess)throw std::runtime_error("native covariance fit baseline shift copy failed");
+    covariance_subtract_diagonal<<<static_cast<unsigned>((r+255)/256),256>>>(shifted,r,epsilon);
+    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit baseline shift failed");
+    double ignored=0.0;if(!factor(shifted,ignored)||!factor(compact,ignored))throw std::runtime_error("native covariance fit soft-mode baseline is not epsilon-positive definite");
+    const int columns=static_cast<int>(modes.size());std::vector<double> host_rhs(static_cast<std::size_t>(r)*columns,0.0);
+    double mass_sum=0.0;for(int atom=0;atom<n;++atom)mass_sum+=sqrt_mass[atom]*sqrt_mass[atom];
+    if(!(mass_sum>0.0)||!std::isfinite(mass_sum))throw std::runtime_error("native covariance fit soft-mode mass sum is invalid");
+    for(int column=0;column<columns;++column){if(modes[column].size()!=static_cast<std::size_t>(d))throw std::invalid_argument("native covariance fit soft-mode vector has an invalid dimension");
+      std::vector<double> transformed=modes[column];
+      for(int axis=0;axis<3;++axis){std::vector<double> house(static_cast<std::size_t>(n));double norm2=0.0;
+        for(int atom=0;atom<n;++atom){house[atom]=sqrt_mass[axis*n+atom]/std::sqrt(mass_sum);if(atom==0)house[atom]-=1.0;norm2+=house[atom]*house[atom];}
+        if(!(norm2>0.0)||!std::isfinite(norm2))throw std::runtime_error("native covariance fit soft-mode Householder is invalid");
+        const double inverse_norm=1.0/std::sqrt(norm2);double dot=0.0;for(int atom=0;atom<n;++atom){house[atom]*=inverse_norm;dot+=house[atom]*transformed[axis*n+atom];}
+        for(int atom=0;atom<n;++atom)transformed[axis*n+atom]-=2.0*house[atom]*dot;}
+      for(int row=0;row<r;++row){const int full_row=row+1+(row>=n-1)+(row>=2*n-2);host_rhs[static_cast<std::size_t>(column)*r+row]=transformed[full_row];}}
+    const std::size_t values=host_rhs.size();if(cudaMemcpy(rhs,host_rhs.data(),values*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
+       cusolverDnDpotrs(solver,CUBLAS_FILL_MODE_LOWER,r,columns,compact,r,rhs,r,info)!=CUSOLVER_STATUS_SUCCESS||cudaDeviceSynchronize()!=cudaSuccess)
+      throw std::runtime_error("native covariance fit soft-mode inverse solve failed");
+    int solve_info=0;if(cudaMemcpy(&solve_info,info,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess||solve_info!=0)
+      throw std::runtime_error("native covariance fit soft-mode inverse solve returned an error");
+    if(cudaMemcpy(rhs_temp,host_rhs.data(),values*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)
+      throw std::runtime_error("native covariance fit soft-mode RHS upload failed");
+    covariance_expand_solutions<<<static_cast<unsigned>((static_cast<std::size_t>(d)*columns+255)/256),256>>>(rhs,ambient,full_to_compact,d,r,columns);
+    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit soft-mode solution expansion failed");
+    original_solve_residual(rhs,rhs_temp,columns,0.0,rhs_check);
+    double original_norm=0.0,rhs_norm=0.0;if(cublasDnrm2(blas,static_cast<int>(values),rhs_check,1,&original_norm)!=CUBLAS_STATUS_SUCCESS||
+      cublasDnrm2(blas,static_cast<int>(values),rhs_temp,1,&rhs_norm)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native covariance fit soft-mode original residual norm failed");
+    original_residual=original_norm/std::max(rhs_norm,1e-300);
+    const double one=1.0;
+    if(cudaMemcpy(rhs_check,rhs,values*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess||
+       cublasDtrmm(blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_T,CUBLAS_DIAG_NON_UNIT,r,columns,&one,compact,r,rhs_check,r,rhs_temp,r)!=CUBLAS_STATUS_SUCCESS||
+       cublasDtrmm(blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_N,CUBLAS_DIAG_NON_UNIT,r,columns,&one,compact,r,rhs_temp,r,rhs_check,r)!=CUBLAS_STATUS_SUCCESS||
+       cudaMemcpy(rhs_temp,host_rhs.data(),values*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)
+      throw std::runtime_error("native covariance fit soft-mode factor residual reconstruction failed");
+    const double minus_one=-1.0;
+    if(cublasDaxpy(blas,static_cast<int>(values),&minus_one,rhs_temp,1,rhs_check,1)!=CUBLAS_STATUS_SUCCESS||
+       cublasDnrm2(blas,static_cast<int>(values),rhs_check,1,&factor_residual)!=CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("native covariance fit soft-mode factor residual comparison failed");
+    factor_residual/=std::max(rhs_norm,1e-300);
+    if(!std::isfinite(factor_residual)||!std::isfinite(original_residual)||factor_residual>1e-7||original_residual>1e-7)
+      throw std::runtime_error("native covariance fit soft-mode inverse solve residual exceeds 1e-7");
+    std::vector<double> quadratic(columns);for(int column=0;column<columns;++column){double value=0.0;
+      if(cublasDdot(blas,r,rhs_temp+static_cast<std::size_t>(column)*r,1,rhs+static_cast<std::size_t>(column)*r,1,&value)!=CUBLAS_STATUS_SUCCESS||
+         !std::isfinite(value)||value<0.0)throw std::runtime_error("native covariance fit soft-mode inverse quadratic is invalid");quadratic[column]=value;}
+    return quadratic;
   }
 };
 
@@ -2925,18 +3050,42 @@ CovarianceBaseline build_graph_covariance_baseline(DeviceCovarianceSystem& syste
   return result;
 }
 
+struct CovarianceFitSnapshot
+{
+  bool available=false;
+  std::vector<double> theta,gradient_data,gradient_prior,gradient_barrier,gradient_total;
+  double objective_data=std::numeric_limits<double>::quiet_NaN(),objective_prior=std::numeric_limits<double>::quiet_NaN();
+  double objective_barrier=std::numeric_limits<double>::quiet_NaN(),objective=std::numeric_limits<double>::quiet_NaN();
+  double tau=std::numeric_limits<double>::quiet_NaN(),scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
+  double raw_gradient_inf_norm=std::numeric_limits<double>::quiet_NaN();
+};
+
+struct CovarianceFailedTrial
+{
+  bool available=false;std::vector<double> theta;int iteration=-1;double alpha=std::numeric_limits<double>::quiet_NaN();
+  double tau=std::numeric_limits<double>::quiet_NaN(),objective_data=std::numeric_limits<double>::quiet_NaN();
+  double objective_prior=std::numeric_limits<double>::quiet_NaN(),objective_barrier=std::numeric_limits<double>::quiet_NaN();
+  double objective=std::numeric_limits<double>::quiet_NaN();std::string failure_stage="NONE";
+};
+
 struct CovarianceFitResult
 {
   bool converged=false;std::string status="NOT_STARTED",reason="none",epsilon_constraint_status="NOT_COMPUTED";
   std::string initialization_status="NOT_STARTED",line_search_failure_status="NONE",directional_derivative_status="NOT_RUN",directional_derivative_side="NONE";
   std::vector<double> statistics,theta_baseline,theta_start,theta;
+  std::vector<double> coordinate_scale;
+  CovarianceFitSnapshot last_valid;
+  CovarianceFailedTrial failed_trial;
+  CovarianceTraceDiagnostics failed_d_trace,failed_shifted_trace;
   double baseline_mu=std::numeric_limits<double>::quiet_NaN(),objective_data=std::numeric_limits<double>::quiet_NaN();
-  double objective_prior=std::numeric_limits<double>::quiet_NaN(),scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
+  double objective_prior=std::numeric_limits<double>::quiet_NaN(),objective_barrier=std::numeric_limits<double>::quiet_NaN();
+  double objective_total=std::numeric_limits<double>::quiet_NaN(),scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
   double raw_gradient_inf_norm=std::numeric_limits<double>::quiet_NaN();
   double start_graph_delta=0.0,start_objective=std::numeric_limits<double>::quiet_NaN(),start_raw_gradient_inf_norm=std::numeric_limits<double>::quiet_NaN();
   double directional_derivative_slope=std::numeric_limits<double>::quiet_NaN(),directional_derivative_finite_difference=std::numeric_limits<double>::quiet_NaN();
   double directional_derivative_step=std::numeric_limits<double>::quiet_NaN();
   double barrier_tau=std::numeric_limits<double>::quiet_NaN(),barrier_gap_estimate=std::numeric_limits<double>::quiet_NaN();
+  double kkt_gradient_denominator=std::numeric_limits<double>::quiet_NaN();
   double worst_solve_relative_residual=std::numeric_limits<double>::quiet_NaN(),optimizer_seconds=0.0;
   std::uint64_t objective_evaluations=0,initialization_evaluations=0,line_search_trials=0,line_search_evaluations=0,shifted_not_spd_trials=0,armijo_reject_trials=0;
   std::uint64_t directional_diagnostic_evaluations=0,factorizations=0,solve_rhs_columns=0;bool barrier_center_condition_pass=false;
@@ -2949,18 +3098,59 @@ struct CovarianceObjectiveEvaluation
 {
   bool feasible=false;CovarianceObjectiveStatus status=CovarianceObjectiveStatus::NotEvaluated;
   double data=0.0,prior=0.0,barrier=0.0,objective=0.0,logdet=0.0,shifted_logdet=0.0;
-  std::vector<double> gradient;
+  std::vector<double> gradient,gradient_data,gradient_prior,gradient_barrier;
 };
+
+void record_covariance_failed_trial(CovarianceFailedTrial& trial,const std::vector<double>& theta,const int iteration,
+  const double alpha,const double tau,const CovarianceObjectiveEvaluation& value)
+{
+  trial.available=true;trial.theta=theta;trial.iteration=iteration;trial.alpha=alpha;trial.tau=tau;
+  trial.objective_data=value.data;trial.objective_prior=value.prior;trial.objective_barrier=value.barrier;
+  trial.objective=value.objective;trial.failure_stage="GRADIENT_VALIDATION_PENDING";
+}
+
+double covariance_prior_mixed_variance_ratio(const double rho,const double baseline_to_training_ratio)
+{return (1.0+rho*baseline_to_training_ratio)/(1.0+rho);}
+
+double covariance_prior_rho_upper_bound(const double ratio,const double delta)
+{const double difference=std::abs(ratio-1.0);return difference>delta?delta/(difference-delta):std::numeric_limits<double>::infinity();}
+
+std::vector<double> covariance_scaled_gradient(const std::vector<double>& gradient,const std::vector<double>& scale);
+double covariance_norm_inf(const std::vector<double>& values);
+
+void covariance_decompose_gradient(CovarianceObjectiveEvaluation& value,const std::vector<double>& statistics,
+  const std::vector<double>& baseline_trace,const std::vector<double>& trace,const std::vector<double>& shifted_trace,
+  const double rho,const double tau)
+{
+  const std::size_t count=statistics.size();if(baseline_trace.size()!=count||trace.size()!=count||shifted_trace.size()!=count)
+    throw std::invalid_argument("native covariance fit gradient decomposition dimensions do not match");
+  value.gradient.resize(count);value.gradient_data.resize(count);value.gradient_prior.resize(count);value.gradient_barrier.resize(count);
+  for(std::size_t i=0;i<count;++i){value.gradient_data[i]=0.5*(statistics[i]-trace[i]);
+    value.gradient_prior[i]=0.5*rho*(baseline_trace[i]-trace[i]);value.gradient_barrier[i]=-tau*shifted_trace[i];
+    value.gradient[i]=0.5*(statistics[i]+rho*baseline_trace[i])-0.5*(1.0+rho)*trace[i]-tau*shifted_trace[i];}
+}
+
+void capture_covariance_snapshot(CovarianceFitSnapshot& snapshot,const std::vector<double>& theta,
+  const CovarianceObjectiveEvaluation& value,const std::vector<double>& scale,const double denominator,const double tau)
+{
+  snapshot.available=true;snapshot.theta=theta;snapshot.gradient_data=value.gradient_data;snapshot.gradient_prior=value.gradient_prior;
+  snapshot.gradient_barrier=value.gradient_barrier;snapshot.gradient_total=value.gradient;snapshot.objective_data=value.data;
+  snapshot.objective_prior=value.prior;snapshot.objective_barrier=value.barrier;snapshot.objective=value.objective;snapshot.tau=tau;
+  snapshot.raw_gradient_inf_norm=covariance_norm_inf(value.gradient);
+  snapshot.scaled_kkt_residual=covariance_norm_inf(covariance_scaled_gradient(value.gradient,scale))/denominator;
+}
 
 const char* covariance_objective_status_name(const CovarianceObjectiveStatus status)
 {switch(status){case CovarianceObjectiveStatus::ShiftedNotSpd:return "SHIFTED_NOT_SPD";case CovarianceObjectiveStatus::Feasible:return "FEASIBLE";default:return "NOT_EVALUATED";}}
 
 CovarianceObjectiveEvaluation evaluate_covariance_fit_objective(DeviceCovarianceSystem& system,
   const std::vector<double>& theta,const CovarianceBaseline& baseline,const std::vector<double>& statistics,
-  const double rho,const double epsilon,const double tau,std::uint64_t& evaluations,const bool compute_gradient=true)
+  const double rho,const double epsilon,const double tau,std::uint64_t& evaluations,const bool compute_gradient=true,
+  const bool check_original_residual=false,const bool strict_solve=true)
 {
   CovarianceObjectiveEvaluation value;++evaluations;std::vector<double> trace,shifted_trace;
-  if(!system.evaluate_factors(theta,epsilon,value.logdet,value.shifted_logdet,compute_gradient?&trace:nullptr,compute_gradient?&shifted_trace:nullptr)){
+  if(!system.evaluate_factors(theta,epsilon,value.logdet,value.shifted_logdet,compute_gradient?&trace:nullptr,compute_gradient?&shifted_trace:nullptr,
+      check_original_residual,strict_solve)){
     value.status=CovarianceObjectiveStatus::ShiftedNotSpd;return value;}
   const double delta_logdet=value.logdet-baseline.logdet;std::vector<double> delta(theta.size());
   for(std::size_t i=0;i<theta.size();++i)delta[i]=theta[i]-baseline.theta[i];
@@ -2968,8 +3158,7 @@ CovarianceObjectiveEvaluation evaluate_covariance_fit_objective(DeviceCovariance
   value.prior=0.5*rho*covariance_dot(delta,baseline.trace)-0.5*rho*delta_logdet;
   value.barrier=-tau*(value.shifted_logdet-baseline.shifted_logdet);
   value.objective=value.data+value.prior+value.barrier;
-  if(compute_gradient){value.gradient.resize(theta.size());for(std::size_t i=0;i<theta.size();++i)value.gradient[i]=0.5*(statistics[i]+rho*baseline.trace[i])-
-      0.5*(1.0+rho)*trace[i]-tau*shifted_trace[i];}
+  if(compute_gradient)covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau);
   value.feasible=std::isfinite(value.objective)&&std::isfinite(value.data)&&std::isfinite(value.prior)&&
     (!compute_gradient||std::all_of(value.gradient.begin(),value.gradient.end(),[](double x){return std::isfinite(x);}));
   if(!value.feasible)throw std::runtime_error("native covariance fit objective or analytic gradient is non-finite");
@@ -2980,9 +3169,10 @@ void complete_covariance_fit_gradient_from_factors(DeviceCovarianceSystem& syste
   const CovarianceBaseline& baseline,const std::vector<double>& statistics,const double rho,const double tau)
 {
   system.worst_solve_relative_residual=0.0;
-  const std::vector<double> trace=system.trace_derivatives(system.compact),shifted_trace=system.trace_derivatives(system.shifted);
-  value.gradient.resize(statistics.size());for(std::size_t i=0;i<value.gradient.size();++i)
-    value.gradient[i]=0.5*(statistics[i]+rho*baseline.trace[i])-0.5*(1.0+rho)*trace[i]-tau*shifted_trace[i];
+  system.last_d_trace=CovarianceTraceDiagnostics{};system.last_d_trace.matrix_kind="D";
+  system.last_shifted_trace=CovarianceTraceDiagnostics{};system.last_shifted_trace.matrix_kind="D_MINUS_EPSILON_I";
+  const std::vector<double> trace=system.trace_derivatives(system.compact,"D"),shifted_trace=system.trace_derivatives(system.shifted,"D_MINUS_EPSILON_I");
+  covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau);
   if(!std::all_of(value.gradient.begin(),value.gradient.end(),[](double x){return std::isfinite(x);}))
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance fit gradient from accepted Cholesky factors is non-finite");
 }
@@ -3043,7 +3233,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     result.theta_baseline=baseline.theta;result.theta_start=baseline.theta;result.theta=baseline.theta;result.baseline_mu=baseline.mu;
     result.epsilon_constraint_status=baseline.epsilon_constraint_active?"ACTIVE":"INACTIVE";
     if(trace)*trace<<"BASELINE_SPD_PASS baseline_mu "<<baseline.mu<<" epsilon_constraint_status "<<result.epsilon_constraint_status<<'\n';flush_trace();
-    const std::vector<double> coordinate_scale=system.coordinate_scales(baseline.theta,epsilon);
+    const std::vector<double> coordinate_scale=system.coordinate_scales(baseline.theta,epsilon);result.coordinate_scale=coordinate_scale;
     double tau=1.0;const std::uint64_t max_evaluations=result.objective_evaluations+std::max<std::uint64_t>(100,20ULL*static_cast<std::uint64_t>(max_iterations));
     constexpr std::uint64_t max_initialization_evaluations=16;
     auto evaluate_initialization=[&](const std::vector<double>& theta,const bool compute_gradient){++result.initialization_evaluations;
@@ -3087,15 +3277,18 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     std::vector<double> objective_gradient_scale(statistics.size());for(std::size_t i=0;i<statistics.size();++i)
       objective_gradient_scale[i]=0.5*(statistics[i]+rho*baseline.trace[i])*coordinate_scale[i];
     const double gradient_scale=std::max(1.0,covariance_norm_inf(objective_gradient_scale));
+    result.kkt_gradient_denominator=gradient_scale;
     const double target_gap=1e-6,tau_min=std::nextafter(target_gap/static_cast<double>(system.r),0.0);
     std::vector<double> inverse_hessian(z.size()*z.size(),0.0);auto reset_hessian=[&](){std::fill(inverse_hessian.begin(),inverse_hessian.end(),0.0);for(std::size_t i=0;i<z.size();++i)inverse_hessian[i*z.size()+i]=1.0;};reset_hessian();
     auto scaled_gradient=[&](const CovarianceObjectiveEvaluation& evaluation){return covariance_scaled_gradient(evaluation.gradient,coordinate_scale);};
     auto kkt=[&](const CovarianceObjectiveEvaluation& evaluation){return covariance_norm_inf(scaled_gradient(evaluation))/gradient_scale;};
+    capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);
     result.status="OPTIMIZING";
     while(result.iterations<max_iterations&&result.objective_evaluations<max_evaluations){
       result.scaled_kkt_residual=kkt(current);result.raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
       if(result.scaled_kkt_residual<=1e-6){if(tau<=tau_min){result.converged=true;result.barrier_center_condition_pass=true;result.status="COVARIANCE_OPTIMIZER_CONVERGED";break;}
-        tau=std::max(tau*0.2,tau_min);current=evaluate_covariance_fit_objective(system,result.theta,baseline,statistics,rho,epsilon,tau,result.objective_evaluations);reset_hessian();continue;}
+        tau=std::max(tau*0.2,tau_min);current=evaluate_covariance_fit_objective(system,result.theta,baseline,statistics,rho,epsilon,tau,result.objective_evaluations);
+        capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);reset_hessian();continue;}
       const std::vector<double> g=scaled_gradient(current);std::vector<double> direction(z.size(),0.0);
       for(std::size_t i=0;i<z.size();++i)for(std::size_t j=0;j<z.size();++j)direction[i]-=inverse_hessian[i*z.size()+j]*g[j];
       double slope=covariance_dot(g,direction);if(!std::isfinite(slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS direction is non-finite");
@@ -3122,7 +3315,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         if(!next.feasible){++result.shifted_not_spd_trials;trial_status="SHIFTED_NOT_SPD";}
         else{objective_delta=next.objective-current.objective;const double armijo_bound=current.objective+armijo_required_delta;
           if(!std::isfinite(objective_delta)||!std::isfinite(armijo_bound))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance Armijo comparison is non-finite");
-          if(next.objective<=armijo_bound){accepted=true;trial_status="ACCEPTED";}
+          if(next.objective<=armijo_bound){accepted=true;trial_status="ARMIJO_ACCEPTED";}
           else{++result.armijo_reject_trials;trial_status="ARMIJO_REJECT";}}
         if(trace){*trace<<"LINE_SEARCH iter="<<iteration<<" tau="<<tau<<" trial="<<trial<<" alpha="<<alpha
           <<" direction_inf_norm="<<direction_inf_norm<<" step_inf_norm="<<step_inf_norm<<" status="<<trial_status;
@@ -3189,7 +3382,11 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           <<" armijo_reject_trials="<<result.armijo_reject_trials<<" directional_derivative_status="<<result.directional_derivative_status<<'\n';flush_trace();
         break;
       }
-      complete_covariance_fit_gradient_from_factors(system,next,baseline,statistics,rho,tau);
+      record_covariance_failed_trial(result.failed_trial,next_theta,iteration,alpha,tau,next);
+      try{complete_covariance_fit_gradient_from_factors(system,next,baseline,statistics,rho,tau);}
+      catch(...){result.failed_trial.failure_stage="GRADIENT_SOLVE_FAIL";result.failed_d_trace=system.last_d_trace;
+        result.failed_shifted_trace=system.last_shifted_trace;throw;}
+      result.failed_trial.failure_stage="BFGS_COMMIT_PENDING";
       if(trace)*trace<<"OPT_STEP iteration="<<iteration<<" tau="<<tau<<" objective_data="<<next.data<<" objective_prior="<<next.prior
         <<" objective_barrier="<<next.barrier<<" scaled_kkt_residual="<<kkt(next)<<" raw_gradient_inf_norm="<<covariance_norm_inf(next.gradient)
         <<" accepted_alpha="<<alpha<<" line_search_trials="<<line_trials<<'\n';flush_trace();
@@ -3200,6 +3397,10 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         const double change_h_change=covariance_dot(change,h_change),factor=(1.0+change_h_change*inverse_sy)*inverse_sy;
         for(std::size_t i=0;i<z.size();++i)for(std::size_t j=0;j<z.size();++j)inverse_hessian[i*z.size()+j]+=factor*step[i]*step[j]-inverse_sy*(step[i]*h_change[j]+h_change[i]*step[j]);
       }else reset_hessian();
+      capture_covariance_snapshot(result.last_valid,next_theta,next,coordinate_scale,gradient_scale,tau);
+      result.failed_trial.available=false;result.failed_trial.failure_stage="NONE";
+      if(trace)*trace<<"STEP_COMMITTED iteration="<<iteration<<" tau="<<tau<<" alpha="<<alpha
+        <<" scaled_kkt_residual="<<result.last_valid.scaled_kkt_residual<<" objective="<<result.last_valid.objective<<'\n';flush_trace();
       z=std::move(next_z);result.theta=std::move(next_theta);current=std::move(next);++result.iterations;
     }
     if(!result.converged&&result.status=="OPTIMIZING"){
@@ -3209,14 +3410,23 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         if(result.objective_evaluations>=max_evaluations)result.status="EVALUATION_BUDGET_EXHAUSTED";else result.status="ITERATION_BUDGET_EXHAUSTED";
         result.reason="the covariance optimizer exhausted its explicit iteration/evaluation budget before satisfying KKT and barrier-gap criteria";}
     }
-    result.objective_data=current.data;result.objective_prior=current.prior;result.barrier_tau=tau;
+    result.objective_data=current.data;result.objective_prior=current.prior;result.objective_barrier=current.barrier;result.objective_total=current.objective;result.barrier_tau=tau;
     result.barrier_gap_estimate=result.barrier_center_condition_pass?system.r*tau:std::numeric_limits<double>::quiet_NaN();
     result.scaled_kkt_residual=kkt(current);result.raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
   }catch(const std::exception& error){
     if(result.reason=="none")result.reason=error.what();
     else if(result.line_search_failure_status!="NONE")result.reason+="; numerical failure during line-search diagnosis: "+std::string(error.what());
     if(!initialization_complete&&!result.theta_baseline.empty())result.initialization_status="NUMERICAL_FAILURE";
-    if(result.status!="BASELINE_SPD_FAIL")result.status="NUMERICAL_SOLVE_FAIL";}
+    if(result.status!="BASELINE_SPD_FAIL")result.status="NUMERICAL_SOLVE_FAIL";
+    if(result.failed_trial.available&&result.failed_trial.failure_stage=="GRADIENT_VALIDATION_PENDING")result.failed_trial.failure_stage="GRADIENT_SOLVE_FAIL";
+    else if(result.failed_trial.available&&result.failed_trial.failure_stage=="BFGS_COMMIT_PENDING")result.failed_trial.failure_stage="STEP_COMMIT_FAIL";
+    if(system.last_d_trace.status=="RUNNING")system.last_d_trace.status="SOLVE_EXCEPTION";
+    if(system.last_shifted_trace.status=="RUNNING")system.last_shifted_trace.status="SOLVE_EXCEPTION";
+    if(result.last_valid.available){result.theta=result.last_valid.theta;result.objective_data=result.last_valid.objective_data;
+      result.objective_prior=result.last_valid.objective_prior;result.objective_barrier=result.last_valid.objective_barrier;
+      result.objective_total=result.last_valid.objective;result.barrier_tau=result.last_valid.tau;
+      result.scaled_kkt_residual=result.last_valid.scaled_kkt_residual;result.raw_gradient_inf_norm=result.last_valid.raw_gradient_inf_norm;}
+    result.failed_d_trace=system.last_d_trace;result.failed_shifted_trace=system.last_shifted_trace;}
   result.factorizations=system.factorizations;result.solve_rhs_columns=system.solve_rhs_columns;
   result.worst_solve_relative_residual=system.worst_solve_relative_residual;
   result.optimizer_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
@@ -3224,12 +3434,39 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
 }
 
 void write_covariance_state(const std::string& path,const CovarianceFitResult& fit,const double rho,
-  const std::string& samples,const std::string& raw)
+  const std::string& samples,const std::string& raw,const RpmdJANativeFitOptions& options,const SampleHeader& header,
+  const QrawIdentity& identity,const Graph& graph,const std::uint64_t frame_count,const std::uint64_t training_frames)
 {
-  std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja Gaussian covariance shrinkage state\nfit_method gaussian_covariance_shrinkage\nstatus "<<fit.status
+  auto write_vector=[](std::ostream& stream,const char* key,const std::vector<double>& values){stream<<'\n'<<key<<' '<<values.size();for(double value:values)stream<<' '<<value;};
+  auto write_trace_diagnostic=[](std::ostream& stream,const char* prefix,const CovarianceTraceDiagnostics& diagnostic){
+    stream<<'\n'<<prefix<<"_matrix_kind "<<diagnostic.matrix_kind<<'\n'<<prefix<<"_status "<<diagnostic.status
+      <<'\n'<<prefix<<"_rhs_scope "<<(diagnostic.total_rhs_columns>0&&diagnostic.rhs_columns_checked==static_cast<std::uint64_t>(diagnostic.total_rhs_columns)?"ALL_RHS_BATCHES":"INCOMPLETE")
+      <<'\n'<<prefix<<"_rhs_total_columns "<<diagnostic.total_rhs_columns
+      <<'\n'<<prefix<<"_rhs_columns_checked "<<diagnostic.rhs_columns_checked<<'\n'<<prefix<<"_last_batch_start "<<diagnostic.rhs_batch_start
+      <<'\n'<<prefix<<"_last_batch_columns "<<diagnostic.rhs_columns<<'\n'<<prefix<<"_first_failure_batch_start "<<diagnostic.first_failure_batch_start
+      <<'\n'<<prefix<<"_first_failure_batch_columns "<<diagnostic.first_failure_columns
+      <<'\n'<<prefix<<"_factor_solve_relative_residual "<<diagnostic.factor_solve_relative_residual
+      <<'\n'<<prefix<<"_original_solve_relative_residual "<<diagnostic.original_solve_relative_residual
+      <<'\n'<<prefix<<"_worst_factor_solve_relative_residual "<<diagnostic.worst_factor_solve_relative_residual
+      <<'\n'<<prefix<<"_worst_factor_batch_start "<<diagnostic.worst_factor_batch_start
+      <<'\n'<<prefix<<"_worst_factor_batch_columns "<<diagnostic.worst_factor_batch_columns
+      <<'\n'<<prefix<<"_worst_original_solve_relative_residual "<<diagnostic.worst_original_solve_relative_residual
+      <<'\n'<<prefix<<"_worst_original_batch_start "<<diagnostic.worst_original_batch_start
+      <<'\n'<<prefix<<"_worst_original_batch_columns "<<diagnostic.worst_original_batch_columns
+      <<'\n'<<prefix<<"_original_residual_checked "<<(diagnostic.original_residual_checked?1:0);};
+  std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja Gaussian covariance shrinkage state\nstate_format_version 2\nfit_method gaussian_covariance_shrinkage\nstatus "<<fit.status
     <<"\nreason "<<fit.reason<<"\nsamples "<<std::quoted(samples)<<"\nqraw "<<std::quoted(raw)<<"\nshrinkage_strength "<<rho
+    <<"\ncutoff_A "<<options.cutoff<<"\nepsilon "<<options.epsilon<<"\nfd_step "<<options.fd_step<<"\ntemperature_K "<<header.temperature
+    <<"\ninternal_mass_com "<<(options.internal_mass_com?1:0)<<"\ncom_convention "<<(options.internal_mass_com?"internal_mass_com_pullback_v1":"strict_raw_zero_net")
+    <<"\nsample_frames "<<frame_count<<"\ntraining_frames "<<training_frames<<"\nparameter_count "<<fit.statistics.size()
+    <<"\nsample_interval "<<options.sample_interval<<"\nbeads "<<header.beads
+    <<"\nqraw_identity_version "<<identity.version<<"\nqraw_data_offset "<<identity.data_offset<<"\nqraw_k_offset "<<identity.k_offset
+    <<"\nqraw_model_fingerprint "<<identity.model<<"\nqraw_config_fingerprint "<<identity.config
+    <<"\nqraw_charge_mode "<<identity.charge<<"\nqraw_kspace_flag "<<identity.kspace<<"\nqraw_mesh_spacing "<<identity.mesh
+    <<"\nactive_pppm_mesh_spacing "<<identity.active_mesh
     <<"\nbaseline_mu "<<fit.baseline_mu<<"\nbaseline_epsilon_constraint_status "<<fit.epsilon_constraint_status
     <<"\nobjective_data "<<fit.objective_data<<"\nobjective_prior "<<fit.objective_prior
+    <<"\nobjective_barrier "<<fit.objective_barrier<<"\nobjective_total "<<fit.objective_total
     <<"\noptimizer_scaled_kkt_residual "<<fit.scaled_kkt_residual<<"\noptimizer_raw_gradient_inf_norm "<<fit.raw_gradient_inf_norm<<"\nbarrier_tau "<<fit.barrier_tau
     <<"\nbarrier_center_condition_status "<<(fit.barrier_center_condition_pass?"PASS":"NOT_VERIFIED")
     <<"\nbarrier_gap_estimate "<<fit.barrier_gap_estimate<<"\nobjective_evaluations "<<fit.objective_evaluations
@@ -3246,10 +3483,28 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\ndirectional_diagnostic_evaluations "<<fit.directional_diagnostic_evaluations
     <<"\nfactorizations "<<fit.factorizations<<"\nsolve_rhs_columns "<<fit.solve_rhs_columns
     <<"\nworst_solve_relative_residual "<<fit.worst_solve_relative_residual<<"\noptimizer_seconds "<<fit.optimizer_seconds<<"\niterations "<<fit.iterations
+    <<"\nkkt_gradient_denominator "<<fit.kkt_gradient_denominator
+    <<"\nlast_valid_available "<<(fit.last_valid.available?1:0)<<"\nlast_valid_objective_data "<<fit.last_valid.objective_data
+    <<"\nlast_valid_objective_prior "<<fit.last_valid.objective_prior<<"\nlast_valid_objective_barrier "<<fit.last_valid.objective_barrier
+    <<"\nlast_valid_objective "<<fit.last_valid.objective<<"\nlast_valid_tau "<<fit.last_valid.tau
+    <<"\nlast_valid_scaled_kkt_residual "<<fit.last_valid.scaled_kkt_residual
+    <<"\nlast_valid_raw_gradient_inf_norm "<<fit.last_valid.raw_gradient_inf_norm
+    <<"\nfailed_trial_available "<<(fit.failed_trial.available?1:0)<<"\nfailed_trial_iteration "<<fit.failed_trial.iteration
+    <<"\nfailed_trial_alpha "<<fit.failed_trial.alpha<<"\nfailed_trial_tau "<<fit.failed_trial.tau
+    <<"\nfailed_trial_objective_data "<<fit.failed_trial.objective_data<<"\nfailed_trial_objective_prior "<<fit.failed_trial.objective_prior
+    <<"\nfailed_trial_objective_barrier "<<fit.failed_trial.objective_barrier<<"\nfailed_trial_objective "<<fit.failed_trial.objective
+    <<"\nfailed_trial_stage "<<fit.failed_trial.failure_stage
     <<"\ntheta_baseline "<<fit.theta_baseline.size();for(double value:fit.theta_baseline)out<<' '<<value;
   out<<"\ntheta_start "<<fit.theta_start.size();for(double value:fit.theta_start)out<<' '<<value;
   out<<"\ntheta "<<fit.theta.size();for(double value:fit.theta)out<<' '<<value;
-  out<<"\ntraining_statistics "<<fit.statistics.size();for(double value:fit.statistics)out<<' '<<value;out<<'\n';
+  out<<"\ntraining_statistics "<<fit.statistics.size();for(double value:fit.statistics)out<<' '<<value;
+  write_vector(out,"coordinate_scale",fit.coordinate_scale);write_vector(out,"last_valid_theta",fit.last_valid.theta);
+  write_vector(out,"last_valid_gradient_data",fit.last_valid.gradient_data);write_vector(out,"last_valid_gradient_prior",fit.last_valid.gradient_prior);
+  write_vector(out,"last_valid_gradient_barrier",fit.last_valid.gradient_barrier);write_vector(out,"last_valid_gradient_total",fit.last_valid.gradient_total);
+  write_vector(out,"failed_trial_theta",fit.failed_trial.theta);
+  out<<"\nparameter_map "<<graph.type_pairs.size()<<" components xx xy xz yy yz zz";
+  for(const auto& pair:graph.type_pairs)out<<' '<<pair.first<<' '<<pair.second;
+  write_trace_diagnostic(out,"failed_d_trace",fit.failed_d_trace);write_trace_diagnostic(out,"failed_shifted_trace",fit.failed_shifted_trace);out<<'\n';
   write_text_exclusive(path,out.str(),"covariance optimizer state");
 }
 
@@ -3450,7 +3705,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" directional_derivative_status "<<covariance_fit.directional_derivative_status
       <<" barrier_center_condition_status "<<(covariance_fit.barrier_center_condition_pass?"PASS":"NOT_VERIFIED")
       <<" barrier_gap_estimate "<<covariance_fit.barrier_gap_estimate<<'\n';trace.flush();
-    if(!covariance_fit.converged){write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path);
+    if(!covariance_fit.converged){write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
       throw std::runtime_error(covariance_fit.reason.empty()?"COVARIANCE_OPTIMIZER_FAILED: inspect covariance state":covariance_fit.reason);}
     theta=covariance_fit.theta;
     trace<<"COVARIANCE_OPTIMIZER_CONVERGED scaled_kkt_residual "<<covariance_fit.scaled_kkt_residual
@@ -3459,7 +3714,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" raw_gradient_inf_norm "<<covariance_fit.raw_gradient_inf_norm<<'\n';trace.flush();
     cusolverDnHandle_t response_solver=nullptr;if(cusolverDnCreate(&response_solver)!=CUSOLVER_STATUS_SUCCESS){
       covariance_fit.status="FIT_RESPONSE_NUMERICAL_FAIL";covariance_fit.reason="native covariance fit response cuSOLVER handle creation failed";
-      write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path);
+      write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
       throw std::runtime_error(covariance_fit.reason);}
     try{const int steps=std::min(96,d-3);DeviceLanczosWorkspace response_lanczos;
       response_lanczos.initialize(graph,sqrt_mass,sqrt_mass_atom,steps,psize);
@@ -3490,7 +3745,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       fit_converged=true;
     }catch(const std::exception& error){covariance_fit.status="FIT_RESPONSE_FAIL";covariance_fit.reason=error.what();
       trace<<"FIT_RESPONSE_ABORT detail "<<std::quoted(error.what())<<'\n';trace.flush();
-      std::ifstream state_exists(covariance_state_path);if(!state_exists.good())write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path);cusolverDnDestroy(response_solver);throw;}
+      std::ifstream state_exists(covariance_state_path);if(!state_exists.good())write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));cusolverDnDestroy(response_solver);throw;}
     cusolverDnDestroy(response_solver);
   }else{
   int search_depth=std::min(96,d-3),consecutive_cg_feedback=0;
@@ -3789,6 +4044,247 @@ void check_rpmd_ja_native_fit_samples(const std::string& spool_path,const std::s
   std::printf("  fixed probes omit four low-frequency Ritz probes; this report cannot replace final response validation.\n");
 }
 
+std::map<std::string,std::string> read_covariance_state_fields(std::istream& input)
+{
+  std::map<std::string,std::string> fields;std::string line;
+  while(std::getline(input,line)){if(!line.empty()&&line.back()=='\r')line.pop_back();
+    std::istringstream row(line);std::string key;if(!(row>>key))continue;std::string value;std::getline(row,value);
+    const auto first=value.find_first_not_of(" \t");fields[key]=first==std::string::npos?std::string():value.substr(first);}
+  return fields;
+}
+
+bool covariance_state_tau_matches(const double saved_tau,const double tau)
+{
+  if(!(saved_tau>0.0)||!std::isfinite(saved_tau)||!(tau>0.0)||!std::isfinite(tau))return false;
+  const double tau_scale=std::max(std::abs(saved_tau),std::abs(tau));
+  return std::abs(saved_tau-tau)<=1e-10*tau_scale;
+}
+
+void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std::string& report_path,
+  const double cutoff,const double epsilon,const double tau,const double fd_step,const bool internal_mass_com,
+  Atom& atom,Box& box,Force& force)
+{
+  if(state_path.empty()||report_path.empty()||state_path==report_path||!(cutoff>0.0)||!(epsilon>0.0)||!(tau>0.0)||!(fd_step>0.0)||
+     !std::isfinite(cutoff)||!std::isfinite(epsilon)||!std::isfinite(tau)||!std::isfinite(fd_step))
+    throw std::invalid_argument("rpmd_ja diagnose_covariance requires distinct paths and positive finite numeric arguments");
+  std::ifstream existing_report(report_path,std::ios::binary);if(existing_report.good())throw std::runtime_error("rpmd_ja diagnose_covariance report already exists: "+report_path);
+  std::ifstream state_in(state_path);if(!state_in)throw std::runtime_error("cannot open covariance state: "+state_path);
+  const std::map<std::string,std::string> fields=read_covariance_state_fields(state_in);
+  auto required=[&](const char* key)->const std::string&{const auto it=fields.find(key);if(it==fields.end())throw std::runtime_error(std::string("covariance state is missing ")+key);return it->second;};
+  auto parse_vector=[&](const char* key){std::istringstream values(required(key));std::size_t count=0;if(!(values>>count)||count>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::runtime_error(std::string("covariance state has an invalid ")+key);std::vector<double> out(count);for(double& value:out)if(!(values>>value)||!std::isfinite(value))
+      throw std::runtime_error(std::string("covariance state has an invalid ")+key);return out;};
+  auto parse_double=[&](const char* key){std::istringstream value(required(key));double out=0.0;if(!(value>>out)||!std::isfinite(out))
+      throw std::runtime_error(std::string("covariance state has an invalid ")+key);return out;};
+  auto optional_double=[&](const char* key,const double value){const auto it=fields.find(key);if(it!=fields.end()){
+      std::istringstream stored(it->second);double parsed=0.0;if(!(stored>>parsed)||!std::isfinite(parsed)||std::abs(parsed-value)>1e-10*std::max({1.0,std::abs(parsed),std::abs(value)}))
+        throw std::runtime_error(std::string("diagnose_covariance argument does not match state metadata: ")+key);}};
+  auto optional_integer=[&](const char* key,const long long value){const auto it=fields.find(key);if(it!=fields.end()){
+      long long parsed=0;std::istringstream stored(it->second);if(!(stored>>parsed)||parsed!=value)
+        throw std::runtime_error(std::string("diagnose_covariance configuration does not match state metadata: ")+key);}};
+  auto optional_u64=[&](const char* key,const std::uint64_t value){const auto it=fields.find(key);if(it!=fields.end()){
+      std::uint64_t parsed=0;std::istringstream stored(it->second);if(!(stored>>parsed)||parsed!=value)
+        throw std::runtime_error(std::string("diagnose_covariance qraw identity does not match state metadata: ")+key);}};
+  auto parse_quoted=[&](const char* key){std::istringstream value(required(key));std::string out;if(!(value>>std::quoted(out))||out.empty())
+      throw std::runtime_error(std::string("covariance state has an invalid ")+key);return out;};
+  const std::string spool_path=parse_quoted("samples"),raw_path=parse_quoted("qraw");
+  std::ifstream spool(spool_path,std::ios::binary);if(!spool)throw std::runtime_error("cannot open covariance state sample spool: "+spool_path);
+  const SampleHeader header=read_header(spool,0,atom,box,0.0,true,true);
+  if(header.frame_count>static_cast<std::uint64_t>(std::numeric_limits<int>::max()))throw std::runtime_error("covariance diagnostic sample count exceeds supported indexing limits");
+  const std::uint64_t frame_count=header.frame_count,training_frames=2*frame_count/3;
+  std::vector<double> r0(static_cast<std::size_t>(3)*header.n,0.0);
+  const double interval=read_training_r0(spool,header,frame_count,std::numeric_limits<double>::quiet_NaN(),r0);
+  validate_fit_branches(spool,header,frame_count,box,r0);
+  optional_double("cutoff_A",cutoff);optional_double("epsilon",epsilon);optional_double("fd_step",fd_step);
+  optional_double("temperature_K",header.temperature);optional_double("sample_interval",interval);
+  optional_integer("internal_mass_com",internal_mass_com?1:0);optional_integer("sample_frames",static_cast<long long>(frame_count));
+  optional_integer("training_frames",static_cast<long long>(training_frames));optional_integer("beads",header.beads);
+  const auto com_field=fields.find("com_convention");if(com_field!=fields.end()&&com_field->second!=(internal_mass_com?"internal_mass_com_pullback_v1":"strict_raw_zero_net"))
+    throw std::runtime_error("diagnose_covariance COM convention does not match state metadata");
+  const bool last_valid_available=fields.count("last_valid_available")&&fields.at("last_valid_available")=="1";
+  std::string tau_metadata_status=last_valid_available?"MATCHED_LAST_VALID_STATE":
+    (fields.count("state_format_version")?"NO_VALID_SNAPSHOT_EXPLICIT_ARGUMENT":"LEGACY_STATE_EXPLICIT_ARGUMENT");
+  if(last_valid_available){const double saved_tau=parse_double("last_valid_tau");
+    if(!covariance_state_tau_matches(saved_tau,tau))
+      throw std::runtime_error("diagnose_covariance tau does not match last_valid_tau in covariance state");}
+  const double rho=parse_double("shrinkage_strength");if(!(rho>0.0))throw std::runtime_error("covariance state shrinkage strength must be positive");
+  const Graph graph=make_graph(r0,header.types,box,cutoff);const std::size_t parameter_count=6*graph.type_pairs.size();
+  std::vector<double> theta_baseline=parse_vector("theta_baseline");
+  std::vector<double> theta=fields.count("last_valid_available")&&fields.at("last_valid_available")=="1"&&fields.count("last_valid_theta")?
+    parse_vector("last_valid_theta"):parse_vector("theta");
+  const std::vector<double> saved_statistics=parse_vector("training_statistics");
+  if(theta.size()!=parameter_count||theta_baseline.size()!=parameter_count||saved_statistics.size()!=parameter_count)
+    throw std::runtime_error("covariance state parameter count does not match the graph rebuilt from samples and cutoff");
+  optional_integer("parameter_count",static_cast<long long>(parameter_count));
+  auto compare_saved_vector=[&](const std::vector<double>& actual,const std::vector<double>& expected,const char* what){
+    if(actual.size()!=expected.size())throw std::runtime_error(std::string("covariance state ")+what+" dimensions do not match");
+    for(std::size_t i=0;i<actual.size();++i)if(std::abs(actual[i]-expected[i])>1e-8*std::max({1.0,std::abs(actual[i]),std::abs(expected[i])}))
+      throw std::runtime_error(std::string("covariance state ")+what+" does not match the rebuilt sample graph at parameter "+std::to_string(i));};
+  if(fields.count("parameter_map")){std::istringstream mapping(fields.at("parameter_map"));std::size_t groups=0;std::string marker,components;
+    if(!(mapping>>groups>>marker)||marker!="components")throw std::runtime_error("covariance state parameter map is malformed");
+    for(const char* expected:{"xx","xy","xz","yy","yz","zz"})if(!(mapping>>components)||components!=expected)throw std::runtime_error("covariance state component map does not match xx/xy/xz/yy/yz/zz order");
+    if(groups!=graph.type_pairs.size())throw std::runtime_error("covariance state type-pair map has a different group count");
+    for(const auto& pair:graph.type_pairs){int a=-1,b=-1;if(!(mapping>>a>>b)||a!=pair.first||b!=pair.second)throw std::runtime_error("covariance state type-pair map does not match the rebuilt graph");}}
+  if(fields.count("last_valid_available")&&fields.at("last_valid_available")=="1")compare_saved_vector(parse_vector("theta"),theta,"committed last-valid parameters");
+  auto number_of=[&](const char* key){const auto it=fields.find(key);if(it==fields.end())return std::string("NOT_STORED");return it->second;};
+  RpmdJANativeFitOptions options;options.temperature=header.temperature;options.cutoff=cutoff;options.epsilon=epsilon;options.fd_step=fd_step;
+  options.internal_mass_com=internal_mass_com;options.sample_interval=static_cast<int>(std::llround(interval));
+  std::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("cannot open covariance state qraw source: "+raw_path);
+  const QrawIdentity identity=validate_qraw_identity(raw,options,header,r0,box,force);
+  optional_integer("qraw_identity_version",identity.version);optional_integer("qraw_data_offset",static_cast<long long>(identity.data_offset));
+  optional_integer("qraw_k_offset",static_cast<long long>(identity.k_offset));optional_u64("qraw_model_fingerprint",identity.model);
+  optional_u64("qraw_config_fingerprint",identity.config);optional_integer("qraw_charge_mode",identity.charge);
+  optional_integer("qraw_kspace_flag",identity.kspace);optional_double("qraw_mesh_spacing",identity.mesh);
+  optional_double("active_pppm_mesh_spacing",identity.active_mesh);
+  const std::vector<double> statistics=collect_covariance_fit_statistics(spool,header,frame_count,training_frames,graph,r0,header.temperature);
+  compare_saved_vector(saved_statistics,statistics,"training statistics");
+  std::vector<double> sqrt_mass(static_cast<std::size_t>(3)*header.n),sqrt_atom(static_cast<std::size_t>(header.n));
+  for(int i=0;i<header.n;++i){sqrt_atom[i]=std::sqrt(header.masses[i]);for(int axis=0;axis<3;++axis)sqrt_mass[static_cast<std::size_t>(axis)*header.n+i]=sqrt_atom[i];}
+  DeviceBaseline baseline_device;baseline_device.initialize(raw,identity.k_offset,3*header.n,header.n,header.masses,sqrt_mass);raw.close();
+  std::ostringstream report;report<<std::setprecision(17)<<"status DIAGNOSTIC_ONLY\nreference_status NOT_ACCEPTED_REFERENCE\nstate_source "<<std::quoted(state_path)
+    <<"\nsample_spool "<<std::quoted(spool_path)<<"\nqraw_source "<<std::quoted(raw_path)<<"\nstate_format_version "<<number_of("state_format_version")
+    <<"\nmetadata_assumption "<<(fields.count("cutoff_A")?"STATE_METADATA_VALIDATED":"LEGACY_STATE_MISSING_METADATA; supplied arguments and current run.in COM setting used")
+    <<"\ntau_metadata_validation "<<tau_metadata_status
+    <<"\ncutoff_A "<<cutoff<<"\nepsilon "<<epsilon<<"\nfd_step "<<fd_step<<"\ntau "<<tau<<"\nrho "<<rho
+    <<"\ntemperature_K "<<header.temperature<<"\ninternal_mass_com "<<(internal_mass_com?1:0)
+    <<"\ncom_convention "<<(internal_mass_com?"internal_mass_com_pullback_v1":"strict_raw_zero_net")<<"\nsample_interval "<<interval
+    <<"\nsample_frames "<<frame_count<<"\ntraining_frames "<<training_frames<<"\nbeads "<<header.beads
+    <<"\nqraw_identity_version "<<identity.version<<"\nqraw_data_offset "<<identity.data_offset<<"\nqraw_k_offset "<<identity.k_offset
+    <<"\nqraw_model_fingerprint "<<identity.model<<"\nqraw_config_fingerprint "<<identity.config<<"\nqraw_charge_mode "<<identity.charge
+    <<"\nqraw_kspace_flag "<<identity.kspace<<"\nqraw_mesh_spacing "<<identity.mesh<<"\nactive_pppm_mesh_spacing "<<identity.active_mesh
+    <<"\ntraining_statistics_validation PASS\nparameter_map_validation "<<(fields.count("parameter_map")?"PASS":"LEGACY_UNAVAILABLE")<<'\n';
+  DeviceCovarianceSystem covariance_system(baseline_device,graph,sqrt_mass,header.masses);
+  std::uint64_t diagnostic_evaluations=0;CovarianceBaseline base;base.theta=theta_baseline;base.mu=parse_double("baseline_mu");
+  std::vector<double> expected_baseline=graph_laplacian_direction(graph);for(double& value:expected_baseline)value*=base.mu;
+  compare_saved_vector(theta_baseline,expected_baseline,"graph-Laplacian baseline parameters");
+  std::vector<double> baseline_shifted_trace;CovarianceObjectiveEvaluation baseline_value;++diagnostic_evaluations;
+  if(!covariance_system.evaluate_factors(base.theta,epsilon,base.logdet,base.shifted_logdet,&base.trace,&baseline_shifted_trace,true,false))
+    throw std::runtime_error("saved graph-Laplacian baseline is not epsilon-positive definite");
+  const CovarianceTraceDiagnostics baseline_d=covariance_system.last_d_trace,baseline_shifted=covariance_system.last_shifted_trace;
+  baseline_value.feasible=true;baseline_value.status=CovarianceObjectiveStatus::Feasible;
+  covariance_decompose_gradient(baseline_value,statistics,base.trace,base.trace,baseline_shifted_trace,rho,tau);
+  optional_double("baseline_mu",base.mu);
+  report<<"baseline_mu "<<base.mu<<"\nbaseline_source SAVED_STATE_REASSEMBLED; TRACE_STATUS_REPORTED_SEPARATELY\n";
+  const std::vector<double> coordinate_scale=covariance_system.coordinate_scales(base.theta,epsilon);
+  std::vector<double> normalization_vector(parameter_count);
+  for(std::size_t i=0;i<parameter_count;++i)normalization_vector[i]=0.5*(statistics[i]+rho*base.trace[i])*coordinate_scale[i];
+  const double kkt_denominator=std::max(1.0,covariance_norm_inf(normalization_vector));
+  struct DiagnosedPoint{CovarianceObjectiveEvaluation evaluation;CovarianceTraceDiagnostics d,shifted;};
+  auto diagnose_point=[&](const std::vector<double>& parameters){DiagnosedPoint point;
+    point.evaluation=evaluate_covariance_fit_objective(covariance_system,parameters,base,statistics,rho,epsilon,tau,diagnostic_evaluations,true,true,false);
+    point.d=covariance_system.last_d_trace;point.shifted=covariance_system.last_shifted_trace;return point;};
+  DiagnosedPoint baseline_point;baseline_point.evaluation=std::move(baseline_value);baseline_point.d=baseline_d;baseline_point.shifted=baseline_shifted;
+  const DiagnosedPoint saved_point=diagnose_point(theta);
+  const int total_rhs_columns=3*header.n;
+  auto solve_passes=[&](const DiagnosedPoint& point){return point.evaluation.feasible&&
+    covariance_trace_diagnostics_pass(point.d,total_rhs_columns)&&covariance_trace_diagnostics_pass(point.shifted,total_rhs_columns);};
+  auto prior_trace_passes=[&](){return baseline_point.evaluation.feasible&&covariance_trace_diagnostics_pass(baseline_point.d,total_rhs_columns);};
+  auto saved_gradient_passes=[&](){return saved_point.evaluation.feasible&&covariance_saved_gradient_diagnostics_pass(
+    baseline_point.d,saved_point.d,saved_point.shifted,total_rhs_columns);};
+  auto write_residual=[&](const char* label,const CovarianceTraceDiagnostics& diag){report<<label<<" matrix_kind="<<diag.matrix_kind<<" status="<<diag.status
+      <<" rhs_scope="<<(diag.total_rhs_columns>0&&diag.rhs_columns_checked==static_cast<std::uint64_t>(diag.total_rhs_columns)?"ALL_RHS_BATCHES":"INCOMPLETE")
+      <<" rhs_columns_checked="<<diag.rhs_columns_checked<<" total_rhs_columns="<<diag.total_rhs_columns
+      <<" last_batch_start="<<diag.rhs_batch_start<<" last_batch_columns="<<diag.rhs_columns
+      <<" first_failure_batch_start="<<diag.first_failure_batch_start<<" first_failure_columns="<<diag.first_failure_columns
+      <<" factor_solve_relative_residual="<<diag.factor_solve_relative_residual
+      <<" original_solve_relative_residual="<<diag.original_solve_relative_residual
+      <<" worst_factor_residual="<<diag.worst_factor_solve_relative_residual<<" worst_factor_batch_start="<<diag.worst_factor_batch_start
+      <<" worst_factor_batch_columns="<<diag.worst_factor_batch_columns<<" worst_original_residual="<<diag.worst_original_solve_relative_residual
+      <<" worst_original_batch_start="<<diag.worst_original_batch_start<<" worst_original_batch_columns="<<diag.worst_original_batch_columns
+      <<" original_residual_checked="<<(diag.original_residual_checked?1:0)<<'\n';};
+  constexpr const char* components[6]={"xx","xy","xz","yy","yz","zz"};
+  auto write_gradient=[&](const char* label,const DiagnosedPoint& point,const bool validated){const auto& value=point.evaluation;
+    report<<"\npoint "<<label<<" objective_status="<<covariance_objective_status_name(value.status)<<" solve_status="<<(validated?"PASS":"RESIDUAL_OR_OBJECTIVE_FAIL")
+      <<" objective_data="<<value.data<<" objective_prior="<<value.prior<<" objective_barrier="<<value.barrier<<" objective_total="<<value.objective;
+    if(value.gradient.size()!=parameter_count){report<<"\ngradient_status NOT_AVAILABLE\n";return;}
+    const std::vector<double> scaled=covariance_scaled_gradient(value.gradient,coordinate_scale);double max_raw=0.0,max_scaled=0.0,component_sum_error=0.0;
+    std::size_t max_raw_index=0,max_scaled_index=0;
+    for(std::size_t i=0;i<parameter_count;++i){if(std::abs(value.gradient[i])>max_raw){max_raw=std::abs(value.gradient[i]);max_raw_index=i;}
+      if(std::abs(scaled[i])>max_scaled){max_scaled=std::abs(scaled[i]);max_scaled_index=i;}
+      component_sum_error=std::max(component_sum_error,std::abs(value.gradient_data[i]+value.gradient_prior[i]+value.gradient_barrier[i]-value.gradient[i]));}
+    const auto raw_pair=graph.type_pairs[max_raw_index/6],scaled_pair=graph.type_pairs[max_scaled_index/6];
+    report<<" scaled_kkt_denominator="<<kkt_denominator<<" scaled_kkt_residual="<<max_scaled/kkt_denominator
+      <<" raw_gradient_inf_norm="<<max_raw<<" raw_gradient_max_index="<<max_raw_index
+      <<" scaled_gradient_inf_norm="<<max_scaled<<" scaled_gradient_max_index="<<max_scaled_index
+      <<" raw_gradient_max_parameter="<<raw_pair.first<<':'<<raw_pair.second<<':'<<components[max_raw_index%6]
+      <<" scaled_gradient_max_parameter="<<scaled_pair.first<<':'<<scaled_pair.second<<':'<<components[max_scaled_index%6]
+      <<" component_sum_max_abs_error="<<component_sum_error<<"\ngradient_table index type_i type_j component g_data g_prior g_barrier g_total scale scaled_g\n";
+    for(std::size_t i=0;i<parameter_count;++i){const auto pair=graph.type_pairs[i/6];report<<i<<' '<<pair.first<<' '<<pair.second<<' '<<components[i%6]<<' '
+        <<value.gradient_data[i]<<' '<<value.gradient_prior[i]<<' '<<value.gradient_barrier[i]<<' '<<value.gradient[i]<<' '
+        <<coordinate_scale[i]<<' '<<scaled[i]<<'\n';}
+    report<<"gradient_status "<<(validated?"VALIDATED":"PARTIAL_UNVALIDATED_SOLVES")<<'\n';};
+  write_gradient("BASELINE",baseline_point,solve_passes(baseline_point));write_residual("BASELINE_SOLVE",baseline_point.d);write_residual("BASELINE_SHIFTED_SOLVE",baseline_point.shifted);
+  write_gradient("SAVED_LAST_VALID",saved_point,saved_gradient_passes());write_residual("SAVED_D_SOLVE",saved_point.d);write_residual("SAVED_SHIFTED_SOLVE",saved_point.shifted);
+  report<<"\noptimizer_residual_reference kappa=||scale*g||_inf/max(1,||scale*0.5*(a+rho*b)||_inf) denominator="<<kkt_denominator
+    <<"\nkkt_denominator_validation_status "<<(prior_trace_passes()?"PASS":"UNVALIDATED_BASELINE_D_TRACE")
+    <<"\nprior_baseline_trace_validation_status "<<(prior_trace_passes()?"PASS":"UNVALIDATED_BASELINE_D_TRACE")
+    <<"\noptimizer_state_saved_last_valid "<<(fields.count("last_valid_available")?fields.at("last_valid_available"):"LEGACY_THETA")
+    <<"\nfailed_trial_stage "<<number_of("failed_trial_stage")<<"\nfailed_trial_available "<<number_of("failed_trial_available")
+    <<"\nfailed_trial_theta_count "<<(fields.count("failed_trial_theta")?parse_vector("failed_trial_theta").size():0)
+    <<"\nfailed_trial_diagnostic_status NOT_EVALUATED_BY_THIS_ENTRY\n"
+    <<"failed_trial_note "<<(fields.count("failed_trial_theta")?"parameters_saved_but_not_replayed":"legacy_state_has_no_failed_trial_theta; diagnostic uses only the saved last-valid point")<<'\n';
+  std::string fd_status="NOT_RUN_SOLVE_RESIDUAL_FAIL",fd_side="NONE";double fd_slope=std::numeric_limits<double>::quiet_NaN();
+  double fd_value=std::numeric_limits<double>::quiet_NaN(),fd_final_step=std::numeric_limits<double>::quiet_NaN();std::size_t fd_index=0;std::uint64_t fd_evaluations=0;
+  double fd_relative_error=std::numeric_limits<double>::quiet_NaN();
+  if(saved_gradient_passes()&&saved_point.evaluation.gradient.size()==parameter_count){const auto scaled=covariance_scaled_gradient(saved_point.evaluation.gradient,coordinate_scale);
+    for(std::size_t i=1;i<scaled.size();++i)if(std::abs(scaled[i])>std::abs(scaled[fd_index]))fd_index=i;
+    fd_slope=scaled[fd_index];std::vector<double> z(parameter_count);for(std::size_t i=0;i<parameter_count;++i)z[i]=theta[i]/coordinate_scale[i];
+    double initial_step=std::cbrt(std::numeric_limits<double>::epsilon())*std::max(1.0,covariance_norm_inf(z));
+    bool found=false,saw_feasible=false,saw_roundoff=false,saw_step_underflow=false;int stable_halvings=0;
+    for(int side:{1,-1}){double h=initial_step,previous=0.0;bool have_previous=false;stable_halvings=0;
+      for(int probe=0;probe<8&&fd_evaluations<16&&!found;++probe){std::vector<double> trial=theta;trial[fd_index]+=side*h*coordinate_scale[fd_index];
+        if(trial==theta){saw_step_underflow=true;break;}
+        const auto value=evaluate_covariance_fit_objective(covariance_system,trial,base,statistics,rho,epsilon,tau,diagnostic_evaluations,false);
+        ++fd_evaluations;if(!value.feasible){have_previous=false;stable_halvings=0;h*=0.5;continue;}
+        saw_feasible=true;const double difference=value.objective-saved_point.evaluation.objective;
+        const double resolution=32.0*std::numeric_limits<double>::epsilon()*std::max({1.0,std::abs(value.objective),std::abs(saved_point.evaluation.objective)});
+        if(std::abs(difference)<=resolution){saw_roundoff=true;fd_status="INCONCLUSIVE_ROUNDOFF";break;}
+        const double slope=side>0?difference/h:-difference/h;double relative_change=std::numeric_limits<double>::quiet_NaN();
+        const bool stable=have_previous&&covariance_directional_fd_stabilized(previous,slope,stable_halvings,relative_change);
+        fd_value=slope;fd_final_step=h;fd_side=side>0?"POSITIVE":"NEGATIVE";
+        if(stable){fd_status=covariance_directional_fd_status(fd_slope,fd_value,true,fd_relative_error);found=true;break;}
+        previous=slope;have_previous=true;h*=0.5;}
+      if(found)break;}
+    if(!found)fd_status=fd_evaluations>=16?"INCONCLUSIVE_BUDGET":saw_roundoff?"INCONCLUSIVE_ROUNDOFF":
+      saw_step_underflow?"INCONCLUSIVE_STEP":saw_feasible?"INCONCLUSIVE_UNSTABLE_FD":"INCONCLUSIVE_NO_FEASIBLE_SIDE";
+  }
+  report<<"directional_fd_status "<<fd_status<<"\ndirectional_fd_parameter "<<fd_index<<"\ndirectional_fd_slope "<<fd_slope
+    <<"\ndirectional_fd_value "<<fd_value<<"\ndirectional_fd_relative_error "<<fd_relative_error
+    <<"\ndirectional_fd_step "<<fd_final_step<<"\ndirectional_fd_side "<<fd_side
+    <<"\ndirectional_fd_objective_evaluations "<<fd_evaluations<<"\ndirectional_fd_coordinate rho_and_tau_fixed baseline_fixed\n";
+  report<<"soft_mode_status ";
+  try{const int d=3*header.n,steps=std::min(96,d-3);cusolverDnHandle_t solver=nullptr;
+    if(cusolverDnCreate(&solver)!=CUSOLVER_STATUS_SUCCESS)throw std::runtime_error("soft-mode eigensolver handle creation failed");
+    std::vector<RitzMode> modes;try{DeviceLanczosWorkspace workspace;workspace.initialize(graph,sqrt_mass,sqrt_atom,steps,static_cast<int>(parameter_count));
+      modes=lanczos_low_modes(solver,baseline_device,graph,base.theta,sqrt_mass,sqrt_atom,header.n,steps,4,epsilon,{},&workspace);}
+    catch(...){cusolverDnDestroy(solver);throw;}cusolverDnDestroy(solver);
+    if(modes.empty())throw std::runtime_error("Lanczos returned no baseline soft modes");
+    std::vector<double> inverse_quad;double factor_residual=0.0,original_residual=0.0;
+    inverse_quad=covariance_system.checked_inverse_quadratics(base.theta,[&](){std::vector<std::vector<double>> vectors;for(const auto& mode:modes)vectors.push_back(mode.vector);return vectors;}(),sqrt_mass,epsilon,factor_residual,original_residual);
+    std::vector<NeumaierAccumulator> train_variance(modes.size());std::vector<double> position(static_cast<std::size_t>(d)),force_frame(position.size()),q(position.size());double frame_step=0.0;
+    spool.clear();spool.seekg(header.frames);for(std::uint64_t frame=0;frame<frame_count;++frame){read_frame(spool,position,force_frame,frame_step);if(frame>=training_frames)continue;
+      for(int i=0;i<d;++i)q[i]=sqrt_mass[i]*(position[i]-r0[i]);project_translation(q,sqrt_atom,header.n);
+      for(std::size_t mode=0;mode<modes.size();++mode){const double projection=compensated_dot(modes[mode].vector,q);train_variance[mode].add_product(projection,projection);}}
+    report<<"PASS\nsoft_mode_solve_scope ALL_RHS_MODE_COLUMNS factor_relative_residual="<<factor_residual<<" original_relative_residual="<<original_residual
+      <<"\nsoft_mode_training_support_status LIMITED_BY_FRAME_COUNT_AND_CORRELATED_SAMPLES\nsoft_mode_rho_delta_threshold 0.1\n"
+      <<"soft_mode_table index baseline_rayleigh c_train c_baseline kBT_vTDbInvv R Q_rho rho_max_for_delta_0.1 support\n";
+    for(std::size_t mode=0;mode<modes.size();++mode){const double c_train=train_variance[mode].value()/static_cast<double>(training_frames);
+      if(!(c_train>0.0)||!std::isfinite(c_train)){report<<mode<<' '<<modes[mode].actual_rayleigh<<" NOT_SUPPORTED_BY_TRAINING NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED UNSUPPORTED_IN_TRAINING\n";continue;}
+      const double c_base=K_B*header.temperature*inverse_quad[mode],ratio=c_base/c_train;
+      if(!std::isfinite(ratio)){report<<mode<<' '<<modes[mode].actual_rayleigh<<' '<<c_train<<" NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NUMERICAL_UNCERTAINTY\n";continue;}
+      const double q_rho=covariance_prior_mixed_variance_ratio(rho,ratio);
+      report<<mode<<' '<<modes[mode].actual_rayleigh<<' '<<c_train<<' '<<c_base<<' '<<inverse_quad[mode]*K_B*header.temperature<<' '<<ratio<<' '<<q_rho<<' ';
+      const double rho_bound=covariance_prior_rho_upper_bound(ratio,0.1);if(std::isfinite(rho_bound))report<<rho_bound;else report<<"NO_FINITE_UPPER_BOUND";report<<" UNCERTAINTY_NOT_ESTIMATED\n";}}
+  catch(const std::exception& error){report<<"FAILED reason="<<std::quoted(error.what())<<"\nsoft_mode_scope NOT_COMPLETE\n";}
+  report<<"ideal_covariance_mixing_formula C_pred=(C_train+rho*C_b)/(1+rho); restricted family and epsilon barrier make it an analysis only\n"
+    <<"acceptance_scope optimizer_response_prepare_and_final_spd_NOT_CHECKED\n";
+  write_text_exclusive(report_path,report.str(),"covariance fixed-point diagnostic report");
+  std::printf("rpmd_ja diagnose_covariance: report=%s; saved gradient raw/scaled=%.9g/%.9g; D and D-epsilon I residuals=%s/%s; DIAGNOSTIC_ONLY, NOT_ACCEPTED_REFERENCE\n",
+    report_path.c_str(),covariance_norm_inf(saved_point.evaluation.gradient),
+    saved_point.evaluation.gradient.size()==parameter_count?covariance_norm_inf(covariance_scaled_gradient(saved_point.evaluation.gradient,coordinate_scale)):std::numeric_limits<double>::quiet_NaN(),
+    saved_point.d.status.c_str(),saved_point.shifted.status.c_str());
+}
+
 void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string& report_path,const bool internal_mass_com,
   Atom& atom,Box& box,Force& force)
 {
@@ -3974,5 +4470,9 @@ void check_rpmd_ja_native_fit_samples(const std::string&,const std::string&,Atom
 void replay_rpmd_ja_native_cg(const std::string&,const std::string&,bool,Atom&,Box&,Force&)
 {
   throw std::runtime_error("native rpmd_ja CG replay requires CUDA");
+}
+void diagnose_rpmd_ja_native_covariance(const std::string&,const std::string&,double,double,double,double,bool,Atom&,Box&,Force&)
+{
+  throw std::runtime_error("native rpmd_ja covariance diagnostics require CUDA");
 }
 #endif

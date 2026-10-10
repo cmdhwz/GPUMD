@@ -799,7 +799,7 @@ void test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_
   assert(fit.initialization_status=="SKIPPED_BASELINE_INTERIOR"&&fit.initialization_evaluations==1);
   assert(fit.theta_start==fit.theta_baseline&&fit.start_graph_delta==0.0);
   assert(trace.str().find("COVARIANCE_INITIALIZATION status SKIPPED_BASELINE_INTERIOR")!=std::string::npos);
-  assert(trace.str().find("status=ACCEPTED")!=std::string::npos&&trace.str().find("OPT_STEP iteration=0 tau=")!=std::string::npos);
+  assert(trace.str().find("status=ARMIJO_ACCEPTED")!=std::string::npos&&trace.str().find("STEP_COMMITTED iteration=0")!=std::string::npos);
   const std::string trace_text=trace.str();const std::size_t first_trial=trace_text.find("LINE_SEARCH iter=0 ");
   const std::size_t first_step=trace_text.find("step_inf_norm=",first_trial);
   assert(first_trial!=std::string::npos&&first_step!=std::string::npos);
@@ -957,7 +957,10 @@ void test_covariance_objective_analytic_gradient_matches_finite_difference()
     const auto fplus=evaluate_covariance_fit_objective(system,plus,reference,statistics,rho,0.01,tau,evaluations,false);
     const auto fminus=evaluate_covariance_fit_objective(system,minus,reference,statistics,rho,0.01,tau,evaluations,false);
     assert(fplus.feasible&&fminus.feasible);const double numerical=(fplus.objective-fminus.objective)/(2.0*step);
-    check_close(analytic.gradient[i],numerical,2e-5);}
+    check_close(analytic.gradient[i],numerical,2e-5);
+    check_close(analytic.gradient_data[i],(fplus.data-fminus.data)/(2.0*step),2e-5);
+    check_close(analytic.gradient_prior[i],(fplus.prior-fminus.prior)/(2.0*step),2e-5);
+    check_close(analytic.gradient_barrier[i],(fplus.barrier-fminus.barrier)/(2.0*step),2e-5);}
   std::vector<double> hessian(36);
   for(int column=0;column<6;++column){const double step=2e-5*std::max(1.0,std::abs(reference.theta[column]));
     std::vector<double> plus=reference.theta,minus=reference.theta;plus[column]+=step;minus[column]-=step;
@@ -965,6 +968,103 @@ void test_covariance_objective_analytic_gradient_matches_finite_difference()
     const auto gminus=evaluate_covariance_fit_objective(system,minus,reference,statistics,rho,0.01,tau,evaluations);
     assert(gplus.feasible&&gminus.feasible);for(int row=0;row<6;++row)hessian[row*6+column]=(gplus.gradient[row]-gminus.gradient[row])/(2.0*step);}
   for(int row=0;row<6;++row)for(int column=0;column<row;++column)check_close(hessian[row*6+column],hessian[column*6+row],2e-4);
+}
+
+void test_covariance_gradient_decomposition_preserves_total()
+{
+  const std::vector<double> statistics={1.2,-0.4,0.8},baseline_trace={0.3,0.2,-0.1};
+  const std::vector<double> trace={0.7,-0.2,0.5},shifted_trace={0.1,0.4,-0.3};
+  constexpr double rho=0.1,tau=0.7;CovarianceObjectiveEvaluation value;
+  covariance_decompose_gradient(value,statistics,baseline_trace,trace,shifted_trace,rho,tau);
+  for(std::size_t i=0;i<statistics.size();++i){
+    const double data=0.5*(statistics[i]-trace[i]),prior=0.5*rho*(baseline_trace[i]-trace[i]),barrier=-tau*shifted_trace[i];
+    const double original=0.5*(statistics[i]+rho*baseline_trace[i])-0.5*(1.0+rho)*trace[i]-tau*shifted_trace[i];
+    check_close(value.gradient_data[i],data,1e-15);check_close(value.gradient_prior[i],prior,1e-15);
+    check_close(value.gradient_barrier[i],barrier,1e-15);check_close(value.gradient[i],original,1e-15);
+    check_close(value.gradient_data[i]+value.gradient_prior[i]+value.gradient_barrier[i],value.gradient[i],2e-15);
+  }
+}
+
+void test_covariance_gemm_original_residual_matches_cpu()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const int map[3]={1,3,5};const double internal[9]={4.0,1.0,-0.25,1.0,3.0,0.5,-0.25,0.5,2.0};
+  std::vector<double> matrix(36,0.0),solution={0.25,-0.5,0.75,-0.2,0.4,0.1},rhs={1.1,-0.7,2.0,-0.3,0.8,-1.2};
+  constexpr double epsilon=0.125;
+  for(int row=0;row<3;++row)for(int column=0;column<3;++column)
+    matrix[static_cast<std::size_t>(map[row])*6+map[column]]=internal[row*3+column];
+  assert(cudaMemcpy(system.full,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  assert(cudaMemcpy(system.rhs,solution.data(),solution.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  assert(cudaMemcpy(system.rhs_check,rhs.data(),rhs.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  covariance_expand_solutions<<<1,32>>>(system.rhs,system.ambient,system.full_to_compact,system.d,system.r,2);
+  assert(cudaGetLastError()==cudaSuccess&&cudaDeviceSynchronize()==cudaSuccess);
+  system.original_solve_residual(system.rhs,system.rhs_check,2,epsilon,system.rhs_temp);
+  std::vector<double> actual(6),expected(6);assert(cudaMemcpy(actual.data(),system.rhs_temp,actual.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  for(int column=0;column<2;++column)for(int row=0;row<3;++row){double value=-epsilon*solution[column*3+row]-rhs[column*3+row];
+    for(int inner=0;inner<3;++inner)value+=internal[row*3+inner]*solution[column*3+inner];expected[column*3+row]=value;}
+  for(std::size_t i=0;i<actual.size();++i)check_close(actual[i],expected[i],2e-14);
+}
+
+void test_covariance_strict_residual_failure_updates_overall_worst()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const std::vector<double> zero_theta(6,0.0);system.assemble(zero_theta);double logdet=0.0;assert(system.factor(system.compact,logdet));
+  std::vector<double> matrix(36);assert(cudaMemcpy(matrix.data(),system.full,matrix.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  matrix[1*6+1]+=0.5;assert(cudaMemcpy(system.full,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  bool failed=false;try{(void)system.trace_derivatives(system.compact,"D",0.0,true,true);}catch(const std::runtime_error&){failed=true;}
+  assert(failed&&system.last_d_trace.status=="RESIDUAL_FAIL");
+  assert(system.last_d_trace.worst_original_solve_relative_residual>1e-7);
+  check_close(system.worst_solve_relative_residual,system.last_d_trace.worst_original_solve_relative_residual,1e-15);
+}
+
+void test_covariance_saved_gradient_does_not_require_baseline_shifted_solve()
+{
+  CovarianceTraceDiagnostics baseline_d,baseline_shifted,saved_d,saved_shifted;
+  baseline_d.status=saved_d.status=saved_shifted.status="PASS";
+  baseline_d.rhs_columns_checked=saved_d.rhs_columns_checked=saved_shifted.rhs_columns_checked=6;
+  baseline_d.total_rhs_columns=saved_d.total_rhs_columns=saved_shifted.total_rhs_columns=6;
+  baseline_shifted.status="RESIDUAL_FAIL";
+  assert(!covariance_trace_diagnostics_pass(baseline_shifted,6));
+  assert(covariance_saved_gradient_diagnostics_pass(baseline_d,saved_d,saved_shifted,6));
+}
+
+void test_covariance_state_parser_accepts_lf_and_crlf()
+{
+  const std::string lf="last_valid_available 1\ncom_convention internal_mass_com_pullback_v1\nlast_valid_tau 5.65e-11\n";
+  std::string crlf;for(const char character:lf){if(character=='\n')crlf.push_back('\r');crlf.push_back(character);}
+  std::istringstream lf_input(lf),crlf_input(crlf);
+  const auto lf_fields=read_covariance_state_fields(lf_input),crlf_fields=read_covariance_state_fields(crlf_input);
+  assert(lf_fields.at("last_valid_available")=="1"&&crlf_fields.at("last_valid_available")=="1");
+  assert(lf_fields.at("com_convention")=="internal_mass_com_pullback_v1"&&
+    crlf_fields.at("com_convention")=="internal_mass_com_pullback_v1");
+  const double lf_tau=std::stod(lf_fields.at("last_valid_tau")),crlf_tau=std::stod(crlf_fields.at("last_valid_tau"));
+  check_close(lf_tau,crlf_tau,0.0);assert(covariance_state_tau_matches(lf_tau,crlf_tau));
+}
+
+void test_covariance_state_tau_comparison_is_relative_for_small_values()
+{
+  constexpr double saved_tau=5.65e-11;
+  assert(covariance_state_tau_matches(saved_tau,saved_tau));
+  assert(!covariance_state_tau_matches(saved_tau,1e-12));
+}
+
+void test_covariance_failed_trial_does_not_replace_last_valid_point()
+{
+  CovarianceFitResult result;result.last_valid.available=true;result.last_valid.theta={1.0,2.0};result.last_valid.objective=3.0;
+  CovarianceObjectiveEvaluation trial;trial.data=4.0;trial.prior=5.0;trial.barrier=-1.0;trial.objective=8.0;
+  record_covariance_failed_trial(result.failed_trial,{9.0,10.0},19,0.125,1.0,trial);
+  assert(result.failed_trial.available&&result.failed_trial.iteration==19&&result.failed_trial.failure_stage=="GRADIENT_VALIDATION_PENDING");
+  assert((result.failed_trial.theta==std::vector<double>{9.0,10.0})&&result.last_valid.available);
+  assert((result.last_valid.theta==std::vector<double>{1.0,2.0})&&result.last_valid.objective==3.0);
+}
+
+void test_covariance_prior_mixing_formula()
+{
+  check_close(covariance_prior_mixed_variance_ratio(0.1,4.0),1.4/1.1,1e-15);
+  check_close(covariance_prior_rho_upper_bound(4.0,0.1),0.1/2.9,1e-15);
+  assert(std::isinf(covariance_prior_rho_upper_bound(1.05,0.1)));
 }
 
 void test_compressed_training_force_residual_distinguishes_fit_cost()
@@ -2041,6 +2141,14 @@ int main()
   test_covariance_scaled_trial_round_trip_underflow();
   test_covariance_optimizer_rank_deficiency_budget_and_33_dimension_barrier();
   test_covariance_objective_analytic_gradient_matches_finite_difference();
+  test_covariance_gradient_decomposition_preserves_total();
+  test_covariance_gemm_original_residual_matches_cpu();
+  test_covariance_strict_residual_failure_updates_overall_worst();
+  test_covariance_saved_gradient_does_not_require_baseline_shifted_solve();
+  test_covariance_state_parser_accepts_lf_and_crlf();
+  test_covariance_state_tau_comparison_is_relative_for_small_values();
+  test_covariance_failed_trial_does_not_replace_last_valid_point();
+  test_covariance_prior_mixing_formula();
   test_compressed_training_force_residual_distinguishes_fit_cost();
   test_saved_sample_diagnostic();
   test_design_and_edge_operator();

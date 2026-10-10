@@ -80,6 +80,50 @@ if(BUILD_TESTING)
     add_executable(quantum_heat_moments_cpu_test tests/quantum_heat_moments_cpu_test.cpp)
     target_include_directories(quantum_heat_moments_cpu_test PRIVATE src)
     add_test(NAME quantum_heat_moments_cpu_test COMMAND quantum_heat_moments_cpu_test)
+
+    find_path(PROTON_TUNNELING_NETCDF_INCLUDE_DIR netcdf.h HINTS ${NETCDF_ROOT} ENV NETCDF_ROOT PATH_SUFFIXES include)
+    find_library(PROTON_TUNNELING_NETCDF_LIBRARY NAMES netcdf HINTS ${NETCDF_ROOT} ENV NETCDF_ROOT PATH_SUFFIXES lib lib64)
+    find_program(PROTON_TUNNELING_NC_CONFIG_EXECUTABLE NAMES nc-config HINTS ${NETCDF_ROOT} ENV NETCDF_ROOT PATH_SUFFIXES bin)
+    find_package(netCDF CONFIG QUIET HINTS ${NETCDF_ROOT} ENV NETCDF_ROOT PATH_SUFFIXES lib/cmake/netCDF share/cmake/netCDF)
+    set(PROTON_TUNNELING_NETCDF_LINK_TARGET "")
+    set(PROTON_TUNNELING_NETCDF_LINK_LIBRARIES "")
+    if(TARGET netCDF::netcdf)
+        set(PROTON_TUNNELING_NETCDF_LINK_TARGET netCDF::netcdf)
+    elseif(PROTON_TUNNELING_NC_CONFIG_EXECUTABLE)
+        execute_process(
+            COMMAND "${PROTON_TUNNELING_NC_CONFIG_EXECUTABLE}" --libs --static
+            RESULT_VARIABLE PROTON_TUNNELING_NC_CONFIG_RESULT
+            OUTPUT_VARIABLE PROTON_TUNNELING_NC_CONFIG_LIBRARIES
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(PROTON_TUNNELING_NC_CONFIG_RESULT EQUAL 0)
+            separate_arguments(PROTON_TUNNELING_NETCDF_LINK_LIBRARIES NATIVE_COMMAND
+                "${PROTON_TUNNELING_NC_CONFIG_LIBRARIES}")
+        endif()
+    endif()
+    if(NOT PROTON_TUNNELING_NETCDF_LINK_TARGET AND NOT PROTON_TUNNELING_NETCDF_LINK_LIBRARIES AND
+       PROTON_TUNNELING_NETCDF_LIBRARY)
+        get_filename_component(PROTON_TUNNELING_NETCDF_LIBRARY_EXTENSION
+            "${PROTON_TUNNELING_NETCDF_LIBRARY}" EXT)
+        if(NOT PROTON_TUNNELING_NETCDF_LIBRARY_EXTENSION MATCHES "^\\.(a|lib)$")
+            set(PROTON_TUNNELING_NETCDF_LINK_LIBRARIES "${PROTON_TUNNELING_NETCDF_LIBRARY}")
+        endif()
+    endif()
+    if((PROTON_TUNNELING_NETCDF_INCLUDE_DIR OR PROTON_TUNNELING_NETCDF_LINK_TARGET) AND
+       (PROTON_TUNNELING_NETCDF_LINK_TARGET OR PROTON_TUNNELING_NETCDF_LINK_LIBRARIES))
+        add_executable(proton_tunneling_netcdf_cpu_test tests/proton_tunneling_netcdf_cpu_test.cpp)
+        target_include_directories(proton_tunneling_netcdf_cpu_test PRIVATE src)
+        if(PROTON_TUNNELING_NETCDF_INCLUDE_DIR)
+            target_include_directories(proton_tunneling_netcdf_cpu_test PRIVATE ${PROTON_TUNNELING_NETCDF_INCLUDE_DIR})
+        endif()
+        if(PROTON_TUNNELING_NETCDF_LINK_TARGET)
+            target_link_libraries(proton_tunneling_netcdf_cpu_test PRIVATE ${PROTON_TUNNELING_NETCDF_LINK_TARGET})
+        else()
+            target_link_libraries(proton_tunneling_netcdf_cpu_test PRIVATE ${PROTON_TUNNELING_NETCDF_LINK_LIBRARIES})
+        endif()
+        add_test(NAME proton_tunneling_netcdf_cpu_test COMMAND proton_tunneling_netcdf_cpu_test)
+    else()
+        message(STATUS "NetCDF development files or complete link metadata not found; proton_tunneling_netcdf_cpu_test is skipped")
+    endif()
 endif()
 
 # --- nep ---

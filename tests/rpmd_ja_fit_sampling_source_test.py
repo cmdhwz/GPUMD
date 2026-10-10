@@ -51,7 +51,7 @@ assert 'if (tokens[1] == "check_samples")' in run
 assert 'check_rpmd_ja_native_fit_samples(tokens[2], tokens[3], atom, box)' in run
 assert "void check_rpmd_ja_native_fit_samples(" in native_header
 check_samples_start = native_fit.index("void check_rpmd_ja_native_fit_samples(")
-check_samples_end = native_fit.index("\n}\n\nvoid replay_rpmd_ja_native_cg", check_samples_start)
+check_samples_end = native_fit.index("\n}\n\nvoid diagnose_rpmd_ja_native_covariance", check_samples_start)
 check_samples_body = native_fit[check_samples_start:check_samples_end]
 assert "read_header(in,0,atom,box,0.0,true)" in check_samples_body
 assert "read_training_r0" in check_samples_body and "collect_fixed_probe_statistics" in check_samples_body
@@ -179,12 +179,31 @@ assert "errno = 0;" in fit_samples_parser and "errno == ERANGE" in fit_samples_p
 assert "end == tokens.back().c_str() || *end != '\\0' || rounds <= 0" in fit_samples_parser
 assert "max_rounds <N>" in fit_samples_parser and "[<qraw>] [max_rounds <N>]" in run
 assert 'if (tokens[1] == "fit_samples_covariance")' in run
+assert 'if (tokens[1] == "diagnose_covariance")' in run
+assert 'diagnose_rpmd_ja_native_covariance(tokens[2], tokens[3]' in run
 assert 'tokens.size() != 14 || tokens[10] != "shrinkage" || tokens[12] != "max_iter"' in run
 assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
 assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
 assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
 assert "sums[p+1]+=2.0*dx[0]*dx[1]" in native_fit
 assert "build_graph_covariance_baseline" in native_fit and "D_b-epsilon I positive definite" in native_fit
+assert "covariance_decompose_gradient" in native_fit and "gradient_data" in native_fit and "gradient_barrier" in native_fit
+assert "covariance_gather_original_solve_residual" in native_fit and "cublasDgemm" in native_fit
+assert "original_solve_relative_residual" in native_fit
+assert "parse_double(\"last_valid_tau\")" in native_fit and "tau_metadata_validation" in native_fit
+assert "covariance_state_tau_matches(saved_tau,tau)" in native_fit
+state_parser = native_fit[native_fit.index("read_covariance_state_fields("):native_fit.index("bool covariance_state_tau_matches(")]
+assert "line.back()=='\\r'" in state_parser
+assert "covariance_saved_gradient_diagnostics_pass" in native_fit and "saved_gradient_passes()" in native_fit
+trace_batch = native_fit[native_fit.index("const double relative=residual/std::max(rhs_norm,1e-300)"):native_fit.index("if(batch_valid){covariance_capture_edge_covariance", native_fit.index("const double relative=residual/std::max(rhs_norm,1e-300)"))]
+assert trace_batch.index("worst_solve_relative_residual=std::max") < trace_batch.index("if(!batch_valid)")
+trace_body = native_fit[native_fit.index("std::vector<double> trace_derivatives("):native_fit.index("std::vector<double> checked_inverse_quadratics(")]
+assert trace_body.index("covariance_expand_solutions") < trace_body.index("original_solve_residual(rhs,rhs_check") < trace_body.index("covariance_householder_dots")
+soft_solve = native_fit[native_fit.index("std::vector<double> checked_inverse_quadratics("):native_fit.index("struct CovarianceBaseline", native_fit.index("std::vector<double> checked_inverse_quadratics("))]
+assert soft_solve.index("const double one=1.0;") < soft_solve.index("cublasDtrmm")
+assert native_fit.index('parse_double("last_valid_tau")') < native_fit.index("DeviceBaseline baseline_device", native_fit.index('void diagnose_rpmd_ja_native_covariance('))
+assert "ARMIJO_ACCEPTED" in native_fit and "STEP_COMMITTED" in native_fit and "last_valid_theta" in native_fit
+assert "state_format_version 2" in native_fit and "parameter_map_validation" in native_fit
 assert "negative graph-Laplacian feasibility boundary" in native_fit and "distance*=2.0" in native_fit
 left_expansion = native_fit.split("auto expand_left=[&](){", 1)[1].split("auto expand_right", 1)[0]
 right_expansion = native_fit.split("auto expand_right=[&](){", 1)[1].split("const bool left_descends", 1)[0]
@@ -217,6 +236,8 @@ assert "test_covariance_optimizer_boundary_start_preserves_prior_center_and_repo
 assert "test_covariance_near_boundary_fd_requires_stable_steps" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_stable_directional_fd_consistency_and_mismatch" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_inconclusive_diagnostic_preserves_failure_status" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_strict_residual_failure_updates_overall_worst" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_saved_gradient_does_not_require_baseline_shifted_solve" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_scaled_trial_round_trip_underflow" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "barrier_center_condition_pass" in native_fit and "barrier_center_condition_status" in native_fit
 assert "write_covariance_state(covariance_state_path" in native_fit
@@ -341,12 +362,26 @@ assert "test_probe_selection_skips_duplicate_low_modes" in source("tests/rpmd_ja
 assert "test_response_uncomputed_values_are_explicit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_probe_moments_centering_and_small_segments" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_check_samples_is_read_only" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_gradient_decomposition_preserves_total" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_gemm_original_residual_matches_cpu" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_state_parser_accepts_lf_and_crlf" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_state_tau_comparison_is_relative_for_small_values" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_failed_trial_does_not_replace_last_valid_point" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_prior_mixing_formula" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_nonfinite_tail_product_is_numerical_failure" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_response_bootstrap_ignores_force_position_tail" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_sample_spool_minimum_frame_boundary" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_fixed_probe_collection_checks_reference_branches" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_baseline_batch_matches_gemv" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "source_atom_slot" not in native_fit
+trace_start = native_fit.index("std::vector<double> trace_derivatives(")
+trace_end = native_fit.index("bool evaluate_factors(", trace_start)
+trace_body = native_fit[trace_start:trace_end]
+assert trace_body.index("const bool batch_valid") < trace_body.index("covariance_capture_edge_covariance")
+assert "check_original" in trace_body and "first_failure_batch_start" in trace_body
+covariance_diagnostic = native_fit[native_fit.index("void diagnose_rpmd_ja_native_covariance("):native_fit.index("void replay_rpmd_ja_native_cg(")]
+assert "collect_covariance_fit_statistics" in covariance_diagnostic and "validate_qraw_identity" in covariance_diagnostic
+assert "fd_evaluations<16" in covariance_diagnostic and "prepare_rpmd_ja" not in covariance_diagnostic
 assert "test_response_snapshot_preserves_recomputable_matrices" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_active_set_qp_snapshot_and_rejection" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "tests/data/ja_reference_resample.bin.qp_state.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")

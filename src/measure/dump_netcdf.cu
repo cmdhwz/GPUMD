@@ -50,6 +50,11 @@ https://ambermd.org/netcdf/nctraj.pdf
 #include <cstring>
 #include <fstream>
 
+#if defined(NC_QUANTIZE_GRANULARBR) && defined(NC_HAS_HDF5) && NC_HAS_HDF5 && \
+  (!defined(NC_HAS_QUANTIZE) || NC_HAS_QUANTIZE)
+#define GPUMD_HAS_NETCDF_QUANTIZE
+#endif
+
 #define GPUMD_VERSION "5.6"
 
 /* Handle errors by printing an error message and exiting with a
@@ -313,6 +318,7 @@ void DUMP_NETCDF::parse(
   bool group_seen = false;
   bool precision_seen = false;
   bool compression_seen = false;
+  bool quantize_seen = false;
   for (int k = 3; k < num_param; k++) {
     if (tokens[k] == "group") {
       if (group_seen) {
@@ -362,10 +368,54 @@ void DUMP_NETCDF::parse(
         PRINT_INPUT_ERROR("Compression should be 'none' or 'deflate <0-9>'.\n");
       }
       compression_seen = true;
+    } else if (tokens[k] == "quantize") {
+      if (quantize_seen) {
+        PRINT_INPUT_ERROR("Option 'quantize' is specified more than once in dump_netcdf.\n");
+      }
+      if (k + 1 >= num_param) {
+        PRINT_INPUT_ERROR("Not enough arguments for option 'quantize'.\n");
+      }
+      if (!is_valid_int(tokens[k + 1], &quantize_digits_)) {
+        PRINT_INPUT_ERROR("The dump_netcdf quantize digits should be an integer.\n");
+      }
+      if (quantize_digits_ < 1) {
+        PRINT_INPUT_ERROR("The dump_netcdf quantize digits must be positive.\n");
+      }
+#ifdef GPUMD_HAS_NETCDF_QUANTIZE
+      if (quantize_digits_ > NC_QUANTIZE_MAX_FLOAT_NSD) {
+        char message[128];
+        snprintf(message, sizeof(message),
+          "The dump_netcdf quantize digits should be between 1 and %d.\n",
+          NC_QUANTIZE_MAX_FLOAT_NSD);
+        PRINT_INPUT_ERROR(message);
+      }
+#endif
+      ++k;
+      quantize_seen = true;
     } else if (!parse_dump_quantity(
                  tokens[k], quantities_, is_nep_charge_, groups, "dump_netcdf")) {
       PRINT_INPUT_ERROR("Unrecognized argument in dump_netcdf.\n");
     }
+  }
+
+  if (quantize_digits_ > 0) {
+    if (precision_ != 1) {
+      PRINT_INPUT_ERROR("dump_netcdf quantize requires single precision.\n");
+    }
+    if (compression_level_ <= 0) {
+      PRINT_INPUT_ERROR(
+        "dump_netcdf quantize requires compression deflate at a level greater than 0.\n");
+    }
+#ifndef GPUMD_HAS_NETCDF_QUANTIZE
+    PRINT_INPUT_ERROR(
+      "dump_netcdf quantize requires NetCDF-C 4.9.0 or newer with quantization support.\n");
+#endif
+    printf("    using Granular Bit Round with %d significant digits for coordinates",
+      quantize_digits_);
+    if (quantities_.has_velocity_) {
+      printf(" and velocities");
+    }
+    printf(".\n");
   }
 
   // A canonical listing of what was requested, independent of the order the arguments came in.
@@ -548,6 +598,8 @@ void DUMP_NETCDF::create_file(const std::vector<Group>& groups)
     ncid, NC_GLOBAL, "gpumd_quantities", quantity_list_.size(), quantity_list_.c_str()));
   NC_CHECK(
     nc_put_att_int(ncid, NC_GLOBAL, "gpumd_compression_level", NC_INT, 1, &compression_level_));
+  NC_CHECK(nc_put_att_int(
+    ncid, NC_GLOBAL, "gpumd_quantize_digits", NC_INT, 1, &quantize_digits_));
 
   // dimensions
   NC_CHECK(nc_def_dim(
@@ -628,6 +680,17 @@ void DUMP_NETCDF::create_file(const std::vector<Group>& groups)
   if (quantities_.has_mass_) {
     define_per_frame_variable(MASS_STR, 2, 1, "amu", mass_var);
   }
+
+#ifdef GPUMD_HAS_NETCDF_QUANTIZE
+  if (quantize_digits_ > 0) {
+    NC_CHECK(nc_def_var_quantize(
+      ncid, coordinates_var, NC_QUANTIZE_GRANULARBR, quantize_digits_));
+    if (quantities_.has_velocity_) {
+      NC_CHECK(nc_def_var_quantize(
+        ncid, velocities_var, NC_QUANTIZE_GRANULARBR, quantize_digits_));
+    }
+  }
+#endif
 
   // The group labels are constant over the run. They are written once and left uncompressed,
   // being one copy rather than one per frame.
@@ -768,12 +831,33 @@ void DUMP_NETCDF::validate_file_definition()
     append_mismatch("compression");
   }
 
+  int previous_quantize_digits = 0;
+  int attribute_id;
+  const int quantize_attribute_status =
+    nc_inq_attid(ncid, NC_GLOBAL, "gpumd_quantize_digits", &attribute_id);
+  if (quantize_attribute_status == NC_NOERR) {
+    nc_type quantize_attribute_type;
+    size_t quantize_attribute_length = 0;
+    NC_CHECK(nc_inq_atttype(
+      ncid, NC_GLOBAL, "gpumd_quantize_digits", &quantize_attribute_type));
+    NC_CHECK(nc_inq_attlen(
+      ncid, NC_GLOBAL, "gpumd_quantize_digits", &quantize_attribute_length));
+    if (quantize_attribute_type != NC_INT || quantize_attribute_length != 1) {
+      append_mismatch("quantization");
+    }
+    NC_CHECK(nc_get_att_int(ncid, NC_GLOBAL, "gpumd_quantize_digits", &previous_quantize_digits));
+  } else if (quantize_attribute_status != NC_ENOTATT) {
+    NC_CHECK(quantize_attribute_status);
+  }
+  if (previous_quantize_digits != quantize_digits_) {
+    append_mismatch("quantization");
+  }
+
   // One attribute covers every quantity, so the whole set is compared at once rather than one
   // flag at a time. Every file dump_netcdf writes records it, as an empty string when no quantity
   // was requested, so one without the attribute cannot be compared against at all. Saying so here
   // rather than where the file is opened leaves the checks above to speak first, so a file that
   // already differs in atom count or precision still gets that more specific message.
-  int attribute_id;
   if (nc_inq_attid(ncid, NC_GLOBAL, "gpumd_quantities", &attribute_id) != NC_NOERR) {
     char message[512];
     snprintf(
@@ -796,6 +880,23 @@ void DUMP_NETCDF::validate_file_definition()
   if (quantities_.has_velocity_) {
     NC_CHECK(nc_inq_varid(ncid, VELOCITIES_STR, &velocities_var));
   }
+#ifdef GPUMD_HAS_NETCDF_QUANTIZE
+  if (compression_level_ >= 0) {
+    const auto validate_quantization = [&](const int variable) {
+      int previous_mode = NC_NOQUANTIZE;
+      int previous_digits = 0;
+      NC_CHECK(nc_inq_var_quantize(ncid, variable, &previous_mode, &previous_digits));
+      const int expected_mode = quantize_digits_ > 0 ? NC_QUANTIZE_GRANULARBR : NC_NOQUANTIZE;
+      if (previous_mode != expected_mode || previous_digits != quantize_digits_) {
+        append_mismatch("quantization");
+      }
+    };
+    validate_quantization(coordinates_var);
+    if (quantities_.has_velocity_) {
+      validate_quantization(velocities_var);
+    }
+  }
+#endif
   if (quantities_.has_force_) {
     NC_CHECK(nc_inq_varid(ncid, FORCES_STR, &forces_var));
   }

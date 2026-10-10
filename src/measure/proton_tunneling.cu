@@ -31,7 +31,7 @@ propagation chains offline.
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
 #ifdef USE_NETCDF
-#include "netcdf.h"
+#include "measure/proton_tunneling_netcdf.cuh"
 #endif
 #include <algorithm>
 #include <chrono>
@@ -43,6 +43,13 @@ propagation chains offline.
 #include <random>
 #include <set>
 #include <utility>
+
+#ifdef USE_NETCDF
+using proton_tunneling_netcdf::netcdf_check;
+using proton_tunneling_netcdf::netcdf_variable;
+using proton_tunneling_netcdf::netcdf_write_double;
+using proton_tunneling_netcdf::netcdf_write_longlong;
+#endif
 
 namespace
 {
@@ -94,14 +101,6 @@ void disjoint_set_unite(std::vector<size_t>& parent, const size_t first, const s
 }
 
 #ifdef USE_NETCDF
-void netcdf_check(const int status, const char* operation)
-{
-  if (status != NC_NOERR) {
-    fprintf(stderr, "Proton observer NetCDF error in %s: %s\n", operation, nc_strerror(status));
-    std::exit(2);
-  }
-}
-
 void netcdf_text_attribute(const int group, const int variable, const char* name, const char* value)
 {
   netcdf_check(
@@ -113,35 +112,6 @@ int netcdf_dimension(const int group, const char* name, const size_t length)
   int dimension = -1;
   netcdf_check(nc_def_dim(group, name, length, &dimension), "nc_def_dim");
   return dimension;
-}
-
-int netcdf_variable(
-  const int group,
-  const char* name,
-  const nc_type type,
-  const std::vector<int>& dimensions,
-  const std::vector<size_t>& lengths,
-  const int compression_level)
-{
-  int variable = -1;
-  netcdf_check(
-    nc_def_var(group, name, type, static_cast<int>(dimensions.size()), dimensions.data(), &variable),
-    "nc_def_var");
-  if (!dimensions.empty()) {
-    std::vector<size_t> chunks(dimensions.size(), 1);
-    for (size_t i = 0; i < dimensions.size(); ++i)
-      chunks[i] = std::max<size_t>(1, std::min<size_t>(lengths[i], 16384));
-    netcdf_check(nc_def_var_chunking(group, variable, NC_CHUNKED, chunks.data()), "nc_def_var_chunking");
-    netcdf_check(
-      nc_def_var_deflate(group, variable, 1, 1, compression_level), "nc_def_var_deflate");
-  }
-  return variable;
-}
-
-void netcdf_write_double(const int group, const int variable, const std::vector<double>& values)
-{
-  if (!values.empty())
-    netcdf_check(nc_put_var_double(group, variable, values.data()), "nc_put_var_double");
 }
 
 void netcdf_write_int(const int group, const int variable, const std::vector<int>& values)
@@ -157,15 +127,6 @@ void netcdf_write_ubyte(
 {
   if (!values.empty())
     netcdf_check(nc_put_var_ubyte(group, variable, values.data()), "nc_put_var_ubyte");
-}
-
-void netcdf_write_longlong(
-  const int group,
-  const int variable,
-  const std::vector<long long>& values)
-{
-  if (!values.empty())
-    netcdf_check(nc_put_var_longlong(group, variable, values.data()), "nc_put_var_longlong");
 }
 
 #endif
@@ -5343,7 +5304,7 @@ void Proton_Tunneling::write_netcdf_output_file()
   netcdf_text_attribute(ncid, NC_GLOBAL, "program", "GPUMD");
   netcdf_text_attribute(ncid, NC_GLOBAL, "observer", "compute_proton_tunneling");
   netcdf_text_attribute(ncid, NC_GLOBAL, "format", "GPUMD proton observer NetCDF-4");
-  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "8");
+  netcdf_text_attribute(ncid, NC_GLOBAL, "format_version", "9");
   netcdf_text_attribute(ncid, NC_GLOBAL, "oxygen_symbol", oxygen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "hydrogen_symbol", hydrogen_symbol_.c_str());
   netcdf_text_attribute(ncid, NC_GLOBAL, "analysis_mode",
@@ -5619,10 +5580,12 @@ void Proton_Tunneling::write_netcdf_output_file()
     const int count_dim = netcdf_dimension(window_group, "count", window_count_names.size());
     window_time_var = netcdf_variable(window_group, "time_fs", NC_DOUBLE,
       {window_dim, endpoint_dim}, {window_records_.size(), 2}, compression_level_);
-    window_value_var = netcdf_variable(window_group, "value", NC_DOUBLE,
-      {window_dim, value_dim}, {window_records_.size(), window_value_names.size()}, compression_level_);
+    window_value_var = netcdf_variable(window_group, "value", NC_FLOAT,
+      {window_dim, value_dim}, {window_records_.size(), window_value_names.size()},
+      compression_level_, true);
     window_count_var = netcdf_variable(window_group, "count", NC_INT64,
-      {window_dim, count_dim}, {window_records_.size(), window_count_names.size()}, compression_level_);
+      {window_dim, count_dim}, {window_records_.size(), window_count_names.size()},
+      compression_level_, true);
     netcdf_text_attribute(window_group, window_value_var, "field_names",
       join_field_names(window_value_names).c_str());
     netcdf_text_attribute(window_group, window_count_var, "field_names",
@@ -5675,12 +5638,13 @@ void Proton_Tunneling::write_netcdf_output_file()
       {row_dim}, {edge_window_records_.size()}, compression_level_);
     edge_window_window_var = netcdf_variable(edge_window_group, "window_index", NC_INT,
       {row_dim}, {edge_window_records_.size()}, compression_level_);
-    edge_window_value_var = netcdf_variable(edge_window_group, "value", NC_DOUBLE,
+    edge_window_value_var = netcdf_variable(edge_window_group, "value", NC_FLOAT,
       {row_dim, value_dim},
       {edge_window_records_.size(), edge_window_value_names.size() + edge_window_time_names.size()},
-      compression_level_);
+      compression_level_, true);
     edge_window_count_var = netcdf_variable(edge_window_group, "count", NC_INT64,
-      {row_dim, count_dim}, {edge_window_records_.size(), edge_window_count_names.size()}, compression_level_);
+      {row_dim, count_dim}, {edge_window_records_.size(), edge_window_count_names.size()},
+      compression_level_, true);
     netcdf_text_attribute(edge_window_group, edge_window_value_var, "field_names",
       join_field_names(edge_window_value_names, edge_window_time_names).c_str());
     netcdf_text_attribute(edge_window_group, edge_window_count_var, "field_names",
