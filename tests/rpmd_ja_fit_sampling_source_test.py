@@ -17,6 +17,7 @@ sampling = source("src/measure/rpmd_ja_fit_sampling.cuh")
 native_header = source("src/measure/rpmd_ja_native_fit.cuh")
 native_fit = source("src/measure/rpmd_ja_native_fit.cu")
 sampler_fit = source("src/measure/rpmd_ja_fit.cu")
+rpmd_ja_doc = source("doc/gpumd/input_parameters/rpmd_ja.rst")
 
 assert 'if (tokens[1] == "fit")' in run
 assert "tokens, number_of_types, integrate, group, atom, box, force, first_potential_filename_" in run
@@ -219,9 +220,26 @@ assert "COVARIANCE_OPTIMIZER_CONVERGED" in native_fit and "LINE_SEARCH_FAILED" i
 assert "max_initialization_evaluations=16" in native_fit and "result.theta_start=start_theta" in native_fit
 assert "result.theta_baseline=baseline.theta" in native_fit and "baseline.trace" in native_fit
 assert "evaluate_initialization(trial_theta,false)" in native_fit and "current=evaluate_initialization(result.theta,true)" in native_fit
+assert 'initialization_phase="SHRINK"' in native_fit and 'initialization_phase="EXPAND"' in native_fit and "stop_reason " in native_fit
+assert "NO_IMPROVEMENT" in native_fit and "IMPROVED_EVALUATION_LIMIT" in native_fit
 assert "std::min(1.0,1.0/direction_inf_norm)" in native_fit and "next_theta!=theta" in native_fit
 assert "covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,alpha" in native_fit
 assert "covariance_directional_fd_stabilized" in native_fit and "stable_halvings>=2" in native_fit
+fixed_coordinate_fd = native_fit.split("CovarianceFixedCoordinateFDResult covariance_fixed_coordinate_fd(", 1)[1].split("\nvoid apply_covariance_directional_diagnostic", 1)[0]
+assert "std::max(1.0,std::abs(z[index]))" in fixed_coordinate_fd
+assert "covariance_build_scaled_trial(theta,z,coordinate_scale,direction,side*h" in fixed_coordinate_fd
+assert "(trial_theta[index]-theta[index])/coordinate_scale[index]" in fixed_coordinate_fd
+assert "finite_difference=objective_change/effective_step" in fixed_coordinate_fd
+assert "constexpr std::uint64_t max_evaluations=16" in fixed_coordinate_fd and "result.evaluations<max_evaluations" in fixed_coordinate_fd
+assert "preferred_side=analytic_slope<=0.0?1:-1" in fixed_coordinate_fd and "sides[2]={first_side,-first_side}" in fixed_coordinate_fd
+assert "if(accepted_side!=side)" in fixed_coordinate_fd and "if(!value.feasible){have_previous=false" in fixed_coordinate_fd
+assert "result.one_percent_check=result.relative_error<=0.01?\"PASS\":\"FAIL\"" in fixed_coordinate_fd
+assert "directional_fd_probe side=" in fixed_coordinate_fd and "directional_fd_one_percent_check" in native_fit
+fd_diagnostic = native_fit.split('std::string fd_status="NOT_RUN_SOLVE_RESIDUAL_FAIL"', 1)[1].split('report<<"soft_mode_status', 1)[0]
+assert "covariance_fixed_coordinate_fd(" in fd_diagnostic and "&report" in fd_diagnostic
+assert "if(trace)" not in fd_diagnostic and "flush_trace()" not in fd_diagnostic
+assert "theta_baseline`` remains the prior center" in rpmd_ja_doc and "phase=SHRINK" in rpmd_ja_doc and "phase=EXPAND" in rpmd_ja_doc
+assert "directional_fd_one_percent_check" in rpmd_ja_doc and "directional_fd_probe" in rpmd_ja_doc
 assert '"INCONCLUSIVE_UNSTABLE_FD"' in native_fit and "stabilized directional finite difference" in native_fit
 assert "apply_covariance_directional_diagnostic(result" in native_fit
 covariance_solver = native_fit.split("CovarianceFitResult solve_covariance_reference(", 1)[1].split("\nvoid write_covariance_state", 1)[0]
@@ -233,7 +251,12 @@ assert 'trial_status="ARMIJO_REJECT"' in native_fit and "status=STEP_UNDERFLOW" 
 assert "DIRECTIONAL_DIAGNOSTIC_RESULT" in native_fit and "GRADIENT_CONSISTENCY_SUSPECT" in native_fit
 assert "OPT_STEP iteration=" in native_fit and "max_covariance_iterations,&trace" in native_fit
 assert "test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_initialization_shrinks_before_expanding" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_initialization_reports_no_improvement_at_budget" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_fixed_coordinate_fd_uses_selected_coordinate_scale" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_fixed_coordinate_fd_switches_feasible_side_with_shared_budget" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_near_boundary_fd_requires_stable_steps" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_fixed_coordinate_fd_one_percent_is_separate_from_classification" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_stable_directional_fd_consistency_and_mismatch" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_inconclusive_diagnostic_preserves_failure_status" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_strict_residual_failure_updates_overall_worst" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
@@ -381,7 +404,8 @@ assert trace_body.index("const bool batch_valid") < trace_body.index("covariance
 assert "check_original" in trace_body and "first_failure_batch_start" in trace_body
 covariance_diagnostic = native_fit[native_fit.index("void diagnose_rpmd_ja_native_covariance("):native_fit.index("void replay_rpmd_ja_native_cg(")]
 assert "collect_covariance_fit_statistics" in covariance_diagnostic and "validate_qraw_identity" in covariance_diagnostic
-assert "fd_evaluations<16" in covariance_diagnostic and "prepare_rpmd_ja" not in covariance_diagnostic
+assert "covariance_fixed_coordinate_fd(" in covariance_diagnostic and "fd_evaluations=fd.evaluations" in covariance_diagnostic
+assert "prepare_rpmd_ja" not in covariance_diagnostic
 assert "test_response_snapshot_preserves_recomputable_matrices" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_active_set_qp_snapshot_and_rejection" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "tests/data/ja_reference_resample.bin.qp_state.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")

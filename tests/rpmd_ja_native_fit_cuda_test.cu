@@ -831,6 +831,7 @@ void test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports
   const std::vector<double> direction=graph_laplacian_direction(graph);
   for(std::size_t i=0;i<direction.size();++i)check_close(fit.theta_start[i],fit.theta_baseline[i]+fit.start_graph_delta*direction[i],1e-12);
   assert(trace.str().find("COVARIANCE_INITIALIZATION_TRIAL")!=std::string::npos);
+  assert(trace.str().find("phase=SHRINK")!=std::string::npos&&trace.str().find("phase=EXPAND")!=std::string::npos);
   assert(trace.str().find("theta_start ")!=std::string::npos);
   std::uint64_t start_evaluations=0;
   const CovarianceObjectiveEvaluation start=evaluate_covariance_fit_objective(system,fit.theta_start,reference,statistics,0.1,0.01,1.0,start_evaluations);
@@ -844,9 +845,88 @@ void test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports
   assert(!shifted.feasible&&shifted.status==CovarianceObjectiveStatus::ShiftedNotSpd);
 }
 
+void test_covariance_initialization_shrinks_before_expanding()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const std::vector<double> direction=graph_laplacian_direction(graph),zero_statistics(6,0.0);
+  const std::vector<double> seed_statistics={1e6,0.0,0.0,1e6,0.0,1e6};std::uint64_t baseline_evaluations=0;
+  CovarianceBaseline reference=build_graph_covariance_baseline(system,seed_statistics,0.01,baseline_evaluations);assert(reference.epsilon_constraint_active);
+  const std::vector<double> scale=system.coordinate_scales(reference.theta,0.01);
+  double delta_scale=std::numeric_limits<double>::infinity();for(std::size_t i=0;i<direction.size();++i)if(direction[i]>0.0)delta_scale=std::min(delta_scale,scale[i]/direction[i]);
+  double initial_delta=0.01*delta_scale;std::uint64_t objective_evaluations=0;
+  std::vector<double> coarse_theta(reference.theta.size()),half_theta(reference.theta.size());
+  for(std::size_t i=0;i<direction.size();++i){coarse_theta[i]=reference.theta[i]+initial_delta*direction[i];half_theta[i]=reference.theta[i]+0.5*initial_delta*direction[i];}
+  const CovarianceObjectiveEvaluation coarse_zero=evaluate_covariance_fit_objective(system,coarse_theta,reference,zero_statistics,0.1,0.01,1.0,objective_evaluations,false);
+  const CovarianceObjectiveEvaluation half_zero=evaluate_covariance_fit_objective(system,half_theta,reference,zero_statistics,0.1,0.01,1.0,objective_evaluations,false);
+  assert(coarse_zero.feasible&&half_zero.feasible);
+  const double lower_diagonal=-coarse_zero.objective/(1.5*initial_delta),upper_diagonal=-half_zero.objective/(0.75*initial_delta);
+  assert(lower_diagonal>0.0&&lower_diagonal<upper_diagonal);
+  const double diagonal=0.5*(lower_diagonal+upper_diagonal);const std::vector<double> statistics={diagonal,0.0,0.0,diagonal,0.0,diagonal};
+  baseline_evaluations=0;reference=build_graph_covariance_baseline(system,statistics,0.01,baseline_evaluations);assert(reference.epsilon_constraint_active);
+  const std::vector<double> final_scale=system.coordinate_scales(reference.theta,0.01);
+  delta_scale=std::numeric_limits<double>::infinity();for(std::size_t i=0;i<direction.size();++i)if(direction[i]>0.0)delta_scale=std::min(delta_scale,final_scale[i]/direction[i]);
+  initial_delta=0.01*delta_scale;objective_evaluations=0;
+  const CovarianceObjectiveEvaluation base_value=evaluate_covariance_fit_objective(system,reference.theta,reference,statistics,0.1,0.01,1.0,objective_evaluations,false);
+  for(std::size_t i=0;i<direction.size();++i){coarse_theta[i]=reference.theta[i]+initial_delta*direction[i];half_theta[i]=reference.theta[i]+0.5*initial_delta*direction[i];}
+  const CovarianceObjectiveEvaluation coarse=evaluate_covariance_fit_objective(system,coarse_theta,reference,statistics,0.1,0.01,1.0,objective_evaluations,false);
+  const CovarianceObjectiveEvaluation half=evaluate_covariance_fit_objective(system,half_theta,reference,statistics,0.1,0.01,1.0,objective_evaluations,false);
+  assert(base_value.feasible&&coarse.feasible&&half.feasible&&coarse.objective>base_value.objective&&half.objective<base_value.objective);
+  std::ostringstream trace;const CovarianceFitResult fit=solve_covariance_reference(system,statistics,0.01,0.1,1,&trace);
+  assert(fit.epsilon_constraint_status=="ACTIVE"&&fit.start_graph_delta>0.0);
+  check_close(fit.start_graph_delta,0.5*initial_delta,1e-10);
+  assert(fit.initialization_status=="IMPROVED"&&fit.initialization_evaluations<=16);
+  assert(fit.theta_baseline==reference.theta&&fit.theta_start.size()==fit.theta_baseline.size());
+  for(std::size_t i=0;i<direction.size();++i)check_close(fit.theta_start[i],fit.theta_baseline[i]+fit.start_graph_delta*direction[i],1e-12);
+  assert(trace.str().find("phase=SHRINK")!=std::string::npos&&trace.str().find("phase=EXPAND")!=std::string::npos);
+  std::uint64_t evaluations=0;const CovarianceObjectiveEvaluation selected=evaluate_covariance_fit_objective(system,fit.theta_start,reference,statistics,0.1,0.01,1.0,evaluations);
+  assert(selected.feasible);check_close(selected.objective,fit.start_objective,1e-12);
+  check_close(covariance_norm_inf(selected.gradient),fit.start_raw_gradient_inf_norm,1e-12);
+}
+
+void test_covariance_initialization_reports_no_improvement_at_budget()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const std::vector<double> statistics={1e12,0.0,0.0,1e12,0.0,1e12};std::ostringstream trace;
+  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,0.01,0.1,1,&trace);
+  assert(fit.epsilon_constraint_status=="ACTIVE"&&fit.initialization_status=="NO_IMPROVEMENT_INITIALIZATION_EVALUATION_LIMIT");
+  assert(fit.initialization_evaluations==16&&fit.start_graph_delta==0.0&&fit.theta_start==fit.theta_baseline);
+  assert(trace.str().find("phase=SHRINK")!=std::string::npos&&trace.str().find("phase=EXPAND")==std::string::npos);
+  assert(trace.str().find("stop_reason INITIALIZATION_EVALUATION_LIMIT")!=std::string::npos);
+}
+
+void test_covariance_fixed_coordinate_fd_uses_selected_coordinate_scale()
+{
+  const std::vector<double> theta={0.437,46.718},scale={1.0,1.0},z=theta;std::ostringstream report;
+  const double expected_step=std::cbrt(std::numeric_limits<double>::epsilon())*std::max(1.0,std::abs(z[0]));
+  const CovarianceFixedCoordinateFDResult result=covariance_fixed_coordinate_fd(theta,z,scale,0,-1.0,0.0,
+    [](const std::vector<double>& trial){CovarianceObjectiveEvaluation value;value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;
+      const double delta=trial[0]-0.437;value.objective=-delta+0.5*delta*delta;return value;},&report);
+  assert(result.initial_step==expected_step&&result.initial_step<std::cbrt(std::numeric_limits<double>::epsilon())*std::abs(z[1]));
+  assert(result.evaluations>0&&result.evaluations<=16&&result.status=="CONSISTENT"&&result.one_percent_check=="PASS");
+  assert(report.str().find("directional_fd_probe side=POSITIVE")!=std::string::npos);
+}
+
+void test_covariance_fixed_coordinate_fd_switches_feasible_side_with_shared_budget()
+{
+  const std::vector<double> theta={0.0},scale={1.0},z={0.0};const double initial_step=std::cbrt(std::numeric_limits<double>::epsilon());
+  std::vector<double> evaluated_coordinates;std::ostringstream report;
+  const CovarianceFixedCoordinateFDResult result=covariance_fixed_coordinate_fd(theta,z,scale,0,-1.0,0.0,
+    [&](const std::vector<double>& trial){CovarianceObjectiveEvaluation value;const double delta=trial[0];evaluated_coordinates.push_back(delta);
+      if(delta>0.0&&delta<initial_step/3.0){value.status=CovarianceObjectiveStatus::ShiftedNotSpd;return value;}
+      value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-delta;return value;},&report);
+  assert(result.evaluations==6&&result.evaluations<=16&&evaluated_coordinates.size()==result.evaluations);
+  assert(evaluated_coordinates[0]>0.0&&evaluated_coordinates[1]>0.0&&evaluated_coordinates[2]>0.0);
+  check_close(evaluated_coordinates[2],initial_step/4.0,1e-15);check_close(evaluated_coordinates[3],-initial_step/4.0,1e-15);
+  assert(result.side==-1&&result.stable_halvings==2&&result.status=="CONSISTENT"&&result.one_percent_check=="PASS");
+  const std::string trace=report.str();const std::size_t switched=trace.find("directional_fd_probe side=NEGATIVE");
+  assert(switched!=std::string::npos&&trace.substr(switched,trace.find('\n',switched)-switched).find("stable_halvings=0 status=FEASIBLE")!=std::string::npos);
+}
+
 void test_covariance_near_boundary_fd_requires_stable_steps()
 {
-  constexpr double epsilon=0.01,gap=1e-10,tau=1.0;
+  constexpr double epsilon=0.01,gap=5e-10,tau=1.0;
   DeviceBaseline baseline;baseline.d=6;assert(cudaMalloc(reinterpret_cast<void**>(&baseline.k),36*sizeof(double))==cudaSuccess);
   const double t[2]={1.0/std::sqrt(5.0),2.0/std::sqrt(5.0)};std::vector<double> matrix(36,0.0);
   for(int axis=0;axis<3;++axis)for(int i=0;i<2;++i)for(int j=0;j<2;++j){const int row=axis*2+i,column=axis*2+j;
@@ -858,21 +938,24 @@ void test_covariance_near_boundary_fd_requires_stable_steps()
   assert(system.evaluate_factors(theta,epsilon,reference.logdet,reference.shifted_logdet,&reference.trace));
   std::uint64_t evaluations=0;const CovarianceObjectiveEvaluation current=evaluate_covariance_fit_objective(system,theta,reference,statistics,0.0,epsilon,tau,evaluations);
   assert(current.feasible);const std::vector<double> scale=system.coordinate_scales(theta,epsilon),g=covariance_scaled_gradient(current.gradient,scale);
-  std::vector<double> direction(g.size());for(std::size_t i=0;i<g.size();++i)direction[i]=-g[i];
-  const double slope=covariance_dot(g,direction),direction_norm=covariance_norm_inf(direction);assert(slope<0.0&&direction_norm>0.0);
-  const std::vector<double> z(6,0.0);double h=std::cbrt(std::numeric_limits<double>::epsilon())/direction_norm,first_error=0.0,previous_fd=0.0,last_fd=0.0;
-  int stable_halvings=0;bool have_previous=false,stable=false;
-  for(int probe=0;probe<8;++probe){std::vector<double> next_z,step,next_theta;
-    assert(covariance_build_scaled_trial(theta,z,scale,direction,h,next_z,step,next_theta));
-    const CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(system,next_theta,reference,statistics,0.0,epsilon,tau,evaluations,false);
-    assert(value.feasible);last_fd=(value.objective-current.objective)/h;assert(std::isfinite(last_fd));
-    if(probe==0){first_error=std::abs(last_fd-slope)/std::max({std::abs(last_fd),std::abs(slope),1e-12});double ignored=0.0;
-      assert(first_error>0.5&&std::string(covariance_directional_fd_status(slope,last_fd,false,ignored))=="INCONCLUSIVE_UNSTABLE_FD");}
-    double relative_change=0.0;if(have_previous&&covariance_directional_fd_stabilized(previous_fd,last_fd,stable_halvings,relative_change)){stable=true;break;}
-    previous_fd=last_fd;have_previous=true;h*=0.5;
-  }
-  assert(!stable);double ignored=0.0;
-  assert(std::string(covariance_directional_fd_status(slope,last_fd,false,ignored))=="INCONCLUSIVE_UNSTABLE_FD");
+  std::size_t index=0;for(std::size_t i=1;i<g.size();++i)if(std::abs(g[i])>std::abs(g[index]))index=i;
+  const double slope=g[index];assert(std::isfinite(slope));std::vector<double> z(theta.size());for(std::size_t i=0;i<theta.size();++i)z[i]=theta[i]/scale[i];
+  std::ostringstream report;const std::uint64_t before=evaluations;
+  const CovarianceFixedCoordinateFDResult result=covariance_fixed_coordinate_fd(theta,z,scale,index,slope,current.objective,
+    [&](const std::vector<double>& trial){return evaluate_covariance_fit_objective(system,trial,reference,statistics,0.0,epsilon,tau,evaluations,false);},&report);
+  assert(result.initial_step==std::cbrt(std::numeric_limits<double>::epsilon())*std::max(1.0,std::abs(z[index])));
+  assert(result.evaluations==evaluations-before&&result.evaluations>8&&result.evaluations<=16);
+  assert(result.stable_halvings>=2&&result.status=="CONSISTENT"&&result.relative_error<=0.01&&result.one_percent_check=="PASS");
+  assert(report.str().find("directional_fd_probe side=")!=std::string::npos);
+}
+
+void test_covariance_fixed_coordinate_fd_one_percent_is_separate_from_classification()
+{
+  const std::vector<double> theta={0.437},scale={1.0},z=theta;
+  const CovarianceFixedCoordinateFDResult result=covariance_fixed_coordinate_fd(theta,z,scale,0,-1.03,0.0,
+    [](const std::vector<double>& trial){CovarianceObjectiveEvaluation value;value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;
+      const double delta=trial[0]-0.437;value.objective=-delta+0.5*delta*delta;return value;});
+  assert(result.status=="CONSISTENT"&&result.relative_error>0.01&&result.relative_error<0.05&&result.one_percent_check=="FAIL");
 }
 
 void test_covariance_stable_directional_fd_consistency_and_mismatch()
@@ -2135,7 +2218,12 @@ int main()
   test_covariance_baseline_brackets_both_signs_and_zero();
   test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_solution();
   test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status();
+  test_covariance_initialization_shrinks_before_expanding();
+  test_covariance_initialization_reports_no_improvement_at_budget();
+  test_covariance_fixed_coordinate_fd_uses_selected_coordinate_scale();
+  test_covariance_fixed_coordinate_fd_switches_feasible_side_with_shared_budget();
   test_covariance_near_boundary_fd_requires_stable_steps();
+  test_covariance_fixed_coordinate_fd_one_percent_is_separate_from_classification();
   test_covariance_stable_directional_fd_consistency_and_mismatch();
   test_covariance_inconclusive_diagnostic_preserves_failure_status();
   test_covariance_scaled_trial_round_trip_underflow();

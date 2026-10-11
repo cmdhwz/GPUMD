@@ -3212,6 +3212,79 @@ const char* covariance_directional_fd_status(const double slope,const double fin
   return (slope<0.0&&finite_difference>=0.0)||relative_error>0.5?"MISMATCH":"CONSISTENT";
 }
 
+struct CovarianceFixedCoordinateFDResult
+{
+  std::string status="INCONCLUSIVE_NO_FEASIBLE_SIDE",one_percent_check="NOT_CHECKED";
+  int side=0,stable_halvings=0;
+  std::uint64_t evaluations=0;
+  double initial_step=std::numeric_limits<double>::quiet_NaN(),nominal_step=std::numeric_limits<double>::quiet_NaN();
+  double effective_step=std::numeric_limits<double>::quiet_NaN(),value=std::numeric_limits<double>::quiet_NaN();
+  double relative_error=std::numeric_limits<double>::quiet_NaN();
+};
+
+template<typename Evaluate>
+CovarianceFixedCoordinateFDResult covariance_fixed_coordinate_fd(const std::vector<double>& theta,const std::vector<double>& z,
+  const std::vector<double>& coordinate_scale,const std::size_t index,const double analytic_slope,const double base_objective,
+  Evaluate&& evaluate,std::ostream* report=nullptr)
+{
+  constexpr std::uint64_t max_evaluations=16;
+  CovarianceFixedCoordinateFDResult result;result.initial_step=std::cbrt(std::numeric_limits<double>::epsilon())*std::max(1.0,std::abs(z[index]));
+  std::vector<double> direction(theta.size(),0.0);direction[index]=1.0;
+  const int preferred_side=analytic_slope<=0.0?1:-1;int accepted_side=0,last_slope_side=0;
+  double h=result.initial_step,previous_fd=0.0;bool have_previous=false,found=false,saw_feasible=false,saw_roundoff=false;
+  while(result.evaluations<max_evaluations&&!found&&!saw_roundoff&&result.status!="INCONCLUSIVE_STEP"){
+    const int first_side=accepted_side==0?preferred_side:accepted_side;const int sides[2]={first_side,-first_side};
+    bool evaluated_at_size=false,shrink_after_attempt=false;
+    for(int side_index=0;side_index<2&&result.evaluations<max_evaluations&&!found&&!saw_roundoff;++side_index){const int side=sides[side_index];
+      std::vector<double> trial_z,actual_step,trial_theta;
+      const bool built=covariance_build_scaled_trial(theta,z,coordinate_scale,direction,side*h,trial_z,actual_step,trial_theta);
+      const double effective_step=built?(trial_theta[index]-theta[index])/coordinate_scale[index]:0.0;
+      const char* side_name=side>0?"POSITIVE":"NEGATIVE";
+      if(!built||effective_step==0.0||!std::isfinite(effective_step)){
+        result.status="INCONCLUSIVE_STEP";
+        if(report)*report<<"directional_fd_probe side="<<side_name<<" nominal_step="<<h<<" effective_step="<<effective_step
+          <<" feasibility=NOT_EVALUATED objective_change=NOT_COMPUTED fd_slope=NOT_COMPUTED stability_change=NOT_COMPUTED stable_halvings="
+          <<result.stable_halvings<<" status=INCONCLUSIVE_STEP\n";
+        break;
+      }
+      const CovarianceObjectiveEvaluation value=evaluate(trial_theta);++result.evaluations;evaluated_at_size=true;
+      if(!value.feasible){have_previous=false;last_slope_side=0;result.stable_halvings=0;shrink_after_attempt=true;
+        if(report)*report<<"directional_fd_probe side="<<side_name<<" nominal_step="<<h<<" effective_step="<<effective_step
+          <<" feasibility=NO objective_change=NOT_COMPUTED fd_slope=NOT_COMPUTED stability_change=NOT_COMPUTED stable_halvings=0 status="
+          <<covariance_objective_status_name(value.status)<<'\n';
+        continue;
+      }
+      saw_feasible=true;
+      if(accepted_side!=side){result.stable_halvings=0;have_previous=false;last_slope_side=0;accepted_side=side;}
+      const double objective_change=value.objective-base_objective;
+      const double resolution=32.0*std::numeric_limits<double>::epsilon()*std::max({1.0,std::abs(value.objective),std::abs(base_objective)});
+      result.nominal_step=h;result.effective_step=effective_step;result.side=side;
+      if(std::abs(objective_change)<=resolution){saw_roundoff=true;result.status="INCONCLUSIVE_ROUNDOFF";
+        if(report)*report<<"directional_fd_probe side="<<side_name<<" nominal_step="<<h<<" effective_step="<<effective_step
+          <<" feasibility=YES objective_change="<<objective_change<<" fd_slope=NOT_COMPUTED stability_change=NOT_COMPUTED stable_halvings="
+          <<result.stable_halvings<<" status=INCONCLUSIVE_ROUNDOFF\n";
+        break;
+      }
+      const double finite_difference=objective_change/effective_step;
+      if(!std::isfinite(finite_difference))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance directional finite difference is non-finite");
+      double relative_change=std::numeric_limits<double>::quiet_NaN();
+      const bool stable=have_previous&&last_slope_side==side&&covariance_directional_fd_stabilized(previous_fd,finite_difference,result.stable_halvings,relative_change);
+      result.value=finite_difference;
+      if(report)*report<<"directional_fd_probe side="<<side_name<<" nominal_step="<<h<<" effective_step="<<effective_step
+        <<" feasibility=YES objective_change="<<objective_change<<" fd_slope="<<finite_difference<<" stability_change="<<relative_change
+        <<" stable_halvings="<<result.stable_halvings<<" status=FEASIBLE\n";
+      if(stable){result.status=covariance_directional_fd_status(analytic_slope,result.value,true,result.relative_error);
+        result.one_percent_check=result.relative_error<=0.01?"PASS":"FAIL";found=true;break;}
+      previous_fd=finite_difference;have_previous=true;last_slope_side=side;shrink_after_attempt=true;break;
+    }
+    if(found||saw_roundoff||result.status=="INCONCLUSIVE_STEP")break;
+    if(shrink_after_attempt||evaluated_at_size){h*=0.5;continue;}
+  }
+  if(!found&&!saw_roundoff&&result.status!="INCONCLUSIVE_STEP")result.status=result.evaluations>=max_evaluations?"INCONCLUSIVE_BUDGET":
+    saw_feasible?"INCONCLUSIVE_UNSTABLE_FD":"INCONCLUSIVE_NO_FEASIBLE_SIDE";
+  return result;
+}
+
 void apply_covariance_directional_diagnostic(CovarianceFitResult& result,const char* status)
 {
   result.directional_derivative_status=status;
@@ -3241,34 +3314,57 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     const bool search_start=baseline.epsilon_constraint_active;
     CovarianceObjectiveEvaluation current=evaluate_initialization(result.theta,!search_start);
     if(!current.feasible)throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance optimizer baseline is not a feasible interior point");
-    std::vector<double> start_theta=baseline.theta;double start_delta=0.0,previous_objective=current.objective;
-    if(baseline.epsilon_constraint_active){result.initialization_status="NO_IMPROVEMENT";const std::vector<double> direction=graph_laplacian_direction(system.graph);
+    std::vector<double> start_theta=baseline.theta;double start_delta=0.0;
+    std::string initialization_stop_reason=search_start?"NOT_STARTED":"SKIPPED_BASELINE_INTERIOR",initialization_phase="NONE";
+    if(search_start){const std::vector<double> direction=graph_laplacian_direction(system.graph);
       double delta_scale=std::numeric_limits<double>::infinity();for(std::size_t i=0;i<direction.size();++i)if(direction[i]>0.0)delta_scale=std::min(delta_scale,coordinate_scale[i]/direction[i]);
-      double delta=0.01*delta_scale;std::string stop_status="SEARCH_LIMIT";
-      if(!(delta>0.0)||!std::isfinite(delta))stop_status="STEP_UNDERFLOW";
-      else for(std::uint64_t trial=1;trial<=max_initialization_evaluations-2&&result.initialization_evaluations+1<max_initialization_evaluations;++trial){
-        if(result.objective_evaluations>=max_evaluations){stop_status="EVALUATION_BUDGET_EXHAUSTED";break;}
-        std::vector<double> trial_theta(baseline.theta.size());for(std::size_t i=0;i<trial_theta.size();++i)trial_theta[i]=baseline.theta[i]+delta*direction[i];
-        if(!std::all_of(trial_theta.begin(),trial_theta.end(),[](double value){return std::isfinite(value);}))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance initialization point is non-finite");
-        if(trial_theta==start_theta){stop_status="STEP_UNDERFLOW";break;}
+      double delta=0.01*delta_scale;std::uint64_t trial=0;bool found_decrease=false;
+      auto can_probe=[&](){if(result.initialization_evaluations+1>=max_initialization_evaluations){initialization_stop_reason="INITIALIZATION_EVALUATION_LIMIT";return false;}
+        if(result.objective_evaluations>=max_evaluations){initialization_stop_reason="EVALUATION_BUDGET_EXHAUSTED";return false;}return true;};
+      auto evaluate_trial=[&](const double candidate_delta,const char* phase){std::vector<double> trial_theta(baseline.theta.size());
+        for(std::size_t i=0;i<trial_theta.size();++i)trial_theta[i]=baseline.theta[i]+candidate_delta*direction[i];
+        if(!std::all_of(trial_theta.begin(),trial_theta.end(),[](double value){return std::isfinite(value);}))
+          throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance initialization point is non-finite");
+        ++trial;const bool changed=trial_theta!=start_theta;
+        if(!changed){initialization_stop_reason="STEP_UNDERFLOW";
+          if(trace)*trace<<"COVARIANCE_INITIALIZATION_TRIAL phase="<<phase<<" trial="<<trial<<" graph_delta="<<candidate_delta<<" status=STEP_UNDERFLOW selected_graph_delta="<<start_delta<<'\n';flush_trace();return false;}
         const CovarianceObjectiveEvaluation trial_value=evaluate_initialization(trial_theta,false);
-        if(trace){*trace<<"COVARIANCE_INITIALIZATION_TRIAL trial "<<trial<<" graph_delta "<<delta<<" status "<<covariance_objective_status_name(trial_value.status);
-          if(trial_value.feasible)*trace<<" objective "<<trial_value.objective;*trace<<'\n';}flush_trace();
-        if(!trial_value.feasible){stop_status="SHIFTED_NOT_SPD";break;}
-        if(trial_value.objective<current.objective&&trial_value.objective<previous_objective){start_theta=trial_theta;start_delta=delta;current=trial_value;}
-        if(!(trial_value.objective<previous_objective)){stop_status="OBJECTIVE_INCREASED";break;}
-        previous_objective=trial_value.objective;delta*=2.0;
-        if(!std::isfinite(delta)){stop_status="DELTA_LIMIT_REACHED";break;}
-        if(trial==max_initialization_evaluations-2)stop_status="EVALUATION_LIMIT_REACHED";
+        const double objective_change=trial_value.feasible?trial_value.objective-current.objective:std::numeric_limits<double>::quiet_NaN();
+        const bool improved=trial_value.feasible&&trial_value.objective<current.objective;
+        if(!trial_value.feasible)initialization_stop_reason="SHIFTED_NOT_SPD";
+        else if(!improved)initialization_stop_reason="OBJECTIVE_NOT_DECREASED";
+        else{start_theta=std::move(trial_theta);start_delta=candidate_delta;current=trial_value;}
+        if(trace){*trace<<"COVARIANCE_INITIALIZATION_TRIAL phase="<<phase<<" trial="<<trial<<" graph_delta="<<candidate_delta
+            <<" status="<<covariance_objective_status_name(trial_value.status);
+          if(trial_value.feasible)*trace<<" objective="<<trial_value.objective<<" objective_change="<<objective_change;
+          *trace<<" selected_graph_delta="<<start_delta<<'\n';}flush_trace();return improved;};
+      if(!(delta>0.0)||!std::isfinite(delta))initialization_stop_reason="STEP_UNDERFLOW";
+      else{
+        initialization_phase="SHRINK";
+        while(can_probe()){
+          if(evaluate_trial(delta,"SHRINK")){found_decrease=true;break;}
+          if(initialization_stop_reason=="STEP_UNDERFLOW")break;
+          delta*=0.5;if(!(delta>0.0)||!std::isfinite(delta)){initialization_stop_reason="STEP_UNDERFLOW";break;}
+        }
+        if(found_decrease){initialization_phase="EXPAND";initialization_stop_reason="SEARCH_LIMIT";
+          while(can_probe()){
+            const double next_delta=2.0*start_delta;
+            if(!std::isfinite(next_delta)){initialization_stop_reason="DELTA_LIMIT_REACHED";break;}
+            if(evaluate_trial(next_delta,"EXPAND")){initialization_stop_reason="SEARCH_LIMIT";continue;}
+            if(initialization_stop_reason=="STEP_UNDERFLOW")break;
+            break;
+          }
+        }
       }
-      if(start_delta>0.0)result.initialization_status=stop_status=="EVALUATION_LIMIT_REACHED"?"IMPROVED_EVALUATION_LIMIT":"IMPROVED";
-      else result.initialization_status=stop_status=="OBJECTIVE_INCREASED"?"NO_IMPROVEMENT":"NO_IMPROVEMENT_"+stop_status;
+      if(start_delta>0.0)result.initialization_status=(initialization_stop_reason=="INITIALIZATION_EVALUATION_LIMIT"||initialization_stop_reason=="EVALUATION_BUDGET_EXHAUSTED")?
+        "IMPROVED_EVALUATION_LIMIT":"IMPROVED";
+      else result.initialization_status="NO_IMPROVEMENT_"+initialization_stop_reason;
     }else result.initialization_status="SKIPPED_BASELINE_INTERIOR";
     result.theta_start=start_theta;result.theta=result.theta_start;result.start_graph_delta=start_delta;
     if(search_start){current=evaluate_initialization(result.theta,true);
       if(!current.feasible)throw std::runtime_error("NUMERICAL_SOLVE_FAIL: selected covariance optimizer start is not feasible");}
     result.start_objective=current.objective;result.start_raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
-    if(trace){*trace<<"COVARIANCE_INITIALIZATION status "<<result.initialization_status<<" tau "<<tau<<" initialization_evaluations "<<result.initialization_evaluations
+    if(trace){*trace<<"COVARIANCE_INITIALIZATION status "<<result.initialization_status<<" phase="<<initialization_phase<<" stop_reason "<<initialization_stop_reason<<" tau "<<tau<<" initialization_evaluations "<<result.initialization_evaluations
         <<" start_graph_delta "<<result.start_graph_delta<<" start_objective "<<result.start_objective
         <<" start_raw_gradient_inf_norm "<<result.start_raw_gradient_inf_norm<<"\ntheta_start "<<result.theta_start.size();
       for(const double value:result.theta_start)*trace<<' '<<value;*trace<<'\n';}flush_trace();
@@ -4223,34 +4319,25 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     <<"\nfailed_trial_theta_count "<<(fields.count("failed_trial_theta")?parse_vector("failed_trial_theta").size():0)
     <<"\nfailed_trial_diagnostic_status NOT_EVALUATED_BY_THIS_ENTRY\n"
     <<"failed_trial_note "<<(fields.count("failed_trial_theta")?"parameters_saved_but_not_replayed":"legacy_state_has_no_failed_trial_theta; diagnostic uses only the saved last-valid point")<<'\n';
-  std::string fd_status="NOT_RUN_SOLVE_RESIDUAL_FAIL",fd_side="NONE";double fd_slope=std::numeric_limits<double>::quiet_NaN();
-  double fd_value=std::numeric_limits<double>::quiet_NaN(),fd_final_step=std::numeric_limits<double>::quiet_NaN();std::size_t fd_index=0;std::uint64_t fd_evaluations=0;
-  double fd_relative_error=std::numeric_limits<double>::quiet_NaN();
+  std::string fd_status="NOT_RUN_SOLVE_RESIDUAL_FAIL",fd_side="NONE",fd_one_percent_check="NOT_CHECKED";double fd_slope=std::numeric_limits<double>::quiet_NaN();
+  double fd_value=std::numeric_limits<double>::quiet_NaN(),fd_initial_step=std::numeric_limits<double>::quiet_NaN();
+  double fd_final_step=std::numeric_limits<double>::quiet_NaN(),fd_effective_step=std::numeric_limits<double>::quiet_NaN();
+  std::size_t fd_index=0;std::uint64_t fd_evaluations=0;double fd_relative_error=std::numeric_limits<double>::quiet_NaN();
   if(saved_gradient_passes()&&saved_point.evaluation.gradient.size()==parameter_count){const auto scaled=covariance_scaled_gradient(saved_point.evaluation.gradient,coordinate_scale);
     for(std::size_t i=1;i<scaled.size();++i)if(std::abs(scaled[i])>std::abs(scaled[fd_index]))fd_index=i;
-    fd_slope=scaled[fd_index];std::vector<double> z(parameter_count);for(std::size_t i=0;i<parameter_count;++i)z[i]=theta[i]/coordinate_scale[i];
-    double initial_step=std::cbrt(std::numeric_limits<double>::epsilon())*std::max(1.0,covariance_norm_inf(z));
-    bool found=false,saw_feasible=false,saw_roundoff=false,saw_step_underflow=false;int stable_halvings=0;
-    for(int side:{1,-1}){double h=initial_step,previous=0.0;bool have_previous=false;stable_halvings=0;
-      for(int probe=0;probe<8&&fd_evaluations<16&&!found;++probe){std::vector<double> trial=theta;trial[fd_index]+=side*h*coordinate_scale[fd_index];
-        if(trial==theta){saw_step_underflow=true;break;}
-        const auto value=evaluate_covariance_fit_objective(covariance_system,trial,base,statistics,rho,epsilon,tau,diagnostic_evaluations,false);
-        ++fd_evaluations;if(!value.feasible){have_previous=false;stable_halvings=0;h*=0.5;continue;}
-        saw_feasible=true;const double difference=value.objective-saved_point.evaluation.objective;
-        const double resolution=32.0*std::numeric_limits<double>::epsilon()*std::max({1.0,std::abs(value.objective),std::abs(saved_point.evaluation.objective)});
-        if(std::abs(difference)<=resolution){saw_roundoff=true;fd_status="INCONCLUSIVE_ROUNDOFF";break;}
-        const double slope=side>0?difference/h:-difference/h;double relative_change=std::numeric_limits<double>::quiet_NaN();
-        const bool stable=have_previous&&covariance_directional_fd_stabilized(previous,slope,stable_halvings,relative_change);
-        fd_value=slope;fd_final_step=h;fd_side=side>0?"POSITIVE":"NEGATIVE";
-        if(stable){fd_status=covariance_directional_fd_status(fd_slope,fd_value,true,fd_relative_error);found=true;break;}
-        previous=slope;have_previous=true;h*=0.5;}
-      if(found)break;}
-    if(!found)fd_status=fd_evaluations>=16?"INCONCLUSIVE_BUDGET":saw_roundoff?"INCONCLUSIVE_ROUNDOFF":
-      saw_step_underflow?"INCONCLUSIVE_STEP":saw_feasible?"INCONCLUSIVE_UNSTABLE_FD":"INCONCLUSIVE_NO_FEASIBLE_SIDE";
+    fd_slope=scaled[fd_index];std::vector<double> z(parameter_count);
+    for(std::size_t i=0;i<parameter_count;++i)z[i]=theta[i]/coordinate_scale[i];
+    const CovarianceFixedCoordinateFDResult fd=covariance_fixed_coordinate_fd(theta,z,coordinate_scale,fd_index,fd_slope,
+      saved_point.evaluation.objective,[&](const std::vector<double>& trial_theta){return evaluate_covariance_fit_objective(
+        covariance_system,trial_theta,base,statistics,rho,epsilon,tau,diagnostic_evaluations,false);},&report);
+    fd_status=fd.status;fd_one_percent_check=fd.one_percent_check;fd_value=fd.value;fd_initial_step=fd.initial_step;
+    fd_final_step=fd.nominal_step;fd_effective_step=fd.effective_step;fd_side=fd.side>0?"POSITIVE":fd.side<0?"NEGATIVE":"NONE";
+    fd_evaluations=fd.evaluations;fd_relative_error=fd.relative_error;
   }
   report<<"directional_fd_status "<<fd_status<<"\ndirectional_fd_parameter "<<fd_index<<"\ndirectional_fd_slope "<<fd_slope
     <<"\ndirectional_fd_value "<<fd_value<<"\ndirectional_fd_relative_error "<<fd_relative_error
-    <<"\ndirectional_fd_step "<<fd_final_step<<"\ndirectional_fd_side "<<fd_side
+    <<"\ndirectional_fd_initial_step "<<fd_initial_step<<"\ndirectional_fd_step "<<fd_final_step<<"\ndirectional_fd_effective_step "<<fd_effective_step
+    <<"\ndirectional_fd_one_percent_check "<<fd_one_percent_check<<"\ndirectional_fd_side "<<fd_side
     <<"\ndirectional_fd_objective_evaluations "<<fd_evaluations<<"\ndirectional_fd_coordinate rho_and_tau_fixed baseline_fixed\n";
   report<<"soft_mode_status ";
   try{const int d=3*header.n,steps=std::min(96,d-3);cusolverDnHandle_t solver=nullptr;
