@@ -223,7 +223,7 @@ assert "evaluate_initialization(trial_theta,false)" in native_fit and "current=e
 assert 'initialization_phase="SHRINK"' in native_fit and 'initialization_phase="EXPAND"' in native_fit and "stop_reason " in native_fit
 assert "NO_IMPROVEMENT" in native_fit and "IMPROVED_EVALUATION_LIMIT" in native_fit
 assert "std::min(1.0,1.0/direction_inf_norm)" in native_fit and "next_theta!=theta" in native_fit
-assert "covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,alpha" in native_fit
+assert "covariance_build_scaled_trial(theta,z,coordinate_scale,direction,alpha" in native_fit
 assert "covariance_directional_fd_stabilized" in native_fit and "stable_halvings>=2" in native_fit
 fixed_coordinate_fd = native_fit.split("CovarianceFixedCoordinateFDResult covariance_fixed_coordinate_fd(", 1)[1].split("\nvoid apply_covariance_directional_diagnostic", 1)[0]
 assert "std::max(1.0,std::abs(z[index]))" in fixed_coordinate_fd
@@ -245,11 +245,43 @@ assert "apply_covariance_directional_diagnostic(result" in native_fit
 covariance_solver = native_fit.split("CovarianceFitResult solve_covariance_reference(", 1)[1].split("\nvoid write_covariance_state", 1)[0]
 assert "result.directional_derivative_status=" not in covariance_solver
 assert covariance_solver.count("apply_covariance_directional_diagnostic(result,") >= 3
-assert "line_search_evaluations" in native_fit and "result.line_search_evaluations" in native_fit
+assert "line_search_evaluations" in native_fit and "fit.line_search_evaluations" in native_fit
 assert "trial<=64" in native_fit and 'trial_status="SHIFTED_NOT_SPD"' in native_fit
 assert 'trial_status="ARMIJO_REJECT"' in native_fit and "status=STEP_UNDERFLOW" in native_fit
 assert "DIRECTIONAL_DIAGNOSTIC_RESULT" in native_fit and "GRADIENT_CONSISTENCY_SUSPECT" in native_fit
 assert "OPT_STEP iteration=" in native_fit and "max_covariance_iterations,&trace" in native_fit
+assert "class CovarianceSolveResidualError" in native_fit
+assert "throw CovarianceSolveResidualError(diagnostic)" in native_fit
+complete_gradient = native_fit.split("void complete_covariance_fit_gradient_from_factors(", 1)[1].split("std::vector<double> covariance_scaled_gradient(", 1)[0]
+assert "catch(CovarianceSolveResidualError& error)" in complete_gradient and "error.d_trace=system.last_d_trace" in complete_gradient
+assert "covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau)" in complete_gradient
+backtracking = native_fit.split("CovarianceBacktrackingResult covariance_backtrack_armijo(", 1)[1].split("CovarianceFitResult solve_covariance_reference(", 1)[0]
+assert "catch(const CovarianceSolveResidualError& error)" in backtracking and "status=GRADIENT_RESIDUAL_REJECT" in backtracking
+assert "gradient_residual_reject_trials" in backtracking and "evaluation_budget_exhausted" in backtracking
+assert 'failure_stage="GRADIENT_RESIDUAL_REJECT"' in backtracking and 'failure_stage="GRADIENT_SOLVE_FAIL"' in backtracking
+assert "catch(...)" in backtracking and "throw;" in backtracking
+assert backtracking.index('trial_status="ARMIJO_ACCEPTED"') < backtracking.index("complete_gradient(result.next)") < backtracking.index("result.accepted=true")
+bfgs_helpers = native_fit.split("struct CovarianceBFGSHistory", 1)[1].split("CovarianceBacktrackingResult covariance_backtrack_armijo(", 1)[0]
+assert "curvature_limit=1e-12*std::sqrt(ss*yy)" in bfgs_helpers and "gamma=sy/yy" in bfgs_helpers
+assert "history.seed_source=\"FIRST_VALID_SECANT\"" in bfgs_helpers and "RECENT_VALID_GAMMA_RESET" in bfgs_helpers
+assert "CovarianceBFGSUpdateStatus::Seeded" in bfgs_helpers and "history.inverse_hessian" in bfgs_helpers
+assert "covariance_reset_non_descent_direction" in bfgs_helpers
+assert "start_scaled_kkt_residual" in native_fit and "start_gradient_data_scaled_inf_norm" in native_fit
+assert "start_gradient_prior_scaled_inf_norm" in native_fit and "start_gradient_barrier_scaled_inf_norm" in native_fit
+assert "start_gradient_solve_status" in native_fit and "bfgs_seed_gamma" in native_fit and "bfgs_seed_source" in native_fit
+assert "gradient_residual_reject_trials" in native_fit
+assert "STEP_COMMITTED" in native_fit and "GRADIENT_RESIDUAL_REJECT" in native_fit
+assert "GRADIENT_RESIDUAL_REJECT" in rpmd_ja_doc and "bfgs_seed_gamma" in rpmd_ja_doc
+covariance_optimizer = native_fit.split("CovarianceFitResult solve_covariance_reference(", 1)[1].split("void write_covariance_state", 1)[0]
+assert covariance_optimizer.index("covariance_backtrack_armijo(") < covariance_optimizer.index("if(!accepted)")
+assert covariance_optimizer.index("if(!accepted)") < covariance_optimizer.index("covariance_update_inverse_hessian(bfgs,step,change)")
+assert covariance_optimizer.index("covariance_update_inverse_hessian(bfgs,step,change)") < covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('"STEP_COMMITTED iteration="')
+non_descent_branch = covariance_optimizer.split("if(!(slope<0.0))", 1)[1].split("const double direction_inf_norm", 1)[0]
+assert "covariance_reset_non_descent_direction(bfgs,g,direction)" in non_descent_branch
+assert "CovarianceFitTestHooks" in native_fit and "gradient_residual_failures_remaining" in native_fit
+assert "test_covariance_non_descent_reset_uses_restored_gamma" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_solver_residual_retry_commits_once" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_solver_residual_budget_preserves_state_points" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_initialization_shrinks_before_expanding" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_initialization_reports_no_improvement_at_budget" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
@@ -257,6 +289,9 @@ assert "test_covariance_fixed_coordinate_fd_uses_selected_coordinate_scale" in s
 assert "test_covariance_fixed_coordinate_fd_switches_feasible_side_with_shared_budget" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_near_boundary_fd_requires_stable_steps" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_fixed_coordinate_fd_one_percent_is_separate_from_classification" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_gradient_residual_reject_retries_before_commit" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_gradient_residual_budget_keeps_last_valid_and_reject" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_bfgs_first_secant_seeds_and_updates_inverse_hessian" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_stable_directional_fd_consistency_and_mismatch" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_inconclusive_diagnostic_preserves_failure_status" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_strict_residual_failure_updates_overall_worst" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
