@@ -186,7 +186,9 @@ assert 'tokens.size() != 14 || tokens[10] != "shrinkage" || tokens[12] != "max_i
 assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
 assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
 assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
-assert "sums[p+1]+=2.0*dx[0]*dx[1]" in native_fit
+assert "const double components[6]={dx[0]*dx[0],2.0*dx[0]*dx[1]" in native_fit
+assert "if(edge_sums){const double components[6]" in native_fit
+assert "sums[p+k]+=components[k];(*edge_sums)[6*e+k]+=components[k]" in native_fit
 assert "build_graph_covariance_baseline" in native_fit and "D_b-epsilon I positive definite" in native_fit
 assert "covariance_decompose_gradient" in native_fit and "gradient_data" in native_fit and "gradient_barrier" in native_fit
 assert "covariance_gather_original_solve_residual" in native_fit and "cublasDgemm" in native_fit

@@ -2512,31 +2512,37 @@ static __device__ __inline__ double covariance_atomic_add(double* address,const 
 #endif
 
 void add_covariance_frame_statistics(const Graph& graph,const std::vector<double>& position,
-  const std::vector<double>& r0,const int n,std::vector<double>& sums)
+  const std::vector<double>& r0,const int n,std::vector<double>& sums,std::vector<double>* edge_sums=nullptr)
 {
-  if(position.size()!=static_cast<std::size_t>(3*n)||r0.size()!=position.size()||sums.size()!=6*graph.type_pairs.size())
+  if(position.size()!=static_cast<std::size_t>(3*n)||r0.size()!=position.size()||sums.size()!=6*graph.type_pairs.size()||
+     (edge_sums&&edge_sums->size()!=6*graph.edges.size()))
     throw std::invalid_argument("native covariance fit statistic dimensions do not match");
-  for(const Edge& edge:graph.edges){
+  for(std::size_t e=0;e<graph.edges.size();++e){const Edge& edge=graph.edges[e];
     const double dx[3]={position[edge.j]-r0[edge.j]-position[edge.i]+r0[edge.i],
       position[n+edge.j]-r0[n+edge.j]-position[n+edge.i]+r0[n+edge.i],
       position[2*n+edge.j]-r0[2*n+edge.j]-position[2*n+edge.i]+r0[2*n+edge.i]};
     const std::size_t p=6*static_cast<std::size_t>(edge.group);
-    sums[p]+=dx[0]*dx[0];sums[p+1]+=2.0*dx[0]*dx[1];sums[p+2]+=2.0*dx[0]*dx[2];
-    sums[p+3]+=dx[1]*dx[1];sums[p+4]+=2.0*dx[1]*dx[2];sums[p+5]+=dx[2]*dx[2];
+    if(edge_sums){const double components[6]={dx[0]*dx[0],2.0*dx[0]*dx[1],2.0*dx[0]*dx[2],
+        dx[1]*dx[1],2.0*dx[1]*dx[2],dx[2]*dx[2]};
+      for(int k=0;k<6;++k){sums[p+k]+=components[k];(*edge_sums)[6*e+k]+=components[k];}}
+    else{sums[p]+=dx[0]*dx[0];sums[p+1]+=2.0*dx[0]*dx[1];sums[p+2]+=2.0*dx[0]*dx[2];
+      sums[p+3]+=dx[1]*dx[1];sums[p+4]+=2.0*dx[1]*dx[2];sums[p+5]+=dx[2]*dx[2];}
   }
 }
 
 std::vector<double> collect_covariance_fit_statistics(std::istream& in,const SampleHeader& header,
   const std::uint64_t frame_count,const std::uint64_t training_frames,const Graph& graph,
-  const std::vector<double>& r0,const double temperature)
+  const std::vector<double>& r0,const double temperature,std::vector<double>* edge_statistics=nullptr)
 {
   if(training_frames==0||training_frames>frame_count||!(temperature>0.0)||!std::isfinite(temperature))
     throw std::invalid_argument("native covariance fit training metadata is invalid");
   std::vector<double> sums(6*graph.type_pairs.size(),0.0),position(r0.size()),force_frame(r0.size());
+  if(edge_statistics)edge_statistics->assign(6*graph.edges.size(),0.0);
   double step=0.0;in.clear();in.seekg(header.frames);
-  for(std::uint64_t frame=0;frame<training_frames;++frame){read_frame(in,position,force_frame,step);add_covariance_frame_statistics(graph,position,r0,header.n,sums);}
+  for(std::uint64_t frame=0;frame<training_frames;++frame){read_frame(in,position,force_frame,step);add_covariance_frame_statistics(graph,position,r0,header.n,sums,edge_statistics);}
   const double beta=1.0/(K_B*temperature*static_cast<double>(training_frames));
   for(double& value:sums){value*=beta;if(!std::isfinite(value))throw std::runtime_error("native covariance fit training statistic is non-finite");}
+  if(edge_statistics)for(double& value:*edge_statistics){value*=beta;if(!std::isfinite(value))throw std::runtime_error("native covariance fit edge statistic is non-finite");}
   return sums;
 }
 
@@ -2866,11 +2872,12 @@ struct DeviceCovarianceSystem
   }
 
   std::vector<double> trace_derivatives(const double* factor_matrix,const char* matrix_kind,const double epsilon=0.0,
-    const bool check_original=false,const bool strict=true)
+    const bool check_original=false,const bool strict=true,std::vector<double>* edge_traces=nullptr)
   {
     CovarianceTraceDiagnostics& diagnostic=std::string(matrix_kind)=="D"?last_d_trace:last_shifted_trace;
     diagnostic=CovarianceTraceDiagnostics{};diagnostic.matrix_kind=matrix_kind;diagnostic.status="RUNNING";
     diagnostic.original_residual_checked=check_original;diagnostic.total_rhs_columns=d;
+    if(edge_traces)edge_traces->assign(6*graph.edges.size(),0.0);
     const std::size_t edge_values=graph.edges.size()*9;if(cudaMemset(edge_cov_left,0,edge_values*sizeof(double))!=cudaSuccess||cudaMemset(edge_cov_right,0,edge_values*sizeof(double))!=cudaSuccess)
       throw std::runtime_error("native covariance fit trace initialization failed");
     const double minus_one=-1.0,one=1.0;
@@ -2929,6 +2936,8 @@ struct DeviceCovarianceSystem
     std::vector<NeumaierAccumulator> sums(static_cast<std::size_t>(p));
     for(std::size_t edge=0;edge<graph.edges.size();++edge){const std::size_t group=6*static_cast<std::size_t>(graph.edges[edge].group);
       double block[9];for(int a=0;a<3;++a)for(int b=0;b<3;++b){const std::size_t ab=edge*9+a*3+b,ba=edge*9+b*3+a;block[a*3+b]=0.5*((left[ab]+right[ab])+(left[ba]+right[ba]));}
+      if(edge_traces){const std::size_t offset=6*edge;(*edge_traces)[offset]=block[0];(*edge_traces)[offset+1]=2.0*block[1];
+        (*edge_traces)[offset+2]=2.0*block[2];(*edge_traces)[offset+3]=block[4];(*edge_traces)[offset+4]=2.0*block[5];(*edge_traces)[offset+5]=block[8];}
       for(int a=0;a<3;++a)sums[group+edge_parameter_index(a,a)].add(block[a*3+a]);
       sums[group+1].add(2.0*block[1]);sums[group+2].add(2.0*block[2]);sums[group+4].add(2.0*block[5]);
     }
@@ -2937,7 +2946,8 @@ struct DeviceCovarianceSystem
 
   bool evaluate_factors(const std::vector<double>& parameters,const double epsilon,double& logdet,
     double& shifted_logdet,std::vector<double>* traces,std::vector<double>* shifted_traces=nullptr,
-    const bool check_original_residual=false,const bool strict_solve=true)
+    const bool check_original_residual=false,const bool strict_solve=true,std::vector<double>* edge_traces=nullptr,
+    std::vector<double>* edge_shifted_traces=nullptr)
   {
     assemble(parameters);const std::size_t bytes=static_cast<std::size_t>(r)*r*sizeof(double);
     if(traces||shifted_traces){worst_solve_relative_residual=0.0;last_d_trace=CovarianceTraceDiagnostics{};last_d_trace.matrix_kind="D";
@@ -2947,8 +2957,8 @@ struct DeviceCovarianceSystem
     if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit epsilon shift failed");
     if(!factor(shifted,shifted_logdet))return false;
     if(!factor(compact,logdet))throw std::runtime_error("native covariance fit unshifted matrix is not SPD after shifted Cholesky passed");
-    if(traces)*traces=trace_derivatives(compact,"D",0.0,check_original_residual,strict_solve);
-    if(shifted_traces)*shifted_traces=trace_derivatives(shifted,"D_MINUS_EPSILON_I",epsilon,check_original_residual,strict_solve);return true;
+    if(traces)*traces=trace_derivatives(compact,"D",0.0,check_original_residual,strict_solve,edge_traces);
+    if(shifted_traces)*shifted_traces=trace_derivatives(shifted,"D_MINUS_EPSILON_I",epsilon,check_original_residual,strict_solve,edge_shifted_traces);return true;
   }
 
   std::vector<double> checked_inverse_quadratics(const std::vector<double>& parameters,
@@ -3154,6 +3164,128 @@ struct CovarianceObjectiveEvaluation
   std::vector<double> gradient,gradient_data,gradient_prior,gradient_barrier;
 };
 
+struct CovarianceEdgeAttribution
+{
+  std::string status="NOT_RUN";
+  int dominant_parameter=-1;
+  std::size_t dominant_group_edge_count=0;
+  double max_reconstruction_error=std::numeric_limits<double>::quiet_NaN();
+  double sum_abs_scaled_edge_contribution=std::numeric_limits<double>::quiet_NaN();
+  double top_20_abs_fraction=std::numeric_limits<double>::quiet_NaN();
+  double sum_abs_atom_contribution=std::numeric_limits<double>::quiet_NaN();
+  double top_20_atom_abs_fraction=std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> edge_data,edge_prior,edge_barrier,edge_total;
+  std::vector<std::size_t> ranked_edges,ranked_atoms;
+  std::vector<double> atom_data,atom_prior,atom_barrier,atom_total,atom_absolute_total;
+};
+
+CovarianceEdgeAttribution covariance_edge_gradient_attribution(const Graph& graph,const int atom_count,
+  const std::vector<double>& edge_statistics,const std::vector<double>& baseline_edge_trace,
+  const std::vector<double>& saved_edge_trace,const std::vector<double>& shifted_edge_trace,
+  const std::vector<double>& coordinate_scale,const CovarianceObjectiveEvaluation& value,
+  const double rho,const double tau,const bool trace_residuals_valid)
+{
+  CovarianceEdgeAttribution result;
+  if(!trace_residuals_valid){result.status="TRACE_RESIDUAL_FAIL";return result;}
+  if(!value.feasible){result.status="OBJECTIVE_FAIL";return result;}
+  const std::size_t parameter_count=6*graph.type_pairs.size(),edge_values=6*graph.edges.size();
+  if(atom_count<=0||parameter_count==0||graph.edges.empty()||edge_statistics.size()!=edge_values||
+     baseline_edge_trace.size()!=edge_values||saved_edge_trace.size()!=edge_values||shifted_edge_trace.size()!=edge_values||
+     coordinate_scale.size()!=parameter_count||value.gradient.size()!=parameter_count||value.gradient_data.size()!=parameter_count||
+     value.gradient_prior.size()!=parameter_count||value.gradient_barrier.size()!=parameter_count){result.status="DIMENSION_FAIL";return result;}
+  for(const Edge& edge:graph.edges)if(edge.i<0||edge.i>=atom_count||edge.j<0||edge.j>=atom_count||
+     edge.group<0||static_cast<std::size_t>(edge.group)>=graph.type_pairs.size()){result.status="DIMENSION_FAIL";return result;}
+  if(!(rho>0.0)||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau)||
+     !std::all_of(coordinate_scale.begin(),coordinate_scale.end(),[](double x){return x>0.0&&std::isfinite(x);})||
+     !std::all_of(value.gradient.begin(),value.gradient.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(value.gradient_data.begin(),value.gradient_data.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(value.gradient_prior.begin(),value.gradient_prior.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(value.gradient_barrier.begin(),value.gradient_barrier.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(edge_statistics.begin(),edge_statistics.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(baseline_edge_trace.begin(),baseline_edge_trace.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(saved_edge_trace.begin(),saved_edge_trace.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(shifted_edge_trace.begin(),shifted_edge_trace.end(),[](double x){return std::isfinite(x);})){result.status="NONFINITE_EDGE_TERM";return result;}
+
+  result.edge_data.resize(edge_values);result.edge_prior.resize(edge_values);result.edge_barrier.resize(edge_values);result.edge_total.resize(edge_values);
+  std::vector<NeumaierAccumulator> data_sums(parameter_count),prior_sums(parameter_count),barrier_sums(parameter_count),total_sums(parameter_count);
+  std::vector<NeumaierAccumulator> data_abs(parameter_count),prior_abs(parameter_count),barrier_abs(parameter_count),total_abs(parameter_count);
+  for(std::size_t e=0;e<graph.edges.size();++e){const std::size_t group=6*static_cast<std::size_t>(graph.edges[e].group);
+    for(std::size_t component=0;component<6;++component){const std::size_t edge_index=6*e+component,parameter=group+component;
+      const double data=0.5*(edge_statistics[edge_index]-saved_edge_trace[edge_index]);
+      const double prior=0.5*rho*(baseline_edge_trace[edge_index]-saved_edge_trace[edge_index]);
+      const double barrier=-tau*shifted_edge_trace[edge_index],total=data+prior+barrier;
+      if(!std::isfinite(data)||!std::isfinite(prior)||!std::isfinite(barrier)||!std::isfinite(total)){result.status="NONFINITE_EDGE_TERM";return result;}
+      result.edge_data[edge_index]=data;result.edge_prior[edge_index]=prior;result.edge_barrier[edge_index]=barrier;result.edge_total[edge_index]=total;
+      data_sums[parameter].add(data);prior_sums[parameter].add(prior);barrier_sums[parameter].add(barrier);total_sums[parameter].add(total);
+      data_abs[parameter].add(std::abs(data));prior_abs[parameter].add(std::abs(prior));barrier_abs[parameter].add(std::abs(barrier));total_abs[parameter].add(std::abs(total));
+    }
+  }
+  result.max_reconstruction_error=0.0;bool reconstructed=true;
+  auto check=[&](const std::vector<NeumaierAccumulator>& sums,const std::vector<NeumaierAccumulator>& absolute,
+      const std::vector<double>& expected){for(std::size_t i=0;i<parameter_count;++i){const double actual=sums[i].value();
+      const double error=std::abs(actual-expected[i]);result.max_reconstruction_error=std::max(result.max_reconstruction_error,error);
+      const double tolerance=1e-10*std::max({1.0,std::abs(actual),std::abs(expected[i]),absolute[i].value()});
+      if(!std::isfinite(actual)||!std::isfinite(error)||error>tolerance)reconstructed=false;}};
+  check(data_sums,data_abs,value.gradient_data);check(prior_sums,prior_abs,value.gradient_prior);
+  check(barrier_sums,barrier_abs,value.gradient_barrier);check(total_sums,total_abs,value.gradient);
+  if(!reconstructed){result.status="RECONSTRUCTION_FAIL";return result;}
+
+  result.dominant_parameter=0;double largest=std::abs(value.gradient[0]*coordinate_scale[0]);
+  if(!std::isfinite(largest)){result.status="NONFINITE_EDGE_TERM";result.dominant_parameter=-1;return result;}
+  for(std::size_t i=1;i<parameter_count;++i){const double magnitude=std::abs(value.gradient[i]*coordinate_scale[i]);
+    if(!std::isfinite(magnitude)){result.status="NONFINITE_EDGE_TERM";result.dominant_parameter=-1;return result;}
+    if(magnitude>largest){largest=magnitude;result.dominant_parameter=static_cast<int>(i);}}
+  const std::size_t component=static_cast<std::size_t>(result.dominant_parameter)%6;
+  const std::size_t dominant_group=static_cast<std::size_t>(result.dominant_parameter)/6;
+  const double scale=coordinate_scale[static_cast<std::size_t>(result.dominant_parameter)];
+  std::vector<std::pair<double,std::size_t>> ordering;ordering.reserve(graph.edges.size());
+  NeumaierAccumulator sum_abs_scaled_edge_contribution;
+  for(std::size_t e=0;e<graph.edges.size();++e){if(static_cast<std::size_t>(graph.edges[e].group)!=dominant_group)continue;
+    const double scaled=result.edge_total[6*e+component]*scale;
+    if(!std::isfinite(scaled)){result.status="NONFINITE_EDGE_TERM";result.dominant_parameter=-1;return result;}
+    ordering.emplace_back(std::abs(scaled),e);sum_abs_scaled_edge_contribution.add(std::abs(scaled));}
+  result.dominant_group_edge_count=ordering.size();result.sum_abs_scaled_edge_contribution=sum_abs_scaled_edge_contribution.value();
+  if(!std::isfinite(result.sum_abs_scaled_edge_contribution)){result.status="NONFINITE_EDGE_TERM";result.dominant_parameter=-1;return result;}
+  const std::size_t top_edge_count=std::min<std::size_t>(20,ordering.size());
+  std::partial_sort(ordering.begin(),ordering.begin()+top_edge_count,ordering.end(),[](const auto& a,const auto& b){
+    return a.first==b.first?a.second<b.second:a.first>b.first;});
+  NeumaierAccumulator top_abs_scaled_edge_contribution;
+  for(std::size_t i=0;i<top_edge_count;++i)top_abs_scaled_edge_contribution.add(ordering[i].first);
+  if(result.sum_abs_scaled_edge_contribution>0.0)
+    result.top_20_abs_fraction=top_abs_scaled_edge_contribution.value()/result.sum_abs_scaled_edge_contribution;
+  ordering.resize(top_edge_count);
+  result.ranked_edges.reserve(ordering.size());for(const auto& item:ordering)result.ranked_edges.push_back(item.second);
+
+  std::vector<NeumaierAccumulator> atom_data(atom_count),atom_prior(atom_count),atom_barrier(atom_count),atom_total(atom_count),atom_absolute_total(atom_count);
+  for(std::size_t e=0;e<graph.edges.size();++e){const Edge& edge=graph.edges[e];if(static_cast<std::size_t>(edge.group)!=dominant_group)continue;
+    const std::size_t index=6*e+component;
+    for(const int atom:{edge.i,edge.j}){atom_data[atom].add(0.5*result.edge_data[index]);atom_prior[atom].add(0.5*result.edge_prior[index]);
+      atom_barrier[atom].add(0.5*result.edge_barrier[index]);atom_total[atom].add(0.5*result.edge_total[index]);
+      atom_absolute_total[atom].add(0.5*std::abs(result.edge_total[index]));}}
+  result.atom_data.resize(atom_count);result.atom_prior.resize(atom_count);result.atom_barrier.resize(atom_count);
+  result.atom_total.resize(atom_count);result.atom_absolute_total.resize(atom_count);
+  for(int atom=0;atom<atom_count;++atom){result.atom_data[atom]=atom_data[atom].value();result.atom_prior[atom]=atom_prior[atom].value();
+    result.atom_barrier[atom]=atom_barrier[atom].value();result.atom_total[atom]=atom_total[atom].value();
+    result.atom_absolute_total[atom]=atom_absolute_total[atom].value();}
+  std::vector<std::size_t> atom_order;atom_order.reserve(static_cast<std::size_t>(atom_count));
+  NeumaierAccumulator sum_abs_atom_contribution;
+  for(std::size_t atom=0;atom<static_cast<std::size_t>(atom_count);++atom){
+    sum_abs_atom_contribution.add(result.atom_absolute_total[atom]);
+    if(result.atom_absolute_total[atom]>0.0)atom_order.push_back(atom);}
+  result.sum_abs_atom_contribution=sum_abs_atom_contribution.value();
+  if(!std::isfinite(result.sum_abs_atom_contribution)){result.status="NONFINITE_EDGE_TERM";result.dominant_parameter=-1;return result;}
+  const std::size_t top_atom_count=std::min<std::size_t>(20,atom_order.size());
+  std::partial_sort(atom_order.begin(),atom_order.begin()+top_atom_count,atom_order.end(),[&](const std::size_t a,const std::size_t b){
+    return result.atom_absolute_total[a]==result.atom_absolute_total[b]?a<b:
+      result.atom_absolute_total[a]>result.atom_absolute_total[b];});
+  NeumaierAccumulator top_abs_atom_contribution;
+  for(std::size_t i=0;i<top_atom_count;++i)top_abs_atom_contribution.add(result.atom_absolute_total[atom_order[i]]);
+  if(result.sum_abs_atom_contribution>0.0)
+    result.top_20_atom_abs_fraction=top_abs_atom_contribution.value()/result.sum_abs_atom_contribution;
+  atom_order.resize(top_atom_count);result.ranked_atoms=std::move(atom_order);
+  result.status="PASS";return result;
+}
+
 void record_covariance_failed_trial(CovarianceFailedTrial& trial,const std::vector<double>& theta,const int iteration,
   const double alpha,const double tau,const CovarianceObjectiveEvaluation& value)
 {
@@ -3199,11 +3331,12 @@ const char* covariance_objective_status_name(const CovarianceObjectiveStatus sta
 CovarianceObjectiveEvaluation evaluate_covariance_fit_objective(DeviceCovarianceSystem& system,
   const std::vector<double>& theta,const CovarianceBaseline& baseline,const std::vector<double>& statistics,
   const double rho,const double epsilon,const double tau,std::uint64_t& evaluations,const bool compute_gradient=true,
-  const bool check_original_residual=false,const bool strict_solve=true)
+  const bool check_original_residual=false,const bool strict_solve=true,std::vector<double>* edge_traces=nullptr,
+  std::vector<double>* edge_shifted_traces=nullptr)
 {
   CovarianceObjectiveEvaluation value;++evaluations;std::vector<double> trace,shifted_trace;
   if(!system.evaluate_factors(theta,epsilon,value.logdet,value.shifted_logdet,compute_gradient?&trace:nullptr,compute_gradient?&shifted_trace:nullptr,
-      check_original_residual,strict_solve)){
+      check_original_residual,strict_solve,edge_traces,edge_shifted_traces)){
     value.status=CovarianceObjectiveStatus::ShiftedNotSpd;return value;}
   const double delta_logdet=value.logdet-baseline.logdet;std::vector<double> delta(theta.size());
   for(std::size_t i=0;i<theta.size();++i)delta[i]=theta[i]-baseline.theta[i];
@@ -4469,7 +4602,8 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   optional_u64("qraw_config_fingerprint",identity.config);optional_integer("qraw_charge_mode",identity.charge);
   optional_integer("qraw_kspace_flag",identity.kspace);optional_double("qraw_mesh_spacing",identity.mesh);
   optional_double("active_pppm_mesh_spacing",identity.active_mesh);
-  const std::vector<double> statistics=collect_covariance_fit_statistics(spool,header,frame_count,training_frames,graph,r0,header.temperature);
+  std::vector<double> edge_statistics;
+  const std::vector<double> statistics=collect_covariance_fit_statistics(spool,header,frame_count,training_frames,graph,r0,header.temperature,&edge_statistics);
   compare_saved_vector(saved_statistics,statistics,"training statistics");
   std::vector<double> sqrt_mass(static_cast<std::size_t>(3)*header.n),sqrt_atom(static_cast<std::size_t>(header.n));
   for(int i=0;i<header.n;++i){sqrt_atom[i]=std::sqrt(header.masses[i]);for(int axis=0;axis<3;++axis)sqrt_mass[static_cast<std::size_t>(axis)*header.n+i]=sqrt_atom[i];}
@@ -4490,8 +4624,9 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   std::uint64_t diagnostic_evaluations=0;CovarianceBaseline base;base.theta=theta_baseline;base.mu=parse_double("baseline_mu");
   std::vector<double> expected_baseline=graph_laplacian_direction(graph);for(double& value:expected_baseline)value*=base.mu;
   compare_saved_vector(theta_baseline,expected_baseline,"graph-Laplacian baseline parameters");
-  std::vector<double> baseline_shifted_trace;CovarianceObjectiveEvaluation baseline_value;++diagnostic_evaluations;
-  if(!covariance_system.evaluate_factors(base.theta,epsilon,base.logdet,base.shifted_logdet,&base.trace,&baseline_shifted_trace,true,false))
+  std::vector<double> baseline_shifted_trace,baseline_edge_trace;CovarianceObjectiveEvaluation baseline_value;++diagnostic_evaluations;
+  if(!covariance_system.evaluate_factors(base.theta,epsilon,base.logdet,base.shifted_logdet,&base.trace,&baseline_shifted_trace,true,false,
+      &baseline_edge_trace,nullptr))
     throw std::runtime_error("saved graph-Laplacian baseline is not epsilon-positive definite");
   const CovarianceTraceDiagnostics baseline_d=covariance_system.last_d_trace,baseline_shifted=covariance_system.last_shifted_trace;
   baseline_value.feasible=true;baseline_value.status=CovarianceObjectiveStatus::Feasible;
@@ -4502,9 +4637,10 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   std::vector<double> normalization_vector(parameter_count);
   for(std::size_t i=0;i<parameter_count;++i)normalization_vector[i]=0.5*(statistics[i]+rho*base.trace[i])*coordinate_scale[i];
   const double kkt_denominator=std::max(1.0,covariance_norm_inf(normalization_vector));
-  struct DiagnosedPoint{CovarianceObjectiveEvaluation evaluation;CovarianceTraceDiagnostics d,shifted;};
+  struct DiagnosedPoint{CovarianceObjectiveEvaluation evaluation;CovarianceTraceDiagnostics d,shifted;std::vector<double> edge_d,edge_shifted;};
   auto diagnose_point=[&](const std::vector<double>& parameters){DiagnosedPoint point;
-    point.evaluation=evaluate_covariance_fit_objective(covariance_system,parameters,base,statistics,rho,epsilon,tau,diagnostic_evaluations,true,true,false);
+    point.evaluation=evaluate_covariance_fit_objective(covariance_system,parameters,base,statistics,rho,epsilon,tau,diagnostic_evaluations,true,true,false,
+      &point.edge_d,&point.edge_shifted);
     point.d=covariance_system.last_d_trace;point.shifted=covariance_system.last_shifted_trace;return point;};
   DiagnosedPoint baseline_point;baseline_point.evaluation=std::move(baseline_value);baseline_point.d=baseline_d;baseline_point.shifted=baseline_shifted;
   const DiagnosedPoint saved_point=diagnose_point(theta);
@@ -4546,8 +4682,42 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
         <<value.gradient_data[i]<<' '<<value.gradient_prior[i]<<' '<<value.gradient_barrier[i]<<' '<<value.gradient[i]<<' '
         <<coordinate_scale[i]<<' '<<scaled[i]<<'\n';}
     report<<"gradient_status "<<(validated?"VALIDATED":"PARTIAL_UNVALIDATED_SOLVES")<<'\n';};
+  auto write_edge_attribution=[&](){const CovarianceEdgeAttribution attribution=covariance_edge_gradient_attribution(graph,header.n,
+      edge_statistics,baseline_edge_trace,saved_point.edge_d,saved_point.edge_shifted,coordinate_scale,saved_point.evaluation,rho,tau,
+      saved_gradient_passes());
+    report<<"\nedge_attribution_status "<<attribution.status<<"\nedge_attribution_reconstruction_max_abs_error "<<attribution.max_reconstruction_error<<'\n';
+    if(attribution.status!="PASS"){report<<"edge_attribution_ranking NOT_AVAILABLE\n";return;}
+    const std::size_t parameter=static_cast<std::size_t>(attribution.dominant_parameter),component=parameter%6;
+    const auto pair=graph.type_pairs[parameter/6];const double scale=coordinate_scale[parameter];
+    report<<"dominant_scaled_kkt_coordinate index="<<parameter<<" type_i="<<pair.first<<" type_j="<<pair.second
+      <<" component="<<components[component]<<" g="<<saved_point.evaluation.gradient[parameter]
+      <<" scale="<<scale<<" scaled_g="<<saved_point.evaluation.gradient[parameter]*scale
+      <<" dominant_group_edge_count="<<attribution.dominant_group_edge_count
+      <<" sum_abs_scaled_edge_contribution="<<attribution.sum_abs_scaled_edge_contribution
+      <<" top_20_abs_fraction="<<attribution.top_20_abs_fraction
+      <<"\natom_attribution_convention each_edge_component_is_split_half_to_each_endpoint; accounting_only_not_a_unique_physical_cause\n";
+    report<<"edge_image_convention image=(nx,ny,nz) is the stored lattice translation added to r_j-r_i\n";
+    report<<"edge_attribution_top_edges limit=20 edge_id_zero_based rank atom_i atom_j type_i type_j reference_distance_A image_x image_y image_z g_data g_prior g_barrier g_total scaled_g_total\n";
+    for(std::size_t rank=0;rank<std::min<std::size_t>(20,attribution.ranked_edges.size());++rank){const std::size_t edge_id=attribution.ranked_edges[rank];
+      const Edge& edge=graph.edges[edge_id];double distance_squared=0.0;
+      for(int a=0;a<3;++a){double displacement=r0[static_cast<std::size_t>(a)*header.n+edge.j]-r0[static_cast<std::size_t>(a)*header.n+edge.i];
+        for(int b=0;b<3;++b)displacement+=box.cpu_h[3*a+b]*edge.image[b];distance_squared+=displacement*displacement;}
+      const double distance=std::sqrt(distance_squared);
+      const std::size_t index=6*edge_id+component;report<<edge_id<<' '<<rank+1<<' '<<edge.i<<' '<<edge.j<<' '<<header.types[edge.i]<<' '<<header.types[edge.j]<<' '
+        <<distance<<' '<<edge.image[0]<<' '<<edge.image[1]<<' '<<edge.image[2]<<' '<<attribution.edge_data[index]<<' '
+        <<attribution.edge_prior[index]<<' '<<attribution.edge_barrier[index]<<' '<<attribution.edge_total[index]<<' '
+        <<scale*attribution.edge_total[index]<<'\n';}
+    report<<"atom_abs_contribution_sum="<<attribution.sum_abs_atom_contribution
+      <<" atom_top_20_abs_fraction="<<attribution.top_20_atom_abs_fraction<<'\n';
+    report<<"edge_attribution_top_atoms limit=20 atom_id type g_data g_prior g_barrier g_total g_abs_total scaled_g_total\n";
+    for(std::size_t rank=0;rank<attribution.ranked_atoms.size();++rank){const std::size_t atom=attribution.ranked_atoms[rank];
+      report<<atom<<' '<<header.types[atom]<<' '<<attribution.atom_data[atom]<<' '<<attribution.atom_prior[atom]<<' '
+        <<attribution.atom_barrier[atom]<<' '<<attribution.atom_total[atom]<<' '<<attribution.atom_absolute_total[atom]<<' '
+        <<scale*attribution.atom_total[atom]<<'\n';}
+  };
   write_gradient("BASELINE",baseline_point,solve_passes(baseline_point));write_residual("BASELINE_SOLVE",baseline_point.d);write_residual("BASELINE_SHIFTED_SOLVE",baseline_point.shifted);
   write_gradient("SAVED_LAST_VALID",saved_point,saved_gradient_passes());write_residual("SAVED_D_SOLVE",saved_point.d);write_residual("SAVED_SHIFTED_SOLVE",saved_point.shifted);
+  write_edge_attribution();
   report<<"\noptimizer_residual_reference kappa=||scale*g||_inf/max(1,||scale*0.5*(a+rho*b)||_inf) denominator="<<kkt_denominator
     <<"\nkkt_denominator_validation_status "<<(prior_trace_passes()?"PASS":"UNVALIDATED_BASELINE_D_TRACE")
     <<"\nprior_baseline_trace_validation_status "<<(prior_trace_passes()?"PASS":"UNVALIDATED_BASELINE_D_TRACE")
