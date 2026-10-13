@@ -3140,6 +3140,7 @@ struct CovarianceFitResult
   double worst_solve_relative_residual=std::numeric_limits<double>::quiet_NaN(),optimizer_seconds=0.0;
   std::uint64_t objective_evaluations=0,initialization_evaluations=0,line_search_trials=0,line_search_evaluations=0;
   std::uint64_t shifted_not_spd_trials=0,armijo_reject_trials=0,gradient_residual_reject_trials=0;
+  std::uint64_t directional_overshoot_reject_trials=0;
   std::uint64_t directional_diagnostic_evaluations=0,factorizations=0,solve_rhs_columns=0;bool barrier_center_condition_pass=false;
   int iterations=0;
 };
@@ -3342,7 +3343,15 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
       *trace<<'\n';}flush_trace();
     if(armijo_accepted){record_covariance_failed_trial(fit.failed_trial,result.next_theta,iteration,alpha,tau,result.next);
       fit.failed_trial.failure_stage="BFGS_COMMIT_PENDING";
-      try{complete_gradient(result.next);}
+      double candidate_slope=std::numeric_limits<double>::quiet_NaN();
+      try{complete_gradient(result.next);
+        const std::vector<double> candidate_gradient=covariance_scaled_gradient(result.next.gradient,coordinate_scale);
+        if(candidate_gradient.size()!=direction.size())throw std::invalid_argument("native covariance fit directional gradient dimensions do not match");
+        if(!std::all_of(candidate_gradient.begin(),candidate_gradient.end(),[](double value){return std::isfinite(value);}))
+          throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance candidate scaled gradient is non-finite");
+        candidate_slope=covariance_dot(candidate_gradient,direction);
+        if(!std::isfinite(candidate_slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance candidate directional slope is non-finite");
+      }
       catch(const CovarianceSolveResidualError& error){++fit.gradient_residual_reject_trials;result.gradient_residual_rejected=true;
         result.failed_d_trace=error.d_trace;result.failed_shifted_trace=error.shifted_trace;
         fit.failed_d_trace=error.d_trace;fit.failed_shifted_trace=error.shifted_trace;
@@ -3356,6 +3365,13 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
           *trace<<" status=GRADIENT_RESIDUAL_REJECT\n";}flush_trace();
         alpha*=0.5;continue;
       }catch(...){fit.failed_trial.failure_stage="GRADIENT_SOLVE_FAIL";throw;}
+      const bool directional_overshoot=candidate_slope>0.0;
+      if(trace){*trace<<"LINE_SEARCH_DIRECTIONAL iter="<<iteration<<" trial="<<trial<<" alpha="<<alpha<<" tau="<<tau
+        <<" current_objective="<<current_objective<<" candidate_objective="<<result.next.objective
+        <<" current_directional_slope="<<slope<<" candidate_directional_slope="<<candidate_slope
+        <<" status="<<(directional_overshoot?"DIRECTIONAL_OVERSHOOT_REJECT":"DIRECTIONAL_ACCEPTED")<<'\n';}flush_trace();
+      if(directional_overshoot){++fit.directional_overshoot_reject_trials;fit.failed_trial.failure_stage="DIRECTIONAL_OVERSHOOT_REJECT";
+        alpha*=0.5;continue;}
       result.accepted=true;result.alpha=alpha;break;
     }
     alpha*=0.5;
@@ -3609,11 +3625,14 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         else if(step_underflow){result.status="STEP_UNDERFLOW";result.line_search_failure_status="STEP_UNDERFLOW";}
         else{result.status="LINE_SEARCH_FAILED";result.line_search_failure_status="MAX_BACKTRACKS";}
         std::ostringstream reason;reason<<"covariance backtracking stopped after "<<line_trials<<" trials; SHIFTED_NOT_SPD="<<result.shifted_not_spd_trials
-          <<" ARMIJO_REJECT="<<result.armijo_reject_trials<<" GRADIENT_RESIDUAL_REJECT="<<result.gradient_residual_reject_trials;
+          <<" ARMIJO_REJECT="<<result.armijo_reject_trials<<" GRADIENT_RESIDUAL_REJECT="<<result.gradient_residual_reject_trials
+          <<" DIRECTIONAL_OVERSHOOT_REJECT="<<result.directional_overshoot_reject_trials;
         if(step_underflow)reason<<"; the actual theta update was not representable";
         else if(result.status=="EVALUATION_BUDGET_EXHAUSTED")reason<<"; the objective evaluation budget was exhausted";
+        else if(result.failed_trial.failure_stage=="DIRECTIONAL_OVERSHOOT_REJECT")reason<<"; Armijo candidates failed the directional-slope check";
         else reason<<"; no sufficient objective decrease was found";
         if(result.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT")reason<<"; the last gradient residual rejection is retained in the covariance state";
+        if(result.failed_trial.failure_stage=="DIRECTIONAL_OVERSHOOT_REJECT")reason<<"; the last positive candidate directional slope is retained in the covariance state";
         result.reason=reason.str();
 
         const double z_norm=covariance_norm_inf(z);double fd_step=std::cbrt(std::numeric_limits<double>::epsilon())*std::max(1.0,z_norm)/direction_inf_norm;
@@ -3662,6 +3681,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         if(trace)*trace<<"LINE_SEARCH_FAILURE iter="<<iteration<<" status="<<result.status<<" reason="<<std::quoted(result.reason)
           <<" line_search_failure_status="<<result.line_search_failure_status<<" shifted_not_spd_trials="<<result.shifted_not_spd_trials
           <<" armijo_reject_trials="<<result.armijo_reject_trials<<" gradient_residual_reject_trials="<<result.gradient_residual_reject_trials
+          <<" directional_overshoot_reject_trials="<<result.directional_overshoot_reject_trials
           <<" directional_derivative_status="<<result.directional_derivative_status<<'\n';flush_trace();
         break;
       }
@@ -3763,6 +3783,7 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\nline_search_evaluations "<<fit.line_search_evaluations
     <<"\nshifted_not_spd_trials "<<fit.shifted_not_spd_trials<<"\narmijo_reject_trials "<<fit.armijo_reject_trials
     <<"\ngradient_residual_reject_trials "<<fit.gradient_residual_reject_trials
+    <<"\ndirectional_overshoot_reject_trials "<<fit.directional_overshoot_reject_trials
     <<"\ndirectional_derivative_status "<<fit.directional_derivative_status<<"\ndirectional_derivative_side "<<fit.directional_derivative_side
     <<"\ndirectional_derivative_slope "<<fit.directional_derivative_slope
     <<"\ndirectional_derivative_finite_difference "<<fit.directional_derivative_finite_difference
@@ -3989,6 +4010,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" line_search_failure_status "<<covariance_fit.line_search_failure_status<<" line_search_trials "<<covariance_fit.line_search_trials
       <<" line_search_evaluations "<<covariance_fit.line_search_evaluations
       <<" shifted_not_spd_trials "<<covariance_fit.shifted_not_spd_trials<<" armijo_reject_trials "<<covariance_fit.armijo_reject_trials
+      <<" directional_overshoot_reject_trials "<<covariance_fit.directional_overshoot_reject_trials
       <<" directional_derivative_status "<<covariance_fit.directional_derivative_status
       <<" barrier_center_condition_status "<<(covariance_fit.barrier_center_condition_pass?"PASS":"NOT_VERIFIED")
       <<" barrier_gap_estimate "<<covariance_fit.barrier_gap_estimate<<'\n';trace.flush();
@@ -4199,6 +4221,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<"\nline_search_evaluations "<<covariance_fit.line_search_evaluations
       <<"\nshifted_not_spd_trials "<<covariance_fit.shifted_not_spd_trials<<"\narmijo_reject_trials "<<covariance_fit.armijo_reject_trials
       <<"\ngradient_residual_reject_trials "<<covariance_fit.gradient_residual_reject_trials
+      <<"\ndirectional_overshoot_reject_trials "<<covariance_fit.directional_overshoot_reject_trials
       <<"\ndirectional_derivative_status "<<covariance_fit.directional_derivative_status
       <<"\ndirectional_derivative_side "<<covariance_fit.directional_derivative_side
       <<"\ndirectional_derivative_slope "<<covariance_fit.directional_derivative_slope
