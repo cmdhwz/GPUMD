@@ -1003,6 +1003,79 @@ SmallEigen eigen_small(cusolverDnHandle_t solver,const std::vector<double>& rowm
 }
 
 struct RitzMode{double value=0.0,actual_rayleigh=0.0,residual=0.0,base_rayleigh=0.0,additive_rayleigh=0.0,curvature_scale=0.0,curvature_tolerance=0.0;int steps_used=0,dense_matrix_actions=0;bool early_exit=false;std::vector<double> vector;};
+struct MassWeightedModeParticipation
+{
+  std::string status="NOT_RUN";double norm2=std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> atom_fractions;std::vector<std::size_t> ranked_atoms;std::vector<std::pair<int,double>> type_fractions;
+};
+
+MassWeightedModeParticipation mass_weighted_mode_participation(const std::vector<double>& mode,const std::vector<int>& types)
+{
+  MassWeightedModeParticipation result;const std::size_t n=types.size();
+  if(n==0||mode.size()!=3*n){result.status="DIMENSION_FAIL";return result;}
+  std::vector<NeumaierAccumulator> atom_norm2(n);NeumaierAccumulator total_norm2;
+  for(int axis=0;axis<3;++axis)for(std::size_t atom=0;atom<n;++atom){const double value=mode[static_cast<std::size_t>(axis)*n+atom];
+    if(!std::isfinite(value)){result.status="NONFINITE_MODE";return result;}atom_norm2[atom].add_product(value,value);total_norm2.add_product(value,value);}
+  result.norm2=total_norm2.value();if(!(result.norm2>0.0)||!std::isfinite(result.norm2)){result.status="INVALID_NORM";return result;}
+  result.atom_fractions.resize(n);std::map<int,NeumaierAccumulator> type_norm2;
+  for(std::size_t atom=0;atom<n;++atom){const double value=atom_norm2[atom].value();result.atom_fractions[atom]=value/result.norm2;type_norm2[types[atom]].add(value);}
+  for(const auto& type:type_norm2)result.type_fractions.emplace_back(type.first,type.second.value()/result.norm2);
+  result.ranked_atoms.resize(n);std::iota(result.ranked_atoms.begin(),result.ranked_atoms.end(),0);
+  std::sort(result.ranked_atoms.begin(),result.ranked_atoms.end(),[&](const std::size_t a,const std::size_t b){
+    return result.atom_fractions[a]==result.atom_fractions[b]?a<b:result.atom_fractions[a]>result.atom_fractions[b];});
+  result.status=std::abs(result.norm2-1.0)<=1e-8?"PASS":"NORM_FAIL";return result;
+}
+
+struct SavedModePairProjection{std::array<double,3> relative{};double norm=0.0,longitudinal=0.0,distance=0.0;};
+
+SavedModePairProjection saved_mode_pair_projection(const std::vector<double>& mode,const std::vector<double>& sqrt_atom,
+  const std::vector<double>& r0,const Box& box,const Edge& edge)
+{
+  const std::size_t n=sqrt_atom.size();if(n==0||mode.size()!=3*n||r0.size()!=3*n||edge.i<0||edge.j<0||
+     static_cast<std::size_t>(edge.i)>=n||static_cast<std::size_t>(edge.j)>=n||edge.i==edge.j)
+    throw std::invalid_argument("saved D mode pair projection dimensions are invalid");
+  if(!(sqrt_atom[edge.i]>0.0)||!(sqrt_atom[edge.j]>0.0)||!std::isfinite(sqrt_atom[edge.i])||!std::isfinite(sqrt_atom[edge.j]))
+    throw std::runtime_error("saved D mode pair projection has invalid masses");
+  double displacement[3],relative_mode[3],distance2=0.0;
+  for(int axis=0;axis<3;++axis){displacement[axis]=r0[static_cast<std::size_t>(axis)*n+edge.j]-r0[static_cast<std::size_t>(axis)*n+edge.i];
+    for(int b=0;b<3;++b)displacement[axis]+=box.cpu_h[3*axis+b]*edge.image[b];
+    relative_mode[axis]=mode[static_cast<std::size_t>(axis)*n+edge.j]/sqrt_atom[edge.j]-
+      mode[static_cast<std::size_t>(axis)*n+edge.i]/sqrt_atom[edge.i];distance2+=displacement[axis]*displacement[axis];}
+  if(!std::isfinite(distance2)||!(distance2>0.0)||
+     !std::all_of(relative_mode,relative_mode+3,[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("saved D mode pair projection has invalid geometry or masses");
+  SavedModePairProjection result;result.distance=std::sqrt(distance2);result.norm=std::hypot(std::hypot(relative_mode[0],relative_mode[1]),relative_mode[2]);
+  for(int axis=0;axis<3;++axis)result.relative[axis]=relative_mode[axis];
+  result.longitudinal=(relative_mode[0]*displacement[0]+relative_mode[1]*displacement[1]+relative_mode[2]*displacement[2])/result.distance;
+  if(!std::isfinite(result.norm)||!std::isfinite(result.longitudinal))throw std::runtime_error("saved D mode pair projection is non-finite");return result;
+}
+
+double saved_d_mode_relative_residual(const RitzMode& mode,const double epsilon)
+{
+  return mode.residual/std::max(std::abs(mode.actual_rayleigh),epsilon);
+}
+
+std::string saved_d_mode_localization_status(const RitzMode& mode,const double epsilon)
+{
+  constexpr double residual_tolerance=1e-6;
+  const double scaled_residual=saved_d_mode_relative_residual(mode,epsilon);
+  return std::isfinite(scaled_residual)&&scaled_residual<=residual_tolerance?"PASS":"INCONCLUSIVE";
+}
+
+std::string saved_d_mode_numerical_status(const RitzMode& mode,const MassWeightedModeParticipation& participation,
+  const double epsilon,const bool inverse_solve_pass)
+{
+  if(!std::isfinite(mode.value)||!std::isfinite(mode.actual_rayleigh)||!std::isfinite(mode.residual)||mode.residual<0.0||
+      !std::isfinite(saved_d_mode_relative_residual(mode,epsilon))||participation.status!="PASS"||!inverse_solve_pass)return "FAILED";
+  return saved_d_mode_localization_status(mode,epsilon)=="PASS"?"PASS":"INCONCLUSIVE_RITZ_RESIDUAL";
+}
+
+std::string saved_d_mode_aggregate_status(const bool numerical_checks_pass,const bool ritz_inconclusive)
+{
+  if(!numerical_checks_pass)return "FAILED";
+  return ritz_inconclusive?"INCONCLUSIVE_RITZ_RESIDUAL":"PASS";
+}
+
 bool stability_cut_is_violated(const double rayleigh,const double epsilon,const double tolerance){return rayleigh<epsilon-tolerance;}
 std::vector<double> spectral_row(const Graph& graph,const std::vector<double>& v,const std::vector<double>& sqrt_mass,const int n,const int p);
 double curvature_rounding_tolerance(double epsilon,double base_rayleigh,const std::vector<double>& row,const std::vector<double>& theta,double& scale);
@@ -4682,9 +4755,11 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
         <<value.gradient_data[i]<<' '<<value.gradient_prior[i]<<' '<<value.gradient_barrier[i]<<' '<<value.gradient[i]<<' '
         <<coordinate_scale[i]<<' '<<scaled[i]<<'\n';}
     report<<"gradient_status "<<(validated?"VALIDATED":"PARTIAL_UNVALIDATED_SOLVES")<<'\n';};
-  auto write_edge_attribution=[&](){const CovarianceEdgeAttribution attribution=covariance_edge_gradient_attribution(graph,header.n,
+  CovarianceEdgeAttribution mode_edge_attribution;
+  auto write_edge_attribution=[&](){mode_edge_attribution=covariance_edge_gradient_attribution(graph,header.n,
       edge_statistics,baseline_edge_trace,saved_point.edge_d,saved_point.edge_shifted,coordinate_scale,saved_point.evaluation,rho,tau,
       saved_gradient_passes());
+    const CovarianceEdgeAttribution& attribution=mode_edge_attribution;
     report<<"\nedge_attribution_status "<<attribution.status<<"\nedge_attribution_reconstruction_max_abs_error "<<attribution.max_reconstruction_error<<'\n';
     if(attribution.status!="PASS"){report<<"edge_attribution_ranking NOT_AVAILABLE\n";return;}
     const std::size_t parameter=static_cast<std::size_t>(attribution.dominant_parameter),component=parameter%6;
@@ -4794,6 +4869,118 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
       report<<'\n';}
   }
   catch(const std::exception& error){report<<"FAILED reason="<<std::quoted(error.what())<<"\nsoft_mode_scope NOT_COMPLETE\n";}
+  report<<"\nsaved_soft_mode_status ";
+  try{const int d=3*header.n,steps=std::min(96,d-3);cusolverDnHandle_t solver=nullptr;
+    if(cusolverDnCreate(&solver)!=CUSOLVER_STATUS_SUCCESS)throw std::runtime_error("saved-D eigensolver handle creation failed");
+    std::vector<RitzMode> modes;try{DeviceLanczosWorkspace workspace;workspace.initialize(graph,sqrt_mass,sqrt_atom,steps,static_cast<int>(parameter_count));
+      modes=lanczos_low_modes(solver,baseline_device,graph,theta,sqrt_mass,sqrt_atom,header.n,steps,4,epsilon,{},&workspace);}
+    catch(...){cusolverDnDestroy(solver);throw;}cusolverDnDestroy(solver);
+    if(modes.empty())throw std::runtime_error("Lanczos returned no saved-D low modes");
+    std::vector<MassWeightedModeParticipation> participation;participation.reserve(modes.size());
+    std::vector<std::vector<double>> vectors;vectors.reserve(modes.size());
+    for(const RitzMode& mode:modes){participation.push_back(mass_weighted_mode_participation(mode.vector,header.types));
+      vectors.push_back(mode.vector);}
+    std::vector<double> inverse_quad;double factor_residual=std::numeric_limits<double>::quiet_NaN(),original_residual=std::numeric_limits<double>::quiet_NaN();
+    std::string inverse_status="NOT_COMPUTED",inverse_error;
+    try{inverse_quad=covariance_system.checked_inverse_quadratics(theta,vectors,sqrt_mass,epsilon,factor_residual,original_residual);inverse_status="PASS";}
+    catch(const std::exception& error){inverse_status="FAILED";inverse_error=error.what();}
+    if(inverse_status=="PASS"&&inverse_quad.size()!=modes.size()){inverse_status="FAILED";inverse_error="checked inverse quadratic count does not match the saved-D modes";}
+    bool numeric_pass=true,ritz_inconclusive=false;std::vector<std::string> mode_numerical_status;mode_numerical_status.reserve(modes.size());
+    for(std::size_t mode=0;mode<modes.size();++mode){const std::string status=saved_d_mode_numerical_status(modes[mode],participation[mode],epsilon,inverse_status=="PASS");
+      mode_numerical_status.push_back(status);if(status=="FAILED")numeric_pass=false;
+      else if(status=="INCONCLUSIVE_RITZ_RESIDUAL")ritz_inconclusive=true;}
+    const std::uint64_t validation_frames=frame_count-training_frames;
+    const std::size_t training_blocks=static_cast<std::size_t>(std::min<std::uint64_t>(4,training_frames));
+    const std::size_t validation_blocks=static_cast<std::size_t>(std::min<std::uint64_t>(4,validation_frames));
+    std::vector<SoftModeTrainingVariance> train_variance(modes.size()),validation_variance(modes.size());
+    std::vector<NeumaierAccumulator> train_projection_sum(modes.size()),validation_projection_sum(modes.size());
+    std::vector<double> train_mean(modes.size()),train_second(modes.size()),train_centered_variance(modes.size());
+    std::vector<double> validation_mean(modes.size()),validation_second(modes.size()),validation_centered_variance(modes.size());
+    std::vector<double> position(static_cast<std::size_t>(d)),force_frame(position.size()),q(position.size());double frame_step=0.0;
+    spool.clear();spool.seekg(header.frames);for(std::uint64_t frame=0;frame<frame_count;++frame){read_frame(spool,position,force_frame,frame_step);
+      for(int i=0;i<d;++i)q[i]=sqrt_mass[i]*(position[i]-r0[i]);project_translation(q,sqrt_atom,header.n);
+      for(std::size_t mode=0;mode<modes.size();++mode){const double projection=compensated_dot(modes[mode].vector,q);
+        if(!std::isfinite(projection))numeric_pass=false;
+        if(frame<training_frames){train_variance[mode].add(projection,frame,training_frames,training_blocks);train_projection_sum[mode].add(projection);}
+        else{validation_variance[mode].add(projection,frame-training_frames,validation_frames,validation_blocks);validation_projection_sum[mode].add(projection);}}}
+    for(std::size_t mode=0;mode<modes.size();++mode){numeric_pass=numeric_pass&&std::isfinite(train_variance[mode].pooled.value());
+      for(std::size_t block=0;block<training_blocks;++block)numeric_pass=numeric_pass&&std::isfinite(train_variance[mode].blocks[block].value());
+      if(validation_frames>0){numeric_pass=numeric_pass&&std::isfinite(validation_variance[mode].pooled.value());
+        for(std::size_t block=0;block<validation_blocks;++block)numeric_pass=numeric_pass&&std::isfinite(validation_variance[mode].blocks[block].value());}
+      train_mean[mode]=train_projection_sum[mode].value()/static_cast<double>(training_frames);
+      train_second[mode]=train_variance[mode].pooled.value()/static_cast<double>(training_frames);
+      train_centered_variance[mode]=train_second[mode]-train_mean[mode]*train_mean[mode];
+      if(train_centered_variance[mode]<0.0){const double scale=std::max({1.0,std::abs(train_second[mode]),train_mean[mode]*train_mean[mode]});
+        if(train_centered_variance[mode]>=-64.0*std::numeric_limits<double>::epsilon()*scale)train_centered_variance[mode]=0.0;else numeric_pass=false;}
+      numeric_pass=numeric_pass&&std::isfinite(train_mean[mode])&&std::isfinite(train_second[mode])&&std::isfinite(train_centered_variance[mode]);
+      if(validation_frames>0){validation_mean[mode]=validation_projection_sum[mode].value()/static_cast<double>(validation_frames);
+        validation_second[mode]=validation_variance[mode].pooled.value()/static_cast<double>(validation_frames);
+        validation_centered_variance[mode]=validation_second[mode]-validation_mean[mode]*validation_mean[mode];
+        if(validation_centered_variance[mode]<0.0){const double scale=std::max({1.0,std::abs(validation_second[mode]),validation_mean[mode]*validation_mean[mode]});
+          if(validation_centered_variance[mode]>=-64.0*std::numeric_limits<double>::epsilon()*scale)validation_centered_variance[mode]=0.0;else numeric_pass=false;}
+        numeric_pass=numeric_pass&&std::isfinite(validation_mean[mode])&&std::isfinite(validation_second[mode])&&std::isfinite(validation_centered_variance[mode]);}}
+    std::vector<std::size_t> pair_projection_edge_ids;std::vector<std::vector<SavedModePairProjection>> pair_projection_by_rank;
+    std::string pair_projection_status=mode_edge_attribution.status=="PASS"&&!mode_edge_attribution.ranked_edges.empty()?"PASS":"NOT_AVAILABLE",pair_projection_error;
+    if(mode_edge_attribution.status=="PASS"){try{for(std::size_t rank=0;rank<std::min<std::size_t>(2,mode_edge_attribution.ranked_edges.size());++rank){
+        const std::size_t edge_id=mode_edge_attribution.ranked_edges[rank];const Edge& edge=graph.edges[edge_id];std::vector<SavedModePairProjection> projections;
+        for(const RitzMode& mode:modes)projections.push_back(saved_mode_pair_projection(mode.vector,sqrt_atom,r0,box,edge));
+        pair_projection_edge_ids.push_back(edge_id);pair_projection_by_rank.push_back(std::move(projections));}}
+      catch(const std::exception& error){pair_projection_status="FAILED";pair_projection_error=error.what();numeric_pass=false;}}
+    report<<"DIAGNOSTIC_ONLY\nsaved_soft_mode_numerical_check_status "<<saved_d_mode_aggregate_status(numeric_pass,ritz_inconclusive)
+      <<"\nsaved_soft_mode_residual_relative_definition residual/max(abs(actual_rayleigh),epsilon)"
+      <<"\nsaved_soft_mode_localization_threshold 1e-6 diagnostic_heuristic_only_not_acceptance\n"
+      <<"d_saved_last_valid_operator D=baseline_plus_additive(theta_last_valid)\nd_saved_last_valid_theta_source "
+      <<(last_valid_available?"last_valid_theta":"legacy_theta")<<"\nd_saved_last_valid_mode_count "<<modes.size()
+      <<"\nsaved_soft_mode_inverse_solve_rhs_scope saved_mode_vectors_only; no_full_rhs_trace_pass\n"
+      <<"saved_soft_mode_inverse_solve_status "<<inverse_status<<" factor_relative_residual="<<factor_residual
+      <<" original_relative_residual="<<original_residual<<"\n";
+    if(!inverse_error.empty())report<<"saved_soft_mode_inverse_solve_error "<<std::quoted(inverse_error)<<'\n';
+    report<<"d_saved_last_valid_interpretation DIAGNOSTIC_ONLY; no physical acceptance claim\n"
+      <<"d_saved_last_valid_mode_table mode ritz_value actual_rayleigh residual relative_residual steps_used early_exit localization_status variance_interpretation_status inverse_solve_status numerical_status kBT_vT_Dinv_v\n";
+    for(std::size_t mode=0;mode<modes.size();++mode){report<<mode<<' '<<modes[mode].value<<' '<<modes[mode].actual_rayleigh<<' '
+        <<modes[mode].residual<<' '<<saved_d_mode_relative_residual(modes[mode],epsilon)<<' '
+        <<modes[mode].steps_used<<' '<<(modes[mode].early_exit?1:0)<<' '
+        <<saved_d_mode_localization_status(modes[mode],epsilon)<<' '
+        <<(saved_d_mode_localization_status(modes[mode],epsilon)=="PASS"?"DIAGNOSTIC_ONLY":"INCONCLUSIVE_RITZ_RESIDUAL")<<' '
+        <<inverse_status<<' '<<mode_numerical_status[mode]<<' ';
+      if(inverse_status=="PASS"&&inverse_quad.size()==modes.size())report<<K_B*header.temperature*inverse_quad[mode];else report<<"NOT_COMPUTED";
+      report<<'\n';}
+    report<<"d_saved_last_valid_mode_participation_convention normalized_mass_weighted_components_squared; rows use atom and numeric type IDs\n"
+      <<"d_saved_last_valid_mode_top_atoms mode rank atom_id type_id participation_fraction\n";
+    for(std::size_t mode=0;mode<modes.size();++mode)if(participation[mode].status=="PASS")
+      for(std::size_t rank=0;rank<std::min<std::size_t>(20,participation[mode].ranked_atoms.size());++rank){const std::size_t atom=participation[mode].ranked_atoms[rank];
+        report<<mode<<' '<<rank+1<<' '<<atom<<' '<<header.types[atom]<<' '<<participation[mode].atom_fractions[atom]<<'\n';}
+    report<<"d_saved_last_valid_mode_type_participation mode type_id atom_count participation_fraction\n";
+    for(std::size_t mode=0;mode<modes.size();++mode)if(participation[mode].status=="PASS")
+      for(const auto& type:participation[mode].type_fractions){const std::size_t count=static_cast<std::size_t>(std::count(header.types.begin(),header.types.end(),type.first));
+        report<<mode<<' '<<type.first<<' '<<count<<' '<<type.second<<'\n';}
+    report<<"d_saved_last_valid_mode_pair_projection_status "<<pair_projection_status
+      <<" source=saved_scaled_kkt_edge_attribution; selected_edges=top_2\n"
+      <<"d_saved_last_valid_mode_pair_projection_convention atomic_displacement=v/sqrt(mass); relative=displacement_j-displacement_i; longitudinal uses the periodic R0 bond direction\n"
+      <<"d_saved_last_valid_mode_pair_projection mode rank edge_id atom_i atom_j type_i type_j image_x image_y image_z distance_A relative_dx relative_dy relative_dz relative_norm longitudinal_projection\n";
+    if(!pair_projection_error.empty())report<<"d_saved_last_valid_mode_pair_projection_error "<<std::quoted(pair_projection_error)<<'\n';
+    for(std::size_t rank=0;rank<pair_projection_edge_ids.size();++rank){const std::size_t edge_id=pair_projection_edge_ids[rank];const Edge& edge=graph.edges[edge_id];
+      for(std::size_t mode=0;mode<modes.size();++mode){const SavedModePairProjection& pair=pair_projection_by_rank[rank][mode];
+        report<<mode<<' '<<rank+1<<' '<<edge_id<<' '<<edge.i<<' '<<edge.j<<' '<<header.types[edge.i]<<' '<<header.types[edge.j]<<' '
+          <<edge.image[0]<<' '<<edge.image[1]<<' '<<edge.image[2]<<' '<<pair.distance<<' '<<pair.relative[0]<<' '<<pair.relative[1]<<' '
+          <<pair.relative[2]<<' '<<pair.norm<<' '<<pair.longitudinal<<'\n';}}
+    report<<"d_saved_last_valid_mode_sample_convention projections use the same training_R0 for both segments; centered_variance is a descriptive segment decomposition only\n"
+      <<"d_saved_last_valid_mode_segment_summary mode segment frames mean_projection_about_training_R0 second_moment_about_training_R0 centered_variance_about_segment_mean\n";
+    for(std::size_t mode=0;mode<modes.size();++mode){report<<mode<<" training "<<training_frames<<' '<<train_mean[mode]<<' '
+        <<train_second[mode]<<' '<<train_centered_variance[mode]<<'\n';
+      if(validation_frames>0)report<<mode<<" validation "<<validation_frames<<' '<<validation_mean[mode]<<' '
+        <<validation_second[mode]<<' '<<validation_centered_variance[mode]<<'\n';
+      else report<<mode<<" validation 0 NOT_AVAILABLE NOT_AVAILABLE NOT_AVAILABLE\n";}
+    report<<"d_saved_last_valid_mode_segment_blocks mode segment block first_frame frames second_moment_about_training_R0\n";
+    for(std::size_t mode=0;mode<modes.size();++mode){
+      for(std::size_t block=0;block<training_blocks;++block)report<<mode<<" training "<<block<<' '<<block*training_frames/training_blocks<<' '
+        <<train_variance[mode].block_frames[block]<<' '<<train_variance[mode].blocks[block].value()/train_variance[mode].block_frames[block]<<'\n';
+      for(std::size_t block=0;block<validation_blocks;++block)report<<mode<<" validation "<<block<<' '
+        <<training_frames+block*validation_frames/validation_blocks<<' '<<validation_variance[mode].block_frames[block]<<' '
+        <<validation_variance[mode].blocks[block].value()/validation_variance[mode].block_frames[block]<<'\n';}
+  }
+  catch(const std::exception& error){report<<"DIAGNOSTIC_ONLY\nsaved_soft_mode_numerical_check_status FAILED reason="
+    <<std::quoted(error.what())<<"\nsaved_soft_mode_scope NOT_COMPLETE\n";}
   report<<"ideal_covariance_mixing_formula C_pred=(C_train+rho*C_b)/(1+rho); restricted family and epsilon barrier make it an analysis only\n"
     <<"acceptance_scope optimizer_response_prepare_and_final_spd_NOT_CHECKED\n";
   write_text_exclusive(report_path,report.str(),"covariance fixed-point diagnostic report");

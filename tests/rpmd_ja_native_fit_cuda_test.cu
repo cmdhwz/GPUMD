@@ -1560,6 +1560,38 @@ void test_soft_mode_training_variance_uses_same_r0_second_moments()
   check_close((16.0-4.0)/(support.pooled.value()/projections.size()),12.0/9.8,1e-15);
 }
 
+void test_saved_d_mode_participation_projection_and_status()
+{
+  RitzMode mode;mode.value=2.5;mode.actual_rayleigh=2.5;mode.residual=1.0e-9;
+  mode.vector={0.6,0.8,0.0,0.0,0.0,0.0};
+  const auto participation=mass_weighted_mode_participation(mode.vector,{4,9});
+  assert(participation.status=="PASS");
+  check_close(participation.atom_fractions[0],0.36,1e-15);
+  check_close(participation.atom_fractions[1],0.64,1e-15);
+  assert(participation.type_fractions.size()==2);
+  assert(participation.type_fractions[0].first==4&&participation.type_fractions[1].first==9);
+  check_close(participation.type_fractions[0].second,0.36,1e-15);
+  check_close(participation.type_fractions[1].second,0.64,1e-15);
+  Edge edge{};edge.i=0;edge.j=1;
+  const std::vector<double> sqrt_atom{1.0,2.0},r0{0.0,2.0,0.0,0.0,0.0,0.0};Box box{};
+  box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;
+  const SavedModePairProjection pair=saved_mode_pair_projection(mode.vector,sqrt_atom,r0,box,edge);
+  check_close(pair.relative[0],-0.2,1e-15);check_close(pair.relative[1],0.0,1e-15);check_close(pair.relative[2],0.0,1e-15);
+  check_close(pair.norm,0.2,1e-15);check_close(pair.longitudinal,-0.2,1e-15);
+  assert(saved_d_mode_localization_status(mode,0.05)=="PASS");
+  assert(saved_d_mode_numerical_status(mode,participation,0.05,true)=="PASS");
+  assert(saved_d_mode_numerical_status(mode,participation,0.05,false)=="FAILED");
+  assert(saved_d_mode_aggregate_status(true,false)=="PASS");
+  assert(saved_d_mode_aggregate_status(true,true)=="INCONCLUSIVE_RITZ_RESIDUAL");
+  assert(saved_d_mode_aggregate_status(false,true)=="FAILED");
+  mode.residual=1.0e6;
+  assert(saved_d_mode_localization_status(mode,0.05)=="INCONCLUSIVE");
+  assert(saved_d_mode_numerical_status(mode,participation,0.05,true)=="INCONCLUSIVE_RITZ_RESIDUAL");
+  assert(saved_d_mode_aggregate_status(true,true)=="INCONCLUSIVE_RITZ_RESIDUAL");
+  mode.actual_rayleigh=std::numeric_limits<double>::quiet_NaN();
+  assert(saved_d_mode_numerical_status(mode,participation,0.05,true)=="FAILED");
+}
+
 void test_compressed_training_force_residual_distinguishes_fit_cost()
 {
   const std::vector<double> r={1.0},z={2.0};constexpr double discarded2=64.0,force2=100.0;
@@ -2661,6 +2693,7 @@ int main()
   test_covariance_failed_trial_does_not_replace_last_valid_point();
   test_covariance_prior_mixing_formula();
   test_soft_mode_training_variance_uses_same_r0_second_moments();
+  test_saved_d_mode_participation_projection_and_status();
   test_compressed_training_force_residual_distinguishes_fit_cost();
   test_saved_sample_diagnostic();
   test_design_and_edge_operator();

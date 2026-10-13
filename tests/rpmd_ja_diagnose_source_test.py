@@ -31,6 +31,21 @@ assert "bool full = false" in (root / "src/measure/rpmd_ja_native_fit.cuh").read
 assert "diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&, bool)" in (root / "tests/rpmd_ja_native_fit_cuda_test.cu").read_text(encoding="utf-8")
 fit_wrapper = native[native.index("bool fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options"):native.index("void diagnose_rpmd_ja_native_fit_samples(")]
 assert "diagnose_rpmd_ja_qnep_reference" not in fit_wrapper
+covariance_diagnostic = native[native.index("void diagnose_rpmd_ja_native_covariance("):native.index("void replay_rpmd_ja_native_cg(")]
+saved_mode_diagnostic = covariance_diagnostic[covariance_diagnostic.index('report<<"\\nsaved_soft_mode_status '):]
+assert 'report<<"DIAGNOSTIC_ONLY\\nsaved_soft_mode_numerical_check_status "' in saved_mode_diagnostic
+assert 'saved_d_mode_aggregate_status(numeric_pass,ritz_inconclusive)' in saved_mode_diagnostic
+assert 'mode_edge_attribution.status=="PASS"&&!mode_edge_attribution.ranked_edges.empty()?"PASS":"NOT_AVAILABLE"' in saved_mode_diagnostic
+assert "saved_soft_mode_inverse_solve_status " in saved_mode_diagnostic
+assert "saved_d_mode_localization_status" in saved_mode_diagnostic
+assert "INCONCLUSIVE_RITZ_RESIDUAL" in saved_mode_diagnostic
+assert "checked_inverse_quadratics(theta,vectors" in saved_mode_diagnostic
+assert "lanczos_low_modes(solver,baseline_device,graph,theta," in saved_mode_diagnostic
+assert "position[i]-r0[i]" in saved_mode_diagnostic
+assert "frame<training_frames" in saved_mode_diagnostic and "frame-training_frames" in saved_mode_diagnostic
+assert "mean_projection_about_training_R0 second_moment_about_training_R0 centered_variance_about_segment_mean" in saved_mode_diagnostic
+assert "mode_edge_attribution.ranked_edges" in saved_mode_diagnostic and "relative_dx relative_dy relative_dz relative_norm" in saved_mode_diagnostic
+assert "steps_used early_exit" in saved_mode_diagnostic
 assert "const bool precheck_failed" in text and "throw std::runtime_error(failure.str())" in text
 precheck_table = text[text.index("void print_qnep_precheck_table("):text.index("std::uint64_t qnep_config_fingerprint(")]
 assert "100.0 * k" in precheck_table and "100.0 * c[alpha]" in precheck_table
