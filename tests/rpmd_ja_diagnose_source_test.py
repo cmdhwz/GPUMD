@@ -39,10 +39,15 @@ assert 'mode_edge_attribution.status=="PASS"&&!mode_edge_attribution.ranked_edge
 assert "saved_soft_mode_inverse_solve_status " in saved_mode_diagnostic
 assert "saved_d_mode_localization_status" in saved_mode_diagnostic
 assert "INCONCLUSIVE_RITZ_RESIDUAL" in saved_mode_diagnostic
-assert "checked_inverse_quadratics(theta,vectors" in saved_mode_diagnostic
-assert "lanczos_low_modes(solver,baseline_device,graph,theta," in saved_mode_diagnostic
-assert "position[i]-r0[i]" in saved_mode_diagnostic
-assert "frame<training_frames" in saved_mode_diagnostic and "frame-training_frames" in saved_mode_diagnostic
+assert "checked_inverse_quadratics" not in covariance_diagnostic
+assert "covariance_bounded_inverse_modes(covariance_system.solver,saved_session" in covariance_diagnostic
+assert "position[i]-r0[i]" in covariance_diagnostic
+assert "frame<training_frames" in covariance_diagnostic and "frame-training_frames" in covariance_diagnostic
+assert "same_probe_covariance_table" in covariance_diagnostic
+assert "row_prefix=same_probe_covariance_row" in covariance_diagnostic and '"same_probe_covariance_row "' in covariance_diagnostic
+assert "row_prefix=same_probe_rayleigh_group_row" in covariance_diagnostic and '"same_probe_rayleigh_group_row "' in covariance_diagnostic
+assert "baseline_Db_probe_error" in covariance_diagnostic
+assert "same-probe sample moments are NOT_AVAILABLE" in covariance_diagnostic
 assert "mean_projection_about_training_R0 second_moment_about_training_R0 centered_variance_about_segment_mean" in saved_mode_diagnostic
 assert "mode_edge_attribution.ranked_edges" in saved_mode_diagnostic and "relative_dx relative_dy relative_dz relative_norm" in saved_mode_diagnostic
 assert "steps_used early_exit" in saved_mode_diagnostic

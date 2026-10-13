@@ -200,10 +200,13 @@ assert "line.back()=='\\r'" in state_parser
 assert "covariance_saved_gradient_diagnostics_pass" in native_fit and "saved_gradient_passes()" in native_fit
 trace_batch = native_fit[native_fit.index("const double relative=residual/std::max(rhs_norm,1e-300)"):native_fit.index("if(batch_valid){covariance_capture_edge_covariance", native_fit.index("const double relative=residual/std::max(rhs_norm,1e-300)"))]
 assert trace_batch.index("worst_solve_relative_residual=std::max") < trace_batch.index("if(!batch_valid)")
-trace_body = native_fit[native_fit.index("std::vector<double> trace_derivatives("):native_fit.index("std::vector<double> checked_inverse_quadratics(")]
+trace_body = native_fit[native_fit.index("std::vector<double> trace_derivatives("):native_fit.index("struct CovarianceProbeColumn")]
 assert trace_body.index("covariance_expand_solutions") < trace_body.index("original_solve_residual(rhs,rhs_check") < trace_body.index("covariance_householder_dots")
-soft_solve = native_fit[native_fit.index("std::vector<double> checked_inverse_quadratics("):native_fit.index("struct CovarianceBaseline", native_fit.index("std::vector<double> checked_inverse_quadratics("))]
-assert soft_solve.index("const double one=1.0;") < soft_solve.index("cublasDtrmm")
+probe_solve = native_fit[native_fit.index("class CovarianceProbeSolveSession"):native_fit.index("struct CovarianceOperatorGram")]
+assert probe_solve.index("const double one=1.0,minus_one=-1.0") < probe_solve.index("cublasDtrmm")
+assert "system.solve_rhs_columns+=static_cast<std::uint64_t>(columns)" in probe_solve
+assert "refinement<2" in probe_solve and "factor_residual_pre" in probe_solve and "original_residual_post" in probe_solve
+assert "assembly_generation" in native_fit and "later matrix assembly" in probe_solve
 assert native_fit.index('parse_double("last_valid_tau")') < native_fit.index("DeviceBaseline baseline_device", native_fit.index('void diagnose_rpmd_ja_native_covariance('))
 assert "ARMIJO_ACCEPTED" in native_fit and "STEP_COMMITTED" in native_fit and "last_valid_theta" in native_fit
 assert "state_format_version 2" in native_fit and "parameter_map_validation" in native_fit
@@ -428,6 +431,27 @@ assert "test_covariance_state_parser_accepts_lf_and_crlf" in source("tests/rpmd_
 assert "test_covariance_state_tau_comparison_is_relative_for_small_values" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_failed_trial_does_not_replace_last_valid_point" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_prior_mixing_formula" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+probe_session_test = source("tests/rpmd_ja_native_fit_cuda_test.cu").split("void test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly()", 1)[1].split("void test_covariance_probe_refinement", 1)[0]
+assert "covariance_bounded_inverse_modes(system.solver,session,baseline" in probe_session_test
+assert "RITZ_RESIDUAL_RESOLVED" in probe_session_test and "mode.steps_used==modes.iterations" in probe_session_test
+assert "test_covariance_probe_refinement_improves_each_original_residual_and_rejects_large_error" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_operator_gram_includes_shared_atom_overlap" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_local_group_hessian_matches_tiny_objective_fd" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_force_residual_uses_training_frames_only" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "covariance probe factors were invalidated by a later matrix assembly" in native_fit
+assert "quadratic_pre" in native_fit and "original_residual_post" in native_fit
+assert "INCONCLUSIVE_BUDGET" in native_fit and "RITZ_RESIDUAL_RESOLVED" in native_fit
+assert "groups_x_groups" in native_fit and "shared_atom_diagonal_overlap_included" in native_fit
+assert "conditional_group_hessian_fd_status" in native_fit and "UNSTABLE_H_H2" in native_fit
+assert "conditional_group_hessian_fd_error \"" in native_fit and "std::quoted(hessian_fd_error)" in native_fit
+assert "INCONCLUSIVE_CANCELLATION" in native_fit and "fine_relative_error_vs_analytic" in native_fit
+assert "if(iteration<max_iterations)for(RitzMode& mode:result.modes)mode.early_exit=true" in native_fit
+assert "diagnostic_total_cost_status MEASURED" in native_fit and "no claim_total_diagnostic_is_faster" in native_fit
+training_force_residual = native_fit[native_fit.index("std::pair<double,double> compare_covariance_training_force_residuals("):native_fit.index("__global__ void covariance_scatter_additive(")]
+assert "for(std::uint64_t frame=0;frame<training_frames;++frame)" in training_force_residual
+assert "if(frame>=training_frames)continue" not in training_force_residual
+assert "unrestricted_full_matrix_eps0_proxy_only" in native_fit
 assert "test_nonfinite_tail_product_is_numerical_failure" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_response_bootstrap_ignores_force_position_tail" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_sample_spool_minimum_frame_boundary" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
