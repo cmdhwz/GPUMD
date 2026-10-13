@@ -2534,7 +2534,7 @@ std::vector<double> collect_covariance_fit_statistics(std::istream& in,const Sam
     throw std::invalid_argument("native covariance fit training metadata is invalid");
   std::vector<double> sums(6*graph.type_pairs.size(),0.0),position(r0.size()),force_frame(r0.size());
   double step=0.0;in.clear();in.seekg(header.frames);
-  for(std::uint64_t frame=0;frame<frame_count;++frame){read_frame(in,position,force_frame,step);if(frame<training_frames)add_covariance_frame_statistics(graph,position,r0,header.n,sums);}
+  for(std::uint64_t frame=0;frame<training_frames;++frame){read_frame(in,position,force_frame,step);add_covariance_frame_statistics(graph,position,r0,header.n,sums);}
   const double beta=1.0/(K_B*temperature*static_cast<double>(training_frames));
   for(double& value:sums){value*=beta;if(!std::isfinite(value))throw std::runtime_error("native covariance fit training statistic is non-finite");}
   return sums;
@@ -3322,11 +3322,17 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
   const int iteration,const double tau,EvaluateObjective&& evaluate_objective,CompleteGradient&& complete_gradient,std::ostream* trace=nullptr)
 {
   CovarianceBacktrackingResult result;double alpha=initial_alpha;
+  bool have_valid_candidate=false;int expansions=0;double valid_alpha=0.0;
+  std::vector<double> valid_z,valid_theta,valid_step;CovarianceObjectiveEvaluation valid_value;
   auto flush_trace=[&](){if(trace){trace->flush();if(!*trace)throw std::runtime_error("failed writing covariance optimizer trace");}};
+  auto preserve_valid_candidate=[&](){result.accepted=have_valid_candidate;result.alpha=valid_alpha;result.next_z=valid_z;result.next_theta=valid_theta;
+    result.step=valid_step;result.next=valid_value;};
   for(int trial=1;trial<=64&&fit.objective_evaluations<max_evaluations;++trial){result.trials=trial;++fit.line_search_trials;
     if(!covariance_build_scaled_trial(theta,z,coordinate_scale,direction,alpha,result.next_z,result.step,result.next_theta)){
       result.step_underflow=true;if(trace)*trace<<"LINE_SEARCH iter="<<iteration<<" tau="<<tau<<" trial="<<trial<<" alpha="<<alpha
-        <<" direction_inf_norm="<<direction_inf_norm<<" step_inf_norm="<<covariance_norm_inf(result.step)<<" status=STEP_UNDERFLOW\n";flush_trace();break;}
+        <<" direction_inf_norm="<<direction_inf_norm<<" step_inf_norm="<<covariance_norm_inf(result.step)<<" status=STEP_UNDERFLOW\n";flush_trace();
+      if(have_valid_candidate)preserve_valid_candidate();
+      break;}
     const double step_inf_norm=covariance_norm_inf(result.step);++fit.line_search_evaluations;
     result.next=evaluate_objective(result.next_theta,fit.objective_evaluations);
     const double armijo_required_delta=1e-4*alpha*slope;
@@ -3341,6 +3347,7 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
       <<" direction_inf_norm="<<direction_inf_norm<<" step_inf_norm="<<step_inf_norm<<" status="<<trial_status;
       if(result.next.feasible)*trace<<" objective_delta="<<objective_delta<<" armijo_required_delta="<<armijo_required_delta;
       *trace<<'\n';}flush_trace();
+    if(!armijo_accepted&&have_valid_candidate){preserve_valid_candidate();break;}
     if(armijo_accepted){record_covariance_failed_trial(fit.failed_trial,result.next_theta,iteration,alpha,tau,result.next);
       fit.failed_trial.failure_stage="BFGS_COMMIT_PENDING";
       double candidate_slope=std::numeric_limits<double>::quiet_NaN();
@@ -3363,6 +3370,7 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
           <<" worst_factor_residual="<<failure.worst_factor_solve_relative_residual<<" worst_original_residual=";
           if(failure.original_residual_checked)*trace<<failure.worst_original_solve_relative_residual;else *trace<<"NOT_CHECKED";
           *trace<<" status=GRADIENT_RESIDUAL_REJECT\n";}flush_trace();
+        if(have_valid_candidate){preserve_valid_candidate();break;}
         alpha*=0.5;continue;
       }catch(...){fit.failed_trial.failure_stage="GRADIENT_SOLVE_FAIL";throw;}
       const bool directional_overshoot=candidate_slope>0.0;
@@ -3371,13 +3379,21 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
         <<" current_directional_slope="<<slope<<" candidate_directional_slope="<<candidate_slope
         <<" status="<<(directional_overshoot?"DIRECTIONAL_OVERSHOOT_REJECT":"DIRECTIONAL_ACCEPTED")<<'\n';}flush_trace();
       if(directional_overshoot){++fit.directional_overshoot_reject_trials;fit.failed_trial.failure_stage="DIRECTIONAL_OVERSHOOT_REJECT";
+        if(have_valid_candidate){preserve_valid_candidate();break;}
         alpha*=0.5;continue;}
+      have_valid_candidate=true;valid_alpha=alpha;valid_z=result.next_z;valid_theta=result.next_theta;valid_step=result.step;valid_value=result.next;
+      if(initial_alpha==1.0&&alpha>=1.0&&expansions<2&&candidate_slope<0.5*slope){
+        preserve_valid_candidate();
+        if(fit.objective_evaluations>=max_evaluations)break;
+        if(trace)*trace<<"COVARIANCE_STEP_EXPAND iteration="<<iteration<<" from_alpha="<<alpha
+          <<" current_slope="<<slope<<" candidate_slope="<<candidate_slope<<'\n';flush_trace();
+        ++expansions;alpha*=2.0;continue;
+      }
       result.accepted=true;result.alpha=alpha;break;
     }
     alpha*=0.5;
   }
   result.evaluation_budget_exhausted=!result.accepted&&fit.objective_evaluations>=max_evaluations;
-  if(result.accepted)result.alpha=alpha;
   return result;
 }
 

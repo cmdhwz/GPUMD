@@ -766,6 +766,17 @@ Graph make_two_atom_covariance_graph()
   Graph graph;graph.type_pairs={{0,1}};Edge edge;edge.i=0;edge.j=1;edge.group=0;graph.edges.push_back(edge);return graph;
 }
 
+void test_covariance_statistics_read_only_training_frames()
+{
+  SampleHeader header{};header.n=2;header.frames=0;Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> r0(6,0.0);std::stringstream spool(std::ios::in|std::ios::out|std::ios::binary);
+  for(int frame=0;frame<2;++frame){const double step=static_cast<double>(frame);const double position[6]={0.0,1.0+frame,0.0,0.0,0.0,0.0};
+    const double force[6]={};spool.write(reinterpret_cast<const char*>(&step),sizeof(step));
+    spool.write(reinterpret_cast<const char*>(position),sizeof(position));spool.write(reinterpret_cast<const char*>(force),sizeof(force));}
+  const std::vector<double> statistics=collect_covariance_fit_statistics(spool,header,3,2,graph,r0,300.0);
+  assert(statistics.size()==6);check_close(statistics[0],5.0/(K_B*300.0*2.0),1e-12);
+}
+
 void initialize_two_atom_covariance_baseline(DeviceBaseline& baseline,const bool identity_internal)
 {
   baseline.d=6;assert(cudaMalloc(reinterpret_cast<void**>(&baseline.k),36*sizeof(double))==cudaSuccess);std::vector<double> matrix(36,0.0);
@@ -1029,6 +1040,75 @@ void test_covariance_gradient_residual_budget_keeps_last_valid_and_reject()
         throw std::runtime_error("non-finite covariance gradient");});}
   catch(const std::runtime_error& error){propagated=std::string(error.what())=="non-finite covariance gradient";}
   assert(propagated&&nonfinite_failure.gradient_residual_reject_trials==0&&nonfinite_failure.failed_trial.failure_stage=="GRADIENT_SOLVE_FAIL");
+}
+
+void test_covariance_armijo_bounded_expansion_preserves_last_valid_candidate()
+{
+  const std::vector<double> theta={0.0},z={0.0},scale={1.0},direction={1.0};
+  auto initialize=[](){CovarianceFitResult fit;fit.theta={0.0};fit.iterations=0;fit.last_valid.available=true;
+    fit.last_valid.theta={0.0};fit.last_valid.objective=0.0;return fit;};
+  {
+    CovarianceFitResult fit=initialize();std::ostringstream trace;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [](CovarianceObjectiveEvaluation& value){value.gradient={-0.5};},&trace);
+    assert(line.accepted&&line.trials==1&&line.alpha==1.0);
+    assert(fit.objective_evaluations==1&&fit.theta==theta&&fit.last_valid.theta==theta);
+  }
+  {
+    CovarianceFitResult fit=initialize();std::ostringstream trace;double evaluated_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){value.gradient={-1.0+0.1*evaluated_x};},&trace);
+    assert(line.accepted&&line.alpha==4.0&&line.trials==3&&fit.objective_evaluations==3);
+    check_close(line.next_theta[0],4.0,1e-15);check_close(line.next.objective,-3.2,1e-15);
+    assert(trace.str().find("COVARIANCE_STEP_EXPAND iteration=0 from_alpha=1")!=std::string::npos);
+    assert(trace.str().find("COVARIANCE_STEP_EXPAND iteration=0 from_alpha=2")!=std::string::npos);
+    assert(fit.theta==theta&&fit.last_valid.theta==theta);
+  }
+  {
+    CovarianceFitResult fit=initialize();int calls=0;double evaluated_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,1,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){++calls;value.gradient={-1.0+0.1*evaluated_x};});
+    assert(line.accepted&&!line.evaluation_budget_exhausted&&line.alpha==1.0&&line.trials==1&&calls==1);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;double evaluated_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=x[0]<1.5;value.status=value.feasible?CovarianceObjectiveStatus::Feasible:CovarianceObjectiveStatus::ShiftedNotSpd;
+        value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){++gradients;value.gradient={-1.0+0.1*evaluated_x};});
+    assert(line.accepted&&line.alpha==1.0&&line.trials==2&&fit.shifted_not_spd_trials==1&&gradients==1);
+    check_close(line.next_theta[0],1.0,1e-15);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){if(++gradients==1){value.gradient={-0.9};return;}CovarianceTraceDiagnostics error;
+        error.matrix_kind="D_MINUS_EPSILON_I";error.status="RESIDUAL_FAIL";error.worst_factor_solve_relative_residual=2e-7;
+        throw CovarianceSolveResidualError(error);});
+    assert(line.accepted&&line.gradient_residual_rejected&&line.alpha==1.0&&line.trials==2);
+    assert(fit.gradient_residual_reject_trials==1&&fit.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT");
+    check_close(line.next_theta[0],1.0,1e-15);
+  }
+  for(const bool nonfinite:{false,true}){
+    CovarianceFitResult fit=initialize();int gradients=0;bool propagated=false;
+    try{covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+        [](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;CovarianceObjectiveEvaluation value;
+          value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+        [&](CovarianceObjectiveEvaluation& value){if(++gradients==1){value.gradient={-0.9};return;}
+          if(nonfinite)value.gradient={std::numeric_limits<double>::quiet_NaN()};else throw std::runtime_error("simulated CUDA failure");});}
+    catch(const std::runtime_error& error){propagated=nonfinite?std::string(error.what()).find("non-finite")!=std::string::npos:
+      std::string(error.what())=="simulated CUDA failure";}
+    assert(propagated&&gradients==2&&fit.objective_evaluations==2&&fit.failed_trial.failure_stage=="GRADIENT_SOLVE_FAIL");
+  }
 }
 
 void test_covariance_bfgs_first_secant_seeds_and_updates_inverse_hessian()
@@ -2439,6 +2519,7 @@ int main()
   test_response_snapshot_preserves_recomputable_matrices();
   test_response_extremes_map_to_internal_coordinates();
   test_covariance_training_statistics_include_symmetric_cross_terms();
+  test_covariance_statistics_read_only_training_frames();
   test_covariance_baseline_brackets_both_signs_and_zero();
   test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_solution();
   test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status();
@@ -2447,6 +2528,7 @@ int main()
   test_covariance_gradient_residual_reject_retries_before_commit();
   test_covariance_directional_overshoot_rejects_before_commit();
   test_covariance_gradient_residual_budget_keeps_last_valid_and_reject();
+  test_covariance_armijo_bounded_expansion_preserves_last_valid_candidate();
   test_covariance_bfgs_first_secant_seeds_and_updates_inverse_hessian();
   test_covariance_non_descent_reset_uses_restored_gamma();
   test_covariance_solver_residual_retry_commits_once();
