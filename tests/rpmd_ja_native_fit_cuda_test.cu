@@ -630,6 +630,21 @@ void test_check_samples_is_read_only()
   assert(text.find("selection_source TRAIN_ONLY")!=std::string::npos&&text.find("ADJACENT_SEGMENT_INTERNAL_CHECK")!=std::string::npos);
 }
 
+void test_fixed_r0_validation_mean_projection_drift_report()
+{
+  FixedProbeStatistics stats;stats.probes.resize(2);stats.sources={"FIXED_RANDOM","TYPE_LOCAL"};
+  for(int i=0;i<7;++i){stats.segments.emplace_back(2);stats.lags.emplace_back(2);}
+  stats.segments[1].add({1.0,-2.0},{0.0,0.0});stats.segments[1].add({3.0,4.0},{0.0,0.0});
+  stats.segments[2].add({5.0,-4.0},{0.0,0.0});stats.segments[2].add({7.0,2.0},{0.0,0.0});
+  stats.segments[0].merge(stats.segments[1]);stats.segments[0].merge(stats.segments[2]);
+  stats.validation_complete_moments=stats.segments[2];
+  SampleHeader header;header.frame_count=4;header.temperature=300.0;
+  const std::string report=format_fixed_probe_report(stats,header,1.0,2);
+  assert(report.find("validation_centering NONE; status DIAGNOSTIC_ONLY; no acceptance threshold")!=std::string::npos);
+  assert(report.find("\n0 FIXED_RANDOM 2 2 2 6 4\n")!=std::string::npos);
+  assert(report.find("\n1 TYPE_LOCAL 2 2 1 -1 -2\n")!=std::string::npos);
+}
+
 void test_sample_spool_minimum_frame_boundary()
 {
   Atom atom;atom.number_of_atoms=2;atom.number_of_beads=4;atom.cpu_mass={1.0,2.0};atom.cpu_type={0,1};
@@ -1295,6 +1310,19 @@ void test_covariance_prior_mixing_formula()
   check_close(covariance_prior_mixed_variance_ratio(0.1,4.0),1.4/1.1,1e-15);
   check_close(covariance_prior_rho_upper_bound(4.0,0.1),0.1/2.9,1e-15);
   assert(std::isinf(covariance_prior_rho_upper_bound(1.05,0.1)));
+}
+
+void test_soft_mode_training_variance_uses_same_r0_second_moments()
+{
+  const std::array<double,5> projections{{2.0,2.0,3.0,4.0,4.0}};SoftModeTrainingVariance support;
+  for(std::size_t frame=0;frame<projections.size();++frame)support.add(projections[frame],frame,projections.size(),4);
+  assert((support.block_frames==std::array<std::uint64_t,4>{{1,1,1,2}}));
+  check_close(support.pooled.value()/projections.size(),9.8,1e-15);
+  check_close(support.blocks[0].value()/support.block_frames[0],4.0,1e-15);
+  check_close(support.blocks[1].value()/support.block_frames[1],4.0,1e-15);
+  check_close(support.blocks[2].value()/support.block_frames[2],9.0,1e-15);
+  check_close(support.blocks[3].value()/support.block_frames[3],16.0,1e-15);
+  check_close((16.0-4.0)/(support.pooled.value()/projections.size()),12.0/9.8,1e-15);
 }
 
 void test_compressed_training_force_residual_distinguishes_fit_cost()
@@ -2357,6 +2385,7 @@ int main()
   test_slow_product_correlation_is_inconclusive();
   test_block_bootstrap_harmonic_coverage();
   test_check_samples_is_read_only();
+  test_fixed_r0_validation_mean_projection_drift_report();
   test_sample_spool_minimum_frame_boundary();
   test_fixed_probe_collection_checks_reference_branches();
   test_response_snapshot_preserves_recomputable_matrices();
@@ -2390,6 +2419,7 @@ int main()
   test_covariance_state_tau_comparison_is_relative_for_small_values();
   test_covariance_failed_trial_does_not_replace_last_valid_point();
   test_covariance_prior_mixing_formula();
+  test_soft_mode_training_variance_uses_same_r0_second_moments();
   test_compressed_training_force_residual_distinguishes_fit_cost();
   test_saved_sample_diagnostic();
   test_design_and_edge_operator();

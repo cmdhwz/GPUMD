@@ -548,6 +548,19 @@ struct NeumaierAccumulator
   double value() const { return sum+correction; }
 };
 
+struct SoftModeTrainingVariance
+{
+  NeumaierAccumulator pooled;
+  std::array<NeumaierAccumulator,4> blocks{};
+  std::array<std::uint64_t,4> block_frames{};
+  void add(const double projection,const std::uint64_t frame,const std::uint64_t training_frames,const std::size_t block_count)
+  {
+    pooled.add_product(projection,projection);
+    const std::size_t block=std::min(block_count-1,static_cast<std::size_t>(((frame+1)*block_count-1)/training_frames));
+    blocks[block].add_product(projection,projection);++block_frames[block];
+  }
+};
+
 double compensated_dot(const std::vector<double>& left,const std::vector<double>& right)
 {
   if(left.size()!=right.size())throw std::runtime_error("native fit compensated dot-product dimensions do not match");
@@ -2134,6 +2147,20 @@ std::string format_fixed_probe_report(const FixedProbeStatistics& stats,const Sa
     out<<"lag_autocorrelation lags=1,2,5,10\n";
     for(int i=0;i<m;++i){out<<i;for(double rho:stats.lags[s].autocorrelation(moments,cov,i))out<<' '<<rho;out<<'\n';}
   }
+  const ProbeMoments& train_moments=stats.segments[1];const ProbeMoments& validation_moments=stats.segments[2];
+  out<<"\nFIXED_R0_VALIDATION_MEAN_PROJECTION_DRIFT\nscope FIXED_PROBES_ONLY\n"
+    <<"reference q_probe=probe dot project_translation(sqrt(M)*(position - training_R0)); both segments use the same training_R0\n"
+    <<"validation_centering NONE; status DIAGNOSTIC_ONLY; no acceptance threshold\n"
+    <<"probe source train_frames validation_frames train_mean_q_probe validation_mean_q_probe validation_minus_train\n";
+  for(int i=0;i<m;++i){out<<i<<' '<<stats.sources[i]<<' '<<train_moments.frames<<' '<<validation_moments.frames<<' ';
+    if(train_moments.frames)out<<train_moments.sum_q[i]/static_cast<double>(train_moments.frames);else out<<"NOT_COMPUTED";
+    out<<' ';
+    if(validation_moments.frames)out<<validation_moments.sum_q[i]/static_cast<double>(validation_moments.frames);else out<<"NOT_COMPUTED";
+    out<<' ';
+    if(train_moments.frames&&validation_moments.frames)
+      out<<validation_moments.sum_q[i]/static_cast<double>(validation_moments.frames)-train_moments.sum_q[i]/static_cast<double>(train_moments.frames);
+    else out<<"NOT_COMPUTED";
+    out<<'\n';}
   const auto overall=stats.segments[0].covariance_q();
   out<<"\nblock_variance_relative_delta_vs_all\nprobe";for(int b=0;b<4;++b)out<<" block"<<b;out<<'\n';
   for(int i=0;i<m;++i){out<<i;for(int b=0;b<4;++b){const auto cov=stats.segments[3+b].covariance_q();const double base=overall[static_cast<std::size_t>(i)*m+i],value=cov[static_cast<std::size_t>(i)*m+i];out<<' '<<(base>0.0?value/base-1.0:std::numeric_limits<double>::infinity());}out<<'\n';}
@@ -4519,20 +4546,44 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     if(modes.empty())throw std::runtime_error("Lanczos returned no baseline soft modes");
     std::vector<double> inverse_quad;double factor_residual=0.0,original_residual=0.0;
     inverse_quad=covariance_system.checked_inverse_quadratics(base.theta,[&](){std::vector<std::vector<double>> vectors;for(const auto& mode:modes)vectors.push_back(mode.vector);return vectors;}(),sqrt_mass,epsilon,factor_residual,original_residual);
-    std::vector<NeumaierAccumulator> train_variance(modes.size());std::vector<double> position(static_cast<std::size_t>(d)),force_frame(position.size()),q(position.size());double frame_step=0.0;
+    const std::size_t support_block_count=static_cast<std::size_t>(std::min<std::uint64_t>(4,training_frames));
+    std::vector<SoftModeTrainingVariance> train_variance(modes.size());std::vector<double> position(static_cast<std::size_t>(d)),force_frame(position.size()),q(position.size());double frame_step=0.0;
     spool.clear();spool.seekg(header.frames);for(std::uint64_t frame=0;frame<frame_count;++frame){read_frame(spool,position,force_frame,frame_step);if(frame>=training_frames)continue;
       for(int i=0;i<d;++i)q[i]=sqrt_mass[i]*(position[i]-r0[i]);project_translation(q,sqrt_atom,header.n);
-      for(std::size_t mode=0;mode<modes.size();++mode){const double projection=compensated_dot(modes[mode].vector,q);train_variance[mode].add_product(projection,projection);}}
+      for(std::size_t mode=0;mode<modes.size();++mode){const double projection=compensated_dot(modes[mode].vector,q);
+        train_variance[mode].add(projection,frame,training_frames,support_block_count);}}
     report<<"PASS\nsoft_mode_solve_scope ALL_RHS_MODE_COLUMNS factor_relative_residual="<<factor_residual<<" original_relative_residual="<<original_residual
       <<"\nsoft_mode_training_support_status LIMITED_BY_FRAME_COUNT_AND_CORRELATED_SAMPLES\nsoft_mode_rho_delta_threshold 0.1\n"
       <<"soft_mode_table index baseline_rayleigh c_train c_baseline kBT_vTDbInvv R Q_rho rho_max_for_delta_0.1 support\n";
-    for(std::size_t mode=0;mode<modes.size();++mode){const double c_train=train_variance[mode].value()/static_cast<double>(training_frames);
+    for(std::size_t mode=0;mode<modes.size();++mode){const double c_train=train_variance[mode].pooled.value()/static_cast<double>(training_frames);
       if(!(c_train>0.0)||!std::isfinite(c_train)){report<<mode<<' '<<modes[mode].actual_rayleigh<<" NOT_SUPPORTED_BY_TRAINING NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED UNSUPPORTED_IN_TRAINING\n";continue;}
       const double c_base=K_B*header.temperature*inverse_quad[mode],ratio=c_base/c_train;
       if(!std::isfinite(ratio)){report<<mode<<' '<<modes[mode].actual_rayleigh<<' '<<c_train<<" NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED NUMERICAL_UNCERTAINTY\n";continue;}
       const double q_rho=covariance_prior_mixed_variance_ratio(rho,ratio);
       report<<mode<<' '<<modes[mode].actual_rayleigh<<' '<<c_train<<' '<<c_base<<' '<<inverse_quad[mode]*K_B*header.temperature<<' '<<ratio<<' '<<q_rho<<' ';
-      const double rho_bound=covariance_prior_rho_upper_bound(ratio,0.1);if(std::isfinite(rho_bound))report<<rho_bound;else report<<"NO_FINITE_UPPER_BOUND";report<<" UNCERTAINTY_NOT_ESTIMATED\n";}}
+      const double rho_bound=covariance_prior_rho_upper_bound(ratio,0.1);if(std::isfinite(rho_bound))report<<rho_bound;else report<<"NO_FINITE_UPPER_BOUND";report<<" UNCERTAINTY_NOT_ESTIMATED\n";}
+    report<<"soft_mode_training_support_method BALANCED_CONTIGUOUS_WINDOWS; c_block is a second moment about the same training R0 as c_train\n"
+      <<"soft_mode_training_support_interpretation DIAGNOSTIC_ONLY; correlated frames limit inference; block spread is not a confidence interval or uncertainty bound; no statistical acceptance claim\n"
+      <<"soft_mode_training_support_block_table mode block first_training_frame frames c_block c_block_over_c_train\n";
+    for(std::size_t mode=0;mode<modes.size();++mode){const double c_train=train_variance[mode].pooled.value()/static_cast<double>(training_frames);
+      for(std::size_t block=0;block<support_block_count;++block){const std::uint64_t first=block*training_frames/support_block_count;
+        const double c_block=train_variance[mode].blocks[block].value()/static_cast<double>(train_variance[mode].block_frames[block]);
+        report<<mode<<' '<<block<<' '<<first<<' '<<train_variance[mode].block_frames[block]<<' ';
+        if(std::isfinite(c_block)){report<<c_block;if(c_train>0.0&&std::isfinite(c_train))report<<' '<<c_block/c_train;else report<<" NOT_COMPUTED";
+        }else report<<"NOT_COMPUTED NOT_COMPUTED";
+        report<<'\n';}
+    }
+    report<<"soft_mode_training_support_spread_table mode positive_blocks block_count positive_block_fraction min_c_block max_c_block block_spread_over_c_train\n";
+    for(std::size_t mode=0;mode<modes.size();++mode){const double c_train=train_variance[mode].pooled.value()/static_cast<double>(training_frames);
+      double min_block=std::numeric_limits<double>::infinity(),max_block=-std::numeric_limits<double>::infinity();std::size_t positive_blocks=0;
+      for(std::size_t block=0;block<support_block_count;++block){const double c_block=train_variance[mode].blocks[block].value()/static_cast<double>(train_variance[mode].block_frames[block]);
+        if(std::isfinite(c_block)){min_block=std::min(min_block,c_block);max_block=std::max(max_block,c_block);if(c_block>0.0)++positive_blocks;}}
+      report<<mode<<' '<<positive_blocks<<' '<<support_block_count<<' '<<static_cast<double>(positive_blocks)/support_block_count<<' ';
+      if(std::isfinite(min_block)&&std::isfinite(max_block)){report<<min_block<<' '<<max_block<<' ';
+        if(c_train>0.0&&std::isfinite(c_train))report<<(max_block-min_block)/c_train;else report<<"NOT_COMPUTED";}
+      else report<<"NOT_COMPUTED NOT_COMPUTED NOT_COMPUTED";
+      report<<'\n';}
+  }
   catch(const std::exception& error){report<<"FAILED reason="<<std::quoted(error.what())<<"\nsoft_mode_scope NOT_COMPLETE\n";}
   report<<"ideal_covariance_mixing_formula C_pred=(C_train+rho*C_b)/(1+rho); restricted family and epsilon barrier make it an analysis only\n"
     <<"acceptance_scope optimizer_response_prepare_and_final_spd_NOT_CHECKED\n";
