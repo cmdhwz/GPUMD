@@ -28,6 +28,7 @@ struct RpmdJANativeFitOptions
   int max_stability_rounds = 160;
   int max_covariance_iterations = 0;
   double covariance_shrinkage = 0.0;
+  bool covariance_block_newton = false;
   RpmdJANativeFitMethod method = RpmdJANativeFitMethod::ForceLeastSquares;
   bool internal_mass_com = false;
 };

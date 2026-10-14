@@ -24,10 +24,11 @@ optimization progress, data support, and material response separately.
    Report lag and block-length sensitivity; block spread is not a confidence
    interval. Centroid spools cannot identify tunneling rates.
 5. For a small supported parameter group, report the conditional Hessian
-   at fixed rho, tau and all other parameters. Its Newton direction is an
-   optimization diagnostic, not a new update rule or a full-space certificate.
-   Finite-difference checks must report their actual steps, feasibility and
-   convergence under step reduction.
+   at fixed rho, tau and all other parameters. BFGS remains the default;
+   ``block_newton`` opts in to using a checked conditional direction for the
+   selected six-parameter group. Neither the local Hessian nor that direction
+   is a full-space certificate. Finite-difference checks must report their
+   actual steps, feasibility and convergence under step reduction.
 6. Record factorization count, RHS columns, sample passes and stage timing.
    New diagnostic work has explicit size/iteration caps. Exceeding a cap is
    an inconclusive diagnostic, not reference-family failure.
@@ -48,8 +49,10 @@ intervals. The selected quadratic products are xx, 2xy, 2xz, yy, 2yz, zz;
 coverage must be checked before treating them as full-group statistics.
 
 New fits record first-order predicted decrease, actual decrease and BFGS
-secant statistics. Older saved states/traces may not contain those fields;
-NOT_STORED is missing evidence, not zero curvature or optimizer failure.
+secant statistics; opt-in block directions also record the selected group,
+conditional solve checks and extra cost. Older saved states/traces may not
+contain those fields; NOT_STORED is missing evidence, not zero curvature or
+optimizer failure.
 
 For comparison only, the unrestricted full-matrix optimum with epsilon=0
 has C*=(C_train+rho*C_b)/(1+rho+2*tau). The restricted local parameter family
@@ -93,7 +96,7 @@ Rebuild gpumd using the server's existing CUDA/NetCDF settings. In the material
 directory, use a new output name in the existing run.in configuration:
 
 ```text
-rpmd_ja diagnose_covariance ja_reference_cov_expand25.bin.covariance_state.txt ja_cov_expand25_full_diag.txt 5 1e-6 1 0.001
+rpmd_ja diagnose_covariance ja_reference_cov_expand25.bin.covariance_state.txt ja_cov_expand25_full_diag_fixed.txt 5 1e-6 1 0.001
 ```
 
 Run the offline pair tool with the two previously attributed edges, including
@@ -106,8 +109,21 @@ python3 <worktree>/tools/rpmd_ja_pair_diagnostic.py ja_reference_sample100ps.bin
 Paths in the state file must resolve in the material directory. Existing
 reports are not overwritten. Run diagnostic commands without a new PIMD
 sampling trajectory; do not reuse a stale gpumd binary for the CUDA report.
-Inspect the same-probe response, Ritz and solve residuals, conditional
-Hessian/finite-difference statuses, graph coverage, mean drift and temporal
-support before scheduling another fit. The extra bounded diagnostic work
-is not a measured speedup of the 25-step fit; compare stage timings on the
-same GPU and inputs before changing production batching or synchronizations.
+After the CUDA regression passes, run a 10-step A/B using the same fixed
+sample, qraw, rho, tau schedule, cutoff and response threshold; vary only the
+output path, iteration budget and opt-in token. The full-gradient KKT
+threshold remains 1e-6, and need not decrease monotonically at every step.
+Use distinct outputs:
+
+```text
+rpmd_ja fit_samples_covariance <same_samples> ja_cov_bfgs10.bin <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <same_qraw> shrinkage <same_rho> max_iter 10
+rpmd_ja fit_samples_covariance <same_samples> ja_cov_block_newton10.bin <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <same_qraw> shrinkage <same_rho> max_iter 10 block_newton
+```
+
+The saved-point response/Ritz/residual and finite-difference diagnostic
+correction can proceed in parallel with this A/B. Compare full-KKT traces,
+accepted steps, group transitions and added cost; neither a 10-step run nor
+finite probes imply optimizer convergence, material acceptance or that the
+material KKT problem is solved. The extra bounded diagnostic work is not a
+measured speedup; compare stage timings on the same GPU and inputs before
+changing production batching or synchronizations.

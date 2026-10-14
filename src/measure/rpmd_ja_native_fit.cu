@@ -2796,7 +2796,7 @@ struct DeviceCovarianceSystem
 {
   static constexpr int solve_batch=32;
   DeviceBaseline& baseline;const Graph& graph;int n=0,d=0,r=0,p=0,edge_count=0,lwork=0;
-  std::vector<double> parameter_basis_norms;
+  std::vector<double> parameter_basis_norms,sqrt_mass_host,sqrt_atom_host;
   std::vector<double> householder_host;
   double *full=nullptr,*compact=nullptr,*shifted=nullptr,*householder=nullptr,*product=nullptr,*matrix_product=nullptr,*theta_device=nullptr;
   double *sqrt_mass_device=nullptr,*rhs=nullptr,*rhs_check=nullptr,*rhs_temp=nullptr,*ambient=nullptr,*dots=nullptr,*diagonal=nullptr;
@@ -2823,6 +2823,8 @@ struct DeviceCovarianceSystem
 
   void initialize(const std::vector<double>& sqrt_mass,const std::vector<double>& masses)
   {
+    sqrt_mass_host=sqrt_mass;sqrt_atom_host.resize(masses.size());
+    for(std::size_t i=0;i<masses.size();++i)sqrt_atom_host[i]=std::sqrt(masses[i]);
     if(n<2||d!=baseline.d||r<=0||p<=0||edge_count<=0||sqrt_mass.size()!=static_cast<std::size_t>(d)||
        graph.edges.size()>static_cast<std::size_t>(std::numeric_limits<int>::max())||
        static_cast<std::size_t>(d)>std::numeric_limits<std::size_t>::max()/static_cast<std::size_t>(d)/sizeof(double)||
@@ -3089,8 +3091,8 @@ public:
       std::vector<double> host_rhs(values,0.0);
       for(int column=0;column<columns;++column){std::vector<double> transformed=vectors[begin+column];project_translation(transformed,sqrt_atom_,system.n);
         for(int axis=0;axis<3;++axis){double dot=0.0;const double* house=system.householder_host.data()+static_cast<std::size_t>(axis)*system.d;
-          for(int atom=0;atom<system.n;++atom)dot+=house[atom]*transformed[axis*system.n+atom];
-          for(int atom=0;atom<system.n;++atom)transformed[axis*system.n+atom]-=2.0*house[atom]*dot;}
+          for(int atom=0;atom<system.n;++atom)dot+=house[axis*system.n+atom]*transformed[axis*system.n+atom];
+          for(int atom=0;atom<system.n;++atom)transformed[axis*system.n+atom]-=2.0*house[axis*system.n+atom]*dot;}
         for(int row=0;row<system.r;++row){const int full=row+1+(row>=system.n-1)+(row>=2*system.n-2);
           host_rhs[static_cast<std::size_t>(column)*system.r+row]=transformed[full];}}
       if(cudaMemcpy(system.rhs,host_rhs.data(),values*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
@@ -3152,8 +3154,8 @@ public:
       for(int column=0;column<columns;++column){std::vector<double>& output=result.solution[begin+column];output.resize(system.d);
         for(int row=0;row<system.d;++row)output[row]=transformed_solution[static_cast<std::size_t>(column)*system.d+row];
         for(int axis=0;axis<3;++axis){double dot=0.0;const double* house=system.householder_host.data()+static_cast<std::size_t>(axis)*system.d;
-          for(int atom=0;atom<system.n;++atom)dot+=house[atom]*output[axis*system.n+atom];
-          for(int atom=0;atom<system.n;++atom)output[axis*system.n+atom]-=2.0*house[atom]*dot;}
+          for(int atom=0;atom<system.n;++atom)dot+=house[axis*system.n+atom]*output[axis*system.n+atom];
+          for(int atom=0;atom<system.n;++atom)output[axis*system.n+atom]-=2.0*house[axis*system.n+atom]*dot;}
         project_translation(output,sqrt_atom_,system.n);}
     }
     return result;
@@ -3206,7 +3208,7 @@ CovarianceOperatorGram covariance_operator_gram(cusolverDnHandle_t solver,const 
 
 struct CovarianceLocalGroupBasis
 {
-  std::string status="NOT_EVALUATED";std::vector<int> atoms;int dimension=0;
+  std::string status="NOT_EVALUATED";std::vector<int> atoms;int dimension=0;std::size_t support_count=0;
   std::array<std::vector<double>,6> basis;
 };
 
@@ -3216,6 +3218,7 @@ CovarianceLocalGroupBasis covariance_local_group_basis(const Graph& graph,const 
   CovarianceLocalGroupBasis result;std::set<int> support;
   for(const Edge& edge:graph.edges)if(edge.group==group){support.insert(edge.i);support.insert(edge.j);}
   if(support.empty()){result.status="EMPTY_GROUP";return result;}
+  result.support_count=support.size();
   if(support.size()>support_cap){result.status="NOT_EVALUATED_SUPPORT_CAP";return result;}
   result.atoms.assign(support.begin(),support.end());result.dimension=3*static_cast<int>(result.atoms.size());
   for(auto& values:result.basis)values.assign(static_cast<std::size_t>(result.dimension)*result.dimension,0.0);
@@ -3246,22 +3249,152 @@ std::array<double,36> covariance_local_trace_products(const std::vector<double>&
   return result;
 }
 
+class CovarianceLocalInverseAsymmetryError final : public std::runtime_error
+{
+public:
+  explicit CovarianceLocalInverseAsymmetryError(const double value)
+    :std::runtime_error("covariance local inverse pre-symmetry asymmetry exceeded 1e-8"),relative_asymmetry(value){}
+  double relative_asymmetry;
+};
+
 std::vector<double> covariance_local_inverse(const CovarianceProbeBatch& solved,const CovarianceLocalGroupBasis& basis,const int n,double& relative_asymmetry)
 {
   const int d=basis.dimension;const std::size_t count=static_cast<std::size_t>(d)*d;
   if(solved.status!="PASS"||solved.solution.size()!=static_cast<std::size_t>(d))throw std::runtime_error("covariance local inverse probes did not pass residual checks");
   std::vector<double> inverse(count,0.0);
   const int support=static_cast<int>(basis.atoms.size());
-  for(int column=0;column<d;++column)for(int row=0;row<d;++row){const int axis=row/support,atom=basis.atoms[row%support];
-    inverse[static_cast<std::size_t>(row)*d+column]=solved.solution[column][static_cast<std::size_t>(axis)*n+atom];}
-  double asymmetry2=0.0,norm2=0.0;
+  for(int column=0;column<d;++column){if(solved.solution[column].size()!=static_cast<std::size_t>(3)*n||
+      !std::all_of(solved.solution[column].begin(),solved.solution[column].end(),[](double value){return std::isfinite(value);}))
+      throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance local inverse solution is non-finite or has invalid dimensions");
+    for(int row=0;row<d;++row){const int axis=row/support,atom=basis.atoms[row%support];
+      inverse[static_cast<std::size_t>(row)*d+column]=solved.solution[column][static_cast<std::size_t>(axis)*n+atom];}}
+  double asymmetry_norm=0.0,norm=0.0;const double root_two=std::sqrt(2.0);
   for(int i=0;i<d;++i)for(int j=0;j<d;++j){const double value=inverse[static_cast<std::size_t>(i)*d+j];
-    norm2+=value*value;if(i<j){const double delta=value-inverse[static_cast<std::size_t>(j)*d+i];asymmetry2+=2.0*delta*delta;}}
-  relative_asymmetry=std::sqrt(asymmetry2)/std::max(std::sqrt(norm2),1e-300);
-  if(!std::isfinite(relative_asymmetry)||relative_asymmetry>1e-8)throw std::runtime_error("covariance local inverse pre-symmetry asymmetry exceeded 1e-8");
+    norm=std::hypot(norm,value);if(i<j){const double delta=value-inverse[static_cast<std::size_t>(j)*d+i];asymmetry_norm=std::hypot(asymmetry_norm,root_two*delta);}}
+  if(!std::isfinite(norm)||!std::isfinite(asymmetry_norm))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance local inverse norm is non-finite");
+  relative_asymmetry=asymmetry_norm/std::max(norm,1e-300);
+  if(!std::isfinite(relative_asymmetry))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance local inverse asymmetry is non-finite");
+  if(relative_asymmetry>1e-8)throw CovarianceLocalInverseAsymmetryError(relative_asymmetry);
   for(int i=0;i<d;++i)for(int j=i+1;j<d;++j){const double value=0.5*inverse[static_cast<std::size_t>(i)*d+j]+0.5*inverse[static_cast<std::size_t>(j)*d+i];
     inverse[static_cast<std::size_t>(i)*d+j]=inverse[static_cast<std::size_t>(j)*d+i]=value;}
   return inverse;
+}
+
+struct CovarianceLocalHessianTerms
+{
+  std::array<double,36> data{},prior{},barrier{},total{};
+};
+
+CovarianceLocalHessianTerms covariance_local_group_hessian(const std::array<double,36>& traces_d,
+  const std::array<double,36>& traces_s,const double rho,const double tau,
+  const std::vector<double>& coordinate_scale,const std::size_t parameter_begin)
+{
+  if(parameter_begin+6>coordinate_scale.size()||!(rho>0.0)||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau))
+    throw std::invalid_argument("native covariance local Hessian inputs are invalid");
+  CovarianceLocalHessianTerms result;
+  for(int a=0;a<6;++a)for(int b=0;b<6;++b){const std::size_t at=static_cast<std::size_t>(a)*6+b;
+    const double scale_a=coordinate_scale[parameter_begin+static_cast<std::size_t>(a)],scale_b=coordinate_scale[parameter_begin+static_cast<std::size_t>(b)];
+    if(!(scale_a>0.0)||!(scale_b>0.0)||!std::isfinite(scale_a)||!std::isfinite(scale_b)||
+       !std::isfinite(traces_d[at])||!std::isfinite(traces_s[at]))
+      throw std::runtime_error("NUMERICAL_SOLVE_FAIL: native covariance local Hessian input is non-finite");
+    result.data[at]=0.5*traces_d[at]*scale_a*scale_b;
+    result.prior[at]=0.5*rho*traces_d[at]*scale_a*scale_b;
+    result.barrier[at]=tau*traces_s[at]*scale_a*scale_b;
+    result.total[at]=result.data[at]+result.prior[at]+result.barrier[at];
+    if(!std::isfinite(result.total[at]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: native covariance local Hessian is non-finite");
+  }
+  return result;
+}
+
+struct CovarianceBlockNewtonResult
+{
+  std::string status="NOT_EVALUATED";std::array<double,6> direction{};
+  double damping=std::numeric_limits<double>::quiet_NaN(),relative_residual=std::numeric_limits<double>::quiet_NaN();
+  double asymmetry=std::numeric_limits<double>::quiet_NaN(),slope=std::numeric_limits<double>::quiet_NaN();
+};
+
+CovarianceBlockNewtonResult covariance_local_newton_direction(const std::array<double,36>& hessian,
+  const std::array<double,6>& gradient)
+{
+  CovarianceBlockNewtonResult result;double norm=0.0,asymmetry_norm=0.0;const double root_two=std::sqrt(2.0);
+  for(int i=0;i<6;++i){if(!std::isfinite(gradient[i]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block gradient is non-finite");
+    for(int j=0;j<6;++j){const double value=hessian[static_cast<std::size_t>(i)*6+j];
+      if(!std::isfinite(value))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block Hessian is non-finite");
+      norm=std::hypot(norm,value);if(i<j){const double delta=value-hessian[static_cast<std::size_t>(j)*6+i];asymmetry_norm=std::hypot(asymmetry_norm,root_two*delta);}}}
+  if(!std::isfinite(norm)||!std::isfinite(asymmetry_norm))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block Hessian norm is non-finite");
+  result.asymmetry=asymmetry_norm/std::max(norm,1e-300);
+  if(!std::isfinite(result.asymmetry))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block Hessian asymmetry is non-finite");
+  if(result.asymmetry>1e-8){result.status="HESSIAN_NOT_SYMMETRIC";return result;}
+  std::array<double,6> equilibration{};
+  for(int i=0;i<6;++i){const double diagonal=hessian[static_cast<std::size_t>(i)*6+i];
+    if(!(diagonal>0.0)){result.status="NONPOSITIVE_DIAGONAL";return result;}
+    equilibration[i]=1.0/std::sqrt(diagonal);
+    if(!(equilibration[i]>0.0)||!std::isfinite(equilibration[i]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block Hessian equilibration is non-finite");}
+  std::array<double,36> balanced{};for(int i=0;i<6;++i)for(int j=0;j<6;++j){const double symmetrized=
+      0.5*hessian[static_cast<std::size_t>(i)*6+j]+0.5*hessian[static_cast<std::size_t>(j)*6+i];
+    balanced[static_cast<std::size_t>(i)*6+j]=symmetrized*equilibration[i]*equilibration[j];
+    if(!std::isfinite(balanced[static_cast<std::size_t>(i)*6+j]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block equilibration is non-finite");}
+  std::array<double,6> rhs{};for(int i=0;i<6;++i){rhs[i]=-gradient[i]*equilibration[i];
+    if(!std::isfinite(rhs[i]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block equilibrated gradient is non-finite");}
+  constexpr double damping_values[]={0.0,1e-12,1e-10,1e-8,1e-6,1e-4,1e-2,1.0};
+  bool cholesky_attempted=false;result.status="CHOLESKY_UNAVAILABLE";
+  for(const double damping:damping_values){std::array<double,36> lower{};bool positive=true;
+    for(int i=0;i<6&&positive;++i)for(int j=0;j<=i;++j){double value=balanced[static_cast<std::size_t>(i)*6+j];
+      if(i==j)value+=damping;for(int k=0;k<j;++k)value-=lower[static_cast<std::size_t>(i)*6+k]*lower[static_cast<std::size_t>(j)*6+k];
+      if(!std::isfinite(value))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block Cholesky arithmetic is non-finite");
+      if(i==j){if(!(value>0.0)){positive=false;break;}lower[static_cast<std::size_t>(i)*6+j]=std::sqrt(value);}
+      else lower[static_cast<std::size_t>(i)*6+j]=value/lower[static_cast<std::size_t>(j)*6+j];}
+    if(!positive)continue;cholesky_attempted=true;
+    std::array<double,6> intermediate{},equilibrated_direction{};
+    for(int i=0;i<6;++i){double value=rhs[i];for(int j=0;j<i;++j)value-=lower[static_cast<std::size_t>(i)*6+j]*intermediate[j];
+      intermediate[i]=value/lower[static_cast<std::size_t>(i)*6+i];}
+    for(int i=5;i>=0;--i){double value=intermediate[i];for(int j=i+1;j<6;++j)value-=lower[static_cast<std::size_t>(j)*6+i]*equilibrated_direction[j];
+      equilibrated_direction[i]=value/lower[static_cast<std::size_t>(i)*6+i];}
+    double rhs_norm=0.0,residual_norm=0.0,curvature=0.0;
+    for(int i=0;i<6;++i){if(!std::isfinite(equilibrated_direction[i]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block direction is non-finite");
+      result.direction[i]=equilibration[i]*equilibrated_direction[i];rhs_norm=std::hypot(rhs_norm,rhs[i]);
+      if(!std::isfinite(result.direction[i]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block unscaled direction is non-finite");
+      double action=0.0;for(int j=0;j<6;++j){const double value=balanced[static_cast<std::size_t>(i)*6+j]+(i==j?damping:0.0);
+        action+=value*equilibrated_direction[j];}
+      const double residual=action-rhs[i];residual_norm=std::hypot(residual_norm,residual);curvature+=equilibrated_direction[i]*action;}
+    result.relative_residual=residual_norm/std::max(rhs_norm,1e-300);
+    result.slope=0.0;for(int i=0;i<6;++i)result.slope+=gradient[i]*result.direction[i];
+    if(!std::isfinite(result.relative_residual)||!std::isfinite(curvature)||!std::isfinite(result.slope))
+      throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block solve diagnostics are non-finite");
+    if(result.relative_residual>1e-8){result.status="LINEAR_SOLVE_RESIDUAL_FAIL";continue;}
+    if(!(curvature>0.0)){result.status="NONPOSITIVE_CURVATURE";continue;}
+    if(!(result.slope<0.0)){result.status="NON_DESCENT";return result;}
+    result.damping=damping;result.status="PASS";return result;
+  }
+  if(cholesky_attempted&&result.status=="CHOLESKY_UNAVAILABLE")result.status="LINEAR_SOLVE_RESIDUAL_FAIL";
+  return result;
+}
+
+struct CovarianceDirectionChoice
+{
+  std::vector<double> direction;std::string method="BFGS",reason="BLOCK_NEWTON_DISABLED";
+  double selected_slope=std::numeric_limits<double>::quiet_NaN();
+};
+
+double covariance_dot(const std::vector<double>& left,const std::vector<double>& right);
+
+CovarianceDirectionChoice covariance_choose_block_direction(const std::vector<double>& gradient,
+  const std::vector<double>& bfgs_direction,const std::size_t group,const CovarianceBlockNewtonResult& block)
+{
+  if(gradient.size()!=bfgs_direction.size()||6*group+6>gradient.size())throw std::invalid_argument("native covariance block direction dimensions do not match");
+  CovarianceDirectionChoice result;result.direction=bfgs_direction;result.selected_slope=covariance_dot(gradient,bfgs_direction);result.reason=block.status;
+  if(!std::isfinite(result.selected_slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS direction slope is non-finite");
+  if(block.status!="PASS")return result;
+  std::vector<double> hybrid=bfgs_direction;for(int a=0;a<6;++a)hybrid[6*group+static_cast<std::size_t>(a)]=block.direction[a];
+  const double hybrid_slope=covariance_dot(gradient,hybrid);
+  if(!std::isfinite(hybrid_slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance hybrid direction slope is non-finite");
+  if(hybrid_slope<0.0){result.direction=std::move(hybrid);result.method="HYBRID";result.reason="HYBRID_DESCENT";result.selected_slope=hybrid_slope;return result;}
+  std::fill(result.direction.begin(),result.direction.end(),0.0);
+  for(int a=0;a<6;++a)result.direction[6*group+static_cast<std::size_t>(a)]=block.direction[a];
+  result.selected_slope=covariance_dot(gradient,result.direction);
+  if(!std::isfinite(result.selected_slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block direction slope is non-finite");
+  if(result.selected_slope<0.0){result.method="BLOCK";result.reason="HYBRID_NON_DESCENT_BLOCK_DESCENT";return result;}
+  result.direction=bfgs_direction;result.selected_slope=covariance_dot(gradient,bfgs_direction);result.reason="BLOCK_NON_DESCENT";return result;
 }
 
 struct CovarianceProbeModes
@@ -3438,6 +3571,7 @@ struct CovarianceFitResult
 {
   bool converged=false;std::string status="NOT_STARTED",reason="none",epsilon_constraint_status="NOT_COMPUTED";
   std::string initialization_status="NOT_STARTED",start_gradient_solve_status="NOT_RUN",bfgs_seed_source="UNIT_IDENTITY";
+  bool block_newton_enabled=false;std::string direction_method="BFGS",direction_reason="NOT_REQUESTED";
   std::string line_search_failure_status="NONE",directional_derivative_status="NOT_RUN",directional_derivative_side="NONE";
   std::vector<double> statistics,theta_baseline,theta_start,theta;
   std::vector<double> coordinate_scale;
@@ -3454,6 +3588,10 @@ struct CovarianceFitResult
   double start_gradient_barrier_scaled_inf_norm=std::numeric_limits<double>::quiet_NaN(),bfgs_seed_gamma=1.0;
   double directional_derivative_slope=std::numeric_limits<double>::quiet_NaN(),directional_derivative_finite_difference=std::numeric_limits<double>::quiet_NaN();
   double directional_derivative_step=std::numeric_limits<double>::quiet_NaN();
+  double direction_bfgs_slope=std::numeric_limits<double>::quiet_NaN(),direction_selected_slope=std::numeric_limits<double>::quiet_NaN();
+  double direction_block_slope=std::numeric_limits<double>::quiet_NaN(),direction_block_damping=std::numeric_limits<double>::quiet_NaN();
+  double direction_block_residual=std::numeric_limits<double>::quiet_NaN(),direction_block_asymmetry=std::numeric_limits<double>::quiet_NaN();
+  double direction_block_gradient_inf=std::numeric_limits<double>::quiet_NaN(),direction_block_seconds=0.0;
   double barrier_tau=std::numeric_limits<double>::quiet_NaN(),barrier_gap_estimate=std::numeric_limits<double>::quiet_NaN();
   double kkt_gradient_denominator=std::numeric_limits<double>::quiet_NaN();
   double worst_solve_relative_residual=std::numeric_limits<double>::quiet_NaN(),optimizer_seconds=0.0;
@@ -3461,6 +3599,9 @@ struct CovarianceFitResult
   std::uint64_t shifted_not_spd_trials=0,armijo_reject_trials=0,gradient_residual_reject_trials=0;
   std::uint64_t directional_overshoot_reject_trials=0;
   std::uint64_t directional_diagnostic_evaluations=0,factorizations=0,solve_rhs_columns=0;bool barrier_center_condition_pass=false;
+  std::uint64_t block_newton_factorizations=0,block_newton_rhs_columns=0;double block_newton_seconds=0.0;
+  int direction_dominant_parameter=-1,direction_group=-1;
+  std::size_t direction_group_support=0;std::vector<int> direction_group_atoms;
   int iterations=0;
 };
 
@@ -3693,6 +3834,26 @@ bool covariance_build_scaled_trial(const std::vector<double>& theta,const std::v
   if(!std::all_of(next_theta.begin(),next_theta.end(),[](double value){return std::isfinite(value);}))
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance trial parameter is non-finite");
   return next_theta!=theta;
+}
+
+CovarianceDirectionChoice covariance_preflight_block_direction(const std::vector<double>& theta,const std::vector<double>& z,
+  const std::vector<double>& coordinate_scale,const std::vector<double>& gradient,const std::vector<double>& bfgs_direction,
+  const double bfgs_slope,CovarianceDirectionChoice choice)
+{
+  if(choice.method=="BFGS")return choice;
+  if(theta.size()!=z.size()||theta.size()!=coordinate_scale.size()||theta.size()!=gradient.size()||theta.size()!=choice.direction.size()||
+     theta.size()!=bfgs_direction.size())throw std::invalid_argument("native covariance direction preflight dimensions do not match");
+  const double direction_inf_norm=covariance_norm_inf(choice.direction);
+  if(!std::isfinite(direction_inf_norm)||!(direction_inf_norm>0.0))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block direction has an invalid infinity norm");
+  double alpha=std::min(1.0,1.0/direction_inf_norm);
+  while(alpha*direction_inf_norm>1.0)alpha=std::nextafter(alpha,0.0);
+  if(!std::isfinite(alpha)||!(alpha>0.0))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block initial step is not representable");
+  std::vector<double> next_z,step,next_theta;
+  if(covariance_build_scaled_trial(theta,z,coordinate_scale,choice.direction,alpha,next_z,step,next_theta))return choice;
+  choice.direction=bfgs_direction;choice.method="BFGS";choice.reason="BLOCK_STEP_UNREPRESENTABLE_BFGS_FALLBACK";choice.selected_slope=bfgs_slope;
+  if(!std::isfinite(choice.selected_slope)||!(choice.selected_slope<0.0))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS fallback direction is not descent");
+  return choice;
 }
 
 struct CovarianceBFGSHistory
@@ -3936,9 +4097,9 @@ void apply_covariance_directional_diagnostic(CovarianceFitResult& result,const c
 }
 
 CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,const std::vector<double>& statistics,
-  const double epsilon,const double rho,const int max_iterations,std::ostream* trace=nullptr)
+  const double epsilon,const double rho,const int max_iterations,std::ostream* trace=nullptr,const bool block_newton=false)
 {
-  CovarianceFitResult result;result.statistics=statistics;const auto started=std::chrono::steady_clock::now();
+  CovarianceFitResult result;result.statistics=statistics;result.block_newton_enabled=block_newton;const auto started=std::chrono::steady_clock::now();
   bool initialization_complete=false,start_gradient_attempted=false;
   auto flush_trace=[&](){if(trace){trace->flush();if(!*trace)throw std::runtime_error("failed writing covariance optimizer trace");}};
   try{
@@ -3947,6 +4108,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     result.theta_baseline=baseline.theta;result.theta_start=baseline.theta;result.theta=baseline.theta;result.baseline_mu=baseline.mu;
     result.epsilon_constraint_status=baseline.epsilon_constraint_active?"ACTIVE":"INACTIVE";
     if(trace)*trace<<"BASELINE_SPD_PASS baseline_mu "<<baseline.mu<<" epsilon_constraint_status "<<result.epsilon_constraint_status<<'\n';flush_trace();
+    if(trace)*trace<<"COVARIANCE_DIRECTION_MODE block_newton="<<(block_newton?"ENABLED":"DISABLED")<<" default_method=BFGS\n";flush_trace();
     const std::vector<double> coordinate_scale=system.coordinate_scales(baseline.theta,epsilon);result.coordinate_scale=coordinate_scale;
     double tau=1.0;std::uint64_t max_evaluations=result.objective_evaluations+std::max<std::uint64_t>(100,20ULL*static_cast<std::uint64_t>(max_iterations));
 #ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
@@ -4044,13 +4206,75 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);
         covariance_reset_bfgs_history(bfgs,z.size(),true);sync_bfgs_seed();
         if(trace)*trace<<"BFGS_STAGE_RESET tau="<<tau<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source<<'\n';flush_trace();continue;}
-      const std::vector<double> g=scaled_gradient(current);std::vector<double> direction(z.size(),0.0);
-      for(std::size_t i=0;i<z.size();++i)for(std::size_t j=0;j<z.size();++j)direction[i]-=bfgs.inverse_hessian[i*z.size()+j]*g[j];
-      double slope=covariance_dot(g,direction);if(!std::isfinite(slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS direction is non-finite");
-      if(!(slope<0.0)){slope=covariance_reset_non_descent_direction(bfgs,g,direction);sync_bfgs_seed();
+      const std::vector<double> g=scaled_gradient(current);std::vector<double> bfgs_direction(z.size(),0.0);
+      for(std::size_t i=0;i<z.size();++i)for(std::size_t j=0;j<z.size();++j)bfgs_direction[i]-=bfgs.inverse_hessian[i*z.size()+j]*g[j];
+      double bfgs_slope=covariance_dot(g,bfgs_direction);if(!std::isfinite(bfgs_slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS direction is non-finite");
+      if(!(bfgs_slope<0.0)){bfgs_slope=covariance_reset_non_descent_direction(bfgs,g,bfgs_direction);sync_bfgs_seed();
         if(trace)*trace<<"BFGS_RESET iteration="<<result.iterations<<" tau="<<tau<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source<<" reason=NON_DESCENT\n";flush_trace();
       }
-      if(!std::isfinite(slope)||!(slope<0.0))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS direction is not a finite descent direction");
+      if(!std::isfinite(bfgs_slope)||!(bfgs_slope<0.0))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS direction is not a finite descent direction");
+      const std::size_t dominant_parameter=static_cast<std::size_t>(std::max_element(g.begin(),g.end(),[](double left,double right){return std::abs(left)<std::abs(right);})-g.begin());
+      const std::size_t group=dominant_parameter/6;CovarianceBlockNewtonResult block;block.status=block_newton?"NOT_EVALUATED":"BLOCK_NEWTON_DISABLED";
+      const std::uint64_t block_factor_start=system.factorizations,block_rhs_start=system.solve_rhs_columns;
+      const auto block_started=std::chrono::steady_clock::now();std::vector<int> support_atoms;
+      std::size_t support_count=0;double block_gradient_inf=std::numeric_limits<double>::quiet_NaN();
+      if(block_newton){
+        const CovarianceLocalGroupBasis local=covariance_local_group_basis(system.graph,system.sqrt_mass_host,system.n,static_cast<int>(group),32);
+        support_count=local.support_count;support_atoms=local.atoms;
+        if(local.status!="READY")block.status=local.status;
+        else{
+          std::array<double,6> local_gradient{};for(int a=0;a<6;++a)local_gradient[a]=g[6*group+static_cast<std::size_t>(a)];
+          block_gradient_inf=covariance_norm_inf(std::vector<double>(local_gradient.begin(),local_gradient.end()));
+          CovarianceProbeSolveSession session(system,system.sqrt_atom_host);session.factor(result.theta,epsilon,true,true);
+          std::vector<std::vector<double>> unit(static_cast<std::size_t>(local.dimension),std::vector<double>(static_cast<std::size_t>(system.d),0.0));
+          for(int column=0;column<local.dimension;++column){const int axis=column/static_cast<int>(local.atoms.size());
+            const int atom=local.atoms[static_cast<std::size_t>(column)%local.atoms.size()];unit[static_cast<std::size_t>(column)][static_cast<std::size_t>(axis)*system.n+atom]=1.0;}
+          const CovarianceProbeBatch solved_d=session.solve(unit,false),solved_s=session.solve(unit,true);
+          auto finite_solutions=[&](const CovarianceProbeBatch& solved){if(solved.columns.size()!=solved.solution.size())return false;
+            for(const std::vector<double>& solution:solved.solution)if(solution.size()!=static_cast<std::size_t>(system.d)||
+                !std::all_of(solution.begin(),solution.end(),[](double value){return std::isfinite(value);}))return false;
+            for(const CovarianceProbeColumn& column:solved.columns)
+              if(!std::isfinite(column.factor_residual_pre)||!std::isfinite(column.original_residual_pre)||
+                 !std::isfinite(column.factor_residual_post)||!std::isfinite(column.original_residual_post)||
+                 !std::isfinite(column.quadratic_pre)||!std::isfinite(column.quadratic_post))return false;return true;};
+          if(!finite_solutions(solved_d)||!finite_solutions(solved_s))
+            throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance block probe returned non-finite residuals");
+          block.relative_residual=0.0;
+          for(const CovarianceProbeBatch* solved:{&solved_d,&solved_s})for(const CovarianceProbeColumn& column:solved->columns)
+            block.relative_residual=std::max(block.relative_residual,std::max(column.factor_residual_post,column.original_residual_post));
+          if(solved_d.status!="PASS"||solved_s.status!="PASS")block.status="LOCAL_SOLVE_RESIDUAL_FAIL";
+          else try{
+            double asymmetry_d=0.0,asymmetry_s=0.0;
+            const std::vector<double> inverse_d=covariance_local_inverse(solved_d,local,system.n,asymmetry_d);
+            const std::vector<double> inverse_s=covariance_local_inverse(solved_s,local,system.n,asymmetry_s);
+            const auto traces_d=covariance_local_trace_products(inverse_d,local),traces_s=covariance_local_trace_products(inverse_s,local);
+            const CovarianceLocalHessianTerms terms=covariance_local_group_hessian(traces_d,traces_s,rho,tau,coordinate_scale,6*group);
+            block=covariance_local_newton_direction(terms.total,local_gradient);
+            block.asymmetry=std::max({block.asymmetry,asymmetry_d,asymmetry_s});
+          }catch(const CovarianceLocalInverseAsymmetryError& error){block.status="LOCAL_INVERSE_ASYMMETRY";block.asymmetry=error.relative_asymmetry;}
+        }
+      }
+      const std::uint64_t block_factorizations=system.factorizations-block_factor_start,block_rhs_columns=system.solve_rhs_columns-block_rhs_start;
+      CovarianceDirectionChoice choice;choice.direction=bfgs_direction;choice.selected_slope=bfgs_slope;choice.reason=block.status;
+      if(block_newton)choice=covariance_choose_block_direction(g,bfgs_direction,group,block);
+      if(block_newton)choice=covariance_preflight_block_direction(result.theta,z,coordinate_scale,g,bfgs_direction,bfgs_slope,std::move(choice));
+      std::vector<double> direction=std::move(choice.direction);const double slope=choice.selected_slope;
+      if(!std::isfinite(slope)||!(slope<0.0))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance selected direction is not a finite descent direction");
+      const double block_seconds=block_newton?std::chrono::duration<double>(std::chrono::steady_clock::now()-block_started).count():0.0;
+      result.block_newton_factorizations+=block_factorizations;result.block_newton_rhs_columns+=block_rhs_columns;result.block_newton_seconds+=block_seconds;
+      result.direction_method=choice.method;result.direction_reason=choice.reason;result.direction_bfgs_slope=bfgs_slope;
+      result.direction_selected_slope=slope;result.direction_block_slope=block.slope;result.direction_block_damping=block.damping;
+      result.direction_block_residual=block.relative_residual;result.direction_block_asymmetry=block.asymmetry;
+      result.direction_block_gradient_inf=block_gradient_inf;result.direction_block_seconds=block_seconds;
+      result.direction_dominant_parameter=static_cast<int>(dominant_parameter);result.direction_group=static_cast<int>(group);
+      result.direction_group_support=support_count;result.direction_group_atoms=std::move(support_atoms);
+      if(trace){*trace<<"COVARIANCE_DIRECTION iteration="<<result.iterations<<" tau="<<tau<<" dominant_parameter="<<dominant_parameter
+          <<" group="<<group<<" support="<<support_count<<" method="<<choice.method<<" reason="<<choice.reason
+          <<" damping="<<block.damping<<" block_gradient_inf="<<block_gradient_inf<<" block_slope="<<block.slope
+          <<" block_asymmetry="<<block.asymmetry<<" block_linear_residual="<<block.relative_residual
+          <<" bfgs_slope="<<bfgs_slope<<" selected_slope="<<slope<<" extra_factorizations="<<block_factorizations
+          <<" extra_rhs_columns="<<block_rhs_columns<<" extra_seconds="<<block_seconds<<" support_atoms";
+        for(const int atom:result.direction_group_atoms)*trace<<' '<<atom;*trace<<'\n';}flush_trace();
       const double direction_inf_norm=covariance_norm_inf(direction);
       if(!std::isfinite(direction_inf_norm)||!(direction_inf_norm>0.0))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance BFGS direction has an invalid infinity norm");
       double alpha=std::min(1.0,1.0/direction_inf_norm);
@@ -4145,12 +4369,16 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       }
       result.failed_trial.failure_stage="BFGS_COMMIT_PENDING";
       const double predicted_first_order_decrease=-covariance_dot(g,step),actual_objective_decrease=current.objective-next.objective;
+      const std::vector<double> next_gradient=scaled_gradient(next);
+      const std::size_t next_dominant_parameter=static_cast<std::size_t>(std::max_element(next_gradient.begin(),next_gradient.end(),
+        [](double left,double right){return std::abs(left)<std::abs(right);})-next_gradient.begin());
       if(trace)*trace<<"OPT_STEP iteration="<<iteration<<" tau="<<tau<<" objective_data="<<next.data<<" objective_prior="<<next.prior
         <<" objective_barrier="<<next.barrier<<" scaled_kkt_residual="<<kkt(next)<<" raw_gradient_inf_norm="<<covariance_norm_inf(next.gradient)
+        <<" dominant_scaled_gradient_parameter="<<next_dominant_parameter<<" dominant_scaled_gradient_group="<<next_dominant_parameter/6
         <<" accepted_alpha="<<alpha<<" line_search_trials="<<line_trials
         <<" predicted_first_order_decrease="<<predicted_first_order_decrease
         <<" actual_objective_decrease="<<actual_objective_decrease<<"\n";flush_trace();
-      const std::vector<double> next_gradient=scaled_gradient(next);std::vector<double> change(z.size());
+      std::vector<double> change(z.size());
       for(std::size_t i=0;i<z.size();++i)change[i]=next_gradient[i]-g[i];
       const double bfgs_sy=covariance_dot(step,change),bfgs_step_norm=covariance_dot(step,step),bfgs_y_norm=covariance_dot(change,change);
       const CovarianceBFGSUpdateStatus bfgs_update=covariance_update_inverse_hessian(bfgs,step,change);sync_bfgs_seed();
@@ -4164,6 +4392,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       z=std::move(next_z);result.theta=std::move(next_theta);current=std::move(next);++result.iterations;
       if(trace)*trace<<"STEP_COMMITTED iteration="<<iteration<<" tau="<<tau<<" alpha="<<alpha
         <<" scaled_kkt_residual="<<result.last_valid.scaled_kkt_residual<<" objective="<<result.last_valid.objective
+        <<" dominant_scaled_gradient_parameter="<<next_dominant_parameter<<" dominant_scaled_gradient_group="<<next_dominant_parameter/6
         <<" predicted_first_order_decrease="<<predicted_first_order_decrease
         <<" actual_objective_decrease="<<actual_objective_decrease<<" bfgs_sy="<<bfgs_sy
         <<" bfgs_s_norm2="<<bfgs_step_norm<<" bfgs_y_norm2="<<bfgs_y_norm
@@ -4246,7 +4475,18 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\nstart_gradient_data_scaled_inf_norm "<<fit.start_gradient_data_scaled_inf_norm
     <<"\nstart_gradient_prior_scaled_inf_norm "<<fit.start_gradient_prior_scaled_inf_norm
     <<"\nstart_gradient_barrier_scaled_inf_norm "<<fit.start_gradient_barrier_scaled_inf_norm
-    <<"\nbfgs_seed_gamma "<<fit.bfgs_seed_gamma<<"\nbfgs_seed_source "<<fit.bfgs_seed_source
+    <<"\noptimizer_step_mode "<<(fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")
+    <<"\nblock_newton_enabled "<<(fit.block_newton_enabled?1:0)<<"\nblock_newton_factorizations "<<fit.block_newton_factorizations
+    <<"\nblock_newton_rhs_columns "<<fit.block_newton_rhs_columns<<"\nblock_newton_seconds "<<fit.block_newton_seconds
+    <<"\ndirection_method "<<fit.direction_method<<"\ndirection_reason "<<fit.direction_reason
+    <<"\ndirection_dominant_parameter "<<fit.direction_dominant_parameter<<"\ndirection_group "<<fit.direction_group
+    <<"\ndirection_group_support "<<fit.direction_group_support<<"\ndirection_bfgs_slope "<<fit.direction_bfgs_slope
+    <<"\ndirection_selected_slope "<<fit.direction_selected_slope<<"\ndirection_block_gradient_inf "<<fit.direction_block_gradient_inf
+    <<"\ndirection_block_slope "<<fit.direction_block_slope<<"\ndirection_block_damping "<<fit.direction_block_damping
+    <<"\ndirection_block_residual "<<fit.direction_block_residual<<"\ndirection_block_asymmetry "<<fit.direction_block_asymmetry
+    <<"\ndirection_block_seconds "<<fit.direction_block_seconds<<"\ndirection_group_atoms "<<fit.direction_group_atoms.size();
+  for(const int atom_index:fit.direction_group_atoms)out<<' '<<atom_index;
+  out<<"\nbfgs_seed_gamma "<<fit.bfgs_seed_gamma<<"\nbfgs_seed_source "<<fit.bfgs_seed_source
     <<"\nline_search_failure_status "<<fit.line_search_failure_status<<"\nline_search_trials "<<fit.line_search_trials
     <<"\nline_search_evaluations "<<fit.line_search_evaluations
     <<"\nshifted_not_spd_trials "<<fit.shifted_not_spd_trials<<"\narmijo_reject_trials "<<fit.armijo_reject_trials
@@ -4465,12 +4705,17 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     const std::vector<double> statistics=collect_covariance_fit_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),graph,r0,options.temperature);
     covariance_fit.statistics=statistics;
     try{DeviceCovarianceSystem covariance_system(baseline,graph,sqrt_mass,atom.cpu_mass);
-      covariance_fit=solve_covariance_reference(covariance_system,statistics,options.epsilon,options.covariance_shrinkage,options.max_covariance_iterations,&trace);}
+      covariance_fit=solve_covariance_reference(covariance_system,statistics,options.epsilon,options.covariance_shrinkage,
+        options.max_covariance_iterations,&trace,options.covariance_block_newton);}
     catch(const std::exception& error){if(covariance_fit.reason=="none"){covariance_fit.status="NUMERICAL_SOLVE_FAIL";covariance_fit.reason=error.what();}}
     if(covariance_fit.theta_baseline.empty())
       trace<<"BASELINE_SPD_FAIL status "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)<<'\n';
     trace<<"COVARIANCE_OPTIMIZER status "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)
       <<" objective_evaluations "<<covariance_fit.objective_evaluations<<" factorizations "<<covariance_fit.factorizations
+      <<" optimizer_step_mode "<<(covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")
+      <<" block_newton_extra_factorizations "<<covariance_fit.block_newton_factorizations
+      <<" block_newton_extra_rhs_columns "<<covariance_fit.block_newton_rhs_columns<<" block_newton_extra_seconds "<<covariance_fit.block_newton_seconds
+      <<" last_direction_method "<<covariance_fit.direction_method<<" last_direction_reason "<<covariance_fit.direction_reason
       <<" solve_rhs_columns "<<covariance_fit.solve_rhs_columns<<" optimizer_seconds "<<covariance_fit.optimizer_seconds
       <<" scaled_kkt_residual "<<covariance_fit.scaled_kkt_residual<<" raw_gradient_inf_norm "<<covariance_fit.raw_gradient_inf_norm<<" barrier_tau "<<covariance_fit.barrier_tau
       <<" initialization_status "<<covariance_fit.initialization_status<<" initialization_evaluations "<<covariance_fit.initialization_evaluations
@@ -4678,7 +4923,22 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<"\nstart_gradient_data_scaled_inf_norm "<<covariance_fit.start_gradient_data_scaled_inf_norm
       <<"\nstart_gradient_prior_scaled_inf_norm "<<covariance_fit.start_gradient_prior_scaled_inf_norm
       <<"\nstart_gradient_barrier_scaled_inf_norm "<<covariance_fit.start_gradient_barrier_scaled_inf_norm
-      <<"\nbfgs_seed_gamma "<<covariance_fit.bfgs_seed_gamma<<"\nbfgs_seed_source "<<covariance_fit.bfgs_seed_source
+      <<"\noptimizer_step_mode "<<(covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")
+      <<"\nblock_newton_enabled "<<(covariance_fit.block_newton_enabled?1:0)
+      <<"\nblock_newton_factorizations "<<covariance_fit.block_newton_factorizations
+      <<"\nblock_newton_rhs_columns "<<covariance_fit.block_newton_rhs_columns
+      <<"\nblock_newton_seconds "<<covariance_fit.block_newton_seconds
+      <<"\ndirection_method "<<covariance_fit.direction_method<<"\ndirection_reason "<<covariance_fit.direction_reason
+      <<"\ndirection_dominant_parameter "<<covariance_fit.direction_dominant_parameter
+      <<"\ndirection_group "<<covariance_fit.direction_group<<"\ndirection_group_support "<<covariance_fit.direction_group_support
+      <<"\ndirection_bfgs_slope "<<covariance_fit.direction_bfgs_slope<<"\ndirection_selected_slope "<<covariance_fit.direction_selected_slope
+      <<"\ndirection_block_gradient_inf "<<covariance_fit.direction_block_gradient_inf
+      <<"\ndirection_block_slope "<<covariance_fit.direction_block_slope<<"\ndirection_block_damping "<<covariance_fit.direction_block_damping
+      <<"\ndirection_block_residual "<<covariance_fit.direction_block_residual<<"\ndirection_block_asymmetry "<<covariance_fit.direction_block_asymmetry
+      <<"\ndirection_block_seconds "<<covariance_fit.direction_block_seconds
+      <<"\ndirection_group_atoms "<<covariance_fit.direction_group_atoms.size();
+    for(const int atom_index:covariance_fit.direction_group_atoms)fitout<<' '<<atom_index;
+    fitout<<"\nbfgs_seed_gamma "<<covariance_fit.bfgs_seed_gamma<<"\nbfgs_seed_source "<<covariance_fit.bfgs_seed_source
       <<"\nobjective_data "<<covariance_fit.objective_data<<"\nobjective_prior "<<covariance_fit.objective_prior
       <<"\noptimizer_scaled_kkt_residual "<<covariance_fit.scaled_kkt_residual<<"\noptimizer_raw_gradient_inf_norm "<<covariance_fit.raw_gradient_inf_norm<<"\nbarrier_tau "<<covariance_fit.barrier_tau
         <<"\nbarrier_center_condition_status "<<(covariance_fit.barrier_center_condition_pass?"PASS":"NOT_VERIFIED")
@@ -5151,10 +5411,10 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
             const std::vector<double> inverse_d=covariance_local_inverse(local_d,local,header.n,hessian_d_asymmetry);
             const std::vector<double> inverse_s=covariance_local_inverse(local_s,local,header.n,hessian_s_asymmetry);
             const auto traces_d=covariance_local_trace_products(inverse_d,local),traces_s=covariance_local_trace_products(inverse_s,local);
-            for(int a=0;a<6;++a)for(int b=0;b<6;++b){const std::size_t at=static_cast<std::size_t>(a)*6+b;
-              const double scale_a=coordinate_scale[static_cast<std::size_t>(6*hessian_group+a)],scale_b=coordinate_scale[static_cast<std::size_t>(6*hessian_group+b)];
-              hessian_data[at]=0.5*traces_d[at]*scale_a*scale_b;hessian_prior[at]=0.5*rho*traces_d[at]*scale_a*scale_b;
-              hessian_barrier[at]=tau*traces_s[at]*scale_a*scale_b;hessian_total[at]=hessian_data[at]+hessian_prior[at]+hessian_barrier[at];}
+            const CovarianceLocalHessianTerms terms=covariance_local_group_hessian(traces_d,traces_s,rho,tau,coordinate_scale,
+              static_cast<std::size_t>(6*hessian_group));
+            hessian_data.assign(terms.data.begin(),terms.data.end());hessian_prior.assign(terms.prior.begin(),terms.prior.end());
+            hessian_barrier.assign(terms.barrier.begin(),terms.barrier.end());hessian_total.assign(terms.total.begin(),terms.total.end());
             const SmallEigen eigen=eigen_small(covariance_system.solver,hessian_total,6);hessian_eigenvalues=eigen.values;hessian_status="EVALUATED_CONDITIONAL_FIXED_OTHER_THETA_TAU";
             double top=0.0;for(double value:hessian_eigenvalues)top=std::max(top,std::abs(value));
         if(top>0.0&&hessian_eigenvalues.front()>top*1e-10){NeumaierAccumulator decrement2;const double* gradient=saved_point.evaluation.gradient.data()+6*hessian_group;

@@ -182,7 +182,8 @@ assert "max_rounds <N>" in fit_samples_parser and "[<qraw>] [max_rounds <N>]" in
 assert 'if (tokens[1] == "fit_samples_covariance")' in run
 assert 'if (tokens[1] == "diagnose_covariance")' in run
 assert 'diagnose_rpmd_ja_native_covariance(tokens[2], tokens[3]' in run
-assert 'tokens.size() != 14 || tokens[10] != "shrinkage" || tokens[12] != "max_iter"' in run
+assert '(tokens.size() != 14 && tokens.size() != 15)' in run and 'tokens[14] != "block_newton"' in run
+assert 'options.covariance_block_newton = tokens.size() == 15;' in run
 assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
 assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
 assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
@@ -281,8 +282,8 @@ covariance_optimizer = native_fit.split("CovarianceFitResult solve_covariance_re
 assert covariance_optimizer.index("covariance_backtrack_armijo(") < covariance_optimizer.index("if(!accepted)")
 assert covariance_optimizer.index("if(!accepted)") < covariance_optimizer.index("covariance_update_inverse_hessian(bfgs,step,change)")
 assert covariance_optimizer.index("covariance_update_inverse_hessian(bfgs,step,change)") < covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('"STEP_COMMITTED iteration="')
-non_descent_branch = covariance_optimizer.split("if(!(slope<0.0))", 1)[1].split("const double direction_inf_norm", 1)[0]
-assert "covariance_reset_non_descent_direction(bfgs,g,direction)" in non_descent_branch
+non_descent_branch = covariance_optimizer.split("if(!(bfgs_slope<0.0))", 1)[1].split("const double direction_inf_norm", 1)[0]
+assert "covariance_reset_non_descent_direction(bfgs,g,bfgs_direction)" in non_descent_branch
 assert "CovarianceFitTestHooks" in native_fit and "gradient_residual_failures_remaining" in native_fit
 assert "test_covariance_non_descent_reset_uses_restored_gamma" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_solver_residual_retry_commits_once" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
@@ -625,3 +626,28 @@ check_multicell_mic([[10.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 6.0]],
                     [0.2, -0.4, 1.1], [3.0, -2.0, 4.0])
 check_multicell_mic([[4.0, 0.7, -0.3], [0.0, 3.5, 0.4], [0.2, 0.0, 5.0]],
                     [0.15, 0.2, -0.3], [-3.0, 4.0, 2.0])
+
+assert "bool covariance_block_newton = false;" in native_header
+assert "fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton]." in run
+assert "options.max_covariance_iterations,&trace,options.covariance_block_newton" in native_fit
+assert "COVARIANCE_DIRECTION_MODE block_newton=" in native_fit
+assert 'result.method="HYBRID"' in native_fit and 'result.method="BLOCK"' in native_fit and 'method="BFGS"' in native_fit
+assert "block_newton_factorizations" in native_fit and "block_newton_rhs_columns" in native_fit and "block_newton_seconds" in native_fit
+assert "direction_dominant_parameter" in native_fit and "direction_selected_slope" in native_fit
+assert "dominant_scaled_gradient_parameter=" in native_fit and "dominant_scaled_gradient_group=" in native_fit
+assert "house[axis*system.n+atom]" in native_fit
+probe_solve = native_fit[native_fit.index("class CovarianceProbeSolveSession"):native_fit.index("struct CovarianceOperatorGram")]
+assert probe_solve.count("house[axis*system.n+atom]") == 4
+assert "covariance_local_group_hessian(" in native_fit
+assert native_fit.count("covariance_local_group_hessian(traces_d,traces_s") >= 2
+assert native_fit.index("double covariance_dot(const std::vector<double>& left,const std::vector<double>& right);") < native_fit.index("CovarianceDirectionChoice covariance_choose_block_direction")
+assert "session.factor(result.theta,epsilon,true,true)" in native_fit
+assert "if(!finite_solutions(solved_d)||!finite_solutions(solved_s))" in native_fit
+assert "catch(const CovarianceLocalInverseAsymmetryError& error)" in native_fit
+assert "catch(...)" not in native_fit[native_fit.index("if(block_newton){", native_fit.index("CovarianceFitResult solve_covariance_reference")):native_fit.index("const std::uint64_t block_factorizations=", native_fit.index("CovarianceFitResult solve_covariance_reference"))]
+assert "constexpr double damping_values[]={0.0,1e-12,1e-10,1e-8,1e-6,1e-4,1e-2,1.0}" in native_fit
+assert "test_covariance_block_newton_host_arithmetic" in cuda_test
+assert "test_covariance_block_newton_optimizer_direction_trace" in cuda_test
+assert "covariance_preflight_block_direction" in cuda_test and "BLOCK_STEP_UNREPRESENTABLE_BFGS_FALLBACK" in native_fit
+assert "for(const bool block_newton:{false,true})" in cuda_test
+assert "physical_rhs(6,std::vector<double>(6,0.0))" in cuda_test

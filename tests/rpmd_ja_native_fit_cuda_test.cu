@@ -799,6 +799,15 @@ void test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly()
   constexpr double small_eigenvalue=1e-5,epsilon=1e-7;std::vector<double> theta(6,0.0);theta[0]=(-1.0+small_eigenvalue)/1.25;
   CovarianceProbeSolveSession session(system,sqrt_atom);const std::uint64_t factors_before=system.factorizations;
   session.factor(theta,epsilon,true,true);assert(system.factorizations-factors_before==2);
+  std::vector<std::vector<double>> physical_rhs(6,std::vector<double>(6,0.0));
+  for(int axis=0;axis<3;++axis)for(int atom=0;atom<2;++atom)physical_rhs[2*axis+atom][axis*2+atom]=1.0;
+  for(const bool shifted:{false,true}){const CovarianceProbeBatch physical=session.solve(physical_rhs,shifted);assert(physical.status=="PASS");
+    for(std::size_t column=0;column<physical_rhs.size();++column){std::vector<double> expected=physical_rhs[column],action(6),base(6),add(6),residual(6);
+      project_translation(expected,sqrt_atom,2);baseline.apply(physical.solution[column],base);
+      apply_additive(graph,physical.solution[column],sqrt_mass,sqrt_atom,theta,2,add);
+      for(int i=0;i<6;++i){action[i]=base[i]+add[i]-(shifted?epsilon*physical.solution[column][i]:0.0);residual[i]=action[i]-expected[i];}
+      project_translation(residual,sqrt_atom,2);const double relative=std::sqrt(compensated_dot(residual,residual))/
+        std::max(std::sqrt(compensated_dot(expected,expected)),1e-300);assert(std::isfinite(relative)&&relative<=2e-7);}}
   std::vector<std::vector<double>> rhs(33,std::vector<double>(6,0.0));for(std::size_t i=0;i<rhs.size();++i)rhs[i][(i%2)*2]=1.0;
   const CovarianceProbeBatch solved=session.solve(rhs,false);assert(solved.status=="PASS"&&solved.columns.size()==33);
   assert(system.factorizations-factors_before==2);
@@ -879,7 +888,13 @@ void test_covariance_local_group_hessian_matches_tiny_objective_fd(cusolverDnHan
     NeumaierAccumulator sum;for(int i=0;i<d;++i)for(int j=0;j<d;++j)sum.add_product(xa[static_cast<std::size_t>(i)*d+j],xb[static_cast<std::size_t>(j)*d+i]);return sum.value();};
   for(const auto& op:{std::make_pair(0.0,&trace_d),std::make_pair(epsilon,&trace_s)}){const std::vector<double> inverse=full_inverse(op.first);
     for(int a=0;a<6;++a)for(int b=0;b<6;++b)check_close((*op.second)[static_cast<std::size_t>(a)*6+b],full_trace(inverse,a,b),2e-7);}
-  const double analytic=0.5*(1.0+rho)*trace_d[0]+tau*trace_s[0];
+  const CovarianceLocalHessianTerms hessian=covariance_local_group_hessian(trace_d,trace_s,rho,tau,std::vector<double>(6,1.0),0);
+  const double analytic=hessian.total[0];
+  std::vector<double> extended_scale(12);for(std::size_t i=0;i<extended_scale.size();++i)extended_scale[i]=0.25+0.125*i;
+  const CovarianceLocalHessianTerms scaled_hessian=covariance_local_group_hessian(trace_d,trace_s,rho,tau,extended_scale,6);
+  for(int a=0;a<6;++a)for(int b=0;b<6;++b){const std::size_t at=static_cast<std::size_t>(a)*6+b;
+    const double expected=(0.5*(1.0+rho)*trace_d[at]+tau*trace_s[at])*extended_scale[6+a]*extended_scale[6+b];
+    check_close(scaled_hessian.total[at],expected,2e-15);}
   CovarianceBaseline reference;reference.theta=theta;std::vector<double> shifted_trace;
   assert(system.evaluate_factors(theta,epsilon,reference.logdet,reference.shifted_logdet,&reference.trace,&shifted_trace,false,true));
   const std::vector<double> statistics={0.2,-0.03,0.04,0.25,0.01,0.3};std::uint64_t evaluations=0;
@@ -904,6 +919,55 @@ void test_covariance_force_residual_uses_training_frames_only()
   spool.seekg(0);const std::vector<double> theta(6,0.0);
   const auto residuals=compare_covariance_training_force_residuals(spool,header,3,2,graph,std::vector<double>(6,0.0),baseline,sqrt_mass,sqrt_atom,theta,theta);
   assert(std::isfinite(residuals.first)&&std::isfinite(residuals.second));
+}
+
+void test_covariance_block_newton_host_arithmetic()
+{
+  std::array<double,36> diagonal_hessian{};std::array<double,6> gradient{};
+  const double diagonal[6]={1e-8,1e-4,1.0,1e2,1e4,1e8};
+  for(int i=0;i<6;++i){diagonal_hessian[static_cast<std::size_t>(i)*6+i]=diagonal[i];gradient[i]=2.0*diagonal[i];}
+  const CovarianceBlockNewtonResult equilibrated=covariance_local_newton_direction(diagonal_hessian,gradient);
+  assert(equilibrated.status=="PASS"&&equilibrated.damping==0.0&&equilibrated.relative_residual<=1e-8);
+  for(const double value:equilibrated.direction)check_close(value,-2.0,1e-12);
+  bool nonfinite_threw=false;gradient[0]=std::numeric_limits<double>::infinity();
+  try{(void)covariance_local_newton_direction(diagonal_hessian,gradient);}catch(const std::runtime_error&){nonfinite_threw=true;}
+  assert(nonfinite_threw);gradient[0]=2.0*diagonal[0];
+  std::array<double,36> asymmetric_hessian{};for(int i=0;i<6;++i)asymmetric_hessian[static_cast<std::size_t>(i)*6+i]=1.0;
+  asymmetric_hessian[1]=1e-4;assert(covariance_local_newton_direction(asymmetric_hessian,gradient).status=="HESSIAN_NOT_SYMMETRIC");
+  std::array<double,36> nonpositive_hessian{};nonpositive_hessian[0]=0.0;
+  assert(covariance_local_newton_direction(nonpositive_hessian,gradient).status=="NONPOSITIVE_DIAGONAL");
+
+  std::array<double,36> damped_hessian{};for(int i=0;i<6;++i)damped_hessian[static_cast<std::size_t>(i)*6+i]=1.0;
+  damped_hessian[1]=damped_hessian[6]=1.0001;gradient={1.0,0.5,0.0,0.0,0.0,0.0};
+  const CovarianceBlockNewtonResult damped=covariance_local_newton_direction(damped_hessian,gradient);
+  assert(damped.status=="PASS"&&damped.damping>0.0&&damped.damping<=1e-2&&damped.relative_residual<=1e-8&&damped.slope<0.0);
+
+  std::vector<double> full_gradient(12,0.0),bfgs_direction(12,0.0);full_gradient[0]=1.0;full_gradient[6]=1.0;
+  bfgs_direction[0]=-5.0;bfgs_direction[6]=4.0;CovarianceBlockNewtonResult block;block.status="PASS";block.direction[0]=-2.0;
+  const CovarianceDirectionChoice pure_block=covariance_choose_block_direction(full_gradient,bfgs_direction,0,block);
+  assert(pure_block.method=="BLOCK"&&pure_block.reason=="HYBRID_NON_DESCENT_BLOCK_DESCENT"&&pure_block.selected_slope==-2.0);
+  std::vector<double> hybrid_gradient(6,0.0),hybrid_bfgs(6,0.0);hybrid_gradient[0]=1.0;hybrid_bfgs[0]=-1.0;
+  const CovarianceDirectionChoice hybrid=covariance_choose_block_direction(hybrid_gradient,hybrid_bfgs,0,block);
+  assert(hybrid.method=="HYBRID"&&hybrid.reason=="HYBRID_DESCENT"&&hybrid.selected_slope<0.0);
+  block.status="LOCAL_SOLVE_RESIDUAL_FAIL";const CovarianceDirectionChoice fallback=covariance_choose_block_direction(full_gradient,bfgs_direction,0,block);
+  assert(fallback.method=="BFGS"&&fallback.direction==bfgs_direction&&fallback.reason=="LOCAL_SOLVE_RESIDUAL_FAIL");
+  const std::vector<double> theta={0.7316913311810651},scale={0.000145},z={theta[0]/scale[0]},preflight_gradient={1.0},preflight_bfgs={-1.0};
+  CovarianceDirectionChoice unrepresentable;unrepresentable.method="BLOCK";unrepresentable.direction={-1e-20};unrepresentable.selected_slope=-1e-20;
+  const CovarianceDirectionChoice preflight=covariance_preflight_block_direction(theta,z,scale,preflight_gradient,preflight_bfgs,-1.0,unrepresentable);
+  assert(preflight.method=="BFGS"&&preflight.direction==preflight_bfgs&&preflight.selected_slope==-1.0&&
+    preflight.reason=="BLOCK_STEP_UNREPRESENTABLE_BFGS_FALLBACK");
+
+  Graph graph;graph.type_pairs={{0,1}};for(int atom=1;atom<=32;++atom){Edge edge;edge.i=0;edge.j=atom;edge.group=0;graph.edges.push_back(edge);}
+  const CovarianceLocalGroupBasis capped=covariance_local_group_basis(graph,std::vector<double>(3*33,1.0),33,0,32);
+  assert(capped.status=="NOT_EVALUATED_SUPPORT_CAP"&&capped.support_count==33);
+
+  const Graph tiny=make_two_atom_covariance_graph();const CovarianceLocalGroupBasis local=covariance_local_group_basis(tiny,{1.0,2.0,1.0,2.0,1.0,2.0},2,0,32);
+  CovarianceProbeBatch asymmetric;asymmetric.status="PASS";asymmetric.solution.assign(6,std::vector<double>(6,0.0));
+  for(int i=0;i<6;++i)asymmetric.solution[i][i]=1.0;asymmetric.solution[1][0]=2.0;
+  double relative_asymmetry=0.0;bool controlled=false;
+  try{(void)covariance_local_inverse(asymmetric,local,2,relative_asymmetry);}
+  catch(const CovarianceLocalInverseAsymmetryError&){controlled=true;}
+  assert(controlled&&std::isfinite(relative_asymmetry)&&relative_asymmetry>1e-8);
 }
 
 void test_covariance_baseline_brackets_both_signs_and_zero()
@@ -1034,6 +1098,23 @@ void test_covariance_initialization_shrinks_before_expanding()
   std::uint64_t evaluations=0;const CovarianceObjectiveEvaluation selected=evaluate_covariance_fit_objective(system,fit.theta_start,reference,statistics,0.1,0.01,1.0,evaluations);
   assert(selected.feasible);check_close(selected.objective,fit.start_objective,1e-12);
   check_close(covariance_norm_inf(selected.gradient),fit.start_raw_gradient_inf_norm,1e-12);
+}
+
+void test_covariance_block_newton_optimizer_direction_trace()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};std::ostringstream trace;
+  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,10,&trace,true);
+  const std::string log=trace.str();
+  assert(fit.block_newton_enabled&&fit.iterations>0&&fit.block_newton_factorizations>=2);
+  assert(fit.block_newton_rhs_columns>0&&fit.direction_group==0&&fit.direction_group_support==2);
+  assert(log.find("COVARIANCE_DIRECTION_MODE block_newton=ENABLED")!=std::string::npos);
+  assert(log.find("COVARIANCE_DIRECTION iteration=0")!=std::string::npos);
+  assert(log.find("method=HYBRID")!=std::string::npos||log.find("method=BLOCK")!=std::string::npos);
+  assert(log.find("extra_factorizations=2")!=std::string::npos&&log.find("extra_rhs_columns=")!=std::string::npos);
+  assert(log.find("dominant_scaled_gradient_parameter=")!=std::string::npos&&log.find("scaled_kkt_residual=")!=std::string::npos);
 }
 
 void test_covariance_initialization_reports_no_improvement_at_budget()
@@ -1264,46 +1345,55 @@ void test_covariance_non_descent_reset_uses_restored_gamma()
 
 void test_covariance_solver_residual_retry_commits_once()
 {
-  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
-  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
-  const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};std::ostringstream trace;
-  covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=1;
-  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace);
-  const std::vector<double> rejected_theta=covariance_fit_test_hooks.last_residual_rejected_theta;covariance_fit_test_hooks={};
-  const std::string log=trace.str();const std::size_t rejected=log.find("GRADIENT_RESIDUAL_REJECT iteration=0 ");
-  const std::size_t committed=log.find("STEP_COMMITTED iteration=0");
-  assert(rejected!=std::string::npos&&committed!=std::string::npos&&rejected<committed);
-  assert(fit.gradient_residual_reject_trials==1&&fit.iterations==1&&fit.theta==fit.last_valid.theta);
-  assert(!rejected_theta.empty()&&rejected_theta!=fit.theta);
-  assert(!fit.failed_trial.available&&fit.failed_trial.failure_stage=="NONE");
+  for(const bool block_newton:{false,true}){
+    DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+    const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+    const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};std::ostringstream trace;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=1;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,block_newton);
+    const std::vector<double> rejected_theta=covariance_fit_test_hooks.last_residual_rejected_theta;covariance_fit_test_hooks={};
+    const std::string log=trace.str();const std::size_t rejected=log.find("GRADIENT_RESIDUAL_REJECT iteration=0 ");
+    const std::size_t committed=log.find("STEP_COMMITTED iteration=0");
+    assert(rejected!=std::string::npos&&committed!=std::string::npos&&rejected<committed);
+    assert(fit.gradient_residual_reject_trials==1&&fit.iterations==1&&fit.theta==fit.last_valid.theta);
+    assert(!rejected_theta.empty()&&rejected_theta!=fit.theta);
+    assert(!fit.failed_trial.available&&fit.failed_trial.failure_stage=="NONE");
+    assert(fit.block_newton_enabled==block_newton);
+    if(block_newton)assert(log.find("COVARIANCE_DIRECTION iteration=0")!=std::string::npos&&fit.block_newton_factorizations==2);
+  }
 }
 
 void test_covariance_solver_residual_budget_preserves_state_points()
 {
-  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
-  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
-  const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};std::ostringstream trace;
-  covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=64;
-  covariance_fit_test_hooks.objective_evaluation_budget_after_baseline=16;
-  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace);
-  const std::vector<double> rejected_theta=covariance_fit_test_hooks.last_residual_rejected_theta;covariance_fit_test_hooks={};
-  assert(fit.status=="EVALUATION_BUDGET_EXHAUSTED"&&!fit.converged&&fit.iterations==0);
-  assert(fit.gradient_residual_reject_trials>0&&fit.last_valid.available&&fit.failed_trial.available);
-  assert(fit.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT"&&fit.last_valid.theta==fit.theta);
-  assert(fit.failed_trial.theta!=fit.last_valid.theta);
-  assert(rejected_theta==fit.failed_trial.theta);
+  for(const bool block_newton:{false,true}){
+    DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+    const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+    const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};std::ostringstream trace;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=64;
+    covariance_fit_test_hooks.objective_evaluation_budget_after_baseline=16;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,block_newton);
+    const std::vector<double> rejected_theta=covariance_fit_test_hooks.last_residual_rejected_theta;covariance_fit_test_hooks={};
+    assert(fit.status=="EVALUATION_BUDGET_EXHAUSTED"&&!fit.converged&&fit.iterations==0);
+    assert(fit.gradient_residual_reject_trials>0&&fit.last_valid.available&&fit.failed_trial.available);
+    assert(fit.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT"&&fit.last_valid.theta==fit.theta);
+    assert(fit.failed_trial.theta!=fit.last_valid.theta&&rejected_theta==fit.failed_trial.theta);
+    assert(fit.block_newton_enabled==block_newton);
+    if(block_newton)assert(trace.str().find("COVARIANCE_DIRECTION iteration=0")!=std::string::npos&&fit.block_newton_factorizations==2);
 
-  const std::string path="rpmd_ja_native_covariance_reject_state_test_"+
-    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
-  RpmdJANativeFitOptions options;options.cutoff=5.0;options.epsilon=1e-6;options.fd_step=1e-4;options.sample_interval=1;
-  SampleHeader header{};header.temperature=300.0;header.beads=4;QrawIdentity identity{};
-  write_covariance_state(path,fit,0.1,"test.samples","test.qraw",options,header,identity,graph,4,2);
-  std::ifstream state_file(path);const auto fields=read_covariance_state_fields(state_file);
-  assert(fields.at("status")=="EVALUATION_BUDGET_EXHAUSTED");
-  assert(fields.at("last_valid_available")=="1"&&fields.at("failed_trial_available")=="1");
-  assert(read_snapshot_vector(read_test_file(path),"last_valid_theta")==fit.last_valid.theta);
-  assert(read_snapshot_vector(read_test_file(path),"failed_trial_theta")==fit.failed_trial.theta);
-  assert(fit.failed_trial.theta!=fit.last_valid.theta);
+    const std::string path="rpmd_ja_native_covariance_reject_state_test_"+
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
+    RpmdJANativeFitOptions options;options.cutoff=5.0;options.epsilon=1e-6;options.fd_step=1e-4;options.sample_interval=1;options.covariance_block_newton=block_newton;
+    SampleHeader header{};header.temperature=300.0;header.beads=4;QrawIdentity identity{};
+    write_covariance_state(path,fit,0.1,"test.samples","test.qraw",options,header,identity,graph,4,2);
+    std::ifstream state_file(path);const auto fields=read_covariance_state_fields(state_file);
+    assert(fields.at("status")=="EVALUATION_BUDGET_EXHAUSTED");
+    assert(fields.at("block_newton_enabled")== (block_newton?"1":"0"));
+    assert(fields.at("optimizer_step_mode")== (block_newton?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT"));
+    assert(fields.at("last_valid_available")=="1"&&fields.at("failed_trial_available")=="1");
+    assert(read_snapshot_vector(read_test_file(path),"last_valid_theta")==fit.last_valid.theta);
+    assert(read_snapshot_vector(read_test_file(path),"failed_trial_theta")==fit.failed_trial.theta);
+    assert(fit.failed_trial.theta!=fit.last_valid.theta);
+  }
 }
 
 void test_covariance_fixed_coordinate_fd_uses_selected_coordinate_scale()
@@ -2784,6 +2874,7 @@ int main()
   test_covariance_force_residual_uses_training_frames_only();
   test_covariance_baseline_brackets_both_signs_and_zero();
   test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_solution();
+  test_covariance_block_newton_optimizer_direction_trace();
   test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status();
   test_covariance_initialization_shrinks_before_expanding();
   test_covariance_initialization_reports_no_improvement_at_budget();
@@ -2825,6 +2916,7 @@ int main()
   DeviceQR qr;qr.initialize(2,3);
   test_covariance_operator_gram_includes_shared_atom_overlap(qr.solver);
   test_covariance_local_group_hessian_matches_tiny_objective_fd(qr.solver);
+  test_covariance_block_newton_host_arithmetic();
   test_padded_qr_svd_and_cut_qp(qr.solver);
   test_active_set_qp_snapshot_and_rejection(qr.solver);
   test_active_set_preserves_svd_primal(qr.solver);
