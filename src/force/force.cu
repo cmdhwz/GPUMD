@@ -2,13 +2,13 @@
     Copyright 2017 Zheyong Fan and GPUMD development team
     This file is part of GPUMD.
     GPUMD is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
+    it under the terms of the GNU Lesser General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version. GPUMD is distributed in the hope that it will be useful, but
    WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-   PARTICULAR PURPOSE.  See the GNU General Public License for more details. You should have
-   received a copy of the GNU General Public License along with GPUMD.  If not, see
-   <http://www.gnu.org/licenses/>.
+   PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more details. You should have
+   received a copy of the GNU Lesser General Public License along with GPUMD.  If not, see
+   <https://www.gnu.org/licenses/>.
 */
 
 /*----------------------------------------------------------------------------80
@@ -1912,6 +1912,36 @@ void Force::compute_single_potential(
     potential.compute(
       box, type, position_per_atom, potential_per_atom, force_per_atom, virial_per_atom);
   }
+}
+
+void Force::compute_one_potential(
+  const int potential_index,
+  Box& box,
+  GPU_Vector<double>& position_per_atom,
+  GPU_Vector<int>& type,
+  const std::vector<Group>& group,
+  GPU_Vector<double>& potential_per_atom,
+  GPU_Vector<double>& force_per_atom,
+  GPU_Vector<double>& virial_per_atom)
+{
+  const int number_of_atoms = type.size();
+  initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+    number_of_atoms,
+    force_per_atom.data(),
+    force_per_atom.data() + number_of_atoms,
+    force_per_atom.data() + number_of_atoms * 2,
+    potential_per_atom.data(),
+    virial_per_atom.data());
+  GPU_CHECK_KERNEL
+  compute_single_potential(
+    *potentials[potential_index],
+    box,
+    position_per_atom,
+    type,
+    group,
+    potential_per_atom,
+    force_per_atom,
+    virial_per_atom);
 }
 
 void Force::compute_potentials(
