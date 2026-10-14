@@ -5188,7 +5188,6 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
             else hessian_fd_status="INCONCLUSIVE_OBJECTIVE_EVALUATION_FAILURE";}
           if(hessian_fd_counter_started){hessian_fd_factorizations=covariance_system.factorizations-hessian_fd_factor_start;
             hessian_fd_rhs_columns=covariance_system.solve_rhs_columns-hessian_fd_rhs_start;hessian_fd_counter_started=false;}}
-        }
       }
     }else hessian_status="NOT_EVALUATED_NO_DOMINANT_GROUP";
 
