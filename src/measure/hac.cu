@@ -24,6 +24,7 @@ Calculate the heat current autocorrelation (HAC) function.
 #include "integrate/integrate.cuh"
 #include "hac.cuh"
 #include "rpmd_ja_math.cuh"
+#include "utilities/compact_nep.cuh"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
@@ -32,8 +33,10 @@ Calculate the heat current autocorrelation (HAC) function.
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 bool HAC::get_current_for_step(const int step, double current[3]) const
@@ -106,6 +109,9 @@ void HAC::pre_run(
     centroid_direct_evaluations_ = 0;
     centroid_force_step_ = -1;
     centroid_qnep_observer_.reset();
+#ifdef GPUMD_WPE_ENABLED
+    wpe_centroid_observer_.reset();
+#endif
     int number_of_frames = number_of_steps / sample_interval;
     if (number_of_frames <= 0 || Nc > number_of_frames) {
       PRINT_INPUT_ERROR("Nc must not exceed the number of sampled HAC frames.");
@@ -326,6 +332,43 @@ void HAC::pre_run(
             active_qnep->get_charge_mode());
         }
       }
+#ifdef GPUMD_WPE_ENABLED
+      if (is_ring_polymer_run && !rpmd_ja_enabled_) {
+        if (split_qnep_heat_by_type_ != 0) {
+          PRINT_INPUT_ERROR("WPE PIMD centroid HAC does not support split_qnep_heat_by_type.");
+        }
+        const std::string model_path = get_first_potential_filename(force.get_run_input());
+        std::ifstream model_file(model_path);
+        std::string model_type;
+        model_file >> model_type;
+        if (!model_file) {
+          PRINT_INPUT_ERROR("Cannot read the WPE PIMD centroid observer model file.");
+        }
+        if (
+          model_type == "nep4_charge1" || model_type == "nep4_zbl_charge1" ||
+          model_type == "nep4_charge2" || model_type == "nep4_zbl_charge2") {
+          std::unique_ptr<NEP_Charge> observer(new NEP_Charge(
+            model_path.c_str(), atom.number_of_atoms, force.get_run_input()));
+          observer->N1 = 0;
+          observer->N2 = atom.number_of_atoms;
+          observer->configure_mechanical_observer();
+          wpe_centroid_observer_ = std::move(observer);
+        } else if (model_type == "nep4" || model_type == "nep4_zbl") {
+          std::unique_ptr<NEP> observer(
+            new NEP(model_path.c_str(), atom.number_of_atoms, force.get_run_input()));
+          observer->N1 = 0;
+          observer->N2 = atom.number_of_atoms;
+          wpe_centroid_observer_ = std::move(observer);
+        } else {
+          const std::string error =
+            "WPE PIMD centroid HAC does not support potential model " + model_type + ".";
+          PRINT_INPUT_ERROR(error.c_str());
+        }
+        centroid_position_work_.resize(static_cast<size_t>(atom.number_of_atoms) * 3);
+        centroid_qnep_observer_error_.resize(1, 0);
+        printf("    WPE centroid HAC uses a private native %s observer.\n", model_type.c_str());
+      }
+#endif
     }
     if (split_qnep_heat_by_type_) {
       heat_all_by_type_electro_.resize(
@@ -1052,6 +1095,36 @@ void HAC::end_of_step(
         centroid_potential_per_atom_,
         centroid_force_per_atom_,
         centroid_virial_per_atom_);
+#ifdef GPUMD_WPE_ENABLED
+    } else if (wpe_centroid_observer_) {
+      box.set_is_orthogonal();
+      centroid_qnep_observer_error_.fill(0);
+      rpmd_ja_wrap_positions(
+        atom.number_of_atoms,
+        atom.position_per_atom,
+        centroid_position_work_,
+        box,
+        centroid_qnep_observer_error_.data());
+      int position_error = 0;
+      centroid_qnep_observer_error_.copy_to_host(&position_error, 1);
+      if (position_error != 0) {
+        PRINT_INPUT_ERROR("WPE centroid observer received a non-finite position.");
+      }
+      centroid_potential_per_atom_.fill(0.0);
+      centroid_force_per_atom_.fill(0.0);
+      centroid_virial_per_atom_.fill(0.0);
+      if (auto* qnep = dynamic_cast<NEP_Charge*>(wpe_centroid_observer_.get())) {
+        qnep->request_peratom_virial_for_next_force();
+      }
+      // WPE's PIMD context must receive only physical bead evaluations.
+      wpe_centroid_observer_->compute(
+        box,
+        atom.type,
+        centroid_position_work_,
+        centroid_potential_per_atom_,
+        centroid_force_per_atom_,
+        centroid_virial_per_atom_);
+#endif
     } else {
       force.compute(
         box,

@@ -271,8 +271,9 @@ void Force::parse_potential(
     PRINT_INPUT_ERROR(
       "Wisevolve Potential Engine integration supports exactly one potential. Use standard GPUMD for multiple potentials.\n");
   }
+  number_of_atoms_ = number_of_atoms;
+  run_input_ = &run_input;
   (void)box;
-  (void)run_input;
   std::unique_ptr<Potential> wpe_potential(new WpePotential(
     tokens[1].c_str(), number_of_atoms));
   wpe_potential->N1 = 0;

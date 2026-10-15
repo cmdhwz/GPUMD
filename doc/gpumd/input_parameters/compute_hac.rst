@@ -29,6 +29,12 @@ evaluated separately at each HAC sample with the complete per-atom virial path.
 This keeps the physical batch at ``P`` lanes and does not change the physical
 bead forces or ring-polymer dynamics.
 
+For WPE PIMD/RPMD/TRPMD runs, sampled centroid HAC uses a private native GPUMD
+observer for NEP4, NEP4-ZBL, and qNEP charge1/charge2 models. It reads the same
+``kspace`` and ``dftd3`` settings, while the WPE force context evaluates
+physical beads only. Other model variants and ``split_qnep_heat_by_type`` are
+unsupported for WPE centroid HAC.
+
 The optional fifth parameter :attr:`split_qnep_heat_by_type` can be set to 1 to export an
 additional type-resolved heat-current file with the electrostatic and non-electrostatic
 contributions separated for qNEP models.

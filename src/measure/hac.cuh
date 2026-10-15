@@ -24,6 +24,7 @@
 
 class NEP_Charge;
 class NEP;
+class Potential;
 
 class HAC : public Action
 {
@@ -160,6 +161,9 @@ private:
   RpmdJASparseWorkspace rpmd_ja_sparse_workspace_;
   std::unique_ptr<NEP> rpmd_ja_nep_;
   std::unique_ptr<NEP_Charge> centroid_qnep_observer_;
+#ifdef GPUMD_WPE_ENABLED
+  std::unique_ptr<Potential> wpe_centroid_observer_;
+#endif
   GPU_Vector<double> rpmd_ja_reference_positions_;
   GPU_Vector<double> rpmd_ja_last_wrapped_centroid_;
   GPU_Vector<double> rpmd_ja_continuous_centroid_;
