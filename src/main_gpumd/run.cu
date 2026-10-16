@@ -725,7 +725,7 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, diagnose_covariance <state> <report> <cutoff> <epsilon> <tau> <fd_step>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, diagnose_covariance <state> <report> <cutoff> <epsilon> <tau> <fd_step>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
@@ -869,8 +869,8 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
   }
   if (tokens[1] == "fit_samples_covariance") {
     if ((tokens.size() != 14 && tokens.size() != 15) || tokens[10] != "shrinkage" || tokens[12] != "max_iter" ||
-        (tokens.size() == 15 && tokens[14] != "block_newton"))
-      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton].");
+        (tokens.size() == 15 && tokens[14] != "block_newton" && tokens[14] != "joint_block"))
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block].");
     if (global_time != 0.0)
       PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance must appear before any run.");
     if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
@@ -883,7 +883,8 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
       PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires fully periodic boundaries.");
     RpmdJANativeFitOptions options;
     options.method = RpmdJANativeFitMethod::GaussianCovarianceShrinkage;
-    options.covariance_block_newton = tokens.size() == 15;
+    options.covariance_block_newton = tokens.size() == 15 && tokens[14] == "block_newton";
+    options.covariance_joint_block = tokens.size() == 15 && tokens[14] == "joint_block";
     options.output_path = tokens[3];
     options.kernel_table = tokens[8];
     options.raw_input_path = tokens[9];

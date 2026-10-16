@@ -929,6 +929,9 @@ void test_covariance_block_newton_host_arithmetic()
   const CovarianceBlockNewtonResult equilibrated=covariance_local_newton_direction(diagonal_hessian,gradient);
   assert(equilibrated.status=="PASS"&&equilibrated.damping==0.0&&equilibrated.relative_residual<=1e-8);
   for(const double value:equilibrated.direction)check_close(value,-2.0,1e-12);
+  const CovarianceBlockNewtonResult generalized_six=covariance_joint_newton_direction(
+    std::vector<double>(diagonal_hessian.begin(),diagonal_hessian.end()),std::vector<double>(gradient.begin(),gradient.end()));
+  assert(generalized_six.status==equilibrated.status&&generalized_six.direction==equilibrated.direction&&generalized_six.damping==equilibrated.damping);
   bool nonfinite_threw=false;gradient[0]=std::numeric_limits<double>::infinity();
   try{(void)covariance_local_newton_direction(diagonal_hessian,gradient);}catch(const std::runtime_error&){nonfinite_threw=true;}
   assert(nonfinite_threw);gradient[0]=2.0*diagonal[0];
@@ -968,6 +971,159 @@ void test_covariance_block_newton_host_arithmetic()
   try{(void)covariance_local_inverse(asymmetric,local,2,relative_asymmetry);}
   catch(const CovarianceLocalInverseAsymmetryError&){controlled=true;}
   assert(controlled&&std::isfinite(relative_asymmetry)&&relative_asymmetry>1e-8);
+}
+
+void test_covariance_joint_block_includes_cross_group_hessian()
+{
+  constexpr int n=8,d=9;
+  Graph graph;graph.type_pairs={{0,0},{0,1},{1,1}};
+  graph.edges={{1,4,0,{0,0,0}},{0,7,1,{0,0,0}},{4,7,2,{0,0,0}}};
+  std::vector<double> sqrt_mass(3*n,1.0);const double atom_sqrt[8]={1.0,2.0,1.5,2.0,3.0,1.0,2.5,4.0};
+  for(int axis=0;axis<3;++axis)for(int atom=0;atom<n;++atom)sqrt_mass[axis*n+atom]=atom_sqrt[atom];
+  std::vector<double> gradient(18,0.0);gradient[0]=0.6;gradient[6]=0.1;gradient[12]=1.0;
+  const CovarianceJointGroupTopology topology=covariance_joint_group_topology(graph);
+  const CovarianceJointGroupSelection selection=covariance_select_joint_groups(topology,gradient,32,2);
+  assert(selection.status=="READY"&&selection.groups==std::vector<int>({2,0})&&selection.group_supports==std::vector<std::size_t>({2,2}));
+  assert(selection.dominant_group==2&&selection.dominant_group_support==2&&topology.atoms[2]==std::vector<int>({4,7}));
+  assert(selection.support_count==3&&selection.atoms==std::vector<int>({1,4,7}));
+  const CovarianceJointGroupBasis basis=covariance_joint_group_basis(graph,topology,sqrt_mass,n,selection.groups,selection.atoms,32);
+  assert(basis.status=="READY"&&basis.atoms==std::vector<int>({1,4,7})&&basis.dimension==9&&basis.basis.size()==12);
+  check_close(basis.basis[0][static_cast<std::size_t>(1)*d+1],1.0/9.0,1e-15);
+  check_close(basis.basis[0][static_cast<std::size_t>(1)*d+2],-1.0/12.0,1e-15);
+  check_close(basis.basis[6][0],1.0/4.0,1e-15);
+  check_close(basis.basis[6][1],-1.0/6.0,1e-15);
+  check_close(basis.basis[7][4],-1.0/6.0,1e-15);
+  check_close(basis.basis[7][static_cast<std::size_t>(4)*d+0],-1.0/6.0,1e-15);
+
+  auto inverse=[&](const double diagonal){std::vector<double> result(static_cast<std::size_t>(d)*d,0.0);
+    for(int i=0;i<d;++i)for(int j=0;j<d;++j)result[static_cast<std::size_t>(i)*d+j]=i==j?diagonal+0.03*i:0.002/(1+std::abs(i-j));return result;};
+  const std::vector<double> inverse_d=inverse(1.0),inverse_s=inverse(1.4);
+  auto direct_trace=[&](const std::vector<double>& inv,const int a,const int b){std::vector<double> left(static_cast<std::size_t>(d)*d,0.0),right(left.size(),0.0);
+    for(int i=0;i<d;++i)for(int k=0;k<d;++k)for(int j=0;j<d;++j){
+      left[static_cast<std::size_t>(i)*d+j]+=inv[static_cast<std::size_t>(i)*d+k]*basis.basis[a][static_cast<std::size_t>(k)*d+j];
+      right[static_cast<std::size_t>(i)*d+j]+=inv[static_cast<std::size_t>(i)*d+k]*basis.basis[b][static_cast<std::size_t>(k)*d+j];}
+    NeumaierAccumulator sum;for(int i=0;i<d;++i)for(int j=0;j<d;++j)sum.add_product(left[static_cast<std::size_t>(i)*d+j],right[static_cast<std::size_t>(j)*d+i]);return sum.value();};
+  const std::vector<double> trace_d=covariance_joint_trace_products(inverse_d,basis),trace_s=covariance_joint_trace_products(inverse_s,basis);
+  for(int a=0;a<12;++a)for(int b=0;b<12;++b){const std::size_t at=static_cast<std::size_t>(a)*12+b;
+    check_close(trace_d[at],direct_trace(inverse_d,a,b),2e-13);check_close(trace_s[at],direct_trace(inverse_s,a,b),2e-13);}
+  std::vector<double> scale(18);for(std::size_t i=0;i<scale.size();++i)scale[i]=0.4+0.07*i;
+  const CovarianceJointHessianTerms hessian=covariance_joint_group_hessian(trace_d,trace_s,0.6,0.3,scale,selection.groups);
+  const std::size_t cross=6;assert(std::abs(hessian.total[cross])>1e-5);
+  check_close(hessian.total[cross],(0.5*(1.0+0.6)*trace_d[cross]+0.3*trace_s[cross])*scale[12]*scale[0],2e-14);
+  std::vector<double> selected_gradient(12);for(int component=0;component<6;++component){
+    selected_gradient[component]=gradient[12+component];selected_gradient[6+component]=gradient[component];}
+  const CovarianceBlockNewtonResult joint=covariance_joint_newton_direction(hessian.total,selected_gradient);
+  assert(joint.status=="PASS"&&joint.direction.size()==12);
+  std::vector<double> rhs(12);for(int i=0;i<12;++i)rhs[i]=-selected_gradient[i];
+  const std::vector<double> dense=solve_dense_reference(hessian.total,rhs,12);
+  for(int i=0;i<12;++i)check_close(joint.direction[i],dense[i],2e-10);
+  const std::vector<double> independent_first=solve_dense_reference(
+    {hessian.total[0],hessian.total[1],hessian.total[2],hessian.total[3],hessian.total[4],hessian.total[5],
+     hessian.total[12],hessian.total[13],hessian.total[14],hessian.total[15],hessian.total[16],hessian.total[17],
+     hessian.total[24],hessian.total[25],hessian.total[26],hessian.total[27],hessian.total[28],hessian.total[29],
+     hessian.total[36],hessian.total[37],hessian.total[38],hessian.total[39],hessian.total[40],hessian.total[41],
+     hessian.total[48],hessian.total[49],hessian.total[50],hessian.total[51],hessian.total[52],hessian.total[53],
+     hessian.total[60],hessian.total[61],hessian.total[62],hessian.total[63],hessian.total[64],hessian.total[65]},
+    std::vector<double>(rhs.begin(),rhs.begin()+6),6);
+  assert(std::abs(independent_first[0]-joint.direction[0])>1e-8);
+  const CovarianceDirectionChoice global=covariance_choose_joint_block_direction(gradient,std::vector<double>(18,-1.0),selection.groups,joint);
+  assert(global.method=="JOINT_BLOCK"&&global.direction.size()==18);
+  for(int component=0;component<6;++component){check_close(global.direction[12+component],joint.direction[component],1e-15);
+    check_close(global.direction[component],joint.direction[6+component],1e-15);assert(global.direction[6+component]==0.0);}
+
+  Graph capped; capped.type_pairs={{0,0},{0,1},{1,1}};
+  for(int atom=1;atom<=19;++atom)capped.edges.push_back({0,atom,0,{0,0,0}});
+  for(int atom=21;atom<=39;++atom)capped.edges.push_back({20,atom,1,{0,0,0}});
+  capped.edges.push_back({0,40,2,{0,0,0}});
+  std::vector<double> ranked_gradient(18,0.0);ranked_gradient[0]=9.0;ranked_gradient[6]=8.0;ranked_gradient[12]=7.0;
+  const CovarianceJointGroupTopology capped_topology=covariance_joint_group_topology(capped);
+  const CovarianceJointGroupSelection selected=covariance_select_joint_groups(capped_topology,ranked_gradient,32,3);
+  assert(selected.status=="READY"&&selected.groups==std::vector<int>({0,2})&&selected.support_count==21);
+  Graph empty_non_dominant;empty_non_dominant.type_pairs={{0,0},{0,1},{1,1}};
+  empty_non_dominant.edges={{0,1,0,{0,0,0}},{2,3,2,{0,0,0}}};
+  const CovarianceJointGroupTopology empty_non_dominant_topology=covariance_joint_group_topology(empty_non_dominant);
+  const CovarianceJointGroupSelection skip_empty=covariance_select_joint_groups(empty_non_dominant_topology,{9,0,0,0,0,0,8,0,0,0,0,0,7,0,0,0,0,0},32,3);
+  assert(skip_empty.status=="READY"&&skip_empty.groups==std::vector<int>({0,2}));
+  const CovarianceJointGroupSelection empty_dominant=covariance_select_joint_groups(empty_non_dominant_topology,{9,0,0,0,0,0,10,0,0,0,0,0,7,0,0,0,0,0},32,3);
+  assert(empty_dominant.status=="DOMINANT_EMPTY_GROUP"&&empty_dominant.groups.empty()&&empty_dominant.dominant_group==1);
+  Graph dominant_too_large;dominant_too_large.type_pairs={{0,0}};
+  for(int atom=1;atom<=32;++atom)dominant_too_large.edges.push_back({0,atom,0,{0,0,0}});
+  const CovarianceJointGroupTopology large_topology=covariance_joint_group_topology(dominant_too_large);
+  const CovarianceJointGroupSelection rejected=covariance_select_joint_groups(large_topology,{1.0,0,0,0,0,0},32,3);
+  assert(rejected.status=="DOMINANT_SUPPORT_CAP"&&rejected.groups.empty()&&rejected.dominant_group==0&&rejected.dominant_group_support==33);
+  CovarianceBlockNewtonResult capped_direction;capped_direction.status=rejected.status;
+  const CovarianceDirectionChoice capped_fallback=covariance_choose_joint_block_direction({1.0,0,0,0,0,0},{-1.0,0,0,0,0,0},rejected.groups,capped_direction);
+  assert(capped_fallback.method=="BFGS"&&capped_fallback.reason=="DOMINANT_SUPPORT_CAP");
+  Graph invalid_atom;invalid_atom.type_pairs={{0,0}};invalid_atom.edges={{0,8,0,{0,0,0}}};
+  const CovarianceJointGroupTopology invalid_atom_topology=covariance_joint_group_topology(invalid_atom);
+  const CovarianceJointGroupSelection invalid_atom_selection=covariance_select_joint_groups(invalid_atom_topology,{1.0,0,0,0,0,0},32,3);
+  bool invalid_atom_rejected=false;try{(void)covariance_joint_group_basis(invalid_atom,invalid_atom_topology,std::vector<double>(24,1.0),8,
+      invalid_atom_selection.groups,invalid_atom_selection.atoms,32);}catch(const std::invalid_argument&){invalid_atom_rejected=true;}
+  assert(invalid_atom_rejected);
+  bool dimensions_rejected=false;try{(void)covariance_select_joint_groups(topology,std::vector<double>(17,0.0),32,3);}
+    catch(const std::invalid_argument&){dimensions_rejected=true;}assert(dimensions_rejected);
+  bool nonfinite_rejected=false;try{std::vector<double> invalid_gradient(18,0.0);invalid_gradient[0]=std::numeric_limits<double>::quiet_NaN();
+      (void)covariance_select_joint_groups(topology,invalid_gradient,32,3);}catch(const std::runtime_error&){nonfinite_rejected=true;}
+  assert(nonfinite_rejected);
+}
+
+void test_covariance_joint_block_commit_attribution_is_transactional()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};
+  {
+    DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,true);
+    assert(fit.joint_block_enabled&&fit.last_joint_attribution.available&&fit.last_joint_attribution.model_status=="COMPUTED");
+    assert(fit.block_newton_factorizations==0&&fit.block_newton_rhs_columns==0);
+    assert(fit.joint_block_factorizations>0&&fit.joint_block_rhs_columns>0);
+    assert(trace.str().find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION iteration=0")!=std::string::npos);
+    const CovarianceJointStepAttribution& attribution=fit.last_joint_attribution;
+    assert(attribution.actual_step.size()==6&&attribution.predicted_gradient.size()==6&&attribution.model_hessian.size()==36);
+    std::vector<double> delta(6),model_action(6);
+    for(int i=0;i<6;++i){delta[i]=attribution.observed_gradient[i]-attribution.gradient_before[i];
+      for(int j=0;j<6;++j)model_action[i]+=attribution.model_hessian[static_cast<std::size_t>(i)*6+j]*attribution.actual_step[j];}
+    double expected_denominator=std::max(covariance_norm_inf(delta),covariance_norm_inf(model_action));
+    expected_denominator=std::max(expected_denominator,1e-300);
+    for(int i=0;i<6;++i)check_close(attribution.predicted_gradient[i],attribution.gradient_before[i]+model_action[i],1e-12);
+    for(int i=0;i<6;++i)delta[i]-=model_action[i];
+    check_close(attribution.model_discrepancy_denominator,expected_denominator,1e-12);
+    check_close(attribution.normalized_model_discrepancy,covariance_norm_inf(delta)/expected_denominator,1e-12);
+  }
+  {
+    DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=1;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,true);
+    const std::vector<double> rejected_theta=covariance_fit_test_hooks.last_residual_rejected_theta;covariance_fit_test_hooks={};
+    const std::string log=trace.str();const std::size_t rejected=log.find("GRADIENT_RESIDUAL_REJECT iteration=0 ");
+    const std::size_t committed=log.find("STEP_COMMITTED iteration=0"),attribution_pos=log.find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION iteration=0");
+    assert(fit.gradient_residual_reject_trials==1&&fit.iterations==1&&fit.last_valid.theta==fit.theta);
+    assert(fit.last_joint_attribution.available&&fit.last_joint_attribution.iteration==0&&fit.last_joint_attribution.tau==1.0);
+    assert(fit.block_newton_factorizations==0&&fit.block_newton_rhs_columns==0);
+    assert(fit.joint_block_factorizations>0&&fit.joint_block_rhs_columns>0);
+    assert(!rejected_theta.empty()&&rejected_theta!=fit.theta&&rejected<committed&&committed<attribution_pos);
+    assert(log.find("STEP_COMMITTED iteration=0 tau=1 alpha=0.5")!=std::string::npos&&!fit.failed_trial.available);
+    assert(log.find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION",attribution_pos+1)==std::string::npos);
+    const std::string path="rpmd_ja_native_joint_attribution_state_test_"+
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
+    RpmdJANativeFitOptions options;options.cutoff=5.0;options.epsilon=1e-6;options.fd_step=1e-4;options.sample_interval=1;options.covariance_joint_block=true;
+    SampleHeader header{};header.temperature=300.0;header.beads=4;QrawIdentity identity{};
+    write_covariance_state(path,fit,0.1,"test.samples","test.qraw",options,header,identity,graph,4,2);
+    std::ifstream state_file(path);const auto fields=read_covariance_state_fields(state_file);
+    assert(fields.at("joint_block_enabled")=="1"&&fields.at("last_joint_attribution_available")=="1");
+    assert(fields.at("last_joint_attribution_iteration")=="0"&&fields.at("last_joint_attribution_tau")=="1");
+    assert(fields.at("last_joint_attribution_model_status")=="COMPUTED");
+  }
+  {
+    DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=64;
+    covariance_fit_test_hooks.objective_evaluation_budget_after_baseline=16;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,true);
+    covariance_fit_test_hooks={};
+    assert(fit.status=="EVALUATION_BUDGET_EXHAUSTED"&&fit.iterations==0&&fit.last_valid.theta==fit.theta);
+    assert(!fit.last_joint_attribution.available&&trace.str().find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION")==std::string::npos);
+  }
 }
 
 void test_covariance_baseline_brackets_both_signs_and_zero()
@@ -2917,6 +3073,8 @@ int main()
   test_covariance_operator_gram_includes_shared_atom_overlap(qr.solver);
   test_covariance_local_group_hessian_matches_tiny_objective_fd(qr.solver);
   test_covariance_block_newton_host_arithmetic();
+  test_covariance_joint_block_includes_cross_group_hessian();
+  test_covariance_joint_block_commit_attribution_is_transactional();
   test_padded_qr_svd_and_cut_qp(qr.solver);
   test_active_set_qp_snapshot_and_rejection(qr.solver);
   test_active_set_preserves_svd_primal(qr.solver);

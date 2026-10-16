@@ -118,7 +118,17 @@ Use distinct outputs:
 ```text
 rpmd_ja fit_samples_covariance <same_samples> ja_cov_bfgs10.bin <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <same_qraw> shrinkage <same_rho> max_iter 10
 rpmd_ja fit_samples_covariance <same_samples> ja_cov_block_newton10.bin <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <same_qraw> shrinkage <same_rho> max_iter 10 block_newton
+rpmd_ja fit_samples_covariance <same_samples> ja_cov_joint_block10.bin <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <same_qraw> shrinkage <same_rho> max_iter 10 joint_block
 ```
+
+The ``joint_block`` trial ranks groups by maximum absolute scaled gradient and
+uses up to three whose union support fits within 32 atoms. It applies a pure
+selected-group direction; larger-support curvature remains BFGS. For an
+accepted joint step, the trace compares the selected-subspace gradient change
+with the undamped Hessian prediction at the actual step ``s`` using
+``||(g_new-g_old)-H*s||inf / max(||g_new-g_old||inf, ||H*s||inf, 1e-300)``.
+This discrepancy and the accompanying group/global gradient norms are local
+optimizer diagnostics, not Hessian, response, or material certification.
 
 The saved-point response/Ritz/residual and finite-difference diagnostic
 correction can proceed in parallel with this A/B. Compare full-KKT traces,

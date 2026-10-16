@@ -183,7 +183,8 @@ assert 'if (tokens[1] == "fit_samples_covariance")' in run
 assert 'if (tokens[1] == "diagnose_covariance")' in run
 assert 'diagnose_rpmd_ja_native_covariance(tokens[2], tokens[3]' in run
 assert '(tokens.size() != 14 && tokens.size() != 15)' in run and 'tokens[14] != "block_newton"' in run
-assert 'options.covariance_block_newton = tokens.size() == 15;' in run
+assert 'options.covariance_block_newton = tokens.size() == 15 && tokens[14] == "block_newton";' in run
+assert 'options.covariance_joint_block = tokens.size() == 15 && tokens[14] == "joint_block";' in run
 assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
 assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
 assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
@@ -628,8 +629,8 @@ check_multicell_mic([[4.0, 0.7, -0.3], [0.0, 3.5, 0.4], [0.2, 0.0, 5.0]],
                     [0.15, 0.2, -0.3], [-3.0, 4.0, 2.0])
 
 assert "bool covariance_block_newton = false;" in native_header
-assert "fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton]." in run
-assert "options.max_covariance_iterations,&trace,options.covariance_block_newton" in native_fit
+assert "fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block]." in run
+assert "options.max_covariance_iterations,&trace,options.covariance_block_newton,options.covariance_joint_block" in native_fit
 assert "COVARIANCE_DIRECTION_MODE block_newton=" in native_fit
 assert 'result.method="HYBRID"' in native_fit and 'result.method="BLOCK"' in native_fit and 'method="BFGS"' in native_fit
 assert "block_newton_factorizations" in native_fit and "block_newton_rhs_columns" in native_fit and "block_newton_seconds" in native_fit
@@ -651,3 +652,19 @@ assert "test_covariance_block_newton_optimizer_direction_trace" in cuda_test
 assert "covariance_preflight_block_direction" in cuda_test and "BLOCK_STEP_UNREPRESENTABLE_BFGS_FALLBACK" in native_fit
 assert "for(const bool block_newton:{false,true})" in cuda_test
 assert "physical_rhs(6,std::vector<double>(6,0.0))" in cuda_test
+assert "bool covariance_joint_block = false;" in native_header
+assert "[block_newton|joint_block]" in run
+assert "options.covariance_joint_block" in run and "options.covariance_block_newton" in run
+assert "covariance_joint_group_hessian" in native_fit and "covariance_select_joint_groups" in native_fit
+assert 'result.status="DOMINANT_EMPTY_GROUP"' in native_fit
+assert "COVARIANCE_JOINT_COMMIT_ATTRIBUTION" in native_fit
+assert "if(block_newton){result.block_newton_factorizations+=block_factorizations;" in native_fit
+assert "dominant_support=\"<<joint_selection.dominant_group_support" in native_fit
+assert "result.direction_group_support=joint_block?joint_selection.dominant_group_support:support_count;" in native_fit
+assert "for(const int atom:joint_selection.atoms)*trace" in native_fit
+assert "joint covariance attribution contains non-finite values" in native_fit
+assert native_fit.count('optimizer_step_mode "<<(covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")') == 2
+assert "\\njoint_block_factorizations \"<<covariance_fit.joint_block_factorizations" in native_fit
+assert '"\\noptimizer_step_mode "<<(covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")' in native_fit
+assert "test_covariance_joint_block_includes_cross_group_hessian" in cuda_test
+assert "test_covariance_joint_block_commit_attribution_is_transactional" in cuda_test
