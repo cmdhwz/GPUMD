@@ -268,6 +268,7 @@ assert "gradient_residual_reject_trials" in backtracking and "evaluation_budget_
 assert 'failure_stage="GRADIENT_RESIDUAL_REJECT"' in backtracking and 'failure_stage="GRADIENT_SOLVE_FAIL"' in backtracking
 assert "catch(...)" in backtracking and "throw;" in backtracking
 assert backtracking.index('trial_status="ARMIJO_ACCEPTED"') < backtracking.index("complete_gradient(result.next)") < backtracking.index("result.accepted=true")
+assert "const bool allow_expansion=true" in backtracking and "if(allow_expansion&&initial_alpha==1.0" in backtracking
 bfgs_helpers = native_fit.split("struct CovarianceBFGSHistory", 1)[1].split("CovarianceBacktrackingResult covariance_backtrack_armijo(", 1)[0]
 assert "curvature_limit=1e-12*std::sqrt(ss*yy)" in bfgs_helpers and "gamma=sy/yy" in bfgs_helpers
 assert "history.seed_source=\"FIRST_VALID_SECANT\"" in bfgs_helpers and "RECENT_VALID_GAMMA_RESET" in bfgs_helpers
@@ -668,3 +669,19 @@ assert "\\njoint_block_factorizations \"<<covariance_fit.joint_block_factorizati
 assert '"\\noptimizer_step_mode "<<(covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")' in native_fit
 assert "test_covariance_joint_block_includes_cross_group_hessian" in cuda_test
 assert "test_covariance_joint_block_commit_attribution_is_transactional" in cuda_test
+assert "test_covariance_joint_ray_spectrum_and_proposal" in cuda_test
+assert "assert(preflight.method==\"BFGS\"" in cuda_test
+assert "joint_ray" not in native_header and "joint_ray" not in run
+joint_ray_spectrum = native_fit.split("CovarianceJointRaySpectrum covariance_joint_ray_spectrum(", 1)[1].split("struct CovarianceLocalHessianTerms", 1)[0]
+assert "eigen_small(solver" in joint_ray_spectrum and "system.factor" not in joint_ray_spectrum
+assert "covariance_joint_ray_spectrum(system.solver,inverse_d,update" in native_fit
+assert "covariance_joint_ray_spectrum(system.solver,inverse_s,update" in native_fit
+joint_ray_branch = covariance_optimizer.split('if(choice.method=="JOINT_BLOCK"){', 1)[1].split('}else{ray_attempt.status="NOT_USED_', 1)[0]
+assert "covariance_joint_ray_proposal(" in joint_ray_branch
+assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
+assert "ray_attempt.eigen_evaluations=joint_direction_result.ray_eigen_evaluations" in covariance_optimizer
+assert "trace,!joint_block||!ray_attempt.usable);" in covariance_optimizer
+assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="PROPOSAL_READY"') < covariance_optimizer.index("covariance_backtrack_armijo(")
+assert covariance_optimizer.index("result.joint_block_factorizations+=joint_factorizations") < covariance_optimizer.index("covariance_joint_ray_proposal(")
+assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('if(joint_block){ray_attempt.line_status="STEP_COMMITTED"')
+assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="STEP_COMMITTED"') < covariance_optimizer.index('"STEP_COMMITTED iteration="')

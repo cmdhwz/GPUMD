@@ -130,6 +130,16 @@ with the undamped Hessian prediction at the actual step ``s`` using
 This discrepancy and the accompanying group/global gradient norms are local
 optimizer diagnostics, not Hessian, response, or material certification.
 
+The joint direction's local inverse probes also provide a bounded spectral
+ray model for choosing the initial line-search alpha. It uses the exact
+``log1p`` determinant change along that direction, keeps a small negative
+model-slope margin near the ray minimum, and stays below 90% of the estimated
+``D``/``D-epsilon I`` feasibility boundary. The actual full objective and
+gradient solves still control Armijo, residual, overshoot, and commit. Trace
+and state keep the latest attempted proposal separate from the latest
+committed proposal, including small eigensolve and scalar-model cost; a finite
+estimate that fails its checks falls back to the prior bounded line search.
+
 The saved-point response/Ritz/residual and finite-difference diagnostic
 correction can proceed in parallel with this A/B. Compare full-KKT traces,
 accepted steps, group transitions and added cost; neither a 10-step run nor

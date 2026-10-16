@@ -1067,6 +1067,115 @@ void test_covariance_joint_block_includes_cross_group_hessian()
   assert(nonfinite_rejected);
 }
 
+void test_covariance_joint_ray_spectrum_and_proposal(cusolverDnHandle_t solver)
+{
+  constexpr int n=8,d=9;Graph graph;graph.type_pairs={{0,0},{0,1},{1,1}};
+  graph.edges={{1,4,0,{0,0,0}},{0,2,1,{0,0,0}},{4,7,2,{0,0,0}}};
+  const double root_mass[8]={1.0,2.0,1.5,2.0,3.0,1.0,2.5,4.0};std::vector<double> sqrt_mass(3*n);
+  for(int axis=0;axis<3;++axis)for(int atom=0;atom<n;++atom)sqrt_mass[axis*n+atom]=root_mass[atom];
+  const CovarianceJointGroupTopology topology=covariance_joint_group_topology(graph);
+  const std::vector<int> groups={2,0};const std::vector<int> atoms={1,4,7};
+  const CovarianceJointGroupBasis basis=covariance_joint_group_basis(graph,topology,sqrt_mass,n,groups,atoms,32);
+  assert(basis.status=="READY"&&basis.dimension==d&&groups[0]!=groups[1]);
+  const std::vector<double> direction={0.04,0.01,-0.02,0.03,0.015,-0.01,-0.03,0.02,0.01,0.025,-0.015,0.02};
+  std::vector<double> scale(18),statistics(18,0.0),baseline_trace(18,0.0),update(static_cast<std::size_t>(d)*d,0.0);
+  for(std::size_t parameter=0;parameter<scale.size();++parameter)scale[parameter]=0.7+0.03*parameter;
+  for(std::size_t local=0;local<direction.size();++local){const std::size_t parameter=6*static_cast<std::size_t>(groups[local/6])+local%6;
+    statistics[parameter]=-100.0*direction[local];for(std::size_t entry=0;entry<update.size();++entry)
+      update[entry]+=scale[parameter]*direction[local]*basis.basis[local][entry];}
+  std::vector<double> projection(static_cast<std::size_t>(d)*d,0.0);double norm2=0.0;
+  for(const int atom:atoms)norm2+=root_mass[atom]*root_mass[atom];
+  for(int axis=0;axis<3;++axis)for(int i=0;i<3;++i)for(int j=0;j<3;++j){const int row=axis*3+i,column=axis*3+j;
+    projection[static_cast<std::size_t>(row)*d+column]=(i==j?1.0:0.0)-root_mass[atoms[i]]*root_mass[atoms[j]]/norm2;}
+  std::vector<double> inverse_s(projection.size());for(std::size_t i=0;i<projection.size();++i)inverse_s[i]=1.3*projection[i];
+  const CovarianceJointRaySpectrum spectrum_d=covariance_joint_ray_spectrum(solver,projection,update,d);
+  const CovarianceJointRaySpectrum spectrum_s=covariance_joint_ray_spectrum(solver,inverse_s,update,d);
+  assert(spectrum_d.status=="PASS"&&spectrum_s.status=="PASS"&&spectrum_d.eigen_evaluations==2&&spectrum_s.eigen_evaluations==2);
+  assert(spectrum_d.inverse_min_eigenvalue>=-1e-10&&spectrum_s.inverse_min_eigenvalue>=-1e-10);
+  assert(spectrum_d.eigen_residual<1e-8&&spectrum_s.eigen_residual<1e-8);
+  auto multiply=[&](const std::vector<double>& left,const std::vector<double>& right){std::vector<double> product(static_cast<std::size_t>(d)*d,0.0);
+    for(int i=0;i<d;++i)for(int j=0;j<d;++j)for(int k=0;k<d;++k)
+      product[static_cast<std::size_t>(i)*d+j]+=left[static_cast<std::size_t>(i)*d+k]*right[static_cast<std::size_t>(k)*d+j];return product;};
+  std::vector<double> matrix_d=multiply(multiply(projection,update),projection),matrix_s(matrix_d.size());
+  for(std::size_t i=0;i<matrix_s.size();++i)matrix_s[i]=1.3*matrix_d[i];
+  auto dense_logdet_trace=[&](const std::vector<double>& matrix,const double alpha){std::vector<double> shifted=matrix;
+    for(int i=0;i<d;++i)for(int j=0;j<d;++j)shifted[static_cast<std::size_t>(i)*d+j]*=alpha;
+    for(int i=0;i<d;++i)shifted[static_cast<std::size_t>(i)*d+i]+=1.0;
+    std::vector<double> lower(static_cast<std::size_t>(d)*d,0.0);double logdet=0.0;
+    for(int i=0;i<d;++i)for(int j=0;j<=i;++j){double value=shifted[static_cast<std::size_t>(i)*d+j];
+      for(int k=0;k<j;++k)value-=lower[static_cast<std::size_t>(i)*d+k]*lower[static_cast<std::size_t>(j)*d+k];
+      if(i==j){assert(value>0.0);lower[static_cast<std::size_t>(i)*d+j]=std::sqrt(value);logdet+=2.0*std::log(lower[static_cast<std::size_t>(i)*d+j]);}
+      else lower[static_cast<std::size_t>(i)*d+j]=value/lower[static_cast<std::size_t>(j)*d+j];}
+    std::vector<double> inverse(static_cast<std::size_t>(d)*d,0.0);
+    for(int column=0;column<d;++column){std::vector<double> unit(d,0.0);unit[column]=1.0;
+      const std::vector<double> solved=solve_dense_reference(shifted,unit,d);
+      for(int row=0;row<d;++row)inverse[static_cast<std::size_t>(row)*d+column]=solved[row];}
+    NeumaierAccumulator trace;for(int i=0;i<d;++i)for(int j=0;j<d;++j)
+      trace.add_product(inverse[static_cast<std::size_t>(i)*d+j],matrix[static_cast<std::size_t>(j)*d+i]);
+    return std::pair<double,double>{logdet,trace.value()};};
+  constexpr double rho=0.4,tau=0.3;NeumaierAccumulator linear_sum;
+  for(std::size_t local=0;local<direction.size();++local){const std::size_t parameter=6*static_cast<std::size_t>(groups[local/6])+local%6;
+    linear_sum.add_product(0.5*(statistics[parameter]+rho*baseline_trace[parameter]),scale[parameter]*direction[local]);}
+  const double linear=linear_sum.value(),a=0.5*(1.0+rho);
+  const double slope_zero=linear-a*dense_logdet_trace(matrix_d,0.0).second-tau*dense_logdet_trace(matrix_s,0.0).second;
+  for(const double alpha:{0.001,0.01,0.05}){double ray_delta=0.0,ray_slope=0.0;
+    assert(covariance_joint_ray_value(spectrum_d.eigenvalues,spectrum_s.eigenvalues,linear,rho,tau,alpha,ray_delta,ray_slope));
+    const auto dense_d=dense_logdet_trace(matrix_d,alpha),dense_s=dense_logdet_trace(matrix_s,alpha);
+    const double dense_delta=alpha*linear-a*dense_d.first-tau*dense_s.first;
+    const double dense_slope=linear-a*dense_d.second-tau*dense_s.second;
+    check_close(ray_delta,dense_delta,2e-10);check_close(ray_slope,dense_slope,2e-10);}
+  CovarianceBlockNewtonResult block;block.status="PASS";block.ray_status="PASS";block.direction=direction;
+  block.ray_d=spectrum_d;block.ray_s=spectrum_s;block.ray_eigen_evaluations=4;block.ray_eigen_seconds=0.001;
+  const CovarianceJointRayProposal proposal=covariance_joint_ray_proposal(block,groups,statistics,baseline_trace,scale,rho,tau,slope_zero,1.0);
+  assert(proposal.usable&&proposal.status=="PROPOSED"&&proposal.slope_relative_error<1e-6&&proposal.cheap_evaluations<=64);
+  assert(proposal.proposed_alpha>0.0&&proposal.proposed_alpha<=4.0&&proposal.ray_slope<proposal.ray_slope_target);
+  {
+    CovarianceBlockNewtonResult boundary;boundary.status="PASS";boundary.ray_status="PASS";boundary.direction.assign(6,0.0);boundary.direction[0]=1.0;
+    boundary.ray_d.status=boundary.ray_s.status="PASS";boundary.ray_d.eigenvalues={-2.0};boundary.ray_s.eigenvalues={-1.0};
+    boundary.ray_d.ray_min_eigenvalue=-2.0;boundary.ray_s.ray_min_eigenvalue=-1.0;
+    const std::vector<int> selected={0};const std::vector<double> scale_one(6,1.0),base(6,0.0),stats={-10.0,0,0,0,0,0};
+    const double exact_slope=-5.0-0.55*(-2.0)-0.1*(-1.0);
+    const CovarianceJointRayProposal inside=covariance_joint_ray_proposal(boundary,selected,stats,base,scale_one,0.1,0.1,exact_slope,1.0);
+    assert(inside.usable&&inside.feasible_boundary==0.5&&inside.model_upper==0.45&&inside.proposed_alpha<inside.feasible_boundary);
+    auto rotated_matrix=[](const double low,const double high){return std::vector<double>{0.5*(low+high),0.5*(low-high),0.5*(low-high),0.5*(low+high)};};
+    auto cholesky2=[](const std::vector<double>& matrix,const double alpha){double a=1.0+alpha*matrix[0],b=alpha*matrix[1],c=alpha*matrix[3];
+      if(!(a>0.0)||!std::isfinite(a)||!std::isfinite(b)||!std::isfinite(c))return false;
+      const double l=std::sqrt(a),pivot=c-b*b/a;return std::isfinite(l)&&std::isfinite(pivot)&&pivot>0.0;};
+    const auto d_inside=rotated_matrix(-2.0,0.1),s_inside=rotated_matrix(-1.0,0.2);
+    assert(cholesky2(d_inside,inside.proposed_alpha)&&cholesky2(s_inside,inside.proposed_alpha));
+    assert(!cholesky2(d_inside,0.55));
+    boundary.ray_d.eigenvalues={-0.1};boundary.ray_s.eigenvalues={0.1};boundary.ray_d.ray_min_eigenvalue=-0.1;
+    const double outside_slope=-5.0-0.55*(-0.1)-0.1*0.1;
+    const CovarianceJointRayProposal outside=covariance_joint_ray_proposal(boundary,selected,stats,base,scale_one,0.1,0.1,outside_slope,1.0);
+    assert(outside.usable&&outside.feasible_boundary==10.0&&outside.model_upper==4.0&&outside.proposed_alpha==4.0);
+    const auto d_outside=rotated_matrix(-0.1,0.2),s_outside=rotated_matrix(0.1,0.3);
+    assert(cholesky2(d_outside,outside.proposed_alpha)&&cholesky2(s_outside,outside.proposed_alpha));
+    assert(!cholesky2(d_outside,11.0));
+    boundary.ray_d.eigenvalues={0.2};boundary.ray_s.eigenvalues={0.1};boundary.ray_d.ray_min_eigenvalue=0.2;
+    const CovarianceJointRayProposal unbounded=covariance_joint_ray_proposal(boundary,selected,stats,base,scale_one,0.1,0.1,-5.0-0.55*0.2-0.1*0.1,1.0);
+    assert(unbounded.usable&&std::isinf(unbounded.feasible_boundary)&&unbounded.proposed_alpha==4.0);
+    const CovarianceJointRayProposal mismatch=covariance_joint_ray_proposal(boundary,selected,stats,base,scale_one,0.1,0.1,-1.0,1.0);
+    assert(!mismatch.usable&&mismatch.status=="FALLBACK_MODEL_SLOPE_MISMATCH");
+    const std::vector<double> underflow_stats={-2e-308,0,0,0,0,0};boundary.ray_d.eigenvalues={0.0};boundary.ray_s.eigenvalues={0.0};
+    const CovarianceJointRayProposal no_progress=covariance_joint_ray_proposal(boundary,selected,underflow_stats,base,scale_one,0.1,0.1,-1e-308,1e-320);
+    assert(!no_progress.usable&&no_progress.status=="FALLBACK_NO_MODEL_PROGRESS");
+  }
+  {
+    SmallEigen damaged;damaged.n=2;damaged.values={1.0,2.0};damaged.vectors={0.0,1.0,1.0,0.0};
+    assert(covariance_symmetric_eigen_residual({1.0,0.0,0.0,2.0},damaged,2)>1e-8);
+    const auto roundoff_negative=covariance_joint_ray_spectrum(solver,{1.0,0.0,0.0,-1e-12},{1.0,0.0,0.0,1.0},2);
+    assert(roundoff_negative.status=="PASS");
+    const auto material_negative=covariance_joint_ray_spectrum(solver,{1.0,0.0,0.0,-1e-5},{1.0,0.0,0.0,1.0},2);
+    assert(material_negative.status=="INVERSE_NOT_PSD");
+    const auto asymmetry=covariance_joint_ray_spectrum(solver,{1.0,1e-4,0.0,1.0},{1.0,0.0,0.0,1.0},2);
+    assert(asymmetry.status=="INVERSE_ASYMMETRY");
+    bool nonfinite_failed=false;try{(void)covariance_joint_ray_spectrum(solver,{1.0,0.0,0.0,std::numeric_limits<double>::infinity()},{1.0,0.0,0.0,1.0},2);}
+      catch(const std::runtime_error&){nonfinite_failed=true;}assert(nonfinite_failed);
+    bool dimensions_failed=false;try{(void)covariance_joint_ray_spectrum(solver,{1.0},{1.0},2);}
+      catch(const std::invalid_argument&){dimensions_failed=true;}assert(dimensions_failed);
+  }
+}
+
 void test_covariance_joint_block_commit_attribution_is_transactional()
 {
   DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
@@ -1076,6 +1185,8 @@ void test_covariance_joint_block_commit_attribution_is_transactional()
     DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
     const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,true);
     assert(fit.joint_block_enabled&&fit.last_joint_attribution.available&&fit.last_joint_attribution.model_status=="COMPUTED");
+    assert(fit.joint_ray_attempt.iteration==0&&fit.joint_ray_attempt.line_status=="STEP_COMMITTED");
+    assert(fit.joint_ray_attempt.usable&&fit.joint_ray_attempt.accepted&&fit.joint_ray_committed.usable);
     assert(fit.block_newton_factorizations==0&&fit.block_newton_rhs_columns==0);
     assert(fit.joint_block_factorizations>0&&fit.joint_block_rhs_columns>0);
     assert(trace.str().find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION iteration=0")!=std::string::npos);
@@ -1103,7 +1214,11 @@ void test_covariance_joint_block_commit_attribution_is_transactional()
     assert(fit.block_newton_factorizations==0&&fit.block_newton_rhs_columns==0);
     assert(fit.joint_block_factorizations>0&&fit.joint_block_rhs_columns>0);
     assert(!rejected_theta.empty()&&rejected_theta!=fit.theta&&rejected<committed&&committed<attribution_pos);
-    assert(log.find("STEP_COMMITTED iteration=0 tau=1 alpha=0.5")!=std::string::npos&&!fit.failed_trial.available);
+    assert(log.find("STEP_COMMITTED iteration=0 tau=1 alpha=")!=std::string::npos&&!fit.failed_trial.available);
+    assert(fit.joint_ray_attempt.usable&&fit.joint_ray_attempt.trials>=2&&fit.joint_ray_attempt.line_status=="STEP_COMMITTED");
+    check_close(fit.joint_ray_attempt.actual_accepted_alpha,fit.joint_ray_attempt.proposed_alpha*
+      std::ldexp(1.0,1-fit.joint_ray_attempt.trials),1e-15);
+    check_close(fit.joint_ray_committed.actual_accepted_alpha,fit.joint_ray_attempt.actual_accepted_alpha,1e-15);
     assert(log.find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION",attribution_pos+1)==std::string::npos);
     const std::string path="rpmd_ja_native_joint_attribution_state_test_"+
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
@@ -1114,6 +1229,9 @@ void test_covariance_joint_block_commit_attribution_is_transactional()
     assert(fields.at("joint_block_enabled")=="1"&&fields.at("last_joint_attribution_available")=="1");
     assert(fields.at("last_joint_attribution_iteration")=="0"&&fields.at("last_joint_attribution_tau")=="1");
     assert(fields.at("last_joint_attribution_model_status")=="COMPUTED");
+    assert(fields.at("last_joint_ray_attempt_status")=="PROPOSED"&&fields.at("last_joint_ray_attempt_line_status")=="STEP_COMMITTED");
+    assert(fields.at("last_joint_ray_attempt_used")=="1"&&fields.at("last_joint_ray_committed_used")=="1");
+    check_close(std::stod(fields.at("last_joint_ray_attempt_actual_accepted_alpha")),fit.joint_ray_attempt.actual_accepted_alpha,1e-15);
   }
   {
     DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
@@ -1122,6 +1240,9 @@ void test_covariance_joint_block_commit_attribution_is_transactional()
     const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,true);
     covariance_fit_test_hooks={};
     assert(fit.status=="EVALUATION_BUDGET_EXHAUSTED"&&fit.iterations==0&&fit.last_valid.theta==fit.theta);
+    assert(fit.joint_ray_attempt.iteration==0&&fit.joint_ray_attempt.line_status=="EVALUATION_BUDGET_EXHAUSTED");
+    assert(!fit.joint_ray_attempt.accepted&&fit.joint_ray_attempt.actual_accepted_alpha!=fit.joint_ray_attempt.actual_accepted_alpha);
+    assert(fit.joint_ray_committed.status=="NOT_APPLICABLE");
     assert(!fit.last_joint_attribution.available&&trace.str().find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION")==std::string::npos);
   }
 }
@@ -1424,6 +1545,15 @@ void test_covariance_armijo_bounded_expansion_preserves_last_valid_candidate()
     assert(trace.str().find("COVARIANCE_STEP_EXPAND iteration=0 from_alpha=1")!=std::string::npos);
     assert(trace.str().find("COVARIANCE_STEP_EXPAND iteration=0 from_alpha=2")!=std::string::npos);
     assert(fit.theta==theta&&fit.last_valid.theta==theta);
+  }
+  {
+    CovarianceFitResult fit=initialize();std::ostringstream trace;double evaluated_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){value.gradient={-1.0+0.1*evaluated_x};},&trace,false);
+    assert(line.accepted&&line.alpha==1.0&&line.trials==1&&fit.objective_evaluations==1);
+    assert(trace.str().find("COVARIANCE_STEP_EXPAND")==std::string::npos);
   }
   {
     CovarianceFitResult fit=initialize();int calls=0;double evaluated_x=0.0;
@@ -3074,6 +3204,7 @@ int main()
   test_covariance_local_group_hessian_matches_tiny_objective_fd(qr.solver);
   test_covariance_block_newton_host_arithmetic();
   test_covariance_joint_block_includes_cross_group_hessian();
+  test_covariance_joint_ray_spectrum_and_proposal(qr.solver);
   test_covariance_joint_block_commit_attribution_is_transactional();
   test_padded_qr_svd_and_cut_qp(qr.solver);
   test_active_set_qp_snapshot_and_rejection(qr.solver);
