@@ -268,7 +268,11 @@ assert "gradient_residual_reject_trials" in backtracking and "evaluation_budget_
 assert 'failure_stage="GRADIENT_RESIDUAL_REJECT"' in backtracking and 'failure_stage="GRADIENT_SOLVE_FAIL"' in backtracking
 assert "catch(...)" in backtracking and "throw;" in backtracking
 assert backtracking.index('trial_status="ARMIJO_ACCEPTED"') < backtracking.index("complete_gradient(result.next)") < backtracking.index("result.accepted=true")
-assert "const bool allow_expansion=true" in backtracking and "if(allow_expansion&&initial_alpha==1.0" in backtracking
+assert "const bool allow_expansion=true,const bool objective_only_expansion=false" in backtracking
+assert "objective_expansion=objective_only_expansion&&allow_expansion&&initial_alpha==1.0" in backtracking
+assert "if(!objective_only_expansion&&allow_expansion&&initial_alpha==1.0" in backtracking
+assert "proposal_objective" in backtracking and "objective_only=1" in backtracking
+assert "line_search_gradient_calls" in native_fit and "line_search_objective_seconds" in native_fit
 bfgs_helpers = native_fit.split("struct CovarianceBFGSHistory", 1)[1].split("CovarianceBacktrackingResult covariance_backtrack_armijo(", 1)[0]
 assert "curvature_limit=1e-12*std::sqrt(ss*yy)" in bfgs_helpers and "gamma=sy/yy" in bfgs_helpers
 assert "history.seed_source=\"FIRST_VALID_SECANT\"" in bfgs_helpers and "RECENT_VALID_GAMMA_RESET" in bfgs_helpers
@@ -680,7 +684,7 @@ joint_ray_branch = covariance_optimizer.split('if(choice.method=="JOINT_BLOCK"){
 assert "covariance_joint_ray_proposal(" in joint_ray_branch
 assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
 assert "ray_attempt.eigen_evaluations=joint_direction_result.ray_eigen_evaluations" in covariance_optimizer
-assert "trace,!joint_block||!ray_attempt.usable);" in covariance_optimizer
+assert 'joint_block&&choice.method!="JOINT_BLOCK");' in covariance_optimizer
 assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="PROPOSAL_READY"') < covariance_optimizer.index("covariance_backtrack_armijo(")
 assert covariance_optimizer.index("result.joint_block_factorizations+=joint_factorizations") < covariance_optimizer.index("covariance_joint_ray_proposal(")
 assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('if(joint_block){ray_attempt.line_status="STEP_COMMITTED"')
@@ -689,6 +693,11 @@ assert "CovarianceDirectionChoice covariance_choose_group_bfgs_direction(" in na
 assert "CovarianceGroupBFGSUpdateStatus covariance_update_group_bfgs_history(" in native_fit
 assert "test_covariance_group_bfgs_independent_history" in cuda_test
 assert "test_covariance_joint_large_group_bfgs_commit_and_default" in cuda_test
+assert "fit.dominant_cap_rescue_next" in cuda_test and "GROUP_GLOBAL_RESCUE" in cuda_test
+assert "gradient_residual_failure_iteration=1" in cuda_test
+assert "dominant_cap_rescue_attempts==1&&rejected_rescue.dominant_cap_rescue_commits==0" in cuda_test
+assert "gradient_x==line.next_theta[0]" in cuda_test and "line.evaluation_budget_exhausted" in cuda_test
+assert "line_search_gradient_calls==2" in cuda_test and "line_search_evaluations==3" in cuda_test
 assert "objective_evaluation_budget_after_baseline=2" in cuda_test
 assert 'fit.group_bfgs_committed_updates[0]==0' in cuda_test
 assert 'fit.gradient_residual_reject_trials>0&&fit.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT"' in cuda_test
@@ -700,6 +709,9 @@ assert covariance_optimizer.index("if(!accepted){") < covariance_optimizer.index
 assert covariance_optimizer.index("covariance_update_group_bfgs_history(") < covariance_optimizer.index("z=std::move(next_z)")
 assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index("group_bfgs_history[updated_group]=std::move(group_bfgs_pending)")
 assert "APPROXIMATE_MODEL_UNAVAILABLE" in covariance_optimizer
+assert 'choice.reason="GROUP_GLOBAL_RESCUE"' in covariance_optimizer
+assert "result.dominant_cap_rescue_next=choice.method==\"GROUP_BFGS\"" in covariance_optimizer
+assert "if(dominant_cap_global_rescue)set_cap_active_groups(step)" in covariance_optimizer
 assert "group_bfgs_direction_gamma" in native_fit and "group_bfgs_direction_source" in native_fit
 assert "group_bfgs_committed_updates" in native_fit and "COVARIANCE_GROUP_BFGS_COMMIT" in covariance_optimizer
 assert "group_bfgs_committed_update_status=" in covariance_optimizer

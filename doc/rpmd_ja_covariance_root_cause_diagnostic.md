@@ -124,14 +124,26 @@ rpmd_ja fit_samples_covariance <same_samples> ja_cov_joint_block10.bin <cutoff> 
 The ``joint_block`` trial ranks groups by maximum absolute scaled gradient and
 uses up to three whose union support fits within 32 atoms. It applies a pure
 selected-group direction. If the dominant support exceeds 32, the status stays
-``DOMINANT_SUPPORT_CAP`` and the optimizer uses ``GROUP_BFGS`` for that group's
-six coordinates, with zeros elsewhere. Each group has its own six-dimensional
-inverse-Hessian history for each ``tau`` stage; it seeds from the first
-curvature-valid committed pure-group secant. Rejected trials and joint or
-mixed-group steps do not update the histories. A finite direction or
-representability failure falls back to global BFGS. The group direction uses no
-extra covariance factors, RHS columns, or joint ray proposal, and its approximate
-model is reported as unavailable. For an accepted joint step, the trace compares the selected-subspace gradient change
+``DOMINANT_SUPPORT_CAP`` and the optimizer alternates a committed
+``GROUP_BFGS`` step with the shared global ``BFGS`` direction, starting with
+``GROUP_BFGS``. A rescue updates the full shared secant history but not any
+per-group history; its attribution lists the nonzero groups and parameters in
+the actual step. Rejected trials leave the schedule pending, and a ``tau``
+change resets it. Each group has its own six-dimensional inverse-Hessian history
+for each ``tau`` stage; it seeds from the first curvature-valid committed
+pure-group secant. Joint or mixed-group steps do not update these histories. A
+finite direction or representability failure falls back to global BFGS. For
+``joint_block`` runs using ``GROUP_BFGS`` or ``BFGS`` directions, bounded
+objective-only expansion proposes alpha values up to 4, then evaluates a full
+gradient at the selected point's factors. A failed or worse expansion
+re-evaluates the best objective-pass point before its gradient; objective-only
+proposals are never committed. The group direction uses no extra covariance
+factors, RHS columns, or joint ray proposal, and its approximate model is
+reported as unavailable. ``line_search_evaluations`` and
+``line_search_objective_seconds`` cover line-search objective evaluations and
+time, including re-evaluations after a failed or worse expansion. Trace
+line-search gradient calls and time exclude baseline, initialization, and
+tau-stage gradients. For an accepted joint step, the trace compares the selected-subspace gradient change
 with the undamped Hessian prediction at the actual step ``s`` using
 ``||(g_new-g_old)-H*s||inf / max(||g_new-g_old||inf, ||H*s||inf, 1e-300)``.
 This discrepancy and the accompanying group/global gradient norms are local

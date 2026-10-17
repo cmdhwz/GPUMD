@@ -1373,6 +1373,7 @@ void test_covariance_joint_large_group_bfgs_commit_and_default()
     assert(fit.last_joint_attribution.groups==std::vector<int>{0}&&fit.last_joint_attribution.group_supports==std::vector<std::size_t>{34});
     assert(fit.last_joint_attribution.parameter_count==6&&fit.last_joint_attribution.support_count==34);
     assert(fit.last_joint_attribution.model_status=="APPROXIMATE_MODEL_UNAVAILABLE");
+    assert(fit.dominant_cap_rescue_next&&fit.dominant_cap_rescue_attempts==0&&fit.dominant_cap_rescue_commits==0);
     assert(fit.joint_ray_attempt.status=="NOT_USED_GROUP_BFGS"&&fit.joint_ray_attempt.line_status=="STEP_COMMITTED");
     assert(fit.joint_block_factorizations==0&&fit.joint_block_rhs_columns==0);
     assert(fit.group_bfgs_committed_updates[0]==1&&fit.group_bfgs_update_status[0]=="SEEDED");
@@ -1387,6 +1388,7 @@ void test_covariance_joint_large_group_bfgs_commit_and_default()
     std::ifstream state_file(path);const auto fields=read_covariance_state_fields(state_file);
     assert(fields.at("direction_method")=="GROUP_BFGS"&&fields.at("direction_group_support")=="34");
     assert(fields.at("last_joint_attribution_parameter_count")=="6");
+    assert(fields.at("dominant_cap_rescue_next")=="1"&&fields.at("dominant_cap_rescue_attempts")=="0");
     assert(fields.at("group_bfgs_direction_source")=="UNIT_IDENTITY"&&fields.at("group_bfgs_group_0_update_status")=="SEEDED");
     assert(fields.at("last_joint_ray_attempt_status")=="NOT_USED_GROUP_BFGS");
   }
@@ -1400,12 +1402,46 @@ void test_covariance_joint_large_group_bfgs_commit_and_default()
     assert(fit.iterations==0&&!fit.converged&&!fit.last_joint_attribution.available);
     assert(fit.status=="EVALUATION_BUDGET_EXHAUSTED"&&fit.objective_evaluations>0);
     assert(fit.gradient_residual_reject_trials>0&&fit.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT");
+    assert(!fit.dominant_cap_rescue_next&&fit.dominant_cap_rescue_attempts==0&&fit.dominant_cap_rescue_commits==0);
     assert(fit.theta==fit.theta_start&&fit.last_valid.available&&fit.last_valid.theta==fit.theta_start);
     assert(fit.group_bfgs_direction_gamma==1.0&&fit.group_bfgs_direction_source=="UNIT_IDENTITY");
     assert(fit.group_bfgs_committed_updates[0]==0&&fit.group_bfgs_update_status[0]=="NOT_UPDATED");
     assert(fit.group_bfgs_gamma[0]==1.0&&fit.group_bfgs_source[0]=="UNIT_IDENTITY");
     assert(log.find("selection_status=DOMINANT_SUPPORT_CAP")!=std::string::npos&&log.find("method=GROUP_BFGS")!=std::string::npos);
     assert(log.find("COVARIANCE_GROUP_BFGS_COMMIT")==std::string::npos&&log.find("REFERENCE_WRITTEN")==std::string::npos);
+  }
+  {
+    DeviceBaseline baseline;initialize_identity_covariance_baseline(baseline,n);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    covariance_fit_test_hooks={};
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,2,&trace,false,true);
+    const std::string log=trace.str();
+    assert(fit.iterations==2&&fit.dominant_cap_rescue_attempts==1&&fit.dominant_cap_rescue_commits==1);
+    assert(fit.last_joint_attribution.available&&fit.last_joint_attribution.method=="BFGS");
+    assert(fit.last_joint_attribution.reason=="GROUP_GLOBAL_RESCUE"&&fit.last_joint_attribution.parameter_count>6);
+    assert(std::find(fit.last_joint_attribution.groups.begin(),fit.last_joint_attribution.groups.end(),1)!=fit.last_joint_attribution.groups.end());
+    assert(fit.group_bfgs_committed_updates[0]==1&&fit.group_bfgs_committed_updates[1]==0);
+    assert(!fit.dominant_cap_rescue_next&&log.find("method=BFGS reason=GROUP_GLOBAL_RESCUE")!=std::string::npos);
+  }
+  {
+    DeviceBaseline baseline;initialize_identity_covariance_baseline(baseline,n);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+    covariance_fit_test_hooks={};const CovarianceFitResult single_step=solve_covariance_reference(system,statistics,1e-6,0.1,1,nullptr,false,true);
+    DeviceBaseline retry_baseline;initialize_identity_covariance_baseline(retry_baseline,n);
+    DeviceCovarianceSystem retry_system(retry_baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=64;
+    covariance_fit_test_hooks.gradient_residual_failure_iteration=1;
+    covariance_fit_test_hooks.objective_evaluation_budget_after_baseline=32;
+    const CovarianceFitResult rejected_rescue=solve_covariance_reference(retry_system,statistics,1e-6,0.1,2,&trace,false,true);
+    covariance_fit_test_hooks={};const std::string log=trace.str();
+    assert(single_step.iterations==1&&rejected_rescue.iterations==1);
+    assert(rejected_rescue.theta==single_step.theta&&rejected_rescue.last_valid.theta==single_step.last_valid.theta);
+    assert(rejected_rescue.gradient_residual_reject_trials>0);
+    assert(rejected_rescue.dominant_cap_rescue_attempts==1&&rejected_rescue.dominant_cap_rescue_commits==0);
+    assert(rejected_rescue.dominant_cap_rescue_next&&rejected_rescue.group_bfgs_committed_updates[0]==1);
+    assert(rejected_rescue.group_bfgs_source[0]==single_step.group_bfgs_source[0]);
+    assert(rejected_rescue.group_bfgs_gamma[0]==single_step.group_bfgs_gamma[0]);
+    assert(rejected_rescue.group_bfgs_update_status[0]==single_step.group_bfgs_update_status[0]);
+    assert(log.find("method=BFGS reason=GROUP_GLOBAL_RESCUE")!=std::string::npos);
+    assert(log.find("LINE_SEARCH_FAILURE iter=1")!=std::string::npos);
   }
   {
     DeviceBaseline baseline;initialize_identity_covariance_baseline(baseline,n);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
@@ -1730,6 +1766,73 @@ void test_covariance_armijo_bounded_expansion_preserves_last_valid_candidate()
         value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
       [&](CovarianceObjectiveEvaluation& value){++calls;value.gradient={-1.0+0.1*evaluated_x};});
     assert(line.accepted&&!line.evaluation_budget_exhausted&&line.alpha==1.0&&line.trials==1&&calls==1);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;double evaluated_x=0.0,gradient_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){++gradients;gradient_x=evaluated_x;value.gradient={-1.0+0.1*evaluated_x};},nullptr,true,true);
+    assert(line.accepted&&line.alpha==4.0&&line.trials==3&&fit.line_search_evaluations==3&&fit.objective_evaluations==3);
+    assert(gradients==1&&gradient_x==line.next_theta[0]&&line.next.objective==-3.2);
+    assert(fit.line_search_gradient_calls==1&&fit.line_search_objective_seconds>=0.0&&fit.line_search_gradient_seconds>=0.0);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;double evaluated_x=0.0,gradient_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=x[0]<1.5;value.status=value.feasible?CovarianceObjectiveStatus::Feasible:CovarianceObjectiveStatus::ShiftedNotSpd;
+        value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){++gradients;gradient_x=evaluated_x;value.gradient={-1.0+0.1*evaluated_x};},nullptr,true,true);
+    assert(line.accepted&&line.alpha==1.0&&line.trials==3&&fit.objective_evaluations==3);
+    assert(gradients==1&&gradient_x==line.next_theta[0]);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;double evaluated_x=0.0,gradient_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.4*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){++gradients;gradient_x=evaluated_x;value.gradient={-1.0+0.8*evaluated_x};},nullptr,true,true);
+    assert(line.accepted&&line.alpha==1.0&&line.trials==3&&fit.objective_evaluations==3);
+    assert(gradients==1&&gradient_x==line.next_theta[0]);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;double evaluated_x=0.0,gradient_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,1,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){++gradients;value.gradient={-1.0+0.1*evaluated_x};},nullptr,true,true);
+    assert(line.accepted&&line.alpha==1.0&&line.trials==1&&fit.objective_evaluations==1&&gradients==1);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;double evaluated_x=0.0,gradient_x=0.0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+      [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){if(++gradients==1){CovarianceTraceDiagnostics error;error.matrix_kind="D_MINUS_EPSILON_I";
+          error.status="RESIDUAL_FAIL";error.worst_factor_solve_relative_residual=2e-7;throw CovarianceSolveResidualError(error);}
+        gradient_x=evaluated_x;value.gradient={-1.0+0.1*evaluated_x};},nullptr,true,true);
+    assert(line.accepted&&line.gradient_residual_rejected&&line.alpha==2.0&&line.trials==4);
+    assert(fit.gradient_residual_reject_trials==1&&gradients==2&&fit.line_search_gradient_calls==2&&gradient_x==line.next_theta[0]);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;
+    const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,2,fit,0,0.5,
+      [](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;CovarianceObjectiveEvaluation value;
+        value.feasible=x[0]<1.5;value.status=value.feasible?CovarianceObjectiveStatus::Feasible:CovarianceObjectiveStatus::ShiftedNotSpd;
+        value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation&){++gradients;},nullptr,true,true);
+    assert(!line.accepted&&line.evaluation_budget_exhausted&&line.trials==2&&fit.objective_evaluations==2&&gradients==0);
+    assert(fit.theta==theta&&fit.last_valid.theta==theta);
+  }
+  {
+    CovarianceFitResult fit=initialize();int gradients=0;bool propagated=false;
+    try{(void)covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
+        [](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;CovarianceObjectiveEvaluation value;
+          value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.05*x[0]*x[0];return value;},
+        [&](CovarianceObjectiveEvaluation& value){++gradients;value.gradient={std::numeric_limits<double>::quiet_NaN()};},nullptr,true,true);}
+    catch(const std::runtime_error& error){propagated=std::string(error.what()).find("non-finite")!=std::string::npos;}
+    assert(propagated&&gradients==1&&fit.failed_trial.failure_stage=="GRADIENT_SOLVE_FAIL");
   }
   {
     CovarianceFitResult fit=initialize();int gradients=0;double evaluated_x=0.0;

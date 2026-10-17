@@ -72,7 +72,41 @@ The separate offline ``fit_samples_covariance`` route reuses the same ``GPJASMP1
 
   rpmd_ja fit_samples_covariance <samples> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block]
 
-Without the final token, covariance fitting keeps its BFGS direction. The ``block_newton`` token preserves the legacy direction: it replaces the six coordinates of the parameter group containing the largest absolute scaled-gradient component when that group's support is at most 32 atoms and its conditional Hessian passes the existing numerical checks. The opt-in ``joint_block`` token ranks groups by their maximum absolute scaled-gradient component, requires the dominant group's support to be at most 32 atoms, then selects up to three groups while the combined atom support stays within 32. It builds one joint Hessian, including cross-group terms, from one factor pair and solves for the union-support RHSs. For ``DOMINANT_SUPPORT_CAP``, it keeps that selection status as a diagnostic and may use ``GROUP_BFGS`` on exactly the dominant group's six coordinates; all other direction coordinates are zero. Each group has an independent six-dimensional history per ``tau`` stage, seeded only by its first curvature-valid committed pure-group secant. Rejected trials and joint or mixed-group steps do not update these histories. If a finite descent direction or representable step is unavailable, the optimizer falls back to global BFGS; non-finite and CUDA failures remain fatal. Group BFGS does not use the joint ray proposal and reports its approximate model as unavailable. Both opt-in modes retain the existing full-gradient residual, Armijo, directional-overshoot, KKT, held-out response, and final SPD acceptance gates.
+Without the final token, covariance fitting keeps its BFGS direction. The
+``block_newton`` token preserves the legacy direction: it replaces the six
+coordinates of the parameter group containing the largest absolute
+scaled-gradient component when that group's support is at most 32 atoms and its
+conditional Hessian passes the existing numerical checks. The opt-in
+``joint_block`` token ranks groups by their maximum absolute scaled-gradient
+component, requires the dominant group's support to be at most 32 atoms, then
+selects up to three groups while the combined atom support stays within 32. It
+builds one joint Hessian, including cross-group terms, from one factor pair and
+solves for the union-support RHSs. For ``DOMINANT_SUPPORT_CAP``, it retains that
+selection status and alternates a committed ``GROUP_BFGS`` step with a global
+``BFGS`` rescue step, beginning with ``GROUP_BFGS``. The rescue uses the shared
+full-parameter history and does not update per-group histories; attribution
+records its actual nonzero groups and parameters. Rejected trials do not
+advance the schedule, and a ``tau`` stage change resets it. Each group keeps an
+independent six-dimensional history per ``tau`` stage, seeded only by its first
+curvature-valid committed pure-group secant. Joint and mixed-group steps do
+not update these histories. If a finite descent direction or representable
+step is unavailable, the optimizer falls back to global BFGS; non-finite and
+CUDA failures remain fatal.
+
+For ``joint_block`` runs using ``GROUP_BFGS`` or ``BFGS`` directions, bounded
+objective-only expansion proposes steps up to alpha 4, then computes a full
+gradient at the selected candidate's factors. A failed or worse expansion
+returns to the best objective-pass proposal and re-evaluates it before the
+gradient. Objective proposals alone never satisfy commit gates.
+``line_search_evaluations`` and ``line_search_objective_seconds`` cover
+line-search objective evaluations and time, including re-evaluations after a
+failed or worse expansion. ``line_search_gradient_calls`` and
+``line_search_gradient_seconds`` cover complete-gradient backtracking work;
+baseline, initialization, and tau-stage gradients are excluded. Group BFGS does
+not use the joint ray proposal and reports its approximate model as unavailable.
+Both opt-in modes retain the
+existing full-gradient residual, Armijo, directional-overshoot, KKT, held-out
+response, and final SPD acceptance gates.
 
 For a successful ``JOINT_BLOCK`` direction, the optimizer also forms the small spectra of ``sqrt(V) L sqrt(V)`` for the local ``D`` and ``D-epsilon I`` inverse probes. Their exact log-determinant ray model proposes an initial alpha, capped at 90% of its estimated SPD boundary and by the existing step policy (up to 4 only from an original alpha of 1). This is only a proposal: the full objective, full-gradient residual, Armijo, directional-overshoot, and commit checks still decide every trial. Finite spectral or slope-consistency failures use the existing initial step and line search. No full-space inverse or solve is added.
 
