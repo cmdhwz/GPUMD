@@ -792,6 +792,19 @@ void initialize_two_atom_covariance_baseline(DeviceBaseline& baseline,const bool
   assert(cudaMemcpy(baseline.k,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
 }
 
+void initialize_identity_covariance_baseline(DeviceBaseline& baseline,const int n)
+{
+  baseline.d=3*n;assert(cublasCreate(&baseline.blas)==CUBLAS_STATUS_SUCCESS);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.k),static_cast<std::size_t>(baseline.d)*baseline.d*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.q),static_cast<std::size_t>(baseline.d)*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.out),static_cast<std::size_t>(baseline.d)*sizeof(double))==cudaSuccess);
+  std::vector<double> matrix(static_cast<std::size_t>(baseline.d)*baseline.d,0.0);
+  for(int axis=0;axis<3;++axis)for(int i=0;i<n;++i)for(int j=0;j<n;++j){
+    const int row=axis*n+i,column=axis*n+j;
+    matrix[static_cast<std::size_t>(row)*baseline.d+column]=(i==j?1.0:0.0)-1.0/n;}
+  assert(cudaMemcpy(baseline.k,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+}
+
 void test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly()
 {
   const Graph graph=make_two_atom_covariance_graph();const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0},sqrt_atom={1.0,2.0};
@@ -1067,6 +1080,102 @@ void test_covariance_joint_block_includes_cross_group_hessian()
   assert(nonfinite_rejected);
 }
 
+void test_covariance_group_bfgs_independent_history()
+{
+  constexpr int groups=2,parameters=6*groups;
+  std::vector<double> hessian(static_cast<std::size_t>(parameters)*parameters,0.0);
+  for(int group=0;group<groups;++group)for(int component=0;component<6;++component){
+    const int index=6*group+component;hessian[static_cast<std::size_t>(index)*parameters+index]=(group?1e6:1.0)*(component+1);}
+  hessian[6]=0.2*std::sqrt(hessian[0]*hessian[static_cast<std::size_t>(6)*parameters+6]);
+  hessian[static_cast<std::size_t>(6)*parameters]=hessian[6];
+  std::vector<double> point(parameters);for(int i=0;i<parameters;++i)point[i]=0.1*(i+1);
+  auto multiply=[&](const std::vector<double>& vector){std::vector<double> result(parameters,0.0);
+    for(int i=0;i<parameters;++i)for(int j=0;j<parameters;++j)result[i]+=hessian[static_cast<std::size_t>(i)*parameters+j]*vector[j];return result;};
+  const std::vector<double> gradient=multiply(point);std::array<CovarianceBFGSHistory,groups> history;
+  for(CovarianceBFGSHistory& item:history)covariance_reset_bfgs_history(item,6,true);
+  const CovarianceDirectionChoice first=covariance_choose_group_bfgs_direction(gradient,0,history[0]);
+  assert(first.method=="GROUP_BFGS"&&first.selected_slope<0.0&&first.direction.size()==parameters);
+  for(int i=6;i<parameters;++i)assert(first.direction[i]==0.0);
+  for(int i=0;i<6;++i)check_close(first.direction[i],-gradient[i],1e-14);
+  std::vector<double> step(parameters);for(int i=0;i<parameters;++i)step[i]=0.2*first.direction[i];
+  const std::vector<double> change=multiply(step);
+  const auto first_update=covariance_update_group_bfgs_history(history[0],0,step,change);
+  assert(first_update==CovarianceGroupBFGSUpdateStatus::Seeded&&history[0].stage_seeded&&history[0].seed_source=="FIRST_VALID_SECANT");
+  assert(history[1].seed_gamma==1.0&&!history[1].stage_seeded);
+  const double group0_gamma=covariance_dot(std::vector<double>(step.begin(),step.begin()+6),std::vector<double>(change.begin(),change.begin()+6)) /
+    covariance_dot(std::vector<double>(change.begin(),change.begin()+6),std::vector<double>(change.begin(),change.begin()+6));
+  check_close(history[0].seed_gamma,group0_gamma,1e-13);
+  const CovarianceDirectionChoice second=covariance_choose_group_bfgs_direction(gradient,1,history[1]);
+  assert(second.method=="GROUP_BFGS"&&second.selected_slope<0.0);
+  for(int i=0;i<6;++i)assert(second.direction[i]==0.0);
+  std::vector<double> second_step(parameters);for(int i=0;i<parameters;++i)second_step[i]=0.2*second.direction[i];
+  const std::vector<double> second_change=multiply(second_step);
+  assert(covariance_update_group_bfgs_history(history[1],1,second_step,second_change)==CovarianceGroupBFGSUpdateStatus::Seeded);
+  assert(history[1].seed_gamma!=history[0].seed_gamma);
+
+  const CovarianceBFGSHistory committed=history[0];CovarianceBFGSHistory rejected_pending=committed;
+  std::vector<double> mixed_step=step;mixed_step[6]=second_step[6];const std::vector<double> mixed_change=multiply(mixed_step);
+  assert(covariance_update_group_bfgs_history(rejected_pending,0,mixed_step,mixed_change)==CovarianceGroupBFGSUpdateStatus::SkippedMixedStep);
+  assert(rejected_pending.inverse_hessian==committed.inverse_hessian&&rejected_pending.seed_gamma==committed.seed_gamma&&
+    rejected_pending.seed_source==committed.seed_source&&rejected_pending.stage_seeded==committed.stage_seeded);
+  CovarianceBFGSHistory overflow_history;covariance_reset_bfgs_history(overflow_history,6,true);bool overflow_rejected=false;
+  std::vector<double> huge_step(12,0.0),huge_change(12,0.0);huge_step[0]=huge_change[0]=1e200;
+  try{(void)covariance_update_group_bfgs_history(overflow_history,0,huge_step,huge_change);}catch(const std::runtime_error&){overflow_rejected=true;}
+  assert(overflow_rejected&&!overflow_history.stage_seeded&&overflow_history.seed_gamma==1.0);
+  CovarianceBFGSHistory budget_pending=committed;
+  std::vector<double> pure_step(12,0.0),pure_change(12,0.0);for(int i=0;i<6;++i){pure_step[i]=0.1*step[i];pure_change[i]=0.1*change[i];}
+  assert(covariance_update_group_bfgs_history(budget_pending,0,pure_step,pure_change)==CovarianceGroupBFGSUpdateStatus::Updated);
+  assert(committed.inverse_hessian==history[0].inverse_hessian&&committed.seed_gamma==history[0].seed_gamma);
+  covariance_reset_bfgs_history(history[0],6,true);
+  assert(!history[0].stage_seeded&&std::isnan(history[0].last_valid_gamma)&&history[0].seed_gamma==1.0&&history[0].seed_source=="UNIT_IDENTITY");
+
+  std::vector<double> coupled_hessian(static_cast<std::size_t>(parameters)*parameters,0.0);
+  std::array<double,groups*6> curvature{};
+  for(int group=0;group<groups;++group)for(int component=0;component<6;++component)
+    curvature[6*group+component]=(group?1e10:1e4)*(1.0+0.1*component);
+  for(int i=0;i<parameters;++i){coupled_hessian[static_cast<std::size_t>(i)*parameters+i]=curvature[i];
+    for(int j=i+1;j<parameters;++j){const bool same_group=i/6==j/6;
+      const double normalized=(same_group&&j/6==i/6&&j-i==1)?0.03:i/6!=j/6&&i%6==j%6?0.2:0.0;
+      if(normalized!=0.0){const double value=normalized*std::sqrt(curvature[i]*curvature[j]);
+        coupled_hessian[static_cast<std::size_t>(i)*parameters+j]=coupled_hessian[static_cast<std::size_t>(j)*parameters+i]=value;}}}
+  for(int i=0;i<parameters;++i){double normalized_off_diagonal_sum=0.0;
+    for(int j=0;j<parameters;++j)if(i!=j)
+      normalized_off_diagonal_sum+=std::abs(coupled_hessian[static_cast<std::size_t>(i)*parameters+j])/std::sqrt(curvature[i]*curvature[j]);
+    assert(normalized_off_diagonal_sum<1.0);}
+  auto coupled_gradient=[&](const std::vector<double>& vector){std::vector<double> result(parameters,0.0);
+    for(int i=0;i<parameters;++i)for(int j=0;j<parameters;++j)result[i]+=coupled_hessian[static_cast<std::size_t>(i)*parameters+j]*vector[j];return result;};
+  auto quadratic=[&](const std::vector<double>& vector){const std::vector<double> product=coupled_gradient(vector);
+    return 0.5*covariance_dot(vector,product);};
+  std::vector<double> point_coupled(parameters);for(int i=0;i<parameters;++i)point_coupled[i]=1.0/std::sqrt(curvature[i]);
+  std::array<CovarianceBFGSHistory,groups> coupled_history;for(auto& item:coupled_history)covariance_reset_bfgs_history(item,6,true);
+  const std::vector<double> initial_gradient=coupled_gradient(point_coupled);const double global_scale=covariance_norm_inf(initial_gradient);
+  std::vector<double> coupled_gradient_now=initial_gradient;double objective=quadratic(point_coupled);int accepted_steps=0;
+  for(;accepted_steps<200&&covariance_norm_inf(coupled_gradient_now)/global_scale>1e-6;++accepted_steps){
+    std::array<double,groups> group_norm{};for(int group=0;group<groups;++group)for(int component=0;component<6;++component)
+      group_norm[group]=std::max(group_norm[group],std::abs(coupled_gradient_now[6*group+component]));
+    const int active=group_norm[1]>group_norm[0]?1:0;
+    CovarianceDirectionChoice direction=covariance_choose_group_bfgs_direction(coupled_gradient_now,active,coupled_history[active]);
+    if(!(direction.selected_slope<0.0)){std::vector<double> local_gradient(6),local_direction;
+      std::copy_n(coupled_gradient_now.begin()+6*active,6,local_gradient.begin());
+      covariance_reset_non_descent_direction(coupled_history[active],local_gradient,local_direction);
+      direction=covariance_choose_group_bfgs_direction(coupled_gradient_now,active,coupled_history[active]);}
+    assert(direction.selected_slope<0.0);double alpha=std::min(1.0,1.0/covariance_norm_inf(direction.direction));
+    bool accepted=false;std::vector<double> next_point,next_gradient,actual_step;double next_objective=0.0;
+    for(int trial=0;trial<64;++trial){next_point=point_coupled;actual_step.resize(parameters);
+      for(int i=0;i<parameters;++i){next_point[i]+=alpha*direction.direction[i];actual_step[i]=next_point[i]-point_coupled[i];}
+      next_gradient=coupled_gradient(next_point);next_objective=quadratic(next_point);
+      const double candidate_slope=covariance_dot(next_gradient,direction.direction);
+      if(next_objective<=objective+1e-4*alpha*direction.selected_slope&&candidate_slope<=0.0){accepted=true;break;}alpha*=0.5;}
+    assert(accepted&&next_objective<objective);std::vector<double> full_change(parameters);
+    for(int i=0;i<parameters;++i)full_change[i]=next_gradient[i]-coupled_gradient_now[i];
+    const auto update=covariance_update_group_bfgs_history(coupled_history[active],active,actual_step,full_change);
+    assert(update==CovarianceGroupBFGSUpdateStatus::Updated||update==CovarianceGroupBFGSUpdateStatus::Seeded||
+      update==CovarianceGroupBFGSUpdateStatus::Reset);
+    point_coupled=std::move(next_point);coupled_gradient_now=std::move(next_gradient);objective=next_objective;
+  }
+  assert(accepted_steps<200&&covariance_norm_inf(coupled_gradient_now)/global_scale<=1e-6);
+}
+
 void test_covariance_joint_ray_spectrum_and_proposal(cusolverDnHandle_t solver)
 {
   constexpr int n=8,d=9;Graph graph;graph.type_pairs={{0,0},{0,1},{1,1}};
@@ -1244,6 +1353,65 @@ void test_covariance_joint_block_commit_attribution_is_transactional()
     assert(!fit.joint_ray_attempt.accepted&&fit.joint_ray_attempt.actual_accepted_alpha!=fit.joint_ray_attempt.actual_accepted_alpha);
     assert(fit.joint_ray_committed.status=="NOT_APPLICABLE");
     assert(!fit.last_joint_attribution.available&&trace.str().find("COVARIANCE_JOINT_COMMIT_ATTRIBUTION")==std::string::npos);
+  }
+}
+
+void test_covariance_joint_large_group_bfgs_commit_and_default()
+{
+  constexpr int n=36;Graph graph;graph.type_pairs={{0,0},{0,1}};
+  for(int atom=0;atom<33;++atom)graph.edges.push_back({atom,atom+1,0,{0,0,0}});
+  graph.edges.push_back({34,35,1,{0,0,0}});
+  const std::vector<double> masses(n,1.0),sqrt_mass(3*n,1.0);
+  std::vector<double> statistics(12,0.0);for(int component=0;component<6;++component){statistics[component]=10.0;statistics[6+component]=0.01;}
+  {
+    DeviceBaseline baseline;initialize_identity_covariance_baseline(baseline,n);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=1;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,true);
+    covariance_fit_test_hooks={};const std::string log=trace.str();
+    assert(fit.joint_block_enabled&&fit.iterations==1&&fit.direction_method=="GROUP_BFGS");
+    assert(fit.direction_group==0&&fit.direction_group_support==34&&fit.last_joint_attribution.available);
+    assert(fit.last_joint_attribution.groups==std::vector<int>{0}&&fit.last_joint_attribution.group_supports==std::vector<std::size_t>{34});
+    assert(fit.last_joint_attribution.parameter_count==6&&fit.last_joint_attribution.support_count==34);
+    assert(fit.last_joint_attribution.model_status=="APPROXIMATE_MODEL_UNAVAILABLE");
+    assert(fit.joint_ray_attempt.status=="NOT_USED_GROUP_BFGS"&&fit.joint_ray_attempt.line_status=="STEP_COMMITTED");
+    assert(fit.joint_block_factorizations==0&&fit.joint_block_rhs_columns==0);
+    assert(fit.group_bfgs_committed_updates[0]==1&&fit.group_bfgs_update_status[0]=="SEEDED");
+    assert(fit.group_bfgs_source[0]=="FIRST_VALID_SECANT"&&fit.group_bfgs_committed_updates[1]==0);
+    assert(fit.gradient_residual_reject_trials==1&&log.find("selection_status=DOMINANT_SUPPORT_CAP")!=std::string::npos);
+    assert(log.find("method=GROUP_BFGS")!=std::string::npos&&log.find("COVARIANCE_GROUP_BFGS_COMMIT")!=std::string::npos);
+    const std::string path="rpmd_ja_native_group_bfgs_state_test_"+
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
+    RpmdJANativeFitOptions options;options.cutoff=5.0;options.epsilon=1e-6;options.fd_step=1e-4;options.sample_interval=1;options.covariance_joint_block=true;
+    SampleHeader header{};header.temperature=300.0;header.beads=4;QrawIdentity identity{};
+    write_covariance_state(path,fit,0.1,"test.samples","test.qraw",options,header,identity,graph,n,2);
+    std::ifstream state_file(path);const auto fields=read_covariance_state_fields(state_file);
+    assert(fields.at("direction_method")=="GROUP_BFGS"&&fields.at("direction_group_support")=="34");
+    assert(fields.at("last_joint_attribution_parameter_count")=="6");
+    assert(fields.at("group_bfgs_direction_source")=="UNIT_IDENTITY"&&fields.at("group_bfgs_group_0_update_status")=="SEEDED");
+    assert(fields.at("last_joint_ray_attempt_status")=="NOT_USED_GROUP_BFGS");
+  }
+  {
+    DeviceBaseline baseline;initialize_identity_covariance_baseline(baseline,n);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.gradient_residual_failures_remaining=10;
+    covariance_fit_test_hooks.objective_evaluation_budget_after_baseline=2;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,true);
+    covariance_fit_test_hooks={};const std::string log=trace.str();
+    assert(fit.direction_method=="GROUP_BFGS"&&fit.direction_group==0&&fit.direction_group_support==34);
+    assert(fit.iterations==0&&!fit.converged&&!fit.last_joint_attribution.available);
+    assert(fit.status=="EVALUATION_BUDGET_EXHAUSTED"&&fit.objective_evaluations>0);
+    assert(fit.gradient_residual_reject_trials>0&&fit.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT");
+    assert(fit.theta==fit.theta_start&&fit.last_valid.available&&fit.last_valid.theta==fit.theta_start);
+    assert(fit.group_bfgs_direction_gamma==1.0&&fit.group_bfgs_direction_source=="UNIT_IDENTITY");
+    assert(fit.group_bfgs_committed_updates[0]==0&&fit.group_bfgs_update_status[0]=="NOT_UPDATED");
+    assert(fit.group_bfgs_gamma[0]==1.0&&fit.group_bfgs_source[0]=="UNIT_IDENTITY");
+    assert(log.find("selection_status=DOMINANT_SUPPORT_CAP")!=std::string::npos&&log.find("method=GROUP_BFGS")!=std::string::npos);
+    assert(log.find("COVARIANCE_GROUP_BFGS_COMMIT")==std::string::npos&&log.find("REFERENCE_WRITTEN")==std::string::npos);
+  }
+  {
+    DeviceBaseline baseline;initialize_identity_covariance_baseline(baseline,n);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
+    const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,1,&trace,false,false);
+    assert(!fit.joint_block_enabled&&fit.direction_method=="BFGS"&&fit.joint_block_factorizations==0&&fit.joint_block_rhs_columns==0);
+    assert(trace.str().find("method=GROUP_BFGS")==std::string::npos);
   }
 }
 
@@ -3204,8 +3372,10 @@ int main()
   test_covariance_local_group_hessian_matches_tiny_objective_fd(qr.solver);
   test_covariance_block_newton_host_arithmetic();
   test_covariance_joint_block_includes_cross_group_hessian();
+  test_covariance_group_bfgs_independent_history();
   test_covariance_joint_ray_spectrum_and_proposal(qr.solver);
   test_covariance_joint_block_commit_attribution_is_transactional();
+  test_covariance_joint_large_group_bfgs_commit_and_default();
   test_padded_qr_svd_and_cut_qp(qr.solver);
   test_active_set_qp_snapshot_and_rejection(qr.solver);
   test_active_set_preserves_svd_primal(qr.solver);

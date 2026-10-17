@@ -123,8 +123,15 @@ rpmd_ja fit_samples_covariance <same_samples> ja_cov_joint_block10.bin <cutoff> 
 
 The ``joint_block`` trial ranks groups by maximum absolute scaled gradient and
 uses up to three whose union support fits within 32 atoms. It applies a pure
-selected-group direction; larger-support curvature remains BFGS. For an
-accepted joint step, the trace compares the selected-subspace gradient change
+selected-group direction. If the dominant support exceeds 32, the status stays
+``DOMINANT_SUPPORT_CAP`` and the optimizer uses ``GROUP_BFGS`` for that group's
+six coordinates, with zeros elsewhere. Each group has its own six-dimensional
+inverse-Hessian history for each ``tau`` stage; it seeds from the first
+curvature-valid committed pure-group secant. Rejected trials and joint or
+mixed-group steps do not update the histories. A finite direction or
+representability failure falls back to global BFGS. The group direction uses no
+extra covariance factors, RHS columns, or joint ray proposal, and its approximate
+model is reported as unavailable. For an accepted joint step, the trace compares the selected-subspace gradient change
 with the undamped Hessian prediction at the actual step ``s`` using
 ``||(g_new-g_old)-H*s||inf / max(||g_new-g_old||inf, ||H*s||inf, 1e-300)``.
 This discrepancy and the accompanying group/global gradient norms are local

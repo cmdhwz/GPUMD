@@ -685,3 +685,23 @@ assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="PROP
 assert covariance_optimizer.index("result.joint_block_factorizations+=joint_factorizations") < covariance_optimizer.index("covariance_joint_ray_proposal(")
 assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('if(joint_block){ray_attempt.line_status="STEP_COMMITTED"')
 assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="STEP_COMMITTED"') < covariance_optimizer.index('"STEP_COMMITTED iteration="')
+assert "CovarianceDirectionChoice covariance_choose_group_bfgs_direction(" in native_fit
+assert "CovarianceGroupBFGSUpdateStatus covariance_update_group_bfgs_history(" in native_fit
+assert "test_covariance_group_bfgs_independent_history" in cuda_test
+assert "test_covariance_joint_large_group_bfgs_commit_and_default" in cuda_test
+assert "objective_evaluation_budget_after_baseline=2" in cuda_test
+assert 'fit.group_bfgs_committed_updates[0]==0' in cuda_test
+assert 'fit.gradient_residual_reject_trials>0&&fit.failed_trial.failure_stage=="GRADIENT_RESIDUAL_REJECT"' in cuda_test
+assert 'joint_selection.status=="DOMINANT_SUPPORT_CAP"' in covariance_optimizer
+assert 'result.method="GROUP_BFGS"' in native_fit
+assert 'selection_status="<<joint_selection.status' in covariance_optimizer
+assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
+assert covariance_optimizer.index("if(!accepted){") < covariance_optimizer.index("covariance_update_group_bfgs_history(")
+assert covariance_optimizer.index("covariance_update_group_bfgs_history(") < covariance_optimizer.index("z=std::move(next_z)")
+assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index("group_bfgs_history[updated_group]=std::move(group_bfgs_pending)")
+assert "APPROXIMATE_MODEL_UNAVAILABLE" in covariance_optimizer
+assert "group_bfgs_direction_gamma" in native_fit and "group_bfgs_direction_source" in native_fit
+assert "group_bfgs_committed_updates" in native_fit and "COVARIANCE_GROUP_BFGS_COMMIT" in covariance_optimizer
+assert "group_bfgs_committed_update_status=" in covariance_optimizer
+assert "write_covariance_group_bfgs_diagnostics(fitout,covariance_fit)" in native_fit
+assert "fit.group_bfgs_update_status[group]" in native_fit

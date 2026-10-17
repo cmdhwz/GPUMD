@@ -4005,6 +4005,8 @@ struct CovarianceFitResult
   std::string line_search_failure_status="NONE",directional_derivative_status="NOT_RUN",directional_derivative_side="NONE";
   std::vector<double> statistics,theta_baseline,theta_start,theta;
   std::vector<double> coordinate_scale;
+  std::vector<double> group_bfgs_gamma;std::vector<std::string> group_bfgs_source,group_bfgs_update_status;
+  std::vector<std::size_t> group_bfgs_supports;std::vector<std::uint64_t> group_bfgs_committed_updates;
   CovarianceFitSnapshot last_valid;
   CovarianceFailedTrial failed_trial;
   CovarianceJointStepAttribution last_joint_attribution;
@@ -4035,6 +4037,8 @@ struct CovarianceFitResult
   std::uint64_t joint_block_factorizations=0,joint_block_rhs_columns=0;double joint_block_seconds=0.0;
   int direction_dominant_parameter=-1,direction_group=-1;
   std::size_t direction_group_support=0;std::vector<int> direction_group_atoms;
+  int group_bfgs_direction_group=-1;std::size_t group_bfgs_direction_support=0;
+  double group_bfgs_direction_gamma=std::numeric_limits<double>::quiet_NaN();std::string group_bfgs_direction_source="NOT_USED";
   int iterations=0;
 };
 
@@ -4342,6 +4346,63 @@ double covariance_reset_non_descent_direction(CovarianceBFGSHistory& history,con
   return covariance_dot(gradient,direction);
 }
 
+CovarianceDirectionChoice covariance_choose_group_bfgs_direction(const std::vector<double>& gradient,const int group,
+  const CovarianceBFGSHistory& history)
+{
+  if(gradient.empty()||gradient.size()%6!=0||group<0||6*static_cast<std::size_t>(group)+6>gradient.size()||
+     history.inverse_hessian.size()!=36)throw std::invalid_argument("native covariance group BFGS dimensions do not match");
+  if(!std::all_of(gradient.begin(),gradient.end(),[](double value){return std::isfinite(value);})||
+     !std::all_of(history.inverse_hessian.begin(),history.inverse_hessian.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS input is non-finite");
+  CovarianceDirectionChoice result;result.method="GROUP_BFGS";result.reason="DOMINANT_SUPPORT_CAP";
+  result.direction.assign(gradient.size(),0.0);const std::size_t offset=6*static_cast<std::size_t>(group);
+  for(int row=0;row<6;++row)for(int column=0;column<6;++column)
+    result.direction[offset+row]-=history.inverse_hessian[static_cast<std::size_t>(row)*6+column]*gradient[offset+column];
+  if(!std::all_of(result.direction.begin(),result.direction.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS direction is non-finite");
+  result.selected_slope=covariance_dot(gradient,result.direction);
+  if(!std::isfinite(result.selected_slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS slope is non-finite");
+  return result;
+}
+
+enum class CovarianceGroupBFGSUpdateStatus { Updated, Seeded, Reset, SkippedMixedStep };
+
+CovarianceGroupBFGSUpdateStatus covariance_update_group_bfgs_history(CovarianceBFGSHistory& history,const int group,
+  const std::vector<double>& actual_step,const std::vector<double>& full_gradient_change)
+{
+  if(actual_step.empty()||actual_step.size()%6!=0||actual_step.size()!=full_gradient_change.size()||group<0||
+     6*static_cast<std::size_t>(group)+6>actual_step.size()||history.inverse_hessian.size()!=36)
+    throw std::invalid_argument("native covariance group BFGS update dimensions do not match");
+  if(!std::all_of(actual_step.begin(),actual_step.end(),[](double value){return std::isfinite(value);})||
+     !std::all_of(full_gradient_change.begin(),full_gradient_change.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS secant is non-finite");
+  const std::size_t offset=6*static_cast<std::size_t>(group);
+  for(std::size_t i=0;i<actual_step.size();++i)if((i<offset||i>=offset+6)&&actual_step[i]!=0.0)
+    return CovarianceGroupBFGSUpdateStatus::SkippedMixedStep;
+  std::vector<double> step(6),gradient_change(6);
+  for(int i=0;i<6;++i){step[i]=actual_step[offset+i];gradient_change[i]=full_gradient_change[offset+i];}
+  const double sy=covariance_dot(step,gradient_change),ss=covariance_dot(step,step),yy=covariance_dot(gradient_change,gradient_change);
+  if(!std::isfinite(sy)||!std::isfinite(ss)||!std::isfinite(yy))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS curvature is non-finite");
+  const CovarianceBFGSUpdateStatus status=covariance_update_inverse_hessian(history,step,gradient_change);
+  if(!std::all_of(history.inverse_hessian.begin(),history.inverse_hessian.end(),[](double value){return std::isfinite(value);})||
+     !(history.seed_gamma>0.0)||!std::isfinite(history.seed_gamma)||
+     (!std::isnan(history.last_valid_gamma)&&(!(history.last_valid_gamma>0.0)||!std::isfinite(history.last_valid_gamma))))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS update is non-finite");
+  if(status==CovarianceBFGSUpdateStatus::Updated)return CovarianceGroupBFGSUpdateStatus::Updated;
+  if(status==CovarianceBFGSUpdateStatus::Seeded)return CovarianceGroupBFGSUpdateStatus::Seeded;
+  return CovarianceGroupBFGSUpdateStatus::Reset;
+}
+
+const char* covariance_group_bfgs_update_name(const CovarianceGroupBFGSUpdateStatus status)
+{
+  switch(status){case CovarianceGroupBFGSUpdateStatus::Updated:return "UPDATED";
+    case CovarianceGroupBFGSUpdateStatus::Seeded:return "SEEDED";
+    case CovarianceGroupBFGSUpdateStatus::Reset:return "RESET";
+    case CovarianceGroupBFGSUpdateStatus::SkippedMixedStep:return "SKIPPED_MIXED_STEP";}
+  return "UNKNOWN";
+}
+
 struct CovarianceBacktrackingResult
 {
   bool accepted=false,step_underflow=false,gradient_residual_rejected=false,evaluation_budget_exhausted=false;
@@ -4635,13 +4696,27 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     if(trace)*trace<<"BFGS_CURVATURE_SEED tau="<<tau<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source<<" reason=START\n";flush_trace();
     capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);
     result.status="OPTIMIZING";
-    CovarianceJointGroupTopology joint_topology;if(joint_block)joint_topology=covariance_joint_group_topology(system.graph);
+    CovarianceJointGroupTopology joint_topology;std::vector<CovarianceBFGSHistory> group_bfgs_history;
+    if(joint_block){joint_topology=covariance_joint_group_topology(system.graph);const std::size_t groups=joint_topology.atoms.size();
+      group_bfgs_history.resize(groups);result.group_bfgs_gamma.resize(groups);result.group_bfgs_source.resize(groups);
+      result.group_bfgs_update_status.assign(groups,"NOT_UPDATED");result.group_bfgs_supports.resize(groups);
+      result.group_bfgs_committed_updates.assign(groups,0);
+      for(std::size_t group=0;group<groups;++group){covariance_reset_bfgs_history(group_bfgs_history[group],6,true);
+        result.group_bfgs_gamma[group]=group_bfgs_history[group].seed_gamma;result.group_bfgs_source[group]=group_bfgs_history[group].seed_source;
+        result.group_bfgs_supports[group]=joint_topology.atoms[group].size();}}
+    if(trace&&joint_block)for(std::size_t group=0;group<group_bfgs_history.size();++group)
+      *trace<<"COVARIANCE_GROUP_BFGS_HISTORY group="<<group<<" support="<<result.group_bfgs_supports[group]
+        <<" gamma="<<group_bfgs_history[group].seed_gamma<<" source="<<group_bfgs_history[group].seed_source
+        <<" update_status="<<result.group_bfgs_update_status[group]<<" committed_updates=0 tau="<<tau<<'\n';flush_trace();
     while(result.iterations<max_iterations&&result.objective_evaluations<max_evaluations){
       result.scaled_kkt_residual=kkt(current);result.raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
       if(result.scaled_kkt_residual<=1e-6){if(tau<=tau_min){result.converged=true;result.barrier_center_condition_pass=true;result.status="COVARIANCE_OPTIMIZER_CONVERGED";break;}
         tau=std::max(tau*0.2,tau_min);current=evaluate_covariance_fit_objective(system,result.theta,baseline,statistics,rho,epsilon,tau,result.objective_evaluations);
         capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);
         covariance_reset_bfgs_history(bfgs,z.size(),true);sync_bfgs_seed();
+        for(std::size_t group=0;group<group_bfgs_history.size();++group){covariance_reset_bfgs_history(group_bfgs_history[group],6,true);
+          result.group_bfgs_gamma[group]=group_bfgs_history[group].seed_gamma;result.group_bfgs_source[group]=group_bfgs_history[group].seed_source;
+          result.group_bfgs_update_status[group]="TAU_RESET";}
         if(trace)*trace<<"BFGS_STAGE_RESET tau="<<tau<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source<<'\n';flush_trace();continue;}
       if(joint_block){result.joint_ray_attempt=CovarianceJointRayProposal{};result.joint_ray_attempt.iteration=result.iterations;
         result.joint_ray_attempt.tau=tau;result.joint_ray_attempt.status="NOT_APPLICABLE";
@@ -4715,12 +4790,34 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       }
       const std::uint64_t block_factorizations=system.factorizations-block_factor_start,block_rhs_columns=system.solve_rhs_columns-block_rhs_start;
       CovarianceDirectionChoice choice;choice.direction=bfgs_direction;choice.selected_slope=bfgs_slope;choice.reason=block.status;
+      CovarianceBFGSHistory group_bfgs_pending;int group_bfgs_pending_group=-1;bool group_bfgs_pending_update=false;
       if(block_newton)choice=covariance_choose_block_direction(g,bfgs_direction,group,block);
+      else if(joint_block&&joint_selection.status=="DOMINANT_SUPPORT_CAP"){
+        group_bfgs_pending_group=joint_selection.dominant_group;
+        group_bfgs_pending=group_bfgs_history[static_cast<std::size_t>(group_bfgs_pending_group)];
+        choice=covariance_choose_group_bfgs_direction(g,group_bfgs_pending_group,group_bfgs_pending);
+        if(!(choice.selected_slope<0.0)){std::vector<double> local_gradient(6),local_direction;
+          for(int component=0;component<6;++component)local_gradient[component]=g[6*static_cast<std::size_t>(group_bfgs_pending_group)+component];
+          const double reset_slope=covariance_reset_non_descent_direction(group_bfgs_pending,local_gradient,local_direction);
+          if(!std::isfinite(reset_slope)||!std::all_of(local_direction.begin(),local_direction.end(),[](double value){return std::isfinite(value);}))
+            throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS reset is non-finite");
+          choice=covariance_choose_group_bfgs_direction(g,group_bfgs_pending_group,group_bfgs_pending);}
+        if(choice.selected_slope<0.0){choice=covariance_preflight_block_direction(result.theta,z,coordinate_scale,g,bfgs_direction,bfgs_slope,std::move(choice));
+          if(choice.method=="BFGS"){choice.reason="GROUP_BFGS_STEP_UNREPRESENTABLE_BFGS_FALLBACK";group_bfgs_pending_group=-1;}
+          else group_bfgs_pending_update=true;}
+        else{choice.direction=bfgs_direction;choice.method="BFGS";choice.reason="GROUP_BFGS_NON_DESCENT_BFGS_FALLBACK";choice.selected_slope=bfgs_slope;group_bfgs_pending_group=-1;}
+      }
       else if(joint_block)choice=covariance_choose_joint_block_direction(g,bfgs_direction,joint_selection.groups,joint_direction_result);
       if(block_newton)choice=covariance_preflight_block_direction(result.theta,z,coordinate_scale,g,bfgs_direction,bfgs_slope,std::move(choice));
-      else if(joint_block)choice=covariance_preflight_block_direction(result.theta,z,coordinate_scale,g,bfgs_direction,bfgs_slope,std::move(choice));
+      else if(joint_block&&choice.method!="GROUP_BFGS"&&joint_selection.status!="DOMINANT_SUPPORT_CAP")
+        choice=covariance_preflight_block_direction(result.theta,z,coordinate_scale,g,bfgs_direction,bfgs_slope,std::move(choice));
       std::vector<double> direction=std::move(choice.direction);const double slope=choice.selected_slope;
       if(!std::isfinite(slope)||!(slope<0.0))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance selected direction is not a finite descent direction");
+      result.group_bfgs_direction_group=-1;result.group_bfgs_direction_support=0;
+      result.group_bfgs_direction_gamma=std::numeric_limits<double>::quiet_NaN();result.group_bfgs_direction_source="NOT_USED";
+      if(choice.method=="GROUP_BFGS"){result.group_bfgs_direction_group=group_bfgs_pending_group;
+        result.group_bfgs_direction_support=joint_selection.dominant_group_support;
+        result.group_bfgs_direction_gamma=group_bfgs_pending.seed_gamma;result.group_bfgs_direction_source=group_bfgs_pending.seed_source;}
       const double block_seconds=block_newton?std::chrono::duration<double>(std::chrono::steady_clock::now()-block_started).count():0.0;
       const std::uint64_t joint_factorizations=system.factorizations-joint_factor_start,joint_rhs_columns=system.solve_rhs_columns-joint_rhs_start;
       const double joint_seconds=joint_block?std::chrono::duration<double>(std::chrono::steady_clock::now()-joint_started).count():0.0;
@@ -4736,16 +4833,25 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       result.direction_group=joint_block&&joint_selection.dominant_group>=0?joint_selection.dominant_group:static_cast<int>(group);
       result.direction_group_support=joint_block?joint_selection.dominant_group_support:support_count;
       result.direction_group_atoms=std::move(support_atoms);
+      std::vector<int> active_groups=joint_selection.groups;std::vector<std::size_t> active_group_supports=joint_selection.group_supports;
+      std::size_t active_support_count=joint_selection.support_count,active_parameter_count=6*active_groups.size();
+      if(choice.method=="GROUP_BFGS"){active_groups={group_bfgs_pending_group};
+        active_group_supports={joint_selection.dominant_group_support};active_support_count=joint_selection.dominant_group_support;active_parameter_count=6;}
       if(joint_block){if(trace){*trace<<"COVARIANCE_JOINT_DIRECTION iteration="<<result.iterations<<" tau="<<tau
           <<" dominant_parameter="<<result.direction_dominant_parameter<<" group="<<result.direction_group
           <<" selection_status="<<joint_selection.status<<" selected_groups";
-        for(const int selected_group:joint_selection.groups)*trace<<' '<<selected_group;*trace<<" group_supports";
-        for(const std::size_t support:joint_selection.group_supports)*trace<<' '<<support;
-        *trace<<" dominant_support="<<joint_selection.dominant_group_support<<" support="<<support_count<<" parameters="<<6*joint_selection.groups.size()<<" method="<<choice.method<<" reason="<<choice.reason
+        for(const int selected_group:active_groups)*trace<<' '<<selected_group;*trace<<" group_supports";
+        for(const std::size_t support:active_group_supports)*trace<<' '<<support;
+          *trace<<" dominant_support="<<joint_selection.dominant_group_support<<" support="<<active_support_count<<" parameters="<<active_parameter_count<<" method="<<choice.method<<" reason="<<choice.reason
           <<" damping="<<joint_direction_result.damping<<" selected_gradient_inf="<<block_gradient_inf<<" block_slope="<<joint_direction_result.slope
           <<" block_asymmetry="<<joint_direction_result.asymmetry<<" block_linear_residual="<<joint_direction_result.relative_residual
           <<" bfgs_slope="<<bfgs_slope<<" selected_slope="<<slope<<" extra_factorizations="<<joint_factorizations
-          <<" extra_rhs_columns="<<joint_rhs_columns<<" extra_seconds="<<joint_seconds<<" support_atoms";
+          <<" extra_rhs_columns="<<joint_rhs_columns<<" extra_seconds="<<joint_seconds;
+          if(choice.method=="GROUP_BFGS")*trace<<" group_bfgs_direction_gamma="<<result.group_bfgs_direction_gamma
+            <<" group_bfgs_direction_source="<<result.group_bfgs_direction_source
+            <<" group_bfgs_committed_update_status="<<result.group_bfgs_update_status[static_cast<std::size_t>(group_bfgs_pending_group)]
+            <<" committed_updates="<<result.group_bfgs_committed_updates[static_cast<std::size_t>(group_bfgs_pending_group)];
+          *trace<<" support_atoms";
         for(const int atom:joint_selection.atoms)*trace<<' '<<atom;*trace<<'\n';}flush_trace();}
       else if(trace){*trace<<"COVARIANCE_DIRECTION iteration="<<result.iterations<<" tau="<<tau<<" dominant_parameter="<<dominant_parameter
           <<" group="<<group<<" support="<<support_count<<" method="<<choice.method<<" reason="<<choice.reason
@@ -4892,8 +4998,8 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       CovarianceJointStepAttribution committed_joint_attribution;
       if(joint_block){committed_joint_attribution.available=true;committed_joint_attribution.iteration=result.iterations;
         committed_joint_attribution.tau=tau;committed_joint_attribution.method=choice.method;committed_joint_attribution.reason=choice.reason;
-        committed_joint_attribution.groups=joint_selection.groups;committed_joint_attribution.group_supports=joint_selection.group_supports;
-        committed_joint_attribution.support_count=joint_selection.support_count;committed_joint_attribution.parameter_count=6*joint_selection.groups.size();
+        committed_joint_attribution.groups=active_groups;committed_joint_attribution.group_supports=active_group_supports;
+        committed_joint_attribution.support_count=active_support_count;committed_joint_attribution.parameter_count=active_parameter_count;
         committed_joint_attribution.global_gradient_inf_before=covariance_norm_inf(g);
         committed_joint_attribution.global_gradient_inf_after=covariance_norm_inf(next_gradient);
         committed_joint_attribution.global_kkt_before=committed_joint_attribution.global_gradient_inf_before/gradient_scale;
@@ -4941,7 +5047,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               throw std::runtime_error("NUMERICAL_SOLVE_FAIL: joint covariance model discrepancy is non-finite");
             committed_joint_attribution.model_status="COMPUTED";
           }else committed_joint_attribution.model_status="NOT_EVALUATED_OUTSIDE_STEP";
-        }
+        }else if(choice.method=="GROUP_BFGS")committed_joint_attribution.model_status="APPROXIMATE_MODEL_UNAVAILABLE";
       }
       if(trace)*trace<<"OPT_STEP iteration="<<iteration<<" tau="<<tau<<" objective_data="<<next.data<<" objective_prior="<<next.prior
         <<" objective_barrier="<<next.barrier<<" scaled_kkt_residual="<<kkt(next)<<" raw_gradient_inf_norm="<<covariance_norm_inf(next.gradient)
@@ -4951,6 +5057,10 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         <<" actual_objective_decrease="<<actual_objective_decrease<<"\n";flush_trace();
       std::vector<double> change(z.size());
       for(std::size_t i=0;i<z.size();++i)change[i]=next_gradient[i]-g[i];
+      CovarianceGroupBFGSUpdateStatus group_bfgs_update=CovarianceGroupBFGSUpdateStatus::SkippedMixedStep;
+      if(group_bfgs_pending_update){group_bfgs_update=covariance_update_group_bfgs_history(group_bfgs_pending,group_bfgs_pending_group,step,change);
+        if(group_bfgs_update==CovarianceGroupBFGSUpdateStatus::SkippedMixedStep)
+          throw std::runtime_error("NUMERICAL_SOLVE_FAIL: GROUP_BFGS accepted a mixed-group step");}
       const double bfgs_sy=covariance_dot(step,change),bfgs_step_norm=covariance_dot(step,step),bfgs_y_norm=covariance_dot(change,change);
       const CovarianceBFGSUpdateStatus bfgs_update=covariance_update_inverse_hessian(bfgs,step,change);sync_bfgs_seed();
       if(trace&&bfgs_update==CovarianceBFGSUpdateStatus::Seeded)*trace<<"BFGS_CURVATURE_SEED iteration="<<iteration<<" tau="<<tau
@@ -4961,6 +5071,11 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       result.failed_trial.available=false;result.failed_trial.failure_stage="NONE";
       result.failed_d_trace=CovarianceTraceDiagnostics{};result.failed_shifted_trace=CovarianceTraceDiagnostics{};
       z=std::move(next_z);result.theta=std::move(next_theta);current=std::move(next);++result.iterations;
+      if(group_bfgs_pending_update){const std::size_t updated_group=static_cast<std::size_t>(group_bfgs_pending_group);
+        group_bfgs_history[updated_group]=std::move(group_bfgs_pending);result.group_bfgs_gamma[updated_group]=group_bfgs_history[updated_group].seed_gamma;
+        result.group_bfgs_source[updated_group]=group_bfgs_history[updated_group].seed_source;
+        result.group_bfgs_update_status[updated_group]=covariance_group_bfgs_update_name(group_bfgs_update);
+        ++result.group_bfgs_committed_updates[updated_group];}
       if(joint_block)result.last_joint_attribution=std::move(committed_joint_attribution);
       if(joint_block){ray_attempt.line_status="STEP_COMMITTED";result.joint_ray_attempt=ray_attempt;
         if(ray_attempt.usable)result.joint_ray_committed=ray_attempt;}
@@ -4972,6 +5087,12 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         <<" bfgs_s_norm2="<<bfgs_step_norm<<" bfgs_y_norm2="<<bfgs_y_norm
         <<" bfgs_update="<<(bfgs_update==CovarianceBFGSUpdateStatus::Updated?"UPDATED":bfgs_update==CovarianceBFGSUpdateStatus::Seeded?"SEEDED":"RESET")
         <<" bfgs_seed_gamma="<<bfgs.seed_gamma<<" bfgs_seed_source="<<bfgs.seed_source<<" tau_stage_fixed=1\n";flush_trace();
+      if(group_bfgs_pending_update&&trace)*trace<<"COVARIANCE_GROUP_BFGS_COMMIT iteration="<<iteration<<" tau="<<tau
+        <<" group="<<group_bfgs_pending_group<<" support="<<result.group_bfgs_supports[static_cast<std::size_t>(group_bfgs_pending_group)]
+        <<" gamma="<<result.group_bfgs_gamma[static_cast<std::size_t>(group_bfgs_pending_group)]
+        <<" source="<<result.group_bfgs_source[static_cast<std::size_t>(group_bfgs_pending_group)]
+        <<" update_status="<<result.group_bfgs_update_status[static_cast<std::size_t>(group_bfgs_pending_group)]
+        <<" committed_updates="<<result.group_bfgs_committed_updates[static_cast<std::size_t>(group_bfgs_pending_group)]<<'\n';flush_trace();
       if(joint_block&&trace){const CovarianceJointStepAttribution& attribution=result.last_joint_attribution;
         *trace<<"COVARIANCE_JOINT_COMMIT_ATTRIBUTION iteration="<<attribution.iteration<<" tau="<<attribution.tau
           <<" method="<<attribution.method<<" reason="<<attribution.reason<<" support="<<attribution.support_count
@@ -5022,6 +5143,21 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
   result.worst_solve_relative_residual=system.worst_solve_relative_residual;
   result.optimizer_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
   return result;
+}
+
+void write_covariance_group_bfgs_diagnostics(std::ostream& out,const CovarianceFitResult& fit)
+{
+  out<<"\ngroup_bfgs_direction_group "<<fit.group_bfgs_direction_group
+     <<"\ngroup_bfgs_direction_support "<<fit.group_bfgs_direction_support
+     <<"\ngroup_bfgs_direction_gamma "<<fit.group_bfgs_direction_gamma
+     <<"\ngroup_bfgs_direction_source "<<fit.group_bfgs_direction_source
+     <<"\ngroup_bfgs_history_count "<<fit.group_bfgs_gamma.size();
+  for(std::size_t group=0;group<fit.group_bfgs_gamma.size();++group)
+    out<<"\ngroup_bfgs_group_"<<group<<"_support "<<fit.group_bfgs_supports[group]
+       <<"\ngroup_bfgs_group_"<<group<<"_gamma "<<fit.group_bfgs_gamma[group]
+       <<"\ngroup_bfgs_group_"<<group<<"_source "<<fit.group_bfgs_source[group]
+       <<"\ngroup_bfgs_group_"<<group<<"_update_status "<<fit.group_bfgs_update_status[group]
+       <<"\ngroup_bfgs_group_"<<group<<"_committed_updates "<<fit.group_bfgs_committed_updates[group];
 }
 
 void write_covariance_state(const std::string& path,const CovarianceFitResult& fit,const double rho,
@@ -5084,6 +5220,7 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\ndirection_block_residual "<<fit.direction_block_residual<<"\ndirection_block_asymmetry "<<fit.direction_block_asymmetry
     <<"\ndirection_block_seconds "<<fit.direction_block_seconds<<"\ndirection_group_atoms "<<fit.direction_group_atoms.size();
   for(const int atom_index:fit.direction_group_atoms)out<<' '<<atom_index;
+  write_covariance_group_bfgs_diagnostics(out,fit);
   const CovarianceJointStepAttribution& joint=fit.last_joint_attribution;
   out<<"\nlast_joint_attribution_available "<<(joint.available?1:0)<<"\nlast_joint_attribution_iteration "<<joint.iteration
     <<"\nlast_joint_attribution_tau "<<joint.tau<<"\nlast_joint_attribution_method "<<joint.method
@@ -5565,6 +5702,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<"\ndirection_block_seconds "<<covariance_fit.direction_block_seconds
       <<"\ndirection_group_atoms "<<covariance_fit.direction_group_atoms.size();
     for(const int atom_index:covariance_fit.direction_group_atoms)fitout<<' '<<atom_index;
+    write_covariance_group_bfgs_diagnostics(fitout,covariance_fit);
     write_covariance_joint_ray(fitout,"last_joint_ray_attempt",covariance_fit.joint_ray_attempt);
     write_covariance_joint_ray(fitout,"last_joint_ray_committed",covariance_fit.joint_ray_committed);
     fitout<<"\nbfgs_seed_gamma "<<covariance_fit.bfgs_seed_gamma<<"\nbfgs_seed_source "<<covariance_fit.bfgs_seed_source
