@@ -4,7 +4,12 @@
 =======================
 
 The :attr:`ensemble` keyword is used to set up an integration method (an integrator).
-The integrators described on this page enable one to carry out path integral molecular dynamics (:term:`PIMD`) simulations and thereby to incorporate quantum dynamical effects.
+The integrators described on this page enable one to carry out path integral
+molecular dynamics (:term:`PIMD`) simulations and thereby to incorporate
+quantum nuclear statistical effects. Standard PIMD samples equilibrium
+statistical distributions; it does not represent real-time nuclear dynamics.
+RPMD and TRPMD are approximate dynamical methods based on the ring-polymer
+representation.
 
 
 Syntax
@@ -22,7 +27,7 @@ It can be used in the following ways::
 In both cases, :attr:`num_beads` is the number of beads in the ring polymer, which should be a positive even integer no larger than 128.
 The first case is similar to the NVT ensemble with :attr:`nvt_lan` as the Langevin thermostat is used for both the internal and the centroid modes [Ceriotti2010]_. 
 The second case is similar to the NPT ensemble with :attr:`npt_ber`, where a Berendsen barostat is added compared to the first case.
-The pressure target is fixed during a run unless the pressure-ramp form below is used.
+The pressure target is fixed during a run.
 Note that :attr:`pimd` or :attr:`pimd_scr` (that is, not :attr:`rpmd` or :attr:`trpmd` described below) must be the first run that requires to set :attr:`num_beads`. By default one cannot change :attr:`num_beads` from run to run. A continuous PIMD sequence may explicitly discard the old internal modes and rebuild a new ring polymer from its current centroid with :attr:`pimd_reseed_from_centroid`; this exception is not available for RPMD or TRPMD.
 
 One-time centroid reseeding
@@ -55,17 +60,16 @@ It can be used in the following ways::
 The pressure-control parameters have the same meaning and support the same isotropic, orthogonal, and triclinic forms as in the pressure-controlled :attr:`pimd` case.
 The difference is that :attr:`pimd` uses the Berendsen barostat, whereas :attr:`pimd_scr` uses stochastic cell rescaling.
 
-
-Pressure ramp
--------------
-
-For either :attr:`pimd` or :attr:`pimd_scr`, the pressure target can be ramped linearly over the current run by supplying an initial pressure, a final pressure, the elastic modulus, and the pressure-coupling time::
-
-    ensemble pimd <num_beads> <T_1> <T_2> <T_coup> <P_start> <P_stop> <C> <tau_p>
-    ensemble pimd <num_beads> <T_1> <T_2> <T_coup> <Pxx_start> <Pyy_start> <Pzz_start> <Pxx_stop> <Pyy_stop> <Pzz_stop> <Cxx> <Cyy> <Czz> <tau_p>
-    ensemble pimd <num_beads> <T_1> <T_2> <T_coup> <Pxx_start> <Pyy_start> <Pzz_start> <Pyz_start> <Pxz_start> <Pxy_start> <Pxx_stop> <Pyy_stop> <Pzz_stop> <Pyz_stop> <Pxz_stop> <Pxy_stop> <Cxx> <Cyy> <Czz> <Cyz> <Cxz> <Cxy> <tau_p>
-
-These three forms control isotropic, orthogonal, and triclinic cells, respectively.  Pressure and elastic-modulus values are in GPa; the pressure is interpolated from ``*_start`` to ``*_stop`` using the progress of the current :attr:`run`.  The fixed-pressure forms remain available by omitting the ``*_stop`` values.  A pressure ramp is intended for compression or equilibration; use a separate fixed-pressure run for stationary production data such as thermal conductivity.
+For both pressure-controlled forms, the barostat transforms the centroid
+position with the updated cell and translates every bead by the same centroid
+displacement, preserving each bead's displacement from the centroid. In each
+``compute1`` step, the current centroid-virial pressure is evaluated after the
+first physical-force half kick, followed by the cell update and free
+ring-polymer propagation. The regular force evaluation later in the step uses
+the updated coordinates and cell. This is a finite-step operator splitting of
+the existing weak-coupling or stochastic cell-rescaling scheme; it does not
+imply strict unbiased NPT sampling or equivalence to every detail of i-PI's
+barostat algorithms.
 
 :attr:`rpmd`
 ^^^^^^^^^^^^

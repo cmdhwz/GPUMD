@@ -93,11 +93,38 @@ not update these histories. If a finite descent direction or representable
 step is unavailable, the optimizer falls back to global BFGS; non-finite and
 CUDA failures remain fatal.
 
+Only while ``joint_block`` is on the ``DOMINANT_SUPPORT_CAP`` path, the shared
+full-parameter history retains at most eight recent curvature-valid committed
+secants. After a complete-gradient candidate passes the commit gates, the
+inverse Hessian is rebuilt from the newest ``gamma = sTy / yTy`` times the
+identity and the retained secants are replayed oldest to newest. This refreshes
+the background scale in directions untouched by those secants; it does not
+guarantee improved conditioning or KKT convergence. ``bfgs_recent_pairs``
+reports the retained count. Invalid curvature and non-descent resets clear the
+recent pairs while retaining the latest valid positive scale; a ``tau`` stage
+change clears them and restarts from identity. Rejected candidates do not
+change the history.
+
+The optimizer summary, fit report, and covariance state also record
+``trace_solve_batch`` (128 columns), ``trace_residual_batch`` (32 columns), and
+``trace_solve_calls`` (submitted wide triangular-solve calls, including a
+failing call). Residual checks still run in the existing 32-column blocks, and
+``solve_rhs_columns`` counts columns from successful wide solves. The
+diagnostic ``rhs_columns_checked`` counts completed 32-column residual blocks
+and may be smaller if a strict check fails partway through a wide solve.
+
 For ``joint_block`` runs using ``GROUP_BFGS`` or ``BFGS`` directions, bounded
 objective-only expansion proposes steps up to alpha 4, then computes a full
 gradient at the selected candidate's factors. A failed or worse expansion
 returns to the best objective-pass proposal and re-evaluates it before the
-gradient. Objective proposals alone never satisfy commit gates.
+gradient. In this objective-only mode, a positive candidate directional slope
+proposes a secant-interpolated alpha bounded to ``[0.1 alpha, 0.9 alpha]``;
+invalid proposals fall back to halving. The overshooting candidate's already
+computed full gradient is used only to calculate the interpolated alpha; the
+new trial point still needs its own full gradient and all commit gates before
+it can be committed. Default BFGS and successful ``JOINT_BLOCK`` line-search
+steps retain their existing halving behavior. Objective proposals alone never
+satisfy commit gates.
 ``line_search_evaluations`` and ``line_search_objective_seconds`` cover
 line-search objective evaluations and time, including re-evaluations after a
 failed or worse expansion. ``line_search_gradient_calls`` and

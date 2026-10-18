@@ -344,6 +344,11 @@ void Run::perform_a_run(const int number_of_steps)
     }
   }
   if (is_pimd(integrate.get_type())) {
+    if (velocity.do_velocity_correction) {
+      PRINT_INPUT_ERROR(
+        "correct_velocity does not update ring-polymer bead velocities. "
+        "Use pimd_fix_com on for global COM removal; group/angular corrections are unsupported.");
+    }
     for (const auto& action : actions) {
       if (action->modifies_force() && !action->supports_ring_polymer_force()) {
         const std::string error =
@@ -367,6 +372,10 @@ void Run::perform_a_run(const int number_of_steps)
   }
   if (rpmd_ja_enabled_ && centroid_force_hac == nullptr) {
     PRINT_INPUT_ERROR("rpmd_ja on requires compute_hac in the same run.");
+  }
+  if (centroid_force_hac != nullptr && max_distance_per_step > 0.0) {
+    PRINT_INPUT_ERROR(
+      "compute_hac requires a fixed integration time step; adaptive max_distance_per_step is unsupported.");
   }
   if (rpmd_ja_enabled_) {
     if (max_distance_per_step > 0.0) {
@@ -1190,8 +1199,8 @@ void Run::parse_pimd_pile_scale(const char** param, int num_param)
   if (!is_valid_real(param[1], &pile_scale)) {
     PRINT_INPUT_ERROR("pimd_pile_scale should be a number.");
   }
-  if (pile_scale <= 0.0) {
-    PRINT_INPUT_ERROR("pimd_pile_scale should be > 0.");
+  if (!std::isfinite(pile_scale) || pile_scale <= 0.0) {
+    PRINT_INPUT_ERROR("pimd_pile_scale should be finite and > 0.");
   }
   integrate.set_pimd_pile_scale(pile_scale);
   printf("PIMD internal-mode Langevin scale is %g.\n", pile_scale);

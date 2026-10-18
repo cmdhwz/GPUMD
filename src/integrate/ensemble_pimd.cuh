@@ -134,4 +134,9 @@ protected:
   void langevin(const double time_step, Atom& atom);
   std::mt19937 rng;
   void initialize_rng();
+
+private:
+  void remove_center_of_mass_velocity_(Atom& atom);
+  void update_thermo_(Box& box, Atom& atom, GPU_Vector<double>& thermo);
+  void apply_barostat_(Box& box, Atom& atom, GPU_Vector<double>& thermo);
 };

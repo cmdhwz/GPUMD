@@ -18,6 +18,11 @@ The first parameter is the sampling interval for the heat current data.
 The second parameter is the maximum correlations steps.
 The third parameter is the output interval of the :term:`HAC` and :term:`RTC` data.
 
+``compute_hac`` requires a fixed integration time step. The adaptive
+``time_step <dt_in_fs> <max_distance_per_step>`` form is rejected in a run
+containing ``compute_hac`` because the correlation and integration assume
+uniformly spaced heat-current samples.
+
 The optional fourth parameter :attr:`use_centroid_heat_flux` can be set to 1 to evaluate the
 full classical heat-flux operator on the instantaneous centroid structure during PIMD-related runs.
 If omitted, the default is 0.
@@ -53,6 +58,30 @@ the final 32-frame postprocessing batch. Unsupported runs, or a nonzero
 For example, with a 5-step sampling interval and 2000 HAC frames::
 
   compute_hac 5 2000 1 1 0 1
+
+Output averaging
+----------------
+
+HAC is calculated and integrated on the full sampled lag grid before output
+averaging. Each output row averages ``output_interval`` consecutive HAC
+values and, separately, the corresponding RTC values. Its time is the mean
+of those lag times: ``(first_lag + (output_interval - 1) / 2.0) * sample_dt``.
+Here ``sample_dt`` is the integration time step times ``sampling_interval``.
+With ``output_interval 1``, the first correlation time is zero.
+
+With the centroid flag enabled, ``hac_centroid.out`` contains 11 columns:
+time in ps, five HAC components, and five RTC components in W/m/K. The
+component order is x-in, x-out, y-in, y-out, z. Using one-based column numbers,
+``kappa_x = column_7 + column_8``, ``kappa_y = column_9 + column_10``, and
+``kappa_z = column_11``. The three-dimensional average is
+``(kappa_x + kappa_y + kappa_z) / 3``.
+
+The RTC columns are already integrated and normalized; do not integrate
+them or apply the Green-Kubo prefactor again. Reintegrating the averaged
+HAC columns is not generally equivalent to averaging the full-grid RTC.
+The instantaneous ``heat_current_centroid.out`` and
+``heat_current_type_resolved_centroid.out`` samples are not averaged by
+``output_interval``.
 
 Examples
 --------

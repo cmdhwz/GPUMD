@@ -1,5 +1,5 @@
 from pathlib import Path
-from math import isclose
+from math import isclose, isfinite
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -203,7 +203,10 @@ assert "covariance_saved_gradient_diagnostics_pass" in native_fit and "saved_gra
 trace_batch = native_fit[native_fit.index("const double relative=residual/std::max(rhs_norm,1e-300)"):native_fit.index("if(batch_valid){covariance_capture_edge_covariance", native_fit.index("const double relative=residual/std::max(rhs_norm,1e-300)"))]
 assert trace_batch.index("worst_solve_relative_residual=std::max") < trace_batch.index("if(!batch_valid)")
 trace_body = native_fit[native_fit.index("std::vector<double> trace_derivatives("):native_fit.index("struct CovarianceProbeColumn")]
-assert trace_body.index("covariance_expand_solutions") < trace_body.index("original_solve_residual(rhs,rhs_check") < trace_body.index("covariance_householder_dots")
+assert "static constexpr int trace_solve_batch=128" in native_fit and "static constexpr int trace_residual_batch=solve_batch" in native_fit
+assert "for(int source=0;source<d;source+=trace_solve_batch)" in trace_body
+assert "for(int offset=0;offset<wide_columns;offset+=trace_residual_batch)" in trace_body
+assert trace_body.index("covariance_expand_solutions") < trace_body.index("original_solve_residual(solution,rhs_check") < trace_body.index("covariance_householder_dots")
 probe_solve = native_fit[native_fit.index("class CovarianceProbeSolveSession"):native_fit.index("struct CovarianceOperatorGram")]
 assert probe_solve.index("const double one=1.0,minus_one=-1.0") < probe_solve.index("cublasDtrmm")
 assert "system.solve_rhs_columns+=static_cast<std::uint64_t>(columns)" in probe_solve
@@ -274,10 +277,18 @@ assert "if(!objective_only_expansion&&allow_expansion&&initial_alpha==1.0" in ba
 assert "proposal_objective" in backtracking and "objective_only=1" in backtracking
 assert "line_search_gradient_calls" in native_fit and "line_search_objective_seconds" in native_fit
 bfgs_helpers = native_fit.split("struct CovarianceBFGSHistory", 1)[1].split("CovarianceBacktrackingResult covariance_backtrack_armijo(", 1)[0]
-assert "curvature_limit=1e-12*std::sqrt(ss*yy)" in bfgs_helpers and "gamma=sy/yy" in bfgs_helpers
+assert "covariance_bfgs_recent_history_limit=8" in bfgs_helpers
+assert "curvature_limit=1e-12*std::sqrt(ss)*std::sqrt(yy)" in bfgs_helpers and "gamma=sy/yy" in bfgs_helpers
 assert "history.seed_source=\"FIRST_VALID_SECANT\"" in bfgs_helpers and "RECENT_VALID_GAMMA_RESET" in bfgs_helpers
+recent_bfgs = bfgs_helpers.split("CovarianceBFGSUpdateStatus covariance_update_recent_inverse_hessian(", 1)[1].split("double covariance_reset_non_descent_direction", 1)[0]
+assert "history.seed_gamma=gamma" in recent_bfgs and "history.recent_secants.push_back" in recent_bfgs
+assert "for(const CovarianceBFGSHistory::Secant& secant:history.recent_secants)" in recent_bfgs
+assert "covariance_apply_inverse_bfgs_update(history.inverse_hessian,secant.step,secant.gradient_change,replay_sy)" in recent_bfgs
 assert "CovarianceBFGSUpdateStatus::Seeded" in bfgs_helpers and "history.inverse_hessian" in bfgs_helpers
 assert "covariance_reset_non_descent_direction" in bfgs_helpers
+assert "std::size_t bfgs_recent_pairs=0" in native_fit and "bfgs_recent_pairs " in native_fit
+assert "trace_solve_calls=system.trace_solve_calls" in native_fit and "COVARIANCE_OPTIMIZER_SUMMARY status=" in native_fit
+assert "trace_solve_batch " in native_fit and "trace_residual_batch " in native_fit
 assert "start_scaled_kkt_residual" in native_fit and "start_gradient_data_scaled_inf_norm" in native_fit
 assert "start_gradient_prior_scaled_inf_norm" in native_fit and "start_gradient_barrier_scaled_inf_norm" in native_fit
 assert "start_gradient_solve_status" in native_fit and "bfgs_seed_gamma" in native_fit and "bfgs_seed_source" in native_fit
@@ -286,8 +297,39 @@ assert "STEP_COMMITTED" in native_fit and "GRADIENT_RESIDUAL_REJECT" in native_f
 assert "GRADIENT_RESIDUAL_REJECT" in rpmd_ja_doc and "bfgs_seed_gamma" in rpmd_ja_doc
 covariance_optimizer = native_fit.split("CovarianceFitResult solve_covariance_reference(", 1)[1].split("void write_covariance_state", 1)[0]
 assert covariance_optimizer.index("covariance_backtrack_armijo(") < covariance_optimizer.index("if(!accepted)")
-assert covariance_optimizer.index("if(!accepted)") < covariance_optimizer.index("covariance_update_inverse_hessian(bfgs,step,change)")
-assert covariance_optimizer.index("covariance_update_inverse_hessian(bfgs,step,change)") < covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('"STEP_COMMITTED iteration="')
+assert covariance_optimizer.index("if(!accepted)") < covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=dominant_cap_path?")
+assert "covariance_update_recent_inverse_hessian(bfgs,step,change)" in covariance_optimizer
+assert covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=dominant_cap_path?") < covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('"STEP_COMMITTED iteration="')
+assert "bfgs.recent_secants.clear()" in covariance_optimizer and "bfgs_recent_pairs" in covariance_optimizer
+assert 'shrink_source="DIRECTIONAL_SECANT"' in native_fit and "std::max(0.1*alpha,std::min(0.9*alpha,proposed))" in native_fit
+overshoot_backtrack = backtracking.split("if(directional_overshoot)", 1)[1].split("have_valid_candidate=true", 1)[0]
+assert "if(objective_only_expansion)" in overshoot_backtrack and "COVARIANCE_OVERSHOOT_BACKTRACK" in overshoot_backtrack
+assert "alpha*=0.5" not in overshoot_backtrack
+curvature = 2.0 / 7.0
+alpha = 4.0
+candidate_slope = -1.0 + curvature * alpha
+denominator = candidate_slope - (-1.0)
+proposal = alpha * ((-(-1.0)) / denominator)
+assert isfinite(proposal) and isclose(proposal, 3.5, rel_tol=0.0, abs_tol=1e-14)
+assert 0.1 * alpha <= proposal <= 0.9 * alpha
+assert isclose(-proposal + 0.5 * curvature * proposal * proposal, -1.75, rel_tol=0.0, abs_tol=1e-14)
+quadratic = [[4.0, 1.0], [1.0, 3.0]]
+steps = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+secants = [(step, tuple(sum(quadratic[i][j] * step[j] for j in range(2)) for i in range(2))) for step in steps]
+gamma = sum(a * b for a, b in zip(secants[-1][0], secants[-1][1])) / sum(v * v for v in secants[-1][1])
+inverse = [[gamma, 0.0], [0.0, gamma]]
+for step, change in secants:
+    rho = 1.0 / sum(a * b for a, b in zip(step, change))
+    v = [[float(i == j) - rho * step[i] * change[j] for j in range(2)] for i in range(2)]
+    vh = [[sum(v[i][k] * inverse[k][j] for k in range(2)) for j in range(2)] for i in range(2)]
+    inverse = [[rho * step[i] * step[j] + sum(vh[i][k] * v[j][k] for k in range(2))
+                for j in range(2)] for i in range(2)]
+assert inverse[0][0] > 0.0 and inverse[0][0] * inverse[1][1] - inverse[0][1] * inverse[1][0] > 0.0
+latest_change = secants[-1][1]
+assert isclose(sum(inverse[0][j] * latest_change[j] for j in range(2)), 0.0, abs_tol=1e-14)
+assert isclose(sum(inverse[1][j] * latest_change[j] for j in range(2)), 1.0, abs_tol=1e-14)
+assert "test_covariance_recent_bfgs_replays_latest_gamma_and_bounds_history" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_objective_only_overshoot_uses_directional_secant" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 non_descent_branch = covariance_optimizer.split("if(!(bfgs_slope<0.0))", 1)[1].split("const double direction_inf_norm", 1)[0]
 assert "covariance_reset_non_descent_direction(bfgs,g,bfgs_direction)" in non_descent_branch
 assert "CovarianceFitTestHooks" in native_fit and "gradient_residual_failures_remaining" in native_fit

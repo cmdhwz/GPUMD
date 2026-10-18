@@ -1942,7 +1942,7 @@ void HAC::post_run(
       hac_ave[m] /= output_interval;
       rtc_ave[m] /= output_interval;
     }
-    fprintf(fid, "%25.15e", (nc + output_interval * 0.5) * dt_in_ps);
+    fprintf(fid, "%25.15e", (nc + 0.5 * (output_interval - 1)) * dt_in_ps);
     for (int m = 0; m < NUM_OF_HEAT_COMPONENTS; m++) {
       fprintf(fid, "%25.15e", hac_ave[m]);
     }

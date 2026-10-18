@@ -351,6 +351,7 @@ void Ensemble_PIMD::initialize_run(
 {
   number_of_atoms = atom.number_of_atoms;
   initialize(atom);
+  remove_center_of_mass_velocity_(atom);
   if (num_target_pressure_components > 0) {
     initialize_rng();
   }
@@ -850,6 +851,7 @@ static __global__ void gpu_correct_momentum_beads(
   const int number_of_beads,
   const double* g_mass,
   double** g_velocity,
+  double* g_average_velocity,
   double* g_nonham_work_per_atom)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -866,11 +868,18 @@ static __global__ void gpu_correct_momentum_beads(
     }
     const double inverse_of_ring_polymer_mass =
       1.0 / (device_momentum_beads[0][3] * number_of_beads);
+    double average_velocity[3] = {0.0};
     for (int k = 0; k < number_of_beads; ++k) {
       for (int d = 0; d < 3; ++d) {
-        g_velocity[k][i + d * number_of_atoms] -=
+        const double corrected_velocity =
+          g_velocity[k][i + d * number_of_atoms] -
           total_momentum[d] * inverse_of_ring_polymer_mass;
+        g_velocity[k][i + d * number_of_atoms] = corrected_velocity;
+        average_velocity[d] += corrected_velocity;
       }
+    }
+    for (int d = 0; d < 3; ++d) {
+      g_average_velocity[i + d * number_of_atoms] = average_velocity[d] / number_of_beads;
     }
 
     if (g_nonham_work_per_atom != nullptr) {
@@ -1281,9 +1290,12 @@ static __global__ void gpu_pressure_orthogonal(
     double scale_factor[3] = {scale_factor_x, scale_factor_y, scale_factor_z};
     for (int d = 0; d < 3; ++d) {
       const int index = i + d * number_of_particles;
-      g_average_position[index] *= scale_factor[d];
+      const double centroid_old = g_average_position[index];
+      const double centroid_new = scale_factor[d] * centroid_old;
+      const double delta = centroid_new - centroid_old;
+      g_average_position[index] = centroid_new;
       for (int k = 0; k < number_of_beads; ++k) {
-        g_beads_position[k][index] *= scale_factor[d];
+        g_beads_position[k][index] += delta;
       }
     }
   }
@@ -1300,9 +1312,12 @@ static __global__ void gpu_pressure_isotropic(
   if (i < number_of_particles) {
     for (int d = 0; d < 3; ++d) {
       const int index = i + d * number_of_particles;
-      g_average_position[index] *= scale_factor;
+      const double centroid_old = g_average_position[index];
+      const double centroid_new = scale_factor * centroid_old;
+      const double delta = centroid_new - centroid_old;
+      g_average_position[index] = centroid_new;
       for (int k = 0; k < number_of_beads; ++k) {
-        g_beads_position[k][index] *= scale_factor;
+        g_beads_position[k][index] += delta;
       }
     }
   }
@@ -1325,147 +1340,50 @@ static __global__ void gpu_pressure_triclinic(
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < number_of_particles) {
-    double x_old = g_average_position[i];
-    double y_old = g_average_position[i + number_of_particles];
-    double z_old = g_average_position[i + number_of_particles * 2];
-    g_average_position[i] = mu0 * x_old + mu1 * y_old + mu2 * z_old;
-    g_average_position[i + number_of_particles] = mu3 * x_old + mu4 * y_old + mu5 * z_old;
-    g_average_position[i + number_of_particles * 2] = mu6 * x_old + mu7 * y_old + mu8 * z_old;
+    const double x_old = g_average_position[i];
+    const double y_old = g_average_position[i + number_of_particles];
+    const double z_old = g_average_position[i + number_of_particles * 2];
+    const double x_new = mu0 * x_old + mu1 * y_old + mu2 * z_old;
+    const double y_new = mu3 * x_old + mu4 * y_old + mu5 * z_old;
+    const double z_new = mu6 * x_old + mu7 * y_old + mu8 * z_old;
+    const double dx = x_new - x_old;
+    const double dy = y_new - y_old;
+    const double dz = z_new - z_old;
+    g_average_position[i] = x_new;
+    g_average_position[i + number_of_particles] = y_new;
+    g_average_position[i + number_of_particles * 2] = z_new;
     for (int k = 0; k < number_of_beads; ++k) {
-      double x_old = g_beads_position[k][i];
-      double y_old = g_beads_position[k][i + number_of_particles];
-      double z_old = g_beads_position[k][i + number_of_particles * 2];
-      g_beads_position[k][i] = mu0 * x_old + mu1 * y_old + mu2 * z_old;
-      g_beads_position[k][i + number_of_particles] = mu3 * x_old + mu4 * y_old + mu5 * z_old;
-      g_beads_position[k][i + number_of_particles * 2] = mu6 * x_old + mu7 * y_old + mu8 * z_old;
+      g_beads_position[k][i] += dx;
+      g_beads_position[k][i + number_of_particles] += dy;
+      g_beads_position[k][i + number_of_particles * 2] += dz;
     }
   }
 }
 
-void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
+void Ensemble_PIMD::remove_center_of_mass_velocity_(Atom& atom)
 {
-  if (thermostat_internal) {
-    double* nonham_work =
-      nonham_work_per_atom_.size() == number_of_atoms
-        ? nonham_work_per_atom_.data()
-        : nullptr;
-    gpu_langevin<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
-      thermostat_centroid,
-      number_of_atoms,
-      number_of_beads,
-      curand_states.data(),
-      temperature,
-      temperature_coupling,
-      time_step,
-      pile_scale_,
-      free_ring_polymer_frequency.data(),
-      transformation_matrix.data(),
-      atom.mass.data(),
-      velocity_beads.data(),
-      nonham_work);
-    GPU_CHECK_KERNEL
-
-    if (fix_com_) {
-      gpu_find_momentum_beads<<<number_of_beads, 1024>>>(
-        number_of_atoms, atom.mass.data(), velocity_beads.data());
-      GPU_CHECK_KERNEL
-
-      gpu_correct_momentum_beads<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
-        number_of_atoms,
-        number_of_beads,
-        atom.mass.data(),
-        velocity_beads.data(),
-        nonham_work);
-      GPU_CHECK_KERNEL
-    }
+  if (!fix_com_) {
+    return;
   }
-}
 
-void Ensemble_PIMD::compute1(
-  const double time_step,
-  const int step,
-  const int number_of_steps,
-  const std::vector<Group>& group,
-  Box& box,
-  Atom& atom,
-  GPU_Vector<double>& thermo)
-{
-  omega_n = number_of_beads * K_B * temperature / HBAR;
-  update_eco_modes();
-  update_free_ring_polymer_propagator_(time_step);
-
-  langevin(time_step, atom);
-
-  gpu_apply_pbc<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
-    box, number_of_atoms, number_of_beads, position_beads.data());
+  double* nonham_work =
+    nonham_work_per_atom_.size() == number_of_atoms ? nonham_work_per_atom_.data() : nullptr;
+  gpu_find_momentum_beads<<<number_of_beads, 1024>>>(
+    number_of_atoms, atom.mass.data(), velocity_beads.data());
   GPU_CHECK_KERNEL
 
-  const dim3 grid((number_of_atoms - 1) / 64 + 1, number_of_beads);
-  gpu_half_kick<<<grid, 64>>>(
+  gpu_correct_momentum_beads<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
     number_of_atoms,
     number_of_beads,
-    time_step,
     atom.mass.data(),
-    force_beads.data(),
-    velocity_beads.data());
-  GPU_CHECK_KERNEL
-
-  gpu_nve_forward<<<grid, 64>>>(
-    number_of_atoms,
-    number_of_beads,
-    time_step,
-    use_exact_propagator_,
-    transformation_matrix.data(),
-    free_ring_polymer_frequency.data(),
-    free_ring_polymer_cosine.data(),
-    free_ring_polymer_sine.data(),
-    position_beads.data(),
     velocity_beads.data(),
-    position_normal.data(),
-    velocity_normal.data());
-  GPU_CHECK_KERNEL
-
-  gpu_nve_inverse<<<grid, 64>>>(
-    number_of_atoms,
-    number_of_beads,
-    transformation_matrix.data(),
-    position_normal.data(),
-    velocity_normal.data(),
-    position_beads.data(),
-    velocity_beads.data());
+    atom.velocity_per_atom.data(),
+    nonham_work);
   GPU_CHECK_KERNEL
 }
 
-void Ensemble_PIMD::compute2(
-  const double time_step,
-  const int step,
-  const int number_of_steps,
-  const std::vector<Group>& group,
-  Box& box,
-  Atom& atom,
-  GPU_Vector<double>& thermo,
-  Force& force)
+void Ensemble_PIMD::update_thermo_(Box& box, Atom& atom, GPU_Vector<double>& thermo)
 {
-  omega_n = number_of_beads * K_B * temperature / HBAR;
-  update_eco_modes();
-  update_free_ring_polymer_propagator_(time_step);
-
-  const dim3 grid((number_of_atoms - 1) / 64 + 1, number_of_beads);
-  gpu_half_kick<<<grid, 64>>>(
-    number_of_atoms,
-    number_of_beads,
-    time_step,
-    atom.mass.data(),
-    force_beads.data(),
-    velocity_beads.data());
-  GPU_CHECK_KERNEL
-
-  langevin(time_step, atom);
-
-  gpu_apply_pbc<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
-    box, number_of_atoms, number_of_beads, position_beads.data());
-  GPU_CHECK_KERNEL
-
   const dim3 average_block(PIMD_ATOM_TILE, number_of_beads);
   const dim3 average_grid((number_of_atoms - 1) / PIMD_ATOM_TILE + 1);
   gpu_average<<<average_grid, average_block>>>(
@@ -1506,7 +1424,10 @@ void Ensemble_PIMD::compute2(
   gpu_find_thermo<<<8, 1024>>>(
     box.get_volume(), number_of_atoms * K_B * temperature, sum_1024.data(), thermo.data());
   GPU_CHECK_KERNEL
+}
 
+void Ensemble_PIMD::apply_barostat_(Box& box, Atom& atom, GPU_Vector<double>& thermo)
+{
   if (num_target_pressure_components == 1) {
     double scale_factor;
     cpu_pressure_isotropic(
@@ -1572,4 +1493,125 @@ void Ensemble_PIMD::compute2(
       atom.position_per_atom.data());
     GPU_CHECK_KERNEL
   }
+}
+
+void Ensemble_PIMD::langevin(const double time_step, Atom& atom)
+{
+  if (thermostat_internal) {
+    double* nonham_work =
+      nonham_work_per_atom_.size() == number_of_atoms
+        ? nonham_work_per_atom_.data()
+        : nullptr;
+    gpu_langevin<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
+      thermostat_centroid,
+      number_of_atoms,
+      number_of_beads,
+      curand_states.data(),
+      temperature,
+      temperature_coupling,
+      time_step,
+      pile_scale_,
+      free_ring_polymer_frequency.data(),
+      transformation_matrix.data(),
+      atom.mass.data(),
+      velocity_beads.data(),
+      nonham_work);
+    GPU_CHECK_KERNEL
+  }
+}
+
+void Ensemble_PIMD::compute1(
+  const double time_step,
+  const int step,
+  const int number_of_steps,
+  const std::vector<Group>& group,
+  Box& box,
+  Atom& atom,
+  GPU_Vector<double>& thermo)
+{
+  omega_n = number_of_beads * K_B * temperature / HBAR;
+  update_eco_modes();
+  update_free_ring_polymer_propagator_(time_step);
+
+  langevin(time_step, atom);
+
+  gpu_apply_pbc<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
+    box, number_of_atoms, number_of_beads, position_beads.data());
+  GPU_CHECK_KERNEL
+
+  const dim3 grid((number_of_atoms - 1) / 64 + 1, number_of_beads);
+  gpu_half_kick<<<grid, 64>>>(
+    number_of_atoms,
+    number_of_beads,
+    time_step,
+    atom.mass.data(),
+    force_beads.data(),
+    velocity_beads.data());
+  GPU_CHECK_KERNEL
+  remove_center_of_mass_velocity_(atom);
+  // Consume the old force before rescaling; the regular force call then refreshes it.
+  if (num_target_pressure_components > 0) {
+    update_thermo_(box, atom, thermo);
+    apply_barostat_(box, atom, thermo);
+    box.set_is_orthogonal();
+  }
+
+  gpu_nve_forward<<<grid, 64>>>(
+    number_of_atoms,
+    number_of_beads,
+    time_step,
+    use_exact_propagator_,
+    transformation_matrix.data(),
+    free_ring_polymer_frequency.data(),
+    free_ring_polymer_cosine.data(),
+    free_ring_polymer_sine.data(),
+    position_beads.data(),
+    velocity_beads.data(),
+    position_normal.data(),
+    velocity_normal.data());
+  GPU_CHECK_KERNEL
+
+  gpu_nve_inverse<<<grid, 64>>>(
+    number_of_atoms,
+    number_of_beads,
+    transformation_matrix.data(),
+    position_normal.data(),
+    velocity_normal.data(),
+    position_beads.data(),
+    velocity_beads.data());
+  GPU_CHECK_KERNEL
+}
+
+void Ensemble_PIMD::compute2(
+  const double time_step,
+  const int step,
+  const int number_of_steps,
+  const std::vector<Group>& group,
+  Box& box,
+  Atom& atom,
+  GPU_Vector<double>& thermo,
+  Force& force)
+{
+  omega_n = number_of_beads * K_B * temperature / HBAR;
+  update_eco_modes();
+  update_free_ring_polymer_propagator_(time_step);
+
+  const dim3 grid((number_of_atoms - 1) / 64 + 1, number_of_beads);
+  gpu_half_kick<<<grid, 64>>>(
+    number_of_atoms,
+    number_of_beads,
+    time_step,
+    atom.mass.data(),
+    force_beads.data(),
+    velocity_beads.data());
+  GPU_CHECK_KERNEL
+
+  langevin(time_step, atom);
+  remove_center_of_mass_velocity_(atom);
+
+  gpu_apply_pbc<<<(number_of_atoms - 1) / 64 + 1, 64>>>(
+    box, number_of_atoms, number_of_beads, position_beads.data());
+  GPU_CHECK_KERNEL
+
+  update_thermo_(box, atom, thermo);
 }

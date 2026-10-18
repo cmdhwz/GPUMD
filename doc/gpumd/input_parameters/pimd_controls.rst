@@ -17,9 +17,10 @@ Syntax::
 
 ``exact`` uses the exact harmonic normal-mode rotation for the free
 ring-polymer part of the Trotter-split propagator. It is the default and is
-consistent with the default propagator in i-PI. ``cayley`` uses the previous
-GPUMD Cayley approximation and can be selected for comparison or for runs
-that deliberately use a larger time step.
+consistent with i-PI's default propagator. The full integration still has
+finite-step splitting error, and ``exact`` is not universally more accurate
+than ``cayley``; check time-step convergence for the property of interest.
+``cayley`` uses the Cayley approximation and can be selected for comparison.
 
 The normal-mode coefficients are updated only when the temperature or time
 step changes and are reused by the GPU kernels. Selecting ``exact`` therefore
@@ -38,7 +39,8 @@ The default is ``2.0``. GPUMD applies two Langevin half steps and uses
 ``2.0`` gives the standard PILE-L friction :math:`\gamma_k=2\omega_k`, as in
 i-PI with its default PILE scale. The historical GPUMD coefficient is
 recovered with ``1.0``. Larger values damp internal normal modes more
-strongly; smaller positive values damp them more weakly.
+strongly; smaller positive values damp them more weakly. The value must be
+finite and greater than zero.
 
 This parameter has no effect in a pure :attr:`rpmd` run because RPMD does not
 apply the internal-mode Langevin thermostat.
@@ -52,15 +54,22 @@ Syntax::
     pimd_fix_com on|off
 
 The default is ``on``. It removes the three global center-of-mass momentum
-components of the complete ring polymer, matching the physical meaning of a
-center-of-mass constraint. It does not independently remove the center-of-mass
-momentum of every bead. Set it to ``off`` when matching i-PI's default
-``fixcom=False`` behavior. This option changes the sampled velocities and can
-therefore affect a heat-current trajectory, but it does not change the
-centroid heat-flux operator itself.
+components of the complete ring polymer by subtracting the same mass-weighted
+center-of-mass velocity from every bead. Internal bead velocities are
+unchanged; the center-of-mass momentum of each bead is not constrained
+separately. The correction is applied after initialization and after each
+integration velocity update, also in a pure :attr:`rpmd` run. This matches the
+default ``fixcom=True`` in i-PI's input configuration. Set it to ``off`` to
+disable the correction. It changes the sampled velocities and can therefore
+affect a heat-current trajectory, but it does not change the centroid
+heat-flux operator itself. The projected bead-mean velocity is also written
+to the centroid velocity buffer.
 
-In the current implementation the COM correction is coupled to the Langevin
-step, so this parameter has no effect in a pure :attr:`rpmd` run.
+The ``correct_velocity`` directive is rejected for PIMD, RPMD, and TRPMD. It
+modifies only the centroid velocity buffer, which is overwritten by the bead
+average and therefore cannot correct the ring-polymer bead velocities. Use
+``pimd_fix_com on`` for global center-of-mass removal; group and angular
+velocity corrections of bead modes are unsupported.
 
 
 PIMD bead batching
@@ -115,9 +124,11 @@ Syntax::
     pimd_bead_neighbor_rebuild auto|always
 
 ``always`` is the default and rebuilds every bead's neighbor list on each force
-call; use it for variable-box runs. ``auto`` reuses lists until atoms move more
-than half the skin distance and is intended for fixed-box performance tests,
-because box changes alone do not invalidate the cached list.
+call; it is the conservative choice for variable-box runs. ``auto`` reuses
+lists until atoms move more than half the skin distance. The NEP and qNEP
+bead-batch paths also rebuild when the cell matrix or PBC state changes; this
+box-change handling is specific to those batch paths and is not guaranteed for
+other force backends.
 
 The older ``pimd_nep_bead_batch`` and ``pimd_qnep_bead_batch`` keywords remain
 accepted as compatibility aliases, but new input files should use
@@ -133,19 +144,15 @@ These controls do not alter the centroid heat-flux implementation selected by
 paths used to construct the centroid heat flux remain active.
 
 For a fixed-box qNEP PIMD/RPMD/TRPMD run with ``pimd_bead_batch on``, the
-centroid qNEP force and virial are evaluated in the same bead batch as one
-auxiliary, non-integrated lane on HAC sampling force calls. The batch capacity
-is allocated once for ``P+1`` lanes, but non-sampling force calls activate only
-the ``P`` physical lanes, so the auxiliary centroid calculation is not
-performed at every integration step. This optimization is enabled
-automatically by ``compute_hac`` when its centroid flag is 1; physical bead
-forces and the ring-polymer propagation are unchanged. Variable-box runs, SCR
-barostats, unsupported potentials, and non-batched runs retain the serial
-centroid-force fallback.
+physical bead batch remains at ``P`` lanes. With the centroid flag set to 1,
+``compute_hac`` evaluates the centroid qNEP potential, force, and complete
+per-atom virial separately at each HAC sample. It does not automatically add
+a ``P+1`` centroid probe lane. Physical bead forces and ring-polymer
+propagation are unchanged.
 
 To remove centroid qNEP work from the dynamics loop, add the optional
 ``deferred_centroid_qnep`` flag to ``compute_hac``. With this flag set to 1,
 fixed-box qNEP PIMD/RPMD/TRPMD runs cache centroid positions and velocities at
 HAC samples and evaluate them later in fixed 32-frame qNEP batches. This mode
 is default-off, supports ``split_qnep_heat_by_type 0`` only, and falls back to
-the sampled auxiliary-lane or serial path when its requirements are not met.
+the normal sampled centroid path when its requirements are not met.
