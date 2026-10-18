@@ -271,7 +271,7 @@ assert "gradient_residual_reject_trials" in backtracking and "evaluation_budget_
 assert 'failure_stage="GRADIENT_RESIDUAL_REJECT"' in backtracking and 'failure_stage="GRADIENT_SOLVE_FAIL"' in backtracking
 assert "catch(...)" in backtracking and "throw;" in backtracking
 assert backtracking.index('trial_status="ARMIJO_ACCEPTED"') < backtracking.index("complete_gradient(result.next)") < backtracking.index("result.accepted=true")
-assert "const bool allow_expansion=true,const bool objective_only_expansion=false" in backtracking
+assert "const bool allow_expansion=true,const bool objective_only_expansion=false,const bool allow_bounded_positive_slope=false" in backtracking
 assert "objective_expansion=objective_only_expansion&&allow_expansion&&initial_alpha==1.0" in backtracking
 assert "if(!objective_only_expansion&&allow_expansion&&initial_alpha==1.0" in backtracking
 assert "proposal_objective" in backtracking and "objective_only=1" in backtracking
@@ -297,11 +297,16 @@ assert "STEP_COMMITTED" in native_fit and "GRADIENT_RESIDUAL_REJECT" in native_f
 assert "GRADIENT_RESIDUAL_REJECT" in rpmd_ja_doc and "bfgs_seed_gamma" in rpmd_ja_doc
 covariance_optimizer = native_fit.split("CovarianceFitResult solve_covariance_reference(", 1)[1].split("void write_covariance_state", 1)[0]
 assert covariance_optimizer.index("covariance_backtrack_armijo(") < covariance_optimizer.index("if(!accepted)")
-assert covariance_optimizer.index("if(!accepted)") < covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=dominant_cap_path?")
+assert covariance_optimizer.index("if(!accepted)") < covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=joint_block?")
 assert "covariance_update_recent_inverse_hessian(bfgs,step,change)" in covariance_optimizer
-assert covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=dominant_cap_path?") < covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('"STEP_COMMITTED iteration="')
-assert "bfgs.recent_secants.clear()" in covariance_optimizer and "bfgs_recent_pairs" in covariance_optimizer
-assert 'shrink_source="DIRECTIONAL_SECANT"' in native_fit and "std::max(0.1*alpha,std::min(0.9*alpha,proposed))" in native_fit
+assert covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=joint_block?") < covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('"STEP_COMMITTED iteration="')
+assert "const CovarianceBFGSUpdateStatus bfgs_update=joint_block?" in covariance_optimizer
+assert '" bfgs_history_mode="<<(joint_block?"RECENT_REPLAY":"STANDARD")' in covariance_optimizer
+assert "if(joint_block&&!dominant_cap_path)bfgs.recent_secants.clear()" not in covariance_optimizer
+assert 'shrink_source="DIRECTIONAL_SECANT"' in native_fit
+assert "std::min((allow_bounded_positive_slope?0.5:0.9)*alpha,proposed)" in native_fit
+assert 'const bool joint_bfgs_line_search=joint_block&&(choice.method=="BFGS"||choice.method=="GROUP_BFGS")' in covariance_optimizer
+assert "joint_bfgs_line_search,joint_bfgs_line_search" in covariance_optimizer
 overshoot_backtrack = backtracking.split("if(directional_overshoot)", 1)[1].split("have_valid_candidate=true", 1)[0]
 assert "if(objective_only_expansion)" in overshoot_backtrack and "COVARIANCE_OVERSHOOT_BACKTRACK" in overshoot_backtrack
 assert "alpha*=0.5" not in overshoot_backtrack
@@ -312,7 +317,11 @@ denominator = candidate_slope - (-1.0)
 proposal = alpha * ((-(-1.0)) / denominator)
 assert isfinite(proposal) and isclose(proposal, 3.5, rel_tol=0.0, abs_tol=1e-14)
 assert 0.1 * alpha <= proposal <= 0.9 * alpha
-assert isclose(-proposal + 0.5 * curvature * proposal * proposal, -1.75, rel_tol=0.0, abs_tol=1e-14)
+legacy_proposal = max(0.1 * alpha, min(0.9 * alpha, proposal))
+assert isclose(legacy_proposal, 3.5, rel_tol=0.0, abs_tol=1e-14)
+bounded_proposal = max(0.1 * alpha, min(0.5 * alpha, proposal))
+assert isclose(bounded_proposal, 2.0, rel_tol=0.0, abs_tol=1e-14)
+assert isclose(-bounded_proposal + 0.5 * curvature * bounded_proposal * bounded_proposal, -1.4285714285714286, rel_tol=0.0, abs_tol=1e-14)
 quadratic = [[4.0, 1.0], [1.0, 3.0]]
 steps = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 secants = [(step, tuple(sum(quadratic[i][j] * step[j] for j in range(2)) for i in range(2))) for step in steps]
@@ -329,6 +338,7 @@ latest_change = secants[-1][1]
 assert isclose(sum(inverse[0][j] * latest_change[j] for j in range(2)), 0.0, abs_tol=1e-14)
 assert isclose(sum(inverse[1][j] * latest_change[j] for j in range(2)), 1.0, abs_tol=1e-14)
 assert "test_covariance_recent_bfgs_replays_latest_gamma_and_bounds_history" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_joint_bfgs_bounded_positive_slope" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_objective_only_overshoot_uses_directional_secant" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 non_descent_branch = covariance_optimizer.split("if(!(bfgs_slope<0.0))", 1)[1].split("const double direction_inf_norm", 1)[0]
 assert "covariance_reset_non_descent_direction(bfgs,g,bfgs_direction)" in non_descent_branch
@@ -726,7 +736,7 @@ joint_ray_branch = covariance_optimizer.split('if(choice.method=="JOINT_BLOCK"){
 assert "covariance_joint_ray_proposal(" in joint_ray_branch
 assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
 assert "ray_attempt.eigen_evaluations=joint_direction_result.ray_eigen_evaluations" in covariance_optimizer
-assert 'joint_block&&choice.method!="JOINT_BLOCK");' in covariance_optimizer
+assert "joint_bfgs_line_search,joint_bfgs_line_search);" in covariance_optimizer
 assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="PROPOSAL_READY"') < covariance_optimizer.index("covariance_backtrack_armijo(")
 assert covariance_optimizer.index("result.joint_block_factorizations+=joint_factorizations") < covariance_optimizer.index("covariance_joint_ray_proposal(")
 assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('if(joint_block){ray_attempt.line_status="STEP_COMMITTED"')

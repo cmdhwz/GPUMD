@@ -4504,7 +4504,7 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
   const std::vector<double>& coordinate_scale,const std::vector<double>& direction,const double current_objective,const double slope,
   const double initial_alpha,const double direction_inf_norm,const std::uint64_t max_evaluations,CovarianceFitResult& fit,
   const int iteration,const double tau,EvaluateObjective&& evaluate_objective,CompleteGradient&& complete_gradient,std::ostream* trace=nullptr,
-  const bool allow_expansion=true,const bool objective_only_expansion=false)
+  const bool allow_expansion=true,const bool objective_only_expansion=false,const bool allow_bounded_positive_slope=false)
 {
   CovarianceBacktrackingResult result;double alpha=initial_alpha;
   bool have_valid_candidate=false,objective_expansion=objective_only_expansion&&allow_expansion&&initial_alpha==1.0;
@@ -4583,11 +4583,16 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
         if(have_valid_candidate){preserve_valid_candidate();break;}
         alpha*=0.5;continue;
       }catch(...){fit.failed_trial.failure_stage="GRADIENT_SOLVE_FAIL";throw;}
-      const bool directional_overshoot=candidate_slope>0.0;
+      const bool bounded_positive_slope=allow_bounded_positive_slope&&candidate_slope>0.0&&candidate_slope<=0.5*(-slope);
+      const bool directional_overshoot=candidate_slope>0.0&&!bounded_positive_slope;
+      const double absolute_slope_ratio=std::abs(candidate_slope)/std::abs(slope);
+      const char* directional_reason=candidate_slope<=0.0?"NONPOSITIVE_SLOPE":
+        bounded_positive_slope?"BOUNDED_POSITIVE_SLOPE":allow_bounded_positive_slope?"POSITIVE_SLOPE_TOO_LARGE":"POSITIVE_SLOPE_NOT_ALLOWED";
       if(trace){*trace<<"LINE_SEARCH_DIRECTIONAL iter="<<iteration<<" trial="<<trial<<" alpha="<<alpha<<" tau="<<tau
         <<" current_objective="<<current_objective<<" candidate_objective="<<result.next.objective
         <<" current_directional_slope="<<slope<<" candidate_directional_slope="<<candidate_slope
-        <<" status="<<(directional_overshoot?"DIRECTIONAL_OVERSHOOT_REJECT":"DIRECTIONAL_ACCEPTED")<<'\n';}flush_trace();
+        <<" status="<<(directional_overshoot?"DIRECTIONAL_OVERSHOOT_REJECT":"DIRECTIONAL_ACCEPTED")
+        <<" reason="<<directional_reason<<" absolute_slope_ratio="<<absolute_slope_ratio<<'\n';}flush_trace();
       if(directional_overshoot){++fit.directional_overshoot_reject_trials;fit.failed_trial.failure_stage="DIRECTIONAL_OVERSHOOT_REJECT";
         if(have_valid_candidate){preserve_valid_candidate();break;}
         double next_alpha=0.5*alpha;const char* shrink_source="HALF_FALLBACK";
@@ -4595,10 +4600,12 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
           const double denominator=candidate_slope-slope;
           const double fraction=std::isfinite(denominator)&&denominator>0.0?-slope/denominator:std::numeric_limits<double>::quiet_NaN();
           const double proposed=alpha*fraction;
-          if(std::isfinite(proposed)&&proposed>0.0){next_alpha=std::max(0.1*alpha,std::min(0.9*alpha,proposed));shrink_source="DIRECTIONAL_SECANT";}
-          if(trace)*trace<<"COVARIANCE_OVERSHOOT_BACKTRACK iteration="<<iteration<<" trial="<<trial
-            <<" alpha="<<alpha<<" source="<<shrink_source<<" proposed_alpha="<<next_alpha<<'\n';flush_trace();
+          if(std::isfinite(proposed)&&proposed>0.0){next_alpha=std::max(0.1*alpha,
+              std::min((allow_bounded_positive_slope?0.5:0.9)*alpha,proposed));shrink_source="DIRECTIONAL_SECANT";}
         }
+        if(trace)*trace<<"COVARIANCE_OVERSHOOT_BACKTRACK iteration="<<iteration<<" trial="<<trial
+          <<" alpha="<<alpha<<" source="<<shrink_source<<" proposed_alpha="<<next_alpha
+          <<" shrink_ratio="<<next_alpha/alpha<<'\n';flush_trace();
         alpha=next_alpha;continue;}
       have_valid_candidate=true;valid_alpha=alpha;valid_z=result.next_z;valid_theta=result.next_theta;valid_step=result.step;valid_value=result.next;
       if(!objective_only_expansion&&allow_expansion&&initial_alpha==1.0&&alpha>=1.0&&expansions<2&&candidate_slope<0.5*slope){
@@ -4841,7 +4848,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           result.group_bfgs_update_status[group]="TAU_RESET";}
         result.dominant_cap_rescue_next=false;
         if(trace)*trace<<"BFGS_STAGE_RESET tau="<<tau<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source
-          <<" recent_pairs="<<bfgs.recent_secants.size()<<'\n';flush_trace();continue;}
+          <<" recent_pairs="<<bfgs.recent_secants.size()<<" reason=TAU_CHANGE\n";flush_trace();continue;}
       if(joint_block){result.joint_ray_attempt=CovarianceJointRayProposal{};result.joint_ray_attempt.iteration=result.iterations;
         result.joint_ray_attempt.tau=tau;result.joint_ray_attempt.status="NOT_APPLICABLE";
         result.joint_ray_attempt.reason="NOT_STARTED";result.joint_ray_attempt.line_status="NOT_STARTED";}
@@ -4928,6 +4935,9 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             const double reset_slope=covariance_reset_non_descent_direction(group_bfgs_pending,local_gradient,local_direction);
             if(!std::isfinite(reset_slope)||!std::all_of(local_direction.begin(),local_direction.end(),[](double value){return std::isfinite(value);}))
               throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS reset is non-finite");
+            if(trace)*trace<<"COVARIANCE_GROUP_BFGS_RESET iteration="<<result.iterations<<" tau="<<tau
+              <<" group="<<group_bfgs_pending_group<<" gamma="<<group_bfgs_pending.seed_gamma
+              <<" source="<<group_bfgs_pending.seed_source<<" reason=NON_DESCENT\n";flush_trace();
             choice=covariance_choose_group_bfgs_direction(g,group_bfgs_pending_group,group_bfgs_pending);}
           if(choice.selected_slope<0.0){choice=covariance_preflight_block_direction(result.theta,z,coordinate_scale,g,bfgs_direction,bfgs_slope,std::move(choice));
             if(choice.method=="BFGS"){choice.reason="GROUP_BFGS_STEP_UNREPRESENTABLE_BFGS_FALLBACK";group_bfgs_pending_group=-1;}
@@ -5048,6 +5058,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             <<" cheap_evaluations="<<ray_attempt.cheap_evaluations<<" cheap_seconds="<<ray_attempt.cheap_seconds<<'\n';}flush_trace();}
       if(joint_block){ray_attempt.line_status="PROPOSAL_READY";result.joint_ray_attempt=ray_attempt;}
       const int iteration=result.iterations;CovarianceBacktrackingResult line;
+      const bool joint_bfgs_line_search=joint_block&&(choice.method=="BFGS"||choice.method=="GROUP_BFGS");
       try{line=covariance_backtrack_armijo(result.theta,z,coordinate_scale,direction,current.objective,slope,alpha,direction_inf_norm,
           max_evaluations,result,iteration,tau,
           [&](const std::vector<double>& trial_theta,std::uint64_t& evaluations){
@@ -5066,7 +5077,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               throw CovarianceSolveResidualError(diagnostic);}
 #endif
             complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,tau);},trace,!joint_block||!ray_attempt.usable,
-          joint_block&&choice.method!="JOINT_BLOCK");}
+          joint_bfgs_line_search,joint_bfgs_line_search);}
       catch(...){if(joint_block){ray_attempt.line_status="ACTUAL_TRIAL_EXCEPTION";result.joint_ray_attempt=ray_attempt;}
         if(result.failed_trial.failure_stage=="GRADIENT_SOLVE_FAIL"){
           result.failed_d_trace=system.last_d_trace;result.failed_shifted_trace=system.last_shifted_trace;}throw;}
@@ -5219,9 +5230,8 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         if(group_bfgs_update==CovarianceGroupBFGSUpdateStatus::SkippedMixedStep)
           throw std::runtime_error("NUMERICAL_SOLVE_FAIL: GROUP_BFGS accepted a mixed-group step");}
       const double bfgs_sy=covariance_dot(step,change),bfgs_step_norm=covariance_dot(step,step),bfgs_y_norm=covariance_dot(change,change);
-      const CovarianceBFGSUpdateStatus bfgs_update=dominant_cap_path?
+      const CovarianceBFGSUpdateStatus bfgs_update=joint_block?
         covariance_update_recent_inverse_hessian(bfgs,step,change):covariance_update_inverse_hessian(bfgs,step,change);
-      if(joint_block&&!dominant_cap_path)bfgs.recent_secants.clear();
       sync_bfgs_seed();
       if(trace&&bfgs_update==CovarianceBFGSUpdateStatus::Seeded)*trace<<"BFGS_CURVATURE_SEED iteration="<<iteration<<" tau="<<tau
         <<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source<<" recent_pairs="<<bfgs.recent_secants.size()<<'\n';
@@ -5252,13 +5262,14 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         <<" bfgs_s_norm2="<<bfgs_step_norm<<" bfgs_y_norm2="<<bfgs_y_norm
         <<" bfgs_update="<<(bfgs_update==CovarianceBFGSUpdateStatus::Updated?"UPDATED":bfgs_update==CovarianceBFGSUpdateStatus::Seeded?"SEEDED":"RESET")
         <<" bfgs_seed_gamma="<<bfgs.seed_gamma<<" bfgs_seed_source="<<bfgs.seed_source
-        <<" bfgs_history_mode="<<(dominant_cap_path?"RECENT_REPLAY":"STANDARD")
+        <<" bfgs_history_mode="<<(joint_block?"RECENT_REPLAY":"STANDARD")
         <<" bfgs_recent_pairs="<<bfgs.recent_secants.size()<<" tau_stage_fixed=1\n";flush_trace();
       if(group_bfgs_pending_update&&trace)*trace<<"COVARIANCE_GROUP_BFGS_COMMIT iteration="<<iteration<<" tau="<<tau
         <<" group="<<group_bfgs_pending_group<<" support="<<result.group_bfgs_supports[static_cast<std::size_t>(group_bfgs_pending_group)]
         <<" gamma="<<result.group_bfgs_gamma[static_cast<std::size_t>(group_bfgs_pending_group)]
         <<" source="<<result.group_bfgs_source[static_cast<std::size_t>(group_bfgs_pending_group)]
         <<" update_status="<<result.group_bfgs_update_status[static_cast<std::size_t>(group_bfgs_pending_group)]
+        <<" reset_reason="<<(group_bfgs_update==CovarianceGroupBFGSUpdateStatus::Reset?"INVALID_CURVATURE":"NONE")
         <<" committed_updates="<<result.group_bfgs_committed_updates[static_cast<std::size_t>(group_bfgs_pending_group)]<<'\n';flush_trace();
       if(joint_block&&trace){const CovarianceJointStepAttribution& attribution=result.last_joint_attribution;
         *trace<<"COVARIANCE_JOINT_COMMIT_ATTRIBUTION iteration="<<attribution.iteration<<" tau="<<attribution.tau

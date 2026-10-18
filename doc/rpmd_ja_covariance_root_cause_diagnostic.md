@@ -54,12 +54,14 @@ conditional solve checks and extra cost. Older saved states/traces may not
 contain those fields; NOT_STORED is missing evidence, not zero curvature or
 optimizer failure.
 
-The capped-support ``joint_block`` path records ``bfgs_recent_pairs`` and
-rebuilds the shared global inverse Hessian after each committed full-gradient
-step from the newest ``gamma = sTy / yTy`` identity background, then replays
-up to eight recent valid secants in chronological order. This can refresh the
-scale in directions not covered by those pairs; it is not an exact-Hessian
-estimate or a guarantee of improved conditioning or KKT convergence.
+The ``joint_block`` optimizer records ``bfgs_recent_pairs`` and rebuilds the
+shared global inverse Hessian after every committed full-gradient step from
+the newest ``gamma = sTy / yTy`` identity background, then replays up to eight
+recent valid secants in chronological order. Pure ``GROUP_BFGS``, global
+``BFGS``, and small-support ``JOINT_BLOCK`` commits all contribute their full
+scaled secant. This can refresh the scale in directions not covered by those
+pairs; it is not an exact-Hessian estimate or a guarantee of improved
+conditioning or KKT convergence.
 The optimizer summary and covariance state also report the 128-column trace
 solve width, the unchanged 32-column residual-check width, and submitted
 ``trace_solve_calls`` (including a failing wide solve); total RHS columns keep
@@ -141,12 +143,14 @@ selected-group direction. If the dominant support exceeds 32, the status stays
 ``GROUP_BFGS`` step with the shared global ``BFGS`` direction, starting with
 ``GROUP_BFGS``. A rescue updates the full shared secant history but not any
 per-group history; its attribution lists the nonzero groups and parameters in
-the actual step. Only in this route, the global history retains at most eight
-recent curvature-valid committed secants and replays them oldest to newest
-over the newest gamma identity background. Rejected candidates leave the
-history and schedule unchanged. Invalid curvature and non-descent resets clear
-the recent secants while keeping the latest valid scale; a ``tau`` change clears
-them and restarts from identity. Each group has its own six-dimensional inverse-Hessian history
+the actual step. Across all ``joint_block`` directions, the shared history
+retains at most eight recent curvature-valid committed secants and replays
+them oldest to newest over the newest gamma identity background. Each
+committed pure-group, global, or small-support joint step contributes its full
+scaled step and gradient change. Rejected candidates leave the history and
+schedule unchanged. Invalid curvature and non-descent resets clear the recent
+secants while keeping the latest valid scale; a ``tau`` change clears them and
+restarts from identity. Each group has its own six-dimensional inverse-Hessian history
 for each ``tau`` stage; it seeds from the first curvature-valid committed
 pure-group secant. Joint or mixed-group steps do not update these histories. A
 finite direction or representability failure falls back to global BFGS. For
@@ -154,13 +158,17 @@ finite direction or representability failure falls back to global BFGS. For
 objective-only expansion proposes alpha values up to 4, then evaluates a full
 gradient at the selected point's factors. A failed or worse expansion
 re-evaluates the best objective-pass point before its gradient; objective-only
-proposals are never committed. For a positive candidate directional slope,
-this mode proposes an alpha by directional secant interpolation, bounded to
-``[0.1 alpha, 0.9 alpha]``; an invalid proposal falls back to halving and uses
-the already computed gradient only to calculate the interpolated alpha. The
-new trial point still needs its own full gradient and all commit gates before
-it can be committed. This does not apply to default BFGS or small-support
-``JOINT_BLOCK`` line searches. The group direction uses no extra covariance
+proposals are never committed. After the full-gradient residual gate, joint
+``GROUP_BFGS`` and global ``BFGS`` directions accept nonpositive candidate
+slopes and positive slopes up to half the magnitude of the initial descent
+slope. Larger positive slopes are rejected; directional secant backtracking
+is bounded to ``[0.1 alpha, 0.5 alpha]`` and falls back to halving if invalid.
+The trace records the directional reason, absolute slope ratio, and actual
+shrink ratio. This bounded rule is separate from objective-only expansion and
+is not a full strong-Wolfe line search. Default BFGS, legacy ``block_newton``,
+and small-support spectral ``JOINT_BLOCK`` directions continue to reject every
+positive slope and halve. The new trial point still needs its own full gradient
+and all commit gates before it can be committed. The group direction uses no extra covariance
 factors, RHS columns, or joint ray proposal, and its approximate model is
 reported as unavailable. ``line_search_evaluations`` and
 ``line_search_objective_seconds`` cover line-search objective evaluations and

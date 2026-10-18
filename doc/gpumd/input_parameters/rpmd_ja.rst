@@ -93,17 +93,20 @@ not update these histories. If a finite descent direction or representable
 step is unavailable, the optimizer falls back to global BFGS; non-finite and
 CUDA failures remain fatal.
 
-Only while ``joint_block`` is on the ``DOMINANT_SUPPORT_CAP`` path, the shared
-full-parameter history retains at most eight recent curvature-valid committed
-secants. After a complete-gradient candidate passes the commit gates, the
-inverse Hessian is rebuilt from the newest ``gamma = sTy / yTy`` times the
-identity and the retained secants are replayed oldest to newest. This refreshes
-the background scale in directions untouched by those secants; it does not
-guarantee improved conditioning or KKT convergence. ``bfgs_recent_pairs``
-reports the retained count. Invalid curvature and non-descent resets clear the
-recent pairs while retaining the latest valid positive scale; a ``tau`` stage
-change clears them and restarts from identity. Rejected candidates do not
-change the history.
+Whenever ``joint_block`` is enabled, the shared full-parameter history retains
+at most eight recent curvature-valid committed secants from pure
+``GROUP_BFGS``, global ``BFGS``, and small-support ``JOINT_BLOCK`` steps. Each
+pair uses the full scaled step and gradient change. After a complete-gradient
+candidate passes the commit gates, the inverse Hessian is rebuilt from the
+newest ``gamma = sTy / yTy`` times the identity and the retained secants are
+replayed oldest to newest. This refreshes the background scale in directions
+untouched by those secants; it does not guarantee improved conditioning or KKT
+convergence. ``bfgs_recent_pairs`` reports the retained count. Invalid
+curvature and non-descent resets clear the recent pairs while retaining the
+latest valid positive scale; a ``tau`` stage change clears them and restarts
+from identity. Rejected candidates do not change the history. The independent
+six-dimensional group histories still update only after pure ``GROUP_BFGS``
+steps.
 
 The optimizer summary, fit report, and covariance state also record
 ``trace_solve_batch`` (128 columns), ``trace_residual_batch`` (32 columns), and
@@ -117,23 +120,25 @@ For ``joint_block`` runs using ``GROUP_BFGS`` or ``BFGS`` directions, bounded
 objective-only expansion proposes steps up to alpha 4, then computes a full
 gradient at the selected candidate's factors. A failed or worse expansion
 returns to the best objective-pass proposal and re-evaluates it before the
-gradient. In this objective-only mode, a positive candidate directional slope
-proposes a secant-interpolated alpha bounded to ``[0.1 alpha, 0.9 alpha]``;
-invalid proposals fall back to halving. The overshooting candidate's already
-computed full gradient is used only to calculate the interpolated alpha; the
-new trial point still needs its own full gradient and all commit gates before
-it can be committed. Default BFGS and successful ``JOINT_BLOCK`` line-search
-steps retain their existing halving behavior. Objective proposals alone never
-satisfy commit gates.
+gradient. After the full-gradient residual gate, this direction family accepts
+a nonpositive candidate slope or a positive slope no greater than half the
+absolute initial slope. A larger positive slope is rejected; its directional
+secant proposal is bounded to ``[0.1 alpha, 0.5 alpha]``, with halving as the
+fallback. The trace records the directional reason, absolute slope ratio, and
+actual shrink ratio. This bounded positive-slope rule is separate from the
+objective-only expansion and is not a full strong-Wolfe line search. Default
+BFGS, legacy ``block_newton``, and spectral ``JOINT_BLOCK`` directions retain
+their existing rejection of any positive slope and halving behavior. Objective
+proposals alone never satisfy commit gates.
 ``line_search_evaluations`` and ``line_search_objective_seconds`` cover
 line-search objective evaluations and time, including re-evaluations after a
 failed or worse expansion. ``line_search_gradient_calls`` and
 ``line_search_gradient_seconds`` cover complete-gradient backtracking work;
 baseline, initialization, and tau-stage gradients are excluded. Group BFGS does
 not use the joint ray proposal and reports its approximate model as unavailable.
-Both opt-in modes retain the
-existing full-gradient residual, Armijo, directional-overshoot, KKT, held-out
-response, and final SPD acceptance gates.
+All modes retain the existing full-gradient residual, Armijo, KKT, held-out
+response, and final SPD acceptance gates; bounded positive-slope acceptance
+applies only to joint ``GROUP_BFGS`` and global ``BFGS`` directions.
 
 For a successful ``JOINT_BLOCK`` direction, the optimizer also forms the small spectra of ``sqrt(V) L sqrt(V)`` for the local ``D`` and ``D-epsilon I`` inverse probes. Their exact log-determinant ray model proposes an initial alpha, capped at 90% of its estimated SPD boundary and by the existing step policy (up to 4 only from an original alpha of 1). This is only a proposal: the full objective, full-gradient residual, Armijo, directional-overshoot, and commit checks still decide every trial. Finite spectral or slope-consistency failures use the existing initial step and line search. No full-space inverse or solve is added.
 
@@ -141,7 +146,14 @@ The trace and covariance state record selected group IDs and supports, direction
 
 This route is opt-in; ``fit_samples`` continues to use the force least-squares/QP method. The covariance method computes training statistics only from the first two thirds of frames and minimizes the Gaussian fluctuation objective with a graph-Laplacian baseline and a positive ``rho`` shrinkage prior. It searches the full feasible interval for the baseline parameter, including negative values when the raw reference is already stable. It uses exact Cholesky factors in the translation-complement space and analytic parameter gradients. BFGS coordinates are scaled from the baseline matrix and each parameter basis matrix; the reports include both the scaled KKT residual and raw parameter-gradient norm. When the baseline is epsilon-boundary-active, initialization first halves the original positive graph-direction step until the full objective decreases, then doubles from that point while the objective continues to decrease. The trace labels these phases ``phase=SHRINK`` and ``phase=EXPAND`` and records the stop reason, trial delta and objective, and selected start. ``theta_baseline`` remains the prior center and ``theta_start`` records the best selected start. ``initialization_status``, ``initialization_evaluations``, ``start_graph_delta``, ``start_objective``, and ``start_raw_gradient_inf_norm`` describe that search. The start report also records the full-gradient solve status, scaled KKT residual, and scaled component gradient norms. The state and fit reports expose ``bfgs_seed_gamma`` and ``bfgs_seed_source``. ``max_iter`` is the optimizer iteration budget; line-search objective evaluations and gradient-residual rejects are reported separately. The first curvature-valid secant in each fixed-``tau`` stage seeds the inverse Hessian with ``gamma = sTy / yTy`` before the inverse-BFGS update; same-stage resets reuse the latest valid positive gamma, while a ``tau`` change restarts from the identity. The ``.fit_trace.txt`` distinguishes ``SHIFTED_NOT_SPD``, ``ARMIJO_REJECT``, ``ARMIJO_ACCEPTED``, ``GRADIENT_RESIDUAL_REJECT``, and ``STEP_UNDERFLOW``. ``ARMIJO_ACCEPTED`` records only the objective test; ``STEP_COMMITTED`` is written only after full gradient solves pass and optimizer state is updated. A failed line search also records a bounded directional finite-difference check. That check compares against the analytic descent prediction only after successive halvings give two consecutive finite-difference changes within 1%; otherwise it reports an ``INCONCLUSIVE_*`` status and preserves the original line-search failure. The saved-point ``diagnose_covariance`` report uses ``cbrt(machine_epsilon) * max(1, abs(z[k]))`` for its selected coordinate, the actual scaled parameter change as the difference denominator, and one shared budget of at most 16 objective evaluations. It tries the gradient-predicted descent side first and tries the opposite side at the same step when needed for feasibility. Each ``directional_fd_probe`` line reports the side, nominal and effective steps, feasibility, objective change, finite-difference slope, stability change, and stable-halving count. ``directional_fd_one_percent_check`` separately reports whether its stabilized slope agrees with the analytic slope within 1%, while ``directional_fd_status`` retains the existing broad consistency classification. ``GRADIENT_CONSISTENCY_SUSPECT`` means a stabilized finite difference disagreed with the analytic descent prediction, and is not convergence. The numerical log-determinant barrier used to enforce ``D-epsilon I > 0`` is an optimizer parameter and is not the shrinkage strength. The optimizer's convergence status is separate from held-out response acceptance and the final stored-D certificate. Read ``baseline_mu``, ``baseline_epsilon_constraint_status``, objective terms, scaled KKT residual, raw gradient norm, barrier gap estimate, factorization count, solve RHS count, and elapsed time from the ``.fit.txt`` report. On optimizer or response failure, ``.covariance_state.txt`` records the baseline, starting, and candidate parameter vectors, optimizer rejection counts, and training statistics; the method does not write an accepted reference on that path.
 
-The boundary-start initialization is capped at 16 full-objective evaluations and consumes the ordinary objective budget. ``initialization_evaluations`` includes the baseline evaluation, all direction-search trials, and the selected-start gradient refresh when a boundary search ran. ``line_search_evaluations`` counts objective evaluations, while ``line_search_trials`` also counts parameter updates stopped by underflow before evaluation. After the candidate gradient is validated, a positive dot product with the original scaled direction rejects an Armijo candidate as ``DIRECTIONAL_OVERSHOOT_REJECT`` and halves alpha. The failure-only directional check uses at most 16 additional objective evaluations and reports ``INCONCLUSIVE_BUDGET`` if no budget remains.
+The boundary-start initialization is capped at 16 full-objective evaluations and consumes the ordinary objective budget. ``initialization_evaluations`` includes the baseline evaluation, all direction-search trials, and the selected-start gradient refresh when a boundary search ran. ``line_search_evaluations`` counts objective evaluations, while ``line_search_trials`` also counts parameter updates stopped by underflow before evaluation. After the candidate gradient is validated, a positive dot product with the original scaled direction is accepted only for joint ``GROUP_BFGS`` and global ``BFGS`` when it is at most half the magnitude of the initial descent slope. Larger positive slopes are rejected as ``DIRECTIONAL_OVERSHOOT_REJECT`` and backtracked. Other direction families retain rejection of any positive slope and their existing halving behavior. This bounded check is not a full strong-Wolfe line search. The failure-only directional check uses at most 16 additional objective evaluations and reports ``INCONCLUSIVE_BUDGET`` if no budget remains.
+
+For ``joint_block``, the shared recent history applies after fully committed
+``GROUP_BFGS``, global ``BFGS``, and small-support ``JOINT_BLOCK`` steps; each
+uses the full scaled step and gradient change. The first-valid-secant gamma
+description above applies to standard BFGS initialization and resets, while
+joint history rebuilds from its newest valid gamma and replays up to eight
+retained secants.
 
 With :math:`D(\theta)=D_t+D_{\rm add}(\theta)` and the baseline :math:`D_b=D(\theta_b)`, the fitted objective is
 
