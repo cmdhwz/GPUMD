@@ -5687,7 +5687,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               diagnostic.first_failure_batch_start=0;diagnostic.first_failure_columns=1;diagnostic.worst_factor_solve_relative_residual=2e-7;
               throw CovarianceSolveResidualError(diagnostic);}
 #endif
-            complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,trial_theta,tau);},trace,!joint_block||!ray_attempt.usable,
+            complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,candidate.cached_theta,tau);},trace,!joint_block||!ray_attempt.usable,
           joint_bfgs_line_search,joint_bfgs_line_search);}
       catch(...){if(joint_block){ray_attempt.line_status="ACTUAL_TRIAL_EXCEPTION";result.joint_ray_attempt=ray_attempt;}
         if(result.failed_trial.failure_stage=="GRADIENT_SOLVE_FAIL"){

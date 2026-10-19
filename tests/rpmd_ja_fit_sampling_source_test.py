@@ -224,6 +224,8 @@ assert "parameter_basis_norms" in native_fit and "coordinate_scales" in native_f
 assert "tau_min=std::nextafter(target_gap/static_cast<double>(system.r),0.0)" in native_fit
 assert "if(tau<=tau_min)" in native_fit and "raw_gradient_inf_norm" in native_fit
 assert "complete_covariance_fit_gradient_from_factors" in native_fit
+assert "complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,candidate.cached_theta,tau)" in native_fit
+assert "complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,trial_theta,tau)" not in native_fit
 assert "evaluate_covariance_fit_objective" in native_fit and "0.5*(1.0+rho)*trace[i]" in native_fit
 assert "cusolverDnDpotrf" in native_fit and "cusolverDnDpotrs" in native_fit
 assert "COVARIANCE_OPTIMIZER_CONVERGED" in native_fit and "LINE_SEARCH_FAILED" in native_fit
