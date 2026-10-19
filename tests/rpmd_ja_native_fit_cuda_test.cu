@@ -1397,6 +1397,10 @@ void test_covariance_joint_large_group_bfgs_commit_and_default()
     assert(fields.at("group_bfgs_direction_source")=="UNIT_IDENTITY"&&fields.at("group_bfgs_group_0_update_status")=="SEEDED");
     assert(fields.at("bfgs_recent_pairs")=="1");
     assert(fields.at("last_joint_ray_attempt_status")=="NOT_USED_GROUP_BFGS");
+    assert(fields.at("inverse_bfgs_spectrum_snapshot")=="DIRECTION_BEFORE_STEP"&&fields.at("inverse_bfgs_spectrum_iteration")=="0");
+    assert(fields.at("run_trace_residual_original_any_checked")=="0"&&fields.at("run_trace_residual_worst_original_matrix_kind")=="NOT_CHECKED");
+    assert(std::isnan(std::stod(fields.at("run_trace_residual_worst_original_relative_residual"))));
+    assert(std::stod(fields.at("inverse_bfgs_spectrum_total_seconds"))>=std::stod(fields.at("inverse_bfgs_spectrum_seconds")));
   }
   {
     DeviceBaseline baseline;initialize_identity_covariance_baseline(baseline,n);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::ostringstream trace;
@@ -1493,6 +1497,9 @@ void test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_
 {
   DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
   const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  system.run_trace_residual_summary.failed_logical_batches=17;system.run_trace_residual_summary.worst_factor_relative_residual=123.0;
+  system.run_trace_residual_summary.worst_factor_matrix_kind="STALE";
+  system.run_trace_residual_summary.original_any_checked=true;system.run_trace_residual_summary.original_batches_checked=11;
   const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};std::ostringstream trace;
   const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,300,&trace);
   assert(fit.converged&&fit.status=="COVARIANCE_OPTIMIZER_CONVERGED"&&fit.iterations>0);
@@ -1520,6 +1527,42 @@ void test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_
   check_close(fit.start_gradient_data_scaled_inf_norm,covariance_norm_inf(covariance_scaled_gradient(start.gradient_data,fit.coordinate_scale)),1e-12);
   check_close(fit.start_gradient_prior_scaled_inf_norm,covariance_norm_inf(covariance_scaled_gradient(start.gradient_prior,fit.coordinate_scale)),1e-12);
   check_close(fit.start_gradient_barrier_scaled_inf_norm,covariance_norm_inf(covariance_scaled_gradient(start.gradient_barrier,fit.coordinate_scale)),1e-12);
+  assert(fit.inverse_bfgs_spectrum.status!="NOT_EVALUATED"&&fit.inverse_bfgs_spectrum.snapshot_stage=="DIRECTION_BEFORE_STEP"&&
+    fit.inverse_bfgs_spectrum.iteration>=0&&fit.inverse_bfgs_spectrum.iteration<fit.iterations);
+  assert(std::isfinite(fit.inverse_bfgs_spectrum.seconds)&&
+    fit.inverse_bfgs_spectrum_seconds>=fit.inverse_bfgs_spectrum.seconds);
+  assert(fit.run_trace_residual_summary.factor_batches_checked>0&&fit.run_trace_residual_summary.failed_logical_batches==0);
+  assert(fit.run_trace_residual_summary.original_batches_checked==0&&!fit.run_trace_residual_summary.original_any_checked);
+  assert(fit.run_trace_residual_summary.worst_factor_matrix_kind!="STALE"&&fit.run_trace_residual_summary.worst_factor_relative_residual<1.0);
+  const std::size_t first_spectrum=trace_text.find("COVARIANCE_BFGS_SPECTRUM snapshot=DIRECTION_BEFORE_STEP iteration=0");
+  assert(first_spectrum!=std::string::npos);
+  const std::string first_spectrum_line=trace_text.substr(first_spectrum,trace_text.find('\n',first_spectrum)-first_spectrum);
+  assert(first_spectrum_line.find("status=SPD_VERIFIED")!=std::string::npos&&first_spectrum_line.find("condition_number=1")!=std::string::npos);
+  assert(trace_text.find("inverse_bfgs_spectrum_total_seconds=")!=std::string::npos);
+  assert(trace_text.find("bfgs_secant_cosine=")!=std::string::npos);
+}
+
+void test_covariance_inverse_bfgs_spectrum_statuses()
+{
+  cusolverDnHandle_t solver=nullptr;assert(cusolverDnCreate(&solver)==CUSOLVER_STATUS_SUCCESS);
+  const auto spd=covariance_inverse_bfgs_spectrum(solver,{1e-80,0.0,0.0,0.0,2e-80,0.0,0.0,0.0,4e-80},3);
+  assert(spd.status=="SPD_VERIFIED"&&spd.matrix_scale==4e-80&&spd.condition_number>=3.999999999&&spd.condition_number<=4.000000001);
+  assert(spd.min_eigenvalue>0.0&&spd.max_eigenvalue>=spd.min_eigenvalue&&spd.relative_asymmetry==0.0);
+  assert(std::isfinite(spd.eigen_residual)&&spd.eigen_residual<=1e-8&&std::isfinite(spd.seconds));
+
+  const auto indefinite=covariance_inverse_bfgs_spectrum(solver,{1.0,0.0,0.0,0.0,-2.0,0.0,0.0,0.0,3.0},3);
+  assert(indefinite.status=="INDEFINITE"&&indefinite.min_eigenvalue<0.0&&std::isnan(indefinite.condition_number));
+  const auto singular=covariance_inverse_bfgs_spectrum(solver,{1.0,0.0,0.0,0.0,1e-17,0.0,0.0,0.0,2.0},3);
+  assert(singular.status=="UNRESOLVED_NEAR_SINGULAR"&&std::isnan(singular.condition_number));
+
+  const auto asymmetric=covariance_inverse_bfgs_spectrum(solver,{2.0,0.01,0.0,0.0,3.0,0.0,0.0,0.0,4.0},3);
+  assert(asymmetric.status=="UNVERIFIED_ASYMMETRY"&&asymmetric.relative_asymmetry>1e-8);
+  std::vector<double> over_cap(61*61,0.0);
+  assert(covariance_inverse_bfgs_spectrum(solver,over_cap,61).status=="NOT_EVALUATED_PARAMETER_COUNT");
+  over_cap[0]=std::numeric_limits<double>::quiet_NaN();bool nonfinite_failed=false;
+  try{(void)covariance_inverse_bfgs_spectrum(solver,over_cap,61);}catch(const std::runtime_error&){nonfinite_failed=true;}
+  assert(nonfinite_failed);
+  assert(cusolverDnDestroy(solver)==CUSOLVER_STATUS_SUCCESS);
 }
 
 void test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status()
@@ -1690,35 +1733,66 @@ void test_covariance_directional_overshoot_rejects_before_commit()
         [](const std::vector<double>&,std::uint64_t& evaluations){++evaluations;CovarianceObjectiveEvaluation value;
           value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-0.5;return value;},
         [wrong_dimension](CovarianceObjectiveEvaluation& value){value.gradient=wrong_dimension?std::vector<double>{1.0,2.0}:
-          std::vector<double>{std::numeric_limits<double>::quiet_NaN()};},nullptr,true,false,true);
+          std::vector<double>{std::numeric_limits<double>::quiet_NaN()};},nullptr,true,false);
     }catch(const std::exception&){propagated=true;}
     assert(propagated&&fatal.directional_overshoot_reject_trials==0&&fatal.failed_trial.failure_stage=="GRADIENT_SOLVE_FAIL");
     assert(fatal.iterations==0&&!fatal.last_valid.available&&fatal.theta.empty());
   }
 }
 
-void test_covariance_joint_bfgs_bounded_positive_slope()
+void test_covariance_joint_bfgs_rejects_positive_slope_and_uses_secant_shrink()
 {
   const std::vector<double> theta={0.0},z={0.0},scale={1.0},direction={1.0};
-  for(const double curvature:{1.4,1.5,1.8}){
+  for(const auto& item:std::vector<std::pair<double,double>>{{1.8,0.5}}){
     CovarianceFitResult fit;std::ostringstream trace;double evaluated_x=0.0;
     const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,10,fit,0,0.5,
       [&](const std::vector<double>& x,std::uint64_t& evaluations){++evaluations;evaluated_x=x[0];CovarianceObjectiveEvaluation value;
-        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.5*curvature*x[0]*x[0];return value;},
-      [&](CovarianceObjectiveEvaluation& value){value.gradient={-1.0+curvature*evaluated_x};},&trace,false,true,true);
+        value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=-x[0]+0.5*item.first*x[0]*x[0];return value;},
+      [&](CovarianceObjectiveEvaluation& value){value.gradient={-1.0+item.first*evaluated_x};},&trace,false,false,true);
     const std::string log=trace.str();
-    if(curvature==1.4){
-      assert(line.accepted&&line.trials==1&&line.alpha==1.0&&fit.directional_overshoot_reject_trials==0);
-      assert(log.find("candidate_directional_slope=0.4 status=DIRECTIONAL_ACCEPTED reason=BOUNDED_POSITIVE_SLOPE absolute_slope_ratio=0.4")!=std::string::npos);
-    }else if(curvature==1.5){
-      assert(line.accepted&&line.trials==1&&line.alpha==1.0&&fit.directional_overshoot_reject_trials==0);
-      assert(log.find("candidate_directional_slope=0.5 status=DIRECTIONAL_ACCEPTED reason=BOUNDED_POSITIVE_SLOPE absolute_slope_ratio=0.5")!=std::string::npos);
-    }else{
-      assert(line.accepted&&line.trials==2&&line.alpha==0.5&&fit.directional_overshoot_reject_trials==1);
-      assert(log.find("candidate_directional_slope=0.8 status=DIRECTIONAL_OVERSHOOT_REJECT reason=POSITIVE_SLOPE_TOO_LARGE absolute_slope_ratio=0.8")!=std::string::npos);
-      assert(log.find("source=DIRECTIONAL_SECANT proposed_alpha=0.5 shrink_ratio=0.5")!=std::string::npos);
-    }
+    assert(line.accepted&&line.trials==2&&line.alpha==item.second&&fit.directional_overshoot_reject_trials==1);
+    assert(log.find("status=DIRECTIONAL_OVERSHOOT_REJECT reason=POSITIVE_SLOPE_NOT_ALLOWED")!=std::string::npos);
+    std::ostringstream expected_proposal;expected_proposal<<"source=DIRECTIONAL_SECANT proposed_alpha="<<item.second<<" shrink_ratio="<<item.second;
+    assert(log.find(expected_proposal.str())!=std::string::npos);
+    assert(log.find("status=DIRECTIONAL_ACCEPTED reason=NONPOSITIVE_SLOPE")!=std::string::npos);
   }
+}
+
+void test_covariance_joint_logdet_target_rejects_positive_slopes()
+{
+  const std::vector<double> theta={0.0,0.0},z=theta,scale={1.0,1.0},direction={1.0,0.001};
+  auto terms=[](const std::vector<double>& point){
+    const double a=0.01+point[0]+point[1],b=0.1*point[1],c=1.0+point[0]+100.0*point[1];
+    const double da=a+0.1,dc=c+0.1,det_s=a*c-b*b,det_d=da*dc-b*b;
+    return std::array<double,7>{a,b,c,det_s,det_d,da,dc};
+  };
+  auto objective=[&](const std::vector<double>& point){const auto m=terms(point);
+    if(!(m[0]>0.0&&m[5]>0.0&&m[3]>0.0&&m[4]>0.0))return std::numeric_limits<double>::infinity();
+    return 10.0*point[0]+20.0*point[1]-0.55*std::log(m[4])-std::log(m[3]);};
+  auto gradient=[&](const std::vector<double>& point){const auto m=terms(point);
+    const double tr_d0=(m[5]+m[6])/m[4],tr_s0=(m[0]+m[2])/m[3];
+    const double tr_d1=(m[6]+100.0*m[5]-0.2*m[1])/m[4],tr_s1=(m[2]+100.0*m[0]-0.2*m[1])/m[3];
+    return std::vector<double>{10.0-0.55*tr_d0-tr_s0,20.0-0.55*tr_d1-tr_s1};
+  };
+  const double slope=covariance_dot(gradient(theta),direction),h=1e-6;
+  std::vector<double> plus=theta,minus=theta;for(std::size_t i=0;i<plus.size();++i){plus[i]=h*direction[i];minus[i]=-h*direction[i];}
+  assert(std::abs((objective(plus)-objective(minus))/(2.0*h)-slope)<1e-8*std::abs(slope));
+  check_close(slope,-96.735,1e-12);
+
+  CovarianceFitResult fit;std::ostringstream trace;std::vector<double> evaluated;
+  const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,objective(theta),slope,1.0,1.0,16,fit,0,0.5,
+    [&](const std::vector<double>& point,std::uint64_t& evaluations){++evaluations;evaluated=point;CovarianceObjectiveEvaluation value;
+      value.feasible=true;value.status=CovarianceObjectiveStatus::Feasible;value.objective=objective(point);return value;},
+    [&](CovarianceObjectiveEvaluation& value){value.gradient=gradient(evaluated);},&trace,true,false,true);
+  assert(line.accepted&&line.trials==4&&line.alpha==0.125&&fit.directional_overshoot_reject_trials==2);
+  const std::string log=trace.str();
+  std::istringstream lines(log);std::string line_text;std::vector<double> candidate_slopes;
+  while(std::getline(lines,line_text)){const std::string key="candidate_directional_slope=";const std::size_t position=line_text.find(key);
+    if(position!=std::string::npos)candidate_slopes.push_back(std::stod(line_text.substr(position+key.size())));}
+  assert(candidate_slopes.size()==3&&candidate_slopes[0]>6.0&&candidate_slopes[0]<6.2&&candidate_slopes[1]>3.2&&candidate_slopes[1]<3.5&&
+    candidate_slopes[2]<0.0&&candidate_slopes[2]>-1.3);
+  assert(log.find("source=DIRECTIONAL_SECANT proposed_alpha=0.25 shrink_ratio=0.5")!=std::string::npos);
+  assert(log.find("source=DIRECTIONAL_SECANT proposed_alpha=0.125 shrink_ratio=0.5")!=std::string::npos);
 }
 
 void test_covariance_gradient_residual_budget_keeps_last_valid_and_reject()
@@ -1732,7 +1806,7 @@ void test_covariance_gradient_residual_budget_keeps_last_valid_and_reject()
   auto complete=[&](CovarianceObjectiveEvaluation& value){value.gradient={456.0};value.gradient_prior={456.0};CovarianceTraceDiagnostics diagnostic;
     diagnostic.matrix_kind="D_MINUS_EPSILON_I";diagnostic.status="RESIDUAL_FAIL";diagnostic.first_failure_batch_start=16*objective_calls;
     diagnostic.first_failure_columns=16;diagnostic.worst_factor_solve_relative_residual=4e-7;throw CovarianceSolveResidualError(diagnostic);};
-  const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,3,fit,0,0.5,evaluate,complete,&trace,true,false,true);
+  const CovarianceBacktrackingResult line=covariance_backtrack_armijo(theta,z,scale,direction,0.0,-1.0,1.0,1.0,3,fit,0,0.5,evaluate,complete,&trace,true,false);
   assert(!line.accepted&&!line.step_underflow&&line.evaluation_budget_exhausted&&line.trials==3);
   assert(objective_calls==3&&fit.objective_evaluations==3&&fit.gradient_residual_reject_trials==3);
   assert(!fit.converged&&fit.theta==theta&&fit.iterations==0&&fit.last_valid.theta==theta&&bfgs.inverse_hessian==initial_hessian);
@@ -2490,15 +2564,39 @@ void test_covariance_strict_residual_failure_updates_overall_worst()
 {
   DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
   const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
-  const std::vector<double> zero_theta(6,0.0);system.assemble(zero_theta);double logdet=0.0;assert(system.factor(system.compact,logdet));
+  const std::vector<double> zero_theta(6,0.0);system.assemble(zero_theta);double logdet=0.0,shifted_logdet=0.0;assert(system.factor(system.compact,logdet));
   std::vector<double> matrix(36);assert(cudaMemcpy(matrix.data(),system.full,matrix.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
   matrix[1*6+1]+=0.5;assert(cudaMemcpy(system.full,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
   (void)system.trace_derivatives(system.compact,"D",0.0,false,true);
   assert(system.last_d_trace.status=="PASS"&&!system.last_d_trace.original_residual_checked);
-  bool failed=false;try{(void)system.trace_derivatives(system.compact,"D",0.0,true,true);}catch(const std::runtime_error&){failed=true;}
+  bool failed=false;try{(void)system.trace_derivatives(system.compact,"D",0.0,true,true);}
+  catch(const CovarianceSolveResidualError& error){failed=error.d_trace.status=="RESIDUAL_FAIL"&&error.d_trace.original_residual_checked;}
   assert(failed&&system.last_d_trace.status=="RESIDUAL_FAIL");
   assert(system.last_d_trace.worst_original_solve_relative_residual>1e-7);
   check_close(system.worst_solve_relative_residual,system.last_d_trace.worst_original_solve_relative_residual,1e-15);
+  const double original_run_worst=system.run_trace_residual_summary.worst_original_relative_residual;
+  assert(system.run_trace_residual_summary.original_any_checked&&system.run_trace_residual_summary.original_batches_checked==1);
+  assert(system.run_trace_residual_summary.failed_logical_batches==1&&system.run_trace_residual_summary.first_failure_matrix_kind=="D");
+  assert(system.run_trace_residual_summary.first_failure_channel=="ORIGINAL"&&system.run_trace_residual_summary.first_failure_batch_start==0);
+
+  system.assemble(zero_theta);assert(system.factor(system.compact,logdet));
+  covariance_fit_test_hooks.trace_solution_failure_column=0;covariance_fit_test_hooks.trace_solution_failure_delta=1e-4;
+  assert(system.evaluate_factors(zero_theta,1e-6,logdet,shifted_logdet,nullptr,nullptr));
+  bool shifted_failed=false;try{(void)system.trace_derivatives(system.shifted,"D_MINUS_EPSILON_I",1e-6,false,true);}
+  catch(const CovarianceSolveResidualError&){shifted_failed=true;}
+  covariance_fit_test_hooks.trace_solution_failure_column=-1;
+  assert(shifted_failed&&system.run_trace_residual_summary.failed_logical_batches==2);
+  assert(system.run_trace_residual_summary.worst_factor_matrix_kind=="D_MINUS_EPSILON_I");
+  assert(system.run_trace_residual_summary.worst_factor_batch_start==0&&system.run_trace_residual_summary.worst_factor_relative_residual>1e-7);
+
+  std::vector<double> trace,shifted_trace;
+  assert(system.evaluate_factors(zero_theta,1e-6,logdet,shifted_logdet,&trace,&shifted_trace,false,true));
+  CovarianceBaseline reference;reference.trace=trace;CovarianceObjectiveEvaluation candidate;
+  complete_covariance_fit_gradient_from_factors(system,candidate,reference,trace,0.5,0.1);
+  assert(system.worst_solve_relative_residual<1e-7);
+  assert(system.run_trace_residual_summary.failed_logical_batches==2&&
+    system.run_trace_residual_summary.first_failure_matrix_kind=="D"&&system.run_trace_residual_summary.first_failure_channel=="ORIGINAL");
+  check_close(system.run_trace_residual_summary.worst_original_relative_residual,original_run_worst,1e-15);
 }
 
 void test_covariance_saved_gradient_does_not_require_baseline_shifted_solve()
@@ -3666,13 +3764,15 @@ int main()
   test_covariance_force_residual_uses_training_frames_only();
   test_covariance_baseline_brackets_both_signs_and_zero();
   test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_solution();
+  test_covariance_inverse_bfgs_spectrum_statuses();
   test_covariance_block_newton_optimizer_direction_trace();
   test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status();
   test_covariance_initialization_shrinks_before_expanding();
   test_covariance_initialization_reports_no_improvement_at_budget();
   test_covariance_gradient_residual_reject_retries_before_commit();
   test_covariance_directional_overshoot_rejects_before_commit();
-  test_covariance_joint_bfgs_bounded_positive_slope();
+  test_covariance_joint_bfgs_rejects_positive_slope_and_uses_secant_shrink();
+  test_covariance_joint_logdet_target_rejects_positive_slopes();
   test_covariance_gradient_residual_budget_keeps_last_valid_and_reject();
   test_covariance_armijo_bounded_expansion_preserves_last_valid_candidate();
   test_covariance_bfgs_first_secant_seeds_and_updates_inverse_hessian();

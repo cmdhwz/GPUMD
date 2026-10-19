@@ -54,6 +54,31 @@ conditional solve checks and extra cost. Older saved states/traces may not
 contain those fields; NOT_STORED is missing evidence, not zero curvature or
 optimizer failure.
 
+The global parameter-space inverse-BFGS spectrum is recorded at the
+``DIRECTION_BEFORE_STEP`` snapshot after any non-descent reset, with iteration
+and tau. The scaled, symmetrized eigensolve reports matrix scale, asymmetry,
+eigen residual, diagnostic time, and whether SPD is reliably verified,
+indefinite, unresolved near singular, or otherwise unverified. A tiny positive
+minimum eigenvalue inside the residual/roundoff uncertainty is unresolved, not
+SPD; a condition number is reported only for a reliable positive spectrum.
+This is read-only optimizer telemetry: it is not a direction gate, reset rule,
+physical Hessian, or material solve. Committed-step ``bfgs_sy``, the existing
+``bfgs_s_norm2`` and ``bfgs_y_norm2`` values (s^T s and y^T y),
+and ``bfgs_secant_cosine`` report curvature and normalized secant quality.
+
+The legacy ``worst_solve_relative_residual`` remains scoped to the latest
+gradient/trace evaluation. Separate ``trace_residual_*`` summary fields retain
+the run-wide factor and checked-original maxima and their matrix kind/batch,
+checked-batch counts, failed logical-batch count, original-check status, and
+first failure matrix kind/batch/channel. The run summary is reset once at
+optimizer entry, includes baseline and initialization gradients and rejected
+trace batches, and excludes probe solves. If original residuals were never
+checked, the summary has ``original_any_checked=0``, matrix kind
+``NOT_CHECKED``, and NaN residual, not a zero-valued pass. State and fit files
+use the ``run_trace_residual_*`` prefix; the trace's optimizer-summary line
+uses ``trace_residual_*``. Parameter counts above 60 report
+``NOT_EVALUATED_PARAMETER_COUNT`` without an eigensolve.
+
 The ``joint_block`` optimizer records ``bfgs_recent_pairs`` and rebuilds the
 shared global inverse Hessian after every committed full-gradient step from
 the newest ``gamma = sTy / yTy`` identity background, then replays up to eight
@@ -124,11 +149,15 @@ python3 <worktree>/tools/rpmd_ja_pair_diagnostic.py ja_reference_sample100ps.bin
 Paths in the state file must resolve in the material directory. Existing
 reports are not overwritten. Run diagnostic commands without a new PIMD
 sampling trajectory; do not reuse a stale gpumd binary for the CUDA report.
-After the CUDA regression passes, run a 10-step A/B using the same fixed
-sample, qraw, rho, tau schedule, cutoff and response threshold; vary only the
-output path, iteration budget and opt-in token. The full-gradient KKT
-threshold remains 1e-6, and need not decrease monotonically at every step.
-Use distinct outputs:
+After the CUDA regression passes, run a 10-step server comparison using the
+same fixed sample and qraw, positive ``rho``, epsilon, internally fixed tau
+schedule, cutoff, kernel table, response threshold, finite-difference step,
+training split, and all reference acceptance gates. Vary only the output path,
+iteration budget and opt-in direction token. Keep the full-gradient KKT
+threshold at ``1e-6``; KKT need not decrease monotonically at every step. Do
+not weaken held-out response or final stored-D SPD/package gates. IBP remains
+a diagnostic and is not a ``REFERENCE_WRITTEN`` gate. Keep its threshold and
+reporting policy unchanged as well. Use distinct outputs:
 
 ```text
 rpmd_ja fit_samples_covariance <same_samples> ja_cov_bfgs10.bin <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <same_qraw> shrinkage <same_rho> max_iter 10
@@ -158,17 +187,16 @@ finite direction or representability failure falls back to global BFGS. For
 objective-only expansion proposes alpha values up to 4, then evaluates a full
 gradient at the selected point's factors. A failed or worse expansion
 re-evaluates the best objective-pass point before its gradient; objective-only
-proposals are never committed. After the full-gradient residual gate, joint
-``GROUP_BFGS`` and global ``BFGS`` directions accept nonpositive candidate
-slopes and positive slopes up to half the magnitude of the initial descent
-slope. Larger positive slopes are rejected; directional secant backtracking
-is bounded to ``[0.1 alpha, 0.5 alpha]`` and falls back to halving if invalid.
-The trace records the directional reason, absolute slope ratio, and actual
-shrink ratio. This bounded rule is separate from objective-only expansion and
-is not a full strong-Wolfe line search. Default BFGS, legacy ``block_newton``,
-and small-support spectral ``JOINT_BLOCK`` directions continue to reject every
-positive slope and halve. The new trial point still needs its own full gradient
-and all commit gates before it can be committed. The group direction uses no extra covariance
+proposals are never committed. After a full validated candidate gradient,
+every positive directional slope is rejected. Joint
+``GROUP_BFGS`` and global ``BFGS`` directions alone use a directional-secant
+proposal for the next trial, clamped to ``[0.1 alpha, 0.5 alpha]``; an invalid
+proposal falls back to halving. Default BFGS, legacy ``block_newton``, and
+small-support spectral ``JOINT_BLOCK`` directions retain legacy halving.
+The trace records rejection reason, absolute slope ratio, and actual shrink
+ratio. This proposal is not a full strong-Wolfe line search. The next trial
+still needs its own full gradient and all commit gates before it can be
+committed. The group direction uses no extra covariance
 factors, RHS columns, or joint ray proposal, and its approximate model is
 reported as unavailable. ``line_search_evaluations`` and
 ``line_search_objective_seconds`` cover line-search objective evaluations and

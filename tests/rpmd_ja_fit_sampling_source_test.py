@@ -271,7 +271,10 @@ assert "gradient_residual_reject_trials" in backtracking and "evaluation_budget_
 assert 'failure_stage="GRADIENT_RESIDUAL_REJECT"' in backtracking and 'failure_stage="GRADIENT_SOLVE_FAIL"' in backtracking
 assert "catch(...)" in backtracking and "throw;" in backtracking
 assert backtracking.index('trial_status="ARMIJO_ACCEPTED"') < backtracking.index("complete_gradient(result.next)") < backtracking.index("result.accepted=true")
-assert "const bool allow_expansion=true,const bool objective_only_expansion=false,const bool allow_bounded_positive_slope=false" in backtracking
+assert "const bool joint_bfgs_directional_secant=false" in backtracking
+assert "allow_bounded_positive_slope" not in native_fit
+assert "const bool directional_overshoot=candidate_slope>0.0" in backtracking
+assert 'candidate_slope<=0.0?"NONPOSITIVE_SLOPE":"POSITIVE_SLOPE_NOT_ALLOWED"' in backtracking
 assert "objective_expansion=objective_only_expansion&&allow_expansion&&initial_alpha==1.0" in backtracking
 assert "if(!objective_only_expansion&&allow_expansion&&initial_alpha==1.0" in backtracking
 assert "proposal_objective" in backtracking and "objective_only=1" in backtracking
@@ -304,11 +307,11 @@ assert "const CovarianceBFGSUpdateStatus bfgs_update=joint_block?" in covariance
 assert '" bfgs_history_mode="<<(joint_block?"RECENT_REPLAY":"STANDARD")' in covariance_optimizer
 assert "if(joint_block&&!dominant_cap_path)bfgs.recent_secants.clear()" not in covariance_optimizer
 assert 'shrink_source="DIRECTIONAL_SECANT"' in native_fit
-assert "std::min((allow_bounded_positive_slope?0.5:0.9)*alpha,proposed)" in native_fit
+assert "std::min((joint_bfgs_directional_secant?0.5:0.9)*alpha,proposed)" in native_fit
 assert 'const bool joint_bfgs_line_search=joint_block&&(choice.method=="BFGS"||choice.method=="GROUP_BFGS")' in covariance_optimizer
-assert "joint_bfgs_line_search,joint_bfgs_line_search" in covariance_optimizer
+assert "joint_bfgs_line_search,joint_bfgs_line_search);" in covariance_optimizer
 overshoot_backtrack = backtracking.split("if(directional_overshoot)", 1)[1].split("have_valid_candidate=true", 1)[0]
-assert "if(objective_only_expansion)" in overshoot_backtrack and "COVARIANCE_OVERSHOOT_BACKTRACK" in overshoot_backtrack
+assert "if(joint_bfgs_directional_secant||objective_only_expansion)" in overshoot_backtrack and "COVARIANCE_OVERSHOOT_BACKTRACK" in overshoot_backtrack
 assert "alpha*=0.5" not in overshoot_backtrack
 curvature = 2.0 / 7.0
 alpha = 4.0
@@ -319,9 +322,9 @@ assert isfinite(proposal) and isclose(proposal, 3.5, rel_tol=0.0, abs_tol=1e-14)
 assert 0.1 * alpha <= proposal <= 0.9 * alpha
 legacy_proposal = max(0.1 * alpha, min(0.9 * alpha, proposal))
 assert isclose(legacy_proposal, 3.5, rel_tol=0.0, abs_tol=1e-14)
-bounded_proposal = max(0.1 * alpha, min(0.5 * alpha, proposal))
-assert isclose(bounded_proposal, 2.0, rel_tol=0.0, abs_tol=1e-14)
-assert isclose(-bounded_proposal + 0.5 * curvature * bounded_proposal * bounded_proposal, -1.4285714285714286, rel_tol=0.0, abs_tol=1e-14)
+joint_secant_proposal = max(0.1 * alpha, min(0.5 * alpha, proposal))
+assert isclose(joint_secant_proposal, 2.0, rel_tol=0.0, abs_tol=1e-14)
+assert isclose(-1.0 + curvature * joint_secant_proposal, -3.0 / 7.0, rel_tol=0.0, abs_tol=1e-14)
 quadratic = [[4.0, 1.0], [1.0, 3.0]]
 steps = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 secants = [(step, tuple(sum(quadratic[i][j] * step[j] for j in range(2)) for i in range(2))) for step in steps]
@@ -338,8 +341,26 @@ latest_change = secants[-1][1]
 assert isclose(sum(inverse[0][j] * latest_change[j] for j in range(2)), 0.0, abs_tol=1e-14)
 assert isclose(sum(inverse[1][j] * latest_change[j] for j in range(2)), 1.0, abs_tol=1e-14)
 assert "test_covariance_recent_bfgs_replays_latest_gamma_and_bounds_history" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
-assert "test_covariance_joint_bfgs_bounded_positive_slope" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_joint_bfgs_rejects_positive_slope_and_uses_secant_shrink" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_covariance_joint_logdet_target_rejects_positive_slopes" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_objective_only_overshoot_uses_directional_secant" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "CovarianceBFGSSpectrumDiagnostic covariance_inverse_bfgs_spectrum" in native_fit
+assert "covariance_symmetric_eigen_residual(symmetrized,eigen,n)" in native_fit
+assert 'snapshot_stage="DIRECTION_BEFORE_STEP"' in native_fit
+assert "SPD_VERIFIED" in native_fit and "UNRESOLVED_NEAR_SINGULAR" in native_fit and "eigen_residual" in native_fit
+assert "CovarianceRunTraceResidualSummary" in native_fit and "covariance_accumulate_run_trace_residual" in trace_body
+assert trace_body.index("covariance_accumulate_run_trace_residual") < trace_body.index("if(!batch_valid&&strict)throw CovarianceSolveResidualError")
+assert "system.run_trace_residual_summary=CovarianceRunTraceResidualSummary{};" in covariance_optimizer
+assert "result.run_trace_residual_summary=system.run_trace_residual_summary;" in covariance_optimizer
+assert "trace_residual_summary" in native_fit and "original_any_checked" in native_fit
+assert "run_trace_residual_summary" in native_fit and "worst_factor_batch_start" in native_fit
+assert 'write_covariance_run_trace_residual_summary(out,fit.run_trace_residual_summary' in native_fit
+assert 'write_covariance_bfgs_spectrum_diagnostic(out,fit.inverse_bfgs_spectrum' in native_fit
+assert "inverse_bfgs_spectrum_seconds+=result.inverse_bfgs_spectrum.seconds" in native_fit
+assert "inverse_bfgs_spectrum_total_seconds" in native_fit
+assert "original_batches_checked" in native_fit and "first_failure_channel" in native_fit
+assert "bfgs_secant_cosine" in native_fit and "bfgs_s_norm2" in native_fit and "bfgs_y_norm2" in native_fit
+assert "&trace,true,false,true" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 non_descent_branch = covariance_optimizer.split("if(!(bfgs_slope<0.0))", 1)[1].split("const double direction_inf_norm", 1)[0]
 assert "covariance_reset_non_descent_direction(bfgs,g,bfgs_direction)" in non_descent_branch
 assert "CovarianceFitTestHooks" in native_fit and "gradient_residual_failures_remaining" in native_fit
