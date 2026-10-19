@@ -70,9 +70,12 @@ The native ``rpmd_ja fit_samples`` route produces a ``finite_temperature_additiv
 
 The separate offline ``fit_samples_covariance`` route reuses the same ``GPJASMP1`` samples, matching qraw, local additive package, ``prepare`` call, and ``J_A`` measurement chain. Its command is::
 
-  rpmd_ja fit_samples_covariance <samples> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block]
+  rpmd_ja fit_samples_covariance <samples> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier]
 
-Without the final token, covariance fitting keeps its BFGS direction. The
+The two optional tokens can appear in either order. At most one step mode may
+be supplied. ``staged_barrier`` is independent of the step mode.
+
+Without a step-mode token, covariance fitting keeps its BFGS direction. The
 ``block_newton`` token preserves the legacy direction: it replaces the six
 coordinates of the parameter group containing the largest absolute
 scaled-gradient component when that group's support is at most 32 atoms and its
@@ -92,6 +95,30 @@ curvature-valid committed pure-group secant. Joint and mixed-group steps do
 not update these histories. If a finite descent direction or representable
 step is unavailable, the optimizer falls back to global BFGS; non-finite and
 CUDA failures remain fatal.
+
+The opt-in ``trust_region`` token solves the quadratic subproblem over all
+scaled parameters using the inverse-BFGS matrix as the inverse model. It checks
+that matrix for positive definiteness and resets the scale model to a positive
+identity if the spectrum is not reliable. Candidate acceptance uses actual
+over predicted reduction; a rejected candidate shrinks the radius and resolves
+the subproblem below the rejected step. The actual scaled step is reconstructed
+from the rounded parameters and must fit inside the radius. A full candidate
+gradient is evaluated only after the objective ratio passes, and the point is
+committed only after the gradient solve passes. Actual objective changes use
+paired log ratios from the retained Cholesky diagonals and a local arithmetic
+resolution bound for those stored factors and weighted parameter terms; this
+bound does not certify Cholesky accuracy. If the model decrease is resolved but
+the actual change is not, the trial is rejected and the radius is reduced for a
+retry. ``NUMERICAL_STAGNATION`` is reserved for an unresolved model decrease.
+
+Without ``staged_barrier``, every barrier stage keeps the existing scaled-KKT
+gate of ``1e-6``. With it, intermediate stages use
+``max(1e-6, 1e-2 * tau)``; the final stage still requires ``1e-6`` and the
+existing small-barrier condition. The ``tau`` reduction remains a factor of
+``0.2``. The fit trace reports per-group ``xx+yy+zz`` prior-mixing diagnostics
+and contiguous training-block statistics about the same fixed training ``R0``.
+The reported block spread is diagnostic only, not a confidence interval, and
+the program keeps the positive ``rho`` supplied by the command.
 
 Whenever ``joint_block`` is enabled, the shared full-parameter history retains
 at most eight recent curvature-valid committed secants from pure
@@ -141,9 +168,13 @@ proposals alone never satisfy commit gates.
 ``line_search_evaluations`` and ``line_search_objective_seconds`` cover
 line-search objective evaluations and time, including re-evaluations after a
 failed or worse expansion. ``line_search_gradient_calls`` and
-``line_search_gradient_seconds`` cover complete-gradient backtracking work;
-baseline, initialization, and tau-stage gradients are excluded. Group BFGS does
-not use the joint ray proposal and reports its approximate model as unavailable.
+``line_search_gradient_seconds`` cover candidate full-gradient work, including
+residual-rejected candidates. ``initialization_gradient_calls`` counts the
+initial or selected-start gradient, and ``full_gradient_evaluations`` is the sum
+of those initialization and candidate calls. Tau-stage cache recomposition does
+not count as a new gradient evaluation. ``trace_solve_calls`` remains reported
+separately. Group BFGS does not use the joint ray proposal and reports its
+approximate model as unavailable.
 All modes retain the existing full-gradient residual, Armijo, KKT, held-out
 response, and final SPD acceptance gates; the BFGS spectrum and secant
 diagnostics do not alter any gate or optimizer state.

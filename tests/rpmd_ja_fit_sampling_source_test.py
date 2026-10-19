@@ -182,15 +182,15 @@ assert "max_rounds <N>" in fit_samples_parser and "[<qraw>] [max_rounds <N>]" in
 assert 'if (tokens[1] == "fit_samples_covariance")' in run
 assert 'if (tokens[1] == "diagnose_covariance")' in run
 assert 'diagnose_rpmd_ja_native_covariance(tokens[2], tokens[3]' in run
-assert '(tokens.size() != 14 && tokens.size() != 15)' in run and 'tokens[14] != "block_newton"' in run
-assert 'options.covariance_block_newton = tokens.size() == 15 && tokens[14] == "block_newton";' in run
-assert 'options.covariance_joint_block = tokens.size() == 15 && tokens[14] == "joint_block";' in run
+assert 'tokens.size() < 14 || tokens.size() > 16' in run
+assert 'tokens[token] == "trust_region"' in run and 'tokens[token] == "staged_barrier"' in run
+assert 'fit_samples_covariance step modes are mutually exclusive' in run
 assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
 assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
 assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
 assert "const double components[6]={dx[0]*dx[0],2.0*dx[0]*dx[1]" in native_fit
-assert "if(edge_sums){const double components[6]" in native_fit
-assert "sums[p+k]+=components[k];(*edge_sums)[6*e+k]+=components[k]" in native_fit
+assert "if(edge_sums)(*edge_sums)[6*e+k]+=components[k];if(block_sums)(*block_sums)[p+k]+=components[k]" in native_fit
+assert "sums[p+k]+=components[k]" in native_fit and "block_count_frames[index]" in native_fit
 assert "build_graph_covariance_baseline" in native_fit and "D_b-epsilon I positive definite" in native_fit
 assert "covariance_decompose_gradient" in native_fit and "gradient_data" in native_fit and "gradient_barrier" in native_fit
 assert "covariance_gather_original_solve_residual" in native_fit and "cublasDgemm" in native_fit
@@ -299,13 +299,23 @@ assert "gradient_residual_reject_trials" in native_fit
 assert "STEP_COMMITTED" in native_fit and "GRADIENT_RESIDUAL_REJECT" in native_fit
 assert "GRADIENT_RESIDUAL_REJECT" in rpmd_ja_doc and "bfgs_seed_gamma" in rpmd_ja_doc
 covariance_optimizer = native_fit.split("CovarianceFitResult solve_covariance_reference(", 1)[1].split("void write_covariance_state", 1)[0]
-assert covariance_optimizer.index("covariance_backtrack_armijo(") < covariance_optimizer.index("if(!accepted)")
-assert covariance_optimizer.index("if(!accepted)") < covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=joint_block?")
-assert "covariance_update_recent_inverse_hessian(bfgs,step,change)" in covariance_optimizer
-assert covariance_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=joint_block?") < covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('"STEP_COMMITTED iteration="')
-assert "const CovarianceBFGSUpdateStatus bfgs_update=joint_block?" in covariance_optimizer
-assert '" bfgs_history_mode="<<(joint_block?"RECENT_REPLAY":"STANDARD")' in covariance_optimizer
-assert "if(joint_block&&!dominant_cap_path)bfgs.recent_secants.clear()" not in covariance_optimizer
+legacy_optimizer = covariance_optimizer.split('if(trust_region){', 1)[1].split('if(joint_block){result.joint_ray_attempt', 1)[1]
+trust_optimizer = covariance_optimizer.split('if(trust_region){\n        const int iteration', 1)[1].split('if(joint_block){result.joint_ray_attempt', 1)[0]
+assert legacy_optimizer.index("covariance_backtrack_armijo(") < legacy_optimizer.index("if(!accepted)")
+assert legacy_optimizer.index("if(!accepted)") < legacy_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=joint_block?")
+assert "covariance_update_recent_inverse_hessian(bfgs,step,change)" in legacy_optimizer
+assert legacy_optimizer.index("const CovarianceBFGSUpdateStatus bfgs_update=joint_block?") < legacy_optimizer.index("z=std::move(next_z)") < legacy_optimizer.index('"STEP_COMMITTED iteration="')
+assert "const CovarianceBFGSUpdateStatus bfgs_update=joint_block?" in legacy_optimizer
+assert '" bfgs_history_mode="<<(joint_block?"RECENT_REPLAY":"STANDARD")' in legacy_optimizer
+assert "if(joint_block&&!dominant_cap_path)bfgs.recent_secants.clear()" not in legacy_optimizer
+assert "covariance_trust_region_model(system.solver,bfgs.inverse_hessian" in trust_optimizer
+assert "covariance_trust_region_subproblem(model,g,radius)" in trust_optimizer
+assert trust_optimizer.index('covariance_trust_region_trial_decision(') < trust_optimizer.index('complete_covariance_fit_gradient_from_factors') < trust_optimizer.index('covariance_update_inverse_hessian(bfgs,step,change)') < trust_optimizer.index('capture_covariance_snapshot') < trust_optimizer.index('z=std::move(next_z)')
+assert 'CovarianceTrustRegionTrialDisposition::UnresolvedActual' in trust_optimizer and 'ACTUAL_UNRESOLVED_REJECT' in trust_optimizer
+assert trust_optimizer.index('decision.disposition==CovarianceTrustRegionTrialDisposition::UnresolvedActual') < trust_optimizer.index('record_covariance_failed_trial')
+assert 'covariance_trust_region_objective_change(current,candidate' in trust_optimizer
+assert "trust_radius*=0.5" in trust_optimizer and "trust_region_radius_resolves" in trust_optimizer
+assert "covariance_backtrack_armijo" not in trust_optimizer
 assert 'shrink_source="DIRECTIONAL_SECANT"' in native_fit
 assert "std::min((joint_bfgs_directional_secant?0.5:0.9)*alpha,proposed)" in native_fit
 assert 'const bool joint_bfgs_line_search=joint_block&&(choice.method=="BFGS"||choice.method=="GROUP_BFGS")' in covariance_optimizer
@@ -707,8 +717,9 @@ check_multicell_mic([[4.0, 0.7, -0.3], [0.0, 3.5, 0.4], [0.2, 0.0, 5.0]],
                     [0.15, 0.2, -0.3], [-3.0, 4.0, 2.0])
 
 assert "bool covariance_block_newton = false;" in native_header
-assert "fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block]." in run
-assert "options.max_covariance_iterations,&trace,options.covariance_block_newton,options.covariance_joint_block" in native_fit
+assert "fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier]." in run
+assert "options.max_covariance_iterations,&trace,options.covariance_block_newton,options.covariance_joint_block," in native_fit
+assert "options.covariance_trust_region,options.covariance_staged_barrier" in native_fit
 assert "COVARIANCE_DIRECTION_MODE block_newton=" in native_fit
 assert 'result.method="HYBRID"' in native_fit and 'result.method="BLOCK"' in native_fit and 'method="BFGS"' in native_fit
 assert "block_newton_factorizations" in native_fit and "block_newton_rhs_columns" in native_fit and "block_newton_seconds" in native_fit
@@ -731,7 +742,8 @@ assert "covariance_preflight_block_direction" in cuda_test and "BLOCK_STEP_UNREP
 assert "for(const bool block_newton:{false,true})" in cuda_test
 assert "physical_rhs(6,std::vector<double>(6,0.0))" in cuda_test
 assert "bool covariance_joint_block = false;" in native_header
-assert "[block_newton|joint_block]" in run
+assert "bool covariance_trust_region = false;" in native_header and "bool covariance_staged_barrier = false;" in native_header
+assert "[block_newton|joint_block|trust_region] [staged_barrier]" in run
 assert "options.covariance_joint_block" in run and "options.covariance_block_newton" in run
 assert "covariance_joint_group_hessian" in native_fit and "covariance_select_joint_groups" in native_fit
 assert 'result.status="DOMINANT_EMPTY_GROUP"' in native_fit
@@ -741,11 +753,35 @@ assert "dominant_support=\"<<joint_selection.dominant_group_support" in native_f
 assert "result.direction_group_support=joint_block?joint_selection.dominant_group_support:support_count;" in native_fit
 assert "for(const int atom:joint_selection.atoms)*trace" in native_fit
 assert "joint covariance attribution contains non-finite values" in native_fit
-assert native_fit.count('optimizer_step_mode "<<(covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")') == 2
+assert native_fit.count('optimizer_step_mode "<<(covariance_fit.trust_region_enabled?"TRUST_REGION_OPT_IN":covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")') == 2
 assert "\\njoint_block_factorizations \"<<covariance_fit.joint_block_factorizations" in native_fit
-assert '"\\noptimizer_step_mode "<<(covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")' in native_fit
+assert '"\\noptimizer_step_mode "<<(covariance_fit.trust_region_enabled?"TRUST_REGION_OPT_IN":covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")' in native_fit
 assert "test_covariance_joint_block_includes_cross_group_hessian" in cuda_test
 assert "test_covariance_joint_block_commit_attribution_is_transactional" in cuda_test
+assert "test_covariance_trust_region_subproblem_and_barrier_cache" in cuda_test
+assert "test_covariance_trust_region_residual_rejection_is_transactional" in cuda_test
+assert "test_covariance_trust_region_staged_barrier_harmonic_solve" in cuda_test
+assert "subnormal_oracle=-726.4715666914936" in cuda_test and "subnormal_ratio<std::numeric_limits<double>::min()" in cuda_test
+assert "subnormal_uphill.disposition==CovarianceTrustRegionTrialDisposition::PoorRatio" in cuda_test
+assert "std::isnormal(ratio)" in native_fit
+assert "covariance_trust_region_model(system.solver,bfgs.inverse_hessian" in native_fit
+assert "const double factor=1.0/(1.0/model.eigenvalues[k]+lambda)" in native_fit
+assert "model.eigenvalues.clear();model.status=\"UNRESOLVED_EIGENVALUE_SCALE\"" in native_fit
+assert "TRUST_REGION_MODEL_RESET" in native_fit and "trust_region_model_resets" in native_fit
+assert "ratio<0.1" in native_fit and "ratio<0.25" in native_fit and "ratio>0.75&&actual_norm>=0.9*radius" in native_fit
+assert "full_gradient_evaluations" in native_fit and "trust_region_radius_resolves" in native_fit
+assert "covariance_barrier_stage_tolerance" in native_fit and "std::max(1e-6,1e-2*tau)" in native_fit
+assert "covariance_barrier_stage_pass(current,result.scaled_kkt_residual,tau,tau_min,staged_barrier)" in native_fit
+assert "covariance_recompose_objective_for_tau(current,result.theta,baseline,statistics,rho,epsilon,tau)" in native_fit
+assert "value.cached_theta!=theta||value.cached_epsilon!=epsilon" in native_fit
+assert "covariance_paired_log_ratio" in native_fit and "current.cached_theta!=current_theta" in native_fit
+assert "covariance_trust_region_prediction_resolution" in native_fit and "covariance_local_difference_resolution" in native_fit
+assert "COVARIANCE_PRIOR_CALIBRATION" in native_fit and "COVARIANCE_PRIOR_BLOCK" in native_fit
+assert "COVARIANCE_PRIOR_ANCHOR prior_center=theta_baseline initialization_point=theta_start" in native_fit
+assert "selection=USER_SUPPLIED_POSITIVE_RHO block_spread_is_not_uncertainty=1" in native_fit
+assert "training_block_statistics_" in native_fit and "training_block_frames_" in native_fit
+assert 'compare_saved_vector(parse_vector(stats_key.c_str()),training_block_statistics[block],"training block statistics")' in native_fit
+assert 'optimizer_step_mode_saved ' in native_fit and 'staged_barrier_enabled_saved ' in native_fit
 assert "test_covariance_joint_ray_spectrum_and_proposal" in cuda_test
 assert "assert(preflight.method==\"BFGS\"" in cuda_test
 assert "joint_ray" not in native_header and "joint_ray" not in run
@@ -778,9 +814,9 @@ assert 'joint_selection.status=="DOMINANT_SUPPORT_CAP"' in covariance_optimizer
 assert 'result.method="GROUP_BFGS"' in native_fit
 assert 'selection_status="<<joint_selection.status' in covariance_optimizer
 assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
-assert covariance_optimizer.index("if(!accepted){") < covariance_optimizer.index("covariance_update_group_bfgs_history(")
-assert covariance_optimizer.index("covariance_update_group_bfgs_history(") < covariance_optimizer.index("z=std::move(next_z)")
-assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index("group_bfgs_history[updated_group]=std::move(group_bfgs_pending)")
+assert legacy_optimizer.index("if(!accepted){") < legacy_optimizer.index("covariance_update_group_bfgs_history(")
+assert legacy_optimizer.index("covariance_update_group_bfgs_history(") < legacy_optimizer.index("z=std::move(next_z)")
+assert legacy_optimizer.index("z=std::move(next_z)") < legacy_optimizer.index("group_bfgs_history[updated_group]=std::move(group_bfgs_pending)")
 assert "APPROXIMATE_MODEL_UNAVAILABLE" in covariance_optimizer
 assert 'choice.reason="GROUP_GLOBAL_RESCUE"' in covariance_optimizer
 assert "result.dominant_cap_rescue_next=choice.method==\"GROUP_BFGS\"" in covariance_optimizer

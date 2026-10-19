@@ -30,6 +30,8 @@ struct RpmdJANativeFitOptions
   double covariance_shrinkage = 0.0;
   bool covariance_block_newton = false;
   bool covariance_joint_block = false;
+  bool covariance_trust_region = false;
+  bool covariance_staged_barrier = false;
   RpmdJANativeFitMethod method = RpmdJANativeFitMethod::ForceLeastSquares;
   bool internal_mass_com = false;
 };
