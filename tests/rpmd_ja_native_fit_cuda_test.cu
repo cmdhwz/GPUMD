@@ -1826,6 +1826,87 @@ void test_covariance_block_newton_optimizer_direction_trace()
   assert(log.find("dominant_scaled_gradient_parameter=")!=std::string::npos&&log.find("scaled_kkt_residual=")!=std::string::npos);
 }
 
+void test_covariance_trust_region_roundoff_boundary_rebuild()
+{
+  const std::vector<double> theta={1.0},z={10000.0},scale={1e-4},direction={4e-12};
+  constexpr double radius=4e-12;
+  std::vector<double> next_z,actual_step,next_theta;bool repaired=false;
+  std::vector<double> initial_z,initial_step,initial_theta;
+  assert(covariance_build_scaled_trial(theta,z,scale,direction,1.0,initial_z,initial_step,initial_theta));
+  assert(initial_step[0]>radius);
+  assert(covariance_build_trust_region_trial(theta,z,scale,direction,4e-12,radius,
+    next_z,actual_step,next_theta,repaired));
+  assert(repaired&&radius==4e-12&&actual_step[0]>0.0&&actual_step[0]<=radius);
+  assert(actual_step[0]==(next_theta[0]-theta[0])/scale[0]);
+  assert(next_z[0]==next_theta[0]/scale[0]);
+
+  const std::vector<double> unequal_theta={1.0,2.0},unequal_z={10000.0,10000.0};
+  const std::vector<double> unequal_scale={1e-4,2e-4},unequal_direction={4e-12,0.8e-12};
+  assert(covariance_build_scaled_trial(unequal_theta,unequal_z,unequal_scale,unequal_direction,1.0,
+    initial_z,initial_step,initial_theta));
+  assert(initial_step[1]==0.0&&std::hypot(initial_step[0],initial_step[1])>4.3e-12);
+  repaired=false;
+  assert(covariance_build_trust_region_trial(unequal_theta,unequal_z,unequal_scale,
+    unequal_direction,std::hypot(4e-12,0.8e-12),4.3e-12,next_z,actual_step,next_theta,repaired));
+  assert(repaired&&actual_step[0]>0.0&&std::hypot(actual_step[0],actual_step[1])<=4.3e-12);
+  assert(actual_step[0]==(next_theta[0]-unequal_theta[0])/unequal_scale[0]);
+  assert(actual_step[1]==(next_theta[1]-unequal_theta[1])/unequal_scale[1]);
+
+  repaired=false;
+  assert(covariance_build_trust_region_trial(theta,z,scale,{1.9e-12},1.9e-12,1.9e-12,
+    next_z,actual_step,next_theta,repaired));
+  assert(!repaired&&actual_step[0]>1.9e-12);
+
+  repaired=false;
+  assert(covariance_build_trust_region_trial(theta,z,scale,{5e-12},5e-12,4e-12,
+    next_z,actual_step,next_theta,repaired));
+  assert(!repaired&&actual_step[0]>4e-12);
+
+  bool invalid_scale_rejected=false;
+  try{(void)covariance_build_trust_region_trial(theta,z,{0.0},direction,4e-12,radius,
+    next_z,actual_step,next_theta,repaired);}catch(const std::invalid_argument&){invalid_scale_rejected=true;}
+  assert(invalid_scale_rejected);
+  bool nonfinite_rejected=false;
+  try{(void)covariance_build_trust_region_trial(theta,z,scale,
+    {std::numeric_limits<double>::quiet_NaN()},4e-12,radius,next_z,actual_step,next_theta,repaired);}
+  catch(const std::invalid_argument&){nonfinite_rejected=true;}
+  assert(nonfinite_rejected);
+
+  const double q=std::nextafter(1.0,2.0)-1.0;
+  const std::vector<double> tie_theta={1.0,1.0},tie_z={1.0,1.0},tie_scale={1.0,1.0};
+  const std::vector<double> tie_direction={0.6*q,0.9*q};const double tie_radius=std::hypot(tie_direction[0],tie_direction[1]);
+  repaired=false;
+  assert(covariance_build_trust_region_trial(tie_theta,tie_z,tie_scale,tie_direction,tie_radius,tie_radius,
+    next_z,actual_step,next_theta,repaired));
+  assert(repaired&&actual_step[0]==0.0&&actual_step[1]==q&&std::hypot(actual_step[0],actual_step[1])<=tie_radius);
+}
+
+void test_covariance_optimizer_trace_parses_legacy_and_trust_region_steps()
+{
+  std::istringstream trace(
+    "STEP_COMMITTED iteration=1 tau=0.1 alpha=0.5 predicted_first_order_decrease=2 actual_objective_decrease=1 bfgs_update=UPDATED\r\n"
+    "TRUST_REGION_TRIAL iteration=2 retry=0 status=RATIO_REJECT\r\n"
+    "TRUST_REGION_STEP_ACCEPT iteration=2 tau=0.1 lambda=1 radius=2 next_radius=2 step_norm=2 predicted=3 actual=2 ratio=0.66 scaled_kkt_residual=0.01 full_gradient_evaluations=2 bfgs_update=SEEDED\r\n"
+    "TRUST_REGION_STEP_REJECT iteration=3 retry=1 status=POOR_RATIO\r\n"
+    "TRUST_REGION_STEP_ACCEPT iteration=3 tau=0.1 lambda=2 radius=1 next_radius=1 step_norm=1 predicted=NOT_STORED actual=NOT_STORED ratio=NOT_STORED bfgs_update=RESET\r\n"
+    "BFGS_CURVATURE_SEED tau=0.1 gamma=1 source=START\r\nBFGS_RESET iteration=4 reason=TEST\r\n");
+  const CovarianceOptimizerTraceSummary summary=covariance_parse_optimizer_trace(trace);
+  assert(summary.accepted_steps()==3&&summary.legacy_steps==1&&summary.trust_region_steps==2);
+  assert(summary.bfgs_seed_events==1&&summary.bfgs_reset_events==1&&summary.tail.size()==3);
+  assert(summary.tail[0].kind=="STEP_COMMITTED"&&summary.tail[1].kind=="TRUST_REGION_STEP_ACCEPT");
+  assert(!summary.tail[1].fields.count("alpha")&&!summary.tail[1].fields.count("predicted_first_order_decrease"));
+  assert(summary.tail[1].fields.at("predicted")=="3"&&summary.tail[1].fields.at("actual")=="2");
+  assert(summary.tail[2].fields.at("predicted")=="NOT_STORED"&&summary.tail[2].fields.at("actual")=="NOT_STORED");
+
+  std::ostringstream many_steps;
+  for(int iteration=0;iteration<40;++iteration)
+    many_steps<<"TRUST_REGION_STEP_ACCEPT iteration="<<iteration<<" predicted="<<iteration<<"\r\n";
+  std::istringstream bounded_input(many_steps.str());
+  const CovarianceOptimizerTraceSummary bounded=covariance_parse_optimizer_trace(bounded_input);
+  assert(bounded.trust_region_steps==40&&bounded.tail.size()==32);
+  assert(bounded.tail.front().fields.at("iteration")=="8"&&bounded.tail.back().fields.at("iteration")=="39");
+}
+
 void test_covariance_trust_region_residual_rejection_is_transactional()
 {
   DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
@@ -4007,6 +4088,8 @@ int main()
   test_covariance_optimizer_rank_deficiency_budget_and_33_dimension_barrier();
   test_covariance_objective_analytic_gradient_matches_finite_difference();
   test_covariance_trust_region_subproblem_and_barrier_cache();
+  test_covariance_trust_region_roundoff_boundary_rebuild();
+  test_covariance_optimizer_trace_parses_legacy_and_trust_region_steps();
   test_covariance_gradient_decomposition_preserves_total();
   test_covariance_edge_attribution_reconstructs_and_ranks();
   test_covariance_edge_attribution_reports_diffuse_top20_fractions();

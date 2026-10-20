@@ -94,6 +94,16 @@ assert "bool require_zero_net_gradient = false" in header
 fit_impl = native[native.index("static bool fit_rpmd_ja_native_reference_impl("):native.index("bool fit_rpmd_ja_native_reference(")]
 assert "force,!options.internal_mass_com);" in fit_impl
 assert "rpmd_ja_reference_math::net_force_stats(raw_gradient,n)" in native
+assert "CovarianceOptimizerTraceSummary covariance_parse_optimizer_trace" in native
+assert 'line.rfind("STEP_COMMITTED ",0)==0' in native
+assert 'line.rfind("TRUST_REGION_STEP_ACCEPT ",0)==0' in native
+assert "optimizer_trace.accepted_steps()" in native
+assert "optimizer_trace.trust_region_steps" in native
+assert "optimizer_trust_region_committed_step_tail_fields" in native
+assert "predicted_quadratic" in native and "predicted_first_order_decrease" in native
+trace_parser_test = (root / "tests/rpmd_ja_native_fit_cuda_test.cu").read_text(encoding="utf-8")
+trace_test = trace_parser_test.split("void test_covariance_optimizer_trace_parses_legacy_and_trust_region_steps()", 1)[1]
+assert "NOT_STORED" in trace_test and "\\r\\n" in trace_test
 
 
 def central2(plus, minus, h):

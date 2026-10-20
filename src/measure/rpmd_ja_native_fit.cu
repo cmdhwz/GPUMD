@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -4563,6 +4564,60 @@ bool covariance_build_scaled_trial(const std::vector<double>& theta,const std::v
   return next_theta!=theta;
 }
 
+// Returns whether a trial was built; any unrepaired over-radius step remains for the caller's strict rejection path.
+bool covariance_build_trust_region_trial(const std::vector<double>& theta,const std::vector<double>& z,
+  const std::vector<double>& scale,const std::vector<double>& direction,const double proposal_norm,const double radius,
+  std::vector<double>& next_z,std::vector<double>& actual_step,std::vector<double>& next_theta,bool& repaired)
+{
+  repaired=false;const std::size_t size=theta.size();
+  if(z.size()!=size||scale.size()!=size||direction.size()!=size||!std::isfinite(proposal_norm)||proposal_norm<0.0||
+     !std::isfinite(radius)||!(radius>0.0)||
+     !std::all_of(theta.begin(),theta.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(z.begin(),z.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(scale.begin(),scale.end(),[](double x){return std::isfinite(x)&&x>0.0;})||
+     !std::all_of(direction.begin(),direction.end(),[](double x){return std::isfinite(x);}))
+    throw std::invalid_argument("trust-region scaled trial has invalid dimensions or non-finite inputs");
+  if(!covariance_build_scaled_trial(theta,z,scale,direction,1.0,next_z,actual_step,next_theta))return false;
+  auto norm=[](const std::vector<double>& values){double value=0.0;for(const double x:values)value=std::hypot(value,x);return value;};
+  const double actual_norm=norm(actual_step);
+  if(!std::isfinite(actual_norm))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region actual step norm is non-finite");
+  if(actual_norm<=radius||proposal_norm>radius)return true;
+
+  const double epsilon=std::numeric_limits<double>::epsilon();
+  const double gamma=6.0*epsilon/(1.0-6.0*epsilon);double discrepancy=0.0,roundoff_bound=0.0;
+  for(std::size_t i=0;i<size;++i){
+    const double proposed_z=z[i]+direction[i],delta=proposed_z-z[i],product=scale[i]*delta;
+    const double proposed_theta=theta[i]+product,numerator=proposed_theta-theta[i];
+    const double magnitude=std::abs(z[i])+std::abs(direction[i])+std::abs(proposed_z)+std::abs(z[i])+
+      (std::abs(theta[i])+std::abs(product)+std::abs(proposed_theta)+std::abs(theta[i])+std::abs(numerator))/scale[i]+
+      std::abs(actual_step[i]);
+    const double coordinate_bound=gamma*magnitude;
+    if(!std::isfinite(proposed_z)||!std::isfinite(delta)||!std::isfinite(product)||!std::isfinite(proposed_theta)||
+       !std::isfinite(numerator)||!std::isfinite(magnitude)||!std::isfinite(coordinate_bound))return true;
+    discrepancy=std::hypot(discrepancy,actual_step[i]-direction[i]);
+    roundoff_bound=std::hypot(roundoff_bound,coordinate_bound);
+  }
+  if(!std::isfinite(discrepancy)||!std::isfinite(roundoff_bound)||actual_norm-radius>roundoff_bound||discrepancy>roundoff_bound)
+    return true;
+
+  double lower=0.0,upper=1.0;bool have_inner=false;
+  std::vector<double> inner_z,inner_step,inner_theta;
+  for(int attempt=0;attempt<64;++attempt){
+    const double factor=lower+0.5*(upper-lower);
+    if(!(factor>lower&&factor<upper))break;
+    std::vector<double> candidate_z,candidate_step,candidate_theta;
+    if(!covariance_build_scaled_trial(theta,z,scale,direction,factor,candidate_z,candidate_step,candidate_theta)){lower=factor;continue;}
+    const double candidate_norm=norm(candidate_step);
+    if(!std::isfinite(candidate_norm))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region rebuilt step norm is non-finite");
+    if(candidate_norm==0.0){lower=factor;continue;}
+    if(candidate_norm<=radius){
+      lower=factor;have_inner=true;inner_z=std::move(candidate_z);inner_step=std::move(candidate_step);inner_theta=std::move(candidate_theta);
+    }else upper=factor;
+  }
+  if(have_inner){next_z=std::move(inner_z);actual_step=std::move(inner_step);next_theta=std::move(inner_theta);repaired=true;}
+  return true;
+}
+
 CovarianceDirectionChoice covariance_preflight_block_direction(const std::vector<double>& theta,const std::vector<double>& z,
   const std::vector<double>& coordinate_scale,const std::vector<double>& gradient,const std::vector<double>& bfgs_direction,
   const double bfgs_slope,CovarianceDirectionChoice choice)
@@ -5336,7 +5391,9 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           const double radius=trust_radius;
           const CovarianceTrustRegionStep proposal=covariance_trust_region_subproblem(model,g,radius);
           std::vector<double> next_z,step,next_theta;
-          if(!covariance_build_scaled_trial(result.theta,z,coordinate_scale,proposal.step,1.0,next_z,step,next_theta)){
+          bool roundoff_repaired=false;
+          if(!covariance_build_trust_region_trial(result.theta,z,coordinate_scale,proposal.step,proposal.norm,radius,
+              next_z,step,next_theta,roundoff_repaired)){
             ++result.trust_region_rejections;trust_radius*=0.5;result.trust_region_radius=trust_radius;
             if(trace)*trace<<"TRUST_REGION_TRIAL iteration="<<iteration<<" retry="<<retry<<" radius="<<radius
               <<" status=STEP_UNDERFLOW next_radius="<<trust_radius<<'\n';flush_trace();
@@ -5344,6 +5401,8 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               result.reason="trust-region radius fell below the representable-step threshold";break;}continue;}
           double actual_norm=0.0;for(const double value:step)actual_norm=std::hypot(actual_norm,value);
           if(!std::isfinite(actual_norm))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region actual step norm is non-finite");
+          if(roundoff_repaired&&trace)*trace<<"TRUST_REGION_ROUNDOFF_REBUILD iteration="<<iteration<<" retry="<<retry
+            <<" radius="<<radius<<" step_norm="<<actual_norm<<'\n';flush_trace();
           const double predicted=covariance_trust_region_predicted_reduction(model,g,step);
           result.trust_region_last_predicted=predicted;result.trust_region_last_actual=std::numeric_limits<double>::quiet_NaN();
           result.trust_region_last_ratio=std::numeric_limits<double>::quiet_NaN();
@@ -6739,6 +6798,43 @@ void check_rpmd_ja_native_fit_samples(const std::string& spool_path,const std::s
   std::printf("  fixed probes omit four low-frequency Ritz probes; this report cannot replace final response validation.\n");
 }
 
+namespace
+{
+struct CovarianceOptimizerTraceStep
+{
+  std::string kind;
+  std::map<std::string,std::string> fields;
+};
+
+struct CovarianceOptimizerTraceSummary
+{
+  std::size_t legacy_steps=0,trust_region_steps=0,bfgs_seed_events=0,bfgs_reset_events=0;
+  std::deque<CovarianceOptimizerTraceStep> tail;
+  std::size_t accepted_steps()const{return legacy_steps+trust_region_steps;}
+};
+
+CovarianceOptimizerTraceSummary covariance_parse_optimizer_trace(std::istream& input)
+{
+  CovarianceOptimizerTraceSummary summary;std::string line;
+  while(std::getline(input,line)){
+    if(!line.empty()&&line.back()=='\r')line.pop_back();
+    if(line.rfind("BFGS_CURVATURE_SEED ",0)==0)++summary.bfgs_seed_events;
+    if(line.rfind("BFGS_RESET ",0)==0||line.rfind("BFGS_STAGE_RESET ",0)==0)++summary.bfgs_reset_events;
+    const bool legacy=line.rfind("STEP_COMMITTED ",0)==0;
+    const bool trust_region=line.rfind("TRUST_REGION_STEP_ACCEPT ",0)==0;
+    if(!legacy&&!trust_region)continue;
+    CovarianceOptimizerTraceStep step;std::istringstream fields_in(line);fields_in>>step.kind;
+    std::string token;
+    while(fields_in>>token){const std::size_t equals=token.find('=');if(equals!=std::string::npos)
+      step.fields[token.substr(0,equals)]=token.substr(equals+1);}
+    if(legacy)++summary.legacy_steps;else ++summary.trust_region_steps;
+    if(summary.tail.size()==32)summary.tail.pop_front();
+    summary.tail.push_back(std::move(step));
+  }
+  return summary;
+}
+}
+
 std::map<std::string,std::string> read_covariance_state_fields(std::istream& input)
 {
   std::map<std::string,std::string> fields;std::string line;
@@ -6832,15 +6928,9 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     for(const auto& pair:graph.type_pairs){int a=-1,b=-1;if(!(mapping>>a>>b)||a!=pair.first||b!=pair.second)throw std::runtime_error("covariance state type-pair map does not match the rebuilt graph");}}
   if(fields.count("last_valid_available")&&fields.at("last_valid_available")=="1")compare_saved_vector(parse_vector("theta"),theta,"committed last-valid parameters");
   auto number_of=[&](const char* key){const auto it=fields.find(key);if(it==fields.end())return std::string("NOT_STORED");return it->second;};
-  std::string optimizer_trace_status="NOT_AVAILABLE";std::vector<std::map<std::string,std::string>> optimizer_steps;
-  std::size_t optimizer_bfgs_seed_events=0,optimizer_bfgs_reset_events=0;
+  std::string optimizer_trace_status="NOT_AVAILABLE";CovarianceOptimizerTraceSummary optimizer_trace;
   if(fields.count("fit_trace_path")){const std::string trace_path=parse_quoted("fit_trace_path");std::ifstream fit_trace(trace_path);
-    if(fit_trace){optimizer_trace_status="PASS";std::string line;while(std::getline(fit_trace,line)){
-        if(line.rfind("BFGS_CURVATURE_SEED ",0)==0)++optimizer_bfgs_seed_events;
-        if(line.rfind("BFGS_RESET ",0)==0||line.rfind("BFGS_STAGE_RESET ",0)==0)++optimizer_bfgs_reset_events;
-        if(line.rfind("STEP_COMMITTED ",0)==0){std::istringstream fields_in(line);std::string token;std::map<std::string,std::string> step;
-          while(fields_in>>token){const std::size_t equals=token.find('=');if(equals!=std::string::npos)step[token.substr(0,equals)]=token.substr(equals+1);}
-          optimizer_steps.push_back(std::move(step));}}}
+    if(fit_trace){optimizer_trace_status="PASS";optimizer_trace=covariance_parse_optimizer_trace(fit_trace);}
     else optimizer_trace_status="MISSING_FILE";}
   RpmdJANativeFitOptions options;options.temperature=header.temperature;options.cutoff=cutoff;options.epsilon=epsilon;options.fd_step=fd_step;
   options.internal_mass_com=internal_mass_com;options.sample_interval=static_cast<int>(std::llround(interval));
@@ -7168,17 +7258,21 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     report<<"Db "<<i<<' '<<column.quadratic_pre<<' '<<column.quadratic_post<<' '<<column.quadratic_post-column.quadratic_pre<<' '
       <<column.factor_residual_pre<<' '<<column.factor_residual_post<<' '<<column.original_residual_pre<<' '
       <<column.original_residual_post<<' '<<column.refinement_steps<<'\n';}
-  report<<"optimizer_fit_trace_status "<<optimizer_trace_status<<" accepted_steps="<<optimizer_steps.size()
+  report<<"optimizer_fit_trace_status "<<optimizer_trace_status<<" accepted_steps="<<optimizer_trace.accepted_steps()
+    <<" legacy_committed_steps="<<optimizer_trace.legacy_steps<<" trust_region_committed_steps="<<optimizer_trace.trust_region_steps
     <<" objective_evaluations="<<number_of("objective_evaluations")<<" optimizer_factorizations="<<number_of("factorizations")
     <<" optimizer_rhs_columns="<<number_of("solve_rhs_columns")<<" optimizer_seconds="<<number_of("optimizer_seconds")
-    <<" bfgs_seed_events="<<optimizer_bfgs_seed_events<<" bfgs_reset_events="<<optimizer_bfgs_reset_events
+    <<" bfgs_seed_events="<<optimizer_trace.bfgs_seed_events<<" bfgs_reset_events="<<optimizer_trace.bfgs_reset_events
     <<" saved_bfgs_seed_gamma="<<number_of("bfgs_seed_gamma")<<" saved_bfgs_seed_source="<<number_of("bfgs_seed_source")
     <<" diagnostic_objective_evaluations="<<diagnostic_evaluations<<'\n';
   report<<"optimizer_committed_step_tail_fields iteration tau alpha predicted_first_order_decrease actual_objective_decrease bfgs_sy bfgs_s_norm2 bfgs_y_norm2 bfgs_secant_cosine bfgs_update bfgs_seed_gamma bfgs_seed_source\n";
-  const std::size_t step_start=optimizer_steps.size()>32?optimizer_steps.size()-32:0;
-  for(std::size_t index=step_start;index<optimizer_steps.size();++index){const auto& step=optimizer_steps[index];
+  for(const CovarianceOptimizerTraceStep& event:optimizer_trace.tail)if(event.kind=="STEP_COMMITTED"){
     for(const char* key:{"iteration","tau","alpha","predicted_first_order_decrease","actual_objective_decrease","bfgs_sy","bfgs_s_norm2","bfgs_y_norm2","bfgs_secant_cosine","bfgs_update","bfgs_seed_gamma","bfgs_seed_source"})
-      report<<(step.count(key)?step.at(key):"NOT_STORED")<<' ';report<<'\n';}
+      report<<(event.fields.count(key)?event.fields.at(key):"NOT_STORED")<<' ';report<<'\n';}
+  report<<"optimizer_trust_region_committed_step_tail_fields iteration tau lambda radius next_radius step_norm predicted_quadratic actual_objective_decrease ratio scaled_kkt_residual full_gradient_evaluations bfgs_update\n";
+  for(const CovarianceOptimizerTraceStep& event:optimizer_trace.tail)if(event.kind=="TRUST_REGION_STEP_ACCEPT"){
+    for(const char* key:{"iteration","tau","lambda","radius","next_radius","step_norm","predicted","actual","ratio","scaled_kkt_residual","full_gradient_evaluations","bfgs_update"})
+      report<<(event.fields.count(key)?event.fields.at(key):"NOT_STORED")<<' ';report<<'\n';}
   if(hessian_group>=0){const auto pair=graph.type_pairs[static_cast<std::size_t>(hessian_group)];report<<"conditional_group_hessian_status "<<hessian_status
       <<" group="<<hessian_group<<" type_i="<<pair.first<<" type_j="<<pair.second<<" support_cap_atoms=32"
       <<" pre_sym_relative_asymmetry_D="<<hessian_d_asymmetry<<" pre_sym_relative_asymmetry_S="<<hessian_s_asymmetry

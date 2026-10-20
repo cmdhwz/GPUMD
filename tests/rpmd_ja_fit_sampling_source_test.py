@@ -1,5 +1,5 @@
 from pathlib import Path
-from math import isclose, isfinite
+from math import hypot, isclose, isfinite, nextafter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -763,6 +763,15 @@ assert "test_covariance_joint_block_commit_attribution_is_transactional" in cuda
 assert "test_covariance_trust_region_subproblem_and_barrier_cache" in cuda_test
 assert "test_covariance_trust_region_residual_rejection_is_transactional" in cuda_test
 assert "test_covariance_trust_region_staged_barrier_harmonic_solve" in cuda_test
+assert "test_covariance_trust_region_roundoff_boundary_rebuild" in cuda_test
+assert "test_covariance_optimizer_trace_parses_legacy_and_trust_region_steps" in cuda_test
+roundoff_test = cuda_test.split("void test_covariance_trust_region_roundoff_boundary_rebuild()", 1)[1].split(
+    "void test_covariance_optimizer_trace_parses_legacy_and_trust_region_steps()", 1)[0]
+assert roundoff_test.count("std::vector<double> initial_z,initial_step,initial_theta;") == 1
+assert "covariance_build_trust_region_trial" in native_fit
+assert "covariance_parse_optimizer_trace" in native_fit
+assert "optimizer_trust_region_committed_step_tail_fields" in native_fit
+assert "predicted_quadratic" in native_fit
 assert "subnormal_oracle=-726.4715666914936" in cuda_test and "subnormal_ratio<std::numeric_limits<double>::min()" in cuda_test
 assert "subnormal_uphill.disposition==CovarianceTrustRegionTrialDisposition::PoorRatio" in cuda_test
 assert "std::isnormal(ratio)" in native_fit
@@ -828,3 +837,65 @@ assert "group_bfgs_committed_updates" in native_fit and "COVARIANCE_GROUP_BFGS_C
 assert "group_bfgs_committed_update_status=" in covariance_optimizer
 assert "write_covariance_group_bfgs_diagnostics(fitout,covariance_fit)" in native_fit
 assert "fit.group_bfgs_update_status[group]" in native_fit
+
+
+# Independent binary64 oracle for a theta/scale reconstruction just outside the radius.
+def scaled_trial_oracle(factor, theta, z, scale, direction):
+    next_z = z + factor * direction
+    next_theta = theta + scale * (next_z - z)
+    actual_step = (next_theta - theta) / scale
+    return next_theta / scale, actual_step, next_theta
+
+
+theta, z, scale, direction, radius = 1.0, 10000.0, 1e-4, 4e-12, 4e-12
+initial = scaled_trial_oracle(1.0, theta, z, scale, direction)
+assert abs(initial[1]) > radius
+lower, upper, best = 0.0, 1.0, None
+for _ in range(64):
+    factor = lower + 0.5 * (upper - lower)
+    if factor == lower or factor == upper:
+        break
+    candidate = scaled_trial_oracle(factor, theta, z, scale, direction)
+    if candidate[1] == 0.0:
+        lower = factor
+    elif abs(candidate[1]) <= radius:
+        lower, best = factor, candidate
+    else:
+        upper = factor
+assert best is not None and 0.0 < abs(best[1]) <= radius and radius == 4e-12
+
+small_radius = 1.9e-12
+small_initial = scaled_trial_oracle(1.0, theta, z, scale, small_radius)
+assert abs(small_initial[1]) > small_radius
+small_inner = [scaled_trial_oracle(factor, theta, z, scale, small_radius)[1]
+               for factor in (0.5, 0.25, 0.125, 0.0625)]
+assert all(step == 0.0 or abs(step) > small_radius for step in small_inner)
+
+q = nextafter(1.0, 2.0) - 1.0
+tie_direction = (0.6 * q, 0.9 * q)
+tie_radius = hypot(*tie_direction)
+
+
+def scaled_vector_trial(factor):
+    z_next = tuple(1.0 + factor * value for value in tie_direction)
+    theta_next = tuple(1.0 + (z_next[i] - 1.0) for i in range(2))
+    return tuple((theta_next[i] - 1.0) for i in range(2))
+
+
+assert scaled_vector_trial(1.0) == (q, q)
+assert scaled_vector_trial(0.5) == (0.0, 0.0)
+assert scaled_vector_trial(0.75) == (0.0, q)
+lower, upper, tie_best = 0.0, 1.0, None
+for _ in range(64):
+    factor = lower + 0.5 * (upper - lower)
+    if factor == lower or factor == upper:
+        break
+    candidate = scaled_vector_trial(factor)
+    candidate_norm = hypot(*candidate)
+    if candidate_norm == 0.0:
+        lower = factor
+    elif candidate_norm <= tie_radius:
+        lower, tie_best = factor, candidate
+    else:
+        upper = factor
+assert tie_best == (0.0, q)
