@@ -214,7 +214,7 @@ inline void write_package_atomic(const std::string& path,const std::string& mani
   };
   {
     rpmd_ja_file_io::ifstream existing(path,std::ios::binary);
-    if(existing){const std::string bytes(std::istreambuf_iterator<char>(existing),std::istreambuf_iterator<char>());
+    if(existing){const std::string bytes{std::istreambuf_iterator<char>(existing),std::istreambuf_iterator<char>()};
       if(!same_source(bytes))throw std::runtime_error("A0 reuse package already exists with different evidence");return;}
   }
   static std::atomic<unsigned long long> sequence{0};
@@ -238,7 +238,7 @@ inline void write_package_atomic(const std::string& path,const std::string& mani
   if(flush_status!=0||close_status!=0)throw std::runtime_error("cannot flush A0 reuse package staging file");
   if(rpmd_ja_file_io::atomic_commit_new_file(temporary,path)!=0){
     rpmd_ja_file_io::ifstream raced(path,std::ios::binary);
-    if(raced){const std::string bytes(std::istreambuf_iterator<char>(raced),std::istreambuf_iterator<char>());
+    if(raced){const std::string bytes{std::istreambuf_iterator<char>(raced),std::istreambuf_iterator<char>()};
       if(bytes==contents||same_source(bytes))return;}
     throw std::runtime_error("cannot atomically commit A0 reuse package without replacing existing evidence");}
 }

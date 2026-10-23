@@ -226,7 +226,11 @@ QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptio
   const bool raw_v3=stats[17]==3.0&&stats[1]<=1e-4&&stats[3]<=1e-4&&std::max({stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]})<=5e-2;
   if(!finite_stats||stats[16]!=options.fd_step||(version==1?!raw_v1:(version==2?!raw_v2:!raw_v3)))
     throw std::runtime_error("qNEP raw diagnostics fail accepted limits");
-  raw.clear();return {data,k_offset,version,model,config,charge,kspace,mesh,active_mesh,active_model_sha256};
+  QrawIdentity identity;
+  identity.data_offset=data;identity.k_offset=k_offset;identity.version=version;
+  identity.model=model;identity.config=config;identity.charge=charge;identity.kspace=kspace;
+  identity.mesh=mesh;identity.active_mesh=active_mesh;identity.model_sha256=active_model_sha256;
+  raw.clear();return identity;
 }
 
 void read_frame(std::istream& in, std::vector<double>& x, std::vector<double>& f, double& step)
@@ -3484,7 +3488,7 @@ std::string write_blind_response_checkpoint(const std::string& path,const Respon
       <<std::quoted(value.verification_method)<<' '<<std::quoted(value.refinement_status)<<' '
       <<std::quoted(value.witness_snapshot_path)<<' '<<std::quoted(value.error)<<' '<<(value.recovered?1:0)<<' '
       <<value.initial_fast_residual<<' '<<value.initial_compensated_residual<<' '<<value.final_fast_residual<<' '
-      <<value.final_compensated_residual<<' '<<value.verification_actions<<' '<<value.refinement_actions<<' '
+      <<value.final_compensated_residual<<' '<<value.verification_matrix_actions<<' '<<value.refinement_matrix_actions<<' '
       <<value.verification_seconds<<' '<<value.refinement_seconds<<' '<<value.refinement_rounds<<'\n';}
   const std::string payload=out.str();const std::string bytes=payload+"sha256 "+rpmd_ja_covariance_checkpoint::sha256(payload)+"\n";
   write_cg_snapshot_atomically(path,bytes);return rpmd_ja_covariance_checkpoint::sha256(bytes);
@@ -11317,6 +11321,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const double sample_statistics_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-sample_statistics_started).count();
   print_fixed_probe_summary(sample_statistics,header,static_cast<double>(options.sample_interval),static_cast<std::uint64_t>(train),options.ibp_tolerance,sample_statistics_seconds);
   rpmd_ja_file_io::ofstream trace(trace_path,std::ios::out|(controller_resume?std::ios::app:std::ios::trunc));if(!trace)throw std::runtime_error("cannot create native fit trace: "+trace_path);
+  std::uint64_t host_required=0;
   std::uint64_t observed_live_disk_peak_bytes=0,observed_min_host_available_bytes=std::numeric_limits<std::uint64_t>::max();
   std::string observed_live_disk_peak_stage="NOT_OBSERVED";
   auto observe_storage_lifetime=[&](const char* stage,const std::uint64_t minimum_free_disk){
@@ -11459,7 +11464,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const int physical_probe_rank=static_cast<int>(std::count_if(sample_statistics.sources.begin(),sample_statistics.sources.end(),
     [&](const std::string& source){return source.compare(0,physical_probe_prefix.size(),physical_probe_prefix)==0;}));
   trace<<"FIXED_PROBE_POLICY physical_channel_candidates "<<common_physical_probes.size()<<" physical_channel_rank "
-    <<physical_probe_rank<<" total_common_rank "<<sample_statistics.probes<<" frozen_for_all_candidates 1\n";
+      <<physical_probe_rank<<" total_common_rank "<<sample_statistics.probes.size()<<" frozen_for_all_candidates 1\n";
   if(budget)trace<<"\nfeasibility_policy version=RPJAFEAS9 wall_seconds="<<feasibility_limits.wall_seconds
     <<" max_exact_gradients="<<feasibility_limits.max_exact_gradients<<" validation_reserve_fraction="<<feasibility_limits.validation_reserve_fraction
     <<" a_branch_gradients="<<feasibility_limits.max_a_branch_gradients<<" family_gradient_cap="<<feasibility_limits.max_fit_family_gradients
@@ -11621,7 +11626,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const std::uint64_t host_graph_lifecycle_bytes=host_graph_m0_bytes+host_graph_m1_bytes;
   const std::uint64_t host_raw_reference_lifecycle_bytes=checked_multiplicity_bytes(raw_bytes,2);
   constexpr std::uint64_t host_safety_margin_bytes=512ULL*1024*1024;
-  std::uint64_t host_required=host_safety_margin_bytes;
+  host_required=host_safety_margin_bytes;
   auto add_host_requirement=[&](const std::uint64_t bytes){if(host_required>std::numeric_limits<std::uint64_t>::max()-bytes)
       throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host memory estimate overflows");host_required+=bytes;};
   add_host_requirement(host_raw_reference_lifecycle_bytes);
@@ -12090,7 +12095,9 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       if(resume_point&&budget){
         auto& restored=resume_storage[0];restored.elapsed_seconds=budget->elapsed_seconds;
         restored.total_budget_gradients=budget->exact_gradients;restored.active_phase=rpmd_ja_feasibility::phase_index(budget->phase);
-        restored.phase_gradients=budget->phase_gradients;restored.phase_seconds=budget->phase_seconds;
+        for(std::size_t phase=0;phase<restored.phase_gradients.size();++phase){
+          restored.phase_gradients[phase]=budget->phase_gradients[phase];
+          restored.phase_seconds[phase]=budget->phase_seconds[phase];}
         restored.operation_in_progress=false;restored.operation_start_epoch_seconds=std::chrono::duration<double>(
           std::chrono::system_clock::now().time_since_epoch()).count();}
       DeviceCovarianceSystem system(baseline,branch_graph,sqrt_mass,atom.cpu_mass,
@@ -12142,7 +12149,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         &feasibility_curvature_workspace,&feasibility_device_workspace);
       development_system.before_factor=observe_controller_budget;
       double development_logdet=0.0,development_shifted_logdet=0.0;
-      if(!development_system.evaluate_factors(fit.theta,options.epsilon,development_logdet,development_shifted_logdet))
+      if(!development_system.evaluate_factors(fit.theta,options.epsilon,development_logdet,development_shifted_logdet,nullptr))
         throw std::runtime_error("IMPLEMENTATION_FAIL: converged development candidate is not epsilon-positive definite");
       development_objective=0.5*(development_baseline_statistic+covariance_dot(branch_development_statistics,fit.theta))-
         0.5*development_logdet;

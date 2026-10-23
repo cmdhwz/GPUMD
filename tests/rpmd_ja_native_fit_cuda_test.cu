@@ -3209,12 +3209,12 @@ void test_covariance_factor_identity_recovery()
   DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
   const double epsilon=0.01;std::vector<double> accepted(6,0.0),candidate=accepted;
   double logdet=0.0,shifted_logdet=0.0;
-  assert(system.evaluate_factors(accepted,epsilon,logdet,shifted_logdet));
+  assert(system.evaluate_factors(accepted,epsilon,logdet,shifted_logdet,nullptr));
   assert(system.factors_valid&&system.factor_theta==accepted&&system.factor_epsilon==epsilon);
   const std::uint64_t accepted_generation=system.factor_assembly_generation;
 
   candidate[0]=1e-4;
-  assert(system.evaluate_factors(candidate,epsilon,logdet,shifted_logdet));
+  assert(system.evaluate_factors(candidate,epsilon,logdet,shifted_logdet,nullptr));
   assert(system.factors_valid&&system.factor_theta==candidate);
   const std::uint64_t candidate_generation=system.factor_assembly_generation;
   const std::uint64_t after_candidate_factors=system.factorizations;
@@ -3227,7 +3227,7 @@ void test_covariance_factor_identity_recovery()
   assert(system.ensure_factors(accepted,epsilon));
   assert(system.factorizations==before_tau_reuse);
 
-  assert(!system.evaluate_factors(candidate,1.0,logdet,shifted_logdet));
+  assert(!system.evaluate_factors(candidate,1.0,logdet,shifted_logdet,nullptr));
   assert(!system.factors_valid&&system.factor_theta.empty());
   assert(system.ensure_factors(accepted,epsilon));
   assert(system.factors_valid&&system.factor_theta==accepted&&system.factor_epsilon==epsilon);

@@ -721,6 +721,7 @@ assert 'acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::INCON
 assert 'estimate_resource_peaks(resource_plan)' in fit and 'workspace.reserve_curvature(' in fit
 assert 'test_covariance_fit_workspace_grows_reuses_and_releases' in cuda_test
 assert 'test_covariance_fit_workspace_is_reused_by_sequential_system_curvature_builds' in cuda_test
+
 system_workspace_start = fit.index('struct DeviceCovarianceSystemWorkspace')
 system_workspace_end = fit.index('struct DeviceCovarianceSystem\n', system_workspace_start)
 system_workspace = fit[system_workspace_start:system_workspace_end]
@@ -808,3 +809,44 @@ assert 'source_file_sha256' in reference_header
 assert 'rpmd_ja_sha256::Digest digest' in reference_reader
 assert 'result.source_file_sha256 = digest.finish_hex()' in reference_reader
 assert 'test_covariance_fit_workspace_is_reused_by_sequential_system_curvature_builds' in cuda_test
+
+a0_write = a0_reuse[a0_reuse.index('inline void write_package_atomic'):]
+assert a0_write.count('const std::string bytes{std::istreambuf_iterator<char>(') == 2
+assert 'const std::string bytes(std::istreambuf_iterator<char>(' not in a0_write
+
+qraw_identity_start = fit.index('QrawIdentity validate_qraw_identity(')
+qraw_identity_end = fit.index('\nvoid read_frame(', qraw_identity_start)
+qraw_identity = fit[qraw_identity_start:qraw_identity_end]
+assert 'QrawIdentity identity;' in qraw_identity
+for field in ('data_offset', 'k_offset', 'version', 'model', 'config', 'charge', 'kspace',
+              'mesh', 'active_mesh', 'model_sha256'):
+    assert f'identity.{field}=' in qraw_identity
+assert 'return {data,k_offset,version,model,config,charge,kspace,mesh,active_mesh,active_model_sha256};' not in qraw_identity
+
+prepare_svd_allocations = prepare_source[prepare_source.index('allocate_gpu(reinterpret_cast<void**>(&sm)'):
+    prepare_source.index('double tile_error[3]={};', prepare_source.index('allocate_gpu(reinterpret_cast<void**>(&sm)'))]
+assert 'static_cast<std::size_t>(tile_size)*tile_size*sizeof(double)' in prepare_svd_allocations
+assert 'maxdim' not in prepare_svd_allocations
+
+assert 'value.verification_matrix_actions' in fit and 'value.refinement_matrix_actions' in fit
+assert 'value.verification_actions' not in fit and 'value.refinement_actions' not in fit
+host_required_declaration = fit.index('std::uint64_t host_required=0;')
+storage_observer_declaration = fit.index('auto observe_storage_lifetime=[&]')
+host_required_initialization = fit.index('host_required=host_safety_margin_bytes;')
+first_storage_observation = fit.index('observe_storage_lifetime("BEFORE_PACKAGE_WRITE"')
+assert host_required_declaration < storage_observer_declaration < host_required_initialization < first_storage_observation
+assert '" total_common_rank "<<sample_statistics.probes.size()' in fit
+
+resume_budget_start = fit.index('if(resume_point&&budget){')
+resume_budget_end = fit.index('operation_start_epoch_seconds=', resume_budget_start)
+resume_budget_copy = fit[resume_budget_start:resume_budget_end]
+assert 'for(std::size_t phase=0;phase<restored.phase_gradients.size();++phase)' in resume_budget_copy
+assert 'restored.phase_gradients=budget->phase_gradients' not in resume_budget_copy
+assert 'restored.phase_seconds=budget->phase_seconds' not in resume_budget_copy
+assert 'development_system.evaluate_factors(fit.theta,options.epsilon,development_logdet,development_shifted_logdet,nullptr)' in fit
+for expression in (
+    'system.evaluate_factors(accepted,epsilon,logdet,shifted_logdet,nullptr)',
+    'system.evaluate_factors(candidate,epsilon,logdet,shifted_logdet,nullptr)',
+    'system.evaluate_factors(candidate,1.0,logdet,shifted_logdet,nullptr)',
+):
+    assert expression in cuda_test

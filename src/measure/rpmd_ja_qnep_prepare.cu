@@ -1172,15 +1172,15 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     std::vector<double> energies(n), fenergy(d), coarse_energy(n), fcoarse(d);
     for(int i=0;i<d;++i){vf.seekg(vstart+static_cast<std::streamoff>(i)*n*sizeof(double));vf.read(reinterpret_cast<char*>(energies.data()),n*sizeof(double));if(!vf)throw std::runtime_error("read fine site derivative");fenergy[i]=-std::accumulate(energies.begin(),energies.end(),0.0);vcf.seekg(vcstart+static_cast<std::streamoff>(i)*n*sizeof(double));vcf.read(reinterpret_cast<char*>(coarse_energy.data()),n*sizeof(double));if(!vcf)throw std::runtime_error("read coarse site derivative");fcoarse[i]=-std::accumulate(coarse_energy.begin(),coarse_energy.end(),0.0);}
     std::vector<double> transport_diff2(3,0.0),transport_norm2(3,0.0); std::vector<double> crows(static_cast<std::size_t>(tile_size)*d), ccrows(static_cast<std::size_t>(tile_size)*d);
-    allocate_gpu(reinterpret_cast<void**>(&sm),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD matrix");
-    allocate_gpu(reinterpret_cast<void**>(&su),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD U");
-    allocate_gpu(reinterpret_cast<void**>(&svt),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD VT");
+    allocate_gpu(reinterpret_cast<void**>(&sm),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD matrix");
+    allocate_gpu(reinterpret_cast<void**>(&su),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD U");
+    allocate_gpu(reinterpret_cast<void**>(&svt),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD VT");
     allocate_gpu(reinterpret_cast<void**>(&sw),static_cast<std::size_t>(lwork)*sizeof(double),"allocate SVD workspace");
     allocate_gpu(reinterpret_cast<void**>(&sinfo),sizeof(int),"allocate SVD info");
-    allocate_gpu(reinterpret_cast<void**>(&dsingular),static_cast<std::size_t>(maxdim)*sizeof(double),"allocate singular values");
-    allocate_gpu(reinterpret_cast<void**>(&dleft),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD left verify buffer");
-    allocate_gpu(reinterpret_cast<void**>(&dright),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD right verify buffer");
-    allocate_gpu(reinterpret_cast<void**>(&dproduct),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD reconstruction buffer");
+    allocate_gpu(reinterpret_cast<void**>(&dsingular),static_cast<std::size_t>(tile_size)*sizeof(double),"allocate singular values");
+    allocate_gpu(reinterpret_cast<void**>(&dleft),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD left verify buffer");
+    allocate_gpu(reinterpret_cast<void**>(&dright),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD right verify buffer");
+    allocate_gpu(reinterpret_cast<void**>(&dproduct),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD reconstruction buffer");
     double tile_error[3]={};
     std::uint64_t h_v_bytes=0;
     for(int alpha=0;alpha<3;++alpha){
