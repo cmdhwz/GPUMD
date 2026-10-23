@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -12,6 +13,12 @@ enum class RpmdJANativeFitMethod
   ForceLeastSquares,
   GaussianCovarianceShrinkage
 };
+
+inline bool rpmd_ja_covariance_prior_ridge_valid(const double rho,const double ridge_lambda)
+{
+  return std::isfinite(rho)&&rho>=0.0&&std::isfinite(ridge_lambda)&&ridge_lambda>=0.0&&
+    (rho>0.0||ridge_lambda>0.0);
+}
 
 struct RpmdJANativeFitOptions
 {

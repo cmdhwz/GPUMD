@@ -8520,6 +8520,10 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
   const rpmd_ja_covariance_checkpoint::AcceptedPoint* checkpoint_metadata=nullptr,
   const std::function<void(const rpmd_ja_covariance_checkpoint::AcceptedPoint&)>& checkpoint_sink={})
 {
+  if(!rpmd_ja_covariance_prior_ridge_valid(rho,ridge_lambda))
+    throw std::invalid_argument("covariance optimizer requires positive shrinkage rho or a positive ridge lambda; both must be finite and non-negative");
+  if(rho>0.0&&ridge_lambda>0.0)
+    throw std::invalid_argument("covariance optimizer shrinkage and ridge objectives are mutually exclusive");
   if(static_cast<int>(block_newton)+static_cast<int>(joint_block)+static_cast<int>(trust_region)>1||
      !std::isfinite(ridge_lambda)||ridge_lambda<0.0||
      (analytic_curvature_probes!=0&&analytic_curvature_probes!=16&&analytic_curvature_probes!=32&&
@@ -9540,7 +9544,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       CovarianceJointRayProposal ray_attempt;
       if(joint_block){
         ray_attempt.original_alpha=alpha;ray_attempt.proposed_alpha=alpha;
-        if(choice.method=="JOINT_BLOCK"){
+        if(choice.method=="JOINT_BLOCK"&&ridge_lambda==0.0){
           const auto proposal_started=std::chrono::steady_clock::now();
           ray_attempt=covariance_joint_ray_proposal(joint_direction_result,joint_selection.groups,statistics,baseline.trace,
             coordinate_scale,rho,tau,slope,alpha);
@@ -9550,7 +9554,9 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             if(!covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,ray_attempt.proposed_alpha,proposal_z,proposal_step,proposal_theta,&baseline.theta)){
               ray_attempt.usable=false;ray_attempt.status="FALLBACK_STEP_UNDERFLOW";ray_attempt.reason=ray_attempt.status;}
             else alpha=ray_attempt.proposed_alpha;}
-        }else{ray_attempt.status="NOT_USED_"+choice.method;ray_attempt.reason=choice.reason;ray_attempt.iteration=result.iterations;ray_attempt.tau=tau;
+        }else{ray_attempt.status=choice.method=="JOINT_BLOCK"?"NOT_USED_CENTERED_RIDGE_OBJECTIVE":"NOT_USED_"+choice.method;
+          ray_attempt.reason=choice.method=="JOINT_BLOCK"?"CENTERED_RIDGE_USES_EXACT_OBJECTIVE_LINE_SEARCH":choice.reason;
+          ray_attempt.iteration=result.iterations;ray_attempt.tau=tau;
           ray_attempt.eigen_evaluations=joint_direction_result.ray_eigen_evaluations;ray_attempt.eigen_seconds=joint_direction_result.ray_eigen_seconds;
           ray_attempt.eigen_residual_d=joint_direction_result.ray_d.eigen_residual;ray_attempt.eigen_residual_s=joint_direction_result.ray_s.eigen_residual;
           ray_attempt.eigmin_d=joint_direction_result.ray_d.ray_min_eigenvalue;ray_attempt.eigmin_s=joint_direction_result.ray_s.ray_min_eigenvalue;}
@@ -11080,11 +11086,13 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     rpmd_ja_covariance_checkpoint::write_controller_journal(controller_checkpoint_path,controller_journal);
   };
+  if(covariance_method&&!rpmd_ja_covariance_prior_ridge_valid(options.covariance_shrinkage,options.covariance_ridge_lambda))
+    throw std::invalid_argument("native covariance objective requires positive shrinkage rho or a positive ridge lambda; both must be finite and non-negative");
   if(options.output_path.empty()||options.kernel_table.empty()||spool_path.empty()||!std::isfinite(options.temperature)||options.temperature<=0.0||
      !std::isfinite(options.cutoff)||options.cutoff<=0.0||!std::isfinite(options.epsilon)||options.epsilon<=0.0||
      !std::isfinite(options.response_tolerance)||options.response_tolerance<0.0||!std::isfinite(options.ibp_tolerance)||options.ibp_tolerance<0.0||!std::isfinite(options.fd_step)||options.fd_step<=0.0||
      options.sample_interval<=0||(!covariance_method&&options.max_stability_rounds<=0)||
-     (covariance_method&&(!std::isfinite(options.covariance_shrinkage)||options.covariance_shrinkage<=0.0||options.max_covariance_iterations<=0||
+     (covariance_method&&(options.max_covariance_iterations<=0||
        options.raw_input_path.empty()||!std::isfinite(options.covariance_ridge_lambda)||options.covariance_ridge_lambda<0.0||
        (options.covariance_analytic_curvature_probes!=0&&options.covariance_analytic_curvature_probes!=16&&
         options.covariance_analytic_curvature_probes!=32&&options.covariance_analytic_curvature_probes!=64&&
@@ -14309,7 +14317,9 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     if(!covariance_state_tau_matches(saved_tau,tau))
       throw std::runtime_error("diagnose_covariance tau does not match last_valid_tau in covariance state");}
   const double rho=parse_double("shrinkage_strength");
-  if(rho<0.0||(rho>0.0&&ridge_lambda>0.0))throw std::runtime_error("covariance state objective mode has incompatible rho/ridge values");
+  if(!rpmd_ja_covariance_prior_ridge_valid(rho,ridge_lambda))
+    throw std::runtime_error("covariance state requires positive shrinkage rho or a positive ridge lambda; both must be finite and non-negative");
+  if(rho>0.0&&ridge_lambda>0.0)throw std::runtime_error("covariance state objective mode has incompatible rho/ridge values");
   const std::string saved_optimizer_mode=fields.count("optimizer_step_mode")?fields.at("optimizer_step_mode"):"LEGACY_UNKNOWN";
   if(saved_optimizer_mode!="BFGS_DEFAULT"&&saved_optimizer_mode!="BLOCK_NEWTON_OPT_IN"&&
      saved_optimizer_mode!="JOINT_BLOCK_OPT_IN"&&saved_optimizer_mode!="TRUST_REGION_OPT_IN"&&saved_optimizer_mode!="LEGACY_UNKNOWN")

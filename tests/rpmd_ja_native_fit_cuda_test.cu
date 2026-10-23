@@ -5984,6 +5984,17 @@ void test_published_outputs_cleaned_after_readback_failure()
   for(const std::string& path:{output,sidecar,output_tmp,sidecar_tmp,pack}){
     std::ifstream input(path,std::ios::binary);if(input.good())throw std::runtime_error("cleanup left an owned publication artifact");}
 }
+
+void test_covariance_prior_ridge_contract()
+{
+  assert(rpmd_ja_covariance_prior_ridge_valid(0.1,0.0));
+  assert(rpmd_ja_covariance_prior_ridge_valid(0.0,0.017685));
+  assert(!rpmd_ja_covariance_prior_ridge_valid(0.0,0.0));
+  assert(!rpmd_ja_covariance_prior_ridge_valid(-0.1,0.017685));
+  assert(!rpmd_ja_covariance_prior_ridge_valid(std::numeric_limits<double>::quiet_NaN(),0.017685));
+  assert(!rpmd_ja_covariance_prior_ridge_valid(0.0,std::numeric_limits<double>::infinity()));
+  assert(!rpmd_ja_covariance_prior_ridge_valid(0.1,-0.01));
+}
 } // namespace
 
 #ifndef GPUMD_RPMD_JA_NATIVE_FIT_TEST_LIBRARY
@@ -5992,6 +6003,7 @@ int main(int argc,char** argv)
   if(argc!=3||std::string(argv[1])!="--fixture-dir"||argv[2][0]=='\0'){
     std::fprintf(stderr,"usage: rpmd_ja_native_fit_cuda_test --fixture-dir <tests/data directory>\n");return 2;}
   covariance_fit_test_fixture_directory=argv[2];
+  test_covariance_prior_ridge_contract();
   test_frozen_qp_fixture_consumer_identity();
   test_feasibility_solver_stop_classification();
   test_cgroup_host_memory_limit();

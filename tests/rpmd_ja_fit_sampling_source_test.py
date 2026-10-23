@@ -190,8 +190,31 @@ assert 'blind_samples_seen!=blind_manifest_seen' in run
 assert 'feasibility requires trust_region' not in run
 assert 'tokens[token] == "trust_region"' in run and 'tokens[token] == "staged_barrier"' in run
 assert 'fit_samples_covariance step modes are mutually exclusive' in run
+covariance_parser = run[run.index('if (tokens[1] == "fit_samples_covariance")'):run.index('if (tokens[1] == "prepare")')]
+assert 'rpmd_ja_covariance_prior_ridge_valid(options.covariance_shrinkage,options.covariance_ridge_lambda)' in covariance_parser
+assert 'shrinkage rho must be finite and non-negative' in covariance_parser
+assert 'zero shrinkage rho requires a positive ridge lambda' in covariance_parser
+assert 'non-rho numeric arguments must be positive finite numbers' in covariance_parser
 assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
 assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
+assert 'inline bool rpmd_ja_covariance_prior_ridge_valid' in native_header
+assert 'rpmd_ja_covariance_prior_ridge_valid(options.covariance_shrinkage,options.covariance_ridge_lambda)' in native_fit
+assert 'rpmd_ja_covariance_prior_ridge_valid(rho,ridge_lambda)' in native_fit
+assert 'covariance state objective mode has incompatible rho/ridge values' in native_fit
+solver_start = native_fit.index('CovarianceFitResult solve_covariance_reference(')
+solver_end = native_fit.index('CovarianceFitResult result;', solver_start)
+covariance_solver = native_fit[solver_start:solver_end]
+assert 'rpmd_ja_covariance_prior_ridge_valid(rho,ridge_lambda)' in covariance_solver
+assert 'rho>0.0&&ridge_lambda>0.0' in covariance_solver
+diagnose_start = native_fit.index('const double rho=parse_double("shrinkage_strength")')
+diagnose_end = native_fit.index('const std::string saved_optimizer_mode=', diagnose_start)
+covariance_diagnose = native_fit[diagnose_start:diagnose_end]
+assert 'rpmd_ja_covariance_prior_ridge_valid(rho,ridge_lambda)' in covariance_diagnose
+assert 'rho>0.0&&ridge_lambda>0.0' in covariance_diagnose
+assert 'choice.method=="JOINT_BLOCK"&&ridge_lambda==0.0' in native_fit
+assert 'NOT_USED_CENTERED_RIDGE_OBJECTIVE' in native_fit
+assert 'void test_covariance_prior_ridge_contract()' in source('tests/rpmd_ja_native_fit_cuda_test.cu')
+assert 'test_covariance_prior_ridge_contract();' in source('tests/rpmd_ja_native_fit_cuda_test.cu')
 assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
 assert "const double components[6]={dx[0]*dx[0],2.0*dx[0]*dx[1]" in native_fit
 assert "if(edge_sums)(*edge_sums)[6*e+k]+=components[k];" in native_fit
@@ -822,9 +845,9 @@ joint_ray_spectrum = native_fit.split("CovarianceJointRaySpectrum covariance_joi
 assert "eigen_small(solver" in joint_ray_spectrum and "system.factor" not in joint_ray_spectrum
 assert "covariance_joint_ray_spectrum(system.solver,inverse_d,update" in native_fit
 assert "covariance_joint_ray_spectrum(system.solver,inverse_s,update" in native_fit
-joint_ray_branch = covariance_optimizer.split('if(choice.method=="JOINT_BLOCK"){', 1)[1].split('}else{ray_attempt.status="NOT_USED_', 1)[0]
+joint_ray_branch = covariance_optimizer.split('if(choice.method=="JOINT_BLOCK"&&ridge_lambda==0.0){', 1)[1].split('}else{ray_attempt.status=choice.method==', 1)[0]
 assert "covariance_joint_ray_proposal(" in joint_ray_branch
-assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
+assert 'ray_attempt.status=choice.method=="JOINT_BLOCK"?"NOT_USED_CENTERED_RIDGE_OBJECTIVE":"NOT_USED_"+choice.method' in covariance_optimizer
 assert "ray_attempt.eigen_evaluations=joint_direction_result.ray_eigen_evaluations" in covariance_optimizer
 assert "joint_bfgs_line_search,joint_bfgs_line_search,&baseline.theta);" in covariance_optimizer
 assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="PROPOSAL_READY"') < covariance_optimizer.index("covariance_backtrack_armijo(")
@@ -846,7 +869,7 @@ assert 'fit.gradient_residual_reject_trials>0&&fit.failed_trial.failure_stage=="
 assert 'joint_selection.status=="DOMINANT_SUPPORT_CAP"' in covariance_optimizer
 assert 'result.method="GROUP_BFGS"' in native_fit
 assert 'selection_status="<<joint_selection.status' in covariance_optimizer
-assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
+assert 'ray_attempt.status=choice.method=="JOINT_BLOCK"?"NOT_USED_CENTERED_RIDGE_OBJECTIVE":"NOT_USED_"+choice.method' in covariance_optimizer
 assert legacy_optimizer.index("if(!accepted){") < legacy_optimizer.index("covariance_update_group_bfgs_history(")
 assert legacy_optimizer.index("covariance_update_group_bfgs_history(") < legacy_optimizer.index("z=std::move(next_z)")
 assert legacy_optimizer.index("z=std::move(next_z)") < legacy_optimizer.index("group_bfgs_history[updated_group]=std::move(group_bfgs_pending)")

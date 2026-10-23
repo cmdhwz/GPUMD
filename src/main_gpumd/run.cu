@@ -959,17 +959,22 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     options.kernel_table = tokens[8];
     options.raw_input_path = tokens[9];
     options.internal_mass_com = integrate.get_pimd_fix_com();
-    double* values[] = {&options.cutoff, &options.epsilon, &options.response_tolerance, &options.fd_step,
-                        &options.covariance_shrinkage};
-    for (int i = 0; i < 5; ++i) {
-      const std::size_t token = i < 4 ? static_cast<std::size_t>(4 + i) : 11;
+    double* values[] = {&options.cutoff, &options.epsilon, &options.response_tolerance, &options.fd_step};
+    for (int i = 0; i < 4; ++i) {
+      const std::size_t token = static_cast<std::size_t>(4 + i);
       char* end = nullptr;
       *values[i] = std::strtod(tokens[token].c_str(), &end);
       if (end == tokens[token].c_str() || *end != '\0' || !std::isfinite(*values[i]) || *values[i] <= 0.0)
-        PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance numeric arguments must be positive finite numbers.");
+        PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance non-rho numeric arguments must be positive finite numbers.");
     }
+    char* shrinkage_end=nullptr;options.covariance_shrinkage=std::strtod(tokens[11].c_str(),&shrinkage_end);
+    if(shrinkage_end==tokens[11].c_str()||*shrinkage_end!='\0'||!std::isfinite(options.covariance_shrinkage)||
+       options.covariance_shrinkage<0.0)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance shrinkage rho must be finite and non-negative.");
     if(options.covariance_feasibility&&std::abs(options.covariance_shrinkage-0.1)>8.0*std::numeric_limits<double>::epsilon())
       PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance feasibility requires shrinkage 0.1 for the A comparison.");
+    if(!rpmd_ja_covariance_prior_ridge_valid(options.covariance_shrinkage,options.covariance_ridge_lambda))
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance zero shrinkage rho requires a positive ridge lambda.");
     errno = 0;
     char* end = nullptr;
     const long long iterations = std::strtoll(tokens[13].c_str(), &end, 10);
