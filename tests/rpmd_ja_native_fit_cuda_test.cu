@@ -1243,6 +1243,20 @@ void test_native_m1_writer_reader_cross_neighbor_images_and_transport()
   const std::vector<int> types={0,1,0};const std::vector<std::string> symbols={"O","H","O"};
   const std::vector<double> masses={16.0,1.0,16.0};constexpr double cutoff=5.2;
   Graph third=make_graph(r0,types,box,cutoff);
+  Graph m0_graph=make_graph(r0,types,box,cutoff);
+  const NativeAdditivePackageEstimate m0_support_estimate=estimate_native_additive_package_size(m0_graph,n);
+  std::uint64_t m0_formula=native_additive_package_header_bytes;
+  for(const auto& site:m0_graph.sites){
+    const std::uint64_t z=site.size(),q=3*z;std::uint64_t base_slots=0;
+    for(const SiteEdge& edge:site)if(edge.edge_index>=0)++base_slots;
+    const std::uint64_t support_entries=std::min<std::uint64_t>(q*q,9*base_slots);
+    const std::uint64_t support_blocks=std::min<std::uint64_t>(z*z,base_slots);
+    const std::uint64_t dense_bytes=8*q*q,scalar_bytes=8+16*support_entries;
+    const std::uint64_t block_bytes=8+80*support_blocks;
+    m0_formula+=sizeof(std::int32_t)+16*z+q*sizeof(double)+sizeof(std::uint32_t)+
+      std::min(dense_bytes,std::min(scalar_bytes,block_bytes));
+  }
+  assert(m0_support_estimate.bytes==m0_formula);
   const auto& metadata=build_m1_local_basis(third,r0,types,symbols,masses,box,cutoff,1);
   assert(metadata.accepted_bridge_count==1&&metadata.added_parameter_count>0);
   const int p=third.parameter_count,base=third.base_parameter_count;
@@ -1255,29 +1269,31 @@ void test_native_m1_writer_reader_cross_neighbor_images_and_transport()
   for(auto& term:half.local_terms)if(term.atom_count==3){
     term.energy_share[0]=0.5;term.energy_share[1]=0.25;term.energy_share[2]=0.25;}
   RpmdJAReference reference;reference.number_of_atoms=n;reference.temperature=300.0;
-  reference.positions=r0;for(int i=0;i<9;++i)reference.cell[i]=box.cpu_h[i];
+  reference.masses=masses;reference.positions=r0;for(int i=0;i<9;++i)reference.cell[i]=box.cpu_h[i];
   const std::vector<double> raw_gradient(d,0.0);
   struct RoundTrip{RpmdJAAdditiveData package;std::vector<NativeAdditiveSiteBlock> blocks;};
-  auto round_trip=[&](const Graph& graph,const char* suffix){
+  auto round_trip=[&](const Graph& graph,const char* suffix,const std::uint32_t version){
     const std::string path=std::string("rpmd_ja_native_m1_writer_")+suffix+"_"+
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".bin";
     std::vector<NativeAdditiveSiteBlock> blocks;std::uint64_t estimated_bytes=0;
     {
       std::ofstream out(path,std::ios::binary);assert(out.good());out.write(additive_magic,8);
-      write(out,std::uint32_t(1));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(4));
+      write(out,version);write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(4));
       write(out,std::uint64_t(0));write(out,300.0);write(out,0.05);write(out,0.01);write(out,0.02);
       write(out,std::uint64_t(1));write(out,std::uint64_t(1));
       estimated_bytes=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);assert(out.good());
     }
     const NativeAdditivePackageEstimate prefit_estimate=estimate_native_additive_package_size(graph,n);
-    assert(prefit_estimate.bytes==estimated_bytes&&prefit_estimate.maximum_site_neighbors>0);
+    assert(prefit_estimate.bytes>=estimated_bytes&&prefit_estimate.maximum_site_neighbors>0);
     std::ifstream sized(path,std::ios::binary|std::ios::ate);assert(sized.good());
     assert(static_cast<std::uint64_t>(sized.tellg())==estimated_bytes);sized.close();
     blocks=build_native_additive_site_blocks(graph,theta,edge_linear,n);
     const RpmdJAAdditiveData package=read_rpmd_ja_additive(path,"test-raw.qraw",reference,4,raw_gradient);
+    assert(package.internal_mass_com==(version==6));
     assert(std::remove(path.c_str())==0);return RoundTrip{package,std::move(blocks)};
   };
-  const RoundTrip one_third=round_trip(third,"third");const RoundTrip one_half=round_trip(half,"half");
+  const RoundTrip one_third=round_trip(third,"third",5);const RoundTrip one_half=round_trip(half,"half",5);
+  const RoundTrip internal_com=round_trip(third,"internal_com",6);assert(internal_com.package.internal_mass_com);
   auto dense=[](const RpmdJASparseRows& sparse){
     const int dimension=static_cast<int>(sparse.offsets.size())-1;std::vector<double> result(static_cast<std::size_t>(dimension)*dimension,0.0);
     for(int row=0;row<dimension;++row)for(std::size_t index=sparse.offsets[row];index<sparse.offsets[row+1];++index)

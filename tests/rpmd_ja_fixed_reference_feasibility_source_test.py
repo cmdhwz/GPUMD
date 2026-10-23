@@ -418,10 +418,28 @@ assert 'independent_curvature_checked_tau!=tau' in fit
 assert '"M1_basis_fingerprint_fnv64","M1_parameter_names"' in fit
 assert 'test_native_m1_writer_reader_cross_neighbor_images_and_transport' in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 prepare_source = source("src/measure/rpmd_ja_qnep_prepare.cu")
+reference_source = source("src/measure/rpmd_ja_reference.cu")
+reference_header = source("src/measure/rpmd_ja_reference.cuh")
 assert 'expected_actions[alpha+1][probe]' in prepare_source
 assert 'read_rpmd_ja_reference(output_path)' in prepare_source
 assert 'block_matrix_action(*stored_matrices[matrix],stored_probes[probe])' in prepare_source
 assert 'rpmd_ja_file_io::remove_file(sidecar_path)' in prepare_source
+assert 'estimate_rpmd_ja_qnep_v3_max_serialized_bytes' in reference_header
+assert 'estimate_rpmd_ja_qnep_v3_max_serialized_bytes' in reference_source
+assert 'Bound the native prepare stream prefix, four block matrices, and stability footer' in reference_source
+assert 'add(21*sizeof(double)+2*sizeof(double))' in reference_source
+qnep_native_prefix = reference_source[reference_source.index('std::streampos write_rpmd_ja_qnep_v3_stream_prefix'):
+                                      reference_source.index('std::uint64_t rpmd_ja_model_fingerprint')]
+assert 'out.write(reinterpret_cast<const char*>(diagnostics), sizeof(diagnostics))' in qnep_native_prefix
+assert 'write_vector(out, std::vector<double>(diagnostics' not in qnep_native_prefix
+assert 'fixed diagnostics array without a vector-length field' in qnep_native_prefix
+qnep_prepare_test = source("tests/rpmd_ja_qnep_prepare_cuda_test.cu")
+assert 'actual_bytes>estimate_rpmd_ja_qnep_v3_max_serialized_bytes(r)' in qnep_prepare_test
+assert 'run_dense_h_upper_bound' in qnep_prepare_test and 'tile.rank!=0' in qnep_prepare_test
+assert 'full-rank D fixture did not exercise dense tile storage' in qnep_prepare_test
+assert 'qnep_size_metadata.types=header.types;qnep_size_metadata.masses=header.masses;qnep_size_metadata.positions=r0' in fit
+assert 'load_rpmd_ja_kernel_table(options.kernel_table,qnep_size_metadata)' in fit
+assert 'estimate_rpmd_ja_qnep_v3_max_serialized_bytes(qnep_size_metadata)' in fit
 assert "prioritize_soft?make_common_probe_set" in fit
 assert "rank_limit=maximum_probe_rank<0?internal:std::min(internal,maximum_probe_rank)" in fit
 assert "for(int k=0;k<16&&static_cast<int>(probes.size())<rank_limit;++k)" in fit
@@ -476,7 +494,35 @@ assert "test_blind_header_rejects_cell_mass_and_type_mismatches" in source("test
 assert "native_additive_package_header_bytes=sizeof(additive_magic)" in fit and \
        "native additive package size estimate does not match bytes written" in fit
 assert "static_cast<std::uint64_t>(sized.tellg())==estimated_bytes" in cuda_test
-assert "actual M1 version-2 package byte count differs from writer estimate" in integration_test
+additive_reader = source("src/measure/rpmd_ja_additive.cuh")
+assert "version < 1 || version > 6" in additive_reader
+assert "version == 2 || version == 4 || version == 6" in additive_reader
+assert "rpmd_ja_additive_max_expanded_elements" in additive_reader
+assert "local matrix exceeds the per-site element limit" in additive_reader
+offline_fitter = source("tools/rpmd_ja_fit_reference.py")
+offline_prepare = source("tools/rpmd_ja_qnep_prepare.py")
+assert "version = 6 if data.get(\"internal_mass_com\", False) else 5" in offline_fitter
+assert "version not in (1,2,3,4,5,6)" in offline_fitter
+assert "internal_mass_com=version in (2,4,6)" in offline_fitter
+assert "version not in (1, 2, 3, 4, 5, 6)" in offline_prepare
+assert 'count>q*q' in offline_prepare and 'entry_bytes>size-f.tell()' in offline_prepare
+assert "MAX_ADDITIVE_DENSE_ELEMENTS = _FITTER.MAX_ADDITIVE_DENSE_ELEMENTS" in offline_prepare
+assert "read_sparse_scalars" in additive_reader and "std::signbit(value)" in additive_reader
+assert "if(value!=0.0||std::signbit(value))" in fit
+assert "write(out,std::uint32_t(options.internal_mass_com?6:5))" in fit
+assert "publication_payload_restored?0:estimated_package_bytes" in fit
+assert "publication_payload_restored?0:\n    estimated_qnep_reference_bytes+qnep_sidecar_and_failure_reserve_bytes" in fit
+assert '<<" publication_payload_restored "<<(publication_payload_restored?1:0)' in fit
+assert "support_entries_upper_bound" in fit and "quadratic_bytes" not in fit[fit.index("NativeAdditivePackageEstimate estimate_native_additive_package_size("):fit.index("#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST", fit.index("NativeAdditivePackageEstimate estimate_native_additive_package_size("))]
+assert "actual additive package bytes exceed the conservative support bound" in fit
+assert "prefit_estimate.bytes>=estimated_bytes" in cuda_test
+assert "write_sparse_package(3)" in source("tests/rpmd_ja_additive_sparse_test.cpp")
+assert "write_sparse_package(4)" in source("tests/rpmd_ja_additive_sparse_test.cpp")
+assert "#undef NDEBUG" in source("tests/rpmd_ja_additive_sparse_test.cpp")
+assert "test_hand_authored_sparse_package_readers_without_hardlink_writer" in source("tests/rpmd_ja_additive_prepare_test.py")
+assert "bad_index_rejected" in source("tests/rpmd_ja_additive_sparse_test.cpp")
+assert "truncated_rejected" in source("tests/rpmd_ja_additive_sparse_test.cpp")
+assert "actual M1 version-6 package byte count differs from writer estimate" in integration_test
 assert "source_fnv64=0" in fit and "verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint)" in fit
 assert "write(out,raw_source_fingerprint)" in fit and "qraw_source_fnv64 \"<<identity.source_fnv64" in fit
 assert "covariance_a0_soft_mode_theta(a0)" in fit and "test_a0_soft_modes_use_covariance_baseline_point" in cuda_test
@@ -601,8 +647,10 @@ assert "const RpmdJAPrepareResourceObserver&,\n                                 
 assert "next_cg_witness_attempt(controller_journal)" in fit
 assert fit.index("next_cg_witness_attempt(controller_journal)") < fit.index("persist_controller_journal();", fit.index("next_cg_witness_attempt(controller_journal)"))
 assert "feasibility_cg_witness_attempt=0" not in fit
-assert "checked_multiplicity_bytes(estimated_package_bytes,2)" in fit
-assert "checked_multiplicity_bytes(raw_bytes,2)" in fit
+assert "const std::uint64_t package_staging_peak_bytes=publication_payload_restored?0:estimated_package_bytes" in fit
+assert "const std::uint64_t reference_staging_peak_bytes=publication_payload_restored?0:" in fit
+assert "persistent_disk_bytes+=persistent_reference_bytes" in fit
+assert "checked_multiplicity_bytes(raw_bytes,2)" not in fit
 assert "host_graph_m0_bytes+host_graph_m1_bytes" in fit
 assert "CONSERVATIVE_KNOWN_HOST_OBJECTS_NOT_COMPLETE" in fit
 assert "CONSERVATIVE_KNOWN_DISK_OBJECTS_NOT_COMPLETE" in fit

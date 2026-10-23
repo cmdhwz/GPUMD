@@ -14,6 +14,7 @@ import numpy as np
 RAW_MAGIC = b"GPJQRAW\0"
 RAW_LAYOUT = b"xyz_soa;derivative_input_rows_output_columns\0"
 ADD_MAGIC = b"GPJAADD1"
+MAX_ADDITIVE_DENSE_ELEMENTS = 4_000_000
 
 
 def _stable_norm(values):
@@ -119,15 +120,21 @@ def _validate_additive(a):
     sites = a["sites"]
     if len(sites) != n: raise ValueError("wrong site count")
     edges = set()
+    expanded_elements = 0
     for i,s in enumerate(sites):
         if int(s["i"]) != i: raise ValueError("sites must be in original atom order")
         es = s["neighbors"]
         keys = [(int(j),tuple(map(int,img))) for j,img in es]
         if len(keys) != len(set(keys)) or any(j < 0 or j >= n or j == i or len(img)!=3 for j,img in keys):
             raise ValueError("invalid or duplicate neighbor image key")
-        z=len(keys); ell=np.asarray(s["ell"],float); b=np.asarray(s["B"],float)
+        z=len(keys)
+        if z>3*n: raise ValueError("invalid local coordination")
+        ell=np.asarray(s["ell"],float); b=np.asarray(s["B"],float)
         if ell.shape != (z,3) or b.shape != (3*z,3*z) or not np.isfinite(ell).all() or not np.isfinite(b).all():
             raise ValueError("invalid local coefficient dimensions or values")
+        expanded_elements += (3*z)*(3*z)
+        if expanded_elements > MAX_ADDITIVE_DENSE_ELEMENTS:
+            raise ValueError(f"GPJAADD1 expanded local matrices exceed {MAX_ADDITIVE_DENSE_ELEMENTS} elements at site {i} ({3*z}x{3*z})")
         scale=float(np.max(np.abs(b))) if b.size else 0.0
         if scale and np.linalg.norm(b/scale-(b/scale).T) > 1e-12*np.linalg.norm(b/scale): raise ValueError("asymmetric local B")
         edges.update((i,j,img) for j,img in keys)
@@ -149,19 +156,56 @@ def _unique_temp_path(destination):
     return Path(name)
 
 
+def _write_additive_stream(f, data):
+    f.write(ADD_MAGIC)
+    version = 6 if data.get("internal_mass_com", False) else 5
+    f.write(struct.pack("<IIiiQ",version,ENDIAN,data["n"],data["beads"],data["source_fingerprint"]))
+    f.write(struct.pack("<ddddQQ",data["temperature"],data["epsilon"],data["response_max"],data["response_tolerance"],data["training_frames"],data["validation_frames"]))
+    for s in data["sites"]:
+        z=len(s["neighbors"]); f.write(struct.pack("<i",z))
+        for j,img in s["neighbors"]: f.write(struct.pack("<4i",j,*img))
+        np.asarray(s["ell"],dtype="<f8").tofile(f)
+        b = np.asarray(s["B"],dtype="<f8")
+        q = 3*z
+        entries = (b != 0.0) | np.signbit(b)
+        scalar_count = int(np.count_nonzero(entries))
+        blocks = entries.reshape(z, 3, z, 3).any(axis=(1, 3))
+        block_count = int(np.count_nonzero(blocks))
+        dense_bytes = 8*q*q
+        scalar_bytes = 8 + 16*scalar_count
+        block_bytes = 8 + 80*block_count
+        if dense_bytes <= scalar_bytes and dense_bytes <= block_bytes:
+            f.write(struct.pack("<I",0))
+            b.tofile(f)
+        elif scalar_bytes <= block_bytes:
+            f.write(struct.pack("<I",1))
+            f.write(struct.pack("<Q",scalar_count))
+            record_dtype = np.dtype([("row","<i4"),("column","<i4"),("value","<f8")])
+            for row in range(q):
+                columns = np.flatnonzero(entries[row])
+                if columns.size:
+                    records = np.empty(columns.size,dtype=record_dtype)
+                    records["row"] = row
+                    records["column"] = columns
+                    records["value"] = b[row,columns]
+                    f.write(records.tobytes())
+        else:
+            f.write(struct.pack("<I",2))
+            f.write(struct.pack("<Q",block_count))
+            for row in range(z):
+                for column in range(z):
+                    if blocks[row,column]:
+                        f.write(struct.pack("<ii",row,column))
+                        np.asarray(b[3*row:3*row+3,3*column:3*column+3],dtype="<f8").tofile(f)
+
+
 def write_additive(path, data):
     _validate_additive(data); path=Path(path)
     if path.exists(): raise FileExistsError(path)
     tmp=_unique_temp_path(path)
     try:
         with tmp.open("wb") as f:
-            f.write(ADD_MAGIC)
-            f.write(struct.pack("<IIiiQ",2 if data.get("internal_mass_com", False) else 1,ENDIAN,data["n"],data["beads"],data["source_fingerprint"]))
-            f.write(struct.pack("<ddddQQ",data["temperature"],data["epsilon"],data["response_max"],data["response_tolerance"],data["training_frames"],data["validation_frames"]))
-            for s in data["sites"]:
-                z=len(s["neighbors"]); f.write(struct.pack("<i",z))
-                for j,img in s["neighbors"]: f.write(struct.pack("<4i",j,*img))
-                np.asarray(s["ell"],dtype="<f8").tofile(f); np.asarray(s["B"],dtype="<f8").tofile(f)
+            _write_additive_stream(f,data)
             f.flush(); os.fsync(f.fileno())
         os.link(tmp,path)
         tmp.unlink()
@@ -170,22 +214,92 @@ def write_additive(path, data):
 
 
 def read_additive(path):
-    with Path(path).open("rb") as f:
+    path = Path(path)
+    with path.open("rb") as f:
+        size = path.stat().st_size
+        if size < 80: raise ValueError("GPJAADD1 package is shorter than its header")
         if _exact(f,8)!=ADD_MAGIC: raise ValueError("wrong GPJAADD1 magic")
         version,endian,n,p,fp=struct.unpack("<IIiiQ",_exact(f,24))
-        if version not in (1,2) or endian != ENDIAN: raise ValueError("unsupported additive package version")
+        if version not in (1,2,3,4,5,6) or endian != ENDIAN: raise ValueError("unsupported additive package version")
+        if n < 2 or p < 1 or n > (size-80)//4:
+            raise ValueError("GPJAADD1 dimensions exceed the declared package length")
         temp,eps,rmax,rtol,ntrain,nval=struct.unpack("<ddddQQ",_exact(f,48))
         sites=[]
+        expanded_elements = 0
         for i in range(n):
             (z,)=struct.unpack("<i",_exact(f,4))
             if z<0 or z>3*n: raise ValueError("invalid local coordination")
+            q=3*z
+            expanded_elements += q*q
+            if expanded_elements > MAX_ADDITIVE_DENSE_ELEMENTS:
+                raise ValueError(f"GPJAADD1 expanded local matrices exceed {MAX_ADDITIVE_DENSE_ELEMENTS} elements at site {i} ({q}x{q})")
+            need=16*z+24*z
+            if need>size-f.tell(): raise ValueError(f"truncated GPJAADD1 site {i} ({q}x{q})")
             neigh=[struct.unpack("<4i",_exact(f,16)) for _ in range(z)]
             ell=np.frombuffer(_exact(f,24*z),"<f8").copy().reshape(z,3)
-            b=np.frombuffer(_exact(f,8*(3*z)**2),"<f8").copy().reshape(3*z,3*z)
+            if version>=5:
+                (mode,)=struct.unpack("<I",_exact(f,4))
+                if mode==0:
+                    dense_bytes=8*q*q
+                    if dense_bytes>size-f.tell(): raise ValueError(f"truncated GPJAADD1 dense quadratic at site {i} ({q}x{q})")
+                    b=np.frombuffer(_exact(f,dense_bytes),"<f8").copy().reshape(q,q)
+                elif mode==1:
+                    (count,)=struct.unpack("<Q",_exact(f,8))
+                    if count>q*q: raise ValueError(f"invalid GPJAADD1 sparse quadratic count at site {i} ({q}x{q})")
+                    payload_bytes=count*16
+                    if payload_bytes>size-f.tell(): raise ValueError(f"truncated GPJAADD1 sparse quadratic at site {i} ({q}x{q})")
+                    payload=_exact(f,payload_bytes)
+                    record_dtype=np.dtype([("row","<i4"),("column","<i4"),("value","<f8")])
+                    records=np.frombuffer(payload,dtype=record_dtype)
+                    rows,columns,values=records["row"],records["column"],records["value"]
+                    indexes=rows.astype(np.int64)*q+columns
+                    if np.any(rows<0) or np.any(rows>=q) or np.any(columns<0) or np.any(columns>=q) or \
+                       np.any(indexes[1:]<=indexes[:-1]) or not np.isfinite(values).all() or \
+                       np.any((values==0.0)&~np.signbit(values)):
+                        raise ValueError(f"invalid GPJAADD1 sparse quadratic entries at site {i} ({q}x{q})")
+                    b=np.zeros((q,q),dtype="<f8")
+                    b[rows,columns]=values
+                elif mode==2:
+                    (count,)=struct.unpack("<Q",_exact(f,8))
+                    if count>z*z: raise ValueError(f"invalid GPJAADD1 sparse 3x3 block count at site {i} ({z}x{z})")
+                    payload_bytes=count*80
+                    if payload_bytes>size-f.tell(): raise ValueError(f"truncated GPJAADD1 sparse 3x3 blocks at site {i} ({z}x{z})")
+                    block_dtype=np.dtype([("row","<i4"),("column","<i4"),("value","<f8",(9,))])
+                    records=np.frombuffer(_exact(f,payload_bytes),dtype=block_dtype)
+                    rows,columns,values=records["row"],records["column"],records["value"]
+                    indexes=rows.astype(np.int64)*z+columns
+                    if np.any(rows<0) or np.any(rows>=z) or np.any(columns<0) or np.any(columns>=z) or \
+                       np.any(indexes[1:]<=indexes[:-1]) or not np.isfinite(values).all():
+                        raise ValueError(f"invalid GPJAADD1 sparse 3x3 block entries at site {i} ({z}x{z})")
+                    b=np.zeros((q,q),dtype="<f8")
+                    for row,column,block in zip(rows,columns,values):
+                        b[3*row:3*row+3,3*column:3*column+3]=block.reshape(3,3)
+                else:
+                    raise ValueError(f"invalid GPJAADD1 quadratic mode {mode} at site {i} ({q}x{q})")
+            elif version>=3:
+                (count,)=struct.unpack("<Q",_exact(f,8))
+                if count>q*q: raise ValueError(f"invalid GPJAADD1 sparse quadratic count at site {i} ({q}x{q})")
+                payload_bytes=count*16
+                if payload_bytes>size-f.tell(): raise ValueError(f"truncated GPJAADD1 sparse quadratic at site {i} ({q}x{q})")
+                payload=_exact(f,payload_bytes)
+                record_dtype=np.dtype([("row","<i4"),("column","<i4"),("value","<f8")])
+                records=np.frombuffer(payload,dtype=record_dtype)
+                rows,columns,values=records["row"],records["column"],records["value"]
+                indexes=rows.astype(np.int64)*q+columns
+                if np.any(rows<0) or np.any(rows>=q) or np.any(columns<0) or np.any(columns>=q) or \
+                   np.any(indexes[1:]<=indexes[:-1]) or not np.isfinite(values).all() or \
+                   np.any((values==0.0)&~np.signbit(values)):
+                    raise ValueError(f"invalid GPJAADD1 sparse quadratic entries at site {i} ({q}x{q})")
+                b=np.zeros((q,q),dtype="<f8")
+                b[rows,columns]=values
+            else:
+                dense_bytes=8*q*q
+                if dense_bytes>size-f.tell(): raise ValueError(f"truncated GPJAADD1 dense quadratic at site {i} ({q}x{q})")
+                b=np.frombuffer(_exact(f,dense_bytes),"<f8").copy().reshape(q,q)
             sites.append(dict(i=i,neighbors=[(x[0],tuple(x[1:])) for x in neigh],ell=ell,B=b))
         if f.read(1): raise ValueError("trailing data in additive package")
     a=dict(n=n,beads=p,source_fingerprint=fp,temperature=temp,epsilon=eps,response_max=rmax,
-           internal_mass_com=version==2,
+           internal_mass_com=version in (2,4,6),
            response_tolerance=rtol,training_frames=ntrain,validation_frames=nval,sites=sites)
     _validate_additive(a); return a
 

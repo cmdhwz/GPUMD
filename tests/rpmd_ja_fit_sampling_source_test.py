@@ -557,6 +557,29 @@ assert "test_covariance_state_parser_accepts_lf_and_crlf" in source("tests/rpmd_
 assert "test_covariance_state_tau_comparison_is_relative_for_small_values" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_failed_trial_does_not_replace_last_valid_point" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_covariance_prior_mixing_formula" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+budget_result_names = native_fit[native_fit.index("const char* covariance_budget_result_name("):native_fit.index("bool covariance_expected_budget_stop(")]
+group_bfgs_names = native_fit[native_fit.index("const char* covariance_group_bfgs_update_name("):native_fit.index("struct CovarianceBacktrackingResult")]
+assert "default:break;" in budget_result_names and 'return "UNKNOWN";' in budget_result_names
+assert "default:break;" in group_bfgs_names and 'return "UNKNOWN";' in group_bfgs_names
+scratch_init_start = native_fit.index("NativeFitScratchOwnership own_scratch{")
+scratch_init_end = native_fit.index(";", scratch_init_start)
+scratch_init = native_fit[scratch_init_start:scratch_init_end]
+for staged_field in ("publication_stage_output_path", 'publication_stage_output_path+".stability"',
+                     'publication_stage_output_path+".tmp"', 'publication_stage_output_path+".stability.tmp"'):
+    assert staged_field in scratch_init
+assert "own_scratch.staged_output=" not in native_fit and "own_scratch.staged_sidecar=" not in native_fit
+for candidate_push in (
+    "development_candidates.push_back({candidate.family,candidate.index,candidate.fit.converged,\n        candidate.development_objective,candidate.development_uncertainty,{}, {}});",
+    "development_candidates.push_back({family,index,candidate.development_pass,candidate.development_objective,\n            candidate.development_uncertainty,{}, {}});",
+    "development_candidates.push_back({family,index,false,std::numeric_limits<double>::infinity(),\n          std::numeric_limits<double>::quiet_NaN(),{}, {}});",
+):
+    assert candidate_push in native_fit
+assert "#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST\nbool covariance_directional_displacement_representable" in native_fit
+assert "#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST\nstd::vector<NativeAdditiveSiteBlock> build_native_additive_site_blocks" in native_fit
+curvature_check = native_fit[native_fit.index("CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature("):
+    native_fit.index("CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(")+14000]
+assert "const CovarianceObjectiveChange& coarse=pair.coarse" not in curvature_check
+assert "const CovarianceObjectiveChange& fine=pair.fine" not in curvature_check
 assert "test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 probe_session_test = source("tests/rpmd_ja_native_fit_cuda_test.cu").split("void test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly()", 1)[1].split("void test_covariance_probe_refinement", 1)[0]
 assert "covariance_bounded_inverse_modes(system.solver,session,baseline" in probe_session_test

@@ -241,7 +241,7 @@ void run_actual_m1_writer_prepare_readback(const std::string& base)
   std::uint64_t estimated_package_bytes=0;
   {
     std::ofstream out(pack,std::ios::binary);if(!out)throw std::runtime_error("cannot create actual M1 integration package");
-    out.write(additive_magic,8);write(out,std::uint32_t(2));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(8));
+    out.write(additive_magic,8);write(out,std::uint32_t(6));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(8));
     write(out,rpmd_ja_model_fingerprint(raw));write(out,300.0);write(out,1.0e-8);write(out,0.0);write(out,0.02);
     write(out,std::uint64_t(1));write(out,std::uint64_t(1));
     estimated_package_bytes=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);
@@ -249,12 +249,12 @@ void run_actual_m1_writer_prepare_readback(const std::string& base)
   }
   std::ifstream sized(pack,std::ios::binary|std::ios::ate);
   if(!sized||static_cast<std::uint64_t>(sized.tellg())!=estimated_package_bytes)
-    throw std::runtime_error("actual M1 version-2 package byte count differs from writer estimate");
+    throw std::runtime_error("actual M1 version-6 package byte count differs from writer estimate");
   sized.close();
   const RpmdJAAdditiveData additive=read_rpmd_ja_additive(pack,raw,baseline,8,std::vector<double>(d,0.0));
   if(!additive.internal_mass_com||additive.k.values.empty()||
      std::abs(additive_sparse_value(additive.k,0,2))+std::abs(additive_sparse_value(additive.k,2,0))<=1.0e-10)
-    throw std::runtime_error("actual M1 writer package lost its version-2 COM identity or O-O cross-neighbor K");
+    throw std::runtime_error("actual M1 writer package lost its version-6 COM identity or O-O cross-neighbor K");
   std::array<double,4> package_entry_error_over_limits{};bool package_entries_checked=false;
   RpmdJAPrepareResourcePlan prepare_resource_plan;bool prepare_resource_plan_seen=false;
   std::vector<std::string> prepare_allocation_requests;
@@ -361,7 +361,7 @@ void run_actual_m1_writer_prepare_readback(const std::string& base)
   if(result.backend!=2||result.number_of_atoms!=n||!result.stability_checked||result.block_dynamical.tiles.empty()||
      result.block_site_transpose[0].tiles.empty()||result.mechanical_policy!=
        "native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1;beads=8;derivative=3")
-    throw std::runtime_error("actual M1 version-2 package did not pass prepare/readback policy checks");
+    throw std::runtime_error("actual M1 version-6 package did not pass prepare/readback policy checks");
   for(int row=0;row<d;++row)for(int column=0;column<d;++column){
     const double expected_package=expected.k[static_cast<std::size_t>(row)*d+column];
     const double actual_package=additive_sparse_value(additive.k,row,column);

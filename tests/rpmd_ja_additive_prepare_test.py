@@ -106,6 +106,296 @@ def _fixture(directory):
     return raw, kernel, pack_path, output, pack, positions, np.diag(cell[:9].reshape(3,3))
 
 
+def test_sparse_additive_v5_v6_roundtrip_and_dense_legacy_compatibility():
+    with tempfile.TemporaryDirectory() as name:
+        raw, _kernel, pack_path, _output, pack, _positions, _cell = _fixture(Path(name))
+        fitter_spec = importlib.util.spec_from_file_location("fit_sparse_compat", ROOT / "tools" / "rpmd_ja_fit_reference.py")
+        fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
+        pack["source_fingerprint"] = qprep._fnv64(raw)
+        pack["sites"][0]["B"][0, 0] = -0.0
+
+        def legacy_package(path, version):
+            with path.open("wb") as stream:
+                stream.write(fitter.ADD_MAGIC)
+                stream.write(struct.pack("<IIiiQ",version,fitter.ENDIAN,pack["n"],pack["beads"],pack["source_fingerprint"]))
+                stream.write(struct.pack("<ddddQQ",pack["temperature"],pack["epsilon"],pack["response_max"],
+                                         pack["response_tolerance"],pack["training_frames"],pack["validation_frames"]))
+                for site in pack["sites"]:
+                    z=len(site["neighbors"]); stream.write(struct.pack("<i",z))
+                    for atom,image in site["neighbors"]: stream.write(struct.pack("<4i",atom,*image))
+                    np.asarray(site["ell"],dtype="<f8").tofile(stream)
+                    np.asarray(site["B"],dtype="<f8").tofile(stream)
+
+        pack_path.unlink()
+        fitter.write_additive(pack_path,pack)
+        assert struct.unpack_from("<I",pack_path.read_bytes(),8)[0] == 5
+        dense_size=80+sum(4+16*len(site["neighbors"])+24*len(site["neighbors"])+8*(3*len(site["neighbors"]))**2
+                           for site in pack["sites"])
+        assert pack_path.stat().st_size < dense_size
+        loaded=fitter.read_additive(pack_path)
+        assert not loaded["internal_mass_com"]
+        assert np.signbit(loaded["sites"][0]["B"][0,0])
+        assert qprep.read_additive(pack_path,expected_n=pack["n"])["internal_mass_com"] is False
+
+        package_bytes=pack_path.read_bytes()
+        first_entry=80+4+16*len(pack["sites"][0]["neighbors"])+24*len(pack["sites"][0]["neighbors"])+4+8
+        for suffix,mutate in (
+            ("bad_index",lambda data: struct.pack_into("<i",data,first_entry,3*len(pack["sites"][0]["neighbors"]))),
+            ("positive_zero",lambda data: struct.pack_into("<d",data,first_entry+8,0.0)),
+        ):
+            damaged=bytearray(package_bytes); mutate(damaged)
+            bad_path=Path(name)/(suffix+".gpjaadd"); bad_path.write_bytes(damaged)
+            try:
+                qprep.read_additive(bad_path)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"sparse additive {suffix} was accepted")
+        truncated=Path(name)/"truncated_sparse.gpjaadd"; truncated.write_bytes(package_bytes[:-1])
+        try:
+            qprep.read_additive(truncated)
+        except ValueError as exc:
+            assert "truncated" in str(exc)
+        else:
+            raise AssertionError("truncated sparse additive package was accepted")
+
+        pack["internal_mass_com"] = True
+        pack_path.unlink(); fitter.write_additive(pack_path,pack)
+        assert struct.unpack_from("<I",pack_path.read_bytes(),8)[0] == 6
+        com=fitter.read_additive(pack_path)
+        assert com["internal_mass_com"] and np.signbit(com["sites"][0]["B"][0,0])
+
+        for version in (1,2):
+            old_path=Path(name)/f"legacy_v{version}.gpjaadd"; legacy_package(old_path,version)
+            old=fitter.read_additive(old_path)
+            assert old["internal_mass_com"] == (version==2)
+            np.testing.assert_array_equal(old["sites"][0]["B"],pack["sites"][0]["B"])
+
+
+def test_hand_authored_sparse_package_readers_without_hardlink_writer():
+    fitter_spec = importlib.util.spec_from_file_location("fit_sparse_hand_authored", ROOT / "tools" / "rpmd_ja_fit_reference.py")
+    fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
+    matrices = [np.diag([-0.0, 2.0, 3.0]), np.diag([1.0, 4.0, 5.0])]
+    matrices[0][0, 1] = matrices[0][1, 0] = 0.25
+
+    def package_bytes(version):
+        data = bytearray(fitter.ADD_MAGIC)
+        data.extend(struct.pack("<IIiiQ",version,fitter.ENDIAN,2,8,1234))
+        data.extend(struct.pack("<ddddQQ",300.0,0.01,0.0,0.1,4,2))
+        for center in range(2):
+            neighbor = 1-center
+            data.extend(struct.pack("<i4i",1,neighbor,0,0,0))
+            data.extend(np.zeros(3,dtype="<f8").tobytes())
+            values = matrices[center].reshape(-1)
+            entries = [(index//3,index%3,float(value)) for index,value in enumerate(values)
+                       if value != 0.0 or np.signbit(value)]
+            data.extend(struct.pack("<Q",len(entries)))
+            for row,column,value in entries:
+                data.extend(struct.pack("<iid",row,column,value))
+        return data
+
+    with tempfile.TemporaryDirectory() as name:
+        for version in (3,4):
+            path=Path(name)/f"hand_v{version}.gpjaadd"; path.write_bytes(package_bytes(version))
+            for reader in (fitter.read_additive,qprep.read_additive):
+                loaded=reader(path)
+                assert loaded["internal_mass_com"] == (version==4)
+                np.testing.assert_array_equal(loaded["sites"][0]["B"],matrices[0])
+                assert np.signbit(loaded["sites"][0]["B"][0,0])
+
+        valid=package_bytes(3)
+        first_entry=80+4+16+24+8
+        for suffix,mutate in (
+            ("index",lambda data: struct.pack_into("<i",data,first_entry,3)),
+            ("positive_zero",lambda data: struct.pack_into("<d",data,first_entry+8,0.0)),
+        ):
+            damaged=bytearray(valid); mutate(damaged); path=Path(name)/(suffix+".gpjaadd"); path.write_bytes(damaged)
+            for reader in (fitter.read_additive,qprep.read_additive):
+                try: reader(path)
+                except ValueError: pass
+                else: raise AssertionError(f"hand-authored sparse {suffix} was accepted")
+        bad_version=bytearray(valid); struct.pack_into("<I",bad_version,8,7)
+        invalid=Path(name)/"bad_version.gpjaadd"; invalid.write_bytes(bad_version)
+        try: qprep.read_additive(invalid)
+        except ValueError: pass
+        else: raise AssertionError("unsupported hand-authored sparse version was accepted")
+        truncated=Path(name)/"truncated.gpjaadd"; truncated.write_bytes(valid[:-1])
+        try: qprep.read_additive(truncated)
+        except ValueError as exc: assert "truncated" in str(exc)
+        else: raise AssertionError("truncated hand-authored sparse package was accepted")
+
+
+def test_additive_modes_and_expansion_limits():
+    with tempfile.TemporaryDirectory() as name:
+        fitter_spec = importlib.util.spec_from_file_location("fit_additive_modes", ROOT / "tools" / "rpmd_ja_fit_reference.py")
+        fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
+        pack_path = Path(name)/"modes.gpjaadd"
+        n=3
+        pack={"n":n,"beads":8,"source_fingerprint":1234,"temperature":300.,"epsilon":0.01,
+              "response_max":0.,"response_tolerance":0.1,"training_frames":4,"validation_frames":2,
+              "sites":[dict(i=i,neighbors=[((i+1)%n,(0,0,0)),((i-1)%n,(0,0,0))],
+                             ell=np.zeros((2,3)),B=np.zeros((6,6))) for i in range(n)]}
+        dense = np.arange(1., 37.).reshape(6, 6); dense = dense + dense.T
+        dense[0,0] = -0.0
+        pack["sites"][0]["B"] = dense
+        scalar = np.zeros((6, 6)); scalar[0, 1] = scalar[1, 0] = 0.25; scalar[2, 2] = -0.0
+        pack["sites"][1]["B"] = scalar
+        block = np.zeros((6, 6)); block[:3, :3] = [[1., 2., 3.], [2., -0.0, 4.], [3., 4., 5.]]
+        cross = np.array([[.125,.25,.375],[.5,.625,.75],[.875,1.,1.125]])
+        block[:3, 3:] = cross; block[3:, :3] = cross.T
+        pack["sites"][2]["B"] = block
+        fitter._validate_additive(pack)
+        with pack_path.open("wb") as stream:
+            fitter._write_additive_stream(stream,pack)
+        payload = pack_path.read_bytes()
+        assert struct.unpack_from("<I", payload, 8)[0] == 5
+        modes = []
+        mode_offsets = []
+        offset = 80
+        for site in pack["sites"]:
+            z = len(site["neighbors"]); q = 3*z
+            offset += 4 + 16*z + 24*z
+            mode_offsets.append(offset)
+            mode = struct.unpack_from("<I", payload, offset)[0]; modes.append(mode); offset += 4
+            if mode == 0:
+                offset += 8*q*q
+            elif mode == 1:
+                count = struct.unpack_from("<Q", payload, offset)[0]; offset += 8 + 16*count
+            else:
+                count = struct.unpack_from("<Q", payload, offset)[0]; offset += 8 + 80*count
+        assert modes == [0, 1, 2]
+        assert offset == len(payload)
+        legacy_dense_size = 80 + sum(4+16*len(s["neighbors"])+24*len(s["neighbors"])+8*(3*len(s["neighbors"]))**2
+                                     for s in pack["sites"])
+        assert len(payload) < legacy_dense_size
+        loaded = fitter.read_additive(pack_path)
+        for site,expected in zip(loaded["sites"],(dense,scalar,block)):
+            np.testing.assert_array_equal(site["B"].view(np.uint64), expected.view(np.uint64))
+        assert np.signbit(loaded["sites"][1]["B"][2, 2])
+        assert np.signbit(loaded["sites"][0]["B"][0, 0])
+        assert np.signbit(loaded["sites"][2]["B"][1, 1])
+        assert loaded["sites"][2]["B"][1, 4] == loaded["sites"][2]["B"][4, 1] == 0.625
+        prepared = qprep.read_additive(pack_path)
+        for site,expected in zip(prepared["sites"],(dense,scalar,block)):
+            np.testing.assert_array_equal(site["B"].view(np.uint64), expected.view(np.uint64))
+
+        for suffix, mutate in (
+            ("bad_mode", lambda data: struct.pack_into("<I", data, mode_offsets[0], 3)),
+            ("bad_block_index", lambda data: struct.pack_into("<i", data,
+                mode_offsets[2]+4+8, len(pack["sites"][2]["neighbors"]))),
+        ):
+            damaged = bytearray(payload); mutate(damaged)
+            bad_path = Path(name)/(suffix+".gpjaadd"); bad_path.write_bytes(damaged)
+            for reader in (fitter.read_additive, qprep.read_additive):
+                try: reader(bad_path)
+                except ValueError: pass
+                else: raise AssertionError(f"{suffix} additive package was accepted")
+        truncated = Path(name)/"truncated_block.gpjaadd"; truncated.write_bytes(payload[:-1])
+        for reader in (fitter.read_additive, qprep.read_additive):
+            try: reader(truncated)
+            except ValueError as exc: assert "truncated" in str(exc)
+            else: raise AssertionError("truncated sparse 3x3 package was accepted")
+
+        n = 1000
+        malformed = bytearray(fitter.ADD_MAGIC)
+        malformed.extend(struct.pack("<IIiiQ", 5, fitter.ENDIAN, n, 8, 1234))
+        malformed.extend(struct.pack("<ddddQQ", 300., 0.01, 0., 0.1, 4, 2))
+        malformed.extend(struct.pack("<i", 3*n)); malformed.extend(b"\0\0\0\0"*(n-1))
+        oversized = Path(name)/"oversized_expansion.gpjaadd"; oversized.write_bytes(malformed)
+        for reader in (fitter.read_additive, qprep.read_additive):
+            try: reader(oversized)
+            except ValueError as exc: assert "expanded local matrices" in str(exc)
+            else: raise AssertionError("oversized sparse local matrix was expanded")
+
+
+def test_additive_writer_rejects_reader_expansion_limit_before_temp_creation():
+    fitter_spec = importlib.util.spec_from_file_location("fit_writer_expansion_limit", ROOT / "tools" / "rpmd_ja_fit_reference.py")
+    fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
+    n=3
+    pack={"n":n,"beads":8,"source_fingerprint":1234,"temperature":300.,"epsilon":0.01,
+          "response_max":0.,"response_tolerance":0.1,"training_frames":4,"validation_frames":2,
+          "sites":[dict(i=i,neighbors=[((i+1)%n,(0,0,0)),((i-1)%n,(0,0,0))],
+                         ell=np.zeros((2,3)),B=np.zeros((6,6))) for i in range(n)]}
+    with tempfile.TemporaryDirectory() as name:
+        destination=Path(name)/"over_limit.gpjaadd"
+        old_limit=fitter.MAX_ADDITIVE_DENSE_ELEMENTS
+        fitter.MAX_ADDITIVE_DENSE_ELEMENTS=100
+        try:
+            try: fitter.write_additive(destination,pack)
+            except ValueError as exc:
+                assert "exceed 100 elements at site 2 (6x6)" in str(exc)
+            else: raise AssertionError("additive writer published a package its reader rejects")
+        finally:
+            fitter.MAX_ADDITIVE_DENSE_ELEMENTS=old_limit
+        assert not destination.exists()
+        assert not list(Path(name).glob(".over_limit.gpjaadd.*.tmp"))
+
+
+def test_additive_writer_and_readers_reject_coordination_over_reader_limit():
+    fitter_spec = importlib.util.spec_from_file_location("fit_writer_coordination_limit", ROOT / "tools" / "rpmd_ja_fit_reference.py")
+    fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
+    n,z=2,7
+    neighbors=[]
+    for center in range(n):
+        offsets=range(-3,4) if center==0 else range(3,-4,-1)
+        neighbors.append([((1-center,(offset,0,0))) for offset in offsets])
+    pack={"n":n,"beads":8,"source_fingerprint":1234,"temperature":300.,"epsilon":0.01,
+          "response_max":0.,"response_tolerance":0.1,"training_frames":4,"validation_frames":2,
+          "sites":[dict(i=i,neighbors=neighbors[i],ell=np.zeros((z,3)),B=np.zeros((3*z,3*z))) for i in range(n)]}
+    with tempfile.TemporaryDirectory() as name:
+        destination=Path(name)/"over_coordination.gpjaadd"
+        try: fitter.write_additive(destination,pack)
+        except ValueError as exc: assert "invalid local coordination" in str(exc)
+        else: raise AssertionError("additive writer accepted coordination rejected by readers")
+        assert not destination.exists()
+        assert not list(Path(name).glob(".over_coordination.gpjaadd.*.tmp"))
+
+        malformed=Path(name)/"reader_over_coordination.gpjaadd"
+        with malformed.open("wb") as stream:
+            stream.write(fitter.ADD_MAGIC)
+            stream.write(struct.pack("<IIiiQ",5,fitter.ENDIAN,n,8,1234))
+            stream.write(struct.pack("<ddddQQ",300.,0.01,0.,0.1,4,2))
+            for edges in neighbors:
+                stream.write(struct.pack("<i",z))
+                for atom,image in edges: stream.write(struct.pack("<4i",atom,*image))
+                stream.write(np.zeros((z,3),dtype="<f8").tobytes())
+                stream.write(struct.pack("<I",0))
+                stream.write(np.zeros((3*z,3*z),dtype="<f8").tobytes())
+        for reader in (fitter.read_additive,qprep.read_additive):
+            try: reader(malformed)
+            except ValueError as exc: assert "local coordination" in str(exc)
+            else: raise AssertionError("reader accepted coordination above 3*n")
+
+
+def test_prepare_reader_accepts_structurally_valid_package_over_64_mib():
+    with tempfile.TemporaryDirectory() as name:
+        path = Path(name)/"large.gpjaadd"
+        n = 111111
+        matrix = np.ones((6, 6),dtype="<f8")
+        scalar_records = b"".join(struct.pack("<iid",row,column,float(matrix[row,column]))
+                                   for row in range(6) for column in range(6))
+        endpoint_records = b"".join(struct.pack("<iid",row,column,1.0) for row in range(3) for column in range(3))
+        with path.open("wb") as stream:
+            stream.write(qprep._FITTER.ADD_MAGIC)
+            stream.write(struct.pack("<IIiiQ",3,qprep.ENDIAN,n,8,1234))
+            stream.write(struct.pack("<ddddQQ",300.,0.01,0.,0.1,4,2))
+            for site in range(n):
+                neighbors = [site+1] if site==0 else [site-1] if site==n-1 else [site-1,site+1]
+                stream.write(struct.pack("<i",len(neighbors)))
+                for neighbor in neighbors: stream.write(struct.pack("<4i",neighbor,0,0,0))
+                stream.write(np.zeros(3*len(neighbors),dtype="<f8").tobytes())
+                records = endpoint_records if len(neighbors)==1 else scalar_records
+                count = len(records)//16
+                stream.write(struct.pack("<Q",count)); stream.write(records)
+        assert path.stat().st_size > 64*1024*1024
+        original_reader = qprep._FITTER.read_additive
+        qprep._FITTER.read_additive = lambda _path: {"preflight": "passed"}
+        try:
+            assert qprep.read_additive(path) == {"preflight": "passed"}
+        finally:
+            qprep._FITTER.read_additive = original_reader
+
+
 def _write_large_canceling_gradient(raw, pack_path, pack, fitter, *, cancel):
     meta = qprep._read_raw(raw)
     v = np.zeros((meta["d"], meta["n"]))
@@ -301,7 +591,7 @@ def test_cli_additive_prepare_accumulates_actual_v3_k_and_h_and_certificate():
         assert "beads=8;derivative=3" in sidecar
 
 
-def test_internal_mass_com_v2_pulls_back_nonzero_net_and_preserves_raw_transport():
+def test_internal_mass_com_v6_pulls_back_nonzero_net_and_preserves_raw_transport():
     with tempfile.TemporaryDirectory() as name:
         raw, kernel, pack_path, output, pack, positions, _ = _fixture(Path(name))
         fitter_spec = importlib.util.spec_from_file_location("fit_additive_internal", ROOT / "tools" / "rpmd_ja_fit_reference.py")
@@ -361,9 +651,11 @@ def test_internal_mass_com_v2_pulls_back_nonzero_net_and_preserves_raw_transport
                                        v_internal @ reduced @ q_internal, atol=2e-12, rtol=2e-12)
             asymmetry = max(asymmetry, np.linalg.norm(h_internal-h_internal.T))
         assert asymmetry > 0
-        old_output = Path(name) / "out_v1.rpmdja"
+        old_output = Path(name) / "out_non_com.rpmdja"
+        pack["internal_mass_com"] = False
+        pack_path.unlink(); fitter.write_additive(pack_path, pack)
         with pack_path.open("r+b") as f:
-            f.seek(8); f.write(struct.pack("<I", 1))
+            f.seek(8); f.write(struct.pack("<I", 3))
         old = subprocess.run([sys.executable, str(ROOT / "tools" / "rpmd_ja_qnep_prepare.py"),
                               str(raw), str(pack_path), "--kernel-table", str(kernel), "--output", str(old_output)],
                              capture_output=True, text=True)
@@ -537,8 +829,14 @@ def test_failed_prepare_closes_first_h_mapping_if_second_open_fails():
 
 if __name__ == "__main__":
     test_additive_assembly_contract_is_available_from_prepare_module()
+    test_sparse_additive_v5_v6_roundtrip_and_dense_legacy_compatibility()
+    test_hand_authored_sparse_package_readers_without_hardlink_writer()
+    test_additive_modes_and_expansion_limits()
+    test_additive_writer_rejects_reader_expansion_limit_before_temp_creation()
+    test_additive_writer_and_readers_reject_coordination_over_reader_limit()
+    test_prepare_reader_accepts_structurally_valid_package_over_64_mib()
     test_cli_additive_prepare_accumulates_actual_v3_k_and_h_and_certificate()
-    test_internal_mass_com_v2_pulls_back_nonzero_net_and_preserves_raw_transport()
+    test_internal_mass_com_v6_pulls_back_nonzero_net_and_preserves_raw_transport()
     test_additive_prepare_rejects_wrong_source_and_truncated_pack()
     test_gradient_gate_uses_stable_norm_and_accepts_large_cancellation()
     test_additive_assembly_rejects_overflow_from_finite_geometry()

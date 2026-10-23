@@ -23,35 +23,82 @@ LAYOUT = b"xyz_soa;native_reference_transport;block_tiles_128;D_then_Bt;rowmajor
 ENDIAN = 0x01020304
 TILE = 128
 HBAR, KB = 6.465412e-2, 8.617343e-5
-MAX_ADDITIVE_DENSE_ELEMENTS = 4_000_000
 
 _FITTER_SPEC = importlib.util.spec_from_file_location(
     "_rpmd_ja_fit_reference", Path(__file__).with_name("rpmd_ja_fit_reference.py"))
 _FITTER = importlib.util.module_from_spec(_FITTER_SPEC)
 _FITTER_SPEC.loader.exec_module(_FITTER)
+MAX_ADDITIVE_DENSE_ELEMENTS = _FITTER.MAX_ADDITIVE_DENSE_ELEMENTS
 
 
 def read_additive(path, expected_n=None):
     path = Path(path)
     size = path.stat().st_size
-    if size < 88 or size > 64 * 1024 * 1024:
-        raise ValueError("GPJAADD1 package must be between 88 bytes and 64 MiB")
+    if size < 80:
+        raise ValueError("GPJAADD1 package is shorter than its header")
     with path.open("rb") as f:
         header = _exact(f, 32)
         magic, version, endian, n, beads, _source = struct.unpack("<8sIIiiQ", header)
-        if magic != b"GPJAADD1" or version not in (1, 2) or endian != ENDIAN or n < 2 or beads < 1 or \
+        if magic != b"GPJAADD1" or version not in (1, 2, 3, 4, 5, 6) or endian != ENDIAN or n < 2 or beads < 1 or \
            (expected_n is not None and n != expected_n):
             raise ValueError("GPJAADD1 magic, version, dimensions, or atom count do not match")
+        if n > (size-80)//4:
+            raise ValueError("GPJAADD1 declared site count exceeds package length")
         _exact(f, 48)
+        expanded_elements = 0
         for _ in range(n):
             (z,) = struct.unpack("<i", _exact(f, 4))
             if z < 0 or z > 3*n:
                 raise ValueError("invalid GPJAADD1 local coordination")
             remaining = size - f.tell()
-            need = 16*z + 8*(3*z) + 8*(3*z)*(3*z)
+            q=3*z
+            expanded_elements += q*q
+            if expanded_elements > MAX_ADDITIVE_DENSE_ELEMENTS:
+                raise ValueError(f"GPJAADD1 expanded local matrices exceed {MAX_ADDITIVE_DENSE_ELEMENTS} elements ({q}x{q})")
+            need = 16*z + 8*q
             if need > remaining:
                 raise ValueError("truncated GPJAADD1 site block")
             f.seek(need, os.SEEK_CUR)
+            if version>=5:
+                (mode,)=struct.unpack("<I",_exact(f,4))
+                remaining=size-f.tell()
+                if mode==0:
+                    dense_bytes=8*q*q
+                    if dense_bytes>remaining:
+                        raise ValueError(f"truncated GPJAADD1 dense quadratic ({q}x{q})")
+                    f.seek(dense_bytes,os.SEEK_CUR)
+                elif mode==1:
+                    (count,)=struct.unpack("<Q",_exact(f,8))
+                    if count>q*q:
+                        raise ValueError(f"invalid GPJAADD1 sparse quadratic count ({q}x{q})")
+                    entry_bytes=count*16
+                    if entry_bytes>size-f.tell():
+                        raise ValueError(f"truncated GPJAADD1 sparse quadratic entries ({q}x{q})")
+                    f.seek(entry_bytes,os.SEEK_CUR)
+                elif mode==2:
+                    (count,)=struct.unpack("<Q",_exact(f,8))
+                    if count>z*z:
+                        raise ValueError(f"invalid GPJAADD1 sparse 3x3 block count ({z}x{z})")
+                    block_bytes=count*80
+                    if block_bytes>size-f.tell():
+                        raise ValueError(f"truncated GPJAADD1 sparse 3x3 blocks ({z}x{z})")
+                    f.seek(block_bytes,os.SEEK_CUR)
+                else:
+                    raise ValueError(f"invalid GPJAADD1 quadratic mode {mode} ({q}x{q})")
+            elif version>=3:
+                (count,)=struct.unpack("<Q",_exact(f,8))
+                q=3*z
+                if count>q*q:
+                    raise ValueError(f"invalid GPJAADD1 sparse quadratic count ({q}x{q})")
+                entry_bytes=count*16
+                if entry_bytes>size-f.tell():
+                    raise ValueError(f"truncated GPJAADD1 sparse quadratic entries ({q}x{q})")
+                f.seek(entry_bytes,os.SEEK_CUR)
+            else:
+                dense_bytes=8*q*q
+                if dense_bytes>size-f.tell():
+                    raise ValueError(f"truncated GPJAADD1 dense quadratic ({q}x{q})")
+                f.seek(dense_bytes,os.SEEK_CUR)
         if f.tell() != size:
             raise ValueError("trailing data in GPJAADD1 package")
     return _FITTER.read_additive(path)

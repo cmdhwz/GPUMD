@@ -20,7 +20,8 @@ template <typename T> void array(std::ostream& out,const std::vector<T>& x){if(!
 
 void make_input(const std::string& raw,const std::string& kernel,const int n,const double stiffness,
                 const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0,const int negative_axis=-1,
-                const bool multi_spectrum=false,const std::vector<double>* custom_masses=nullptr,const std::vector<int>* custom_types=nullptr)
+                const bool multi_spectrum=false,const std::vector<double>* custom_masses=nullptr,const std::vector<int>* custom_types=nullptr,
+                const bool full_rank_h=false)
 {
   const int d=3*n;const double temperature=300.0,step=0.01;
   std::vector<double> mass(n),position(d,0.0),v(static_cast<std::size_t>(d)*n),vc(v.size()),c(static_cast<std::size_t>(3)*d*d),k(static_cast<std::size_t>(d)*d),coarse_c(c.size());
@@ -35,7 +36,7 @@ void make_input(const std::string& raw,const std::string& kernel,const int n,con
   }
   for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){double dm=0.0;if(multi_spectrum){for(int q=0;q<n-1;++q){const double value=(row/n)*10.0+ (q==0?-1.0:static_cast<double>(q));dm+=value*complement[q][ar]*complement[q][ac];}}else{const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double axis_stiffness=negative_axis<0?stiffness:(row/n==negative_axis?-1.0e-10:1.0e-10);dm=axis_stiffness*((row==col?1.0:0.0)-tr*tc);}k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
   for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=version>=2?v[ix]:0.97*v[ix];}
-  for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double target=left*right;double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
+  for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double phase=(row+1)*12.9898+(col+1)*78.233+(alpha+1)*37.719;const double noise=std::sin(phase)*43758.5453-std::floor(std::sin(phase)*43758.5453);const double target=full_rank_h?noise+(row==col?1.0:0.0):left*right;double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
   std::ofstream out(raw,std::ios::binary);if(!out)throw std::runtime_error("cannot create raw fixture");
   const char magic[8]={'G','P','J','Q','R','A','W','\0'};const char layout[]="xyz_soa;derivative_input_rows_output_columns";
   const std::uint32_t endian=0x01020304;const int charge=1,pppm=1;const std::uint64_t model=0x12345678,config=0x87654321;const double spacing=0.5;
@@ -99,7 +100,27 @@ void run_positive(const std::string& base,const int n,const std::uint32_t versio
     (version==2?"native_reference_transport;analytic_site_gradient_v1":"native_reference_transport;analytic_site_gradient_fd4_v1");
   if(r.mechanical_policy!=expected_policy)throw std::runtime_error("prepared qNEP v3 fixture lost its derivative-source marker");
   if(r.block_dynamical.tiles.size()!=static_cast<std::size_t>((3*n+127)/128)*((3*n+127)/128))throw std::runtime_error("D tile grid readback incomplete");
+  std::ifstream serialized(out,std::ios::binary|std::ios::ate);
+  const std::uint64_t actual_bytes=static_cast<std::uint64_t>(serialized.tellg());
+  if(!serialized||actual_bytes>estimate_rpmd_ja_qnep_v3_max_serialized_bytes(r))
+    throw std::runtime_error("qNEP v3 output exceeds its conservative serialized-size bound");
   verify_matrices(r,1.0e-10);
+  clean(raw);clean(kernel);clean(out);
+}
+
+void run_dense_h_upper_bound(const std::string& base)
+{
+  constexpr int n=44;const std::string raw=base+"_dense_h.qraw",kernel=base+"_dense_h.kernel",out=base+"_dense_h.ja";
+  make_input(raw,kernel,n,1.0e-10,3,-1.0,0.0,-1,false,nullptr,nullptr,true);
+  prepare_rpmd_ja_qnep_reference(raw,out,kernel);const RpmdJAReference reference=read_rpmd_ja_reference(out);
+  for(const auto& tile:reference.block_dynamical.tiles)
+    if(tile.rank!=0)throw std::runtime_error("full-rank D fixture did not exercise dense tile storage");
+  for(const auto& matrix:reference.block_site_transpose)for(const auto& tile:matrix.tiles)
+    if(tile.rank!=0)throw std::runtime_error("full-rank H fixture did not exercise dense SVD fallback");
+  std::ifstream serialized(out,std::ios::binary|std::ios::ate);
+  const std::uint64_t actual_bytes=static_cast<std::uint64_t>(serialized.tellg());
+  if(!serialized||actual_bytes!=estimate_rpmd_ja_qnep_v3_max_serialized_bytes(reference))
+    throw std::runtime_error("dense H qNEP v3 output did not meet its exact worst-rank serialized-size bound");
   clean(raw);clean(kernel);clean(out);
 }
 
@@ -259,6 +280,7 @@ int main(int argc,char** argv)
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()):(argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test");
     if(integration_smoke){run_additive(base,1);run_additive(base+"_internal_com",2);return 0;}
     run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,44,1);
+    run_dense_h_upper_bound(base);
     run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);
     run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);run_additive(base);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}

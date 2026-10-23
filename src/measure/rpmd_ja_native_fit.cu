@@ -6245,7 +6245,8 @@ const char* covariance_budget_result_name(const rpmd_ja_feasibility::BudgetResul
     case BudgetResult::GRADIENT_LIMIT:return "GRADIENT_LIMIT";case BudgetResult::PHASE_GRADIENT_LIMIT:return "PHASE_GRADIENT_LIMIT";
     case BudgetResult::FAMILY_GRADIENT_LIMIT:return "FAMILY_GRADIENT_LIMIT";
     case BudgetResult::FAMILY_WALL_LIMIT:return "FAMILY_WALL_LIMIT";
-    case BudgetResult::A_WALL_LIMIT:return "A_WALL_LIMIT";case BudgetResult::VALIDATION_RESERVED:return "VALIDATION_RESERVED";}
+    case BudgetResult::A_WALL_LIMIT:return "A_WALL_LIMIT";case BudgetResult::VALIDATION_RESERVED:return "VALIDATION_RESERVED";
+    default:break;}
   return "UNKNOWN";
 }
 
@@ -7142,12 +7143,14 @@ bool covariance_directional_displacements(const std::vector<double>& theta,const
   return direction_norm>0.0&&std::isfinite(tolerance)&&asymmetry_norm<=tolerance&&direction_error_norm<=tolerance;
 }
 
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
 bool covariance_directional_displacement_representable(const std::vector<double>& theta,
   const std::vector<double>& coordinate_scale,const std::vector<double>& direction,const double step_size)
 {
   std::vector<double> plus,minus;
   return covariance_directional_displacements(theta,coordinate_scale,direction,step_size,plus,minus);
 }
+#endif
 
 CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(DeviceCovarianceSystem& system,
   const CovarianceObjectiveEvaluation& current,const CovarianceBaseline& baseline,const std::vector<double>& statistics,
@@ -7239,7 +7242,6 @@ CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(De
       const double suggested_norm=actual_step?std::sqrt(std::inner_product(actual_step->begin(),actual_step->end(),actual_step->begin(),0.0)):1.0;
       const double h=std::min(1.0e-3,std::max(1.0e-6,0.25*std::min(1.0,suggested_norm)));
       const DirectionalSecondPair pair=evaluate_pair(direction,h,gram_value,named.first.c_str());
-      const CovarianceObjectiveChange& coarse=pair.coarse;const CovarianceObjectiveChange& fine=pair.fine;
       const CovarianceDirectionalCurvatureComparison& comparison=pair.comparison;
       if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION trigger="<<trigger<<" direction="<<named.first
         <<" status="<<comparison.status<<" gram="<<gram_value<<" coarse="<<comparison.coarse
@@ -8021,7 +8023,8 @@ const char* covariance_group_bfgs_update_name(const CovarianceGroupBFGSUpdateSta
   switch(status){case CovarianceGroupBFGSUpdateStatus::Updated:return "UPDATED";
     case CovarianceGroupBFGSUpdateStatus::Seeded:return "SEEDED";
     case CovarianceGroupBFGSUpdateStatus::Reset:return "RESET";
-    case CovarianceGroupBFGSUpdateStatus::SkippedMixedStep:return "SKIPPED_MIXED_STEP";}
+    case CovarianceGroupBFGSUpdateStatus::SkippedMixedStep:return "SKIPPED_MIXED_STEP";
+    default:break;}
   return "UNKNOWN";
 }
 
@@ -8306,17 +8309,47 @@ std::uint64_t stream_native_additive_site_blocks(const Graph& graph,const std::v
           const int slot=static_cast<int>(site_edges[center.atom].size());site_edges[center.atom].push_back(edge);
           slot_indices[center.atom].emplace(key,slot);}}}}}
   std::uint64_t total_bytes=native_additive_package_header_bytes;
+  auto add_serialized_bytes=[&](const std::uint64_t bytes){
+    if(total_bytes>std::numeric_limits<std::uint64_t>::max()-bytes)
+      throw std::runtime_error("native additive package byte estimate overflows");
+    total_bytes+=bytes;
+  };
   for(int center=0;center<n;++center){const std::size_t z=site_edges[center].size();
     if(maximum_site_neighbors)*maximum_site_neighbors=std::max(*maximum_site_neighbors,z);
     if(z>static_cast<std::size_t>(3*n)||z>static_cast<std::size_t>(std::numeric_limits<int>::max()/3))
       throw std::runtime_error("native additive site coordination exceeds reader limits");
-    const std::size_t q=3*z;if(q&&q>std::numeric_limits<std::size_t>::max()/q)throw std::runtime_error("native additive site block size overflows");
-    const std::uint64_t linear_bytes=static_cast<std::uint64_t>(q)*sizeof(double),quadratic_bytes=static_cast<std::uint64_t>(q*q)*sizeof(double);
-    if(z>(std::numeric_limits<std::uint64_t>::max()-sizeof(std::int32_t))/16||
-       total_bytes>std::numeric_limits<std::uint64_t>::max()-sizeof(std::int32_t)-16*z||
-       total_bytes+sizeof(std::int32_t)+16*z>std::numeric_limits<std::uint64_t>::max()-linear_bytes-quadratic_bytes)
+    const std::uint64_t q=3ULL*z;
+    if(q&&q>std::numeric_limits<std::uint64_t>::max()/q/sizeof(double))
+      throw std::runtime_error("native additive site block size overflows");
+    const std::uint64_t maximum_entries=rpmd_ja_additive_validate_site_dimension(z,center);
+    std::uint64_t support_entries_upper_bound=0;
+    const std::uint64_t maximum_blocks=static_cast<std::uint64_t>(z)*z;
+    std::uint64_t support_blocks_upper_bound=0;
+    auto add_support_entries=[&](const std::uint64_t count){
+      support_entries_upper_bound=count>maximum_entries-support_entries_upper_bound?
+        maximum_entries:support_entries_upper_bound+count;};
+    auto add_support_blocks=[&](const std::uint64_t count){
+      support_blocks_upper_bound=count>maximum_blocks-support_blocks_upper_bound?
+        maximum_blocks:support_blocks_upper_bound+count;};
+    for(const SiteEdge& edge:site_edges[center])if(edge.edge_index>=0){add_support_entries(9);add_support_blocks(1);}
+    if(m1)for(const auto& indexed_center:center_terms[center]){
+      const int atom_count=graph.local_terms[indexed_center.first].atom_count;
+      add_support_entries(9ULL*static_cast<std::uint64_t>(atom_count-1)*(atom_count-1));
+      add_support_blocks(static_cast<std::uint64_t>(atom_count-1)*(atom_count-1));}
+    const std::uint64_t linear_bytes=q*sizeof(double);
+    if(z>(std::numeric_limits<std::uint64_t>::max()-sizeof(std::int32_t))/16)
       throw std::runtime_error("native additive package byte estimate overflows");
-    total_bytes+=sizeof(std::int32_t)+16*z+linear_bytes+quadratic_bytes;
+    add_serialized_bytes(sizeof(std::int32_t)+16*z);
+    add_serialized_bytes(linear_bytes);
+    const std::uint64_t dense_bytes=maximum_entries*sizeof(double);
+    const std::uint64_t scalar_bytes=support_entries_upper_bound>(std::numeric_limits<std::uint64_t>::max()-sizeof(std::uint64_t)) /
+      (2*sizeof(std::int32_t)+sizeof(double))?std::numeric_limits<std::uint64_t>::max():
+      sizeof(std::uint64_t)+support_entries_upper_bound*(2*sizeof(std::int32_t)+sizeof(double));
+    const std::uint64_t block_count_upper_bound=support_blocks_upper_bound;
+    const std::uint64_t block_bytes=block_count_upper_bound>(std::numeric_limits<std::uint64_t>::max()-sizeof(std::uint64_t)) /
+      (2*sizeof(std::int32_t)+9*sizeof(double))?std::numeric_limits<std::uint64_t>::max():
+      sizeof(std::uint64_t)+block_count_upper_bound*(2*sizeof(std::int32_t)+9*sizeof(double));
+    add_serialized_bytes(sizeof(std::uint32_t)+std::min(dense_bytes,std::min(scalar_bytes,block_bytes)));
   }
   if(total_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
     throw std::runtime_error("native additive package exceeds stream limits");
@@ -8369,6 +8402,7 @@ NativeAdditivePackageEstimate estimate_native_additive_package_size(const Graph&
   return estimate;
 }
 
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
 std::vector<NativeAdditiveSiteBlock> build_native_additive_site_blocks(const Graph& graph,const std::vector<double>& theta,
   const std::vector<std::array<double,3>>& edge_linear,const int n)
 {
@@ -8376,14 +8410,48 @@ std::vector<NativeAdditiveSiteBlock> build_native_additive_site_blocks(const Gra
   stream_native_additive_site_blocks(graph,theta,edge_linear,n,[&](const int,const NativeAdditiveSiteBlock& block){blocks.push_back(block);});
   return blocks;
 }
+#endif
 
 std::uint64_t write_native_additive_site_blocks(std::ostream& out,const Graph& graph,const std::vector<double>& theta,
   const std::vector<std::array<double,3>>& edge_linear,const int n)
 {
-  return stream_native_additive_site_blocks(graph,theta,edge_linear,n,[&](const int,const NativeAdditiveSiteBlock& block){
+  const std::uint64_t upper_bound=stream_native_additive_site_blocks(graph,theta,edge_linear,n,
+    [&](const int,const NativeAdditiveSiteBlock& block){
     write(out,std::int32_t(block.edges.size()));for(const SiteEdge& edge:block.edges){write(out,std::int32_t(edge.j));
       for(int axis=0;axis<3;++axis)write(out,std::int32_t(edge.image[axis]));}
-    for(double value:block.linear)write(out,value);for(double value:block.quadratic)write(out,value);});
+    for(double value:block.linear)write(out,value);
+    const int q=static_cast<int>(block.linear.size()),z=q/3;
+    std::uint64_t quadratic_entry_count=0,quadratic_block_count=0;
+    for(const double value:block.quadratic){
+      if(!std::isfinite(value))throw std::runtime_error("non-finite native additive quadratic coefficient");
+      if(value!=0.0||std::signbit(value))++quadratic_entry_count;}
+    for(int row=0;row<z;++row)for(int column=0;column<z;++column){bool active=false;
+      for(int a=0;a<3;++a)for(int b=0;b<3;++b){const double value=block.quadratic[static_cast<std::size_t>(3*row+a)*q+3*column+b];
+        active=active||value!=0.0||std::signbit(value);}
+      if(active)++quadratic_block_count;}
+    const std::uint64_t dense_bytes=static_cast<std::uint64_t>(q)*q*sizeof(double);
+    const std::uint64_t scalar_bytes=sizeof(std::uint64_t)+quadratic_entry_count*(2*sizeof(std::int32_t)+sizeof(double));
+    const std::uint64_t block_bytes=sizeof(std::uint64_t)+quadratic_block_count*(2*sizeof(std::int32_t)+9*sizeof(double));
+    if(dense_bytes<=scalar_bytes&&dense_bytes<=block_bytes){
+      write(out,std::uint32_t(0));for(double value:block.quadratic)write(out,value);
+    }else if(scalar_bytes<=block_bytes){
+      write(out,std::uint32_t(1));write(out,quadratic_entry_count);
+      for(int row=0;row<q;++row)for(int column=0;column<q;++column){
+        const double value=block.quadratic[static_cast<std::size_t>(row)*q+column];
+        if(value!=0.0||std::signbit(value)){write(out,std::int32_t(row));write(out,std::int32_t(column));write(out,value);}}
+    }else{
+      write(out,std::uint32_t(2));write(out,quadratic_block_count);
+      for(int row=0;row<z;++row)for(int column=0;column<z;++column){bool active=false;
+        for(int a=0;a<3;++a)for(int b=0;b<3;++b){const double value=block.quadratic[static_cast<std::size_t>(3*row+a)*q+3*column+b];
+          active=active||value!=0.0||std::signbit(value);}
+        if(active){write(out,std::int32_t(row));write(out,std::int32_t(column));
+          for(int a=0;a<3;++a)for(int b=0;b<3;++b)write(out,block.quadratic[static_cast<std::size_t>(3*row+a)*q+3*column+b]);}}
+    }
+  });
+  const std::streampos end=out.tellp();
+  if(end<0||static_cast<std::uint64_t>(end)>upper_bound)
+    throw std::runtime_error("native additive package writer exceeded the conservative support bound");
+  return static_cast<std::uint64_t>(end);
 }
 
 std::array<double,4> verify_native_additive_package_entries(const RpmdJAAdditiveData& package,const Graph& graph,
@@ -11541,6 +11609,20 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   }else if(options.covariance_feasibility)
     trace<<"COST_BASELINE status NOT_PROVIDED predictor_uses_current_run_measurements_and_reports_unknown_stages 1 hard_budget_still_authoritative 1\n";
   covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
+  RpmdJAReference qnep_size_metadata;qnep_size_metadata.number_of_atoms=n;
+  qnep_size_metadata.temperature=options.temperature;qnep_size_metadata.fd_step=options.fd_step;
+  qnep_size_metadata.types=header.types;qnep_size_metadata.masses=header.masses;qnep_size_metadata.positions=r0;
+  std::copy(header.cell,header.cell+9,qnep_size_metadata.cell);
+  qnep_size_metadata.pbc[0]=qnep_size_metadata.pbc[1]=qnep_size_metadata.pbc[2]=1;
+  qnep_size_metadata.mechanical_policy="native_reference_transport;";
+  if(options.internal_mass_com)qnep_size_metadata.mechanical_policy+="internal_mass_com_pullback_v1;";
+  qnep_size_metadata.mechanical_policy+="finite_temperature_additive_v1;beads="+
+    std::to_string(header.beads)+";derivative=3";
+  load_rpmd_ja_kernel_table(options.kernel_table,qnep_size_metadata);
+  const std::uint64_t estimated_qnep_reference_bytes=
+    estimate_rpmd_ja_qnep_v3_max_serialized_bytes(qnep_size_metadata);
+  if(estimated_qnep_reference_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: qNEP v3 maximum file size exceeds stream-offset limits");
   const NativeAdditivePackageEstimate package_estimate_m0=estimate_native_additive_package_size(graph,n);
   const NativeAdditivePackageEstimate package_estimate_m1=options.covariance_feasibility?
     estimate_native_additive_package_size(structured_graph,n):package_estimate_m0;
@@ -11549,7 +11631,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     package_estimate_m1.maximum_site_neighbors);
   covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
   trace<<"RESOURCE_PREFLIGHT additive_package_bytes "<<estimated_package_bytes<<" maximum_site_neighbors "
-    <<estimated_package_max_neighbors<<" estimate_scope MAX_M0_M1_EXACT_SERIALIZED_BYTES\n";trace.flush();
+    <<estimated_package_max_neighbors<<" estimate_scope MAX_M0_M1_CONSERVATIVE_SUPPORT_UPPER_BOUND\n";trace.flush();
   std::uint64_t design_bytes=0,qr_bytes=0;
   if(!covariance_method){const std::uint64_t frame_design=static_cast<std::uint64_t>(d)*psize,padded_rows=std::max<std::uint64_t>(d,psize);
     if(frame_design>std::numeric_limits<std::size_t>::max()/sizeof(double)||padded_rows>std::numeric_limits<std::size_t>::max()/psize/sizeof(double)||psize>std::numeric_limits<std::size_t>::max()/psize/sizeof(double))
@@ -11567,17 +11649,27 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const std::uint64_t raw_elements=2*vd64+7*dd64+18;if(raw_elements>std::numeric_limits<std::uint64_t>::max()/sizeof(double))throw std::runtime_error("native fit qraw byte estimate overflows");
   const std::uint64_t raw_bytes=raw_elements*sizeof(double);
   if(dd64>std::numeric_limits<std::size_t>::max()/sizeof(double)||raw_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))throw std::runtime_error("native fit qraw/Hessian exceeds host or file-offset limits");
+  constexpr std::uint64_t qnep_sidecar_and_failure_reserve_bytes=64ULL*1024;
+  const std::uint64_t qnep_tile_axis=(d64+127)/128,qnep_tile_count=qnep_tile_axis*qnep_tile_axis;
+  const std::uint64_t qnep_tile_header_bytes=5*sizeof(int)+2*sizeof(std::uint64_t);
+  const std::uint64_t qnep_tile_host_extra=sizeof(RpmdJAMatrixTile)>qnep_tile_header_bytes?
+    sizeof(RpmdJAMatrixTile)-qnep_tile_header_bytes:0;
+  if(qnep_tile_count&&qnep_tile_host_extra>std::numeric_limits<std::uint64_t>::max()/4/qnep_tile_count)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: qNEP readback tile host estimate overflows");
+  const std::uint64_t qnep_tile_object_bytes=4*qnep_tile_count*qnep_tile_host_extra;
+  if(estimated_qnep_reference_bytes>std::numeric_limits<std::uint64_t>::max()-sizeof(RpmdJAReference)-qnep_tile_object_bytes)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: qNEP readback host estimate overflows");
+  const std::uint64_t host_prepared_reference_bytes=estimated_qnep_reference_bytes+sizeof(RpmdJAReference)+qnep_tile_object_bytes;
   constexpr std::uint64_t disk_margin_bytes=1024ULL*1024*1024;
   std::uint64_t disk_required=disk_margin_bytes;
   auto add_disk_requirement=[&](const std::uint64_t bytes){if(disk_required>std::numeric_limits<std::uint64_t>::max()-bytes)
       throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: disk-space estimate overflows");disk_required+=bytes;};
-  auto checked_multiplicity_bytes=[&](const std::uint64_t bytes,const std::uint64_t copies){
-    if(copies&&bytes>std::numeric_limits<std::uint64_t>::max()/copies)
-      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: known-object lifecycle estimate overflows");
-    return bytes*copies;};
   if(generate_raw)add_disk_requirement(raw_bytes);
-  const std::uint64_t package_staging_peak_bytes=checked_multiplicity_bytes(estimated_package_bytes,2);
-  const std::uint64_t reference_staging_peak_bytes=checked_multiplicity_bytes(raw_bytes,2);
+  const std::uint64_t package_staging_peak_bytes=publication_payload_restored?0:estimated_package_bytes;
+  if(estimated_qnep_reference_bytes>std::numeric_limits<std::uint64_t>::max()-qnep_sidecar_and_failure_reserve_bytes)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: qNEP reference staging estimate overflows");
+  const std::uint64_t reference_staging_peak_bytes=publication_payload_restored?0:
+    estimated_qnep_reference_bytes+qnep_sidecar_and_failure_reserve_bytes;
   constexpr std::uint64_t feasibility_controller_disk_reserve_bytes=64ULL*1024*1024;
   add_disk_requirement(package_staging_peak_bytes);
   add_disk_requirement(reference_staging_peak_bytes);
@@ -11585,6 +11677,8 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
   const std::uint64_t disk_available=rpmd_ja_file_io::available_disk_bytes_for_path(options.output_path);
   trace<<"RESOURCE_PREFLIGHT disk_available_bytes "<<disk_available<<" disk_required_bytes "<<disk_required
+    <<" publication_payload_restored "<<(publication_payload_restored?1:0)
+    <<" qnep_v3_max_serialized_bytes "<<estimated_qnep_reference_bytes
     <<" reference_staging_lifecycle_bytes "<<reference_staging_peak_bytes
     <<" generated_qraw_bytes "<<(generate_raw?raw_bytes:0)
     <<" additive_package_staging_lifecycle_bytes "<<package_staging_peak_bytes
@@ -11632,18 +11726,17 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   if(host_graph_m0_bytes>std::numeric_limits<std::uint64_t>::max()-host_graph_m1_bytes)
     throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: simultaneous graph estimate overflows");
   const std::uint64_t host_graph_lifecycle_bytes=host_graph_m0_bytes+host_graph_m1_bytes;
-  const std::uint64_t host_raw_reference_lifecycle_bytes=checked_multiplicity_bytes(raw_bytes,2);
   constexpr std::uint64_t host_safety_margin_bytes=512ULL*1024*1024;
   host_required=host_safety_margin_bytes;
   auto add_host_requirement=[&](const std::uint64_t bytes){if(host_required>std::numeric_limits<std::uint64_t>::max()-bytes)
       throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host memory estimate overflows");host_required+=bytes;};
-  add_host_requirement(host_raw_reference_lifecycle_bytes);
+  add_host_requirement(host_prepared_reference_bytes);
   add_host_requirement(estimated_package_bytes);
   add_host_requirement(host_graph_lifecycle_bytes);
   if(options.covariance_feasibility)add_host_requirement(feasibility_statistics_storage_budget_bytes);
   const std::uint64_t host_available=rpmd_ja_file_io::available_physical_memory_bytes();
   trace<<"RESOURCE_PREFLIGHT host_available_bytes "<<host_available<<" host_required_bytes "<<host_required
-    <<" raw_and_reference_lifecycle_bytes "<<host_raw_reference_lifecycle_bytes
+    <<" qnep_reference_readback_host_bound_bytes "<<host_prepared_reference_bytes
     <<" additive_package_object_bytes "<<estimated_package_bytes
     <<" simultaneous_m0_m1_graph_working_set_bytes "<<host_graph_lifecycle_bytes
     <<" statistics_storage_budget_bytes "<<(options.covariance_feasibility?feasibility_statistics_storage_budget_bytes:0)
@@ -11719,9 +11812,11 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     <<" maximum_curvature_workspace_bytes "<<curvature_workspace_bytes<<'\n';trace.flush();
   if(std::max(prepare_gpu_lower_bound,fit_gpu_lower_bound)>free_before)
     throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: free GPU memory is below the known prepare or fit workspace estimate");
-  if(generate_raw&&raw_bytes>std::numeric_limits<std::uint64_t>::max()/2)
-    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: simultaneous qraw disk estimate overflows");
-  const std::uint64_t persistent_disk_bytes=generate_raw?2*raw_bytes:raw_bytes;
+  std::uint64_t persistent_disk_bytes=generate_raw?raw_bytes:0;
+  const std::uint64_t persistent_reference_bytes=publication_payload_restored?0:estimated_qnep_reference_bytes;
+  if(persistent_reference_bytes>std::numeric_limits<std::uint64_t>::max()-persistent_disk_bytes)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: persistent raw/reference disk estimate overflows");
+  persistent_disk_bytes+=persistent_reference_bytes;
   if(persistent_disk_bytes>disk_required||prepare_gpu_lower_bound<matrix_bytes||fit_gpu_lower_bound<matrix_bytes)
     throw std::runtime_error("IMPLEMENTATION_FAIL: acceptance-stage resource lifetime estimates are inconsistent");
   rpmd_ja_feasibility::ResourcePlan acceptance_resource_plan;
@@ -11732,8 +11827,8 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   for(const rpmd_ja_feasibility::ResourceStage stage:acceptance_stages){
     auto& usage=acceptance_resource_plan.stages[rpmd_ja_feasibility::resource_stage_index(stage)];
     usage.host_known=false;
-    usage.persistent_host_bytes=raw_bytes;
-    usage.transient_host_bytes=host_required-raw_bytes;
+    usage.persistent_host_bytes=host_prepared_reference_bytes;
+    usage.transient_host_bytes=host_required-host_prepared_reference_bytes;
     usage.persistent_disk_bytes=persistent_disk_bytes;
     usage.transient_disk_bytes=disk_required-persistent_disk_bytes;
     if(stage==rpmd_ja_feasibility::ResourceStage::FIT){
@@ -11767,10 +11862,8 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::printf("    rpmd_ja native fit preflight: qraw %.2f GiB, GPU baseline %.2f GiB, free GPU %.2f GiB, host design+QR %.2f MiB\n",static_cast<double>(raw_bytes)/(1024.0*1024.0*1024.0),static_cast<double>(dd64*sizeof(double))/(1024.0*1024.0*1024.0),static_cast<double>(free_before)/(1024.0*1024.0*1024.0),static_cast<double>(design_bytes+qr_bytes)/(1024.0*1024.0));
   if(dd64*sizeof(double)>free_before||free_before-dd64*sizeof(double)<256ULL*1024*1024)throw std::runtime_error("native fit baseline matrix does not fit current GPU memory with a 256 MiB safety margin");
   NativeFitScratchOwnership own_scratch{generated_raw_path,pack_path,options.output_path,options.output_path+".stability",
-      options.output_path+".tmp",options.output_path+".stability.tmp",fit_path,fit_tmp};
-  own_scratch.staged_output=publication_stage_output_path;own_scratch.staged_sidecar=publication_stage_output_path+".stability";
-  own_scratch.staged_output_tmp=publication_stage_output_path+".tmp";
-  own_scratch.staged_sidecar_tmp=publication_stage_output_path+".stability.tmp";
+      options.output_path+".tmp",options.output_path+".stability.tmp",fit_path,fit_tmp,publication_stage_output_path,
+      publication_stage_output_path+".stability",publication_stage_output_path+".tmp",publication_stage_output_path+".stability.tmp"};
   std::printf("    rpmd_ja fit reference policy: %s; raw qraw remains the unmodified native derivative source\n",
     options.internal_mass_com?"internal_mass_com_pullback_v1 (raw net force diagnostic only)":"strict raw zero-net gradient");
   if(generate_raw){generate_rpmd_ja_qnep_raw(generated_raw_path,options.temperature,options.fd_step,options.kernel_table,atom,box,force,!options.internal_mass_com);own_scratch.raw_owned=true;}
@@ -12314,7 +12407,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       if(!restored_development_response.passed||!response_consumer_statistics_ready(candidate.development))
         throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: frozen development response is not complete");
       development_candidates.push_back({candidate.family,candidate.index,candidate.fit.converged,
-        candidate.development_objective,candidate.development_uncertainty});
+        candidate.development_objective,candidate.development_uncertainty,{}, {}});
       development_candidates.back().development_block_scores_b=candidate.development_block_scores_b;
       development_candidates.back().development_block_scores_2b=candidate.development_block_scores_2b;
       candidates.push_back(std::move(candidate));
@@ -12643,7 +12736,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
           candidate.development_block_scores_b=candidate_saved_record->block_scores_b;
           candidate.development_block_scores_2b=candidate_saved_record->block_scores_2b;
           development_candidates.push_back({family,index,candidate.development_pass,candidate.development_objective,
-            candidate.development_uncertainty});
+            candidate.development_uncertainty,{}, {}});
           development_candidates.back().development_block_scores_b=candidate.development_block_scores_b;
           development_candidates.back().development_block_scores_2b=candidate.development_block_scores_2b;
           warm=candidate.fit.theta;
@@ -12667,12 +12760,12 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
           }
           development_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-development_started).count();
           development_candidates.push_back({family,index,candidate.development_pass,candidate.development_objective,
-            candidate.development_uncertainty});
+            candidate.development_uncertainty,{}, {}});
           development_candidates.back().development_block_scores_b=candidate.development_block_scores_b;
           development_candidates.back().development_block_scores_2b=candidate.development_block_scores_2b;
           warm=candidate.fit.theta;}
         else development_candidates.push_back({family,index,false,std::numeric_limits<double>::infinity(),
-          std::numeric_limits<double>::quiet_NaN()});
+          std::numeric_limits<double>::quiet_NaN(),{}, {}});
         if(!candidate_score_was_complete||!candidate_restored)
           save_controller_candidate(candidate_label,index,lambda,candidate.fit,true,candidate.development_scored,
             candidate.development_pass,candidate.development_objective,candidate.development_uncertainty,
@@ -13616,12 +13709,14 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     FeasibilityStageTimer package_write_timer(trace,"PACKAGE_WRITE",
       stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE));
     rpmd_ja_file_io::ofstream out(pack_path,std::ios::binary|std::ios::trunc);if(!out)throw std::runtime_error("cannot create native additive package");own_scratch.pack_owned=true;
-    out.write(additive_magic,8);write(out,std::uint32_t(options.internal_mass_com?2:1));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(header.beads));write(out,raw_source_fingerprint);
+    out.write(additive_magic,8);write(out,std::uint32_t(options.internal_mass_com?6:5));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(header.beads));write(out,raw_source_fingerprint);
     write(out,options.temperature);write(out,options.epsilon);write(out,response.response);write(out,options.response_tolerance);write(out,std::uint64_t(train));write(out,std::uint64_t(validation));
     estimated=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);
     const std::streamoff actual_bytes=out.tellp();
     if(actual_bytes<0||static_cast<std::uint64_t>(actual_bytes)!=estimated)
       throw std::runtime_error("native additive package size estimate does not match bytes written");
+    if(estimated>estimated_package_bytes)
+      throw std::runtime_error("actual additive package bytes exceed the conservative support bound");
     out.close();if(!out)throw std::runtime_error("failed closing native additive package");
     package_write_timer.complete();
   }

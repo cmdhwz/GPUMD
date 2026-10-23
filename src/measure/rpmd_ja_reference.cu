@@ -1117,6 +1117,62 @@ void load_rpmd_ja_kernel_table(const std::string& path, RpmdJAReference& referen
   load_kernel_table(path, reference);
 }
 
+std::uint64_t estimate_rpmd_ja_qnep_v3_max_serialized_bytes(const RpmdJAReference& reference)
+{
+  // Bound the native prepare stream prefix, four block matrices, and stability footer.
+  if(reference.number_of_atoms<=0||reference.number_of_atoms>std::numeric_limits<int>::max()/3||
+     reference.types.size()!=static_cast<std::size_t>(reference.number_of_atoms)||
+     reference.masses.size()!=static_cast<std::size_t>(reference.number_of_atoms)||
+     reference.positions.size()!=static_cast<std::size_t>(3)*reference.number_of_atoms||
+     reference.mechanical_policy.size()>static_cast<std::size_t>(std::numeric_limits<int>::max())||
+     reference.kernel_degree<0||reference.kernel_degree>512||reference.p_rank<=0||reference.q_rank<=0||
+     reference.p_rank>reference.kernel_degree+1||reference.q_rank>reference.kernel_degree+1||
+     reference.p_values.size()!=static_cast<std::size_t>(reference.p_rank)||
+     reference.q_values.size()!=static_cast<std::size_t>(reference.q_rank)||
+     reference.p_vectors.size()!=static_cast<std::size_t>(reference.kernel_degree+1)*reference.p_rank||
+     reference.q_vectors.size()!=static_cast<std::size_t>(reference.kernel_degree+1)*reference.q_rank)
+    throw std::runtime_error("cannot estimate qNEP v3 output bytes from incomplete reference metadata");
+  const std::uint64_t maximum=std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t bytes=sizeof(kMagic)+2*sizeof(std::uint32_t)+sizeof(int)+2*sizeof(double)+sizeof(std::uint64_t)+
+    sizeof(kUnits)+sizeof(kLayoutBlock)+sizeof(reference.cell)+sizeof(reference.pbc);
+  const auto add=[&](const std::uint64_t amount){
+    if(bytes>maximum-amount)throw std::runtime_error("qNEP v3 maximum serialized-size estimate overflows");
+    bytes+=amount;};
+  const auto add_vector=[&](const std::size_t count,const std::size_t element_bytes){
+    if(element_bytes&&count>maximum/element_bytes)
+      throw std::runtime_error("qNEP v3 vector serialized-size estimate overflows");
+    add(sizeof(std::uint64_t));add(static_cast<std::uint64_t>(count)*element_bytes);};
+  add_vector(reference.types.size(),sizeof(int));add_vector(reference.masses.size(),sizeof(double));
+  add_vector(reference.positions.size(),sizeof(double));
+  add(sizeof(std::uint64_t)+2*sizeof(int)+sizeof(double)+sizeof(int)+reference.mechanical_policy.size());
+  add(21*sizeof(double)+2*sizeof(double));
+  add_vector(2,sizeof(double));add_vector(2,sizeof(double));
+  add(3*sizeof(int));add_vector(reference.p_values.size(),sizeof(double));add_vector(reference.q_values.size(),sizeof(double));
+  add_vector(reference.p_vectors.size(),sizeof(double));add_vector(reference.q_vectors.size(),sizeof(double));
+
+  const std::uint64_t dimension=static_cast<std::uint64_t>(reference.number_of_atoms)*3;
+  if(dimension>(maximum/sizeof(double))/dimension)
+    throw std::runtime_error("qNEP v3 matrix serialized-size estimate overflows");
+  const std::uint64_t matrix_payload=dimension*dimension*sizeof(double);
+  constexpr std::uint64_t tile_size=128;
+  const std::uint64_t tiles_per_axis=(dimension+tile_size-1)/tile_size;
+  if(tiles_per_axis&&tiles_per_axis>maximum/tiles_per_axis)
+    throw std::runtime_error("qNEP v3 tile count estimate overflows");
+  const std::uint64_t tile_count=tiles_per_axis*tiles_per_axis;
+  constexpr std::uint64_t tile_header_bytes=5*sizeof(int)+2*sizeof(std::uint64_t);
+  if(tile_count>maximum/tile_header_bytes)
+    throw std::runtime_error("qNEP v3 tile-header estimate overflows");
+  const std::uint64_t matrix_header_bytes=sizeof(int)+sizeof(std::uint64_t);
+  const std::uint64_t tile_headers=tile_count*tile_header_bytes;
+  if(tile_headers>maximum-matrix_header_bytes||matrix_payload>maximum-matrix_header_bytes-tile_headers)
+    throw std::runtime_error("qNEP v3 matrix serialized-size estimate overflows");
+  const std::uint64_t one_matrix_bytes=matrix_header_bytes+tile_headers+matrix_payload;
+  if(one_matrix_bytes>(maximum-sizeof(int))/4)
+    throw std::runtime_error("qNEP v3 four-matrix serialized-size estimate overflows");
+  add(4*one_matrix_bytes+sizeof(int));
+  return bytes;
+}
+
 int rpmd_ja_reference_policy_beads(const std::string& policy)
 {
   int beads=0, derivative=0;
@@ -1131,6 +1187,7 @@ bool rpmd_ja_reference_policy_requires_pimd_fix_com(const std::string& policy)
 
 std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference)
 {
+  // This native prepare prefix writes the fixed diagnostics array without a vector-length field.
   if (!is_supported_qnep_policy(reference.mechanical_policy))
     throw std::runtime_error("unsupported qNEP RPMD-JA derivative-source policy");
   out.write(kMagic, sizeof(kMagic));
