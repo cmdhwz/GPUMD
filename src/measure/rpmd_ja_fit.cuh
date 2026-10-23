@@ -10,6 +10,7 @@
 #pragma once
 
 #include "action.cuh"
+#include "rpmd_ja_utf8_file_io.h"
 #include "utilities/gpu_vector.cuh"
 #include <cstdint>
 #include <cstdio>
@@ -56,7 +57,20 @@ private:
   std::string output_path_;
   std::string kernel_table_;
   std::string spool_path_;
+  std::string provenance_path_;
+  std::string provenance_temp_path_;
   std::string lock_path_;
+  std::string run_input_sha256_;
+  std::string physical_force_configuration_sha256_;
+  std::string integrator_configuration_sha256_;
+  std::string active_configuration_scope_;
+  std::string model_sha256_;
+  std::string atom_signature_sha256_;
+  std::string thermostat_tokens_json_;
+  std::string model_path_;
+  std::string source_job_id_;
+  std::string source_job_id_status_;
+  std::string source_run_id_;
   int sample_interval_ = 0;
   int max_stability_rounds_ = 160;
   double cutoff_ = 0.0;
@@ -64,10 +78,15 @@ private:
   double response_tolerance_ = 0.0;
   double fd_step_ = 0.0;
   double temperature_ = 0.0;
+  double timestep_internal_ = 0.0;
+  double timestep_fs_ = 0.0;
   int number_of_atoms_ = 0;
   int number_of_beads_ = 0;
   std::uint64_t frame_count_ = 0;
-  std::ofstream spool_;
+  unsigned active_run_ordinal_ = 0;
+  int first_sample_step_ = -1;
+  int last_sample_step_ = -1;
+  rpmd_ja_file_io::ofstream spool_;
   std::FILE* lock_file_ = nullptr;
   Force* force_ = nullptr;
   std::vector<double> masses_;
@@ -86,4 +105,7 @@ private:
   int pbc_[3] = {};
   bool has_previous_centroid_ = false;
   bool sample_only_ = false;
+  bool internal_mass_com_ = false;
+  bool provenance_snapshot_initialized_ = false;
+  bool configuration_stable_during_sampling_ = true;
 };

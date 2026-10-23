@@ -734,7 +734,7 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, diagnose_covariance <state> <report> <cutoff> <epsilon> <tau> <fd_step>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, diagnose_covariance <state> <report> <cutoff> <epsilon> <tau> <fd_step>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier] [ridge <lambda>] [analytic_curvature <16|32|64|128>] [feasibility] [structured_basis] [blind_samples <samples_file>] [blind_manifest <manifest_file>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
@@ -877,8 +877,8 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     return;
   }
   if (tokens[1] == "fit_samples_covariance") {
-    if (tokens.size() < 14 || tokens.size() > 16 || tokens[10] != "shrinkage" || tokens[12] != "max_iter")
-      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier].");
+    if (tokens.size() < 14 || tokens[10] != "shrinkage" || tokens[12] != "max_iter")
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier] [ridge <lambda>] [analytic_curvature <16|32|64|128>] [feasibility] [structured_basis] [blind_samples <samples_file>] [blind_manifest <manifest_file>].");
     if (global_time != 0.0)
       PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance must appear before any run.");
     if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
@@ -891,6 +891,7 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
       PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance requires fully periodic boundaries.");
     RpmdJANativeFitOptions options;
     options.method = RpmdJANativeFitMethod::GaussianCovarianceShrinkage;
+    bool ridge_seen=false,analytic_curvature_seen=false,feasibility_seen=false,structured_basis_seen=false,blind_samples_seen=false,blind_manifest_seen=false;
     for (std::size_t token = 14; token < tokens.size(); ++token) {
       if (tokens[token] == "block_newton") {
         if (options.covariance_block_newton || options.covariance_joint_block || options.covariance_trust_region)
@@ -908,8 +909,52 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
         if (options.covariance_staged_barrier)
           PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance staged_barrier may appear only once.");
         options.covariance_staged_barrier = true;
-      } else PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance options must be block_newton, joint_block, trust_region, or staged_barrier.");
+      } else if (tokens[token] == "ridge") {
+        if (ridge_seen || token + 1 >= tokens.size())
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance ridge requires one positive finite lambda and may appear only once.");
+        char* end=nullptr;options.covariance_ridge_lambda=std::strtod(tokens[++token].c_str(),&end);
+        if(end==tokens[token].c_str()||*end!='\0'||!std::isfinite(options.covariance_ridge_lambda)||options.covariance_ridge_lambda<=0.0)
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance ridge lambda must be positive and finite.");
+        ridge_seen=true;
+      } else if (tokens[token] == "analytic_curvature") {
+        if (analytic_curvature_seen || token + 1 >= tokens.size())
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance analytic_curvature requires a probe count and may appear only once.");
+        errno=0;char* end=nullptr;const long long probes=std::strtoll(tokens[++token].c_str(),&end,10);
+        if(errno==ERANGE||end==tokens[token].c_str()||*end!='\0'||(probes!=16&&probes!=32&&probes!=64&&probes!=128))
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance analytic_curvature probes must be 16, 32, 64, or 128.");
+        options.covariance_analytic_curvature_probes=static_cast<int>(probes);analytic_curvature_seen=true;
+      } else if (tokens[token] == "feasibility") {
+        if (feasibility_seen)
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance feasibility may appear only once.");
+        options.covariance_feasibility=true;feasibility_seen=true;
+      } else if (tokens[token] == "structured_basis") {
+        if (structured_basis_seen)
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance structured_basis may appear only once.");
+        options.covariance_structured_basis=true;structured_basis_seen=true;
+      } else if (tokens[token] == "blind_samples") {
+        if (blind_samples_seen || token + 1 >= tokens.size())
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance blind_samples requires one sample file and may appear only once.");
+        options.covariance_blind_samples=tokens[++token];blind_samples_seen=true;
+      } else if (tokens[token] == "blind_manifest") {
+        if (blind_manifest_seen || token + 1 >= tokens.size())
+          PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance blind_manifest requires one manifest file and may appear only once.");
+        options.covariance_blind_manifest_path=tokens[++token];blind_manifest_seen=true;
+      } else PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance options must be block_newton, joint_block, trust_region, staged_barrier, ridge <lambda>, analytic_curvature <probes>, feasibility, structured_basis, blind_samples <file>, or blind_manifest <file>.");
     }
+    if(options.covariance_analytic_curvature_probes>0&&!options.covariance_trust_region)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance analytic_curvature requires trust_region.");
+    if(options.covariance_feasibility&&!options.covariance_structured_basis)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance feasibility requires structured_basis.");
+    if(options.covariance_feasibility&&(ridge_seen||analytic_curvature_seen))
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance feasibility owns the ridge and analytic_curvature schedule; remove manual ridge and analytic_curvature options.");
+    if(options.covariance_feasibility&&(options.covariance_block_newton||options.covariance_joint_block))
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance feasibility does not support block_newton or joint_block.");
+    if(options.covariance_feasibility&&options.covariance_staged_barrier)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance feasibility owns the barrier schedule; remove staged_barrier.");
+    if((options.covariance_structured_basis||blind_samples_seen||blind_manifest_seen)&&!options.covariance_feasibility)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance structured_basis, blind_samples, and blind_manifest require feasibility.");
+    if(blind_samples_seen!=blind_manifest_seen)
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance blind_samples and blind_manifest must be supplied together.");
     options.output_path = tokens[3];
     options.kernel_table = tokens[8];
     options.raw_input_path = tokens[9];
@@ -923,6 +968,8 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
       if (end == tokens[token].c_str() || *end != '\0' || !std::isfinite(*values[i]) || *values[i] <= 0.0)
         PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance numeric arguments must be positive finite numbers.");
     }
+    if(options.covariance_feasibility&&std::abs(options.covariance_shrinkage-0.1)>8.0*std::numeric_limits<double>::epsilon())
+      PRINT_INPUT_ERROR("rpmd_ja fit_samples_covariance feasibility requires shrinkage 0.1 for the A comparison.");
     errno = 0;
     char* end = nullptr;
     const long long iterations = std::strtoll(tokens[13].c_str(), &end, 10);

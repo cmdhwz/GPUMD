@@ -65,12 +65,12 @@ inline RpmdJAAdditiveData read_rpmd_ja_additive(
   const std::string& path, const std::string& raw_path, const RpmdJAReference& ref,
   const int beads, const std::vector<double>& raw_gradient)
 {
-  std::ifstream size_in(path, std::ios::binary | std::ios::ate);
+  rpmd_ja_file_io::ifstream size_in(path, std::ios::binary | std::ios::ate);
   if (!size_in || size_in.tellg() < 88) throw std::runtime_error("GPJAADD1 package is shorter than its header");
   const std::streamoff package_bytes = size_in.tellg();
   if (static_cast<std::uintmax_t>(package_bytes) > std::numeric_limits<std::size_t>::max())
     throw std::runtime_error("GPJAADD1 package exceeds host addressable size");
-  std::ifstream in(path, std::ios::binary);
+  rpmd_ja_file_io::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("cannot open GPJAADD1 package: " + path);
   char magic[8]{}; in.read(magic, sizeof(magic));
   const int version = rpmd_ja_additive_read<std::uint32_t>(in);

@@ -1,6 +1,7 @@
 #include "rpmd_ja_reference.cuh"
 #include "rpmd_ja_reference_math.cuh"
 #include "rpmd_ja_qnep_prepare.cuh"
+#include "rpmd_ja_sha256.h"
 #include "force/force.cuh"
 #include "force/nep.cuh"
 #include "force/nep_charge.cuh"
@@ -742,7 +743,7 @@ double relative_translation_residual(const std::vector<double>& dmat, const std:
 
 void load_kernel_table(const std::string& path, RpmdJAReference& reference)
 {
-  std::ifstream in(path);
+  rpmd_ja_file_io::ifstream in(path);
   if (!in) throw std::runtime_error("cannot open RPMD-JA kernel table: " + path);
   std::string token;
   int version = 0;
@@ -1014,11 +1015,11 @@ void write_reference(const std::string& path, const RpmdJAReference& reference)
   const std::string temporary = path + ".tmp";
   bool created_temporary = false;
   try {
-    std::ifstream existing(path, std::ios::binary);
-    std::ifstream existing_temporary(temporary, std::ios::binary);
+    rpmd_ja_file_io::ifstream existing(path, std::ios::binary);
+    rpmd_ja_file_io::ifstream existing_temporary(temporary, std::ios::binary);
     if (existing.good() || existing_temporary.good())
       throw std::runtime_error("RPMD-JA reference destination or temporary file already exists");
-    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    rpmd_ja_file_io::ofstream out(temporary, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("cannot create RPMD-JA reference file: " + temporary);
     created_temporary = true;
     out.write(kMagic, sizeof(kMagic));
@@ -1102,10 +1103,10 @@ void write_reference(const std::string& path, const RpmdJAReference& reference)
     out.flush();
     if (!out) throw std::runtime_error("failed flushing RPMD-JA reference file");
     out.close();
-    if (std::rename(temporary.c_str(), path.c_str()) != 0)
+    if (rpmd_ja_file_io::rename_file(temporary,path) != 0)
       throw std::runtime_error("cannot replace RPMD-JA reference destination");
   } catch (...) {
-    if (created_temporary) std::remove(temporary.c_str());
+    if (created_temporary) rpmd_ja_file_io::remove_file(temporary);
     throw;
   }
 }
@@ -1170,7 +1171,7 @@ std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const Rpmd
 
 std::uint64_t rpmd_ja_model_fingerprint(const std::string& path)
 {
-  std::ifstream in(path, std::ios::binary);
+  rpmd_ja_file_io::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("cannot open NEP model for RPMD-JA fingerprint: " + path);
   std::uint64_t hash = 14695981039346656037ULL;
   char bytes[8192];
@@ -1435,7 +1436,7 @@ RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom& atom, Box& active_box
 
 RpmdJAReference read_rpmd_ja_reference(const std::string& path)
 {
-  std::ifstream in(path, std::ios::binary);
+  rpmd_ja_file_io::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("cannot open RPMD-JA reference file: " + path);
   char magic[sizeof(kMagic)], units[sizeof(kUnits)];
   in.read(magic, sizeof(magic));
@@ -1619,7 +1620,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     require_finite(result.p_vectors, "P eigenvectors");
     require_finite(result.q_vectors, "Q eigenvectors");
     const std::string stability_path = path + ".stability";
-    std::ifstream stability(stability_path);
+    rpmd_ja_file_io::ifstream stability(stability_path);
     std::string tag;
     int stability_version = 0, atom_count = 0;
     std::uint64_t fingerprint = 0;
@@ -1664,7 +1665,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     if (actual_bound > result.spectral_bound * (1.0 + 32.0 * std::numeric_limits<double>::epsilon()))
       throw std::runtime_error("qNEP RPMD-JA stored spectral bound is below its block row-sum bound");
     const std::string stability_path = path + ".stability";
-    std::ifstream stability(stability_path);
+    rpmd_ja_file_io::ifstream stability(stability_path);
     std::string tag;
     int stability_version = 0, atom_count = 0;
     std::uint64_t file_fingerprint = 0, config_fingerprint = 0;
@@ -1754,6 +1755,15 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     result.relative_operator_bound = operator_bound;
     result.stability_checked = true;
   }
+  in.clear();
+  in.seekg(0, std::ios::beg);
+  if (!in) throw std::runtime_error("cannot rewind RPMD-JA reference file for SHA-256 identity");
+  rpmd_ja_sha256::Digest digest;
+  char digest_buffer[8192];
+  while (in.read(digest_buffer, sizeof(digest_buffer)) || in.gcount() != 0)
+    digest.update(reinterpret_cast<const unsigned char*>(digest_buffer), static_cast<std::size_t>(in.gcount()));
+  if (!in.eof()) throw std::runtime_error("failed reading RPMD-JA reference file for SHA-256 identity");
+  result.source_file_sha256 = digest.finish_hex();
   return result;
 }
 
@@ -1768,7 +1778,7 @@ void generate_rpmd_ja_reference(
   if (!(temperature > 0.0) || !std::isfinite(temperature) || !(fd_step > 0.0) || !std::isfinite(fd_step))
     throw std::invalid_argument("rpmd_ja reference requires positive finite temperature and fd_step");
   if (path.empty()) throw std::invalid_argument("rpmd_ja reference requires an output path");
-  std::ifstream existing(path, std::ios::binary), existing_temporary(path + ".tmp", std::ios::binary);
+  rpmd_ja_file_io::ifstream existing(path, std::ios::binary), existing_temporary(path + ".tmp", std::ios::binary);
   if (existing.good() || existing_temporary.good())
     throw std::runtime_error("RPMD-JA reference destination or temporary file already exists");
   if (atom.number_of_atoms <= 1 || atom.cpu_type.size() != static_cast<size_t>(atom.number_of_atoms) ||
@@ -1936,7 +1946,7 @@ void generate_rpmd_ja_sparse_reference(
   if (!(temperature > 0.0) || !std::isfinite(temperature) || !(fd_step > 0.0) || !std::isfinite(fd_step))
     throw std::invalid_argument("sparse rpmd_ja reference requires positive finite temperature and fd_step");
   if (path.empty() || kernel_table_path.empty()) throw std::invalid_argument("sparse rpmd_ja requires output and kernel-table paths");
-  std::ifstream existing(path, std::ios::binary), existing_temporary(path + ".tmp", std::ios::binary);
+  rpmd_ja_file_io::ifstream existing(path, std::ios::binary), existing_temporary(path + ".tmp", std::ios::binary);
   if (existing.good() || existing_temporary.good()) throw std::runtime_error("RPMD-JA sparse destination or temporary already exists");
   if (atom.number_of_atoms <= 1 || atom.cpu_type.size() != static_cast<std::size_t>(atom.number_of_atoms) ||
       atom.cpu_mass.size() != static_cast<std::size_t>(atom.number_of_atoms))
@@ -2233,7 +2243,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
     if (!std::isfinite(value)) throw std::runtime_error("qNEP rpmd_ja requires a finite cell");
 
   const std::string temporary = path + ".tmp";
-  std::ifstream existing(path, std::ios::binary), existing_temporary(temporary, std::ios::binary);
+  rpmd_ja_file_io::ifstream existing(path, std::ios::binary), existing_temporary(temporary, std::ios::binary);
   if (existing.good() || existing_temporary.good())
     throw std::runtime_error("qNEP rpmd_ja raw output or temporary file already exists");
   const auto generation_start = std::chrono::steady_clock::now();
@@ -2408,9 +2418,9 @@ static void generate_rpmd_ja_qnep_raw_reference(
     explicit RemoveRawTemporary(const std::string& value) : path(value) {}
     std::string path;
     bool active = true;
-    ~RemoveRawTemporary() { if (active) std::remove(path.c_str()); }
+    ~RemoveRawTemporary() { if (active) rpmd_ja_file_io::remove_file(path); }
   } remove_temporary(temporary);
-  std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+  rpmd_ja_file_io::ofstream out(temporary, std::ios::binary | std::ios::trunc);
   if (!out) throw std::runtime_error("cannot create qNEP rpmd_ja raw file: " + temporary);
   constexpr char raw_magic[8] = {'G','P','J','Q','R','A','W','\0'};
   constexpr char raw_layout[] = "xyz_soa;derivative_input_rows_output_columns";
@@ -2684,7 +2694,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   if (!out) throw std::runtime_error("failed writing qNEP rpmd_ja raw diagnostic footer");
   out.close();
   if (!out) throw std::runtime_error("failed closing qNEP rpmd_ja raw file");
-  if (std::rename(temporary.c_str(), path.c_str()) != 0)
+  if (rpmd_ja_file_io::rename_file(temporary,path) != 0)
     throw std::runtime_error("cannot finalize qNEP rpmd_ja raw file");
   remove_temporary.active = false;
   std::printf("    qNEP rpmd_ja raw v3: maximum force %.3e eV/A; analytic-gradient/native-force abs RMS %.3e; site-JVP/gradient identity abs RMS %.3e; V analytic, coarse V repeats it; K uses fourth-order analytic-gradient FD; C uses fourth-order native nine-component virial FD.\n",
@@ -2743,13 +2753,13 @@ void generate_rpmd_ja_qnep_reference(
 {
   const std::string raw_path = path + ".qraw";
   const std::string sidecar_path = path + ".stability";
-  std::ifstream existing(path, std::ios::binary), existing_sidecar(sidecar_path), existing_raw(raw_path, std::ios::binary);
+  rpmd_ja_file_io::ifstream existing(path, std::ios::binary), existing_sidecar(sidecar_path), existing_raw(raw_path, std::ios::binary);
   if (existing.good() || existing_sidecar.good() || existing_raw.good())
     throw std::runtime_error("qNEP rpmd_ja final output, sidecar, or scratch file already exists");
   generate_rpmd_ja_qnep_raw_reference(
     raw_path, temperature, fd_step, kernel_table_path, atom, box, force, false);
   prepare_rpmd_ja_qnep_reference(raw_path, path, kernel_table_path, make_rpmd_ja_qnep_mode_validator(atom, box, force));
-  if (std::remove(raw_path.c_str()) != 0)
+  if (rpmd_ja_file_io::remove_file(raw_path) != 0)
     throw std::runtime_error("qNEP rpmd_ja finalized but could not remove raw scratch file: " + raw_path);
 }
 

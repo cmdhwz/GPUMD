@@ -2065,7 +2065,7 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
   const double volume = box.get_volume();
   if (!qnep_existing_file_has_schema(
         "heat_current_rpmd_ja.out",
-        {"# segment_metadata_version 1",
+        {"# segment_metadata_version 2",
          "# columns time_ps Jcent_x Jcent_y Jcent_z DeltaJ_x DeltaJ_y DeltaJ_z JA_x JA_y JA_z"}) ||
       !qnep_existing_file_has_schema(
         "hac_rpmd_ja.out",
@@ -2074,7 +2074,8 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
     PRINT_INPUT_ERROR("rpmd_ja output schema changed during the run; refusing to append incompatible data.");
   }
   FILE* current_file = my_fopen("heat_current_rpmd_ja.out", "a");
-  fprintf(current_file, "# segment_metadata_version 1\n");
+  fprintf(current_file, "# segment_metadata_version 2\n");
+  fprintf(current_file, "# reference_package_sha256 %s\n", rpmd_ja_reference_.source_file_sha256.c_str());
   fprintf(current_file, "# backend %s\n",
     rpmd_ja_reference_.backend == 0 ? "dense-v1" :
       rpmd_ja_reference_.backend == 1 ? "sparse-v2" : "qnep-block-v3");

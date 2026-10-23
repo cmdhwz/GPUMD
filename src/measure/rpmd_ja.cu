@@ -176,7 +176,7 @@ void HAC::pre_run_rpmd_ja_(
   if (output_interval > Nc) PRINT_INPUT_ERROR("rpmd_ja requires output_interval not to exceed Nc.");
   if (!qnep_existing_file_has_schema(
         "heat_current_rpmd_ja.out",
-        {"# segment_metadata_version 1",
+        {"# segment_metadata_version 2",
          "# columns time_ps Jcent_x Jcent_y Jcent_z DeltaJ_x DeltaJ_y DeltaJ_z JA_x JA_y JA_z"}) ||
       !qnep_existing_file_has_schema(
         "hac_rpmd_ja.out",

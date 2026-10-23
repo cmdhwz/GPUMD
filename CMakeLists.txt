@@ -75,11 +75,40 @@ target_compile_definitions(gpumd PRIVATE
     GPUMD_GIT_DIRTY="${GPUMD_GIT_DIRTY}")
 
 option(BUILD_TESTING "Build GPUMD tests" OFF)
+option(BUILD_RPMD_JA_CUDA_REGRESSIONS "Build RPMD-JA CUDA numerical and real-linked prepare/readback regressions" OFF)
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(rpmd_ja_statistics_policy_cpu_test tests/rpmd_ja_statistics_policy_test.cpp)
+    target_include_directories(rpmd_ja_statistics_policy_cpu_test PRIVATE src src/measure)
+    add_test(NAME rpmd_ja_statistics_policy_cpu_test COMMAND rpmd_ja_statistics_policy_cpu_test)
+
+    add_executable(rpmd_ja_feasibility_policy_cpu_test tests/rpmd_ja_feasibility_policy_test.cpp)
+    target_include_directories(rpmd_ja_feasibility_policy_cpu_test PRIVATE src)
+    add_test(NAME rpmd_ja_feasibility_policy_cpu_test COMMAND rpmd_ja_feasibility_policy_cpu_test)
+
     add_executable(quantum_heat_moments_cpu_test tests/quantum_heat_moments_cpu_test.cpp)
     target_include_directories(quantum_heat_moments_cpu_test PRIVATE src)
     add_test(NAME quantum_heat_moments_cpu_test COMMAND quantum_heat_moments_cpu_test)
+
+    add_executable(rpmd_ja_file_io_cpu_test tests/rpmd_ja_file_io_cpu_test.cpp)
+    target_include_directories(rpmd_ja_file_io_cpu_test PRIVATE src)
+    add_test(NAME rpmd_ja_file_io_cpu_test COMMAND rpmd_ja_file_io_cpu_test)
+
+    add_executable(rpmd_ja_covariance_checkpoint_cpu_test tests/rpmd_ja_covariance_checkpoint_test.cpp)
+    target_include_directories(rpmd_ja_covariance_checkpoint_cpu_test PRIVATE src)
+    add_test(NAME rpmd_ja_covariance_checkpoint_cpu_test COMMAND rpmd_ja_covariance_checkpoint_cpu_test)
+
+    add_executable(rpmd_ja_a0_reuse_export_cpu_test tests/rpmd_ja_a0_reuse_export_test.cpp)
+    target_include_directories(rpmd_ja_a0_reuse_export_cpu_test PRIVATE src)
+    add_test(NAME rpmd_ja_a0_reuse_export_cpu_test COMMAND rpmd_ja_a0_reuse_export_cpu_test)
+
+    add_executable(rpmd_ja_preflight_receipt_cpu_test tests/rpmd_ja_preflight_receipt_test.cpp)
+    target_include_directories(rpmd_ja_preflight_receipt_cpu_test PRIVATE src)
+    add_test(NAME rpmd_ja_preflight_receipt_cpu_test COMMAND rpmd_ja_preflight_receipt_cpu_test)
+
+    add_executable(rpmd_ja_local_basis_cpu_test tests/rpmd_ja_local_basis_test.cpp)
+    target_include_directories(rpmd_ja_local_basis_cpu_test PRIVATE src src/measure)
+    add_test(NAME rpmd_ja_local_basis_cpu_test COMMAND rpmd_ja_local_basis_cpu_test)
 
     find_path(PROTON_TUNNELING_NETCDF_INCLUDE_DIR netcdf.h HINTS ${NETCDF_ROOT} ENV NETCDF_ROOT PATH_SUFFIXES include)
     find_library(PROTON_TUNNELING_NETCDF_LIBRARY NAMES netcdf HINTS ${NETCDF_ROOT} ENV NETCDF_ROOT PATH_SUFFIXES lib lib64)
@@ -123,6 +152,30 @@ if(BUILD_TESTING)
         add_test(NAME proton_tunneling_netcdf_cpu_test COMMAND proton_tunneling_netcdf_cpu_test)
     else()
         message(STATUS "NetCDF development files or complete link metadata not found; proton_tunneling_netcdf_cpu_test is skipped")
+    endif()
+
+    if(BUILD_RPMD_JA_CUDA_REGRESSIONS)
+        add_executable(rpmd_ja_native_fit_cuda_test
+            tests/rpmd_ja_native_fit_cuda_test.cu
+            src/utilities/error.cu)
+        target_include_directories(rpmd_ja_native_fit_cuda_test PRIVATE src)
+        target_link_libraries(rpmd_ja_native_fit_cuda_test PRIVATE CUDA::cublas CUDA::cusolver)
+        add_test(NAME rpmd_ja_native_fit_cuda_test
+            COMMAND rpmd_ja_native_fit_cuda_test --fixture-dir "${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+
+        set(RPMD_JA_INTEGRATION_SOURCES ${GPUMD_SOURCES})
+        list(FILTER RPMD_JA_INTEGRATION_SOURCES EXCLUDE REGEX "/src/main_gpumd/main\\.cu$")
+        list(FILTER RPMD_JA_INTEGRATION_SOURCES EXCLUDE REGEX "/src/measure/rpmd_ja_native_fit\\.cu$")
+        add_executable(rpmd_ja_fit_prepare_integration_cuda_test
+            tests/rpmd_ja_fit_prepare_integration_cuda_test.cu
+            ${RPMD_JA_INTEGRATION_SOURCES})
+        target_compile_definitions(rpmd_ja_fit_prepare_integration_cuda_test PRIVATE
+            GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST)
+        target_include_directories(rpmd_ja_fit_prepare_integration_cuda_test PRIVATE src)
+        target_link_libraries(rpmd_ja_fit_prepare_integration_cuda_test PRIVATE
+            CUDA::cublas CUDA::cusolver CUDA::cufft Threads::Threads)
+        add_test(NAME rpmd_ja_fit_prepare_integration_cuda_test
+            COMMAND rpmd_ja_fit_prepare_integration_cuda_test --integration-smoke)
     endif()
 endif()
 

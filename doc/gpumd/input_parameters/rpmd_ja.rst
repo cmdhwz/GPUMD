@@ -72,6 +72,314 @@ The separate offline ``fit_samples_covariance`` route reuses the same ``GPJASMP1
 
   rpmd_ja fit_samples_covariance <samples> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier]
 
+The bounded fixed-reference feasibility schedule has this additional form::
+
+  rpmd_ja fit_samples_covariance <samples> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage 0.1 max_iter <N> trust_region feasibility structured_basis blind_samples <blind_samples> blind_manifest <manifest>
+
+This schedule must be launched through
+``scripts/rpmd_ja_feasibility_preflight.py`` so the declared numerical CUDA
+regression and real prepare/readback integration executable run before fitting.
+The offline ``run.in`` may contain only ``potential``,
+``pppm_mesh_spacing``, ``pimd_fix_com``, and ``kspace`` setup commands before
+the fit command. Commands that perform calculations, including ``minimize``
+and ``compute_phonon``, are rejected so their work cannot run outside the
+declared feasibility budget. At native startup, qraw and kernel contents are
+hashed in one streaming pass and both SHA-256 values are compared with the
+manifest before sample traversal; the resulting FNV identities continue to
+guard these files during fitting and reference preparation.
+The ``RPJAFEAS9`` manifest must include ``m1_minimum_support_count`` as an
+integer from 1 through 1000 and ``response_delta_tolerance`` as a finite,
+positive response-change threshold. Both values are frozen before the fit,
+copied into the execution receipt, and checked again by the native executable.
+The same manifest also freezes ``curvature_primary_seed`` as
+``8d12e5b7c3a964f1``, ``curvature_independent_seed`` as
+``4f1bbcdc6762c9a5``, ``curvature_probe_cap`` as 128, and
+``curvature_directional_tolerance`` as 0.1. The launcher copies these values
+to the receipt, and native startup rejects a receipt or manifest that does
+not match the executable's compiled curvature contract.
+The manifest also declares ``candidate_cost_stop_rule`` as
+``MAX_COMPLETE_OR_PARTIAL_LOWER_BOUND_SECONDS_V1`` and a finite
+``candidate_cost_safety_factor`` from 1 through 10. Before each B/C candidate,
+the controller compares the larger of the largest completed candidate cost and
+the longest elapsed lower bound from an incomplete candidate, multiplied by
+that factor, against both the remaining family allowance and the global fit
+allowance after the validation reserve. Partial time never counts as a
+completed cost sample. If the projection does not fit, that candidate is not
+started and is reported as incomplete; this is not evidence that the reference
+family failed. This estimate does not predict the final prepare/readback
+duration.
+The same manifest freezes ``lambda_factors`` to ``0.01,0.0001,0.000001``,
+the wall and gradient limits (28800 seconds, 240 global gradients, 8 per A
+branch, and 112 shared B/C gradients), the 0.25 validation reserve, and the
+0.10 A wall fraction. It also freezes equal remaining B/C wall and gradient
+splits. The solver's training and development uncertainty ledgers use at most
+eight contiguous equal-frame-count blocks and require at least four. Candidate
+selection additionally uses the training-derived common block length ``B``
+and adjacent length ``2B`` over the same complete development prefix for every
+candidate. Each pair is compared with paired differences at both scales; a
+two-standard-error winner must agree at ``B`` and ``2B``. A disagreement or a
+resolved winner at only one scale is ``DATA_INCONCLUSIVE``. If both scales are
+unresolved, the frozen M0 tie preference applies. The existing frozen
+max-z-adjusted drift test remains in force; only a predeclared drift threshold
+exceedance rejects the data. The launcher writes these rules into the receipt;
+native startup rejects any mismatch with the executable contract.
+The manifest also fixes ``statistics_storage_budget_bytes`` at 536870912.
+Fixed-R0 admission statistics use mass-weighted internal physical probes and
+parameter channels, with B and 2B summaries sharing the same covered prefix.
+The pre-allocation peak estimate includes the simultaneously live sample,
+covariance, block, optimizer, and candidate-score storage. Before the training
+block length is known, it bounds block means at one mean per sample frame.
+Parameter covariance means are consumed incrementally rather than retained as
+a second full set.
+A larger input is reported as ``DATA_INCONCLUSIVE`` before fitting rather than
+truncated at a hidden frame-count cap. Statistical frame and lag loops observe
+the feasibility budget; exhaustion is reported as ``DATA_INCONCLUSIVE``.
+For each of ``training`` and ``blind``, RPJAFEAS9 requires
+``<sample>_model_sha256``, ``<sample>_physical_force_configuration_sha256``,
+and ``<sample>_integrator_configuration_sha256``. The producer's RPJAPROV2
+sidecar records the model-content digest alongside the declared historical
+configuration digests. Native startup hashes the active NEP model contents and
+binds that digest to the manifest's training and blind identities and the
+qraw's recorded model identity. A matching sidecar binds the sample bytes
+separately from those declared historical digests. The receipt reports byte
+integrity, declared-configuration matching, and source-job/run relationship as
+separate statuses. A missing sidecar is accepted only when all three manifest
+identities for that sample explicitly say ``NOT_VERIFIABLE``; concrete
+identities require matching evidence, and partial or downgraded declarations
+fail closed. The current offline ``run.in`` is not treated as evidence of how
+an existing sample was generated. Distinct sidecar identities are declarations
+and do not by themselves authenticate source independence.
+After the fixed M0/M1 graphs are built, native preflight performs a size-only
+walk of the frozen site blocks and checks disk space before fitting. It uses
+the larger exact serialized additive-package size, a qraw-sized upper bound
+for the final reference, and a 1 GiB margin. Host readback and minimum prepare
+GPU allocations are also estimated before fitting; the prepare stage repeats
+its dynamic peak-memory check when it starts.
+On Linux, the host-memory check also respects an available cgroup memory
+limit. During prepare, the written reference and stability sidecar are read
+back before success is reported. Three fixed vector actions are checked for
+stored D and each stored ``B_alpha^T`` against the precompression operators;
+failure removes the reference and sidecar.
+Adjacent-lambda response change is measured as
+``||P_right-P_left||_F / max(||P_left||_F, ||P_right||_F)`` using the full
+predicted response matrices in the frozen common-probe order. This fixed
+``FROBENIUS_RELATIVE_MAX_NORM_V1`` metric includes every cross term and does
+not normalize individual entries. The formula and near-zero rule are fixed
+by the native executable SHA-256 pinned in the manifest and are written to
+the fit trace. If the probe orders or matrix dimensions
+differ, any matrix entry or norm is non-finite, or both global matrix norms are
+at most the smallest normal double value, the comparison is ``INCONCLUSIVE``.
+The existing response SPD gate also rejects a predicted matrix whose minimum
+eigenvalue is at most ``1e-12`` of its maximum eigenvalue. The scalar response
+error difference is retained only as a diagnostic. The response-change
+threshold is independent of the absolute candidate ``response_tolerance``.
+If adjacent-lambda sensitivity is resolved as
+``REGULARIZATION_SENSITIVE`` or remains ``INCONCLUSIVE``, the candidate is
+recorded but blind data stays unopened and no reference is published. Raw
+local terms below the support threshold are removed before operator
+residualization. M0 remains the shared base of M1.
+
+After A0/A1, B and C each receive an equal wall-clock cap from the time left
+after the reserved blind/prepare allowance. The B/C gradient cap remains
+shared as well. Development likelihood uncertainty uses at most eight
+contiguous fixed-R0 blocks, requires at least four blocks, and reports a
+two-standard-error block-scatter interval. Adjacent-lambda sensitivity uses
+paired block differences and the manifest-frozen ``response_delta_tolerance``
+as its response-change scale. Cross-family selection compares paired score
+differences over the same development prefix at ``B`` and ``2B`` with a
+two-standard-error rule; only a same resolved winner at both scales selects a
+candidate. A scale disagreement is ``DATA_INCONCLUSIVE``; when both
+comparisons are unresolved, the frozen M0 preference applies. This block
+scatter is not a universal confidence interval. Converged baseline/candidate soft Ritz directions that pass the
+``1e-6`` relative-residual check are unioned and all selectable candidates are
+rescored on the same frozen probe set before candidate selection and blind
+data access.
+
+On a CUDA development host, configure and build the production executable and
+both RPMD-JA CUDA regressions with assertions enabled::
+
+  cmake -S . -B build -DBUILD_TESTING=ON -DBUILD_RPMD_JA_CUDA_REGRESSIONS=ON -DCMAKE_BUILD_TYPE=Debug
+  cmake --build build --config Debug --target gpumd rpmd_ja_native_fit_cuda_test rpmd_ja_fit_prepare_integration_cuda_test
+  ctest --test-dir build -C Debug --output-on-failure -R "rpmd_ja_(native_fit|fit_prepare_integration)_cuda_test"
+
+The numerical regression is a standalone CUDA executable. The integration
+regression links the production GPUMD sources except the application entry point
+and the native-fit translation unit (which is included in the test translation
+unit), so it exercises the real prepare, reference readback, and CUDA matrix
+code. Point the feasibility manifest at both built test executables. Build
+commands are recorded here but still require execution on the target CUDA
+toolchain before their results can count as regression evidence. The preflight
+receipt records executable identities and statuses; manifest text alone is not
+execution evidence.
+
+Feasibility launcher, resume, and cost baseline
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Run the launcher from the repository root. Its complete command-line form is
+``python scripts/rpmd_ja_feasibility_preflight.py [--resume] <manifest> <run-directory>``.
+For example::
+
+  python scripts/rpmd_ja_feasibility_preflight.py runs/job17/manifest.txt runs/job17
+
+The launcher runs both CUDA regression executables declared by the manifest,
+writes its receipt and logs in the run directory, then launches GPUMD. It has
+no check-only mode. A new run requires unused output and checkpoint paths.
+The manifest's ``native_output_path`` must match the fit command in ``run.in``.
+Its ``checkpoint_path`` identifies the outer controller journal; a relative
+value is resolved from the run directory, and the native solver checkpoint is
+stored beside it with ``.solver`` appended. Preserve both checkpoints and the
+candidate-state files for recovery.
+
+Resume with the same manifest file and run directory::
+
+  python scripts/rpmd_ja_feasibility_preflight.py --resume runs/job17/manifest.txt runs/job17
+
+The preflight revalidates the manifest, inputs, checkpoint identity, all
+resume artifacts, and both CUDA regression executables before launching
+GPUMD. The controller journal must be intact and match the original manifest
+and job ID. Interrupted A0/A1/B/C fitting resumes from the saved scheduler
+and solver state. After selection freezes, recovery restores the exact chosen
+candidate and development response. At ``FREEZE``, the journal branch/family
+remains the scheduler cursor: ``B2/M0`` when no M1 candidate was added, or
+``C2/M1`` after M1 candidates were evaluated. The selected candidate is recorded
+separately, so an M0 winner can retain a ``C2/M1`` cursor. If blind validation
+was interrupted, it may be repeated only for that candidate with the frozen
+probes; after a passing blind result, the persisted response is reused without reselecting. A
+``PUBLISHING`` resume accepts only reference/sidecar bytes matching the
+committed stage digests and can finish either rename of that same pair. A
+``PUBLISHED`` resume verifies the final reference, sidecar, fit diagnostics,
+trace, and response snapshots, then exits without modifying those sealed
+files. Unknown, changed, or foreign artifacts fail closed. Resume never resets
+the cumulative wall-time or gradient budget. An in-flight operation is charged
+from its recorded start time through restart, including stopped time; an
+in-flight gradient is conservatively charged once. A long stop can exhaust
+the remaining wall budget. The manifest bytes and input identities must remain
+unchanged, so changing any manifest field requires a new run directory, output,
+and checkpoint.
+
+The manifest protocol is ``RPJAFEAS9`` and the execution receipt is
+``RPJAPREFLIGHT5``. The outer restart journal is ``RPJAOUTER5`` and the solver
+checkpoint is ``RPJACKPT4``. Older journal/checkpoint versions are rejected,
+not migrated. The outer journal binds the selected candidate, final probe set,
+development/blind response snapshots, publication-stage digests, and final
+artifact digests. In-flight controller operations record their start time for
+wall-budget reconciliation. Fit locking uses a persistent lock file with an
+operating-system lock; the OS releases ownership when the process exits, so a
+stale file does not prevent recovery and is never removed to guess whether
+another job is live.
+The journal path is exactly the manifest's ``checkpoint_path`` after resolving
+it against the run directory.
+
+An optional historical A0 import uses the paired fields
+``a0_reuse_package_path`` and ``a0_reuse_package_sha256``. Both must be present
+or both omitted. A completed job exports one atomic
+``<native_output_path>.a0_reuse.record`` package containing the exact source
+manifest, fit-state, and record byte snapshots; the manifest digest field is
+the SHA-256 of the whole package. A staged package is committed without
+replacing existing evidence, so a process interruption leaves no partial
+final package and resume can write a fresh stage. Only a converged A0 fit with
+complete development-response statistics is eligible. A failed development response
+may still be imported as a diagnostic; it is recomputed for the new job.
+
+The import requires matching input content digests, model/qraw, fixed-R0 and
+sampling identity, graph, objective/scales, sampling and statistics rules,
+budgets, executable, and machine fingerprint. Output/job paths and the A0
+import-control fields are excluded from the canonical comparison so a new job
+can consume the source package. Historical optimizer and fit costs remain
+source metadata with their origin job ID. The current snapshot-export job ID is
+stored separately. Current import validation, numerical replay, baseline/factor
+rebuild, and response scoring are recorded separately and charged to the new
+job's wall budget. Nonconverged A0 states are not
+importable. Same-job resume remains the outer-journal protocol and is not an
+A0 import.
+
+Before blind validation, the manifest and receipt also freeze a performance
+stop heuristic for analytic-curvature trust-region candidates. After three
+successful curvature builds at unchanged ``tau``, the candidate stops as
+``NUMERICAL_INCONCLUSIVE_PERFORMANCE_STOP`` when their measured host wall time
+exceeds one maximum measured full exact-gradient wall time from that same
+``tau`` window and relative objective improvement is below ``0.001``. Relative
+improvement is normalized by ``max(1, abs(window-start objective))``. A
+``tau`` change starts a new window. The normal KKT/convergence test runs first,
+and this heuristic does not change the KKT gate or show that a reference family
+has no solution. Timings are steady-clock host wall measurements, not GPU event
+times; objective, gradient, factorization, curvature, and response costs are
+recorded, including partial/failed work.
+
+``RPJACOST1`` is an optional measured-cost baseline. With no matched prior
+measurements, set ``cost_baseline_status "NOT_PROVIDED"`` (or omit that
+status) and omit the baseline path and hash. Unknown costs remain unknown, not
+zero, and this does not prevent startup; the hard wall/gradient budgets still
+apply. The repository does not provide a baseline-generation command. For a
+verified baseline, create a text file from completed measurements for the same
+machine and problem dimensions, using the largest completed measurement for
+each field::
+
+  RPJACOST1
+  machine_fingerprint "<64 lowercase hex characters>"
+  atom_count "<integer>"
+  sample_frames "<integer>"
+  training_frames "<integer>"
+  development_frames "<integer>"
+  m0_parameter_count "<integer>"
+  m1_parameter_count "<integer>"
+  candidate_seconds "<positive seconds>"
+  fit_seconds "<positive seconds>"
+  curvature_seconds "<positive seconds>"
+  blind_seconds "<positive seconds>"
+  package_write_seconds "<positive seconds>"
+  prepare_seconds "<positive seconds>"
+  readback_seconds "<positive seconds>"
+
+Obtain ``machine_fingerprint`` with the launcher's helper and the same visible
+GPU inventory/environment used for the run::
+
+  python -c "import importlib.util,subprocess; p='scripts/rpmd_ja_feasibility_preflight.py'; s=importlib.util.spec_from_file_location('rpmd_ja_pf',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); g=subprocess.run(['nvidia-smi','-L'],check=True,capture_output=True,text=True).stdout; print(m.machine_fingerprint(g))"
+
+Use ``sample_frames`` from the training sample; the frozen split is
+``training_frames = 2 * sample_frames // 3`` and the remainder is
+``development_frames``. Use the actual atom count, type-derived M0 parameter
+count ``6 * ntypes * (ntypes + 1) // 2`` (``ntypes`` is the number of unique
+atom types in the training sample), and M1 parameter count for that problem,
+not estimates. For timing,
+use only ``MEASURED_CANDIDATE_COST`` rows with ``complete_cost_sample 1`` and
+``MEASURED_STAGE_COST`` rows with ``status PASS`` in a successful
+``.fit_trace.txt``. ``candidate_seconds`` is the largest completed candidate
+``total_seconds``. For each complete candidate row, derive ``curvature_seconds``
+as the smaller of ``total_seconds`` and ``curvature_seconds`` in that row, and
+``fit_seconds`` as ``total_seconds - curvature_seconds``; use the largest
+derived value for each. Use the largest passing stage duration for blind,
+package write, prepare, and readback. Do not substitute partial elapsed lower
+bounds or fabricate a missing measurement.
+
+Bind the file in the manifest, with ``cost_baseline_path`` resolved relative
+to the run directory and ``cost_baseline_sha256`` equal to its SHA-256::
+
+  cost_baseline_status "VERIFIED"
+  cost_baseline_path "cost_baseline.txt"
+  cost_baseline_sha256 "<64 lowercase hex characters>"
+
+From the directory containing the baseline file, compute its digest on
+PowerShell with::
+
+  (Get-FileHash .\cost_baseline.txt -Algorithm SHA256).Hash.ToLowerInvariant()
+
+Preflight checks that digest before and after the CUDA regressions and binds the
+baseline to the machine fingerprint, atom/sample/train/development sizes, and
+M0/M1 parameter counts. The native executable checks those dimensions again.
+
+Resource checks are estimates with explicit limits. The Python preflight first
+requires the input-file sizes plus a 1 GiB free-disk floor. Native preflight
+then reserves known simultaneous host/disk objects, including M0/M1 graph
+working sets, package staging copies, generated qraw when applicable, and
+reference publication copies; available host/disk capacity is rechecked before
+package write, prepare, and readback. These known-object lifecycle bounds are
+not complete allocator/OS/runtime certificates
+(``host_allocator_peak_complete=0``). The early GPU figure is a lower bound;
+prepare queries the cuSOLVER POTRF and SVD workspaces and checks its known live
+GPU allocations before the main prepare allocations. Neither estimate replaces
+the runtime capacity checks or constitutes a material-validation result.
+
 The two optional tokens can appear in either order. At most one step mode may
 be supplied. ``staged_barrier`` is independent of the step mode.
 

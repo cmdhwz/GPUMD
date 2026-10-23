@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rpmd_ja_utf8_file_io.h"
 #include <cstdint>
 #include <iosfwd>
 #include <string>
@@ -34,6 +35,7 @@ struct RpmdJAReference
   int number_of_atoms = 0;
   double temperature = 0.0;
   double fd_step = 0.0;
+  std::string source_file_sha256;
   std::uint64_t model_fingerprint = 0;
   std::uint64_t reference_edge_count = 0;
   std::uint64_t reference_edge_fingerprint = 0;

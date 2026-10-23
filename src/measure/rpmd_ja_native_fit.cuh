@@ -28,6 +28,12 @@ struct RpmdJANativeFitOptions
   int max_stability_rounds = 160;
   int max_covariance_iterations = 0;
   double covariance_shrinkage = 0.0;
+  double covariance_ridge_lambda = 0.0;
+  int covariance_analytic_curvature_probes = 0;
+  bool covariance_feasibility = false;
+  bool covariance_structured_basis = false;
+  std::string covariance_blind_samples;
+  std::string covariance_blind_manifest_path;
   bool covariance_block_newton = false;
   bool covariance_joint_block = false;
   bool covariance_trust_region = false;

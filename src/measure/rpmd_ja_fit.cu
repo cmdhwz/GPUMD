@@ -1,8 +1,10 @@
 #include "rpmd_ja_fit.cuh"
+#include "rpmd_ja_process_lock.h"
 
 #include "rpmd_ja_fit_sampling.cuh"
 #include "rpmd_ja_native_fit.cuh"
 #include "rpmd_ja_reference.cuh"
+#include "rpmd_ja_sample_provenance.h"
 #include "integrate/integrate.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
@@ -16,8 +18,10 @@
 #include <climits>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <set>
 #include <stdexcept>
 
@@ -36,7 +40,7 @@ double parse_positive(const std::string& value, const char* name)
 
 bool file_exists(const std::string& path)
 {
-  std::ifstream in(path, std::ios::binary);
+  rpmd_ja_file_io::ifstream in(path, std::ios::binary);
   return in.good();
 }
 
@@ -45,13 +49,74 @@ bool apply_fit_mic(const Box& box, double& x, double& y, double& z)
   return rpmd_ja_fit_mic(box.cpu_h + 9, box.cpu_h, x, y, z);
 }
 
-void write_or_throw(std::ofstream& out, const void* data, const std::size_t bytes)
+void write_or_throw(rpmd_ja_file_io::ofstream& out, const void* data, const std::size_t bytes)
 {
   if (bytes > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
     throw std::runtime_error("RPMD-JA sample spool write exceeds stream limits");
   }
   out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
   if (!out) throw std::runtime_error("failed writing RPMD-JA sample spool");
+}
+
+void write_exclusive_file(const std::string& path, const std::string& contents)
+{
+  std::FILE* output = rpmd_ja_file_io::open_file(path, "wx");
+  if (!output) throw std::runtime_error(std::string("RPMD-JA provenance output already exists or cannot be created: ") + path);
+  const std::size_t written = std::fwrite(contents.data(), 1, contents.size(), output);
+  const bool flushed = std::fflush(output) == 0;
+  const bool closed = std::fclose(output) == 0;
+  if (written != contents.size() || !flushed || !closed) {
+    rpmd_ja_file_io::remove_file(path);
+    throw std::runtime_error(std::string("failed writing RPMD-JA provenance output: ") + path);
+  }
+}
+
+std::string build_provenance_json(
+  const std::string& sample_sha256, const std::uint64_t sample_bytes, const std::uint64_t sample_frames,
+  const std::string& source_job_id, const std::string& source_job_id_status, const std::string& source_run_id,
+  const int first_sample_step, const int last_sample_step, const double timestep_internal, const double timestep_fs,
+  const double temperature, const int beads, const bool internal_mass_com, const double* sampling_com_shift,
+  const std::string& thermostat_tokens_json,const std::string& active_configuration_scope,const unsigned active_run_ordinal,
+  const std::string& model_path,
+  const std::string& model_sha256_begin, const std::string& model_sha256_end,
+  const std::string& run_input_sha256_begin, const std::string& run_input_sha256_end,
+  const std::string& physical_force_configuration_sha256, const std::string& integrator_configuration_sha256,
+  const std::string& atom_signature_sha256,
+  const bool configuration_stable)
+{
+  std::ostringstream output;
+  output.imbue(std::locale::classic());
+  output << std::setprecision(17);
+  output << "{\"schema\":\"RPJAPROV2\",\"sample_sha256\":\"" << sample_sha256
+    << "\",\"sample_bytes\":" << sample_bytes << ",\"sample_frames\":" << sample_frames
+    << ",\"source_job_id\":\"" << rpmd_ja_sample_provenance::json_escape(source_job_id)
+    << "\",\"source_job_id_status\":\"" << rpmd_ja_sample_provenance::json_escape(source_job_id_status)
+    << "\",\"source_run_id\":\"" << rpmd_ja_sample_provenance::json_escape(source_run_id)
+    << "\",\"step_start\":" << first_sample_step << ",\"step_end\":" << last_sample_step
+    << ",\"provenance_status\":\"PRODUCER_OBSERVED\",\"independence_attestation\":\"NOT_ASSERTED\""
+    << ",\"metadata\":{\"integrator_type\":\"PIMD\",\"timestep_internal\":" << timestep_internal
+    << ",\"timestep_internal_unit\":\"GPUMD_INTERNAL_TIME\",\"timestep_fs\":" << timestep_fs
+    << ",\"timestep_fs_unit\":\"fs\",\"temperature_K\":" << temperature
+    << ",\"number_of_beads\":" << beads << ",\"thermostat_configuration_tokens\":" << thermostat_tokens_json
+    << ",\"active_configuration_scope\":\"" << rpmd_ja_sample_provenance::json_escape(active_configuration_scope)
+    << "\",\"active_run_ordinal\":" << active_run_ordinal
+    << ",\"model_path\":\"" << rpmd_ja_sample_provenance::json_escape(model_path)
+    << "\",\"model_sha256\":\"" << model_sha256_begin
+    << "\",\"model_sha256_begin\":\"" << model_sha256_begin
+    << "\",\"model_sha256_end\":\"" << model_sha256_end
+    << "\",\"run_input_sha256\":\"" << run_input_sha256_begin
+    << "\",\"run_input_sha256_begin\":\"" << run_input_sha256_begin
+    << "\",\"run_input_sha256_end\":\"" << run_input_sha256_end
+    << "\",\"physical_force_configuration_sha256\":\"" << physical_force_configuration_sha256
+    << "\",\"integrator_configuration_sha256\":\"" << integrator_configuration_sha256
+    << "\",\"atom_signature_sha256\":\"" << atom_signature_sha256
+    << "\",\"physical_force_source\":\"MEAN_OF_PHYSICAL_PIMD_BEAD_FORCES\""
+    << ",\"internal_mass_com\":" << (internal_mass_com ? "true" : "false")
+    << ",\"sampling_com_method\":\"MASS_WEIGHTED_CUMULATIVE_CENTROID_DRIFT_REMOVAL\""
+    << ",\"sampling_com_shift_final\":[" << sampling_com_shift[0] << ',' << sampling_com_shift[1] << ','
+    << sampling_com_shift[2] << "],\"configuration_stable_during_run\":"
+    << (configuration_stable ? "true" : "false") << "}}\n";
+  return output.str();
 }
 
 } // namespace
@@ -101,6 +166,8 @@ RpmdJA_Fit::RpmdJA_Fit(const std::vector<std::string>& tokens)
     throw std::invalid_argument("rpmd_ja output and kernel table paths must be nonempty");
   }
   spool_path_ = output_path_ + ".samples.tmp";
+  provenance_path_ = spool_path_ + ".provenance.json";
+  provenance_temp_path_ = provenance_path_ + ".tmp";
   lock_path_ = output_path_ + ".fit.lock";
 }
 
@@ -109,20 +176,23 @@ RpmdJA_Fit::~RpmdJA_Fit() { release_lock_(); }
 void RpmdJA_Fit::release_lock_()
 {
   if (!lock_file_) return;
+  rpmd_ja_process_lock::unlock(lock_file_);
   std::fclose(lock_file_);
   lock_file_ = nullptr;
-  std::remove(lock_path_.c_str());
 }
 
 void RpmdJA_Fit::pre_run(
   const int number_of_steps,
-  const double,
+  const double time_step,
   Integrate& integrate,
   std::vector<Group>&,
   Atom& atom,
   Box& box,
   Force& force)
 {
+  timestep_internal_ = time_step;
+  timestep_fs_ = time_step * TIME_UNIT_CONVERSION;
+  internal_mass_com_ = integrate.get_pimd_fix_com();
   if (integrate.get_type() != EnsembleType::PIMD || integrate.get_number_of_beads() < 1 ||
       atom.number_of_beads != integrate.get_number_of_beads()) {
     PRINT_INPUT_ERROR("rpmd_ja fit requires canonical PIMD sampling with initialized bead positions; RPMD and TRPMD do not thermostat the centroid and cannot guarantee canonical sampling.");
@@ -184,8 +254,29 @@ void RpmdJA_Fit::pre_run(
   if (pbc_[0] != 1 || pbc_[1] != 1 || pbc_[2] != 1) {
     PRINT_INPUT_ERROR("rpmd_ja fit currently requires periodic boundaries in all three directions.");
   }
-  const std::vector<std::string> outputs = sample_only_ ? std::vector<std::string>{spool_path_} :
-    std::vector<std::string>{output_path_, spool_path_, output_path_ + ".stability", output_path_ + ".qraw",
+  const unsigned current_run_ordinal=active_run_ordinal_++;
+  const rpmd_ja_sample_provenance::ConfigurationSnapshot provenance_snapshot=rpmd_ja_sample_provenance::snapshot(
+    force,atom,box,number_of_steps,current_run_ordinal,time_step,temperature_,number_of_beads_,internal_mass_com_);
+  if(!provenance_snapshot_initialized_){
+    run_input_sha256_=provenance_snapshot.run_input_sha256;
+    physical_force_configuration_sha256_=provenance_snapshot.physical_force_configuration_sha256;
+    integrator_configuration_sha256_=provenance_snapshot.integrator_configuration_sha256;
+    active_configuration_scope_=provenance_snapshot.active_configuration_scope;
+    model_sha256_=provenance_snapshot.model_sha256;atom_signature_sha256_=provenance_snapshot.atom_signature_sha256;
+    thermostat_tokens_json_=provenance_snapshot.thermostat_tokens_json;model_path_=provenance_snapshot.model_path;
+    provenance_snapshot_initialized_=true;
+  }else if(!provenance_snapshot.active_configuration_identified||
+      provenance_snapshot.run_input_sha256!=run_input_sha256_||
+      provenance_snapshot.physical_force_configuration_sha256!=physical_force_configuration_sha256_||
+      provenance_snapshot.integrator_configuration_sha256!=integrator_configuration_sha256_||
+      provenance_snapshot.model_sha256!=model_sha256_||provenance_snapshot.atom_signature_sha256!=atom_signature_sha256_){
+    configuration_stable_during_sampling_=false;
+  }
+  if(!provenance_snapshot.active_configuration_identified)configuration_stable_during_sampling_=false;
+  const std::vector<std::string> outputs = sample_only_ ?
+    std::vector<std::string>{spool_path_, provenance_path_, provenance_temp_path_} :
+    std::vector<std::string>{output_path_, spool_path_, provenance_path_, provenance_temp_path_,
+      output_path_ + ".stability", output_path_ + ".qraw",
       output_path_ + ".additive.tmp", output_path_ + ".fit.txt", output_path_ + ".fit.txt.tmp",
       output_path_ + ".fit_trace.txt", output_path_ + ".cg_witness.txt", output_path_ + ".qp_state.txt",
       output_path_ + ".failure.txt", output_path_ + ".tmp", output_path_ + ".stability.tmp"};
@@ -229,9 +320,15 @@ void RpmdJA_Fit::pre_run(
   sample_output_.resize(static_cast<std::size_t>(10) * number_of_atoms_);
   sample_output_gpu_.resize(sample_output_.size());
   force_ = &force;
+  const rpmd_ja_sample_provenance::SourceIdentity source_identity =
+    rpmd_ja_sample_provenance::source_identity();
+  source_job_id_ = source_identity.job_id;
+  source_job_id_status_ = source_identity.job_id_status;
+  source_run_id_ = source_identity.run_id;
 
-  lock_file_ = std::fopen(lock_path_.c_str(), "wx");
-  if (!lock_file_) {
+  lock_file_ = rpmd_ja_file_io::open_file(lock_path_, "a+b");
+  if (!lock_file_||!rpmd_ja_process_lock::try_lock(lock_file_)) {
+    if(lock_file_){std::fclose(lock_file_);lock_file_=nullptr;}
     const std::string message = "rpmd_ja fit could not acquire its exclusive basename lock: " + lock_path_;
     PRINT_INPUT_ERROR(message.c_str());
   }
@@ -257,7 +354,7 @@ void RpmdJA_Fit::pre_run(
     for (const std::int32_t type : atom.cpu_type) write_or_throw(spool_, &type, sizeof(type));
   } catch (...) {
     spool_.close();
-    std::remove(spool_path_.c_str());
+    rpmd_ja_file_io::remove_file(spool_path_);
     release_lock_();
     throw;
   }
@@ -390,6 +487,8 @@ void RpmdJA_Fit::post_force(
   std::copy(centroid_.begin(), centroid_.end(), frame_buffer_.begin() + 1);
   std::copy(mean_force_.begin(), mean_force_.end(), frame_buffer_.begin() + 1 + coordinates);
   write_or_throw(spool_, frame_buffer_.data(), frame_buffer_.size() * sizeof(double));
+  if (frame_count_ == 0) first_sample_step_ = step + 1;
+  last_sample_step_ = step + 1;
   ++frame_count_;
 }
 
@@ -397,8 +496,8 @@ void RpmdJA_Fit::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
-  const int,
-  const double,
+  const int number_of_steps,
+  const double time_step,
   const double)
 {
   if (sample_only_ && frame_count_ < 3) {
@@ -411,7 +510,7 @@ void RpmdJA_Fit::post_run(
   if (!spool_) PRINT_INPUT_ERROR("rpmd_ja fit failed to flush its sample spool.");
   spool_.close();
   if (spool_.fail()) PRINT_INPUT_ERROR("rpmd_ja fit failed to close its sample spool.");
-  std::ifstream size_stream(spool_path_, std::ios::binary | std::ios::ate);
+  rpmd_ja_file_io::ifstream size_stream(spool_path_, std::ios::binary | std::ios::ate);
   if (!size_stream) {
     PRINT_INPUT_ERROR("rpmd_ja fit could not inspect its closed sample spool.");
   }
@@ -422,10 +521,37 @@ void RpmdJA_Fit::post_run(
   size_stream.close();
   if (size_stream.fail()) PRINT_INPUT_ERROR("rpmd_ja fit could not close its sample spool size reader.");
   const std::uint64_t bytes = static_cast<std::uint64_t>(spool_end);
+  if(!provenance_snapshot_initialized_)PRINT_INPUT_ERROR("rpmd_ja fit has no active run configuration provenance snapshot.");
+  const rpmd_ja_sample_provenance::ConfigurationSnapshot final_snapshot=
+    rpmd_ja_sample_provenance::snapshot(*force_,atom,box,number_of_steps,
+      active_run_ordinal_?active_run_ordinal_-1:0,time_step,temperature_,number_of_beads_,internal_mass_com_);
+  const bool configuration_stable = configuration_stable_during_sampling_&&final_snapshot.active_configuration_identified&&
+    final_snapshot.run_input_sha256 == run_input_sha256_ &&
+    final_snapshot.physical_force_configuration_sha256 == physical_force_configuration_sha256_ &&
+    final_snapshot.integrator_configuration_sha256 == integrator_configuration_sha256_ &&
+    final_snapshot.model_sha256 == model_sha256_ && final_snapshot.atom_signature_sha256 == atom_signature_sha256_;
+  const std::string sample_sha256 = rpmd_ja_sample_provenance::sha256_file(spool_path_);
+  if (sample_sha256.empty()) PRINT_INPUT_ERROR("rpmd_ja fit could not hash its closed sample spool.");
+  const std::string sidecar = build_provenance_json(sample_sha256, bytes, frame_count_, source_job_id_,
+    source_job_id_status_, source_run_id_, first_sample_step_, last_sample_step_, timestep_internal_,
+    timestep_fs_, temperature_, number_of_beads_, internal_mass_com_, com_shift_, thermostat_tokens_json_,
+    final_snapshot.active_configuration_scope,final_snapshot.active_run_ordinal,
+    model_path_, model_sha256_, final_snapshot.model_sha256, run_input_sha256_, final_snapshot.run_input_sha256,
+    physical_force_configuration_sha256_, integrator_configuration_sha256_, atom_signature_sha256_, configuration_stable);
+  try {
+    write_exclusive_file(provenance_temp_path_, sidecar);
+    write_exclusive_file(provenance_path_, sidecar);
+    if (rpmd_ja_file_io::remove_file(provenance_temp_path_) != 0)
+      throw std::runtime_error("could not remove completed RPMD-JA provenance temporary file");
+  } catch (const std::exception& error) {
+    const std::string message = std::string("rpmd_ja fit could not write sample provenance: ") + error.what();
+    PRINT_INPUT_ERROR(message.c_str());
+  }
   if (sample_only_) {
     release_lock_();
-    std::printf("rpmd_ja sample saved %llu frames (%llu spool bytes) to %s; fitting was not run.\n",
-      static_cast<unsigned long long>(frame_count_), static_cast<unsigned long long>(bytes), spool_path_.c_str());
+    std::printf("rpmd_ja sample saved %llu frames (%llu spool bytes) to %s; provenance %s; fitting was not run.\n",
+      static_cast<unsigned long long>(frame_count_), static_cast<unsigned long long>(bytes), spool_path_.c_str(),
+      provenance_path_.c_str());
     return;
   }
   RpmdJANativeFitOptions options;
@@ -449,9 +575,12 @@ void RpmdJA_Fit::post_run(
     throw;
   }
   if (preserve_replay_inputs) {
-    std::printf("rpmd_ja fit retained sample spool for CG replay: %s\n", spool_path_.c_str());
-  } else if (std::remove(spool_path_.c_str()) != 0) {
+    std::printf("rpmd_ja fit retained sample spool and provenance for CG replay: %s\n", spool_path_.c_str());
+  } else if (rpmd_ja_file_io::remove_file(spool_path_) != 0) {
     std::cerr << "rpmd_ja fit produced the reference but could not remove its spool: " << spool_path_ << "\n";
+  } else if (rpmd_ja_file_io::remove_file(provenance_path_) != 0) {
+    std::cerr << "rpmd_ja fit removed its sample spool but could not remove its provenance sidecar: "
+              << provenance_path_ << "\n";
   }
   std::printf("rpmd_ja fit sampled %llu frames (%llu spool bytes); reference written to %s\n",
     static_cast<unsigned long long>(frame_count_), static_cast<unsigned long long>(bytes), output_path_.c_str());

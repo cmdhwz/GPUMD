@@ -2,6 +2,7 @@
 #include "measure/rpmd_ja_reference.cuh"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,12 +19,15 @@ template <typename T> void put(std::ostream& out,const T& x){out.write(reinterpr
 template <typename T> void array(std::ostream& out,const std::vector<T>& x){if(!x.empty())out.write(reinterpret_cast<const char*>(x.data()),x.size()*sizeof(T));}
 
 void make_input(const std::string& raw,const std::string& kernel,const int n,const double stiffness,
-                const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0,const int negative_axis=-1,const bool multi_spectrum=false)
+                const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0,const int negative_axis=-1,
+                const bool multi_spectrum=false,const std::vector<double>* custom_masses=nullptr,const std::vector<int>* custom_types=nullptr)
 {
   const int d=3*n;const double temperature=300.0,step=0.01;
   std::vector<double> mass(n),position(d,0.0),v(static_cast<std::size_t>(d)*n),vc(v.size()),c(static_cast<std::size_t>(3)*d*d),k(static_cast<std::size_t>(d)*d),coarse_c(c.size());
   std::vector<int> types(n,0),pbc(3,1);double mass_sum=0.0;
-  for(int i=0;i<n;++i){mass[i]=1.0+0.07*i;mass_sum+=mass[i];}
+  if((custom_masses&&custom_masses->size()!=static_cast<std::size_t>(n))||
+     (custom_types&&custom_types->size()!=static_cast<std::size_t>(n)))throw std::invalid_argument("custom qraw atom fixture dimensions do not match");
+  for(int i=0;i<n;++i){mass[i]=custom_masses?(*custom_masses)[i]:1.0+0.07*i;types[i]=custom_types?(*custom_types)[i]:0;mass_sum+=mass[i];}
   std::vector<std::vector<double>> complement;
   if(multi_spectrum){
     const double inv_mass=1.0/std::sqrt(mass_sum);std::vector<double> translation(n);for(int i=0;i<n;++i)translation[i]=std::sqrt(mass[i])*inv_mass;
@@ -83,6 +87,8 @@ void verify_matrices(const RpmdJAReference& r,const double stiffness)
 }
 
 void clean(const std::string& p){std::remove(p.c_str());std::remove((p+".tmp").c_str());std::remove((p+".stability").c_str());std::remove((p+".stability.tmp").c_str());std::remove((p+".failure.txt").c_str());}
+
+bool exists(const std::string& path){std::ifstream file(path,std::ios::binary);return file.good();}
 
 void run_positive(const std::string& base,const int n,const std::uint32_t version)
 {
@@ -170,10 +176,10 @@ void patch_additive_source_geometry(const std::string& raw,const int n)
   if(!file)throw std::runtime_error("failed patching additive raw fixture");
 }
 
-void write_additive_package(const std::string& path,const std::string& raw,const int n)
+void write_additive_package(const std::string& path,const std::string& raw,const int n,const std::uint32_t version=1)
 {
   std::ofstream out(path,std::ios::binary);if(!out)throw std::runtime_error("cannot create additive fixture package");
-  const char magic[8]={'G','P','J','A','A','D','D','1'};const std::uint32_t version=1,endian=0x01020304;
+  const char magic[8]={'G','P','J','A','A','D','D','1'};const std::uint32_t endian=0x01020304;
   const int beads=8;const std::uint64_t source=rpmd_ja_model_fingerprint(raw),training=4,validation=2;
   const double temperature=300.,epsilon=1e-8,response=0.,budget=.02;
   out.write(magic,8);put(out,version);put(out,endian);put(out,n);put(out,beads);put(out,source);
@@ -188,7 +194,7 @@ void write_additive_package(const std::string& path,const std::string& raw,const
   out.close();if(!out)throw std::runtime_error("failed writing additive fixture package");(void)d;
 }
 
-void verify_additive_reference(const RpmdJAReference& r,const int n)
+void verify_additive_reference(const RpmdJAReference& r,const int n,const std::uint32_t version)
 {
   const int d=3*n,q=6;double mass_sum=0.0;for(double m:r.masses)mass_sum+=m;
   std::vector<double> kadd(static_cast<std::size_t>(d)*d,0.0),hadd[3];for(auto& h:hadd)h.assign(static_cast<std::size_t>(d)*d,0.0);
@@ -200,22 +206,30 @@ void verify_additive_reference(const RpmdJAReference& r,const int n)
     for(int x=0;x<q;++x)for(int y=0;y<q;++y){const int ex=x/3,ey=y/3,ax=x%3,ay=y%3,ix[2]={ax*n+neighbors[ex],ax*n+i},iy[2]={ay*n+neighbors[ey],ay*n+i};const double signs[2]={1.,-1.};for(int u=0;u<2;++u)for(int v=0;v<2;++v)kadd[static_cast<std::size_t>(ix[u])*d+iy[v]]+=signs[u]*b[x*q+y]*signs[v];}
     for(int e=0;e<2;++e)for(int mu=0;mu<3;++mu)for(int y=0;y<q;++y){const int axis=y%3,edge=y/3,disp[2]={axis*n+neighbors[edge],axis*n+i},vel=mu*n+neighbors[e];const double signs[2]={1.,-1.};for(int a=0;a<3;++a)for(int v=0;v<2;++v)hadd[a][static_cast<std::size_t>(disp[v])*d+vel]-=xyz[e][a]*b[(3*e+mu)*q+y]*signs[v];}
   }
-  if(r.mechanical_policy!="native_reference_transport;finite_temperature_additive_v1;beads=8;derivative=3"||r.additive_beads!=8||r.stability_certificate!="additive_shifted_frobenius_v1"||!(r.additive_reconstruction_bound<.5*r.additive_epsilon))throw std::runtime_error("additive reference policy/certificate mismatch");
+  const std::string expected_policy=version==1?"native_reference_transport;finite_temperature_additive_v1;beads=8;derivative=3":
+    "native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1;beads=8;derivative=3";
+  if(r.mechanical_policy!=expected_policy||r.additive_beads!=8||
+     !r.stability_checked||r.stability_certificate!="additive_shifted_frobenius_v1"||!(r.additive_reconstruction_bound<.5*r.additive_epsilon))
+    throw std::runtime_error("additive reference policy/certificate mismatch");
   for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ax=row/n,ay=col/n;const double tr=std::sqrt(r.masses[row%n]/mass_sum),tc=std::sqrt(r.masses[col%n]/mass_sum);const double baseline=ax==ay?1e-10*((row==col?1.0:0.0)-tr*tc):0.0;const double expected=baseline+kadd[static_cast<std::size_t>(row)*d+col]/std::sqrt(r.masses[row%n]*r.masses[col%n]);if(std::abs(tile_value(r.block_dynamical,row,col)-expected)>2e-9)throw std::runtime_error("additive K readback mismatch");}
   bool nonsymmetric=false;
   for(int a=0;a<3;++a)for(int row=0;row<d;++row)for(int col=0;col<d;++col){const double left=1.+.01*std::sin((row+1)*(a+1)),right=1.+.01*std::cos((col+1)*(a+2));const double expected=left*right/std::sqrt(r.masses[row%n]*r.masses[col%n])+hadd[a][static_cast<std::size_t>(col)*d+row]/std::sqrt(r.masses[row%n]*r.masses[col%n]);const double actual=tile_value(r.block_site_transpose[a],row,col);if(std::abs(actual-expected)>2e-8)throw std::runtime_error("additive transposed H readback mismatch");if(std::abs(actual-tile_value(r.block_site_transpose[a],col,row))>1e-7)nonsymmetric=true;}
   if(!nonsymmetric)throw std::runtime_error("additive H fixture did not exercise non-symmetric cross-axis terms");
 }
 
-void run_additive(const std::string& base)
+void run_additive(const std::string& base,const std::uint32_t version=1)
 {
   const int n=3;const std::string stem=base+"_additive",raw=stem+".qraw",kernel=stem+".kernel",pack=stem+".gpjaadd",out=stem+".ja";
-  make_input(raw,kernel,n,1.0e-10,3);patch_additive_source_geometry(raw,n);write_additive_package(pack,raw,n);
-  prepare_rpmd_ja_qnep_reference(raw,out,kernel,{},pack);verify_additive_reference(read_rpmd_ja_reference(out),n);
+  make_input(raw,kernel,n,1.0e-10,3);patch_additive_source_geometry(raw,n);write_additive_package(pack,raw,n,version);
+  prepare_rpmd_ja_qnep_reference(raw,out,kernel,{},pack);verify_additive_reference(read_rpmd_ja_reference(out),n,version);
   const std::string wrong=stem+"_wrong.gpjaadd",truncated=stem+"_truncated.gpjaadd";std::ifstream in(pack,std::ios::binary);std::vector<char> bytes((std::istreambuf_iterator<char>(in)),{}),wrong_bytes=bytes;wrong_bytes[24]^=1;
   {std::ofstream f(wrong,std::ios::binary);f.write(wrong_bytes.data(),wrong_bytes.size());}
   bytes.pop_back();{std::ofstream f(truncated,std::ios::binary);f.write(bytes.data(),bytes.size());}
-  for(const std::string& bad:{wrong,truncated}){const std::string failed=bad+".ja";bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,failed,kernel,{},bad);}catch(const std::exception&){rejected=true;}if(!rejected)throw std::runtime_error("invalid additive package was accepted");clean(failed);}
+  for(const std::string& bad:{wrong,truncated}){const std::string failed=bad+".ja";bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,failed,kernel,{},bad);}catch(const std::exception&){rejected=true;}
+    if(!rejected)throw std::runtime_error("invalid additive package was accepted");
+    if(exists(failed)||exists(failed+".tmp")||exists(failed+".stability")||exists(failed+".stability.tmp"))
+      throw std::runtime_error("failed additive prepare left a publishable output or temporary file");
+    clean(failed);}
   clean(raw);clean(kernel);clean(pack);clean(out);clean(wrong);clean(truncated);
 }
 
@@ -237,8 +251,16 @@ void run_raw2_rejections(const std::string& base)
 }
 } // namespace
 
+#ifndef GPUMD_RPMD_JA_QNEP_PREPARE_TEST_LIBRARY
 int main(int argc,char** argv)
 {
-  try{const std::string base=argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test";run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,44,1);run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);run_additive(base);return 0;}
+  try{const bool integration_smoke=argc>1&&std::string(argv[1])=="--integration-smoke";
+    const std::string base=integration_smoke?"rpmd_ja_qnep_prepare_integration_smoke_"+
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()):(argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test");
+    if(integration_smoke){run_additive(base,1);run_additive(base+"_internal_com",2);return 0;}
+    run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,44,1);
+    run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);
+    run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);run_additive(base);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}
 }
+#endif

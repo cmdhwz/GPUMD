@@ -1,9 +1,20 @@
 #include "rpmd_ja_native_fit.cuh"
+#include "rpmd_ja_utf8_file_io.h"
+#include "rpmd_ja_feasibility_policy.cuh"
+#include "rpmd_ja_sha256.h"
+#include "rpmd_ja_covariance_checkpoint.h"
+#include "rpmd_ja_process_lock.h"
+#include "rpmd_ja_preflight_receipt.h"
+#include "rpmd_ja_a0_reuse.h"
+#include "rpmd_ja_statistics_policy.h"
 
 #ifndef USE_HIP
+#include "rpmd_ja_cuda_workspace.cuh"
 #include "rpmd_ja_qnep_prepare.cuh"
 #include "rpmd_ja_reference.cuh"
 #include "rpmd_ja_reference_math.cuh"
+#include "rpmd_ja_additive.cuh"
+#include "rpmd_ja_local_basis.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "force/force.cuh"
@@ -12,11 +23,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -28,6 +43,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <vector>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -122,10 +138,26 @@ struct QrawIdentity
 {
   std::streamoff data_offset=0,k_offset=0;
   std::uint32_t version=0;
+  std::uint64_t source_fnv64=0;
   std::uint64_t model=0,config=0;
   int charge=0,kspace=0;
   double mesh=0.0,active_mesh=0.0;
+  std::string model_sha256;
 };
+
+std::string sha256_file_digest(const std::string& path)
+{
+  std::ifstream input(path,std::ios::binary);if(!input)throw std::runtime_error("cannot open active NEP model for SHA-256: "+path);
+  rpmd_ja_sha256::Digest digest;std::array<unsigned char,1<<16> buffer{};
+  while(input){input.read(reinterpret_cast<char*>(buffer.data()),static_cast<std::streamsize>(buffer.size()));
+    const std::streamsize count=input.gcount();if(count>0)digest.update(buffer.data(),static_cast<std::size_t>(count));}
+  if(!input.eof())throw std::runtime_error("failed reading active NEP model for SHA-256: "+path);
+  return digest.finish_hex();
+}
+
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+bool covariance_fit_test_allow_qraw_fixture_identity=false;
+#endif
 
 QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptions& options,
   const SampleHeader& header,const std::vector<double>& r0,const Box& box,Force& force)
@@ -160,12 +192,20 @@ QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptio
     throw std::runtime_error("qraw byte length exceeds file-offset limits");
   const std::streamoff expected_end=data+static_cast<std::streamoff>(payload_bytes);
   const std::streamoff k_offset=data+static_cast<std::streamoff>(vd+3*dd)*sizeof(double);
-  auto* active_qnep=force.get_number_of_potentials()==1?dynamic_cast<NEP_Charge*>(&force.get_potential(0)):nullptr;
-  if(active_qnep==nullptr||!active_qnep->uses_pppm())
-    throw std::runtime_error("native fit qraw validation requires exactly one qNEP potential using PPPM");
-  const double active_mesh=active_qnep->get_pppm_mesh_spacing();
-  const auto expected_model=rpmd_ja_model_fingerprint(force.primary_nep_model_path());
-  const auto expected_config=rpmd_ja_qnep_config_fingerprint(force);
+  double active_mesh=0.0;int active_charge=0;std::uint64_t expected_model=0,expected_config=0;std::string active_model_sha256;
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+  if(covariance_fit_test_allow_qraw_fixture_identity){active_mesh=mesh;active_charge=charge;expected_model=model;expected_config=config;}
+  else
+#endif
+  {
+    auto* active_qnep=force.get_number_of_potentials()==1?dynamic_cast<NEP_Charge*>(&force.get_potential(0)):nullptr;
+    if(active_qnep==nullptr||!active_qnep->uses_pppm())
+      throw std::runtime_error("native fit qraw validation requires exactly one qNEP potential using PPPM");
+    active_mesh=active_qnep->get_pppm_mesh_spacing();active_charge=active_qnep->get_charge_mode();
+    expected_model=rpmd_ja_model_fingerprint(force.primary_nep_model_path());
+    active_model_sha256=sha256_file_digest(force.primary_nep_model_path());
+    expected_config=rpmd_ja_qnep_config_fingerprint(force);
+  }
   bool geometry_matches=std::all_of(raw_cell,raw_cell+18,[](double x){return std::isfinite(x);})&&
     std::all_of(raw_positions.begin(),raw_positions.end(),[](double x){return std::isfinite(x);});
   for(int i=0;i<18&&geometry_matches;++i)geometry_matches=std::abs(raw_cell[i]-box.cpu_h[i])<=1e-10*std::max(1.0,std::abs(box.cpu_h[i]));
@@ -173,7 +213,7 @@ QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptio
   for(int i=0;i<3&&geometry_matches;++i)geometry_matches=raw_pbc[i]==1;
   for(int i=0;i<n&&geometry_matches;++i)geometry_matches=raw_types[i]==header.types[i]&&raw_masses[i]==header.masses[i];
   for(int i=0;i<d&&geometry_matches;++i)geometry_matches=std::abs(raw_positions[i]-r0[i])<=1e-10*std::max(1.0,std::abs(r0[i]));
-  if(!raw||model!=expected_model||config!=expected_config||charge!=active_qnep->get_charge_mode()||kspace!=1||
+  if(!raw||model!=expected_model||config!=expected_config||charge!=active_charge||kspace!=1||
      !std::isfinite(mesh)||std::abs(mesh-active_mesh)>1e-12*std::max(1.0,std::abs(active_mesh))||!geometry_matches)
     throw std::runtime_error("qNEP qraw model, PPPM configuration, temperature, step, atom identity, cell, or sampled training R0 does not match current fit inputs");
   raw.clear();raw.seekg(0,std::ios::end);const std::streamoff actual_end=raw.tellg();
@@ -186,7 +226,7 @@ QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptio
   const bool raw_v3=stats[17]==3.0&&stats[1]<=1e-4&&stats[3]<=1e-4&&std::max({stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]})<=5e-2;
   if(!finite_stats||stats[16]!=options.fd_step||(version==1?!raw_v1:(version==2?!raw_v2:!raw_v3)))
     throw std::runtime_error("qNEP raw diagnostics fail accepted limits");
-  raw.clear();return {data,k_offset,version,model,config,charge,kspace,mesh,active_mesh};
+  raw.clear();return {data,k_offset,version,model,config,charge,kspace,mesh,active_mesh,active_model_sha256};
 }
 
 void read_frame(std::istream& in, std::vector<double>& x, std::vector<double>& f, double& step)
@@ -263,7 +303,42 @@ struct Graph
   std::vector<std::vector<SiteEdge>> sites;
   std::vector<std::pair<int,int>> type_pairs;
   std::map<std::pair<int,int>,int> group_by_type;
+  int base_parameter_count=0,parameter_count=0,raw_local_parameter_count=0;
+  std::vector<rpmd_ja_local_basis::Term> local_terms;
+  std::vector<double> local_transform,local_base_mix,parameter_basis_norms;
+  std::vector<std::string> parameter_names;
+  struct LocalParameterSupport{std::string name,status;int support_count=0,term_count=0;double residual_relative_norm=0.0;};
+  struct FrozenBridge
+  {
+    rpmd_ja_local_basis::Site oxygen1{},hydrogen{},oxygen2{};
+    std::vector<rpmd_ja_local_basis::Site> oxygen_candidates;
+    int group=0;double oh1=0.0,oh2=0.0,oo=0.0,third_gap=std::numeric_limits<double>::infinity(),a0=0.0;
+    bool ambiguous=false,accepted=false;
+  };
+  struct M1BasisMetadata
+  {
+    int base_parameter_count=0,raw_parameter_count=0,added_parameter_count=0,unclassified_edge_count=0;
+    int hydrogen_count=0,bridge_candidate_count=0,accepted_bridge_count=0,ambiguous_bridge_count=0;
+    std::size_t operator_map_entry_count=0,operator_map_bytes_estimate=0;
+    int minimum_support_count=3;double cutoff=0.0,third_gap_ambiguity_tolerance=1.0e-6;
+    std::string operator_map_estimate_scope="MAX_RAW_OR_MASS_WEIGHTED_BASE_MAP; APPROXIMATE; EXCLUDES NORMALIZATION SCRATCH, ALLOCATOR AND OTHER BUILDER DATA; TERM VECTOR CAP IS SEPARATE; NOT A PREFLIGHT";
+    std::string support_policy="MINIMUM_SUPPORT_COUNT_IS_DIAGNOSTIC_ONLY; LOW_SUPPORT_DOES_NOT_DROP_TERMS";
+    std::string frozen_bridge_rule="TWO_NEAREST_O_WITHIN_CUTOFF; THIRD_O_GAP_AMBIGUITY; GEOMETRY_ONLY_NOT_OHO_CHEMISTRY_CERTIFICATION";
+    std::string a0_rule="frozen_geometric_polarity_a0";
+    std::vector<LocalParameterSupport> raw_parameters;
+    std::vector<std::string> output_parameter_names;
+    std::vector<int> redundant_raw_parameters;
+    std::vector<double> transform,base_mix,redundant_combination;
+    std::vector<FrozenBridge> frozen_bridges;
+    std::array<double,6> shell_medians{};
+    std::array<std::array<int,2>,6> edge_support{};
+    std::array<int,2> bridge_support{};
+    std::string status="NOT_BUILT";
+  } m1;
 };
+
+std::uint64_t covariance_m1_basis_fingerprint(const Graph& graph);
+std::string covariance_graph_content_sha256(const Graph& graph);
 
 __global__ void mass_symmetrize(double* k, const double* sqrt_mass, int* error, const int d, const int n)
 {
@@ -324,6 +399,34 @@ __global__ void lanczos_additive_action(const double* q,double* result,const dou
   result[index]=value;
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 600)
+static __device__ __inline__ double covariance_atomic_add(double* address,const double value)
+{
+  unsigned long long* bits=reinterpret_cast<unsigned long long*>(address);unsigned long long old=*bits,assumed;
+  do{assumed=old;old=atomicCAS(bits,assumed,__double_as_longlong(value+__longlong_as_double(assumed)));}while(assumed!=old);
+  return __longlong_as_double(old);
+}
+#else
+static __device__ __inline__ double covariance_atomic_add(double* address,const double value)
+{return atomicAdd(address,value);}
+#endif
+
+__global__ void lanczos_local_additive_action(const double* q,double* result,const double* sqrt_mass,
+  const double* raw_theta,const rpmd_ja_local_basis::Term* terms,const int term_count,const int n)
+{
+  const int term_index=static_cast<int>(blockIdx.x*blockDim.x+threadIdx.x);if(term_index>=term_count)return;
+  const rpmd_ja_local_basis::Term& term=terms[term_index];double projection=0.0;
+  for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+    projection+=term.coefficient[site].x*q[atom]/sqrt_mass[atom];
+    projection+=term.coefficient[site].y*q[n+atom]/sqrt_mass[n+atom];
+    projection+=term.coefficient[site].z*q[2*n+atom]/sqrt_mass[2*n+atom];}
+  const double scale=term.weight*raw_theta[term.parameter]*projection;
+  for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+    covariance_atomic_add(result+atom,term.coefficient[site].x*scale/sqrt_mass[atom]);
+    covariance_atomic_add(result+n+atom,term.coefficient[site].y*scale/sqrt_mass[n+atom]);
+    covariance_atomic_add(result+2*n+atom,term.coefficient[site].z*scale/sqrt_mass[2*n+atom]);}
+}
+
 __device__ inline void add_compensated_value(double& sum,double& correction,const double value)
 {
   const double next=sum+value;
@@ -360,17 +463,20 @@ __global__ void compensated_baseline_matvec(const double* matrix,const double* i
   if(lane==0){output_high[row]=sum;output_low[row]=correction;}
 }
 
+std::uint64_t next_device_baseline_identity_generation()
+{static std::atomic<std::uint64_t> generation{0};return generation.fetch_add(1,std::memory_order_relaxed)+1;}
+
 struct DeviceBaseline
 {
   static constexpr int batch_capacity=32;
   double* k=nullptr; double* q=nullptr; double* out=nullptr; double* compensated_high=nullptr; double* compensated_low=nullptr; double* batch_q=nullptr; double* batch_out=nullptr; double* t=nullptr; double* kt=nullptr;double* g=nullptr;int* error=nullptr;
-  cublasHandle_t blas=nullptr; int d=0;std::uint64_t dense_matrix_actions=0;
+  cublasHandle_t blas=nullptr; int d=0;std::uint64_t identity_generation=next_device_baseline_identity_generation(),dense_matrix_actions=0;
   void release(){if(blas){cublasDestroy(blas);blas=nullptr;}if(k){cudaFree(k);k=nullptr;}if(q){cudaFree(q);q=nullptr;}if(out){cudaFree(out);out=nullptr;}if(compensated_high){cudaFree(compensated_high);compensated_high=nullptr;}if(compensated_low){cudaFree(compensated_low);compensated_low=nullptr;}if(batch_q){cudaFree(batch_q);batch_q=nullptr;}if(batch_out){cudaFree(batch_out);batch_out=nullptr;}if(t){cudaFree(t);t=nullptr;}if(kt){cudaFree(kt);kt=nullptr;}if(g){cudaFree(g);g=nullptr;}if(error){cudaFree(error);error=nullptr;}d=0;dense_matrix_actions=0;}
   ~DeviceBaseline(){release();}
   void initialize(std::istream& raw,const std::streamoff offset,const int dimension,const int n,
                   const std::vector<double>& masses,const std::vector<double>& sqrt_mass)
   {
-    d=dimension;std::size_t free_bytes=0,total_bytes=0;
+    identity_generation=next_device_baseline_identity_generation();d=dimension;std::size_t free_bytes=0,total_bytes=0;
     if(cudaMemGetInfo(&free_bytes,&total_bytes)!=cudaSuccess)throw std::runtime_error("native fit cudaMemGetInfo failed");
     const std::size_t dim_size=static_cast<std::size_t>(d),max_size=std::numeric_limits<std::size_t>::max();
     if(d<=0||dim_size>max_size/dim_size/sizeof(double)||dim_size>max_size/batch_capacity/sizeof(double))throw std::runtime_error("native fit raw Hessian GPU workspace size overflows");
@@ -438,17 +544,26 @@ struct DeviceBaseline
 
 struct DeviceLanczosWorkspace
 {
-  double *basis=nullptr,*v=nullptr,*previous=nullptr,*w=nullptr,*add=nullptr,*ritz=nullptr,*coefficient=nullptr,*theta=nullptr,*sqrt_mass=nullptr,*sqrt_atom=nullptr,*translation=nullptr;
+  double *basis=nullptr,*v=nullptr,*previous=nullptr,*w=nullptr,*add=nullptr,*ritz=nullptr,*coefficient=nullptr,*theta=nullptr,*raw_theta=nullptr,*sqrt_mass=nullptr,*sqrt_atom=nullptr,*translation=nullptr;
+  rpmd_ja_local_basis::Term* local_terms=nullptr;
   int *offsets=nullptr,*neighbors=nullptr,*groups=nullptr; signed char* signs=nullptr;
-  int d=0,n=0,p=0,max_steps=0;double inverse_mass_sum=0.0;
-  void release(){double** values[]={&basis,&v,&previous,&w,&add,&ritz,&coefficient,&theta,&sqrt_mass,&sqrt_atom,&translation};for(double** value:values)if(*value){cudaFree(*value);*value=nullptr;}if(offsets){cudaFree(offsets);offsets=nullptr;}if(neighbors){cudaFree(neighbors);neighbors=nullptr;}if(groups){cudaFree(groups);groups=nullptr;}if(signs){cudaFree(signs);signs=nullptr;}d=n=p=max_steps=0;inverse_mass_sum=0.0;}
+  int d=0,n=0,p=0,base_p=0,raw_p=0,local_term_count=0,max_steps=0;double inverse_mass_sum=0.0;const Graph* graph_ref=nullptr;
+  void release(){double** values[]={&basis,&v,&previous,&w,&add,&ritz,&coefficient,&theta,&raw_theta,&sqrt_mass,&sqrt_atom,&translation};for(double** value:values)if(*value){cudaFree(*value);*value=nullptr;}if(local_terms){cudaFree(local_terms);local_terms=nullptr;}if(offsets){cudaFree(offsets);offsets=nullptr;}if(neighbors){cudaFree(neighbors);neighbors=nullptr;}if(groups){cudaFree(groups);groups=nullptr;}if(signs){cudaFree(signs);signs=nullptr;}d=n=p=base_p=raw_p=local_term_count=max_steps=0;inverse_mass_sum=0.0;graph_ref=nullptr;}
   ~DeviceLanczosWorkspace(){release();}
   void initialize(const Graph& graph,const std::vector<double>& sqrt_mass_host,const std::vector<double>& sqrt_atom_host,
                   const int steps,const std::size_t parameter_count)
   {
     if(sqrt_atom_host.empty()||sqrt_atom_host.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()/3)||parameter_count>static_cast<std::size_t>(std::numeric_limits<int>::max())||steps<=0||graph.edges.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()/2))
       throw std::runtime_error("native fit Lanczos workspace dimensions are invalid");
-    d=static_cast<int>(sqrt_mass_host.size());n=static_cast<int>(sqrt_atom_host.size());p=static_cast<int>(parameter_count);max_steps=steps;
+    d=static_cast<int>(sqrt_mass_host.size());n=static_cast<int>(sqrt_atom_host.size());p=static_cast<int>(parameter_count);max_steps=steps;graph_ref=&graph;
+    const bool m1=graph.raw_local_parameter_count>0;
+    base_p=m1?graph.base_parameter_count:p;raw_p=m1?graph.raw_local_parameter_count:0;
+    if(m1&&graph.local_terms.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))throw std::runtime_error("native fit Lanczos M1 term count overflows");
+    local_term_count=m1?static_cast<int>(graph.local_terms.size()):0;
+    if(m1&&(base_p<=0||p!=graph.parameter_count||
+       graph.local_base_mix.size()!=static_cast<std::size_t>(base_p)*(p-base_p)||
+       graph.local_transform.size()!=static_cast<std::size_t>(raw_p)*(p-base_p)))
+      throw std::runtime_error("native fit Lanczos M1 transform dimensions are invalid");
     if(d!=3*n)throw std::runtime_error("native fit Lanczos workspace dimensions are invalid");
     std::vector<int> host_offsets(static_cast<std::size_t>(n)+1,0);
     for(const auto& edge:graph.edges){if(edge.i<0||edge.i>=n||edge.j<0||edge.j>=n||edge.group<0||6ULL*static_cast<std::size_t>(edge.group)+5>=parameter_count)throw std::runtime_error("native fit Lanczos graph edge is invalid");++host_offsets[edge.i+1];++host_offsets[edge.j+1];}
@@ -458,14 +573,18 @@ struct DeviceLanczosWorkspace
     for(const auto& edge:graph.edges){int at=cursor[edge.i]++;host_neighbors[at]=edge.j;host_groups[at]=edge.group;host_signs[at]=1;at=cursor[edge.j]++;host_neighbors[at]=edge.i;host_groups[at]=edge.group;host_signs[at]=-1;}
     std::size_t free_bytes=0,total_bytes=0;if(cudaMemGetInfo(&free_bytes,&total_bytes)!=cudaSuccess)throw std::runtime_error("native fit Lanczos workspace cudaMemGetInfo failed");
     const std::size_t basis_bytes=static_cast<std::size_t>(d)*steps*sizeof(double);
-    const std::size_t vector_bytes=(7ULL*static_cast<std::size_t>(d)+steps+std::max(1,p)+static_cast<std::size_t>(n)+3)*sizeof(double);
+    const std::size_t vector_bytes=(7ULL*static_cast<std::size_t>(d)+steps+std::max(1,p)+std::max(1,raw_p)+static_cast<std::size_t>(n)+3)*sizeof(double);
     const std::size_t graph_bytes=(host_offsets.size()+std::max<std::size_t>(1,host_neighbors.size())+std::max<std::size_t>(1,host_groups.size()))*sizeof(int)+std::max<std::size_t>(1,host_signs.size())*sizeof(signed char);
-    if(basis_bytes>free_bytes||vector_bytes>free_bytes-basis_bytes||graph_bytes>free_bytes-basis_bytes-vector_bytes||free_bytes-basis_bytes-vector_bytes-graph_bytes<128ULL*1024*1024)
+    const std::size_t local_bytes=graph.local_terms.size()*sizeof(rpmd_ja_local_basis::Term);
+    if(basis_bytes>free_bytes||vector_bytes>free_bytes-basis_bytes||graph_bytes>free_bytes-basis_bytes-vector_bytes||local_bytes>free_bytes-basis_bytes-vector_bytes-graph_bytes||free_bytes-basis_bytes-vector_bytes-graph_bytes-local_bytes<128ULL*1024*1024)
       throw std::runtime_error("native fit Lanczos workspace preflight leaves less than 128 MiB safety margin");
     auto alloc_double=[](double** pointer,const std::size_t count){if(cudaMalloc(reinterpret_cast<void**>(pointer),std::max<std::size_t>(1,count)*sizeof(double))!=cudaSuccess)throw std::runtime_error("native fit Lanczos GPU allocation failed");};
-    alloc_double(&basis,static_cast<std::size_t>(d)*steps);alloc_double(&v,d);alloc_double(&previous,d);alloc_double(&w,d);alloc_double(&add,d);alloc_double(&ritz,d);alloc_double(&coefficient,steps);alloc_double(&theta,parameter_count);alloc_double(&sqrt_mass,d);alloc_double(&sqrt_atom,n);alloc_double(&translation,3);
+    alloc_double(&basis,static_cast<std::size_t>(d)*steps);alloc_double(&v,d);alloc_double(&previous,d);alloc_double(&w,d);alloc_double(&add,d);alloc_double(&ritz,d);alloc_double(&coefficient,steps);alloc_double(&theta,parameter_count);alloc_double(&raw_theta,raw_p);alloc_double(&sqrt_mass,d);alloc_double(&sqrt_atom,n);alloc_double(&translation,3);
     if(cudaMalloc(reinterpret_cast<void**>(&offsets),host_offsets.size()*sizeof(int))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&neighbors),std::max<std::size_t>(1,host_neighbors.size())*sizeof(int))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&groups),std::max<std::size_t>(1,host_groups.size())*sizeof(int))!=cudaSuccess||cudaMalloc(reinterpret_cast<void**>(&signs),std::max<std::size_t>(1,host_signs.size())*sizeof(signed char))!=cudaSuccess)
       throw std::runtime_error("native fit Lanczos graph allocation failed");
+    if(local_term_count>0&&(cudaMalloc(reinterpret_cast<void**>(&local_terms),local_bytes)!=cudaSuccess||
+       cudaMemcpy(local_terms,graph.local_terms.data(),local_bytes,cudaMemcpyHostToDevice)!=cudaSuccess))
+      throw std::runtime_error("native fit Lanczos M1 term upload failed");
     if(cudaMemcpy(offsets,host_offsets.data(),host_offsets.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(sqrt_mass,sqrt_mass_host.data(),sqrt_mass_host.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(sqrt_atom,sqrt_atom_host.data(),sqrt_atom_host.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)
       throw std::runtime_error("native fit Lanczos static data upload failed");
     if(!host_neighbors.empty()&&(cudaMemcpy(neighbors,host_neighbors.data(),host_neighbors.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(groups,host_groups.data(),host_groups.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(signs,host_signs.data(),host_signs.size()*sizeof(signed char),cudaMemcpyHostToDevice)!=cudaSuccess))
@@ -473,9 +592,18 @@ struct DeviceLanczosWorkspace
     inverse_mass_sum=1.0/std::inner_product(sqrt_atom_host.begin(),sqrt_atom_host.end(),sqrt_atom_host.begin(),0.0);
     if(!std::isfinite(inverse_mass_sum)||!(inverse_mass_sum>0.0))throw std::runtime_error("native fit Lanczos translation norm is invalid");
   }
-  void set_theta(const std::vector<double>& values){if(values.size()!=static_cast<std::size_t>(p))throw std::runtime_error("native fit Lanczos parameter dimension changed");if(p&&cudaMemcpy(theta,values.data(),values.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)throw std::runtime_error("native fit Lanczos parameter upload failed");}
+  void set_theta(const std::vector<double>& values){if(values.size()!=static_cast<std::size_t>(p))throw std::runtime_error("native fit Lanczos parameter dimension changed");
+    if(raw_p){const int added=p-base_p;std::vector<double> base(values.begin(),values.begin()+base_p),raw(static_cast<std::size_t>(raw_p),0.0);
+      for(int parameter=0;parameter<base_p;++parameter)for(int column=0;column<added;++column)
+        base[parameter]+=graph_ref->local_base_mix[static_cast<std::size_t>(parameter)*added+column]*values[base_p+column];
+      for(int parameter=0;parameter<raw_p;++parameter)for(int column=0;column<added;++column)
+        raw[parameter]+=graph_ref->local_transform[static_cast<std::size_t>(parameter)*added+column]*values[base_p+column];
+      if(cudaMemcpy(theta,base.data(),base.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||cudaMemcpy(raw_theta,raw.data(),raw.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)throw std::runtime_error("native fit Lanczos M1 parameter upload failed");}
+    else if(p&&cudaMemcpy(theta,values.data(),values.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)throw std::runtime_error("native fit Lanczos parameter upload failed");}
   void project(double* x){lanczos_translation_coefficients<<<3,256>>>(x,sqrt_atom,translation,n,inverse_mass_sum);lanczos_remove_translation<<<static_cast<unsigned>((static_cast<std::size_t>(d)+255)/256),256>>>(x,sqrt_atom,translation,d,n);if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native fit Lanczos translation projection kernel failed");}
-  void additive_action(const double* input){lanczos_additive_action<<<static_cast<unsigned>((static_cast<std::size_t>(d)+255)/256),256>>>(input,add,sqrt_mass,theta,offsets,neighbors,groups,signs,n,d);if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native fit Lanczos additive-action kernel failed");project(add);}
+  void additive_action(const double* input){lanczos_additive_action<<<static_cast<unsigned>((static_cast<std::size_t>(d)+255)/256),256>>>(input,add,sqrt_mass,theta,offsets,neighbors,groups,signs,n,d);
+    if(raw_p&&local_term_count)lanczos_local_additive_action<<<static_cast<unsigned>((local_term_count+255)/256),256>>>(input,add,sqrt_mass,raw_theta,local_terms,local_term_count,n);
+    if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native fit Lanczos additive-action kernel failed");project(add);}
 };
 
 struct DeviceQR
@@ -713,8 +841,8 @@ void write_cut_qp_state(const std::string& path,const int outer,const QPSolution
   const std::vector<double>& initial_lambda)
 {
   if(path.empty())return;
-  std::ifstream existing(path,std::ios::binary);if(existing.good())throw std::runtime_error("native fit refuses to overwrite an existing QP state snapshot: "+path);
-  std::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("native fit cannot create QP state snapshot: "+path);
+  rpmd_ja_file_io::ifstream existing(path,std::ios::binary);if(existing.good())throw std::runtime_error("native fit refuses to overwrite an existing QP state snapshot: "+path);
+  rpmd_ja_file_io::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("native fit cannot create QP state snapshot: "+path);
   out<<std::setprecision(17)<<"outer_index "<<outer<<"\niterations "<<solution.iterations<<"\nmethod "<<solution.method
     <<"\npolish_attempts "<<solution.polish_attempts<<"\nactive_constraints "<<solution.active_constraints
     <<"\npolish_updates "<<solution.polish_updates<<"\npolish_failure_reason "<<solution.polish_failure_reason
@@ -925,6 +1053,17 @@ std::array<double,3> mic_displacement(const std::vector<double>& r, const int n,
   return out;
 }
 
+std::array<double,3> image_displacement(const std::vector<double>& r,const int n,const int i,const int j,
+                                        const int image[3],const Box& box)
+{
+  double fractional[3]={};for(int a=0;a<3;++a){
+    for(int b=0;b<3;++b)fractional[a]+=box.cpu_h[9+3*a+b]*(r[b*n+j]-r[b*n+i]);
+    fractional[a]+=image[a];}
+  std::array<double,3> result{};for(int a=0;a<3;++a)for(int b=0;b<3;++b)
+    result[a]+=box.cpu_h[3*a+b]*fractional[b];
+  return result;
+}
+
 Graph make_graph(const std::vector<double>& r, const std::vector<int>& types, const Box& box, const double cutoff)
 {
   const int n = static_cast<int>(types.size());
@@ -957,13 +1096,264 @@ Graph make_graph(const std::vector<double>& r, const std::vector<int>& types, co
   std::vector<char> seen(n); std::vector<int> todo(1,0); seen[0]=1;
   while (!todo.empty()) { const int i=todo.back(); todo.pop_back(); for (const auto& e:g.sites[i]) if(!seen[e.j]) { seen[e.j]=1; todo.push_back(e.j); } }
   if (std::find(seen.begin(),seen.end(),0)!=seen.end()) throw std::runtime_error("native fit cutoff graph is disconnected");
+  if(g.type_pairs.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()/6))
+    throw std::runtime_error("native fit base parameter count overflows");
+  g.base_parameter_count=g.parameter_count=6*static_cast<int>(g.type_pairs.size());
+  const char* component_names[6]={"xx","xy","xz","yy","yz","zz"};
+  for(const auto& type_pair:g.type_pairs)for(const char* component:component_names)
+    g.parameter_names.push_back("M0.type"+std::to_string(type_pair.first)+"_"+
+      std::to_string(type_pair.second)+"."+component);
   return g;
+}
+
+int m1_edge_category(const std::string& first,const std::string& second)
+{
+  if(first=="O"&&second=="O")return 0;
+  if((first=="O"&&second=="Na")||(first=="Na"&&second=="O"))return 1;
+  if((first=="O"&&second=="Cl")||(first=="Cl"&&second=="O"))return 2;
+  if(first=="Na"&&second=="Na")return 3;
+  if((first=="Na"&&second=="Cl")||(first=="Cl"&&second=="Na"))return 4;
+  if(first=="Cl"&&second=="Cl")return 5;
+  return -1;
+}
+
+const char* m1_edge_category_name(const int category)
+{
+  static const char* names[6]={"OO","ONa","OCl","NaNa","NaCl","ClCl"};
+  if(category<0||category>=6)throw std::runtime_error("native M1 edge category is invalid");
+  return names[category];
+}
+
+const Graph::M1BasisMetadata& build_m1_local_basis(Graph& graph,const std::vector<double>& r0,
+  const std::vector<int>& types,const std::vector<std::string>& atom_symbols,const std::vector<double>& masses,
+  const Box& box,const double cutoff,const int minimum_support_count=3)
+{
+  using namespace rpmd_ja_local_basis;
+  const int n=static_cast<int>(types.size()),base=graph.base_parameter_count,raw_count=32;
+  if(n<=0||r0.size()!=static_cast<std::size_t>(3)*n||atom_symbols.size()!=types.size()||masses.size()!=types.size()||
+     graph.sites.size()!=types.size()||base<=0||base>std::numeric_limits<int>::max()-raw_count||
+     !(cutoff>0.0)||!std::isfinite(cutoff)||minimum_support_count<1||minimum_support_count>1000)
+    throw std::invalid_argument("native M1 local-basis inputs are invalid");
+  if(graph.m1.status!="NOT_BUILT")throw std::runtime_error("native M1 local basis was already constructed");
+  Graph::M1BasisMetadata metadata;metadata.base_parameter_count=base;metadata.raw_parameter_count=raw_count;
+  metadata.minimum_support_count=minimum_support_count;metadata.cutoff=cutoff;
+  metadata.support_policy="MINIMUM_SUPPORT_COUNT_"+std::to_string(minimum_support_count)+"_DROP_BEFORE_OPERATOR_RESIDUALIZATION";
+  const char* bridge_groups[2]={"near_salt","far_salt"};
+  const char* bridge_components[4]={"s","ell","cross","transverse"};
+  metadata.raw_parameters.resize(raw_count);
+  for(int category=0;category<6;++category)for(int shell=0;shell<2;++shell)for(int direction=0;direction<2;++direction){
+    const int raw=(category*2+shell)*2+direction;auto& item=metadata.raw_parameters[raw];
+    item.name=std::string("M1.edge.")+m1_edge_category_name(category)+".shell"+std::to_string(shell)+
+      (direction==0?".longitudinal":".transverse");}
+  for(int group=0;group<2;++group)for(int component=0;component<4;++component){
+    const int raw=24+group*4+component;metadata.raw_parameters[raw].name=std::string("M1.bridge.")+bridge_groups[group]+"."+bridge_components[component];}
+
+  struct EdgeCandidate{int edge=0,category=0;double distance=0.0;};
+  std::array<std::vector<EdgeCandidate>,6> edge_candidates;
+  std::array<std::vector<double>,6> distances;
+  for(std::size_t index=0;index<graph.edges.size();++index){const Edge& edge=graph.edges[index];
+    const int category=m1_edge_category(atom_symbols[edge.i],atom_symbols[edge.j]);
+    if(category<0){++metadata.unclassified_edge_count;continue;}
+    int image[3];const auto dr=mic_displacement(r0,n,edge.i,edge.j,box,image);
+    const double distance=std::sqrt(dr[0]*dr[0]+dr[1]*dr[1]+dr[2]*dr[2]);
+    if(!(distance>0.0)||!std::isfinite(distance))throw std::runtime_error("native M1 fixed edge has invalid R0 distance");
+    edge_candidates[category].push_back({static_cast<int>(index),category,distance});
+    distances[category].push_back(distance);
+  }
+  for(int category=0;category<6;++category){auto& values=distances[category];
+    if(values.empty())continue;std::sort(values.begin(),values.end());metadata.shell_medians[category]=values[values.size()/2];}
+
+  constexpr std::size_t max_local_term_bytes=256ULL*1024*1024;
+  const std::size_t max_local_terms=max_local_term_bytes/sizeof(Term);
+  std::vector<Term> raw_terms;
+  auto append_term=[&](const Term& term){
+    if(raw_terms.size()>=max_local_terms)throw std::runtime_error("M1_PERFORMANCE_FAIL: frozen raw local terms exceed the 256 MiB limit");
+    raw_terms.push_back(term);};
+  for(int category=0;category<6;++category)for(const EdgeCandidate& candidate:edge_candidates[category]){
+    const int shell=candidate.distance<=metadata.shell_medians[category]?0:1;
+    ++metadata.edge_support[category][shell];
+    const Edge& edge=graph.edges[static_cast<std::size_t>(candidate.edge)];int image[3];
+    const auto dr=mic_displacement(r0,n,edge.i,edge.j,box,image);const double distance=candidate.distance;
+    EdgeInput input{};input.first={edge.i,{0,0,0}};input.second={edge.j,{image[0],image[1],image[2]}};
+    input.axis={dr[0]/distance,dr[1]/distance,dr[2]/distance};
+    const int longitudinal=(category*2+shell)*2,transverse=longitudinal+1;
+    input.longitudinal_parameter=base+longitudinal;input.transverse_parameter=base+transverse;
+    const std::vector<Term> terms=make_edge_terms(input);
+    for(const Term& term:terms){append_term(term);++metadata.raw_parameters[term.parameter-base].term_count;}
+    ++metadata.raw_parameters[longitudinal].support_count;++metadata.raw_parameters[transverse].support_count;
+  }
+
+  for(int hydrogen=0;hydrogen<n;++hydrogen)if(atom_symbols[hydrogen]=="H"){
+    ++metadata.hydrogen_count;
+    struct OxygenCandidate{int atom=0;double distance=0.0;int image[3]={};};std::vector<OxygenCandidate> oxygens;
+    for(const SiteEdge& neighbor:graph.sites[hydrogen])if(atom_symbols[neighbor.j]=="O"){
+      int image[3];const auto dr=mic_displacement(r0,n,hydrogen,neighbor.j,box,image);
+      const double distance=std::sqrt(dr[0]*dr[0]+dr[1]*dr[1]+dr[2]*dr[2]);
+      if(distance<cutoff)oxygens.push_back({neighbor.j,distance,{image[0],image[1],image[2]}});}
+    std::sort(oxygens.begin(),oxygens.end(),[](const OxygenCandidate& a,const OxygenCandidate& b){
+      return a.distance<b.distance||(a.distance==b.distance&&a.atom<b.atom);});
+    Graph::FrozenBridge frozen{};frozen.hydrogen.atom=hydrogen;
+    for(const OxygenCandidate& oxygen:oxygens){rpmd_ja_local_basis::Site candidate{};candidate.atom=oxygen.atom;
+      std::copy(oxygen.image,oxygen.image+3,candidate.image);frozen.oxygen_candidates.push_back(candidate);}
+    if(oxygens.size()<2){metadata.frozen_bridges.push_back(std::move(frozen));continue;}++metadata.bridge_candidate_count;
+    frozen.oh1=oxygens[0].distance;frozen.oh2=oxygens[1].distance;
+    if(oxygens.size()>2){frozen.third_gap=oxygens[2].distance-oxygens[1].distance;
+      frozen.ambiguous=frozen.third_gap<=metadata.third_gap_ambiguity_tolerance*std::max(1.0,oxygens[1].distance);}
+    frozen.oxygen1.atom=oxygens[0].atom;frozen.oxygen2.atom=oxygens[1].atom;frozen.hydrogen.atom=hydrogen;
+    bool near_salt=false;for(const SiteEdge& neighbor:graph.sites[hydrogen])
+      if(atom_symbols[neighbor.j]=="Na"||atom_symbols[neighbor.j]=="Cl"){near_salt=true;break;}
+    frozen.group=near_salt?0:1;
+    const int oxygen1=frozen.oxygen1.atom,oxygen2=frozen.oxygen2.atom;
+    const auto dr_h_o1=image_displacement(r0,n,hydrogen,oxygen1,oxygens[0].image,box);
+    const auto dr_h_o2=image_displacement(r0,n,hydrogen,oxygen2,oxygens[1].image,box);
+    const std::array<double,3> dr_oo={dr_h_o2[0]-dr_h_o1[0],dr_h_o2[1]-dr_h_o1[1],dr_h_o2[2]-dr_h_o1[2]};
+    frozen.oo=std::sqrt(dr_oo[0]*dr_oo[0]+dr_oo[1]*dr_oo[1]+dr_oo[2]*dr_oo[2]);
+    if(!(frozen.oo>0.0)||!std::isfinite(frozen.oo)){frozen.ambiguous=true;metadata.frozen_bridges.push_back(frozen);++metadata.ambiguous_bridge_count;continue;}
+    const Vec3 axis={dr_oo[0]/frozen.oo,dr_oo[1]/frozen.oo,dr_oo[2]/frozen.oo};
+    const Vec3 midpoint_offset={-0.5*(dr_h_o1[0]+dr_h_o2[0]),-0.5*(dr_h_o1[1]+dr_h_o2[1]),-0.5*(dr_h_o1[2]+dr_h_o2[2])};
+    frozen.a0=(axis.x*midpoint_offset.x+axis.y*midpoint_offset.y+axis.z*midpoint_offset.z)/frozen.oo;
+    std::copy(oxygens[0].image,oxygens[0].image+3,frozen.oxygen1.image);
+    frozen.hydrogen.image[0]=frozen.hydrogen.image[1]=frozen.hydrogen.image[2]=0;
+    std::copy(oxygens[1].image,oxygens[1].image+3,frozen.oxygen2.image);
+    frozen.accepted=!frozen.ambiguous;
+    if(frozen.ambiguous)++metadata.ambiguous_bridge_count;
+    if(frozen.accepted){BridgeInput input{};input.oxygen1=frozen.oxygen1;input.hydrogen=frozen.hydrogen;
+      input.oxygen2=frozen.oxygen2;input.axis=axis;input.a0=frozen.a0;
+      input.s_parameter=base+24+frozen.group*4;input.ell_parameter=input.s_parameter+1;
+      input.cross_parameter=input.s_parameter+2;input.transverse_parameter=input.s_parameter+3;
+      const std::vector<Term> terms=make_bridge_terms(input);
+      for(const Term& term:terms){append_term(term);++metadata.raw_parameters[term.parameter-base].term_count;}
+      ++metadata.accepted_bridge_count;++metadata.bridge_support[frozen.group];
+      for(int component=0;component<4;++component)++metadata.raw_parameters[24+frozen.group*4+component].support_count;}
+    metadata.frozen_bridges.push_back(frozen);
+  }
+
+  for(auto& item:metadata.raw_parameters){
+    if(item.support_count==0)item.status="EMPTY";
+    else if(item.support_count<metadata.minimum_support_count)item.status="LOW_SUPPORT";
+    else item.status="SUPPORTED";}
+  raw_terms.erase(std::remove_if(raw_terms.begin(),raw_terms.end(),[&](const Term& term){
+    const int raw=term.parameter-base;
+    if(raw<0||raw>=raw_count)throw std::runtime_error("native M1 local term references an invalid raw parameter");
+    return metadata.raw_parameters[static_cast<std::size_t>(raw)].support_count<metadata.minimum_support_count;
+  }),raw_terms.end());
+  std::size_t raw_operator_map_entries=0;
+  const OperatorNormalization normalization=[&](){
+    OperatorGramAccumulator raw_operators(base+raw_count,n);
+    for(const Edge& edge:graph.edges){const Site first{edge.i,{0,0,0}};const Site second{edge.j,{edge.image[0],edge.image[1],edge.image[2]}};
+      const std::vector<Term> terms=make_symmetric_edge_terms(first,second,6*edge.group);
+      for(const Term& term:terms)raw_operators.add(term);}
+    for(const Term& term:raw_terms)raw_operators.add(term);
+    raw_operator_map_entries=raw_operators.sparse_entry_count();
+    return normalize_added_operators(raw_operators,base);
+  }();
+  metadata.added_parameter_count=normalization.output_parameter_count-base;
+  metadata.transform.assign(static_cast<std::size_t>(raw_count)*metadata.added_parameter_count,0.0);
+  metadata.base_mix.assign(static_cast<std::size_t>(base)*metadata.added_parameter_count,0.0);
+  for(int raw=0;raw<raw_count;++raw)for(int added=0;added<metadata.added_parameter_count;++added)
+    metadata.transform[static_cast<std::size_t>(raw)*metadata.added_parameter_count+added]=
+      normalization.transform[static_cast<std::size_t>(base+raw)*normalization.output_parameter_count+base+added];
+  for(int parameter=0;parameter<base;++parameter)for(int added=0;added<metadata.added_parameter_count;++added)
+    metadata.base_mix[static_cast<std::size_t>(parameter)*metadata.added_parameter_count+added]=
+      normalization.transform[static_cast<std::size_t>(parameter)*normalization.output_parameter_count+base+added];
+  for(int raw:normalization.redundant_parameters)metadata.redundant_raw_parameters.push_back(raw-base);
+  metadata.redundant_combination=normalization.redundant_combination;
+  for(int raw=0;raw<raw_count;++raw){auto& item=metadata.raw_parameters[raw];
+    item.residual_relative_norm=normalization.residual_relative_norm[base+raw];
+    if(std::find(metadata.redundant_raw_parameters.begin(),metadata.redundant_raw_parameters.end(),raw)!=metadata.redundant_raw_parameters.end())
+      item.status+="_OPERATOR_REDUNDANT";}
+
+  graph.parameter_count=normalization.output_parameter_count;graph.raw_local_parameter_count=raw_count;
+  graph.local_transform=metadata.transform;graph.local_base_mix=metadata.base_mix;graph.local_terms=std::move(raw_terms);
+  for(Term& term:graph.local_terms)term.parameter-=base;
+  graph.parameter_names.resize(static_cast<std::size_t>(base));
+  metadata.output_parameter_names=graph.parameter_names;
+  for(int added=0;added<metadata.added_parameter_count;++added){
+    const int source=normalization.output_source_parameters[base+added]-base;
+    metadata.output_parameter_names.push_back(metadata.raw_parameters[static_cast<std::size_t>(source)].name);}
+  graph.parameter_names=metadata.output_parameter_names;
+  std::size_t weighted_operator_map_entries=0;
+  {
+    OperatorGramAccumulator weighted_operators(base+raw_count,n,masses.data());
+    for(const Edge& edge:graph.edges){const Site first{edge.i,{0,0,0}};const Site second{edge.j,{edge.image[0],edge.image[1],edge.image[2]}};
+      const std::vector<Term> terms=make_symmetric_edge_terms(first,second,6*edge.group);
+      for(const Term& term:terms)weighted_operators.add(term);}
+    for(const Term& term:graph.local_terms){Term raw=term;raw.parameter+=base;weighted_operators.add(raw);}
+    graph.parameter_basis_norms.assign(static_cast<std::size_t>(graph.parameter_count),0.0);
+    for(int output=0;output<graph.parameter_count;++output){std::vector<double> coefficients(static_cast<std::size_t>(base+raw_count));
+      for(int input=0;input<base+raw_count;++input)
+        coefficients[input]=normalization.transform[static_cast<std::size_t>(input)*graph.parameter_count+output];
+      graph.parameter_basis_norms[output]=weighted_operators.linear_combination_norm(coefficients);
+      if(!(graph.parameter_basis_norms[output]>0.0))throw std::runtime_error("native M1 output operator has zero mass-weighted norm");}
+    weighted_operator_map_entries=weighted_operators.sparse_entry_count();
+  }
+  metadata.operator_map_entry_count=std::max(raw_operator_map_entries,weighted_operator_map_entries);
+  const std::size_t estimated_bytes_per_entry=sizeof(rpmd_ja_local_basis::detail::OperatorKey)+sizeof(double)+4*sizeof(void*);
+  if(metadata.operator_map_entry_count>std::numeric_limits<std::size_t>::max()/estimated_bytes_per_entry)
+    throw std::runtime_error("native M1 operator-map memory estimate overflows");
+  metadata.operator_map_bytes_estimate=metadata.operator_map_entry_count*estimated_bytes_per_entry;
+  metadata.status=metadata.added_parameter_count==0?"NO_INDEPENDENT_ADDITIONS":"BUILT";
+  graph.m1=std::move(metadata);return graph.m1;
+}
+
+struct EffectiveM1Parameters{std::vector<double> base,raw;};
+
+bool has_m1_local_basis(const Graph& graph){return graph.raw_local_parameter_count>0;}
+
+EffectiveM1Parameters effective_m1_parameters(const Graph& graph,const std::vector<double>& theta)
+{
+  if(theta.size()!=static_cast<std::size_t>(graph.parameter_count)||graph.parameter_count<graph.base_parameter_count)
+    throw std::invalid_argument("native M1 parameter vector dimensions do not match the graph");
+  const int base=graph.base_parameter_count,added=graph.parameter_count-base,raw=graph.raw_local_parameter_count;
+  if(graph.local_base_mix.size()!=static_cast<std::size_t>(base)*added||
+     graph.local_transform.size()!=static_cast<std::size_t>(raw)*added)
+    throw std::invalid_argument("native M1 parameter transform dimensions do not match the graph");
+  EffectiveM1Parameters result;result.base.assign(theta.begin(),theta.begin()+base);result.raw.assign(raw,0.0);
+  for(int parameter=0;parameter<base;++parameter)for(int column=0;column<added;++column)
+    result.base[parameter]+=graph.local_base_mix[static_cast<std::size_t>(parameter)*added+column]*theta[base+column];
+  for(int parameter=0;parameter<raw;++parameter)for(int column=0;column<added;++column)
+    result.raw[parameter]+=graph.local_transform[static_cast<std::size_t>(parameter)*added+column]*theta[base+column];
+  if(!std::all_of(result.base.begin(),result.base.end(),[](double value){return std::isfinite(value);})||
+     !std::all_of(result.raw.begin(),result.raw.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("native M1 effective parameters are non-finite");
+  return result;
+}
+
+EffectiveM1Parameters effective_m1_parameters_compensated(const Graph& graph,const std::vector<double>& theta)
+{
+  if(theta.size()!=static_cast<std::size_t>(graph.parameter_count)||graph.parameter_count<graph.base_parameter_count)
+    throw std::invalid_argument("native compensated M1 parameter vector dimensions do not match the graph");
+  const int base=graph.base_parameter_count,added=graph.parameter_count-base,raw=graph.raw_local_parameter_count;
+  if(graph.local_base_mix.size()!=static_cast<std::size_t>(base)*added||
+     graph.local_transform.size()!=static_cast<std::size_t>(raw)*added)
+    throw std::invalid_argument("native compensated M1 parameter transform dimensions do not match the graph");
+  std::vector<NeumaierAccumulator> base_sums(static_cast<std::size_t>(base)),raw_sums(static_cast<std::size_t>(raw));
+  for(int parameter=0;parameter<base;++parameter)base_sums[parameter].add(theta[parameter]);
+  for(int parameter=0;parameter<base;++parameter)for(int column=0;column<added;++column)
+    base_sums[parameter].add_product(graph.local_base_mix[static_cast<std::size_t>(parameter)*added+column],theta[base+column]);
+  for(int parameter=0;parameter<raw;++parameter)for(int column=0;column<added;++column)
+    raw_sums[parameter].add_product(graph.local_transform[static_cast<std::size_t>(parameter)*added+column],theta[base+column]);
+  EffectiveM1Parameters result;result.base.resize(base);result.raw.resize(raw);
+  for(int parameter=0;parameter<base;++parameter)result.base[parameter]=base_sums[parameter].value();
+  for(int parameter=0;parameter<raw;++parameter)result.raw[parameter]=raw_sums[parameter].value();
+  if(!std::all_of(result.base.begin(),result.base.end(),[](double value){return std::isfinite(value);})||
+     !std::all_of(result.raw.begin(),result.raw.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("native compensated M1 effective parameters are non-finite");
+  return result;
 }
 
 void make_design(const Graph& graph,const std::vector<double>& q,const std::vector<double>& sqrt_mass,
                  const int n,const int p,std::vector<double>& design)
 {
-  std::fill(design.begin(),design.end(),0.0);
+  const bool m1=has_m1_local_basis(graph);
+  if(m1&&(p!=graph.parameter_count||design.size()!=static_cast<std::size_t>(p)*3*n||
+      graph.base_parameter_count!=6*static_cast<int>(graph.type_pairs.size())))
+    throw std::invalid_argument("native M1 design dimensions do not match the graph");
+  const int base=m1?graph.base_parameter_count:p,raw=m1?graph.raw_local_parameter_count:0;
+  std::vector<double> raw_design;
+  std::vector<double>& target=m1?raw_design:design;
+  if(m1)raw_design.assign(static_cast<std::size_t>(base+raw)*3*n,0.0);
+  else std::fill(design.begin(),design.end(),0.0);
   for(const auto&e:graph.edges){
     const double dx[3]={q[e.j]/sqrt_mass[e.j]-q[e.i]/sqrt_mass[e.i],
                         q[n+e.j]/sqrt_mass[n+e.j]-q[n+e.i]/sqrt_mass[n+e.i],
@@ -971,8 +1361,26 @@ void make_design(const Graph& graph,const std::vector<double>& q,const std::vect
     const double values[6][3]={{dx[0],0,0},{dx[1],dx[0],0},{dx[2],0,dx[0]},
                                {0,dx[1],0},{0,dx[2],dx[1]},{0,0,dx[2]}};
     for(int a=0;a<6;++a)for(int axis=0;axis<3;++axis){const int col=6*e.group+a;
-      design[static_cast<std::size_t>(col)*3*n+axis*n+e.i]+=values[a][axis]/sqrt_mass[axis*n+e.i];
-      design[static_cast<std::size_t>(col)*3*n+axis*n+e.j]-=values[a][axis]/sqrt_mass[axis*n+e.j];}
+      target[static_cast<std::size_t>(col)*3*n+axis*n+e.i]+=values[a][axis]/sqrt_mass[axis*n+e.i];
+      target[static_cast<std::size_t>(col)*3*n+axis*n+e.j]-=values[a][axis]/sqrt_mass[axis*n+e.j];}
+  }
+  if(m1){
+    for(const rpmd_ja_local_basis::Term& term:graph.local_terms){double projection=0.0;
+      for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+        projection+=term.coefficient[site].x*q[atom]/sqrt_mass[atom];
+        projection+=term.coefficient[site].y*q[n+atom]/sqrt_mass[n+atom];
+        projection+=term.coefficient[site].z*q[2*n+atom]/sqrt_mass[2*n+atom];}
+      const std::size_t column=static_cast<std::size_t>(base+term.parameter)*3*n;
+      for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+        target[column+atom]-=term.weight*term.coefficient[site].x*projection/sqrt_mass[atom];
+        target[column+n+atom]-=term.weight*term.coefficient[site].y*projection/sqrt_mass[n+atom];
+        target[column+2*n+atom]-=term.weight*term.coefficient[site].z*projection/sqrt_mass[2*n+atom];}}
+    for(int output=0;output<p;++output)for(int input=0;input<base+raw;++input){
+      double coefficient=0.0;if(output<base){if(input==output)coefficient=1.0;}
+      else if(input<base)coefficient=graph.local_base_mix[static_cast<std::size_t>(input)*(p-base)+output-base];
+      else coefficient=graph.local_transform[static_cast<std::size_t>(input-base)*(p-base)+output-base];
+      if(coefficient!=0.0)for(int component=0;component<3*n;++component)
+        design[static_cast<std::size_t>(output)*3*n+component]+=coefficient*raw_design[static_cast<std::size_t>(input)*3*n+component];}
   }
   (void)p;
 }
@@ -981,10 +1389,16 @@ void apply_additive(const Graph& graph,const std::vector<double>& q,const std::v
                     const std::vector<double>& sqrt_atom,const std::vector<double>& theta,const int n,std::vector<double>& result)
 {
   std::fill(result.begin(),result.end(),0.0);
+  const bool m1=has_m1_local_basis(graph);EffectiveM1Parameters effective;
+  const std::vector<double>* base_theta=&theta;
+  if(m1){effective=effective_m1_parameters(graph,theta);base_theta=&effective.base;}
   for(const auto&e:graph.edges){const std::size_t p=6*static_cast<std::size_t>(e.group);
     const double dx[3]={q[e.j]/sqrt_mass[e.j]-q[e.i]/sqrt_mass[e.i],q[n+e.j]/sqrt_mass[n+e.j]-q[n+e.i]/sqrt_mass[n+e.i],q[2*n+e.j]/sqrt_mass[2*n+e.j]-q[2*n+e.i]/sqrt_mass[2*n+e.i]};
-    const double y[3]={theta[p]*dx[0]+theta[p+1]*dx[1]+theta[p+2]*dx[2],theta[p+1]*dx[0]+theta[p+3]*dx[1]+theta[p+4]*dx[2],theta[p+2]*dx[0]+theta[p+4]*dx[1]+theta[p+5]*dx[2]};
+    const double y[3]={(*base_theta)[p]*dx[0]+(*base_theta)[p+1]*dx[1]+(*base_theta)[p+2]*dx[2],(*base_theta)[p+1]*dx[0]+(*base_theta)[p+3]*dx[1]+(*base_theta)[p+4]*dx[2],(*base_theta)[p+2]*dx[0]+(*base_theta)[p+4]*dx[1]+(*base_theta)[p+5]*dx[2]};
     for(int a=0;a<3;++a){result[a*n+e.i]-=y[a]/sqrt_mass[a*n+e.i];result[a*n+e.j]+=y[a]/sqrt_mass[a*n+e.j];}}
+  if(m1){const std::vector<double> local=rpmd_ja_local_basis::apply_hessian_sqrt_mass(graph.local_terms,effective.raw.data(),
+      graph.raw_local_parameter_count,q.data(),sqrt_mass.data(),n);
+    for(std::size_t i=0;i<result.size();++i)result[i]+=local[i];}
   project_translation(result,sqrt_atom,n);
 }
 
@@ -1082,7 +1496,8 @@ std::vector<double> spectral_row(const Graph& graph,const std::vector<double>& v
 double curvature_rounding_tolerance(double epsilon,double base_rayleigh,const std::vector<double>& row,const std::vector<double>& theta,double& scale);
 std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline& baseline,const Graph& graph,
   const std::vector<double>& theta,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const int n,const int max_steps,const int wanted,const double epsilon,
-  const std::vector<double>& initial_vector=std::vector<double>{},DeviceLanczosWorkspace* workspace=nullptr)
+  const std::vector<double>& initial_vector=std::vector<double>{},DeviceLanczosWorkspace* workspace=nullptr,
+  const std::function<void(int,double)>& iteration_budget_check={})
 {
   const int d=3*n;const int steps=std::min(max_steps,d-3);if(steps<=0)throw std::runtime_error("native fit Lanczos has no internal dimensions");
   DeviceLanczosWorkspace local_workspace;if(workspace==nullptr){local_workspace.initialize(graph,sqrt_mass,sqrt_atom,steps,theta.size());workspace=&local_workspace;}
@@ -1114,9 +1529,13 @@ std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline
     return out;
   };
   for(int k=0;k<steps;++k){
+    const auto iteration_started=std::chrono::steady_clock::now();
+    if(iteration_budget_check)iteration_budget_check(k,0.0);
     if(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->basis+static_cast<std::size_t>(k)*d,1)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos basis copy failed");
     if(baseline.apply_device(workspace->v,baseline.out)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("native fit Lanczos basis Hessian operation failed");++dense_matrix_actions;
-    workspace->additive_action(workspace->v);blas_check(cublasDcopy(baseline.blas,d,baseline.out,1,workspace->w,1),"native fit Lanczos operator copy failed");axpy(one,workspace->add,workspace->w);
+    workspace->additive_action(workspace->v);
+    if(iteration_budget_check)iteration_budget_check(k,std::chrono::duration<double>(std::chrono::steady_clock::now()-iteration_started).count());
+    blas_check(cublasDcopy(baseline.blas,d,baseline.out,1,workspace->w,1),"native fit Lanczos operator copy failed");axpy(one,workspace->add,workspace->w);
     const double av_norm=norm(workspace->w);if(!std::isfinite(av_norm))throw std::runtime_error("native fit Lanczos operator norm is non-finite");
     if(k)axpy(-beta_prev,workspace->previous,workspace->w);const double a=dot(workspace->v,workspace->w);if(!std::isfinite(a))throw std::runtime_error("native fit Lanczos diagonal is non-finite");alpha.push_back(a);axpy(-a,workspace->v,workspace->w);
     workspace->project(workspace->w);
@@ -1126,10 +1545,13 @@ std::vector<RitzMode> lanczos_low_modes(cusolverDnHandle_t solver,DeviceBaseline
     const double operator_scale=std::max({av_norm,std::abs(a),std::abs(beta_prev)}),breakdown=64.0*std::numeric_limits<double>::epsilon()*operator_scale;
     const int used=k+1;const bool search_finished=b<=breakdown||k==steps-1;
     const bool checkpoint=search_finished||used==32||used==64||used==128||used==256;
+    if(iteration_budget_check)iteration_budget_check(k,std::chrono::duration<double>(std::chrono::steady_clock::now()-iteration_started).count());
     if(checkpoint){auto modes=extract_modes(used,false);const bool below_threshold=std::any_of(modes.begin(),modes.end(),[&](const RitzMode& mode){return stability_cut_is_violated(mode.actual_rayleigh,epsilon,mode.curvature_tolerance);});
       const bool early_cut=steps<=96&&below_threshold&&!search_finished;
+      if(iteration_budget_check)iteration_budget_check(k,std::chrono::duration<double>(std::chrono::steady_clock::now()-iteration_started).count());
       if(search_finished||early_cut){if(early_cut)for(auto& mode:modes)mode.early_exit=true;return modes;}}
     blas_check(cublasDcopy(baseline.blas,d,workspace->v,1,workspace->previous,1),"native fit Lanczos previous-vector copy failed");blas_check(cublasDcopy(baseline.blas,d,workspace->w,1,workspace->v,1),"native fit Lanczos next-vector copy failed");const double inverse_b=1.0/b;blas_check(cublasDscal(baseline.blas,d,&inverse_b,workspace->v,1),"native fit Lanczos next-vector normalization failed");beta_prev=b;
+    if(iteration_budget_check)iteration_budget_check(k,std::chrono::duration<double>(std::chrono::steady_clock::now()-iteration_started).count());
   }
   return extract_modes(static_cast<int>(alpha.size()),false);
 }
@@ -1176,14 +1598,44 @@ void add_compensated_quotient(NeumaierAccumulator& result,const double numerator
   result.add_product(sign,high);result.add_product(sign,low);result.add_product(sign,low2);result.add_product(sign,low3);
 }
 
+void add_local_terms_compensated(const Graph& graph,const std::vector<double>& q,const std::vector<double>& sqrt_mass,
+  const std::vector<double>& raw_theta,const int n,std::vector<NeumaierAccumulator>& sums)
+{
+  if(raw_theta.size()!=static_cast<std::size_t>(graph.raw_local_parameter_count)||sums.size()!=static_cast<std::size_t>(3*n))
+    throw std::invalid_argument("native compensated local-term dimensions do not match");
+  for(const rpmd_ja_local_basis::Term& term:graph.local_terms){
+    if(term.parameter<0||term.parameter>=graph.raw_local_parameter_count||term.atom_count<1||term.atom_count>3||
+       !std::isfinite(term.weight)||!std::isfinite(raw_theta[term.parameter]))
+      throw std::runtime_error("native compensated local term is invalid");
+    NeumaierAccumulator projection;
+    for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+      if(atom<0||atom>=n)throw std::runtime_error("native compensated local term site is invalid");
+      const double coefficient[3]={term.coefficient[site].x,term.coefficient[site].y,term.coefficient[site].z};
+      for(int axis=0;axis<3;++axis){NeumaierAccumulator quotient;const std::size_t index=static_cast<std::size_t>(axis)*n+atom;
+        add_compensated_quotient(quotient,q[index],0.0,sqrt_mass[index],1.0);
+        projection.add_product(coefficient[axis],quotient.sum);projection.add_product(coefficient[axis],quotient.correction);}}
+    NeumaierAccumulator amplitude;amplitude.add_product(term.weight,raw_theta[term.parameter]);
+    NeumaierAccumulator scale;scale.add_product(amplitude.sum,projection.sum);scale.add_product(amplitude.sum,projection.correction);
+    scale.add_product(amplitude.correction,projection.sum);scale.add_product(amplitude.correction,projection.correction);
+    for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+      const double coefficient[3]={term.coefficient[site].x,term.coefficient[site].y,term.coefficient[site].z};
+      for(int axis=0;axis<3;++axis){NeumaierAccumulator numerator;numerator.add_product(coefficient[axis],scale.sum);
+        numerator.add_product(coefficient[axis],scale.correction);
+        add_compensated_quotient(sums[static_cast<std::size_t>(axis)*n+atom],numerator.sum,numerator.correction,
+          sqrt_mass[static_cast<std::size_t>(axis)*n+atom],1.0);}}
+  }
+}
+
 void apply_additive_compensated(const Graph& graph,const std::vector<double>& q,const std::vector<double>& sqrt_mass,
   const std::vector<double>& theta,const int n,std::vector<double>& high,std::vector<double>& low)
 {
   if(q.size()!=static_cast<std::size_t>(3*n)||sqrt_mass.size()!=q.size()||high.size()!=q.size()||low.size()!=q.size())
     throw std::invalid_argument("native fit compensated graph action dimensions are invalid");
+  const bool m1=has_m1_local_basis(graph);EffectiveM1Parameters effective;
+  const std::vector<double>* base_theta=&theta;if(m1){effective=effective_m1_parameters_compensated(graph,theta);base_theta=&effective.base;}
   std::vector<NeumaierAccumulator> sums(q.size());
   for(const auto& edge:graph.edges){
-    if(edge.i<0||edge.j<0||edge.i>=n||edge.j>=n||edge.group<0||6ULL*static_cast<std::size_t>(edge.group)+5>=theta.size())
+    if(edge.i<0||edge.j<0||edge.i>=n||edge.j>=n||edge.group<0||6ULL*static_cast<std::size_t>(edge.group)+5>=base_theta->size())
       throw std::runtime_error("native fit compensated graph action has an invalid edge");
     const std::size_t p=6*static_cast<std::size_t>(edge.group);
     NeumaierAccumulator dx[3];
@@ -1191,9 +1643,9 @@ void apply_additive_compensated(const Graph& graph,const std::vector<double>& q,
       add_compensated_quotient(dx[axis],q[offset+edge.j],0.0,sqrt_mass[offset+edge.j],1.0);
       add_compensated_quotient(dx[axis],q[offset+edge.i],0.0,sqrt_mass[offset+edge.i],-1.0);}
     NeumaierAccumulator y[3];
-    y[0].add_product(theta[p],dx[0].sum);y[0].add_product(theta[p],dx[0].correction);y[0].add_product(theta[p+1],dx[1].sum);y[0].add_product(theta[p+1],dx[1].correction);y[0].add_product(theta[p+2],dx[2].sum);y[0].add_product(theta[p+2],dx[2].correction);
-    y[1].add_product(theta[p+1],dx[0].sum);y[1].add_product(theta[p+1],dx[0].correction);y[1].add_product(theta[p+3],dx[1].sum);y[1].add_product(theta[p+3],dx[1].correction);y[1].add_product(theta[p+4],dx[2].sum);y[1].add_product(theta[p+4],dx[2].correction);
-    y[2].add_product(theta[p+2],dx[0].sum);y[2].add_product(theta[p+2],dx[0].correction);y[2].add_product(theta[p+4],dx[1].sum);y[2].add_product(theta[p+4],dx[1].correction);y[2].add_product(theta[p+5],dx[2].sum);y[2].add_product(theta[p+5],dx[2].correction);
+    y[0].add_product((*base_theta)[p],dx[0].sum);y[0].add_product((*base_theta)[p],dx[0].correction);y[0].add_product((*base_theta)[p+1],dx[1].sum);y[0].add_product((*base_theta)[p+1],dx[1].correction);y[0].add_product((*base_theta)[p+2],dx[2].sum);y[0].add_product((*base_theta)[p+2],dx[2].correction);
+    y[1].add_product((*base_theta)[p+1],dx[0].sum);y[1].add_product((*base_theta)[p+1],dx[0].correction);y[1].add_product((*base_theta)[p+3],dx[1].sum);y[1].add_product((*base_theta)[p+3],dx[1].correction);y[1].add_product((*base_theta)[p+4],dx[2].sum);y[1].add_product((*base_theta)[p+4],dx[2].correction);
+    y[2].add_product((*base_theta)[p+2],dx[0].sum);y[2].add_product((*base_theta)[p+2],dx[0].correction);y[2].add_product((*base_theta)[p+4],dx[1].sum);y[2].add_product((*base_theta)[p+4],dx[1].correction);y[2].add_product((*base_theta)[p+5],dx[2].sum);y[2].add_product((*base_theta)[p+5],dx[2].correction);
     for(int axis=0;axis<3;++axis){
       add_compensated_quotient(sums[static_cast<std::size_t>(axis)*n+edge.i],y[axis].sum,y[axis].correction,
         sqrt_mass[static_cast<std::size_t>(axis)*n+edge.i],-1.0);
@@ -1201,31 +1653,35 @@ void apply_additive_compensated(const Graph& graph,const std::vector<double>& q,
         sqrt_mass[static_cast<std::size_t>(axis)*n+edge.j],1.0);
     }
   }
+  if(m1)add_local_terms_compensated(graph,q,sqrt_mass,effective.raw,n,sums);
   for(std::size_t i=0;i<q.size();++i){high[i]=sums[i].sum;low[i]=sums[i].correction;}
 }
 
 void compute_cg_true_residual_compensated(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
   const std::vector<double>& x,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,
-  const std::vector<double>& theta,const int n,std::vector<double>& residual)
+  const std::vector<double>& theta,const int n,std::vector<double>& residual,
+  const std::function<void()>& budget_observer={})
 {
   if(rhs.size()!=x.size()||rhs.size()!=static_cast<std::size_t>(3*n)||sqrt_mass.size()!=rhs.size()||sqrt_atom.size()!=static_cast<std::size_t>(n))
     throw std::invalid_argument("native fit compensated CG residual dimensions are invalid");
   std::vector<double> base_high(rhs.size()),base_low(rhs.size()),add_high(rhs.size()),add_low(rhs.size());
+  if(budget_observer)budget_observer();
   baseline.apply_compensated(x,base_high,base_low);
+  if(budget_observer)budget_observer();
   apply_additive_compensated(graph,x,sqrt_mass,theta,n,add_high,add_low);
   std::vector<NeumaierAccumulator> values(rhs.size());
-  for(std::size_t i=0;i<rhs.size();++i){values[i].add(rhs[i]);values[i].add(-base_high[i]);values[i].add(-base_low[i]);values[i].add(-add_high[i]);values[i].add(-add_low[i]);}
+  for(std::size_t i=0;i<rhs.size();++i){if((i&4095u)==0&&budget_observer)budget_observer();values[i].add(rhs[i]);values[i].add(-base_high[i]);values[i].add(-base_low[i]);values[i].add(-add_high[i]);values[i].add(-add_low[i]);}
   const double mass_sum=compensated_dot(sqrt_atom,sqrt_atom);
   if(!(mass_sum>0.0)||!std::isfinite(mass_sum))throw std::runtime_error("native fit compensated CG residual has invalid total mass");
   for(int axis=0;axis<3;++axis){
     NeumaierAccumulator projection;
-    for(int i=0;i<n;++i){const std::size_t index=static_cast<std::size_t>(axis)*n+i;
+    for(int i=0;i<n;++i){if((i&4095)==0&&budget_observer)budget_observer();const std::size_t index=static_cast<std::size_t>(axis)*n+i;
       projection.add_product(sqrt_atom[i],values[index].sum);projection.add_product(sqrt_atom[i],values[index].correction);}
-    for(int i=0;i<n;++i){const std::size_t index=static_cast<std::size_t>(axis)*n+i;
+    for(int i=0;i<n;++i){if((i&4095)==0&&budget_observer)budget_observer();const std::size_t index=static_cast<std::size_t>(axis)*n+i;
       add_compensated_quotient(values[index],projection.sum,projection.correction,mass_sum,-sqrt_atom[i]);}
   }
   residual.resize(rhs.size());
-  for(std::size_t i=0;i<rhs.size();++i){residual[i]=values[i].value();if(!std::isfinite(residual[i]))throw std::runtime_error("native fit compensated CG residual is non-finite");}
+  for(std::size_t i=0;i<rhs.size();++i){if((i&4095u)==0&&budget_observer)budget_observer();residual[i]=values[i].value();if(!std::isfinite(residual[i]))throw std::runtime_error("native fit compensated CG residual is non-finite");}
 }
 
 struct CGResidualComparison
@@ -1236,23 +1692,110 @@ struct CGResidualComparison
 
 CGResidualComparison compare_cg_true_residuals(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
   const std::vector<double>& x,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,
-  const std::vector<double>& theta,const int n)
+  const std::vector<double>& theta,const int n,const std::function<void()>& budget_observer={})
 {
   CGResidualComparison comparison;std::vector<double> projected_rhs=rhs,action(rhs.size());
   project_translation(projected_rhs,sqrt_atom,n);
   const double rhs_norm=std::sqrt(compensated_dot(projected_rhs,projected_rhs));
   if(!(rhs_norm>0.0)||!std::isfinite(rhs_norm))throw std::runtime_error("native fit CG replay has zero or non-finite projected right-hand side");
+  if(budget_observer)budget_observer();
   apply_total(baseline,graph,x,sqrt_mass,sqrt_atom,theta,n,action);
   comparison.fast.resize(rhs.size());
-  for(std::size_t i=0;i<rhs.size();++i)comparison.fast[i]=std::fma(-1.0,action[i],projected_rhs[i]);
+  for(std::size_t i=0;i<rhs.size();++i){if((i&4095u)==0&&budget_observer)budget_observer();comparison.fast[i]=std::fma(-1.0,action[i],projected_rhs[i]);}
   project_translation(comparison.fast,sqrt_atom,n);
-  compute_cg_true_residual_compensated(baseline,graph,rhs,x,sqrt_mass,sqrt_atom,theta,n,comparison.compensated);
+  compute_cg_true_residual_compensated(baseline,graph,rhs,x,sqrt_mass,sqrt_atom,theta,n,comparison.compensated,budget_observer);
   comparison.fast_relative=std::sqrt(compensated_dot(comparison.fast,comparison.fast))/rhs_norm;
   comparison.compensated_relative=std::sqrt(compensated_dot(comparison.compensated,comparison.compensated))/rhs_norm;
   for(std::size_t i=0;i<rhs.size();++i)comparison.difference_norm=std::hypot(comparison.difference_norm,comparison.fast[i]-comparison.compensated[i]);
   if(!std::isfinite(comparison.fast_relative)||!std::isfinite(comparison.compensated_relative)||!std::isfinite(comparison.difference_norm))
     throw std::runtime_error("native fit CG replay residual comparison is non-finite");
   return comparison;
+}
+
+void cg_basis_append_u8(std::string& output,const std::uint8_t value)
+{output.push_back(static_cast<char>(value));}
+void cg_basis_append_i32(std::string& output,const int value)
+{const std::int32_t stored=static_cast<std::int32_t>(value);output.append(reinterpret_cast<const char*>(&stored),sizeof(stored));}
+void cg_basis_append_u64(std::string& output,const std::uint64_t value)
+{output.append(reinterpret_cast<const char*>(&value),sizeof(value));}
+void cg_basis_append_double(std::string& output,const double value)
+{output.append(reinterpret_cast<const char*>(&value),sizeof(value));}
+void cg_basis_append_string(std::string& output,const std::string& value)
+{cg_basis_append_u64(output,value.size());output.append(value);}
+void cg_basis_append_site(std::string& output,const rpmd_ja_local_basis::Site& site)
+{cg_basis_append_i32(output,site.atom);for(const int image:site.image)cg_basis_append_i32(output,image);}
+void cg_basis_append_double_vector(std::string& output,const std::vector<double>& values)
+{cg_basis_append_u64(output,values.size());for(const double value:values)cg_basis_append_double(output,value);}
+
+std::string serialize_m1_cg_basis(const Graph& graph)
+{
+  if(graph.parameter_count<=graph.base_parameter_count||graph.m1.status=="NOT_BUILT"||
+     graph.m1.minimum_support_count<1||graph.local_terms.empty())
+    throw std::runtime_error("cannot serialize an incomplete M1 CG basis");
+  std::string output("RPJAM1B1",8);const std::uint32_t endian=native_endian;
+  output.append(reinterpret_cast<const char*>(&endian),sizeof(endian));
+  cg_basis_append_i32(output,graph.base_parameter_count);cg_basis_append_i32(output,graph.parameter_count);
+  cg_basis_append_i32(output,graph.raw_local_parameter_count);cg_basis_append_i32(output,graph.m1.minimum_support_count);
+  cg_basis_append_double(output,graph.m1.cutoff);cg_basis_append_double(output,graph.m1.third_gap_ambiguity_tolerance);
+  cg_basis_append_string(output,graph.m1.status);cg_basis_append_string(output,graph.m1.support_policy);
+  cg_basis_append_string(output,graph.m1.frozen_bridge_rule);cg_basis_append_string(output,graph.m1.a0_rule);
+  cg_basis_append_string(output,graph.m1.operator_map_estimate_scope);
+  cg_basis_append_i32(output,graph.m1.unclassified_edge_count);cg_basis_append_i32(output,graph.m1.hydrogen_count);
+  cg_basis_append_i32(output,graph.m1.bridge_candidate_count);cg_basis_append_i32(output,graph.m1.accepted_bridge_count);
+  cg_basis_append_i32(output,graph.m1.ambiguous_bridge_count);cg_basis_append_u64(output,graph.m1.operator_map_entry_count);
+  cg_basis_append_u64(output,graph.m1.operator_map_bytes_estimate);
+  cg_basis_append_u64(output,graph.type_pairs.size());for(const auto& pair:graph.type_pairs){cg_basis_append_i32(output,pair.first);cg_basis_append_i32(output,pair.second);}
+  cg_basis_append_u64(output,graph.group_by_type.size());for(const auto& item:graph.group_by_type){
+    cg_basis_append_i32(output,item.first.first);cg_basis_append_i32(output,item.first.second);cg_basis_append_i32(output,item.second);}
+  cg_basis_append_u64(output,graph.edges.size());for(const Edge& edge:graph.edges){
+    cg_basis_append_i32(output,edge.i);cg_basis_append_i32(output,edge.j);cg_basis_append_i32(output,edge.group);
+    for(const int image:edge.image)cg_basis_append_i32(output,image);}
+  for(const double median:graph.m1.shell_medians)cg_basis_append_double(output,median);
+  for(const auto& shell:graph.m1.edge_support)for(const int support:shell)cg_basis_append_i32(output,support);
+  for(const int support:graph.m1.bridge_support)cg_basis_append_i32(output,support);
+  cg_basis_append_u64(output,graph.m1.raw_parameters.size());for(const auto& support:graph.m1.raw_parameters){
+    cg_basis_append_string(output,support.name);cg_basis_append_string(output,support.status);
+    cg_basis_append_i32(output,support.support_count);cg_basis_append_i32(output,support.term_count);
+    cg_basis_append_double(output,support.residual_relative_norm);}
+  cg_basis_append_u64(output,graph.parameter_names.size());for(const std::string& name:graph.parameter_names)cg_basis_append_string(output,name);
+  cg_basis_append_u64(output,graph.m1.output_parameter_names.size());
+  for(const std::string& name:graph.m1.output_parameter_names)cg_basis_append_string(output,name);
+  cg_basis_append_u64(output,graph.m1.redundant_raw_parameters.size());
+  for(const int parameter:graph.m1.redundant_raw_parameters)cg_basis_append_i32(output,parameter);
+  cg_basis_append_double_vector(output,graph.m1.redundant_combination);
+  cg_basis_append_double_vector(output,graph.local_transform);cg_basis_append_double_vector(output,graph.local_base_mix);
+  cg_basis_append_double_vector(output,graph.parameter_basis_norms);
+  cg_basis_append_u64(output,graph.m1.frozen_bridges.size());for(const Graph::FrozenBridge& bridge:graph.m1.frozen_bridges){
+    cg_basis_append_site(output,bridge.oxygen1);cg_basis_append_site(output,bridge.hydrogen);cg_basis_append_site(output,bridge.oxygen2);
+    cg_basis_append_i32(output,bridge.group);cg_basis_append_double(output,bridge.oh1);cg_basis_append_double(output,bridge.oh2);
+    cg_basis_append_double(output,bridge.oo);cg_basis_append_double(output,bridge.third_gap);cg_basis_append_double(output,bridge.a0);
+    cg_basis_append_u8(output,bridge.ambiguous?1:0);cg_basis_append_u8(output,bridge.accepted?1:0);
+    cg_basis_append_u64(output,bridge.oxygen_candidates.size());
+    for(const auto& candidate:bridge.oxygen_candidates)cg_basis_append_site(output,candidate);}
+  cg_basis_append_u64(output,graph.local_terms.size());for(const rpmd_ja_local_basis::Term& term:graph.local_terms){
+    cg_basis_append_i32(output,term.parameter);cg_basis_append_i32(output,term.atom_count);cg_basis_append_double(output,term.weight);
+    for(int site=0;site<term.atom_count;++site){cg_basis_append_site(output,term.site[site]);
+      cg_basis_append_double(output,term.coefficient[site].x);cg_basis_append_double(output,term.coefficient[site].y);
+      cg_basis_append_double(output,term.coefficient[site].z);cg_basis_append_double(output,term.energy_share[site]);}}
+  return output;
+}
+
+std::uint64_t cg_basis_snapshot_hash(const std::string& bytes)
+{
+  std::uint64_t hash=14695981039346656037ULL;
+  for(const unsigned char value:bytes){hash^=value;hash*=1099511628211ULL;}return hash;
+}
+
+std::string cg_basis_snapshot_hash_hex(const std::uint64_t hash)
+{std::ostringstream value;value<<std::hex<<std::setw(16)<<std::setfill('0')<<hash;return value.str();}
+
+void write_cg_snapshot_atomically(const std::string& path,const std::string& contents)
+{
+  const std::string temporary=path+".tmp";rpmd_ja_file_io::ofstream out(temporary,std::ios::out|std::ios::binary|std::ios::trunc);
+  if(!out)throw std::runtime_error("cannot create temporary CG witness snapshot: "+temporary);
+  out.write(contents.data(),static_cast<std::streamsize>(contents.size()));out.flush();out.close();
+  if(!out||rpmd_ja_file_io::atomic_replace_file(temporary,path)!=0){rpmd_ja_file_io::remove_file(temporary);
+    throw std::runtime_error("cannot atomically publish CG witness snapshot: "+path);}
 }
 
 struct CGResidualCheck{int iteration=0,restarts=0;double recursive_relative=0.0,true_relative=0.0;};
@@ -1286,10 +1829,21 @@ void set_true_residual_failure(CGResult& result,const int probe,const int iterat
     std::all_of(witness.residual_checks.begin(),witness.residual_checks.end(),[](const CGResidualCheck& check){return std::isfinite(check.recursive_relative)&&std::isfinite(check.true_relative);});
 }
 void write_cg_witness(const std::string& path,const CGWitness& w,const std::vector<double>& theta,
-  const std::string& raw_path,const std::string& spool_path,const CGReplayContext& replay)
+  const std::string& raw_path,const std::string& spool_path,const CGReplayContext& replay,const Graph* graph=nullptr)
 {
-  std::ofstream out(path,std::ios::out|std::ios::trunc);if(!out)throw std::runtime_error("cannot write native fit CG witness: "+path);
-  const auto& options=replay.options;out<<std::setprecision(17)<<"status NOT_ACCEPTED_REFERENCE\nclassification "<<w.classification<<"\nprobe "<<w.probe<<"\niteration "<<w.iteration
+  const bool m1=graph&&graph->parameter_count>graph->base_parameter_count;
+  if(graph&&graph->parameter_count!=static_cast<int>(theta.size()))
+    throw std::runtime_error("native fit CG witness parameter dimension does not match its graph");
+  std::string basis_sidecar;std::uint64_t basis_hash=0,basis_fingerprint=0;
+  if(m1){const std::string basis=serialize_m1_cg_basis(*graph);basis_hash=cg_basis_snapshot_hash(basis);
+    basis_sidecar=path+".m1basis."+cg_basis_snapshot_hash_hex(basis_hash);basis_fingerprint=covariance_m1_basis_fingerprint(*graph);
+    write_cg_snapshot_atomically(basis_sidecar,basis);}
+  std::ostringstream out;out<<std::setprecision(17)<<"witness_format_version 2\nparameter_family "<<(m1?"M1":"M0")
+    <<"\nparameter_count "<<theta.size();
+  if(m1)out<<"\nM1_minimum_support_count "<<graph->m1.minimum_support_count
+    <<"\nM1_basis_sidecar "<<std::quoted(basis_sidecar)<<"\nM1_basis_snapshot_fnv64 "<<basis_hash
+    <<"\nM1_basis_fingerprint_fnv64 "<<basis_fingerprint;
+  const auto& options=replay.options;out<<"\nstatus NOT_ACCEPTED_REFERENCE\nclassification "<<w.classification<<"\nprobe "<<w.probe<<"\niteration "<<w.iteration
     <<"\nresidual_restarts "<<w.residual_restarts<<"\nrecursive_relative_residual "<<w.recursive_relative_residual<<"\ntrue_residual_status "<<(w.true_residual_computed?"COMPUTED":"NOT_COMPUTED")<<"\ntrue_relative_residual ";
   if(w.true_residual_computed)out<<w.relative_residual;else out<<"NOT_COMPUTED";out<<"\nresidual_checks "<<w.residual_checks.size()<<'\n';
   for(const auto& check:w.residual_checks)out<<"residual_check "<<check.iteration<<' '<<check.restarts<<' '<<check.recursive_relative<<' '<<check.true_relative<<'\n';
@@ -1303,13 +1857,15 @@ void write_cg_witness(const std::string& path,const CGWitness& w,const std::vect
     <<(options.internal_mass_com?"internal mass-COM projected mass-weighted xyz-SoA":"raw mass-weighted xyz-SoA")<<"\ntheta "<<theta.size();for(double x:theta)out<<' '<<x;out<<'\n';
   auto vector=[&](const char* label,const std::vector<double>& x){out<<label<<' '<<x.size();for(double v:x)out<<' '<<v;out<<'\n';};
   vector("rhs_input_xyz_soa",w.rhs_input);vector("rhs_projected_xyz_soa",w.rhs);vector("solution_x_xyz_soa",w.solution);vector("v_xyz_soa",w.direction);vector("Dv_xyz_soa",w.action);vector("base_Dv_xyz_soa",w.base);vector("additive_Dv_xyz_soa",w.add);
-  out.close();if(!out)throw std::runtime_error("failed closing native fit CG witness: "+path);
+  write_cg_snapshot_atomically(path,out.str());
 }
 
 struct CGWitnessSnapshot
 {
-  std::string status,classification,true_residual_status,qraw_path,sample_path;
+  std::string status,classification,true_residual_status,qraw_path,sample_path,parameter_family="M0",m1_basis_sidecar;
   std::uint64_t sample_frames=0,training_frames=0,qraw_model=0,qraw_config=0,active_model=0,active_config=0;
+  std::uint64_t m1_basis_snapshot_fnv64=0,m1_basis_fingerprint=0;
+  int witness_format_version=1,parameter_count=0,m1_minimum_support_count=3;
   int sample_interval=0,internal_mass_com=0,qraw_charge=0,qraw_kspace=0,probe=-1,iteration=-1;
   double cutoff=0.0,temperature=0.0,fd_step=0.0,epsilon=0.0,qraw_mesh=0.0,active_mesh=0.0;
   std::vector<double> theta,rhs_input,rhs_projected,solution;
@@ -1317,7 +1873,7 @@ struct CGWitnessSnapshot
 
 std::pair<std::string,std::string> read_cg_witness_paths(const std::string& path)
 {
-  std::ifstream in(path);if(!in)throw std::runtime_error("cannot open native fit CG witness: "+path);
+  rpmd_ja_file_io::ifstream in(path);if(!in)throw std::runtime_error("cannot open native fit CG witness: "+path);
   std::string line,qraw_path,sample_path;
   while(std::getline(in,line)){std::istringstream fields(line);std::string key;if(!(fields>>key))continue;
     if(key=="qraw_source")fields>>std::quoted(qraw_path);
@@ -1329,7 +1885,7 @@ std::pair<std::string,std::string> read_cg_witness_paths(const std::string& path
 
 CGWitnessSnapshot read_cg_witness(const std::string& path,const int dimension,const int parameter_count)
 {
-  std::ifstream in(path);if(!in)throw std::runtime_error("cannot open native fit CG witness: "+path);
+  rpmd_ja_file_io::ifstream in(path);if(!in)throw std::runtime_error("cannot open native fit CG witness: "+path);
   CGWitnessSnapshot snapshot;std::set<std::string> seen;std::string line;
   const std::set<std::string> repeated={"residual_check","curvature_diagnostic_status","p2","pAp","rayleigh_quotient",
     "base_rayleigh","additive_rayleigh","curvature_tolerance","repeat_rayleigh","repeat_diff_norm","translation_overlap",
@@ -1340,7 +1896,7 @@ CGWitnessSnapshot read_cg_witness(const std::string& path,const int dimension,co
     if(key=="theta"||key=="rhs_input_xyz_soa"||key=="rhs_projected_xyz_soa"||key=="solution_x_xyz_soa"){
       std::size_t count=0;if(!(fields>>count))throw std::runtime_error("invalid vector header in native fit CG witness");
       const std::size_t expected=key=="theta"?static_cast<std::size_t>(std::max(0,parameter_count)):static_cast<std::size_t>(dimension);
-      if(key=="theta"&&parameter_count==0){if(count>1000000||count%6!=0)throw std::runtime_error("native fit CG witness theta dimension is invalid");}
+      if(key=="theta"&&parameter_count==0){if(count>1000000)throw std::runtime_error("native fit CG witness theta dimension is invalid");}
       else if(count!=expected)throw std::runtime_error("native fit CG witness vector dimension does not match sample/qraw inputs: "+key);
       std::vector<double> values(count);for(double& value:values)if(!(fields>>value)||!std::isfinite(value))throw std::runtime_error("native fit CG witness vector is truncated or non-finite: "+key);
       std::string extra;if(fields>>extra)throw std::runtime_error("native fit CG witness vector has trailing data: "+key);
@@ -1349,7 +1905,14 @@ CGWitnessSnapshot read_cg_witness(const std::string& path,const int dimension,co
       else if(key=="rhs_projected_xyz_soa")snapshot.rhs_projected=std::move(values);
       else snapshot.solution=std::move(values);
       continue; // The trailing-data probe normally sets failbit at end of line.
-    }else if(key=="status")fields>>snapshot.status;
+    }else if(key=="witness_format_version")fields>>snapshot.witness_format_version;
+    else if(key=="parameter_family")fields>>snapshot.parameter_family;
+    else if(key=="parameter_count")fields>>snapshot.parameter_count;
+    else if(key=="M1_minimum_support_count")fields>>snapshot.m1_minimum_support_count;
+    else if(key=="M1_basis_sidecar")fields>>std::quoted(snapshot.m1_basis_sidecar);
+    else if(key=="M1_basis_snapshot_fnv64")fields>>snapshot.m1_basis_snapshot_fnv64;
+    else if(key=="M1_basis_fingerprint_fnv64")fields>>snapshot.m1_basis_fingerprint;
+    else if(key=="status")fields>>snapshot.status;
     else if(key=="classification")fields>>snapshot.classification;
     else if(key=="true_residual_status")fields>>snapshot.true_residual_status;
     else if(key=="qraw_source")fields>>std::quoted(snapshot.qraw_path);
@@ -1381,6 +1944,36 @@ CGWitnessSnapshot read_cg_witness(const std::string& path,const int dimension,co
     "cutoff_A","temperature_K","fd_step","epsilon","qraw_pppm_mesh_spacing","active_pppm_mesh_spacing","theta",
     "rhs_input_xyz_soa","rhs_projected_xyz_soa","solution_x_xyz_soa"};
   for(const char* key:required)if(!seen.count(key))throw std::runtime_error(std::string("native fit CG witness is missing field: ")+key);
+  if(snapshot.witness_format_version!=1&&snapshot.witness_format_version!=2)
+    throw std::runtime_error("native fit CG witness format version is unsupported");
+  if(snapshot.witness_format_version==1){snapshot.parameter_family="M0";snapshot.parameter_count=static_cast<int>(snapshot.theta.size());
+    if(seen.count("M1_basis_sidecar")||seen.count("M1_basis_snapshot_fnv64")||seen.count("M1_basis_fingerprint_fnv64"))
+      throw std::runtime_error("legacy native fit CG witness contains unsupported M1 mapping fields");}
+  else{
+    const char* version_two_required[]={"parameter_family","parameter_count"};
+    for(const char* key:version_two_required)if(!seen.count(key))
+      throw std::runtime_error(std::string("version-2 native fit CG witness is missing field: ")+key);
+    if(snapshot.parameter_count<0||snapshot.parameter_count>1000000||
+       static_cast<std::size_t>(snapshot.parameter_count)!=snapshot.theta.size()||
+       (snapshot.parameter_family!="M0"&&snapshot.parameter_family!="M1"))
+      throw std::runtime_error("version-2 native fit CG witness family or parameter count is invalid");
+    if(snapshot.parameter_family=="M1"){
+      const char* m1_required[]={"M1_minimum_support_count","M1_basis_sidecar","M1_basis_snapshot_fnv64","M1_basis_fingerprint_fnv64"};
+      for(const char* key:m1_required)if(!seen.count(key))
+        throw std::runtime_error(std::string("M1 native fit CG witness is missing mapping field: ")+key);
+      if(snapshot.m1_minimum_support_count<1||snapshot.m1_minimum_support_count>1000||snapshot.m1_basis_sidecar.empty()||
+         snapshot.m1_basis_snapshot_fnv64==0||snapshot.m1_basis_fingerprint==0)
+        throw std::runtime_error("M1 native fit CG witness mapping identity is invalid");
+      const std::string expected_suffix=".m1basis."+cg_basis_snapshot_hash_hex(snapshot.m1_basis_snapshot_fnv64);
+      if(snapshot.m1_basis_sidecar.size()<expected_suffix.size()||
+         snapshot.m1_basis_sidecar.compare(snapshot.m1_basis_sidecar.size()-expected_suffix.size(),expected_suffix.size(),expected_suffix)!=0)
+        throw std::runtime_error("M1 native fit CG witness sidecar path does not match its content identity");
+      if(snapshot.m1_basis_sidecar!=path+expected_suffix)
+        throw std::runtime_error("M1 native fit CG witness sidecar path is not the witness-owned content address");
+    }else if(seen.count("M1_minimum_support_count")||seen.count("M1_basis_sidecar")||
+             seen.count("M1_basis_snapshot_fnv64")||seen.count("M1_basis_fingerprint_fnv64"))
+      throw std::runtime_error("M0 native fit CG witness contains unexpected M1 mapping fields");
+  }
   if(snapshot.status!="NOT_ACCEPTED_REFERENCE"||snapshot.classification!="TRUE_RESIDUAL_FAILURE"||snapshot.true_residual_status!="COMPUTED"||
      (snapshot.internal_mass_com!=0&&snapshot.internal_mass_com!=1)||snapshot.sample_interval<=0||snapshot.probe<0||snapshot.iteration<0||
      !std::isfinite(snapshot.cutoff)||snapshot.cutoff<=0.0||!std::isfinite(snapshot.temperature)||snapshot.temperature<=0.0||
@@ -1395,9 +1988,13 @@ bool preserve_candidate_package_on_full_spd_failure(const std::string& message,b
   if(message.find("qNEP translation-complement Hessian is not positive definite")!=0)return false;
   pack_owned=false;return true;
 }
+bool is_feasibility_budget_exception(const std::exception& error)
+{return std::string(error.what()).rfind("FEASIBILITY_BUDGET_",0)==0;}
+
 CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
   const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<double>& theta,const int n,const int probe=-1,const double epsilon=0.0,
-  const double relative_tolerance=1e-8,const int max_iterations=20000,const bool return_on_iteration_limit=false)
+  const double relative_tolerance=1e-8,const int max_iterations=20000,const bool return_on_iteration_limit=false,
+  const std::function<void()>& budget_observer={})
 {
   if(!(relative_tolerance>0.0)||!(relative_tolerance<1.0)||!std::isfinite(relative_tolerance)||max_iterations<=0)
     throw std::invalid_argument("native fit projected CG tolerance or iteration limit is invalid");
@@ -1405,7 +2002,7 @@ CGResult solve_projected_cg(DeviceBaseline& baseline,const Graph& graph,const st
   const std::vector<double> projected_rhs=r;double rr=compensated_dot(r,r);const double initial=std::sqrt(rr);if(!(initial>0.0)||!std::isfinite(initial))throw std::runtime_error("NONFINITE_CG_ARITHMETIC: native fit response probe has zero or non-finite norm");
   auto record_failure=[&](const char* classification,const int it){CGWitness& w=out.witness;w.classification=classification;w.probe=probe;w.iteration=it;w.residual_restarts=out.residual_restarts;w.p2=compensated_dot(p,p);w.pap=compensated_dot(p,ap);w.relative_residual=std::sqrt(rr)/initial;w.recursive_relative_residual=w.relative_residual;out.recursive_relative_residual=w.relative_residual;if(w.p2>0.0&&std::isfinite(w.p2)){w.direction=p;for(double& x:w.direction)x/=std::sqrt(w.p2);w.base.resize(p.size());w.add.resize(p.size());w.action.resize(p.size());baseline.apply(w.direction,w.base);apply_additive(graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.add);apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,w.action);std::vector<double> repeat(p.size());apply_total(baseline,graph,w.direction,sqrt_mass,sqrt_atom,theta,n,repeat);w.rayleigh=compensated_dot(w.direction,w.action);w.base_rayleigh=compensated_dot(w.direction,w.base);w.add_rayleigh=compensated_dot(w.direction,w.add);w.repeat_rayleigh=compensated_dot(w.direction,repeat);for(std::size_t i=0;i<repeat.size();++i)w.repeat_diff_norm=std::hypot(w.repeat_diff_norm,repeat[i]-w.action[i]);}w.finite=std::isfinite(w.p2)&&std::isfinite(w.pap)&&std::isfinite(w.relative_residual)&&std::all_of(w.base.begin(),w.base.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.add.begin(),w.add.end(),[](double x){return std::isfinite(x);})&&std::all_of(w.action.begin(),w.action.end(),[](double x){return std::isfinite(x);});};
   std::vector<CGResidualCheck> residual_checks;
-  for(int it=0;it<max_iterations;++it){out.iterations=it;project_translation(p,sqrt_atom,n);apply_total(baseline,graph,p,sqrt_mass,sqrt_atom,theta,n,ap);const double pap=compensated_dot(p,ap);if(!std::all_of(ap.begin(),ap.end(),[](double x){return std::isfinite(x);} )){
+  for(int it=0;it<max_iterations;++it){if(budget_observer)budget_observer();out.iterations=it;project_translation(p,sqrt_atom,n);apply_total(baseline,graph,p,sqrt_mass,sqrt_atom,theta,n,ap);const double pap=compensated_dot(p,ap);if(!std::all_of(ap.begin(),ap.end(),[](double x){return std::isfinite(x);} )){
       record_failure("NONFINITE_OPERATOR",it);return out;
     }
      if(!std::isfinite(pap)){record_failure("NONFINITE_CG_ARITHMETIC",it);return out;}
@@ -1481,7 +2078,8 @@ struct CGProbeRecoveryDiagnostic
 CGReplayRefinement refine_cg_replay_solution(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
   const std::vector<double>& saved_solution,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,
   const std::vector<double>& theta,const int n,const int probe,const CGResidualComparison& saved_residuals,
-  const int max_rounds=3,const std::uint64_t max_dense_matrix_actions=4096)
+  const int max_rounds=3,const std::uint64_t max_dense_matrix_actions=4096,
+  const std::function<void()>& budget_observer={})
 {
   constexpr std::uint64_t reserved_matrix_actions=5; // Three CG checks/diagnostics plus two trial-residual actions.
   constexpr double correction_relative_tolerance=1e-2;
@@ -1490,6 +2088,7 @@ CGReplayRefinement refine_cg_replay_solution(DeviceBaseline& baseline,const Grap
   const std::uint64_t actions_start=baseline.dense_matrix_actions;
   if(result.residuals.compensated_relative<=final_relative_tolerance){result.status="COMPENSATED_RESIDUAL_ALREADY_WITHIN_GATE";return result;}
   for(int round=0;round<max_rounds;++round){
+    if(budget_observer)budget_observer();
     CGReplayRefinementRound record;const auto round_started=std::chrono::steady_clock::now();
     const std::uint64_t used=baseline.dense_matrix_actions-actions_start;
     if(used>max_dense_matrix_actions||max_dense_matrix_actions-used<=reserved_matrix_actions){result.status="MATRIX_ACTION_LIMIT";break;}
@@ -1499,14 +2098,14 @@ CGReplayRefinement refine_cg_replay_solution(DeviceBaseline& baseline,const Grap
     const std::vector<double> correction_rhs=result.residuals.compensated;
     CGResult correction;
     try{correction=solve_projected_cg(baseline,graph,correction_rhs,sqrt_mass,sqrt_atom,theta,n,probe,0.0,
-        correction_relative_tolerance,max_iterations,true);
+        correction_relative_tolerance,max_iterations,true,budget_observer);
       record.status=correction.witness.classification.empty()?"CG_PASS":correction.witness.classification;
       record.iterations=correction.iterations;record.restarts=correction.residual_restarts;record.solver_counts_available=true;
       record.recursive_relative=correction.recursive_relative_residual;
       if(correction.witness.classification.empty())record.correction_relative=correction.relative_residual;
       else if(correction.witness.true_residual_computed)record.correction_relative=correction.witness.relative_residual;
       if(record.status=="ITERATION_LIMIT"&&matrix_action_limited)record.status="MATRIX_ACTION_LIMIT";
-    }catch(const std::exception& error){record.error=error.what();record.status="CG_EXCEPTION";}
+    }catch(const std::exception& error){if(is_feasibility_budget_exception(error))throw;record.error=error.what();record.status="CG_EXCEPTION";}
     if(!record.status.empty()&&record.status!="CG_PASS"){
       record.dense_matrix_actions=baseline.dense_matrix_actions-actions_before;
       record.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-round_started).count();
@@ -1527,8 +2126,9 @@ CGReplayRefinement refine_cg_replay_solution(DeviceBaseline& baseline,const Grap
     std::vector<double> trial_solution=result.solution;
     for(std::size_t i=0;i<trial_solution.size();++i)trial_solution[i]=std::fma(1.0,correction.x[i],trial_solution[i]);
     CGResidualComparison trial_residuals;
-    try{trial_residuals=compare_cg_true_residuals(baseline,graph,rhs,trial_solution,sqrt_mass,sqrt_atom,theta,n);}
-    catch(const std::exception& error){record.status="RESIDUAL_CHECK_EXCEPTION";record.error=error.what();
+    if(budget_observer)budget_observer();
+    try{trial_residuals=compare_cg_true_residuals(baseline,graph,rhs,trial_solution,sqrt_mass,sqrt_atom,theta,n,budget_observer);}
+    catch(const std::exception& error){if(is_feasibility_budget_exception(error))throw;record.status="RESIDUAL_CHECK_EXCEPTION";record.error=error.what();
       record.dense_matrix_actions=baseline.dense_matrix_actions-actions_before;record.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-round_started).count();
       result.rounds.push_back(std::move(record));result.status="CORRECTION_RESIDUAL_CHECK_FAILED";break;}
     record.fast_relative=trial_residuals.fast_relative;record.compensated_relative=trial_residuals.compensated_relative;
@@ -1547,13 +2147,15 @@ CGReplayRefinement refine_cg_replay_solution(DeviceBaseline& baseline,const Grap
 
 bool recover_cg_true_residual_failure(DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& rhs,
   CGResult& cg,const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<double>& theta,
-  const int n,CGProbeRecoveryDiagnostic& diagnostic,const int outer=-1)
+  const int n,CGProbeRecoveryDiagnostic& diagnostic,const int outer=-1,const std::function<void()>& budget_observer={})
 {
+  if(budget_observer)budget_observer();
   diagnostic.probe=cg.witness.probe;diagnostic.outer=outer;diagnostic.initial_cg_status=cg.witness.classification;
   diagnostic.original_witness=cg.witness;
   const std::uint64_t verification_actions=baseline.dense_matrix_actions;const auto verification_started=std::chrono::steady_clock::now();
   CGResidualComparison initial;
-  try{initial=compare_cg_true_residuals(baseline,graph,rhs,cg.x,sqrt_mass,sqrt_atom,theta,n);}
+  if(budget_observer)budget_observer();
+  try{initial=compare_cg_true_residuals(baseline,graph,rhs,cg.x,sqrt_mass,sqrt_atom,theta,n,budget_observer);}
   catch(const std::exception& error){diagnostic.refinement_status="COMPENSATED_VERIFICATION_EXCEPTION";diagnostic.error=error.what();
     diagnostic.verification_matrix_actions=baseline.dense_matrix_actions-verification_actions;
     diagnostic.verification_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-verification_started).count();throw;}
@@ -1566,7 +2168,8 @@ bool recover_cg_true_residual_failure(DeviceBaseline& baseline,const Graph& grap
     diagnostic.recovered=true;cg.relative_residual=initial.compensated_relative;return true;}
   const std::uint64_t refinement_actions=baseline.dense_matrix_actions;const auto refinement_started=std::chrono::steady_clock::now();
   try{
-    const CGReplayRefinement refinement=refine_cg_replay_solution(baseline,graph,rhs,cg.x,sqrt_mass,sqrt_atom,theta,n,cg.witness.probe,initial);
+    const CGReplayRefinement refinement=refine_cg_replay_solution(baseline,graph,rhs,cg.x,sqrt_mass,sqrt_atom,theta,n,
+      cg.witness.probe,initial,3,4096,budget_observer);
     diagnostic.refinement_status=refinement.status;diagnostic.refinement_rounds=static_cast<int>(refinement.rounds.size());
     diagnostic.refinement_matrix_actions=refinement.dense_matrix_actions;
     diagnostic.refinement_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-refinement_started).count();
@@ -1600,15 +2203,130 @@ struct ProbeOrigin
   double mass=std::numeric_limits<double>::quiet_NaN();
 };
 
-std::vector<std::vector<double>> make_probes(const std::vector<RitzMode>& soft,const std::vector<double>& sqrt_mass,
-  const std::vector<int>& types,const int n,std::vector<std::string>* sources=nullptr,std::vector<ProbeOrigin>* origins=nullptr)
+bool probe_origin_valid(const std::string& source,const ProbeOrigin& origin)
 {
-  const int d=3*n,internal=d-3;std::vector<std::vector<double>> probes;probes.reserve(std::min(24,internal));std::uint64_t state=0x243f6a8885a308d3ULL;
-  auto add=[&](std::vector<double> v,const char* source,const int seed_atom){project_translation(v,sqrt_mass,n);for(const auto&w:probes){const double c=std::inner_product(v.begin(),v.end(),w.begin(),0.0);for(int i=0;i<d;++i)v[i]-=c*w[i];}const double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(norm>1e-10){for(double&x:v)x/=norm;probes.push_back(std::move(v));if(sources)sources->emplace_back(source);if(origins){ProbeOrigin origin;if(seed_atom>=0){origin.seed_atom_index=seed_atom;origin.type_index=types[seed_atom];origin.mass=sqrt_mass[seed_atom]*sqrt_mass[seed_atom];}origins->push_back(origin);}return true;}return false;};
-  for(int k=0;k<std::min(16,internal);++k){std::vector<double> v(d);for(double&x:v){state^=state>>12;state^=state<<25;state^=state>>27;x=(static_cast<double>((state*2685821657736338717ULL)>>11)/9007199254740992.0)-0.5;}add(std::move(v),"FIXED_RANDOM",-1);}
-  std::set<int> seen_types;for(int atom=0;atom<n&&seen_types.size()<4&&static_cast<int>(probes.size())<internal;++atom)if(seen_types.insert(types[atom]).second){std::vector<double> v(d);for(int a=0;a<3;++a)v[a*n+atom]=sqrt_mass[atom];add(std::move(v),"TYPE_LOCAL",atom);}
-  int low_mode_probes=0;for(std::size_t i=0;i<soft.size()&&low_mode_probes<4&&static_cast<int>(probes.size())<internal;++i)if(add(soft[i].vector,"LOW_RITZ",-1))++low_mode_probes;
+  if(source=="TYPE_LOCAL")return origin.seed_atom_index>=0&&origin.type_index>=0&&
+    std::isfinite(origin.mass)&&origin.mass>0.0;
+  const bool known_nonlocal=source=="LOW_RITZ"||source=="FIXED_RANDOM"||
+    source.rfind("FIXED_PHYSICAL_",0)==0;
+  return known_nonlocal&&origin.seed_atom_index==-1&&origin.type_index==-1&&std::isnan(origin.mass);
+}
+
+std::string probe_origin_mass_token(const ProbeOrigin& origin)
+{
+  if(std::isnan(origin.mass))return "NA";
+  std::ostringstream value;value<<std::setprecision(17)<<origin.mass;return value.str();
+}
+
+std::string encode_probe_origin(const ProbeOrigin& origin)
+{return std::to_string(origin.seed_atom_index)+","+std::to_string(origin.type_index)+","+probe_origin_mass_token(origin);}
+
+ProbeOrigin parse_probe_origin(const std::string& source,const std::string& encoded)
+{
+  std::istringstream row(encoded);std::string seed_text,type_text,mass_text;ProbeOrigin origin;
+  if(!std::getline(row,seed_text,',')||!std::getline(row,type_text,',')||!std::getline(row,mass_text)||
+     mass_text.find(',')!=std::string::npos)throw std::invalid_argument("malformed probe origin");
+  try{std::size_t consumed=0;origin.seed_atom_index=std::stoi(seed_text,&consumed);
+    if(consumed!=seed_text.size())throw std::invalid_argument("malformed probe origin");
+    origin.type_index=std::stoi(type_text,&consumed);if(consumed!=type_text.size())throw std::invalid_argument("malformed probe origin");
+    if(mass_text!="NA"){origin.mass=std::stod(mass_text,&consumed);if(consumed!=mass_text.size())throw std::invalid_argument("malformed probe origin");}}
+  catch(...){throw std::invalid_argument("malformed probe origin");}
+  if(!probe_origin_valid(source,origin))throw std::invalid_argument("probe origin does not match its source kind");
+  return origin;
+}
+
+struct FixedPhysicalProbe
+{
+  std::string source;
+  std::vector<double> vector;
+};
+
+std::vector<FixedPhysicalProbe> make_fixed_physical_probes(const std::vector<double>& r0,
+  const std::vector<int>& types,const std::vector<std::string>& symbols,const std::vector<double>& sqrt_mass,
+  const Box& box,const double cutoff)
+{
+  const int n=static_cast<int>(types.size()),d=3*n;
+  if(n<=0||r0.size()!=static_cast<std::size_t>(d)||symbols.size()!=types.size()||sqrt_mass.size()!=types.size()||
+     !(cutoff>0.0)||!std::isfinite(cutoff))
+    throw std::invalid_argument("fixed physical response probe inputs are invalid");
+  std::vector<FixedPhysicalProbe> result;
+  const bool has_oxygen=std::find(symbols.begin(),symbols.end(),"O")!=symbols.end();
+  if(has_oxygen)for(int axis=0;axis<3;++axis){FixedPhysicalProbe probe;
+    probe.source=std::string("FIXED_PHYSICAL_OXYGEN_SKELETON_")+"XYZ"[axis];probe.vector.assign(d,0.0);
+    for(int atom=0;atom<n;++atom)if(symbols[atom]=="O")probe.vector[axis*n+atom]=sqrt_mass[atom];
+    result.push_back(std::move(probe));}
+  if(std::find(symbols.begin(),symbols.end(),"Na")!=symbols.end()||
+     std::find(symbols.begin(),symbols.end(),"Cl")!=symbols.end()){
+    for(int axis=0;axis<3;++axis){FixedPhysicalProbe probe;
+      probe.source=std::string("FIXED_PHYSICAL_SALT_POLARITY_")+"XYZ"[axis];probe.vector.assign(d,0.0);
+      for(int atom=0;atom<n;++atom){const double sign=symbols[atom]=="Na"?1.0:(symbols[atom]=="Cl"?-1.0:0.0);
+        probe.vector[axis*n+atom]=sign*sqrt_mass[atom];}
+      result.push_back(std::move(probe));}}
+
+  struct OxygenCandidate{int atom=0;double distance=0.0;int image[3]={};};
+  std::array<std::vector<double>,2> bridge_vectors={std::vector<double>(d,0.0),std::vector<double>(d,0.0)};
+  std::array<int,2> bridge_counts{};
+  for(int hydrogen=0;hydrogen<n;++hydrogen)if(symbols[hydrogen]=="H"){
+    std::vector<OxygenCandidate> oxygens;
+    for(int oxygen=0;oxygen<n;++oxygen)if(symbols[oxygen]=="O"){
+      int image[3];const auto displacement=mic_displacement(r0,n,hydrogen,oxygen,box,image);
+      const double distance=std::sqrt(displacement[0]*displacement[0]+displacement[1]*displacement[1]+
+        displacement[2]*displacement[2]);
+      if(distance<cutoff)oxygens.push_back({oxygen,distance,{image[0],image[1],image[2]}});}
+    std::sort(oxygens.begin(),oxygens.end(),[](const OxygenCandidate& left,const OxygenCandidate& right){
+      return left.distance<right.distance||(left.distance==right.distance&&left.atom<right.atom);});
+    if(oxygens.size()<2)continue;
+    if(oxygens.size()>2&&oxygens[2].distance-oxygens[1].distance<=
+       1.0e-6*std::max(1.0,oxygens[1].distance))continue;
+    bool near_salt=false;
+    for(int salt=0;salt<n&&!near_salt;++salt)if(symbols[salt]=="Na"||symbols[salt]=="Cl"){
+      int image[3];const auto displacement=mic_displacement(r0,n,hydrogen,salt,box,image);
+      near_salt=displacement[0]*displacement[0]+displacement[1]*displacement[1]+
+        displacement[2]*displacement[2]<cutoff*cutoff;}
+    const int group=near_salt?0:1;
+    const auto dr_h_o1=image_displacement(r0,n,hydrogen,oxygens[0].atom,oxygens[0].image,box);
+    const auto dr_h_o2=image_displacement(r0,n,hydrogen,oxygens[1].atom,oxygens[1].image,box);
+    std::array<double,3> axis={dr_h_o2[0]-dr_h_o1[0],dr_h_o2[1]-dr_h_o1[1],dr_h_o2[2]-dr_h_o1[2]};
+    const double length=std::sqrt(axis[0]*axis[0]+axis[1]*axis[1]+axis[2]*axis[2]);
+    if(!(length>0.0)||!std::isfinite(length))continue;
+    for(double& value:axis)value/=length;
+    for(int component=0;component<3;++component){
+      bridge_vectors[group][component*n+hydrogen]+=sqrt_mass[hydrogen]*axis[component];
+      bridge_vectors[group][component*n+oxygens[0].atom]-=0.5*sqrt_mass[oxygens[0].atom]*axis[component];
+      bridge_vectors[group][component*n+oxygens[1].atom]-=0.5*sqrt_mass[oxygens[1].atom]*axis[component];}
+    ++bridge_counts[group];
+  }
+  for(int group=0;group<2;++group)if(bridge_counts[group]){
+    FixedPhysicalProbe probe;probe.source=group==0?"FIXED_PHYSICAL_OHO_NEAR_SALT":"FIXED_PHYSICAL_OHO_FAR_SALT";
+    probe.vector=std::move(bridge_vectors[group]);const double inverse_count=1.0/bridge_counts[group];
+    for(double& value:probe.vector)value*=inverse_count;result.push_back(std::move(probe));}
+  return result;
+}
+
+std::vector<std::vector<double>> make_probes(const std::vector<RitzMode>& soft,const std::vector<double>& sqrt_mass,
+  const std::vector<int>& types,const int n,std::vector<std::string>* sources=nullptr,
+  std::vector<ProbeOrigin>* origins=nullptr,const std::vector<FixedPhysicalProbe>* fixed_physical=nullptr,
+  const bool prioritize_soft=false,const int maximum_probe_rank=-1)
+{
+  const int d=3*n,internal=d-3,rank_limit=maximum_probe_rank<0?internal:std::min(internal,maximum_probe_rank);
+  std::vector<std::vector<double>> probes;probes.reserve(std::min(32,rank_limit));std::uint64_t state=0x243f6a8885a308d3ULL;
+  auto add=[&](std::vector<double> v,const std::string& source,const int seed_atom){project_translation(v,sqrt_mass,n);for(const auto&w:probes){const double c=std::inner_product(v.begin(),v.end(),w.begin(),0.0);for(int i=0;i<d;++i)v[i]-=c*w[i];}const double norm=std::sqrt(std::inner_product(v.begin(),v.end(),v.begin(),0.0));if(norm>1e-10){for(double&x:v)x/=norm;probes.push_back(std::move(v));if(sources)sources->push_back(source);if(origins){ProbeOrigin origin;if(seed_atom>=0){origin.seed_atom_index=seed_atom;origin.type_index=types[seed_atom];origin.mass=sqrt_mass[seed_atom]*sqrt_mass[seed_atom];}origins->push_back(origin);}return true;}return false;};
+  if(prioritize_soft)for(std::size_t i=0;i<soft.size()&&static_cast<int>(probes.size())<rank_limit;++i)
+    add(soft[i].vector,"LOW_RITZ",-1);
+  if(fixed_physical)for(const FixedPhysicalProbe& probe:*fixed_physical){if(static_cast<int>(probes.size())>=rank_limit)break;add(probe.vector,probe.source,-1);}
+  for(int k=0;k<16&&static_cast<int>(probes.size())<rank_limit;++k){std::vector<double> v(d);for(double&x:v){state^=state>>12;state^=state<<25;state^=state>>27;x=(static_cast<double>((state*2685821657736338717ULL)>>11)/9007199254740992.0)-0.5;}add(std::move(v),"FIXED_RANDOM",-1);}
+  std::set<int> seen_types;for(int atom=0;atom<n&&seen_types.size()<4&&static_cast<int>(probes.size())<rank_limit;++atom)if(seen_types.insert(types[atom]).second){std::vector<double> v(d);for(int a=0;a<3;++a)v[a*n+atom]=sqrt_mass[atom];add(std::move(v),"TYPE_LOCAL",atom);}
+  if(!prioritize_soft)for(std::size_t i=0;i<soft.size()&&static_cast<int>(probes.size())<rank_limit;++i)
+    add(soft[i].vector,"LOW_RITZ",-1);
   if(probes.empty())throw std::runtime_error("native fit could not construct an independent response probe");return probes;
+}
+
+std::vector<std::vector<double>> make_common_probe_set(const std::vector<RitzMode>& soft,
+  const std::vector<double>& sqrt_mass,const std::vector<int>& types,const int n,
+  std::vector<std::string>* sources=nullptr,std::vector<ProbeOrigin>* origins=nullptr,
+  const std::vector<FixedPhysicalProbe>* fixed_physical=nullptr,const int maximum_probe_rank=-1)
+{
+  return make_probes(soft,sqrt_mass,types,n,sources,origins,fixed_physical,true,maximum_probe_rank);
 }
 
 struct ProbeMoments
@@ -1634,6 +2352,11 @@ struct ProbeMoments
   {
     std::vector<double> out(sum_qq.size());if(!frames)return out;const double count=static_cast<double>(frames);
     for(int i=0;i<m;++i)for(int j=0;j<m;++j){const std::size_t ij=static_cast<std::size_t>(i)*m+j;out[ij]=sum_qq[ij]/count-(sum_q[i]/count)*(sum_q[j]/count);}return out;
+  }
+  std::vector<double> second_moment_q() const
+  {
+    std::vector<double> out(sum_qq.size());if(!frames)return out;const double count=static_cast<double>(frames);
+    for(std::size_t i=0;i<out.size();++i)out[i]=sum_qq[i]/count;return out;
   }
   std::vector<double> covariance_fq() const
   {
@@ -1899,12 +2622,13 @@ void write_bootstrap_diagnostic(std::ostream& out,const char* label,const Bootst
 
 template <typename MatrixMetric,typename Distance>
 std::vector<double> resample_percentile_deviations(const std::vector<ProbeMoments>& blocks,const int factor,
-  const std::vector<double>& center,const int replicates,const std::uint64_t seed,MatrixMetric matrix_metric,Distance distance)
+  const std::vector<double>& center,const int replicates,const std::uint64_t seed,MatrixMetric matrix_metric,Distance distance,
+  const std::function<void()>& budget_observer={})
 {
   const int count=static_cast<int>(blocks.size()),m=blocks.front().m;
   std::mt19937_64 random(seed+static_cast<std::uint64_t>(factor));std::uniform_int_distribution<int> pick(0,count-1);
   std::vector<double> deviations;deviations.reserve(replicates);
-  for(int r=0;r<replicates;++r){ProbeMoments sample(m);int consumed=0;while(consumed<count){const int start=pick(random),length=std::min(factor,count-consumed);for(int k=0;k<length;++k)sample.merge(blocks[(start+k)%count]);consumed+=length;}
+  for(int r=0;r<replicates;++r){if(budget_observer)budget_observer();ProbeMoments sample(m);int consumed=0;while(consumed<count){if((consumed&63)==0&&budget_observer)budget_observer();const int start=pick(random),length=std::min(factor,count-consumed);for(int k=0;k<length;++k)sample.merge(blocks[(start+k)%count]);consumed+=length;}
     const double deviation=distance(matrix_metric(sample),center);if(!std::isfinite(deviation))return {std::numeric_limits<double>::quiet_NaN()};deviations.push_back(deviation);}
   std::sort(deviations.begin(),deviations.end());
   return deviations;
@@ -1914,7 +2638,7 @@ template <typename MatrixMetric,typename Norm,typename Distance>
 BootstrapBand bootstrap_metric_band(const ProbeMoments& full,const std::vector<ProbeMoments>& blocks,
   const int base_block_length,const double tolerance,const std::uint64_t seed,MatrixMetric matrix_metric,
   Norm norm,Distance distance,const char* pass,const char* fail,const char* inconclusive,
-  const bool check_fq=true,const bool check_qq=true)
+  const bool check_fq=true,const bool check_qq=true,const std::function<void()>& budget_observer={})
 {
   BootstrapBand result;result.status=inconclusive;result.diagnostic_stage="INPUT_CHECK";
   const auto stop=[&](const char* reason){result.rejection_reason=reason;return result;};
@@ -1945,7 +2669,8 @@ BootstrapBand bootstrap_metric_band(const ProbeMoments& full,const std::vector<P
   result.diagnostic_stage="BOOTSTRAP";result.bootstrap_started=true;
   constexpr int replicates=500;
   for(const int factor:bootstrap_block_factors(blocks.size())){
-    auto deviations=resample_percentile_deviations(blocks,factor,center,replicates,seed,matrix_metric,distance);
+    if(budget_observer)budget_observer();
+    auto deviations=resample_percentile_deviations(blocks,factor,center,replicates,seed,matrix_metric,distance,budget_observer);
     if(deviations.empty()||!std::isfinite(deviations.back())){result.status="NUMERICAL_FAILURE";return stop("NONFINITE_BOOTSTRAP_DEVIATION");}
     // The raw 95th percentile under-covered correlated harmonic samples with this finite block count.
     const std::size_t q=static_cast<std::size_t>(std::ceil(0.99*replicates))-1;
@@ -1976,14 +2701,15 @@ double symmetric_matrix_distance(const std::vector<double>& a,const std::vector<
 {if(a.size()!=b.size())return std::numeric_limits<double>::quiet_NaN();std::vector<double> difference(a.size());for(std::size_t i=0;i<a.size();++i)difference[i]=a[i]-b[i];return max_abs_symmetric_eigenvalue(std::move(difference),n);}
 
 BootstrapBand bootstrap_ibp_band(const ProbeMoments& full,const std::vector<ProbeMoments>& blocks,
-  const int base_block_length,const double kbt,const double tolerance,const std::uint64_t seed)
+  const int base_block_length,const double kbt,const double tolerance,const std::uint64_t seed,
+  const std::function<void()>& budget_observer={})
 {
   const int m=full.m;
   return bootstrap_metric_band(full,blocks,base_block_length,tolerance,seed,
     [=](const ProbeMoments& moments){return moments.ibp_matrix(kbt);},
     [=](const std::vector<double>& matrix){return nonsymmetric_spectral_norm(matrix,m);},
     [=](const std::vector<double>& a,const std::vector<double>& b){return nonsymmetric_matrix_distance(a,b,m);},
-    "IBP_PASS","IBP_FAIL","IBP_INCONCLUSIVE");
+    "IBP_PASS","IBP_FAIL","IBP_INCONCLUSIVE",true,true,budget_observer);
 }
 
 struct FixedChannelNoiseDiagnostic
@@ -2085,7 +2811,7 @@ void write_probe_origin_table(std::ostream& out,const std::vector<std::string>& 
 {
   out<<"\nPROBE_ORIGINS\nprobe_index source seed_atom_index type_index mass\n";
   for(std::size_t i=0;i<sources.size();++i){const ProbeOrigin origin=i<origins.size()?origins[i]:ProbeOrigin{};
-    out<<i<<' '<<sources[i]<<' '<<origin.seed_atom_index<<' '<<origin.type_index<<' '<<origin.mass<<'\n';}
+    out<<i<<' '<<sources[i]<<' '<<origin.seed_atom_index<<' '<<origin.type_index<<' '<<probe_origin_mass_token(origin)<<'\n';}
   out<<"probe_direction_note type-local seed vectors are translation-projected and orthogonalized; the seed atom is not the final probe direction\n";
 }
 
@@ -2100,11 +2826,12 @@ void write_probe_origin_diagnostics(std::ostream& out,const FixedProbeStatistics
 
 FixedProbeStatistics collect_fixed_probe_statistics(std::istream& spool,const SampleHeader& header,
   const std::uint64_t frames,const std::uint64_t train,const std::vector<double>& r0,const bool collect_lags=false,
-  const double ibp_tolerance=0.15,const Box* branch_check_box=nullptr)
+  const double ibp_tolerance=0.15,const Box* branch_check_box=nullptr,
+  const std::vector<FixedPhysicalProbe>* fixed_physical=nullptr)
 {
   const int n=header.n,d=3*n;std::vector<double> sqrt_atom(n),sqrt_mass(d);
   for(int i=0;i<n;++i){sqrt_atom[i]=std::sqrt(header.masses[i]);for(int a=0;a<3;++a)sqrt_mass[a*n+i]=sqrt_atom[i];}
-  FixedProbeStatistics result;result.probes=make_probes({},sqrt_atom,header.types,n,&result.sources,&result.origins);const int m=static_cast<int>(result.probes.size());
+  FixedProbeStatistics result;result.probes=make_probes({},sqrt_atom,header.types,n,&result.sources,&result.origins,fixed_physical);const int m=static_cast<int>(result.probes.size());
   for(const ProbeOrigin& origin:result.origins)if(origin.seed_atom_index>=0){
     SourceAtomMotion motion;motion.atom_index=origin.seed_atom_index;motion.type_index=origin.type_index;motion.mass=origin.mass;
     result.source_atom_motion.push_back(std::move(motion));}
@@ -2146,9 +2873,9 @@ void write_matrix(std::ostream& out,const char* name,const std::vector<double>& 
 
 void write_text_exclusive(const std::string& path,const std::string& contents,const char* description)
 {
-  std::FILE* file=std::fopen(path.c_str(),"wx");if(!file)throw std::runtime_error(std::string("cannot create ")+description+" without overwriting existing evidence: "+path);
+  std::FILE* file=rpmd_ja_file_io::open_file(path,"wx");if(!file)throw std::runtime_error(std::string("cannot create ")+description+" without overwriting existing evidence: "+path);
   const std::size_t written=std::fwrite(contents.data(),1,contents.size(),file);const int close_status=std::fclose(file);const bool failed=written!=contents.size()||close_status!=0;
-  if(failed){std::remove(path.c_str());throw std::runtime_error(std::string("failed writing ")+description+": "+path);}
+  if(failed){rpmd_ja_file_io::remove_file(path);throw std::runtime_error(std::string("failed writing ")+description+": "+path);}
 }
 
 void print_fixed_probe_summary(const FixedProbeStatistics& stats,const SampleHeader& header,const double interval,
@@ -2257,30 +2984,64 @@ struct ResponseCheck{
   std::string cg_verification_method="FAST";
   bool observed_cov_available=false,predicted_cov_available=false,cg_residual_available=false,response_ibp_available=false,force_residual_available=false,response_extremes_available=false;
   bool has_underprediction=false,has_overprediction=false;
+  bool fixed_center_second_moment=false;
   std::vector<std::string> probe_sources;
   std::vector<ProbeOrigin> probe_origins;
   std::vector<CGProbeRecoveryDiagnostic> cg_probe_recoveries;
-  std::vector<double> observed_matrix,predicted_matrix,ibp_matrix,whitened_matrix,worst_response_coefficients,worst_ibp_coefficients;
+  std::vector<double> observed_matrix,centered_covariance_matrix,mean_q,predicted_matrix,ibp_matrix,whitened_matrix,worst_response_coefficients,worst_ibp_coefficients;
   std::vector<double> underpredicted_probe_coefficients,overpredicted_probe_coefficients,worst_underpredicted_direction,worst_overpredicted_direction;
   BootstrapBand response_band,ibp_band;
   CGWitness witness;
 };
 
+struct NormalizedResponseMatrixDelta
+{
+  bool available=false;
+  std::string status="INVALID_DIMENSIONS";
+  double absolute=std::numeric_limits<double>::quiet_NaN();
+  double relative=std::numeric_limits<double>::quiet_NaN();
+  double left_norm=std::numeric_limits<double>::quiet_NaN();
+  double right_norm=std::numeric_limits<double>::quiet_NaN();
+};
+
+NormalizedResponseMatrixDelta normalized_response_matrix_delta(const std::vector<double>& left,
+  const std::vector<double>& right,const int probes)
+{
+  NormalizedResponseMatrixDelta result;
+  if(probes<=0||static_cast<std::size_t>(probes)>std::numeric_limits<std::size_t>::max()/static_cast<std::size_t>(probes))return result;
+  const std::size_t elements=static_cast<std::size_t>(probes)*static_cast<std::size_t>(probes);
+  if(left.size()!=elements||right.size()!=elements)return result;
+  double difference=0.0,left_norm=0.0,right_norm=0.0;
+  for(std::size_t i=0;i<elements;++i){
+    if(!std::isfinite(left[i])||!std::isfinite(right[i])){result.status="NONFINITE_MATRIX";return result;}
+    difference=std::hypot(difference,right[i]-left[i]);
+    left_norm=std::hypot(left_norm,left[i]);right_norm=std::hypot(right_norm,right[i]);
+  }
+  result.absolute=difference;result.left_norm=left_norm;result.right_norm=right_norm;
+  if(!std::isfinite(difference)||!std::isfinite(left_norm)||!std::isfinite(right_norm)){result.status="NONFINITE_NORM";return result;}
+  const double denominator=std::max(left_norm,right_norm);
+  if(denominator<=std::numeric_limits<double>::min()){result.status="NEAR_ZERO_GLOBAL_NORM";return result;}
+  result.relative=difference/denominator;
+  if(!std::isfinite(result.relative)){result.status="NONFINITE_RELATIVE_DELTA";return result;}
+  result.available=true;result.status="AVAILABLE";return result;
+}
+
 void write_recovered_cg_witnesses(ResponseCheck& response,const std::string& witness_path,const std::vector<double>& theta,
   const std::string& raw_path,const std::string& spool_path,const CGReplayContext& replay,
-  std::vector<std::string>& saved_paths)
+  std::vector<std::string>& saved_paths,const Graph* graph=nullptr)
 {
   for(CGProbeRecoveryDiagnostic& diagnostic:response.cg_probe_recoveries)if(diagnostic.recovered){
     const std::string path=witness_path+".outer_"+std::to_string(diagnostic.outer)+".probe_"+std::to_string(diagnostic.probe)+".txt";
-    std::ifstream existing(path,std::ios::binary);if(existing.good())throw std::runtime_error("refusing to overwrite recovered CG witness: "+path);
-    write_cg_witness(path,diagnostic.original_witness,theta,raw_path,spool_path,replay);diagnostic.witness_snapshot_path=path;saved_paths.push_back(path);
+    rpmd_ja_file_io::ifstream existing(path,std::ios::binary);if(existing.good())throw std::runtime_error("refusing to overwrite recovered CG witness: "+path);
+    write_cg_witness(path,diagnostic.original_witness,theta,raw_path,spool_path,replay,graph);diagnostic.witness_snapshot_path=path;saved_paths.push_back(path);
   }
 }
 
 std::vector<double> response_error_matrix(const ProbeMoments& moments,const std::vector<double>& predicted,
-  const std::vector<double>& invroot)
+  const std::vector<double>& invroot,const bool fixed_center_second_moment=false)
 {
-  const int m=moments.m;std::vector<double> observed=moments.covariance_q(),difference(static_cast<std::size_t>(m)*m),left(difference.size()),whitened(difference.size(),0.0);
+  const int m=moments.m;std::vector<double> observed=fixed_center_second_moment?moments.second_moment_q():moments.covariance_q();
+  std::vector<double> difference(static_cast<std::size_t>(m)*m),left(difference.size()),whitened(difference.size(),0.0);
   for(int i=0;i<m;++i)for(int j=i+1;j<m;++j){const double value=.5*observed[static_cast<std::size_t>(i)*m+j]+.5*observed[static_cast<std::size_t>(j)*m+i];observed[static_cast<std::size_t>(i)*m+j]=observed[static_cast<std::size_t>(j)*m+i]=value;}
   for(std::size_t i=0;i<difference.size();++i)difference[i]=observed[i]-predicted[i];
   for(int i=0;i<m;++i)for(int j=0;j<m;++j)for(int a=0;a<m;++a)
@@ -2334,7 +3095,12 @@ void write_response_stats(std::ostream& out,const ResponseCheck& r)
 {
   const auto write_cg_value=[&](const double value){if(std::isfinite(value))out<<value;else out<<"NOT_COMPUTED";};
   out<<"validation_frames="<<r.validation_frames<<" statistical_frames="<<r.statistical_frames<<" probes="<<r.probes
-    <<" observed_cov_status="<<(r.observed_cov_available?"AVAILABLE":"NOT_COMPUTED")<<" observed_cov_min="<<r.observed_cov_min
+    <<" response_statistic="<<(r.fixed_center_second_moment?"FIXED_R0_SECOND_MOMENT":"SEGMENT_CENTERED_COVARIANCE")
+    <<" fixed_R0_mean_norm=";
+  if(r.mean_q.size()==static_cast<std::size_t>(std::max(0,r.probes)))
+    write_cg_value(std::sqrt(std::inner_product(r.mean_q.begin(),r.mean_q.end(),r.mean_q.begin(),0.0)));
+  else out<<"NOT_COMPUTED";
+  out<<" observed_cov_status="<<(r.observed_cov_available?"AVAILABLE":"NOT_COMPUTED")<<" observed_cov_min="<<r.observed_cov_min
     <<" observed_cov_max="<<r.observed_cov_max<<" observed_cov_condition="<<r.observed_cov_condition
     <<" predicted_cov_status="<<(r.predicted_cov_available?"AVAILABLE":"NOT_COMPUTED")<<" predicted_cov_min="<<r.predicted_cov_min<<" predicted_cov_max="<<r.predicted_cov_max
     <<" predicted_cov_condition="<<r.predicted_cov_condition<<" block_frames=";
@@ -2379,26 +3145,108 @@ void write_response_stats(std::ostream& out,const ResponseCheck& r)
   out<<' ';write_bootstrap_diagnostic(out,"response_diagnostic",r.response_band,false);
   out<<' ';write_bootstrap_diagnostic(out,"ibp_diagnostic",r.ibp_band,false);
 }
+
+bool response_consumer_statistics_ready(const ResponseCheck& response)
+{
+  if(response.probes<=0||response.cg_residual_status!="CG_PASS"||!response.witness.classification.empty()||
+     !response.cg_residual_available||!response.observed_cov_available||!response.predicted_cov_available||
+     !response.response_ibp_available||!response.force_residual_available||
+     response.mean_q.size()!=static_cast<std::size_t>(response.probes))return false;
+  const std::size_t matrix_size=static_cast<std::size_t>(response.probes)*response.probes;
+  return response.observed_matrix.size()==matrix_size&&response.centered_covariance_matrix.size()==matrix_size&&
+    response.predicted_matrix.size()==matrix_size&&response.ibp_matrix.size()==matrix_size;
+}
+
+bool development_response_needs_replay(const bool only_missing_response,const bool already_scored,
+  const ResponseCheck& response)
+{
+  return !only_missing_response||!already_scored||!response_consumer_statistics_ready(response);
+}
+
+void validate_blind_response_snapshot_dimensions(const ResponseCheck& response,const std::vector<double>& theta)
+{
+  if(theta.empty()||theta.size()>1000000||response.total_frames==0||response.validation_frames==0||
+     response.validation_frames>response.total_frames||response.statistical_frames==0||
+     response.statistical_frames>response.validation_frames||response.probes<=0||response.probes>1000000||
+     static_cast<std::size_t>(response.probes)>std::numeric_limits<std::size_t>::max()/static_cast<std::size_t>(response.probes))
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: response snapshot dimensions are invalid");
+  const std::size_t probes=static_cast<std::size_t>(response.probes),matrix_size=probes*probes;
+  if(response.probe_sources.size()!=probes||response.probe_origins.size()!=probes||response.mean_q.size()!=probes||
+     response.observed_matrix.size()!=matrix_size||response.centered_covariance_matrix.size()!=matrix_size||
+     response.predicted_matrix.size()!=matrix_size||response.ibp_matrix.size()!=matrix_size||
+     response.whitened_matrix.size()!=matrix_size||response.worst_response_coefficients.size()!=probes||
+     response.worst_ibp_coefficients.size()!=probes||
+     (response.has_underprediction&&response.underpredicted_probe_coefficients.size()!=probes)||
+     (response.has_overprediction&&response.overpredicted_probe_coefficients.size()!=probes)||
+     (!response.has_underprediction&&(!response.underpredicted_probe_coefficients.empty()||
+       !response.worst_underpredicted_direction.empty()))||
+     (!response.has_overprediction&&(!response.overpredicted_probe_coefficients.empty()||
+       !response.worst_overpredicted_direction.empty())))
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: response snapshot vector dimensions do not match the frozen probe rank");
+  for(std::size_t index=0;index<probes;++index)if(!probe_origin_valid(response.probe_sources[index],response.probe_origins[index]))
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: response snapshot probe origin does not match its source kind");
+  for(const CGProbeRecoveryDiagnostic& recovery:response.cg_probe_recoveries)
+    if(recovery.probe<0||recovery.probe>=response.probes)
+      throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: response snapshot recovery probe is outside the frozen probe set");
+}
+
+bool write_response_consumer_statistics(std::ostream& out,const std::string& label,const ResponseCheck& response)
+{
+  if(!response_consumer_statistics_ready(response)){
+    out<<label<<"_statistics_status NOT_COMPUTED cg_status "
+      <<(response.cg_residual_status.empty()?"NOT_COMPUTED":response.cg_residual_status)<<'\n';
+    return false;
+  }
+  out<<label<<"_statistics_status AVAILABLE\n"<<label<<"_MEAN_Q_FIXED_R0 "<<response.mean_q.size();
+  for(const double value:response.mean_q)out<<' '<<value;
+  out<<'\n';
+  const std::string centered=label+"_CENTERED_COVARIANCE_ABOUT_SEGMENT_MEAN";
+  const std::string second=label+"_SECOND_MOMENT_ABOUT_FIXED_R0";
+  write_matrix(out,centered.c_str(),response.centered_covariance_matrix,response.probes);
+  write_matrix(out,second.c_str(),response.observed_matrix,response.probes);
+  return true;
+}
+
 ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline,const Graph& graph,const std::vector<double>& theta,
   const std::vector<double>& sqrt_mass,const std::vector<double>& sqrt_atom,const std::vector<int>& types,const int n,
   const std::vector<double>& r0,std::ifstream& spool,const std::streamoff frame_start,const std::uint64_t frame_count,const int train,
   const int sample_interval,const double temperature,const std::vector<RitzMode>& soft,const double epsilon=0.0,ResponseCheck* progress=nullptr,
   const double response_tolerance=0.15,const double ibp_tolerance=0.15,const int outer=-1,
-  const std::function<CGResult(int,const std::vector<double>&)>& solve_probe_override={})
+  const std::function<CGResult(int,const std::vector<double>&)>& solve_probe_override={},
+  const bool fixed_center_second_moment=false,const std::vector<FixedPhysicalProbe>* fixed_physical=nullptr,
+  const bool prioritize_soft=false,const int maximum_probe_rank=-1,
+  const std::vector<std::vector<double>>* frozen_probe_vectors=nullptr,
+  const std::vector<std::string>* frozen_probe_sources=nullptr,
+  const std::vector<ProbeOrigin>* frozen_probe_origins=nullptr,
+  const std::function<void()>& budget_observer={})
 {
-  const int d=3*n;std::vector<std::string> probe_sources;std::vector<ProbeOrigin> probe_origins;const auto probes=make_probes(soft,sqrt_atom,types,n,&probe_sources,&probe_origins);const int m=static_cast<int>(probes.size());ResponseCheck result;result.probes=m;result.probe_sources=probe_sources;result.probe_origins=probe_origins;
+  const int d=3*n;std::vector<std::string> probe_sources;std::vector<ProbeOrigin> probe_origins;
+  std::vector<std::vector<double>> generated_probes;
+  if(frozen_probe_vectors){
+    if(!frozen_probe_sources||!frozen_probe_origins||frozen_probe_sources->size()!=frozen_probe_vectors->size()||
+       frozen_probe_origins->size()!=frozen_probe_vectors->size()||
+       (maximum_probe_rank>=0&&frozen_probe_vectors->size()>static_cast<std::size_t>(maximum_probe_rank)))
+      throw std::runtime_error("IMPLEMENTATION_FAIL: frozen response probe set has inconsistent metadata or exceeds its rank limit");
+    probe_sources=*frozen_probe_sources;probe_origins=*frozen_probe_origins;
+  }else{
+    generated_probes=prioritize_soft?make_common_probe_set(soft,sqrt_atom,types,n,&probe_sources,&probe_origins,
+      fixed_physical,maximum_probe_rank):
+      make_probes(soft,sqrt_atom,types,n,&probe_sources,&probe_origins,fixed_physical,false,maximum_probe_rank);
+  }
+  const auto& probes=frozen_probe_vectors?*frozen_probe_vectors:generated_probes;
+  const int m=static_cast<int>(probes.size());ResponseCheck result;result.probes=m;result.probe_sources=probe_sources;result.probe_origins=probe_origins;
   if(frame_count<static_cast<std::uint64_t>(train))throw std::runtime_error("native fit held-out frame count is invalid");
   result.total_frames=frame_count;result.validation_frames=frame_count-train;if(progress)*progress=result;
   if(result.validation_frames<=static_cast<std::uint64_t>(m))throw std::runtime_error("native fit held-out frames must exceed the fixed probe count");
   std::vector<double> predicted(static_cast<std::size_t>(m)*m),rhs(d);double max_cg=0.0;int fast_verified=0,compensated_verified=0;
   const auto update_verification_method=[&](){result.cg_verification_method=compensated_verified?(fast_verified?"MIXED":"COMPENSATED"):"FAST";};
-  for(int j=0;j<m;++j){CGResult cg=solve_probe_override?solve_probe_override(j,probes[j]):solve_projected_cg(baseline,graph,probes[j],sqrt_mass,sqrt_atom,theta,n,j,epsilon);result.cg_residual_restarts+=cg.residual_restarts;
+  for(int j=0;j<m;++j){if(budget_observer)budget_observer();CGResult cg=solve_probe_override?solve_probe_override(j,probes[j]):solve_projected_cg(baseline,graph,probes[j],sqrt_mass,sqrt_atom,theta,n,j,epsilon,1e-8,20000,false,budget_observer);result.cg_residual_restarts+=cg.residual_restarts;
     if(!cg.witness.classification.empty()){
       result.cg=cg.relative_residual;result.cg_residual_available=cg.witness.true_residual_computed;result.cg_residual_status=cg.witness.classification;result.witness=cg.witness;
       if(cg.witness.classification!="TRUE_RESIDUAL_FAILURE"){if(progress)*progress=result;return result;}
       result.cg_probe_recoveries.emplace_back();CGProbeRecoveryDiagnostic& diagnostic=result.cg_probe_recoveries.back();diagnostic.probe=j;diagnostic.outer=outer;diagnostic.original_witness=cg.witness;
       ++compensated_verified;update_verification_method();if(progress)*progress=result;
-      bool recovered=false;try{recovered=recover_cg_true_residual_failure(baseline,graph,probes[j],cg,sqrt_mass,sqrt_atom,theta,n,diagnostic,outer);}
+      bool recovered=false;try{recovered=recover_cg_true_residual_failure(baseline,graph,probes[j],cg,sqrt_mass,sqrt_atom,theta,n,diagnostic,outer,budget_observer);}
       catch(...){if(progress)*progress=result;throw;}
       result.cg=diagnostic.final_compensated_residual;result.cg_residual_available=std::isfinite(diagnostic.final_compensated_residual);
       result.cg_residual_restarts+=diagnostic.refinement_restarts;
@@ -2413,10 +3261,10 @@ ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline
   const std::size_t batch_elements=static_cast<std::size_t>(d)*DeviceBaseline::batch_capacity;std::vector<double> q_batch(batch_elements),force_batch(batch_elements),base_batch(batch_elements);
   double residual2=0.0,force2=0.0;spool.clear();spool.seekg(frame_start);double step=0.0,previous=-std::numeric_limits<double>::infinity();
   const auto read_checked_frame=[&](const std::uint64_t frame){read_frame(spool,x,f,step);if(!(step>previous)||(frame&&std::abs((step-previous)-sample_interval)>1e-9))throw std::runtime_error("native fit validation steps do not match sample_interval");previous=step;};
-  for(std::uint64_t frame=0;frame<static_cast<std::uint64_t>(train);++frame)read_checked_frame(frame);
+  for(std::uint64_t frame=0;frame<static_cast<std::uint64_t>(train);++frame){if((frame&63u)==0&&budget_observer)budget_observer();read_checked_frame(frame);}
   for(std::uint64_t first=static_cast<std::uint64_t>(train);first<frame_count;){
     const int columns=static_cast<int>(std::min<std::uint64_t>(DeviceBaseline::batch_capacity,frame_count-first));
-    for(int column=0;column<columns;++column){const std::uint64_t frame=first+column;read_checked_frame(frame);
+    for(int column=0;column<columns;++column){const std::uint64_t frame=first+column;if(((frame-static_cast<std::uint64_t>(train))&63u)==0&&budget_observer)budget_observer();read_checked_frame(frame);
       for(int i=0;i<d;++i){q[i]=sqrt_mass[i]*(x[i]-r0[i]);fw[i]=f[i]/sqrt_mass[i];}project_translation(q,sqrt_atom,n);project_translation(fw,sqrt_atom,n);
       std::copy(q.begin(),q.end(),q_batch.begin()+static_cast<std::size_t>(column)*d);std::copy(fw.begin(),fw.end(),force_batch.begin()+static_cast<std::size_t>(column)*d);}
     const auto baseline_started=std::chrono::steady_clock::now();baseline.apply_batch(q_batch,columns,base_batch);
@@ -2431,13 +3279,18 @@ ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline
   }
   ProbeMoments statistical_moments(m);for(const ProbeMoments& block:validation_bootstrap_blocks)statistical_moments.merge(block);
   result.statistical_frames=statistical_moments.frames;
-  std::vector<double> observed=statistical_moments.covariance_q(),ibp=statistical_moments.ibp_matrix(K_B*temperature);
+  std::vector<double> centered_covariance=statistical_moments.covariance_q();
+  std::vector<double> observed=fixed_center_second_moment?statistical_moments.second_moment_q():centered_covariance;
+  std::vector<double> mean_q(m,0.0);if(statistical_moments.frames)for(int i=0;i<m;++i)
+    mean_q[i]=statistical_moments.sum_q[i]/static_cast<double>(statistical_moments.frames);
+  std::vector<double> ibp=statistical_moments.ibp_matrix(K_B*temperature);
   // Symmetric whitening on the finite, declared probe subspace.
   for(int i=0;i<m;++i)for(int j=i+1;j<m;++j){const double v=.5*predicted[static_cast<std::size_t>(i)*m+j]+.5*predicted[static_cast<std::size_t>(j)*m+i];predicted[static_cast<std::size_t>(i)*m+j]=predicted[static_cast<std::size_t>(j)*m+i]=v;}
   for(int i=0;i<m;++i)for(int j=i+1;j<m;++j){const double v=.5*observed[static_cast<std::size_t>(i)*m+j]+.5*observed[static_cast<std::size_t>(j)*m+i];observed[static_cast<std::size_t>(i)*m+j]=observed[static_cast<std::size_t>(j)*m+i]=v;}
   const SmallEigen oe=eigen_small(solver,observed,m);result.observed_cov_min=oe.values.front();result.observed_cov_max=oe.values.back();result.observed_cov_condition=oe.values.front()>0.0?oe.values.back()/oe.values.front():std::numeric_limits<double>::infinity();
   result.block_variance_relative_delta.fill(0.0);result.block_variance_max_relative_delta=0.0;for(int b=0;b<4;++b){for(int a=0;a<m;++a){const double overall=observed[static_cast<std::size_t>(a)*m+a];const std::size_t ba=static_cast<std::size_t>(b)*m+a;const double count=result.block_frames[b];const double block_variance=count>0.0?block_q2[ba]/count-(block_q[ba]/count)*(block_q[ba]/count):0.0;const double delta=overall>0.0?std::abs(block_variance/overall-1.0):std::numeric_limits<double>::infinity();result.block_variance_relative_delta[b]=std::max(result.block_variance_relative_delta[b],delta);}result.block_variance_max_relative_delta=std::max(result.block_variance_max_relative_delta,result.block_variance_relative_delta[b]);}
-  result.observed_cov_available=true;if(progress)*progress=result;
+  result.observed_cov_available=true;result.fixed_center_second_moment=fixed_center_second_moment;
+  result.centered_covariance_matrix=std::move(centered_covariance);result.mean_q=std::move(mean_q);if(progress)*progress=result;
   if(!(oe.values.front()>0.0)||oe.values.front()<=oe.values.back()*1e-12)throw std::runtime_error("native fit held-out probe covariance is rank deficient or too small to validate");
   const SmallEigen pe=eigen_small(solver,predicted,m);result.predicted_cov_min=pe.values.front();result.predicted_cov_max=pe.values.back();result.predicted_cov_condition=pe.values.front()>0.0?pe.values.back()/pe.values.front():std::numeric_limits<double>::infinity();result.predicted_cov_available=true;if(progress)*progress=result;
   if(!(pe.values.front()>0.0)||pe.values.front()<=pe.values.back()*1e-12)throw std::runtime_error("native fit predicted probe response is non-positive or ill-conditioned");
@@ -2447,15 +3300,15 @@ ResponseCheck validate_probes(cusolverDnHandle_t solver,DeviceBaseline& baseline
   std::vector<double> gram(static_cast<std::size_t>(m)*m,0.0);for(int i=0;i<m;++i)for(int j=0;j<m;++j)for(int k=0;k<m;++k)gram[static_cast<std::size_t>(i)*m+j]+=ibp[static_cast<std::size_t>(k)*m+i]*ibp[static_cast<std::size_t>(k)*m+j];
   const SmallEigen ie=eigen_small(solver,gram,m);const int worst_ibp=m-1;const double ibp_error=std::sqrt(std::max(0.0,ie.values.back()));result.response=response;result.ibp=ibp_error;result.response_ibp_available=true;result.observed_matrix=observed;result.predicted_matrix=predicted;result.ibp_matrix=ibp;result.whitened_matrix=whitened;result.worst_response_coefficients=response_probe_basis_coefficients(invroot,re.vectors,m,worst_response);result.worst_ibp_coefficients.resize(m);for(int i=0;i<m;++i)result.worst_ibp_coefficients[i]=ie.vectors[static_cast<std::size_t>(i)+static_cast<std::size_t>(worst_ibp)*m];if(progress)*progress=result;if(!std::isfinite(response)||!std::isfinite(ibp_error)||!std::isfinite(max_cg))throw std::runtime_error("native fit response diagnostics are non-finite");
   result.response_band=bootstrap_metric_band(validation_moments,validation_bootstrap_blocks,bootstrap_block_length,response_tolerance,
-    0xbb67ae8584caa73bULL,[&](const ProbeMoments& moments){return response_error_matrix(moments,predicted,invroot);},
+    0xbb67ae8584caa73bULL,[&](const ProbeMoments& moments){return response_error_matrix(moments,predicted,invroot,fixed_center_second_moment);},
     [=](const std::vector<double>& matrix){return max_abs_symmetric_eigenvalue(matrix,m);},
     [=](const std::vector<double>& a,const std::vector<double>& b){return symmetric_matrix_distance(a,b,m);},
-    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE",false,true);
+    "RESPONSE_PASS","RESPONSE_FAIL","RESPONSE_INCONCLUSIVE",false,true,budget_observer);
   result.ibp_band=bootstrap_metric_band(validation_moments,validation_bootstrap_blocks,bootstrap_block_length,ibp_tolerance,
     0x3c6ef372fe94f82bULL,[&](const ProbeMoments& moments){return moments.ibp_matrix(K_B*temperature);},
     [=](const std::vector<double>& matrix){return nonsymmetric_spectral_norm(matrix,m);},
     [=](const std::vector<double>& a,const std::vector<double>& b){return nonsymmetric_matrix_distance(a,b,m);},
-    "IBP_PASS","IBP_FAIL","IBP_INCONCLUSIVE",true,true);
+    "IBP_PASS","IBP_FAIL","IBP_INCONCLUSIVE",true,true,budget_observer);
   set_response_extremes(result,re,invroot,probes,result.response>response_tolerance||result.response_band.status!="RESPONSE_PASS");
   if(progress)*progress=result;
   if(!std::isfinite(residual2)||!std::isfinite(force2)||force2<0.0)throw std::runtime_error("native fit held-out force residual is non-finite");const double heldout_residual=force2>0.0?std::sqrt(residual2/force2):(residual2==0.0?0.0:std::numeric_limits<double>::infinity());if(!std::isfinite(heldout_residual))throw std::runtime_error("native fit held-out residual is nonzero at zero physical-force scale");
@@ -2468,6 +3321,7 @@ void write_response_state(const std::string& path,const ResponseCheck& response,
   const int m=response.probes;std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja response failure state\nstatus RESPONSE_CHECK_FAIL\ntemperature_K "<<temperature
     <<"\ntotal_frames "<<response.total_frames<<"\nvalidation_frames "<<response.validation_frames<<"\nstatistical_frames "<<response.statistical_frames<<"\nprobe_count "<<m<<"\nresponse_tolerance "<<response_tolerance
     <<"\nibp_tolerance "<<ibp_tolerance<<"\nresponse_error "<<response.response<<"\nibp_error "<<response.ibp
+    <<"\nresponse_statistic "<<(response.fixed_center_second_moment?"FIXED_R0_SECOND_MOMENT":"SEGMENT_CENTERED_COVARIANCE")
     <<"\nresponse_ratio_definition observed_over_predicted=1+whitened_eigenvalue\nresponse_ratio_status "<<(response.response_extremes_available?"AVAILABLE":"NOT_COMPUTED")
     <<"\nresponse_ratio_min ";
   if(response.response_extremes_available)out<<response.response_ratio_min;else out<<"NOT_COMPUTED";
@@ -2482,7 +3336,12 @@ void write_response_state(const std::string& path,const ResponseCheck& response,
   write_probe_origin_table(out,response.probe_sources,response.probe_origins);
   out<<"probe_variances index observed predicted observed_over_predicted\n";
   for(int i=0;i<m;++i){const double observed=response.observed_matrix[static_cast<std::size_t>(i)*m+i],predicted=response.predicted_matrix[static_cast<std::size_t>(i)*m+i];out<<i<<' '<<observed<<' '<<predicted<<' '<<(predicted!=0.0?observed/predicted:std::numeric_limits<double>::infinity())<<'\n';}
-  write_matrix(out,"observed_covariance",response.observed_matrix,m);write_matrix(out,"predicted_covariance",response.predicted_matrix,m);
+  if(response.fixed_center_second_moment){
+    out<<"mean_q_fixed_R0\n";for(int i=0;i<m;++i)out<<i<<' '<<response.mean_q[i]<<'\n';
+    write_matrix(out,"observed_second_moment_about_fixed_R0",response.observed_matrix,m);
+    write_matrix(out,"centered_covariance_about_segment_mean",response.centered_covariance_matrix,m);
+  }else write_matrix(out,"observed_covariance",response.observed_matrix,m);
+  write_matrix(out,"predicted_covariance",response.predicted_matrix,m);
   write_matrix(out,"IBP_residual_nonsymmetric",response.ibp_matrix,m);write_matrix(out,"whitened_response_difference",response.whitened_matrix,m);
   out<<"worst_response_direction_mapping c=P^(-1/2)*u, where u is the whitened eigenvector\n";
   out<<"worst_response_probe_basis_coefficients\n";for(int i=0;i<m;++i)out<<i<<' '<<response.worst_response_coefficients[i]<<'\n';
@@ -2497,6 +3356,319 @@ void write_response_state(const std::string& path,const ResponseCheck& response,
     out<<"worst_overpredicted_direction_mass_weighted_internal_xyz_soa\n";for(std::size_t i=0;i<response.worst_overpredicted_direction.size();++i)out<<i<<' '<<response.worst_overpredicted_direction[i]<<'\n';}
   out<<"worst_IBP_right_singular_probe_basis_coefficients (from eigenvector of E^T E)\n";for(int i=0;i<m;++i)out<<i<<' '<<response.worst_ibp_coefficients[i]<<'\n';
   write_text_exclusive(path,out.str(),"response state snapshot");
+}
+
+void write_response_snapshot_band(std::ostream& out,const char* prefix,const BootstrapBand& band)
+{
+  out<<prefix<<"_estimate "<<band.estimate<<'\n'<<prefix<<"_radius "<<band.radius<<'\n'
+    <<prefix<<"_lower "<<band.lower<<'\n'<<prefix<<"_upper "<<band.upper<<'\n'
+    <<prefix<<"_frames "<<band.frames<<'\n'<<prefix<<"_block_lengths_stable "<<(band.block_lengths_stable?1:0)<<'\n'
+    <<prefix<<"_status "<<std::quoted(band.status)<<'\n'<<prefix<<"_diagnostic_stage "<<std::quoted(band.diagnostic_stage)<<'\n'
+    <<prefix<<"_rejection_reason "<<std::quoted(band.rejection_reason)<<'\n'
+    <<prefix<<"_rejection_detail "<<std::quoted(band.rejection_detail)<<'\n'
+    <<prefix<<"_bootstrap_started "<<(band.bootstrap_started?1:0)<<'\n'
+    <<prefix<<"_level_count "<<band.level_radii.size()<<'\n';
+  for(const auto& level:band.level_radii)out<<prefix<<"_level "<<level.first<<' '<<level.second<<'\n';
+}
+
+std::string write_blind_response_checkpoint(const std::string& path,const ResponseCheck& response,
+  const std::vector<double>& theta,const std::string& manifest_identity,const std::string& candidate_identity,
+  const std::string& blind_input_identity,const bool passed)
+{
+  if(!response_consumer_statistics_ready(response)||theta.empty()||!rpmd_ja_covariance_checkpoint::is_sha256(manifest_identity)||
+     !rpmd_ja_covariance_checkpoint::is_sha256(candidate_identity)||!rpmd_ja_covariance_checkpoint::is_sha256(blind_input_identity)||
+     response.probe_origins.size()!=response.probe_sources.size())
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed blind response is not safe to persist");
+  validate_blind_response_snapshot_dimensions(response,theta);
+  rpmd_ja_covariance_checkpoint::require_finite(theta,"frozen response theta");
+  const std::vector<const std::vector<double>*> response_vectors={&response.mean_q,&response.observed_matrix,
+    &response.centered_covariance_matrix,&response.predicted_matrix,&response.ibp_matrix,&response.whitened_matrix,
+    &response.worst_response_coefficients,&response.worst_ibp_coefficients,&response.underpredicted_probe_coefficients,
+    &response.overpredicted_probe_coefficients,&response.worst_underpredicted_direction,&response.worst_overpredicted_direction};
+  for(const auto* values:response_vectors)rpmd_ja_covariance_checkpoint::require_finite(*values,"frozen response statistic");
+  const auto require_band_finite=[](const BootstrapBand& band){
+    const double required[]={band.estimate,band.radius,band.lower,band.upper};
+    for(const double value:required)if(!std::isfinite(value))
+      throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed response has a non-finite bootstrap statistic");
+    for(const auto& level:band.level_radii)if(level.first<=0||!std::isfinite(level.second))
+      throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed response has an invalid bootstrap level");};
+  require_band_finite(response.response_band);
+  if(response.ibp_band.status=="NUMERICAL_FAILURE"||!std::isfinite(response.ibp_band.estimate)||
+     (response.ibp_band.diagnostic_stage=="INTERVAL_CHECK"&&
+       (!std::isfinite(response.ibp_band.radius)||!std::isfinite(response.ibp_band.lower)||!std::isfinite(response.ibp_band.upper))))
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed response has a non-finite IBP diagnostic");
+  const double required_scalars[]={response.response,response.ibp,response.cg,response.force_residual,
+    response.response_ratio_min,response.response_ratio_max,response.observed_cov_min,response.observed_cov_max,
+    response.observed_cov_condition,response.predicted_cov_min,response.predicted_cov_max,response.predicted_cov_condition,
+    response.baseline_apply_seconds,response.block_variance_max_relative_delta,
+    response.block_variance_relative_delta[0],response.block_variance_relative_delta[1],
+    response.block_variance_relative_delta[2],response.block_variance_relative_delta[3]};
+  for(const double value:required_scalars)if(!std::isfinite(value))
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed response has a non-finite required statistic");
+  for(const auto& recovery:response.cg_probe_recoveries){const double values[]={recovery.initial_fast_residual,
+      recovery.initial_compensated_residual,recovery.final_fast_residual,recovery.final_compensated_residual,
+      recovery.verification_seconds,recovery.refinement_seconds};
+    for(const double value:values)if(!std::isfinite(value))
+      throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed response has a non-finite CG recovery diagnostic");}
+  std::ostringstream out;out<<std::setprecision(17)<<"RPJABLIN2\n"
+    <<"manifest_identity "<<std::quoted(manifest_identity)<<'\n'<<"candidate_identity "<<std::quoted(candidate_identity)<<'\n'
+    <<"blind_input_identity "<<std::quoted(blind_input_identity)<<'\n'<<"blind_passed "<<(passed?1:0)<<'\n'
+    <<"theta "<<theta.size();for(const double value:theta)out<<' '<<value;out<<'\n';
+  const auto scalar=[&](const char* key,const double value){out<<key<<' '<<value<<'\n';};
+  const auto integer=[&](const char* key,const std::uint64_t value){out<<key<<' '<<value<<'\n';};
+  const auto flag=[&](const char* key,const bool value){out<<key<<' '<<(value?1:0)<<'\n';};
+  const auto string=[&](const char* key,const std::string& value){out<<key<<' '<<std::quoted(value)<<'\n';};
+  scalar("response",response.response);scalar("ibp",response.ibp);scalar("cg",response.cg);scalar("force_residual",response.force_residual);
+  scalar("response_ratio_min",response.response_ratio_min);scalar("response_ratio_max",response.response_ratio_max);
+  scalar("observed_cov_min",response.observed_cov_min);scalar("observed_cov_max",response.observed_cov_max);
+  scalar("observed_cov_condition",response.observed_cov_condition);scalar("predicted_cov_min",response.predicted_cov_min);
+  scalar("predicted_cov_max",response.predicted_cov_max);scalar("predicted_cov_condition",response.predicted_cov_condition);
+  scalar("baseline_apply_seconds",response.baseline_apply_seconds);scalar("block_variance_max_relative_delta",response.block_variance_max_relative_delta);
+  integer("total_frames",response.total_frames);integer("validation_frames",response.validation_frames);
+  integer("statistical_frames",response.statistical_frames);integer("probe_count",static_cast<std::uint64_t>(response.probes));
+  integer("cg_residual_restarts",static_cast<std::uint64_t>(response.cg_residual_restarts));
+  string("cg_residual_status",response.cg_residual_status);string("cg_verification_method",response.cg_verification_method);
+  flag("observed_cov_available",response.observed_cov_available);flag("predicted_cov_available",response.predicted_cov_available);
+  flag("cg_residual_available",response.cg_residual_available);flag("response_ibp_available",response.response_ibp_available);
+  flag("force_residual_available",response.force_residual_available);flag("response_extremes_available",response.response_extremes_available);
+  flag("has_underprediction",response.has_underprediction);flag("has_overprediction",response.has_overprediction);
+  flag("fixed_center_second_moment",response.fixed_center_second_moment);
+  for(int index=0;index<4;++index){integer(("block_frames_"+std::to_string(index)).c_str(),static_cast<std::uint64_t>(response.block_frames[index]));
+    scalar(("block_variance_relative_delta_"+std::to_string(index)).c_str(),response.block_variance_relative_delta[index]);}
+  auto vector=[&](const char* key,const std::vector<double>& values){out<<"vector "<<key<<' '<<values.size();for(const double value:values)out<<' '<<value;out<<'\n';};
+  vector("mean_q",response.mean_q);vector("observed_matrix",response.observed_matrix);
+  vector("centered_covariance_matrix",response.centered_covariance_matrix);vector("predicted_matrix",response.predicted_matrix);
+  vector("ibp_matrix",response.ibp_matrix);vector("whitened_matrix",response.whitened_matrix);
+  vector("worst_response_coefficients",response.worst_response_coefficients);vector("worst_ibp_coefficients",response.worst_ibp_coefficients);
+  vector("underpredicted_probe_coefficients",response.underpredicted_probe_coefficients);
+  vector("overpredicted_probe_coefficients",response.overpredicted_probe_coefficients);
+  vector("worst_underpredicted_direction",response.worst_underpredicted_direction);
+  vector("worst_overpredicted_direction",response.worst_overpredicted_direction);
+  for(std::size_t index=0;index<response.probe_sources.size();++index){const ProbeOrigin& origin=response.probe_origins[index];
+    out<<"probe "<<std::quoted(response.probe_sources[index])<<' '<<origin.seed_atom_index<<' '<<origin.type_index<<' '
+      <<probe_origin_mass_token(origin)<<'\n';}
+  write_response_snapshot_band(out,"response_band",response.response_band);
+  write_response_snapshot_band(out,"ibp_band",response.ibp_band);
+  const CGWitness& witness=response.witness;
+  const double witness_scalars[]={witness.p2,witness.pap,witness.rayleigh,witness.base_rayleigh,witness.add_rayleigh,
+    witness.repeat_rayleigh,witness.repeat_diff_norm,witness.translation_overlap,witness.relative_residual,
+    witness.recursive_relative_residual,witness.curvature_tolerance};
+  for(const double value:witness_scalars)if(!std::isfinite(value))
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed response has a non-finite CG witness statistic");
+  for(const std::vector<double>* values:{&witness.direction,&witness.action,&witness.base,&witness.add,
+      &witness.rhs_input,&witness.rhs,&witness.solution})rpmd_ja_covariance_checkpoint::require_finite(*values,"CG witness vector");
+  for(const CGResidualCheck& check:witness.residual_checks)
+    if(!std::isfinite(check.recursive_relative)||!std::isfinite(check.true_relative))
+      throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed response has a non-finite CG residual check");
+  string("witness_classification",witness.classification);integer("witness_probe",static_cast<std::uint64_t>(witness.probe+1));
+  integer("witness_iteration",static_cast<std::uint64_t>(witness.iteration+1));
+  integer("witness_residual_restarts",static_cast<std::uint64_t>(witness.residual_restarts));
+  scalar("witness_p2",witness.p2);scalar("witness_pap",witness.pap);scalar("witness_rayleigh",witness.rayleigh);
+  scalar("witness_base_rayleigh",witness.base_rayleigh);scalar("witness_add_rayleigh",witness.add_rayleigh);
+  scalar("witness_repeat_rayleigh",witness.repeat_rayleigh);scalar("witness_repeat_diff_norm",witness.repeat_diff_norm);
+  scalar("witness_translation_overlap",witness.translation_overlap);scalar("witness_relative_residual",witness.relative_residual);
+  scalar("witness_recursive_relative_residual",witness.recursive_relative_residual);
+  scalar("witness_curvature_tolerance",witness.curvature_tolerance);flag("witness_finite",witness.finite);
+  flag("witness_true_residual_computed",witness.true_residual_computed);
+  integer("witness_residual_check_count",witness.residual_checks.size());
+  for(const CGResidualCheck& check:witness.residual_checks)out<<"witness_residual_check "<<check.iteration<<' '<<check.restarts<<' '
+    <<check.recursive_relative<<' '<<check.true_relative<<'\n';
+  auto witness_vector=[&](const char* key,const std::vector<double>& values){vector(key,values);};
+  witness_vector("witness_direction",witness.direction);witness_vector("witness_action",witness.action);
+  witness_vector("witness_base",witness.base);witness_vector("witness_add",witness.add);
+  witness_vector("witness_rhs_input",witness.rhs_input);witness_vector("witness_rhs",witness.rhs);
+  witness_vector("witness_solution",witness.solution);
+  integer("recovery_count",response.cg_probe_recoveries.size());
+  for(std::size_t index=0;index<response.cg_probe_recoveries.size();++index){const auto& value=response.cg_probe_recoveries[index];
+    out<<"recovery "<<index<<' '<<value.probe<<' '<<std::quoted(value.initial_cg_status)<<' '
+      <<std::quoted(value.verification_method)<<' '<<std::quoted(value.refinement_status)<<' '
+      <<std::quoted(value.witness_snapshot_path)<<' '<<std::quoted(value.error)<<' '<<(value.recovered?1:0)<<' '
+      <<value.initial_fast_residual<<' '<<value.initial_compensated_residual<<' '<<value.final_fast_residual<<' '
+      <<value.final_compensated_residual<<' '<<value.verification_actions<<' '<<value.refinement_actions<<' '
+      <<value.verification_seconds<<' '<<value.refinement_seconds<<' '<<value.refinement_rounds<<'\n';}
+  const std::string payload=out.str();const std::string bytes=payload+"sha256 "+rpmd_ja_covariance_checkpoint::sha256(payload)+"\n";
+  write_cg_snapshot_atomically(path,bytes);return rpmd_ja_covariance_checkpoint::sha256(bytes);
+}
+
+struct BlindResponseSnapshot
+{
+  ResponseCheck response;std::vector<double> theta;std::string digest;bool passed=false;
+};
+
+BlindResponseSnapshot read_blind_response_checkpoint(const std::string& path,const std::string& manifest_identity,
+  const std::string& candidate_identity,const std::string& blind_input_identity,const std::string& expected_digest,
+  const std::vector<std::string>& expected_probe_sources,const std::vector<std::string>& expected_probe_origins)
+{
+  rpmd_ja_file_io::ifstream input(path,std::ios::binary);if(!input)throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: frozen blind response snapshot is missing");
+  std::ostringstream contents;contents<<input.rdbuf();const std::string bytes=contents.str();
+  const std::size_t checksum=bytes.rfind("sha256 ");if(checksum==std::string::npos||checksum==0||bytes.back()!='\n')
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: blind response snapshot is truncated");
+  const std::string payload=bytes.substr(0,checksum),digest=rpmd_ja_covariance_checkpoint::sha256(payload);
+  if(bytes.substr(checksum)!="sha256 "+digest+"\n"||
+     rpmd_ja_covariance_checkpoint::sha256(bytes)!=expected_digest)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: blind response snapshot checksum differs from the controller journal");
+  std::istringstream rows(payload);std::string line;if(!std::getline(rows,line)||line!="RPJABLIN2")
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: unsupported blind response snapshot version");
+  std::map<std::string,std::string> scalars,strings;std::map<std::string,std::vector<double>> vectors;
+  std::vector<std::pair<std::string,ProbeOrigin>> probes;std::vector<std::pair<int,double>> response_levels,ibp_levels;
+  struct RecoveryRow{CGProbeRecoveryDiagnostic value;};std::vector<RecoveryRow> recoveries;
+  std::vector<CGResidualCheck> residual_checks;std::uint64_t theta_count=0;
+  while(std::getline(rows,line)){std::istringstream row(line);std::string key;if(!(row>>key))continue;
+    if(key=="vector"){std::string name;std::size_t count=0;if(!(row>>name>>count)||count>1000000||vectors.count(name))
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid blind-response vector header");
+      std::vector<double> values(count);for(double& value:values)if(!(row>>value)||!std::isfinite(value))
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid blind-response vector");
+      row>>std::ws;if(!row.eof())throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: trailing blind-response vector data");
+      vectors.emplace(std::move(name),std::move(values));continue;}
+    if(key=="probe"){std::string source,extra,mass_text;ProbeOrigin origin;
+      if(!(row>>std::quoted(source)>>origin.seed_atom_index>>origin.type_index>>mass_text)||(row>>extra)||source.empty())
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid frozen blind probe identity");
+      try{origin=parse_probe_origin(source,std::to_string(origin.seed_atom_index)+","+std::to_string(origin.type_index)+","+mass_text);}
+      catch(const std::invalid_argument&){throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid frozen blind probe identity");}
+      probes.push_back({std::move(source),origin});continue;}
+    if(key=="response_band_level"||key=="ibp_band_level"){int length=0;double radius=0.0;std::string extra;
+      if(!(row>>length>>radius)||(row>>extra)||length<=0||!std::isfinite(radius))throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid blind bootstrap level");
+      (key=="response_band_level"?response_levels:ibp_levels).push_back({length,radius});continue;}
+    if(key=="witness_residual_check"){CGResidualCheck check;std::string extra;
+      if(!(row>>check.iteration>>check.restarts>>check.recursive_relative>>check.true_relative)||(row>>extra)||
+         !std::isfinite(check.recursive_relative)||!std::isfinite(check.true_relative))throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid blind CG residual check");
+      residual_checks.push_back(check);continue;}
+    if(key=="recovery"){std::size_t index=0;RecoveryRow saved;auto& value=saved.value;unsigned recovered=0;std::string extra;
+      if(!(row>>index>>value.probe>>std::quoted(value.initial_cg_status)>>std::quoted(value.verification_method)>>
+           std::quoted(value.refinement_status)>>std::quoted(value.witness_snapshot_path)>>std::quoted(value.error)>>recovered>>
+           value.initial_fast_residual>>value.initial_compensated_residual>>value.final_fast_residual>>value.final_compensated_residual>>
+           value.verification_matrix_actions>>value.refinement_matrix_actions>>value.verification_seconds>>value.refinement_seconds>>value.refinement_rounds)||
+         (row>>extra)||recovered>1||index!=recoveries.size())throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid blind CG recovery diagnostic");
+      value.recovered=recovered!=0;recoveries.push_back(std::move(saved));continue;}
+    if(key=="theta"){std::size_t count=0;if(theta_count!=0||vectors.count("theta")||!(row>>count)||count==0||count>1000000)
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid frozen candidate theta length");
+      theta_count=count;std::vector<double> values(count);for(double& value:values)if(!(row>>value)||!std::isfinite(value))
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: invalid frozen candidate theta");
+      row>>std::ws;if(!row.eof())throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: trailing frozen theta data");
+      vectors.emplace("theta",std::move(values));continue;}
+    std::string value,extra;if(!(row>>value)||(row>>extra)||scalars.count(key)||strings.count(key))
+      throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: duplicate or malformed blind response field");
+    if(key=="manifest_identity"||key=="candidate_identity"||key=="blind_input_identity"||
+       key=="cg_residual_status"||key=="cg_verification_method"||key=="witness_classification"||
+       key.rfind("response_band_",0)==0||key.rfind("ibp_band_",0)==0){
+      std::istringstream quoted_row(line);quoted_row>>key>>std::quoted(value);quoted_row>>std::ws;
+      if(!quoted_row.eof())throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: malformed blind-response text field");strings.emplace(key,value);
+    }else scalars.emplace(key,value);
+  }
+  const auto number=[&](const char* name)->double{const auto found=scalars.find(name);if(found==scalars.end())throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: missing blind-response field ")+name);
+    std::size_t used=0;double value=0.0;try{value=std::stod(found->second,&used);}catch(...){throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: invalid blind-response field ")+name);}
+    if(used!=found->second.size())throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: invalid blind-response field ")+name);return value;};
+  const auto unsigned_value=[&](const char* name)->std::uint64_t{const auto found=scalars.find(name);if(found==scalars.end())
+      throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: missing blind-response integer ")+name);
+    std::size_t used=0;unsigned long long value=0;try{value=std::stoull(found->second,&used);}catch(...){
+      throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: invalid blind-response integer ")+name);}
+    if(used!=found->second.size())throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: invalid blind-response integer ")+name);
+    return static_cast<std::uint64_t>(value);};
+  const auto text=[&](const char* name)->const std::string&{const auto found=strings.find(name);if(found==strings.end())throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: missing blind-response text ")+name);return found->second;};
+  const auto boolean=[&](const char* name){const double value=number(name);if(value!=0.0&&value!=1.0)throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: invalid blind-response flag ")+name);return value==1.0;};
+  if(text("manifest_identity")!=manifest_identity||text("candidate_identity")!=candidate_identity||
+     text("blind_input_identity")!=blind_input_identity||!scalars.count("blind_passed")||theta_count==0)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: blind response does not bind the frozen manifest, candidate, and trajectory");
+  BlindResponseSnapshot snapshot;snapshot.digest=digest;snapshot.passed=boolean("blind_passed");
+  snapshot.theta=vectors.at("theta");if(theta_count!=snapshot.theta.size())
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: frozen candidate theta count is inconsistent");
+  snapshot.response.probes=static_cast<int>(unsigned_value("probe_count"));
+  if(snapshot.response.probes<=0||snapshot.response.probes>1000000||
+     static_cast<std::size_t>(snapshot.response.probes)!=probes.size())
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: blind response probe rank is inconsistent");
+  ResponseCheck& response=snapshot.response;response.response=number("response");response.ibp=number("ibp");response.cg=number("cg");
+  response.force_residual=number("force_residual");response.response_ratio_min=number("response_ratio_min");response.response_ratio_max=number("response_ratio_max");
+  response.observed_cov_min=number("observed_cov_min");response.observed_cov_max=number("observed_cov_max");response.observed_cov_condition=number("observed_cov_condition");
+  response.predicted_cov_min=number("predicted_cov_min");response.predicted_cov_max=number("predicted_cov_max");response.predicted_cov_condition=number("predicted_cov_condition");
+  response.baseline_apply_seconds=number("baseline_apply_seconds");response.block_variance_max_relative_delta=number("block_variance_max_relative_delta");
+  response.total_frames=unsigned_value("total_frames");response.validation_frames=unsigned_value("validation_frames");
+  response.statistical_frames=unsigned_value("statistical_frames");response.cg_residual_restarts=static_cast<int>(unsigned_value("cg_residual_restarts"));
+  if(response.total_frames==0||response.validation_frames==0||response.validation_frames>response.total_frames||
+     response.statistical_frames==0||response.statistical_frames>response.validation_frames)
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: response snapshot frame counts are inconsistent");
+  response.cg_residual_status=text("cg_residual_status");response.cg_verification_method=text("cg_verification_method");
+  response.observed_cov_available=boolean("observed_cov_available");response.predicted_cov_available=boolean("predicted_cov_available");
+  response.cg_residual_available=boolean("cg_residual_available");response.response_ibp_available=boolean("response_ibp_available");
+  response.force_residual_available=boolean("force_residual_available");response.response_extremes_available=boolean("response_extremes_available");
+  response.has_underprediction=boolean("has_underprediction");response.has_overprediction=boolean("has_overprediction");
+  response.fixed_center_second_moment=boolean("fixed_center_second_moment");
+  for(int index=0;index<4;++index){response.block_frames[index]=static_cast<int>(unsigned_value(("block_frames_"+std::to_string(index)).c_str()));
+    response.block_variance_relative_delta[index]=number(("block_variance_relative_delta_"+std::to_string(index)).c_str());}
+  for(auto& value:probes){response.probe_sources.push_back(std::move(value.first));response.probe_origins.push_back(value.second);}
+  response.response_band.estimate=number("response_band_estimate");response.response_band.radius=number("response_band_radius");
+  response.response_band.lower=number("response_band_lower");response.response_band.upper=number("response_band_upper");
+  response.response_band.frames=unsigned_value("response_band_frames");response.response_band.block_lengths_stable=boolean("response_band_block_lengths_stable");
+  response.response_band.status=text("response_band_status");response.response_band.diagnostic_stage=text("response_band_diagnostic_stage");
+  response.response_band.rejection_reason=text("response_band_rejection_reason");response.response_band.rejection_detail=text("response_band_rejection_detail");
+  response.response_band.bootstrap_started=boolean("response_band_bootstrap_started");response.response_band.level_radii=std::move(response_levels);
+  response.ibp_band.estimate=number("ibp_band_estimate");response.ibp_band.radius=number("ibp_band_radius");
+  response.ibp_band.lower=number("ibp_band_lower");response.ibp_band.upper=number("ibp_band_upper");
+  response.ibp_band.frames=unsigned_value("ibp_band_frames");response.ibp_band.block_lengths_stable=boolean("ibp_band_block_lengths_stable");
+  response.ibp_band.status=text("ibp_band_status");response.ibp_band.diagnostic_stage=text("ibp_band_diagnostic_stage");
+  response.ibp_band.rejection_reason=text("ibp_band_rejection_reason");response.ibp_band.rejection_detail=text("ibp_band_rejection_detail");
+  response.ibp_band.bootstrap_started=boolean("ibp_band_bootstrap_started");response.ibp_band.level_radii=std::move(ibp_levels);
+  if(unsigned_value("response_band_level_count")!=response.response_band.level_radii.size()||
+     unsigned_value("ibp_band_level_count")!=response.ibp_band.level_radii.size())
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: blind bootstrap levels are truncated");
+  response.witness.classification=text("witness_classification");response.witness.probe=static_cast<int>(number("witness_probe"))-1;
+  response.witness.iteration=static_cast<int>(number("witness_iteration"))-1;response.witness.residual_restarts=static_cast<int>(unsigned_value("witness_residual_restarts"));
+  response.witness.p2=number("witness_p2");response.witness.pap=number("witness_pap");response.witness.rayleigh=number("witness_rayleigh");
+  response.witness.base_rayleigh=number("witness_base_rayleigh");response.witness.add_rayleigh=number("witness_add_rayleigh");
+  response.witness.repeat_rayleigh=number("witness_repeat_rayleigh");response.witness.repeat_diff_norm=number("witness_repeat_diff_norm");
+  response.witness.translation_overlap=number("witness_translation_overlap");response.witness.relative_residual=number("witness_relative_residual");
+  response.witness.recursive_relative_residual=number("witness_recursive_relative_residual");response.witness.curvature_tolerance=number("witness_curvature_tolerance");
+  response.witness.finite=boolean("witness_finite");response.witness.true_residual_computed=boolean("witness_true_residual_computed");
+  response.witness.residual_checks=std::move(residual_checks);
+  auto get_vector=[&](const char* name)->std::vector<double>{const auto found=vectors.find(name);return found==vectors.end()?std::vector<double>{}:found->second;};
+  response.mean_q=get_vector("mean_q");response.observed_matrix=get_vector("observed_matrix");
+  response.centered_covariance_matrix=get_vector("centered_covariance_matrix");response.predicted_matrix=get_vector("predicted_matrix");
+  response.ibp_matrix=get_vector("ibp_matrix");response.whitened_matrix=get_vector("whitened_matrix");
+  response.worst_response_coefficients=get_vector("worst_response_coefficients");response.worst_ibp_coefficients=get_vector("worst_ibp_coefficients");
+  response.underpredicted_probe_coefficients=get_vector("underpredicted_probe_coefficients");
+  response.overpredicted_probe_coefficients=get_vector("overpredicted_probe_coefficients");
+  response.worst_underpredicted_direction=get_vector("worst_underpredicted_direction");
+  response.worst_overpredicted_direction=get_vector("worst_overpredicted_direction");
+  response.cg_probe_recoveries.reserve(recoveries.size());for(auto& value:recoveries)response.cg_probe_recoveries.push_back(std::move(value.value));
+  if(unsigned_value("witness_residual_check_count")!=residual_checks.size()||
+     unsigned_value("recovery_count")!=recoveries.size())
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: response snapshot recovery rows are truncated");
+  if(response.probe_sources!=expected_probe_sources||expected_probe_sources.size()!=expected_probe_origins.size())
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: response snapshot probe order differs from the frozen common probes");
+  for(std::size_t index=0;index<response.probe_origins.size();++index){
+    try{if(encode_probe_origin(response.probe_origins[index])!=
+        encode_probe_origin(parse_probe_origin(response.probe_sources[index],expected_probe_origins[index])))
+        throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: response snapshot probe origin differs from the frozen common probes");}
+    catch(const std::invalid_argument&){
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: response snapshot probe origin differs from the frozen common probes");}
+  }
+  const double required_finite[]={response.response,response.ibp,response.cg,response.force_residual,
+    response.response_ratio_min,response.response_ratio_max,response.observed_cov_min,response.observed_cov_max,
+    response.observed_cov_condition,response.predicted_cov_min,response.predicted_cov_max,response.predicted_cov_condition,
+    response.baseline_apply_seconds,response.block_variance_max_relative_delta,response.block_variance_relative_delta[0],
+    response.block_variance_relative_delta[1],response.block_variance_relative_delta[2],response.block_variance_relative_delta[3],
+    response.response_band.estimate,response.response_band.radius,response.response_band.lower,response.response_band.upper,
+    response.witness.p2,response.witness.pap,response.witness.rayleigh,response.witness.base_rayleigh,
+    response.witness.add_rayleigh,response.witness.repeat_rayleigh,response.witness.repeat_diff_norm,
+    response.witness.translation_overlap,response.witness.relative_residual,response.witness.recursive_relative_residual,
+    response.witness.curvature_tolerance};
+  for(const double value:required_finite)if(!std::isfinite(value))
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: response snapshot has a non-finite required statistic");
+  if(response.ibp_band.status=="NUMERICAL_FAILURE"||!std::isfinite(response.ibp_band.estimate))
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: response snapshot has a non-finite IBP diagnostic");
+  if(response.ibp_band.diagnostic_stage=="INTERVAL_CHECK")
+    for(const double value:{response.ibp_band.radius,response.ibp_band.lower,response.ibp_band.upper})
+      if(!std::isfinite(value))throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: response snapshot has a non-finite IBP interval");
+  for(const auto& row:recoveries){const auto& value=row.value;
+    if(!std::isfinite(value.initial_fast_residual)||!std::isfinite(value.initial_compensated_residual)||
+       !std::isfinite(value.final_fast_residual)||!std::isfinite(value.final_compensated_residual)||
+       !std::isfinite(value.verification_seconds)||!std::isfinite(value.refinement_seconds))
+      throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: response snapshot has a non-finite CG recovery diagnostic");}
+  if(!response_consumer_statistics_ready(response)||!snapshot.passed||!std::isfinite(response.response)||
+     response.response_band.status!="RESPONSE_PASS"||!response.witness.classification.empty())
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: blind response snapshot is not a completed passing validation");
+  try{validate_blind_response_snapshot_dimensions(response,snapshot.theta);}
+  catch(const std::runtime_error& error){throw std::runtime_error(std::string("FEASIBILITY_RESUME_STATE_FAIL: ")+error.what());}
+  return snapshot;
 }
 
 void householder_compress(std::vector<double>& a, std::vector<double>& y, const int rows, const int cols,
@@ -2573,25 +3745,214 @@ __host__ __device__ inline std::size_t edge_parameter_index(const int a,const in
   return static_cast<std::size_t>(lo==0?hi:(lo==1?(hi==1?3:4):5));
 }
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 600)
-static __device__ __inline__ double covariance_atomic_add(double* address,const double value)
+struct M1SampleStructureDiagnostic
 {
-  unsigned long long* bits=reinterpret_cast<unsigned long long*>(address);unsigned long long old=*bits,assumed;
-  do{assumed=old;old=atomicCAS(bits,assumed,__double_as_longlong(value+__longlong_as_double(assumed)));}while(assumed!=old);
-  return __longlong_as_double(old);
+  std::uint64_t frames=0,hydrogen_frame_observations=0,candidate_covered_hydrogen_frames=0,pair_comparison_hydrogen_frames=0;
+  std::uint64_t nearest_pair_change_observations=0;
+  double candidate_coverage_fraction=std::numeric_limits<double>::quiet_NaN();
+  double nearest_pair_change_fraction=std::numeric_limits<double>::quiet_NaN();
+  std::string scope="FROZEN_GRAPH_OXYGEN_CANDIDATES_ONLY";
+  std::string interpretation="DIAGNOSTIC_NOT_TUNNELING_RATE; OUTSIDE_CUTOFF_OXYGENS_UNOBSERVED";
+};
+
+struct RpmdJAParameterScaleStatistics
+{
+  std::string status="DATA_INCONCLUSIVE",reason;
+  std::string boundary_rule="PREFIX_NONOVERLAP_2B_NESTED_OVER_B_V1";
+  std::size_t block_length=0,training_block_count=0,development_block_count=0;
+  std::uint64_t training_discarded_tail_frames=0,development_discarded_tail_frames=0;
+  std::vector<double> training_mean,development_mean,mean_difference;
+  std::vector<double> standard_error_train,standard_error_development,standard_error_difference;
+  std::vector<std::vector<double>> covariance_of_mean_train,covariance_of_mean_development,covariance_of_mean_difference;
+};
+
+struct RpmdJAStatistics
+{
+  std::string policy_version="RPJASTAT2",status="DATA_INCONCLUSIVE",reason;
+  std::string channel_scope="FIXED_INTERNAL_PHYSICAL_PROJECTIONS_SECOND_MOMENTS_AND_PARAMETER_QUADRATICS";
+  std::size_t maximum_parameter_count=92;
+  std::uint64_t storage_budget_bytes=0,estimated_storage_bytes=0;
+  rpmd_ja_statistics_policy::BlockPlan training_block_plan;
+  rpmd_ja_statistics_policy::MeanDrift fixed_r0_mean_drift;
+  std::vector<std::string> parameter_names;
+  RpmdJAParameterScaleStatistics block,adjacent_block;
+};
+
+std::vector<FixedPhysicalProbe> make_internal_statistics_probes(
+  const std::vector<FixedPhysicalProbe>& probes,const std::vector<double>& sqrt_atom,const int n)
+{
+  const int d=3*n;if(n<=1||sqrt_atom.size()!=static_cast<std::size_t>(n))
+    throw std::invalid_argument("fixed internal statistics probe dimensions do not match");
+  std::vector<FixedPhysicalProbe> result;
+  for(const FixedPhysicalProbe& source:probes){
+    if(source.vector.size()!=static_cast<std::size_t>(d))
+      throw std::invalid_argument("fixed internal statistics probe vector dimensions do not match");
+    std::vector<double> vector=source.vector;project_translation(vector,sqrt_atom,n);
+    for(const FixedPhysicalProbe& prior:result){
+      const double projection=std::inner_product(vector.begin(),vector.end(),prior.vector.begin(),0.0);
+      for(int i=0;i<d;++i)vector[i]-=projection*prior.vector[i];}
+    const double norm=std::sqrt(std::inner_product(vector.begin(),vector.end(),vector.begin(),0.0));
+    if(!(norm>1e-10)||!std::isfinite(norm))continue;
+    for(double& value:vector)value/=norm;result.push_back({source.source,std::move(vector)});
+  }
+  return result;
 }
-#else
-static __device__ __inline__ double covariance_atomic_add(double* address,const double value)
-{return atomicAdd(address,value);}
-#endif
+
+std::uint64_t estimate_admission_statistics_storage_bytes(const std::uint64_t frame_count,
+  const std::uint64_t training_frames,const std::size_t parameter_count,const std::size_t physical_channel_count,
+  const std::size_t maximum_blocks,const std::size_t atom_count)
+{
+  const std::uint64_t limit=std::numeric_limits<std::uint64_t>::max();
+  const std::uint64_t development_frames=frame_count-training_frames;
+  const std::uint64_t channels=static_cast<std::uint64_t>(physical_channel_count)+parameter_count;
+  const std::uint64_t summary_channels=channels;
+  const auto checked_product=[&](const std::uint64_t left,const std::uint64_t right){
+    return right&&left>limit/right?limit:left*right;};
+  const auto checked_sum=[&](const std::uint64_t left,const std::uint64_t right){
+    return right>limit-left?limit:left+right;};
+  const std::uint64_t common_values=checked_sum(
+    checked_product(6,checked_product(parameter_count,parameter_count)),
+    checked_product(6,checked_product(summary_channels,summary_channels)));
+  const std::uint64_t common_bytes=checked_product(common_values,sizeof(double));
+  const std::uint64_t optimizer_values=checked_product(checked_product(4,maximum_blocks),parameter_count);
+  const std::uint64_t optimizer_bytes=checked_product(optimizer_values,sizeof(double));
+  const std::uint64_t frame_values=checked_product(frame_count,channels);
+  const std::uint64_t frame_bytes=checked_product(frame_values,sizeof(double));
+  const std::uint64_t base_batch_values=checked_sum(checked_product(
+    checked_product(3,atom_count),2ULL*DeviceBaseline::batch_capacity),checked_sum(checked_product(3,atom_count),parameter_count));
+  const std::uint64_t base_batch_bytes=checked_product(base_batch_values,sizeof(double));
+  // Fixed-R0 drift statistics can hold channel values and B-block means together; B is not known yet,
+  // so reserve the worst-case one-frame block count before allocating either collection.
+  const std::uint64_t admission_peak=checked_sum(checked_sum(checked_product(2,frame_bytes),common_bytes),
+    checked_sum(checked_sum(optimizer_bytes,base_batch_bytes),checked_product(64ULL*channels,sizeof(double))));
+  // Six candidates retain B and 2B score arrays in both ledgers, two local copies for regularization
+  // comparison, and one paired-difference scratch vector can coexist.
+  const std::uint64_t candidate_score_values=checked_product(22,development_frames);
+  const std::uint64_t candidate_peak=checked_sum(checked_sum(checked_product(candidate_score_values,sizeof(double)),common_bytes),
+    checked_sum(optimizer_bytes,checked_product(64ULL*channels,sizeof(double))));
+  return std::max(admission_peak,candidate_peak);
+}
+
+std::uint64_t estimate_fixed_r0_drift_storage_bytes(const std::uint64_t training_frames,
+  const std::uint64_t development_frames,const std::uint64_t channel_count,const std::uint64_t block_length)
+{
+  const std::uint64_t limit=std::numeric_limits<std::uint64_t>::max();
+  if(channel_count==0||block_length==0||training_frames>limit-development_frames)return limit;
+  const auto product=[&](const std::uint64_t left,const std::uint64_t right){
+    return right&&left>limit/right?limit:left*right;};
+  const auto sum=[&](const std::uint64_t left,const std::uint64_t right){
+    return right>limit-left?limit:left+right;};
+  const std::uint64_t channel_values=product(training_frames+development_frames,channel_count);
+  const std::uint64_t block_values=product(training_frames/block_length+development_frames/block_length,channel_count);
+  const std::uint64_t covariance_values=product(9,product(channel_count,channel_count));
+  const std::uint64_t summary_bytes=product(channel_count,2*sizeof(rpmd_ja_statistics_policy::ChannelDriftSummary)+1024);
+  const std::uint64_t means_values=product(channel_count,8);
+  const std::uint64_t values=sum(sum(sum(channel_values,block_values),covariance_values),means_values);
+  const std::uint64_t numeric_bytes=product(values,sizeof(double));
+  const std::uint64_t vector_overhead=product(product(16,channel_count),sizeof(std::vector<double>));
+  return sum(sum(numeric_bytes,summary_bytes),vector_overhead);
+}
+
+void append_fixed_r0_physical_frame(rpmd_ja_statistics_policy::TrainingChannels& channels,
+  const std::vector<double>& position,const std::vector<double>& r0,const std::vector<double>& masses,
+  const std::vector<double>& sqrt_mass,const std::vector<FixedPhysicalProbe>& probes,const int n)
+{
+  if(channels.values.size()<3+probes.size()||position.size()!=static_cast<std::size_t>(3*n)||r0.size()!=position.size()||
+     masses.size()!=static_cast<std::size_t>(n)||sqrt_mass.size()!=position.size())
+    throw std::invalid_argument("native fixed-R0 physical statistics dimensions do not match");
+  NeumaierAccumulator mass_sum;for(const double mass:masses)mass_sum.add(mass);
+  if(!(mass_sum.value()>0.0)||!std::isfinite(mass_sum.value()))
+    throw std::invalid_argument("native fixed-R0 physical statistics require positive total mass");
+  std::vector<double> mass_weighted_displacement(position.size());
+  for(std::size_t coordinate=0;coordinate<position.size();++coordinate)
+    mass_weighted_displacement[coordinate]=sqrt_mass[coordinate]*(position[coordinate]-r0[coordinate]);
+  for(int axis=0;axis<3;++axis){NeumaierAccumulator second;
+    for(int atom=0;atom<n;++atom){const double displacement=position[static_cast<std::size_t>(axis)*n+atom]-r0[static_cast<std::size_t>(axis)*n+atom];
+      second.add_product(masses[atom],displacement*displacement);}
+    channels.values[static_cast<std::size_t>(axis)].push_back(second.value()/mass_sum.value());}
+  for(std::size_t probe=0;probe<probes.size();++probe)
+    channels.values[3+probe].push_back(std::inner_product(probes[probe].vector.begin(),probes[probe].vector.end(),
+      mass_weighted_displacement.begin(),0.0));
+}
+
+RpmdJAParameterScaleStatistics summarize_parameter_block_scale(
+  const rpmd_ja_statistics_policy::TrainingChannels& training,
+  const rpmd_ja_statistics_policy::TrainingChannels& development,
+  const std::size_t parameter_offset,const std::size_t parameter_count,const std::size_t block_length,
+  const std::size_t base_block_length,const rpmd_ja_statistics_policy::FrozenConfig& config,
+  const rpmd_ja_statistics_policy::BudgetObserver& observer={})
+{
+  using rpmd_ja_statistics_policy::detail::mean;
+  using rpmd_ja_statistics_policy::detail::validate_channels;
+  RpmdJAParameterScaleStatistics result;result.block_length=block_length;
+  const std::size_t training_frames=validate_channels(training,observer),development_frames=validate_channels(development,observer);
+  const std::size_t training_covered=rpmd_ja_statistics_policy::detail::common_block_coverage(training_frames,base_block_length);
+  const std::size_t development_covered=rpmd_ja_statistics_policy::detail::common_block_coverage(development_frames,base_block_length);
+  result.training_block_count=training_covered/block_length;result.development_block_count=development_covered/block_length;
+  result.training_discarded_tail_frames=training_frames-training_covered;
+  result.development_discarded_tail_frames=development_frames-development_covered;
+  if(result.training_block_count<config.min_blocks||result.development_block_count<config.min_blocks){
+    result.reason="TOO_FEW_TRAINING_OR_DEVELOPMENT_BLOCKS";return result;}
+  result.training_mean.resize(parameter_count);result.development_mean.resize(parameter_count);result.mean_difference.resize(parameter_count);
+  result.standard_error_train.resize(parameter_count);result.standard_error_development.resize(parameter_count);
+  result.standard_error_difference.resize(parameter_count);
+  result.covariance_of_mean_train.assign(parameter_count,std::vector<double>(parameter_count,0.0));
+  result.covariance_of_mean_development.assign(parameter_count,std::vector<double>(parameter_count,0.0));
+  result.covariance_of_mean_difference.assign(parameter_count,std::vector<double>(parameter_count,0.0));
+  for(std::size_t parameter=0;parameter<parameter_count;++parameter){
+    const std::vector<double>& train_values=training.values[parameter_offset+parameter];
+    const std::vector<double>& development_values=development.values[parameter_offset+parameter];
+    result.training_mean[parameter]=rpmd_ja_statistics_policy::detail::prefix_mean(train_values,training_covered,observer);
+    result.development_mean[parameter]=rpmd_ja_statistics_policy::detail::prefix_mean(development_values,development_covered,observer);
+    result.mean_difference[parameter]=result.development_mean[parameter]-result.training_mean[parameter];
+  }
+  std::vector<double> train_block(parameter_count),development_block(parameter_count);
+  for(std::size_t block=0;block<result.training_block_count;++block){
+    rpmd_ja_statistics_policy::detail::observe_budget(observer,block);
+    for(std::size_t parameter=0;parameter<parameter_count;++parameter){
+      double total=0.0;const std::vector<double>& values=training.values[parameter_offset+parameter];
+      for(std::size_t frame=block*block_length;frame<(block+1)*block_length;++frame){
+        rpmd_ja_statistics_policy::detail::observe_budget(observer,frame);total+=values[frame];}
+      train_block[parameter]=total/static_cast<double>(block_length);}
+    for(std::size_t i=0;i<parameter_count;++i)for(std::size_t j=0;j<parameter_count;++j)
+      result.covariance_of_mean_train[i][j]+=(train_block[i]-result.training_mean[i])*(train_block[j]-result.training_mean[j]);}
+  for(std::size_t block=0;block<result.development_block_count;++block){
+    rpmd_ja_statistics_policy::detail::observe_budget(observer,block);
+    for(std::size_t parameter=0;parameter<parameter_count;++parameter){
+      double total=0.0;const std::vector<double>& values=development.values[parameter_offset+parameter];
+      for(std::size_t frame=block*block_length;frame<(block+1)*block_length;++frame){
+        rpmd_ja_statistics_policy::detail::observe_budget(observer,frame);total+=values[frame];}
+      development_block[parameter]=total/static_cast<double>(block_length);}
+    for(std::size_t i=0;i<parameter_count;++i)for(std::size_t j=0;j<parameter_count;++j)
+      result.covariance_of_mean_development[i][j]+=(development_block[i]-result.development_mean[i])*
+        (development_block[j]-result.development_mean[j]);}
+  for(std::size_t i=0;i<parameter_count;++i)for(std::size_t j=0;j<parameter_count;++j){
+    const double train_covariance=result.covariance_of_mean_train[i][j]/
+      (static_cast<double>(result.training_block_count-1)*result.training_block_count);
+    const double development_covariance=result.covariance_of_mean_development[i][j]/
+      (static_cast<double>(result.development_block_count-1)*result.development_block_count);
+    result.covariance_of_mean_train[i][j]=train_covariance;
+    result.covariance_of_mean_development[i][j]=development_covariance;
+    result.covariance_of_mean_difference[i][j]=train_covariance+development_covariance;}
+  for(std::size_t parameter=0;parameter<parameter_count;++parameter){
+    result.standard_error_train[parameter]=std::sqrt(result.covariance_of_mean_train[parameter][parameter]);
+    result.standard_error_development[parameter]=std::sqrt(result.covariance_of_mean_development[parameter][parameter]);
+    result.standard_error_difference[parameter]=std::sqrt(result.covariance_of_mean_difference[parameter][parameter]);}
+  result.status="PASS";return result;
+}
 
 void add_covariance_frame_statistics(const Graph& graph,const std::vector<double>& position,
   const std::vector<double>& r0,const int n,std::vector<double>& sums,std::vector<double>* edge_sums=nullptr,
-  std::vector<double>* block_sums=nullptr)
+  std::vector<double>* block_sums=nullptr,std::vector<double>* frame_values=nullptr)
 {
-  if(position.size()!=static_cast<std::size_t>(3*n)||r0.size()!=position.size()||sums.size()!=6*graph.type_pairs.size()||
-     (edge_sums&&edge_sums->size()!=6*graph.edges.size())||(block_sums&&block_sums->size()!=sums.size()))
+  const bool m1=has_m1_local_basis(graph);const int base=m1?graph.base_parameter_count:static_cast<int>(sums.size());
+  const int raw=m1?graph.raw_local_parameter_count:0;
+  if(position.size()!=static_cast<std::size_t>(3*n)||r0.size()!=position.size()||
+     sums.size()!=static_cast<std::size_t>(m1?graph.parameter_count:6*graph.type_pairs.size())||
+     (edge_sums&&edge_sums->size()!=6*graph.edges.size())||(block_sums&&block_sums->size()!=sums.size())||
+     (frame_values&&frame_values->size()!=sums.size()))
     throw std::invalid_argument("native covariance fit statistic dimensions do not match");
+  std::vector<double> input(static_cast<std::size_t>(base+raw),0.0);
   for(std::size_t e=0;e<graph.edges.size();++e){const Edge& edge=graph.edges[e];
     const double dx[3]={position[edge.j]-r0[edge.j]-position[edge.i]+r0[edge.i],
       position[n+edge.j]-r0[n+edge.j]-position[n+edge.i]+r0[n+edge.i],
@@ -2599,8 +3960,92 @@ void add_covariance_frame_statistics(const Graph& graph,const std::vector<double
     const std::size_t p=6*static_cast<std::size_t>(edge.group);
     const double components[6]={dx[0]*dx[0],2.0*dx[0]*dx[1],2.0*dx[0]*dx[2],
       dx[1]*dx[1],2.0*dx[1]*dx[2],dx[2]*dx[2]};
-    for(int k=0;k<6;++k){sums[p+k]+=components[k];
-      if(edge_sums)(*edge_sums)[6*e+k]+=components[k];if(block_sums)(*block_sums)[p+k]+=components[k];}
+    for(int k=0;k<6;++k){input[p+k]+=components[k];
+      if(edge_sums)(*edge_sums)[6*e+k]+=components[k];}
+  }
+  if(m1){std::vector<NeumaierAccumulator> raw_sums(static_cast<std::size_t>(raw));
+    for(const rpmd_ja_local_basis::Term& term:graph.local_terms){NeumaierAccumulator projection;
+      for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+        projection.add_product(term.coefficient[site].x,position[atom]-r0[atom]);
+        projection.add_product(term.coefficient[site].y,position[n+atom]-r0[n+atom]);
+        projection.add_product(term.coefficient[site].z,position[2*n+atom]-r0[2*n+atom]);}
+      const double value=projection.value();raw_sums[term.parameter].add_product(term.weight,value*value);}
+    for(int parameter=0;parameter<raw;++parameter)input[base+parameter]=raw_sums[parameter].value();}
+  if(!m1){for(std::size_t parameter=0;parameter<input.size();++parameter){sums[parameter]+=input[parameter];
+      if(frame_values)(*frame_values)[parameter]=input[parameter];
+      if(block_sums)(*block_sums)[parameter]+=input[parameter];}return;}
+  const int added=static_cast<int>(sums.size())-base;
+  for(int output=0;output<base;++output){sums[output]+=input[output];if(frame_values)(*frame_values)[output]=input[output];if(block_sums)(*block_sums)[output]+=input[output];}
+  for(int output=0;output<added;++output){NeumaierAccumulator value;
+    for(int parameter=0;parameter<base;++parameter)value.add_product(input[parameter],graph.local_base_mix[static_cast<std::size_t>(parameter)*added+output]);
+    for(int parameter=0;parameter<raw;++parameter)value.add_product(input[base+parameter],graph.local_transform[static_cast<std::size_t>(parameter)*added+output]);
+    sums[base+output]+=value.value();if(frame_values)(*frame_values)[base+output]=value.value();
+    if(block_sums)(*block_sums)[base+output]+=value.value();}
+}
+
+rpmd_ja_statistics_policy::TrainingChannels collect_fixed_r0_admission_channels(std::istream& in,
+  const SampleHeader& header,const std::uint64_t frame_count,const Graph& graph,const std::vector<double>& r0,
+  const double temperature,const std::vector<FixedPhysicalProbe>& probes,const std::vector<double>& sqrt_mass,
+  const std::uint64_t storage_budget_bytes,const std::function<void()>& budget_observer={})
+{
+  if(frame_count==0||frame_count>static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())||
+     !(temperature>0.0)||!std::isfinite(temperature)||probes.empty()||sqrt_mass.size()!=r0.size())
+    throw std::invalid_argument("native fixed-R0 admission channel metadata is invalid");
+  const std::size_t parameter_count=has_m1_local_basis(graph)?static_cast<std::size_t>(graph.parameter_count):
+    6*graph.type_pairs.size();
+  const std::size_t channel_count=3+probes.size()+parameter_count;
+  if(channel_count==0||channel_count>std::numeric_limits<std::uint64_t>::max()/sizeof(double)||
+     frame_count>std::numeric_limits<std::uint64_t>::max()/channel_count/sizeof(double))
+    throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: fixed-R0 admission channel storage overflows");
+  const std::uint64_t required_bytes=frame_count*channel_count*sizeof(double);
+  if(storage_budget_bytes==0||required_bytes>storage_budget_bytes)
+    throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: fixed-R0 admission channel storage exceeds the frozen budget");
+  rpmd_ja_statistics_policy::TrainingChannels channels;
+  channels.names={"fixed_r0_second_moment_x_angstrom2","fixed_r0_second_moment_y_angstrom2",
+    "fixed_r0_second_moment_z_angstrom2"};
+  for(const FixedPhysicalProbe& probe:probes)
+    channels.names.push_back("fixed_internal_projection:"+probe.source);
+  for(std::size_t parameter=0;parameter<parameter_count;++parameter){
+    const std::string name=parameter<graph.parameter_names.size()&&!graph.parameter_names[parameter].empty()?
+      graph.parameter_names[parameter]:"parameter_"+std::to_string(parameter);
+    channels.names.push_back("parameter:"+name);}
+  channels.values.resize(channel_count);
+  for(auto& values:channels.values)values.reserve(static_cast<std::size_t>(frame_count));
+  std::vector<double> sums(parameter_count,0.0),frame_values(parameter_count,0.0),position(r0.size()),force_frame(r0.size());
+  const double scale=1.0/(K_B*temperature);double step=0.0;
+  in.clear();in.seekg(header.frames);
+  if(!in)throw std::runtime_error("IMPLEMENTATION_FAIL: could not seek to fixed-R0 admission trajectory frames");
+  for(std::uint64_t frame=0;frame<frame_count;++frame){
+    if(budget_observer&&(frame&63ULL)==0)budget_observer();
+    read_frame(in,position,force_frame,step);
+    append_fixed_r0_physical_frame(channels,position,r0,header.masses,sqrt_mass,probes,header.n);
+    std::fill(frame_values.begin(),frame_values.end(),0.0);
+    add_covariance_frame_statistics(graph,position,r0,header.n,sums,nullptr,nullptr,&frame_values);
+    for(std::size_t parameter=0;parameter<parameter_count;++parameter)
+      channels.values[3+probes.size()+parameter].push_back(frame_values[parameter]*scale);
+  }
+  return channels;
+}
+
+void add_m1_sample_structure_frame(const Graph& graph,const std::vector<double>& position,const Box& box,
+  const int n,M1SampleStructureDiagnostic& diagnostic)
+{
+  if(!has_m1_local_basis(graph))return;
+  for(const Graph::FrozenBridge& bridge:graph.m1.frozen_bridges){
+    ++diagnostic.hydrogen_frame_observations;
+    if(bridge.oxygen_candidates.size()<2)continue;
+    ++diagnostic.candidate_covered_hydrogen_frames;
+    if(!bridge.accepted)continue;
+    ++diagnostic.pair_comparison_hydrogen_frames;
+    std::vector<std::pair<double,int>> distances;distances.reserve(bridge.oxygen_candidates.size());
+    for(const rpmd_ja_local_basis::Site& oxygen:bridge.oxygen_candidates){double distance2=0.0;
+      for(int axis=0;axis<3;++axis){double delta=position[axis*n+oxygen.atom]-position[axis*n+bridge.hydrogen.atom];
+        for(int cell=0;cell<3;++cell)delta+=box.cpu_h[3*axis+cell]*oxygen.image[cell];distance2+=delta*delta;}
+      distances.emplace_back(distance2,oxygen.atom);}
+    std::sort(distances.begin(),distances.end(),[](const auto& a,const auto& b){return a.first<b.first||(a.first==b.first&&a.second<b.second);});
+    const int first=std::min(bridge.oxygen1.atom,bridge.oxygen2.atom),second=std::max(bridge.oxygen1.atom,bridge.oxygen2.atom);
+    const int observed_first=std::min(distances[0].second,distances[1].second),observed_second=std::max(distances[0].second,distances[1].second);
+    if(first!=observed_first||second!=observed_second)++diagnostic.nearest_pair_change_observations;
   }
 }
 
@@ -2608,29 +4053,207 @@ std::vector<double> collect_covariance_fit_statistics(std::istream& in,const Sam
   const std::uint64_t frame_count,const std::uint64_t training_frames,const Graph& graph,
   const std::vector<double>& r0,const double temperature,std::vector<double>* edge_statistics=nullptr,
   std::vector<std::vector<double>>* block_statistics=nullptr,
-  std::vector<std::uint64_t>* block_frames=nullptr)
+  std::vector<std::uint64_t>* block_frames=nullptr,M1SampleStructureDiagnostic* structure_diagnostic=nullptr,
+  const Box* structure_box=nullptr,DeviceBaseline* baseline=nullptr,const std::vector<double>* sqrt_mass=nullptr,
+  const std::vector<double>* sqrt_atom=nullptr,std::vector<double>* development_statistics=nullptr,
+  double* development_baseline_statistic=nullptr,
+  std::vector<std::vector<double>>* development_block_statistics=nullptr,
+  std::vector<double>* development_block_baseline_statistics=nullptr,
+  std::vector<std::uint64_t>* development_block_frames=nullptr,const std::size_t maximum_blocks=8,
+  RpmdJAStatistics* admission_statistics=nullptr,const std::vector<FixedPhysicalProbe>* admission_probes=nullptr,
+  const std::uint64_t statistics_storage_budget_bytes=0,const std::function<void()>& budget_observer={})
 {
-  if(training_frames==0||training_frames>frame_count||!(temperature>0.0)||!std::isfinite(temperature))
+  if(training_frames==0||training_frames>frame_count||!(temperature>0.0)||!std::isfinite(temperature)||maximum_blocks==0)
     throw std::invalid_argument("native covariance fit training metadata is invalid");
-  std::vector<double> sums(6*graph.type_pairs.size(),0.0),position(r0.size()),force_frame(r0.size());
+  if(structure_diagnostic&&has_m1_local_basis(graph)&&structure_box==nullptr)
+    throw std::invalid_argument("native M1 structure diagnostic requires the fixed cell");
+  const std::uint64_t development_frames=frame_count-training_frames;
+  if((development_statistics||development_baseline_statistic)&&development_frames==0)
+    throw std::invalid_argument("native covariance development statistics require development frames");
+  if(development_baseline_statistic&&(!development_statistics||!baseline||!sqrt_mass||!sqrt_atom||
+     sqrt_mass->size()!=r0.size()||sqrt_atom->size()!=static_cast<std::size_t>(header.n)))
+    throw std::invalid_argument("native covariance development objective requires fixed-base and mass inputs");
+  if((development_block_statistics||development_block_baseline_statistics||development_block_frames)&&
+     (!development_statistics||!development_baseline_statistic||!baseline||!sqrt_mass||!sqrt_atom||
+      !development_block_statistics||!development_block_baseline_statistics||!development_block_frames))
+    throw std::invalid_argument("native covariance paired development blocks require all fixed-R0 statistic outputs");
+  const std::size_t parameter_count=has_m1_local_basis(graph)?static_cast<std::size_t>(graph.parameter_count):6*graph.type_pairs.size();
+  const rpmd_ja_statistics_policy::FrozenConfig statistics_config=rpmd_ja_statistics_policy::frozen_config();
+  const std::size_t physical_channel_count=admission_probes?3+admission_probes->size():0;
+  bool collect_admission_statistics=false;
+  if(admission_statistics){
+    *admission_statistics=RpmdJAStatistics{};
+    admission_statistics->storage_budget_bytes=statistics_storage_budget_bytes;
+    admission_statistics->parameter_names=graph.parameter_names;
+    admission_statistics->parameter_names.resize(parameter_count);
+    for(std::size_t parameter=0;parameter<parameter_count;++parameter)
+      if(admission_statistics->parameter_names[parameter].empty())
+        admission_statistics->parameter_names[parameter]="parameter_"+std::to_string(parameter);
+    if(parameter_count>admission_statistics->maximum_parameter_count)
+      admission_statistics->reason="PARAMETER_COUNT_EXCEEDS_FROZEN_LIMIT";
+    else if(!admission_probes||admission_probes->empty()||!sqrt_atom||sqrt_atom->size()!=static_cast<std::size_t>(header.n)||
+       !sqrt_mass||sqrt_mass->size()!=r0.size())
+      admission_statistics->reason="FIXED_INTERNAL_PHYSICAL_PROBES_UNAVAILABLE";
+    else if(statistics_storage_budget_bytes==0)
+      admission_statistics->reason="STATISTICS_STORAGE_BUDGET_NOT_DECLARED";
+    else if((admission_statistics->estimated_storage_bytes=estimate_admission_statistics_storage_bytes(
+        frame_count,training_frames,parameter_count,physical_channel_count,maximum_blocks,
+        static_cast<std::size_t>(header.n)))>statistics_storage_budget_bytes)
+      admission_statistics->reason="STATISTICS_STORAGE_BUDGET_EXCEEDED";
+    else if(development_frames<2||training_frames<2)
+      admission_statistics->reason="TRAINING_OR_DEVELOPMENT_SEGMENT_TOO_SHORT";
+    else collect_admission_statistics=true;
+  }
+  std::vector<double> sums(parameter_count,0.0),position(r0.size()),force_frame(r0.size());
+  const bool collect_development_sums=development_statistics||collect_admission_statistics;
+  std::vector<double> development_sums(collect_development_sums?parameter_count:0,0.0);
+  if(development_statistics)development_statistics->assign(parameter_count,0.0);
+  const std::size_t development_block_count=development_block_statistics?
+    static_cast<std::size_t>(std::min<std::uint64_t>(maximum_blocks,development_frames)):0;
+  std::vector<std::vector<double>> development_sums_blocks(development_block_count,
+    std::vector<double>(development_block_statistics?parameter_count:0,0.0));
+  std::vector<std::uint64_t> development_block_count_frames(development_block_count,0);
+  std::vector<NeumaierAccumulator> development_base_block_sums(development_block_count);
+  std::vector<std::size_t> base_block_indices;
+  if(structure_diagnostic)*structure_diagnostic=M1SampleStructureDiagnostic{};
   if(edge_statistics)edge_statistics->assign(6*graph.edges.size(),0.0);
-  const std::size_t block_count=block_statistics?static_cast<std::size_t>(std::min<std::uint64_t>(8,training_frames)):0;
+  const std::size_t block_count=block_statistics?static_cast<std::size_t>(std::min<std::uint64_t>(maximum_blocks,training_frames)):0;
   std::vector<std::uint64_t> block_count_frames(block_count,0);
   if(block_statistics)block_statistics->assign(block_count,std::vector<double>(sums.size(),0.0));
   if(block_frames)block_frames->assign(block_count,0);
+  rpmd_ja_statistics_policy::TrainingChannels training_admission,development_admission;
+  std::vector<double> frame_parameter_values(collect_admission_statistics?parameter_count:0,0.0);
+  if(collect_admission_statistics){
+    training_admission.names={"fixed_r0_second_moment_x_angstrom2","fixed_r0_second_moment_y_angstrom2",
+      "fixed_r0_second_moment_z_angstrom2"};
+    for(const FixedPhysicalProbe& probe:*admission_probes)
+      training_admission.names.push_back("fixed_internal_projection:"+probe.source);
+    development_admission.names=training_admission.names;
+    training_admission.values.resize(physical_channel_count);development_admission.values.resize(physical_channel_count);
+    for(std::size_t parameter=0;parameter<parameter_count;++parameter){
+      const std::string name=admission_statistics->parameter_names[parameter];
+      training_admission.names.push_back("parameter:"+name);development_admission.names.push_back("parameter:"+name);
+      training_admission.values.emplace_back();development_admission.values.emplace_back();
+      training_admission.values.back().reserve(static_cast<std::size_t>(training_frames));
+      development_admission.values.back().reserve(static_cast<std::size_t>(development_frames));}
+  }
+  std::vector<double> base_batch,base_result,base_coordinate;
+  int base_columns=0;NeumaierAccumulator development_base_sum;
+  if(development_baseline_statistic){const std::size_t capacity=static_cast<std::size_t>(header.n)*3*DeviceBaseline::batch_capacity;
+    base_batch.reserve(capacity);base_result.resize(capacity);base_coordinate.resize(r0.size());
+    if(development_block_statistics)base_block_indices.reserve(DeviceBaseline::batch_capacity);}
+  auto flush_development_base=[&](){if(base_columns==0)return;
+    base_batch.resize(static_cast<std::size_t>(header.n)*3*base_columns);
+    base_result.resize(base_batch.size());baseline->apply_batch(base_batch,base_columns,base_result);
+    for(int column=0;column<base_columns;++column){NeumaierAccumulator value;
+      for(std::size_t row=0;row<r0.size();++row)value.add_product(base_batch[static_cast<std::size_t>(column)*r0.size()+row],
+        base_result[static_cast<std::size_t>(column)*r0.size()+row]);development_base_sum.add(value.value());
+      if(development_block_statistics)development_base_block_sums[base_block_indices[static_cast<std::size_t>(column)]].add(value.value());}
+    base_block_indices.clear();
+    base_batch.clear();base_columns=0;};
   double step=0.0;in.clear();in.seekg(header.frames);
-  for(std::uint64_t frame=0;frame<training_frames;++frame){read_frame(in,position,force_frame,step);
-    std::vector<double>* block=nullptr;if(block_statistics){const std::size_t index=static_cast<std::size_t>(frame*block_count/training_frames);
-      block=&(*block_statistics)[index];++block_count_frames[index];}
-    add_covariance_frame_statistics(graph,position,r0,header.n,sums,edge_statistics,block);}
+  const std::uint64_t frames_to_read=collect_development_sums?frame_count:training_frames;
+  for(std::uint64_t frame=0;frame<frames_to_read;++frame){
+    if(budget_observer&&(frame&63ULL)==0)budget_observer();
+    read_frame(in,position,force_frame,step);
+    if(frame<training_frames){
+      std::vector<double>* block=nullptr;if(block_statistics){const std::size_t index=static_cast<std::size_t>(frame*block_count/training_frames);
+        block=&(*block_statistics)[index];++block_count_frames[index];}
+      add_covariance_frame_statistics(graph,position,r0,header.n,sums,edge_statistics,block,
+        collect_admission_statistics?&frame_parameter_values:nullptr);
+      if(collect_admission_statistics){
+        append_fixed_r0_physical_frame(training_admission,position,r0,header.masses,*sqrt_mass,*admission_probes,header.n);
+        const double scale=1.0/(K_B*temperature);
+        for(std::size_t parameter=0;parameter<parameter_count;++parameter)
+          training_admission.values[physical_channel_count+parameter].push_back(frame_parameter_values[parameter]*scale);}
+      if(structure_diagnostic){++structure_diagnostic->frames;if(structure_box)
+          add_m1_sample_structure_frame(graph,position,*structure_box,header.n,*structure_diagnostic);}
+    }else{
+      std::size_t development_block=0;
+      if(development_block_statistics){development_block=std::min(development_block_count-1,
+          static_cast<std::size_t>((frame-training_frames)*development_block_count/development_frames));
+        ++development_block_count_frames[development_block];
+        add_covariance_frame_statistics(graph,position,r0,header.n,development_sums,nullptr,
+          &development_sums_blocks[development_block],collect_admission_statistics?&frame_parameter_values:nullptr);}
+      else if(collect_development_sums)add_covariance_frame_statistics(graph,position,r0,header.n,development_sums,
+        nullptr,nullptr,collect_admission_statistics?&frame_parameter_values:nullptr);
+      if(collect_admission_statistics){
+        append_fixed_r0_physical_frame(development_admission,position,r0,header.masses,*sqrt_mass,*admission_probes,header.n);
+        const double scale=1.0/(K_B*temperature);
+        for(std::size_t parameter=0;parameter<parameter_count;++parameter)
+          development_admission.values[physical_channel_count+parameter].push_back(frame_parameter_values[parameter]*scale);}
+      if(development_baseline_statistic){
+        for(std::size_t row=0;row<r0.size();++row)base_coordinate[row]=(*sqrt_mass)[row]*(position[row]-r0[row]);
+        project_translation(base_coordinate,*sqrt_atom,header.n);
+        base_batch.insert(base_batch.end(),base_coordinate.begin(),base_coordinate.end());++base_columns;
+        if(development_block_statistics)base_block_indices.push_back(development_block);
+        if(base_columns==DeviceBaseline::batch_capacity)flush_development_base();
+      }
+    }
+  }
+  flush_development_base();
   const double beta=1.0/(K_B*temperature*static_cast<double>(training_frames));
   for(double& value:sums){value*=beta;if(!std::isfinite(value))throw std::runtime_error("native covariance fit training statistic is non-finite");}
   if(edge_statistics)for(double& value:*edge_statistics){value*=beta;if(!std::isfinite(value))throw std::runtime_error("native covariance fit edge statistic is non-finite");}
+  if(collect_development_sums){const double development_beta=1.0/(K_B*temperature*static_cast<double>(development_frames));
+    for(std::size_t index=0;index<development_sums.size();++index){development_sums[index]*=development_beta;
+      if(!std::isfinite(development_sums[index]))throw std::runtime_error("native covariance fit development statistic is non-finite");}
+    if(development_statistics)*development_statistics=std::move(development_sums);}
+  if(development_baseline_statistic){const double development_beta=1.0/(K_B*temperature*static_cast<double>(development_frames));
+    *development_baseline_statistic=development_base_sum.value()*development_beta;
+    if(!std::isfinite(*development_baseline_statistic))throw std::runtime_error("native covariance fit development baseline statistic is non-finite");}
+  if(development_block_statistics){
+    development_block_statistics->assign(development_block_count,std::vector<double>(parameter_count));
+    development_block_baseline_statistics->assign(development_block_count,0.0);
+    for(std::size_t block=0;block<development_block_count;++block){
+      if(development_block_count_frames[block]==0)throw std::runtime_error("native covariance paired development partition contains an empty block");
+      const double beta=1.0/(K_B*temperature*static_cast<double>(development_block_count_frames[block]));
+      for(std::size_t parameter=0;parameter<parameter_count;++parameter){
+        (*development_block_statistics)[block][parameter]=development_sums_blocks[block][parameter]*beta;
+        if(!std::isfinite((*development_block_statistics)[block][parameter]))
+          throw std::runtime_error("native covariance paired development statistic is non-finite");}
+      (*development_block_baseline_statistics)[block]=development_base_block_sums[block].value()*beta;
+      if(!std::isfinite((*development_block_baseline_statistics)[block]))
+        throw std::runtime_error("native covariance paired development baseline is non-finite");}
+    *development_block_frames=development_block_count_frames;
+  }
   if(block_statistics)for(std::size_t block=0;block<block_count;++block){
     const double block_beta=1.0/(K_B*temperature*static_cast<double>(block_count_frames[block]));
     for(double& value:(*block_statistics)[block]){value*=block_beta;
       if(!std::isfinite(value))throw std::runtime_error("native covariance fit block statistic is non-finite");}}
   if(block_frames)*block_frames=std::move(block_count_frames);
+  if(collect_admission_statistics){
+    admission_statistics->training_block_plan=rpmd_ja_statistics_policy::plan_training_blocks(
+      training_admission,statistics_config,budget_observer);
+    const std::vector<std::string> no_expected_zero_mean_channels;
+    admission_statistics->fixed_r0_mean_drift=rpmd_ja_statistics_policy::assess_fixed_r0_means(
+      training_admission,development_admission,admission_statistics->training_block_plan,statistics_config,
+      &no_expected_zero_mean_channels,budget_observer);
+    if(admission_statistics->training_block_plan.status!="PASS"){
+      admission_statistics->reason="TRAINING_BLOCK_PLAN:"+admission_statistics->training_block_plan.reason;
+    }else{
+      const std::size_t block_length=admission_statistics->training_block_plan.block_length;
+      admission_statistics->block=summarize_parameter_block_scale(training_admission,development_admission,
+        physical_channel_count,parameter_count,block_length,block_length,statistics_config,budget_observer);
+      admission_statistics->adjacent_block=summarize_parameter_block_scale(training_admission,development_admission,
+        physical_channel_count,parameter_count,2*block_length,block_length,statistics_config,budget_observer);
+      const std::string& drift_reason=admission_statistics->fixed_r0_mean_drift.reason;
+      if(admission_statistics->fixed_r0_mean_drift.status!="PASS"){
+        admission_statistics->status=drift_reason=="DEVELOPMENT_BLOCK_SENSITIVE"?"DEVELOPMENT_BLOCK_SENSITIVE":"DATA_INCONCLUSIVE";
+        admission_statistics->reason=drift_reason.empty()?"FIXED_R0_DRIFT_UNRESOLVED":drift_reason;
+      }else if(admission_statistics->block.status!="PASS"||admission_statistics->adjacent_block.status!="PASS"){
+        admission_statistics->reason=admission_statistics->block.status!="PASS"?
+          admission_statistics->block.reason:admission_statistics->adjacent_block.reason;
+      }else admission_statistics->status="PASS";
+    }
+  }
+  if(structure_diagnostic){
+    const double observations=static_cast<double>(structure_diagnostic->hydrogen_frame_observations);
+    const double covered=static_cast<double>(structure_diagnostic->candidate_covered_hydrogen_frames);
+    structure_diagnostic->candidate_coverage_fraction=observations>0.0?covered/observations:0.0;
+    const double pair_comparisons=static_cast<double>(structure_diagnostic->pair_comparison_hydrogen_frames);
+    structure_diagnostic->nearest_pair_change_fraction=pair_comparisons>0.0?
+      static_cast<double>(structure_diagnostic->nearest_pair_change_observations)/pair_comparisons:0.0;}
   return sums;
 }
 
@@ -2726,6 +4349,109 @@ __global__ void covariance_expand_solutions(const double* compact,double* ambien
   const int source=full_to_compact[row];ambient[index]=source<0?0.0:compact[static_cast<std::size_t>(column)*r+source];
 }
 
+__device__ inline double covariance_m1_base_coefficient(const int output_parameter,const int base_parameter,
+  const int base_count,const int added_count,const double* base_mix)
+{
+  if(output_parameter<base_count)return output_parameter==base_parameter?1.0:0.0;
+  return base_mix[static_cast<std::size_t>(base_parameter)*added_count+output_parameter-base_count];
+}
+
+__global__ void covariance_apply_basis_edges(double* action,const double* ambient,const double* sqrt_mass,
+  const int* edge_i,const int* edge_j,const int* edge_group,const double* base_mix,const int edge_count,
+  const int n,const int d,const int output_parameter,const int base_count,const int added_count,const int columns)
+{
+  const std::size_t index=static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(index>=static_cast<std::size_t>(edge_count)*columns)return;
+  const int edge=static_cast<int>(index/columns),column=static_cast<int>(index%columns),i=edge_i[edge],j=edge_j[edge],group=edge_group[edge];
+  const int atoms[2]={i,j};const double signs[2]={-1.0,1.0};double coefficient[6];
+  for(int k=0;k<6;++k)coefficient[k]=covariance_m1_base_coefficient(output_parameter,6*group+k,base_count,added_count,base_mix);
+  for(int u=0;u<2;++u)for(int axis=0;axis<3;++axis){double value=0.0;
+    for(int v=0;v<2;++v)for(int component=0;component<3;++component){const int lo=axis<component?axis:component,hi=axis>component?axis:component;
+      const int parameter=lo==0?hi:(lo==1?(hi==1?3:4):5);const double k=coefficient[parameter];
+      value+=signs[u]*signs[v]*k*ambient[static_cast<std::size_t>(column)*d+component*n+atoms[v]]/sqrt_mass[atoms[v]];}
+    if(value!=0.0)covariance_atomic_add(action+static_cast<std::size_t>(column)*d+axis*n+atoms[u],value/sqrt_mass[atoms[u]]);}
+}
+
+__global__ void covariance_apply_basis_local_terms(double* action,const double* ambient,const double* sqrt_mass,
+  const rpmd_ja_local_basis::Term* terms,const double* transform,const int term_count,const int n,const int d,
+  const int output_parameter,const int base_count,const int added_count,const int columns)
+{
+  const std::size_t index=static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(index>=static_cast<std::size_t>(term_count)*columns)return;
+  const int term_index=static_cast<int>(index/columns),column=static_cast<int>(index%columns);
+  const rpmd_ja_local_basis::Term& term=terms[term_index];if(output_parameter<base_count)return;
+  const double coefficient=transform[static_cast<std::size_t>(term.parameter)*added_count+output_parameter-base_count];
+  if(coefficient==0.0)return;double projection=0.0;
+  for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+    projection+=term.coefficient[site].x*ambient[static_cast<std::size_t>(column)*d+atom]/sqrt_mass[atom];
+    projection+=term.coefficient[site].y*ambient[static_cast<std::size_t>(column)*d+n+atom]/sqrt_mass[atom];
+    projection+=term.coefficient[site].z*ambient[static_cast<std::size_t>(column)*d+2*n+atom]/sqrt_mass[atom];}
+  const double scale=coefficient*term.weight*projection;
+  for(int site=0;site<term.atom_count;++site){const int atom=term.site[site].atom;
+    covariance_atomic_add(action+static_cast<std::size_t>(column)*d+atom,scale*term.coefficient[site].x/sqrt_mass[atom]);
+    covariance_atomic_add(action+static_cast<std::size_t>(column)*d+n+atom,scale*term.coefficient[site].y/sqrt_mass[atom]);
+    covariance_atomic_add(action+static_cast<std::size_t>(column)*d+2*n+atom,scale*term.coefficient[site].z/sqrt_mass[atom]);}
+}
+
+__global__ void covariance_scatter_local_terms(double* matrix,const rpmd_ja_local_basis::Term* terms,
+  const double* raw_theta,const double* sqrt_mass,const int term_count,const int n,const int d)
+{
+  const int term_index=static_cast<int>(blockIdx.x*blockDim.x+threadIdx.x);if(term_index>=term_count)return;
+  const rpmd_ja_local_basis::Term& term=terms[term_index];const double scale=term.weight*raw_theta[term.parameter];
+  for(int i=0;i<term.atom_count;++i)for(int j=0;j<term.atom_count;++j)
+    for(int a=0;a<3;++a)for(int b=0;b<3;++b){
+      const double ci=a==0?term.coefficient[i].x:(a==1?term.coefficient[i].y:term.coefficient[i].z);
+      const double cj=b==0?term.coefficient[j].x:(b==1?term.coefficient[j].y:term.coefficient[j].z);
+      const int row=a*n+term.site[i].atom,column=b*n+term.site[j].atom;
+      const double value=scale*ci*cj/(sqrt_mass[term.site[i].atom]*sqrt_mass[term.site[j].atom]);
+      covariance_atomic_add(matrix+static_cast<std::size_t>(row)*d+column,value);}
+}
+
+__global__ void covariance_accumulate_local_trace(double* raw_trace,const double* ambient,const double* sqrt_mass,
+  const rpmd_ja_local_basis::Term* terms,const int term_count,const int n,const int d,const int source_begin,
+  const int columns)
+{
+  const std::size_t index=static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(index>=static_cast<std::size_t>(term_count)*9)return;
+  const int term_index=static_cast<int>(index/9),source_slot=static_cast<int>(index%9);
+  const rpmd_ja_local_basis::Term& term=terms[term_index];const int site=source_slot/3,axis=source_slot%3;
+  if(site>=term.atom_count)return;const int atom=term.site[site].atom,source=axis*n+atom;
+  if(source<source_begin||source>=source_begin+columns)return;const int column=source-source_begin;double contraction=0.0;
+  for(int k=0;k<term.atom_count;++k){const int other=term.site[k].atom;
+    contraction+=term.coefficient[k].x*ambient[static_cast<std::size_t>(column)*d+other]/sqrt_mass[other];
+    contraction+=term.coefficient[k].y*ambient[static_cast<std::size_t>(column)*d+n+other]/sqrt_mass[other];
+    contraction+=term.coefficient[k].z*ambient[static_cast<std::size_t>(column)*d+2*n+other]/sqrt_mass[other];}
+  const double source_coefficient=axis==0?term.coefficient[site].x:(axis==1?term.coefficient[site].y:term.coefficient[site].z);
+  covariance_atomic_add(raw_trace+term.parameter,term.weight*contraction*source_coefficient/sqrt_mass[atom]);
+}
+
+__global__ void covariance_gather_compact_batch(const double* ambient,double* compact,const int* compact_to_full,
+  const int d,const int r,const int columns)
+{
+  const std::size_t index=static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(index>=static_cast<std::size_t>(r)*columns)return;
+  const int row=static_cast<int>(index%r),column=static_cast<int>(index/r);
+  compact[index]=ambient[static_cast<std::size_t>(column)*d+compact_to_full[row]];
+}
+
+__global__ void covariance_scale_parameter_block(double* values,const double scale,const std::size_t count)
+{
+  const std::size_t index=static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(index<count)values[index]*=scale;
+}
+
+__global__ void covariance_column_relative_residual(const double* residual,const double* rhs,double* ratios,
+  const int rows,const int columns)
+{
+  __shared__ double residual_sum[256],rhs_sum[256];const int column=static_cast<int>(blockIdx.x),lane=static_cast<int>(threadIdx.x);
+  double residual_value=0.0,rhs_value=0.0;
+  for(int row=lane;row<rows;row+=blockDim.x){const double r=residual[static_cast<std::size_t>(column)*rows+row];
+    const double b=rhs[static_cast<std::size_t>(column)*rows+row];residual_value+=r*r;rhs_value+=b*b;}
+  residual_sum[lane]=residual_value;rhs_sum[lane]=rhs_value;__syncthreads();
+  for(int stride=blockDim.x/2;stride>0;stride>>=1){if(lane<stride){residual_sum[lane]+=residual_sum[lane+stride];rhs_sum[lane]+=rhs_sum[lane+stride];}__syncthreads();}
+  if(lane==0&&column<columns)ratios[column]=sqrt(residual_sum[0])/fmax(sqrt(rhs_sum[0]),1e-300);
+}
+
 __global__ void covariance_householder_dots(const double* ambient,const double* householder,double* dots,
   const int n,const int d,const int columns)
 {
@@ -2762,7 +4488,8 @@ __global__ void covariance_log_diagonal(const double* factor,double* values,cons
 {const int i=static_cast<int>(blockIdx.x*blockDim.x+threadIdx.x);if(i<n)values[i]=factor[static_cast<std::size_t>(i)*n+i];}
 
 int covariance_parameter_count(const Graph& graph)
-{if(graph.type_pairs.empty()||graph.type_pairs.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()/6))throw std::runtime_error("native covariance fit parameter count is invalid");return static_cast<int>(6*graph.type_pairs.size());}
+{if(graph.raw_local_parameter_count>0){if(graph.parameter_count<=0||graph.parameter_count<graph.base_parameter_count||graph.base_parameter_count!=6*static_cast<int>(graph.type_pairs.size()))throw std::runtime_error("native covariance fit M1 parameter count is invalid");return graph.parameter_count;}
+ if(graph.type_pairs.empty()||graph.type_pairs.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()/6))throw std::runtime_error("native covariance fit parameter count is invalid");return static_cast<int>(6*graph.type_pairs.size());}
 
 int covariance_edge_count(const Graph& graph)
 {if(graph.edges.empty()||graph.edges.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))throw std::runtime_error("native covariance fit edge count is invalid");return static_cast<int>(graph.edges.size());}
@@ -2842,10 +4569,29 @@ struct CovarianceFitTestHooks
   int gradient_residual_failure_iteration=0;
   int trace_solution_failure_column=-1;
   double trace_solution_failure_delta=0.0;
+  int independent_curvature_hard_failures_remaining=0;
+  int directional_curvature_reference_checks=0;
+  int directional_curvature_step_checks=0;
+  int trust_region_forced_rejections_remaining=0;
+  int checkpoint_interruptions_remaining=0;
+  bool fail_after_prepare_publication=false;
+  bool fail_between_reference_and_sidecar_renames=false;
   std::uint64_t objective_evaluation_budget_after_baseline=0;
   std::vector<double> current_trial_theta,last_residual_rejected_theta;
 };
 CovarianceFitTestHooks covariance_fit_test_hooks;
+void maybe_fail_after_prepare_publication_for_test()
+{
+  if(covariance_fit_test_hooks.fail_after_prepare_publication){
+    covariance_fit_test_hooks.fail_after_prepare_publication=false;
+    throw std::runtime_error("TEST_PREPARE_POST_PUBLICATION_FAILURE");}
+}
+void maybe_fail_between_publication_renames_for_test()
+{
+  if(covariance_fit_test_hooks.fail_between_reference_and_sidecar_renames){
+    covariance_fit_test_hooks.fail_between_reference_and_sidecar_renames=false;
+    throw std::runtime_error("TEST_PUBLICATION_INTERRUPTED_BETWEEN_RENAMES");}
+}
 #endif
 
 bool covariance_trace_diagnostics_pass(const CovarianceTraceDiagnostics& diagnostic,const int total_rhs_columns)
@@ -2857,64 +4603,164 @@ bool covariance_saved_gradient_diagnostics_pass(const CovarianceTraceDiagnostics
 {return covariance_trace_diagnostics_pass(baseline_d,total_rhs_columns)&&covariance_trace_diagnostics_pass(saved_d,total_rhs_columns)&&
   covariance_trace_diagnostics_pass(saved_shifted,total_rhs_columns);}
 
+struct CovarianceWallSeconds
+{
+  double* total=nullptr;double* latest=nullptr;
+  std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
+  explicit CovarianceWallSeconds(double* accumulated=nullptr,double* last=nullptr):total(accumulated),latest(last){}
+  ~CovarianceWallSeconds(){const double seconds=std::chrono::duration<double>(
+      std::chrono::steady_clock::now()-started).count();
+    if(total)*total+=seconds;if(latest)*latest=seconds;}
+};
+
+struct DeviceCovarianceSystemWorkspace
+{
+  rpmd_ja_device::DeviceBuffer<double> full,compact,shifted,householder,product,matrix_product,theta_device,raw_theta_device;
+  rpmd_ja_device::DeviceBuffer<double> basis_base_mix,basis_local_transform,local_trace,sqrt_mass,rhs,trace_rhs,rhs_check,rhs_temp;
+  rpmd_ja_device::DeviceBuffer<double> ambient,dots,diagonal,edge_cov_left,edge_cov_right,solver_work;
+  rpmd_ja_device::DeviceBuffer<int> edge_i,edge_j,edge_group,compact_to_full,full_to_compact,info;
+  rpmd_ja_device::DeviceBuffer<rpmd_ja_local_basis::Term> local_terms;
+  cublasHandle_t blas=nullptr;cusolverDnHandle_t solver=nullptr;
+  std::string static_graph_identity;const DeviceBaseline* active_baseline=nullptr;std::uint64_t active_baseline_generation=0;
+  int static_n=0,static_d=0,static_r=0,static_p=0;std::vector<double> static_sqrt_mass;
+  std::uint64_t allocation_count=0,static_upload_count=0,static_upload_bytes=0,factorization_count=0;
+  bool factor_cache_valid=false;std::vector<double> factor_theta;double factor_epsilon=std::numeric_limits<double>::quiet_NaN();
+  std::string factor_graph_identity;const DeviceBaseline* factor_baseline=nullptr;std::uint64_t factor_baseline_generation=0;
+  int factor_n=0,factor_d=0,factor_r=0,factor_p=0;double factor_logdet=0.0,factor_shifted_logdet=0.0;
+  ~DeviceCovarianceSystemWorkspace(){if(solver)cusolverDnDestroy(solver);if(blas)cublasDestroy(blas);}
+};
+
 struct DeviceCovarianceSystem
 {
   static constexpr int solve_batch=32;
   static constexpr int trace_solve_batch=128;
   static constexpr int trace_residual_batch=solve_batch;
-  DeviceBaseline& baseline;const Graph& graph;int n=0,d=0,r=0,p=0,edge_count=0,lwork=0;
+  DeviceBaseline& baseline;const Graph& graph;int n=0,d=0,r=0,p=0,base_p=0,raw_p=0,added_p=0,local_term_count=0,edge_count=0,lwork=0;
+  rpmd_ja_device::CovarianceFitWorkspace owned_fit_workspace;
+  rpmd_ja_device::CovarianceFitWorkspace* fit_workspace=&owned_fit_workspace;
+  bool owns_fit_workspace=true;
+  DeviceCovarianceSystemWorkspace owned_system_workspace;
+  DeviceCovarianceSystemWorkspace* system_workspace=&owned_system_workspace;
+  std::string graph_identity;
   std::vector<double> parameter_basis_norms,sqrt_mass_host,sqrt_atom_host;
   std::vector<double> householder_host;
-  double *full=nullptr,*compact=nullptr,*shifted=nullptr,*householder=nullptr,*product=nullptr,*matrix_product=nullptr,*theta_device=nullptr;
+  double *full=nullptr,*compact=nullptr,*shifted=nullptr,*householder=nullptr,*product=nullptr,*matrix_product=nullptr,*theta_device=nullptr,*raw_theta_device=nullptr;
+  double *basis_base_mix_device=nullptr,*basis_local_transform_device=nullptr,*local_trace_device=nullptr;
+  rpmd_ja_local_basis::Term* local_terms_device=nullptr;
   double *sqrt_mass_device=nullptr,*rhs=nullptr,*trace_rhs=nullptr,*rhs_check=nullptr,*rhs_temp=nullptr,*ambient=nullptr,*dots=nullptr,*diagonal=nullptr;
   double *edge_cov_left=nullptr,*edge_cov_right=nullptr,*solver_work=nullptr;int *edge_i=nullptr,*edge_j=nullptr,*edge_group=nullptr;
   int *compact_to_full=nullptr,*full_to_compact=nullptr,*info=nullptr;cublasHandle_t blas=nullptr;cusolverDnHandle_t solver=nullptr;
-  std::uint64_t factorizations=0,solve_rhs_columns=0,trace_solve_calls=0,assembly_generation=0;double worst_solve_relative_residual=0.0;
+  std::uint64_t factorizations=0,solve_rhs_columns=0,trace_solve_calls=0,assembly_generation=0,graph_assembly_generation=1;
+  double factorization_wall_seconds=0.0;
+  bool factors_valid=false;std::vector<double> factor_theta;double factor_epsilon=std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t factor_assembly_generation=0;
+  std::function<void()> before_factor;
+  double worst_solve_relative_residual=0.0;
   CovarianceRunTraceResidualSummary run_trace_residual_summary;
   CovarianceTraceDiagnostics last_d_trace,last_shifted_trace;
 
   DeviceCovarianceSystem(DeviceBaseline& base,const Graph& fixed_graph,const std::vector<double>& sqrt_mass,
-    const std::vector<double>& masses)
+    const std::vector<double>& masses,rpmd_ja_device::CovarianceFitWorkspace* shared_fit_workspace=nullptr,
+    DeviceCovarianceSystemWorkspace* shared_system_workspace=nullptr)
     :baseline(base),graph(fixed_graph),n(static_cast<int>(masses.size())),d(3*n),r(d-3),
      p(covariance_parameter_count(fixed_graph)),edge_count(covariance_edge_count(fixed_graph))
-  {try{initialize(sqrt_mass,masses);}catch(...){release();throw;}}
+  {if(shared_fit_workspace){fit_workspace=shared_fit_workspace;owns_fit_workspace=false;}
+    if(shared_system_workspace)system_workspace=shared_system_workspace;
+    try{initialize(sqrt_mass,masses);}catch(...){release();throw;}}
   ~DeviceCovarianceSystem(){release();}
 
   void release()
   {
-    if(solver){cusolverDnDestroy(solver);solver=nullptr;}if(blas){cublasDestroy(blas);blas=nullptr;}
-    double** values[]={&full,&compact,&shifted,&householder,&product,&matrix_product,&theta_device,&sqrt_mass_device,&rhs,&trace_rhs,&rhs_check,&rhs_temp,&ambient,&dots,&diagonal,&edge_cov_left,&edge_cov_right,&solver_work};
-    for(double** value:values)if(*value){cudaFree(*value);*value=nullptr;}
-    int** indices[]={&edge_i,&edge_j,&edge_group,&compact_to_full,&full_to_compact,&info};
-    for(int** value:indices)if(*value){cudaFree(*value);*value=nullptr;}
+    if(owns_fit_workspace)fit_workspace->release_curvature();
+    full=compact=shifted=householder=product=matrix_product=theta_device=raw_theta_device=nullptr;
+    basis_base_mix_device=basis_local_transform_device=local_trace_device=sqrt_mass_device=rhs=trace_rhs=rhs_check=rhs_temp=nullptr;
+    ambient=dots=diagonal=edge_cov_left=edge_cov_right=solver_work=nullptr;
+    edge_i=edge_j=edge_group=compact_to_full=full_to_compact=info=nullptr;local_terms_device=nullptr;
+    blas=nullptr;solver=nullptr;factors_valid=false;
   }
 
   void initialize(const std::vector<double>& sqrt_mass,const std::vector<double>& masses)
   {
     sqrt_mass_host=sqrt_mass;sqrt_atom_host.resize(masses.size());
     for(std::size_t i=0;i<masses.size();++i)sqrt_atom_host[i]=std::sqrt(masses[i]);
+    const bool m1=graph.raw_local_parameter_count>0;base_p=m1?graph.base_parameter_count:p;
+    raw_p=m1?graph.raw_local_parameter_count:0;added_p=p-base_p;
+    if(m1){if(added_p<0||graph.local_base_mix.size()!=static_cast<std::size_t>(base_p)*added_p||
+        graph.local_transform.size()!=static_cast<std::size_t>(raw_p)*added_p||
+        graph.parameter_basis_norms.size()!=static_cast<std::size_t>(p)||
+        graph.local_terms.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("native covariance fit M1 operator metadata dimensions are invalid");
+      local_term_count=static_cast<int>(graph.local_terms.size());}
     if(n<2||d!=baseline.d||r<=0||p<=0||edge_count<=0||sqrt_mass.size()!=static_cast<std::size_t>(d)||
        graph.edges.size()>static_cast<std::size_t>(std::numeric_limits<int>::max())||
        static_cast<std::size_t>(d)>std::numeric_limits<std::size_t>::max()/static_cast<std::size_t>(d)/sizeof(double)||
        static_cast<std::size_t>(r)>std::numeric_limits<std::size_t>::max()/static_cast<std::size_t>(r)/sizeof(double))
       throw std::runtime_error("native covariance fit dimensions are invalid");
-    const std::size_t full_bytes=static_cast<std::size_t>(d)*d*sizeof(double),compact_bytes=static_cast<std::size_t>(r)*r*sizeof(double);
-    const std::size_t trace_columns=static_cast<std::size_t>(std::min(d,trace_solve_batch));
+    const std::size_t trace_columns=trace_solve_batch;
     if(static_cast<std::size_t>(d)>std::numeric_limits<std::size_t>::max()/solve_batch/sizeof(double)||
        static_cast<std::size_t>(r)>std::numeric_limits<std::size_t>::max()/trace_columns/sizeof(double)||
        graph.edges.size()>std::numeric_limits<std::size_t>::max()/18/sizeof(double))
       throw std::runtime_error("native covariance fit workspace size overflows");
-    const std::size_t batch_bytes=static_cast<std::size_t>(d)*solve_batch*sizeof(double);
-    const std::size_t trace_rhs_bytes=static_cast<std::size_t>(r)*trace_columns*sizeof(double);
     const std::size_t edge_bytes=graph.edges.size()*9*sizeof(double);
-    std::size_t required=full_bytes;
-    for(const std::size_t amount:{compact_bytes,compact_bytes,batch_bytes,batch_bytes,batch_bytes,batch_bytes,batch_bytes,trace_rhs_bytes,2*edge_bytes,
-        static_cast<std::size_t>(3)*d*sizeof(double),static_cast<std::size_t>(4)*d*sizeof(double),
-        static_cast<std::size_t>(3)*graph.edges.size()*sizeof(int),static_cast<std::size_t>(d+r)*sizeof(int),
-        static_cast<std::size_t>(p)*sizeof(double),static_cast<std::size_t>(r)*sizeof(double)}){
-      if(amount>std::numeric_limits<std::size_t>::max()-required)throw std::runtime_error("native covariance fit workspace size overflows");required+=amount;}
-    std::size_t free_bytes=0,total_bytes=0;if(cudaMemGetInfo(&free_bytes,&total_bytes)!=cudaSuccess||required>free_bytes||free_bytes-required<512ULL*1024*1024)
-      throw std::runtime_error("native covariance fit exact-Cholesky workspace preflight leaves less than 512 MiB safety margin");
+    const std::size_t local_term_bytes=graph.local_terms.size()*sizeof(rpmd_ja_local_basis::Term);
+    if(static_cast<std::size_t>(base_p)>std::numeric_limits<std::size_t>::max()/std::max(1,added_p)/sizeof(double)||
+       static_cast<std::size_t>(raw_p)>std::numeric_limits<std::size_t>::max()/std::max(1,added_p)/sizeof(double))
+      throw std::runtime_error("native covariance fit M1 operator-map workspace overflows");
+    const std::size_t base_mix_bytes=static_cast<std::size_t>(base_p)*added_p*sizeof(double);
+    const std::size_t local_map_bytes=static_cast<std::size_t>(raw_p)*added_p*sizeof(double);
+    std::vector<std::uint64_t> current_workspace_bytes,requested_workspace_bytes;
+    current_workspace_bytes.reserve(32);requested_workspace_bytes.reserve(32);
+    auto append_workspace_capacity=[&](const std::size_t current_count,const std::size_t requested_count,const std::size_t element_bytes){
+      if(current_count>std::numeric_limits<std::uint64_t>::max()/element_bytes||
+         requested_count>std::numeric_limits<std::uint64_t>::max()/element_bytes)
+        throw std::runtime_error("native covariance fit workspace capacity overflows");
+      current_workspace_bytes.push_back(static_cast<std::uint64_t>(current_count*element_bytes));
+      requested_workspace_bytes.push_back(static_cast<std::uint64_t>(requested_count*element_bytes));};
+    append_workspace_capacity(system_workspace->full.capacity(),static_cast<std::size_t>(d)*d,sizeof(double));
+    append_workspace_capacity(system_workspace->compact.capacity(),static_cast<std::size_t>(r)*r,sizeof(double));
+    append_workspace_capacity(system_workspace->shifted.capacity(),static_cast<std::size_t>(r)*r,sizeof(double));
+    append_workspace_capacity(system_workspace->householder.capacity(),static_cast<std::size_t>(3)*d,sizeof(double));
+    append_workspace_capacity(system_workspace->product.capacity(),d,sizeof(double));
+    append_workspace_capacity(system_workspace->matrix_product.capacity(),static_cast<std::size_t>(d)*solve_batch,sizeof(double));
+    append_workspace_capacity(system_workspace->theta_device.capacity(),p,sizeof(double));
+    append_workspace_capacity(system_workspace->raw_theta_device.capacity(),raw_p,sizeof(double));
+    append_workspace_capacity(system_workspace->basis_base_mix.capacity(),static_cast<std::size_t>(base_p)*added_p,sizeof(double));
+    append_workspace_capacity(system_workspace->basis_local_transform.capacity(),static_cast<std::size_t>(raw_p)*added_p,sizeof(double));
+    append_workspace_capacity(system_workspace->local_trace.capacity(),raw_p,sizeof(double));
+    append_workspace_capacity(system_workspace->sqrt_mass.capacity(),n,sizeof(double));
+    append_workspace_capacity(system_workspace->rhs.capacity(),static_cast<std::size_t>(r)*solve_batch,sizeof(double));
+    append_workspace_capacity(system_workspace->rhs_check.capacity(),static_cast<std::size_t>(r)*solve_batch,sizeof(double));
+    append_workspace_capacity(system_workspace->rhs_temp.capacity(),static_cast<std::size_t>(r)*solve_batch,sizeof(double));
+    append_workspace_capacity(system_workspace->trace_rhs.capacity(),static_cast<std::size_t>(r)*trace_columns,sizeof(double));
+    append_workspace_capacity(system_workspace->ambient.capacity(),static_cast<std::size_t>(d)*solve_batch,sizeof(double));
+    append_workspace_capacity(system_workspace->dots.capacity(),static_cast<std::size_t>(3)*solve_batch,sizeof(double));
+    append_workspace_capacity(system_workspace->diagonal.capacity(),r,sizeof(double));
+    append_workspace_capacity(system_workspace->edge_cov_left.capacity(),graph.edges.size()*9,sizeof(double));
+    append_workspace_capacity(system_workspace->edge_cov_right.capacity(),graph.edges.size()*9,sizeof(double));
+    append_workspace_capacity(system_workspace->edge_i.capacity(),edge_count,sizeof(int));
+    append_workspace_capacity(system_workspace->edge_j.capacity(),edge_count,sizeof(int));
+    append_workspace_capacity(system_workspace->edge_group.capacity(),edge_count,sizeof(int));
+    append_workspace_capacity(system_workspace->compact_to_full.capacity(),r,sizeof(int));
+    append_workspace_capacity(system_workspace->full_to_compact.capacity(),d,sizeof(int));
+    append_workspace_capacity(system_workspace->info.capacity(),1,sizeof(int));
+    append_workspace_capacity(system_workspace->local_terms.capacity(),graph.local_terms.size(),sizeof(rpmd_ja_local_basis::Term));
+    std::size_t free_bytes=0,total_bytes=0;if(cudaMemGetInfo(&free_bytes,&total_bytes)!=cudaSuccess)
+      throw std::runtime_error("native covariance fit CUDA workspace preflight failed");
+    std::uint64_t workspace_growth_peak_bytes=0;
+    if(!rpmd_ja_feasibility::estimate_workspace_growth_peak_bytes(current_workspace_bytes.data(),
+         requested_workspace_bytes.data(),requested_workspace_bytes.size(),workspace_growth_peak_bytes))
+      throw std::runtime_error("native covariance fit workspace growth estimate overflows");
+    rpmd_ja_feasibility::ResourcePlan allocation_plan;
+    for(auto& stage:allocation_plan.stages)stage.host_known=stage.device_known=stage.disk_known=true;
+    allocation_plan.stages[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::FIT)].transient_device_bytes=
+      workspace_growth_peak_bytes;
+    const auto allocation_peak=rpmd_ja_feasibility::estimate_resource_peaks(allocation_plan);
+    const std::uint64_t device_capacity=free_bytes>512ULL*1024*1024?
+      static_cast<std::uint64_t>(free_bytes)-512ULL*1024*1024:0;
+    const auto allocation_gate=rpmd_ja_feasibility::resource_capacity_gate(allocation_peak,
+      std::numeric_limits<std::uint64_t>::max(),device_capacity,std::numeric_limits<std::uint64_t>::max());
+    if(allocation_gate!=rpmd_ja_feasibility::ResourceGateResult::PEAK_WITHIN_CAPACITY_ESTIMATE)
+      throw std::runtime_error("native covariance fit workspace growth leaves less than 512 MiB safety margin");
     std::vector<int> host_ctf(r),host_ftc(d,-1),host_i(edge_count),host_j(edge_count),host_group(edge_count);
     for(int k=0,index=0;k<d;++k)if(k!=0&&k!=n&&k!=2*n){host_ctf[index]=k;host_ftc[k]=index++;}
     for(int e=0;e<edge_count;++e){host_i[e]=graph.edges[e].i;host_j[e]=graph.edges[e].j;host_group[e]=graph.edges[e].group;}
@@ -2925,39 +4771,112 @@ struct DeviceCovarianceSystem
     // The off-diagonal parameter basis occupies two symmetric coordinate blocks.
     std::vector<NeumaierAccumulator> group_norm_squared(groups);for(const auto& entry:group_diagonal)
       group_norm_squared[entry.first.first].add_product(entry.second,entry.second);
-    parameter_basis_norms.resize(static_cast<std::size_t>(p));
-    for(std::size_t group=0;group<groups;++group){group_norm_squared[group].add(2.0*group_off_diagonal[group]);const double diagonal_norm=std::sqrt(group_norm_squared[group].value());if(!(diagonal_norm>0.0)||!std::isfinite(diagonal_norm))throw std::runtime_error("native covariance fit parameter basis norm is invalid");
-      for(const int index:{0,3,5})parameter_basis_norms[6*group+index]=diagonal_norm;
-      for(const int index:{1,2,4})parameter_basis_norms[6*group+index]=std::sqrt(2.0)*diagonal_norm;}
+    if(m1)parameter_basis_norms=graph.parameter_basis_norms;
+    else{parameter_basis_norms.resize(static_cast<std::size_t>(p));
+      for(std::size_t group=0;group<groups;++group){group_norm_squared[group].add(2.0*group_off_diagonal[group]);const double diagonal_norm=std::sqrt(group_norm_squared[group].value());if(!(diagonal_norm>0.0)||!std::isfinite(diagonal_norm))throw std::runtime_error("native covariance fit parameter basis norm is invalid");
+        for(const int index:{0,3,5})parameter_basis_norms[6*group+index]=diagonal_norm;
+        for(const int index:{1,2,4})parameter_basis_norms[6*group+index]=std::sqrt(2.0)*diagonal_norm;}}
     householder_host.assign(static_cast<std::size_t>(3)*d,0.0);const double mass_sum=std::accumulate(masses.begin(),masses.end(),0.0);
     if(!std::isfinite(mass_sum)||!(mass_sum>0.0))throw std::runtime_error("native covariance fit total mass is invalid");
     for(int axis=0;axis<3;++axis){double norm2=0.0;for(int i=0;i<n;++i){const int k=axis*n+i;householder_host[static_cast<std::size_t>(axis)*d+k]=sqrt_mass[k]/std::sqrt(mass_sum);if(i==0)householder_host[static_cast<std::size_t>(axis)*d+k]-=1.0;norm2+=householder_host[static_cast<std::size_t>(axis)*d+k]*householder_host[static_cast<std::size_t>(axis)*d+k];}
       if(!(norm2>0.0)||!std::isfinite(norm2))throw std::runtime_error("native covariance fit translation Householder is degenerate");const double inv=1.0/std::sqrt(norm2);for(int i=0;i<n;++i)householder_host[static_cast<std::size_t>(axis)*d+axis*n+i]*=inv;}
-    auto alloc_double=[](double** out,const std::size_t count){if(cudaMalloc(reinterpret_cast<void**>(out),std::max<std::size_t>(1,count)*sizeof(double))!=cudaSuccess)throw std::runtime_error("native covariance fit GPU allocation failed");};
-    auto alloc_int=[](int** out,const std::size_t count){if(cudaMalloc(reinterpret_cast<void**>(out),std::max<std::size_t>(1,count)*sizeof(int))!=cudaSuccess)throw std::runtime_error("native covariance fit GPU allocation failed");};
-    alloc_double(&full,static_cast<std::size_t>(d)*d);alloc_double(&compact,static_cast<std::size_t>(r)*r);alloc_double(&shifted,static_cast<std::size_t>(r)*r);
-    alloc_double(&householder,static_cast<std::size_t>(3)*d);alloc_double(&product,d);alloc_double(&matrix_product,static_cast<std::size_t>(d)*solve_batch);alloc_double(&theta_device,p);alloc_double(&sqrt_mass_device,n);
-    alloc_double(&rhs,static_cast<std::size_t>(r)*solve_batch);alloc_double(&rhs_check,static_cast<std::size_t>(r)*solve_batch);alloc_double(&rhs_temp,static_cast<std::size_t>(r)*solve_batch);
-    alloc_double(&trace_rhs,static_cast<std::size_t>(r)*trace_columns);
-    alloc_double(&ambient,static_cast<std::size_t>(d)*solve_batch);alloc_double(&dots,static_cast<std::size_t>(3)*solve_batch);alloc_double(&diagonal,r);
-    alloc_double(&edge_cov_left,graph.edges.size()*9);alloc_double(&edge_cov_right,graph.edges.size()*9);
-    alloc_int(&edge_i,edge_count);alloc_int(&edge_j,edge_count);alloc_int(&edge_group,edge_count);alloc_int(&compact_to_full,r);alloc_int(&full_to_compact,d);alloc_int(&info,1);
-    if(cudaMemcpy(householder,householder_host.data(),householder_host.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
-       cudaMemcpy(sqrt_mass_device,sqrt_mass.data(),static_cast<std::size_t>(n)*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
-       cudaMemcpy(edge_i,host_i.data(),host_i.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
-       cudaMemcpy(edge_j,host_j.data(),host_j.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
-       cudaMemcpy(edge_group,host_group.data(),host_group.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
-       cudaMemcpy(compact_to_full,host_ctf.data(),host_ctf.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
-       cudaMemcpy(full_to_compact,host_ftc.data(),host_ftc.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess)
-      throw std::runtime_error("native covariance fit static workspace upload failed");
-    if(cublasCreate(&blas)!=CUBLAS_STATUS_SUCCESS||cusolverDnCreate(&solver)!=CUSOLVER_STATUS_SUCCESS)
-      throw std::runtime_error("native covariance fit cuBLAS/cuSOLVER handle creation failed");
+    graph_identity=covariance_graph_content_sha256(graph);
+    const bool upload_graph_static=system_workspace->static_graph_identity!=graph_identity||
+      system_workspace->static_sqrt_mass!=sqrt_mass||system_workspace->static_n!=n||
+      system_workspace->static_d!=d||system_workspace->static_r!=r||system_workspace->static_p!=p;
+    const bool baseline_identity_changed=system_workspace->active_baseline!=&baseline||
+      system_workspace->active_baseline_generation!=baseline.identity_generation;
+    if(upload_graph_static||baseline_identity_changed)system_workspace->factor_cache_valid=false;
+    auto reserve_double=[&](auto& buffer,double*& pointer,const std::size_t count,const char* label){
+      const std::size_t before=buffer.capacity();buffer.reserve(count,label);
+      if(buffer.capacity()>before)++system_workspace->allocation_count;pointer=buffer.data();};
+    auto reserve_int=[&](auto& buffer,int*& pointer,const std::size_t count,const char* label){
+      const std::size_t before=buffer.capacity();buffer.reserve(count,label);
+      if(buffer.capacity()>before)++system_workspace->allocation_count;pointer=buffer.data();};
+    reserve_double(system_workspace->full,full,static_cast<std::size_t>(d)*d,"covariance full matrix");
+    reserve_double(system_workspace->compact,compact,static_cast<std::size_t>(r)*r,"covariance compact matrix");
+    reserve_double(system_workspace->shifted,shifted,static_cast<std::size_t>(r)*r,"covariance shifted matrix");
+    reserve_double(system_workspace->householder,householder,static_cast<std::size_t>(3)*d,"covariance Householder vectors");
+    reserve_double(system_workspace->product,product,d,"covariance product");
+    reserve_double(system_workspace->matrix_product,matrix_product,static_cast<std::size_t>(d)*solve_batch,"covariance matrix product");
+    reserve_double(system_workspace->theta_device,theta_device,p,"covariance parameters");
+    reserve_double(system_workspace->raw_theta_device,raw_theta_device,raw_p,"covariance local parameters");
+    reserve_double(system_workspace->basis_base_mix,basis_base_mix_device,static_cast<std::size_t>(base_p)*added_p,"covariance base mix");
+    reserve_double(system_workspace->basis_local_transform,basis_local_transform_device,static_cast<std::size_t>(raw_p)*added_p,"covariance local transform");
+    reserve_double(system_workspace->local_trace,local_trace_device,raw_p,"covariance local trace");
+    reserve_double(system_workspace->sqrt_mass,sqrt_mass_device,n,"covariance atom masses");
+    reserve_double(system_workspace->rhs,rhs,static_cast<std::size_t>(r)*solve_batch,"covariance rhs");
+    reserve_double(system_workspace->rhs_check,rhs_check,static_cast<std::size_t>(r)*solve_batch,"covariance rhs check");
+    reserve_double(system_workspace->rhs_temp,rhs_temp,static_cast<std::size_t>(r)*solve_batch,"covariance rhs temporary");
+    reserve_double(system_workspace->trace_rhs,trace_rhs,static_cast<std::size_t>(r)*trace_columns,"covariance trace rhs");
+    reserve_double(system_workspace->ambient,ambient,static_cast<std::size_t>(d)*solve_batch,"covariance ambient workspace");
+    reserve_double(system_workspace->dots,dots,static_cast<std::size_t>(3)*solve_batch,"covariance Householder dots");
+    reserve_double(system_workspace->diagonal,diagonal,r,"covariance Cholesky diagonal");
+    reserve_double(system_workspace->edge_cov_left,edge_cov_left,graph.edges.size()*9,"covariance edge trace left");
+    reserve_double(system_workspace->edge_cov_right,edge_cov_right,graph.edges.size()*9,"covariance edge trace right");
+    reserve_int(system_workspace->edge_i,edge_i,edge_count,"covariance edge i");
+    reserve_int(system_workspace->edge_j,edge_j,edge_count,"covariance edge j");
+    reserve_int(system_workspace->edge_group,edge_group,edge_count,"covariance edge groups");
+    reserve_int(system_workspace->compact_to_full,compact_to_full,r,"covariance compact map");
+    reserve_int(system_workspace->full_to_compact,full_to_compact,d,"covariance full map");
+    reserve_int(system_workspace->info,info,1,"covariance solver info");
+    const std::size_t old_term_capacity=system_workspace->local_terms.capacity();
+    system_workspace->local_terms.reserve(graph.local_terms.size(),"covariance M1 terms");
+    if(system_workspace->local_terms.capacity()>old_term_capacity)++system_workspace->allocation_count;
+    local_terms_device=system_workspace->local_terms.data();
+    if(!system_workspace->blas&&cublasCreate(&system_workspace->blas)!=CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("native covariance fit cuBLAS handle creation failed");
+    if(!system_workspace->solver&&cusolverDnCreate(&system_workspace->solver)!=CUSOLVER_STATUS_SUCCESS)
+      throw std::runtime_error("native covariance fit cuSOLVER handle creation failed");
+    blas=system_workspace->blas;solver=system_workspace->solver;
+    if(upload_graph_static){
+      if(cudaMemcpy(householder,householder_host.data(),householder_host.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
+         cudaMemcpy(sqrt_mass_device,sqrt_mass.data(),static_cast<std::size_t>(n)*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
+         cudaMemcpy(edge_i,host_i.data(),host_i.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
+         cudaMemcpy(edge_j,host_j.data(),host_j.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
+         cudaMemcpy(edge_group,host_group.data(),host_group.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
+         cudaMemcpy(compact_to_full,host_ctf.data(),host_ctf.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess||
+         cudaMemcpy(full_to_compact,host_ftc.data(),host_ftc.size()*sizeof(int),cudaMemcpyHostToDevice)!=cudaSuccess)
+        throw std::runtime_error("native covariance fit static workspace upload failed");
+      if(m1&&((!graph.local_terms.empty()&&cudaMemcpy(local_terms_device,graph.local_terms.data(),local_term_bytes,cudaMemcpyHostToDevice)!=cudaSuccess)||
+         (base_mix_bytes&&cudaMemcpy(basis_base_mix_device,graph.local_base_mix.data(),base_mix_bytes,cudaMemcpyHostToDevice)!=cudaSuccess)||
+         (local_map_bytes&&cudaMemcpy(basis_local_transform_device,graph.local_transform.data(),local_map_bytes,cudaMemcpyHostToDevice)!=cudaSuccess)))
+        throw std::runtime_error("native covariance fit M1 static operator upload failed");
+      system_workspace->static_graph_identity=graph_identity;system_workspace->static_sqrt_mass=sqrt_mass;
+      system_workspace->static_n=n;system_workspace->static_d=d;system_workspace->static_r=r;system_workspace->static_p=p;
+      ++system_workspace->static_upload_count;
+      system_workspace->static_upload_bytes+=householder_host.size()*sizeof(double)+sqrt_mass.size()*sizeof(double)+
+        host_i.size()*sizeof(int)+host_j.size()*sizeof(int)+host_group.size()*sizeof(int)+host_ctf.size()*sizeof(int)+
+        host_ftc.size()*sizeof(int)+local_term_bytes+base_mix_bytes+local_map_bytes;
+    }
+    system_workspace->active_baseline=&baseline;
+    system_workspace->active_baseline_generation=baseline.identity_generation;
     if(cusolverDnDpotrf_bufferSize(solver,CUBLAS_FILL_MODE_LOWER,r,compact,r,&lwork)!=CUSOLVER_STATUS_SUCCESS||lwork<=0)
       throw std::runtime_error("native covariance fit Cholesky workspace query failed");
-    std::size_t workspace_free=0,workspace_total=0;const std::size_t workspace_bytes=static_cast<std::size_t>(lwork)*sizeof(double);
-    if(cudaMemGetInfo(&workspace_free,&workspace_total)!=cudaSuccess||workspace_bytes>workspace_free||workspace_free-workspace_bytes<512ULL*1024*1024)
-      throw std::runtime_error("native covariance fit Cholesky workspace preflight leaves less than 512 MiB safety margin");
-    alloc_double(&solver_work,lwork);
+    std::size_t workspace_free=0,workspace_total=0;
+    if(cudaMemGetInfo(&workspace_free,&workspace_total)!=cudaSuccess)
+      throw std::runtime_error("native covariance fit Cholesky workspace preflight failed");
+    if(system_workspace->solver_work.capacity()>std::numeric_limits<std::uint64_t>::max()/sizeof(double)||
+       static_cast<std::size_t>(lwork)>std::numeric_limits<std::uint64_t>::max()/sizeof(double))
+      throw std::runtime_error("native covariance fit Cholesky workspace growth overflows");
+    const std::uint64_t solver_current_bytes=system_workspace->solver_work.capacity()*sizeof(double);
+    const std::uint64_t solver_requested_bytes=static_cast<std::uint64_t>(lwork)*sizeof(double);
+    std::uint64_t solver_growth_peak_bytes=0;
+    if(!rpmd_ja_feasibility::estimate_workspace_growth_peak_bytes(&solver_current_bytes,
+         &solver_requested_bytes,1,solver_growth_peak_bytes))
+      throw std::runtime_error("native covariance fit Cholesky workspace growth estimate overflows");
+    rpmd_ja_feasibility::ResourcePlan solver_allocation_plan;
+    for(auto& stage:solver_allocation_plan.stages)stage.host_known=stage.device_known=stage.disk_known=true;
+    solver_allocation_plan.stages[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::FIT)].device_library_workspace_bytes=
+      solver_growth_peak_bytes;
+    const auto solver_allocation_peak=rpmd_ja_feasibility::estimate_resource_peaks(solver_allocation_plan);
+    const std::uint64_t solver_device_capacity=workspace_free>512ULL*1024*1024?
+      static_cast<std::uint64_t>(workspace_free)-512ULL*1024*1024:0;
+    const auto solver_allocation_gate=rpmd_ja_feasibility::resource_capacity_gate(solver_allocation_peak,
+      std::numeric_limits<std::uint64_t>::max(),solver_device_capacity,std::numeric_limits<std::uint64_t>::max());
+    if(solver_allocation_gate!=rpmd_ja_feasibility::ResourceGateResult::PEAK_WITHIN_CAPACITY_ESTIMATE)
+      throw std::runtime_error("native covariance fit Cholesky workspace growth leaves less than 512 MiB safety margin");
+    reserve_double(system_workspace->solver_work,solver_work,static_cast<std::size_t>(lwork),"covariance solver work");
   }
 
   std::vector<double> coordinate_scales(const std::vector<double>& parameters,const double epsilon)
@@ -2975,12 +4894,21 @@ struct DeviceCovarianceSystem
 
   void assemble(const std::vector<double>& parameters)
   {
+    factors_valid=false;factor_theta.clear();factor_epsilon=std::numeric_limits<double>::quiet_NaN();factor_assembly_generation=0;
+    system_workspace->factor_cache_valid=false;
+    ++assembly_generation;
     if(parameters.size()!=static_cast<std::size_t>(p)||!std::all_of(parameters.begin(),parameters.end(),[](double x){return std::isfinite(x);}))
       throw std::runtime_error("native covariance fit parameter vector is invalid");
+    std::vector<double> base_parameters,raw_parameters;
+    if(raw_p){const EffectiveM1Parameters effective=effective_m1_parameters(graph,parameters);base_parameters=effective.base;raw_parameters=effective.raw;}
+    const std::vector<double>& edge_parameters=raw_p?base_parameters:parameters;
     if(cudaMemcpy(full,baseline.k,static_cast<std::size_t>(d)*d*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess||
-       cudaMemcpy(theta_device,parameters.data(),parameters.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)
+       cudaMemcpy(theta_device,edge_parameters.data(),edge_parameters.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
+       (raw_p&&cudaMemcpy(raw_theta_device,raw_parameters.data(),raw_parameters.size()*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess))
       throw std::runtime_error("native covariance fit matrix/parameter copy failed");
     covariance_scatter_additive<<<static_cast<unsigned>((edge_count+255)/256),256>>>(full,edge_i,edge_j,edge_group,theta_device,sqrt_mass_device,edge_count,n,d);
+    if(local_term_count)covariance_scatter_local_terms<<<static_cast<unsigned>((local_term_count+255)/256),256>>>(
+      full,local_terms_device,raw_theta_device,sqrt_mass_device,local_term_count,n,d);
     if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit additive matrix assembly failed");
     const std::size_t dd=static_cast<std::size_t>(d)*d;
     covariance_symmetrize_matrix<<<static_cast<unsigned>((dd+255)/256),256>>>(full,d);
@@ -2992,14 +4920,34 @@ struct DeviceCovarianceSystem
       covariance_householder_update<<<static_cast<unsigned>((dd+255)/256),256>>>(full,vector,product,gamma,d);
       if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit Householder congruence failed");}
     covariance_compact_matrix<<<static_cast<unsigned>((static_cast<std::size_t>(r)*r+255)/256),256>>>(full,compact,d,r,n);
-    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit translation-complement compaction failed");++assembly_generation;
+    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit translation-complement compaction failed");
+  }
+
+  void apply_parameter_operator(const int parameter,const double* input_d_by_columns,double* output_d_by_columns,const int columns)
+  {
+    if(parameter<0||parameter>=p||columns<=0||columns>solve_batch||input_d_by_columns==nullptr||output_d_by_columns==nullptr||
+       input_d_by_columns==output_d_by_columns)
+      throw std::invalid_argument("native covariance parameter-operator dimensions are invalid");
+    const std::size_t values=static_cast<std::size_t>(d)*columns;
+    if(cudaMemset(output_d_by_columns,0,values*sizeof(double))!=cudaSuccess)
+      throw std::runtime_error("native covariance parameter-operator initialization failed");
+    const std::size_t edge_work=static_cast<std::size_t>(edge_count)*columns;
+    covariance_apply_basis_edges<<<static_cast<unsigned>((edge_work+255)/256),256>>>(output_d_by_columns,input_d_by_columns,
+      sqrt_mass_device,edge_i,edge_j,edge_group,basis_base_mix_device,edge_count,n,d,parameter,base_p,added_p,columns);
+    if(local_term_count)covariance_apply_basis_local_terms<<<static_cast<unsigned>((static_cast<std::size_t>(local_term_count)*columns+255)/256),256>>>(
+      output_d_by_columns,input_d_by_columns,sqrt_mass_device,local_terms_device,basis_local_transform_device,local_term_count,
+      n,d,parameter,base_p,added_p,columns);
+    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)
+      throw std::runtime_error("native covariance parameter-operator GPU action failed");
   }
 
   bool factor(double* matrix,double& logdet,std::vector<double>* cholesky_diagonal=nullptr)
   {
+    CovarianceWallSeconds factor_time(&factorization_wall_seconds);
+    if(before_factor)before_factor();
     if(cusolverDnDpotrf(solver,CUBLAS_FILL_MODE_LOWER,r,matrix,r,solver_work,lwork,info)!=CUSOLVER_STATUS_SUCCESS||cudaDeviceSynchronize()!=cudaSuccess)
       throw std::runtime_error("native covariance fit Cholesky call failed");
-    ++factorizations;int host_info=0;if(cudaMemcpy(&host_info,info,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native covariance fit Cholesky status read failed");
+    ++factorizations;++system_workspace->factorization_count;int host_info=0;if(cudaMemcpy(&host_info,info,sizeof(int),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native covariance fit Cholesky status read failed");
     if(host_info>0)return false;if(host_info<0)throw std::runtime_error("native covariance fit Cholesky received an invalid parameter");
     covariance_log_diagonal<<<static_cast<unsigned>((r+255)/256),256>>>(matrix,diagonal,r);
     if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit Cholesky diagonal extraction failed");
@@ -3008,6 +4956,43 @@ struct DeviceCovarianceSystem
       logdet_sum.add(2.0*std::log(value));}logdet=logdet_sum.value();
     if(!std::isfinite(logdet))throw std::runtime_error("native covariance fit log-determinant is non-finite");
     if(cholesky_diagonal)*cholesky_diagonal=std::move(values);return true;
+  }
+
+  bool factor_assembled_pair(const std::vector<double>& parameters,const double epsilon,double& logdet,
+    double& shifted_logdet,std::vector<double>* cholesky_diagonal=nullptr,
+    std::vector<double>* shifted_cholesky_diagonal=nullptr)
+  {
+    const std::size_t bytes=static_cast<std::size_t>(r)*r*sizeof(double);
+    if(cudaMemcpy(shifted,compact,bytes,cudaMemcpyDeviceToDevice)!=cudaSuccess)
+      throw std::runtime_error("native covariance fit shifted matrix copy failed");
+    covariance_subtract_diagonal<<<static_cast<unsigned>((r+255)/256),256>>>(shifted,r,epsilon);
+    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)
+      throw std::runtime_error("native covariance fit epsilon shift failed");
+    if(!factor(shifted,shifted_logdet,shifted_cholesky_diagonal))return false;
+    if(!factor(compact,logdet,cholesky_diagonal))
+      throw std::runtime_error("native covariance fit unshifted matrix is not SPD after shifted Cholesky passed");
+    factor_theta=parameters;factor_epsilon=epsilon;factor_assembly_generation=assembly_generation;factors_valid=true;
+    system_workspace->factor_cache_valid=true;system_workspace->factor_theta=parameters;
+    system_workspace->factor_epsilon=epsilon;system_workspace->factor_logdet=logdet;
+    system_workspace->factor_graph_identity=graph_identity;system_workspace->factor_baseline=&baseline;
+    system_workspace->factor_baseline_generation=baseline.identity_generation;
+    system_workspace->factor_n=n;system_workspace->factor_d=d;system_workspace->factor_r=r;system_workspace->factor_p=p;
+    system_workspace->factor_shifted_logdet=shifted_logdet;
+    return true;
+  }
+
+  bool ensure_factors(const std::vector<double>& parameters,const double epsilon)
+  {
+    if(!(epsilon>0.0)||!std::isfinite(epsilon))throw std::invalid_argument("native covariance factor epsilon is invalid");
+    if(factors_valid&&factor_assembly_generation==assembly_generation&&factor_epsilon==epsilon&&factor_theta==parameters)
+      return true;
+    if(system_workspace->factor_cache_valid&&system_workspace->factor_graph_identity==graph_identity&&
+       system_workspace->factor_baseline==&baseline&&system_workspace->factor_baseline_generation==baseline.identity_generation&&
+       system_workspace->factor_n==n&&system_workspace->factor_d==d&&system_workspace->factor_r==r&&system_workspace->factor_p==p&&
+       system_workspace->factor_epsilon==epsilon&&system_workspace->factor_theta==parameters){
+      factors_valid=true;factor_theta=parameters;factor_epsilon=epsilon;factor_assembly_generation=assembly_generation;return true;}
+    assemble(parameters);double logdet=0.0,shifted_logdet=0.0;
+    return factor_assembled_pair(parameters,epsilon,logdet,shifted_logdet);
   }
 
   void original_solve_residual(const double* solution,const double* original_rhs,const int columns,const double epsilon,double* residual)
@@ -3027,6 +5012,8 @@ struct DeviceCovarianceSystem
     CovarianceTraceDiagnostics& diagnostic=std::string(matrix_kind)=="D"?last_d_trace:last_shifted_trace;
     diagnostic=CovarianceTraceDiagnostics{};diagnostic.matrix_kind=matrix_kind;diagnostic.status="RUNNING";
     diagnostic.original_residual_checked=check_original;diagnostic.total_rhs_columns=d;
+    if(raw_p&&local_term_count&&cudaMemset(local_trace_device,0,static_cast<std::size_t>(raw_p)*sizeof(double))!=cudaSuccess)
+      throw std::runtime_error("native covariance fit M1 trace initialization failed");
     if(edge_traces)edge_traces->assign(6*graph.edges.size(),0.0);
     const std::size_t edge_values=graph.edges.size()*9;if(cudaMemset(edge_cov_left,0,edge_values*sizeof(double))!=cudaSuccess||cudaMemset(edge_cov_right,0,edge_values*sizeof(double))!=cudaSuccess)
       throw std::runtime_error("native covariance fit trace initialization failed");
@@ -3066,6 +5053,9 @@ struct DeviceCovarianceSystem
         if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native covariance fit inverse Householder projection failed");
         covariance_apply_householder<<<static_cast<unsigned>((static_cast<std::size_t>(d)*columns+255)/256),256>>>(ambient,householder,dots,n,d,columns);
         if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native covariance fit inverse Householder projection failed");
+        if(raw_p&&local_term_count)covariance_accumulate_local_trace<<<static_cast<unsigned>((static_cast<std::size_t>(local_term_count)*9+255)/256),256>>>(
+          local_trace_device,ambient,sqrt_mass_device,local_terms_device,local_term_count,n,d,batch_start,columns);
+        if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("native covariance fit M1 inverse trace contraction failed");
         if(cudaMemcpy(rhs_check,solution,values*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess||
            cublasDtrmm(blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_T,CUBLAS_DIAG_NON_UNIT,r,columns,&one,factor_matrix,r,rhs_check,r,rhs_temp,r)!=CUBLAS_STATUS_SUCCESS||
            cublasDtrmm(blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_N,CUBLAS_DIAG_NON_UNIT,r,columns,&one,factor_matrix,r,rhs_temp,r,rhs_check,r)!=CUBLAS_STATUS_SUCCESS)
@@ -3107,7 +5097,16 @@ struct DeviceCovarianceSystem
       for(int a=0;a<3;++a)sums[group+edge_parameter_index(a,a)].add(block[a*3+a]);
       sums[group+1].add(2.0*block[1]);sums[group+2].add(2.0*block[2]);sums[group+4].add(2.0*block[5]);
     }
-    std::vector<double> trace(p);for(int i=0;i<p;++i){trace[i]=sums[i].value();if(!std::isfinite(trace[i]))throw std::runtime_error("native covariance fit inverse trace is non-finite");}return trace;
+    std::vector<double> trace(static_cast<std::size_t>(p));std::vector<double> base_trace(static_cast<std::size_t>(base_p));
+    for(int i=0;i<base_p;++i){base_trace[i]=sums[i].value();if(!std::isfinite(base_trace[i]))throw std::runtime_error("native covariance fit inverse trace is non-finite");trace[i]=base_trace[i];}
+    if(raw_p&&local_term_count){std::vector<double> raw_trace(static_cast<std::size_t>(raw_p));
+      if(cudaMemcpy(raw_trace.data(),local_trace_device,raw_trace.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)
+        throw std::runtime_error("native covariance fit M1 inverse trace readback failed");
+      for(int output=0;output<added_p;++output){NeumaierAccumulator value;
+        for(int parameter=0;parameter<base_p;++parameter)value.add_product(base_trace[parameter],graph.local_base_mix[static_cast<std::size_t>(parameter)*added_p+output]);
+        for(int parameter=0;parameter<raw_p;++parameter)value.add_product(raw_trace[parameter],graph.local_transform[static_cast<std::size_t>(parameter)*added_p+output]);
+        trace[base_p+output]=value.value();}}
+    if(!std::all_of(trace.begin(),trace.end(),[](double value){return std::isfinite(value);}))throw std::runtime_error("native covariance fit inverse trace is non-finite");return trace;
   }
 
   bool evaluate_factors(const std::vector<double>& parameters,const double epsilon,double& logdet,
@@ -3116,14 +5115,18 @@ struct DeviceCovarianceSystem
     std::vector<double>* edge_shifted_traces=nullptr,std::vector<double>* cholesky_diagonal=nullptr,
     std::vector<double>* shifted_cholesky_diagonal=nullptr)
   {
-    assemble(parameters);const std::size_t bytes=static_cast<std::size_t>(r)*r*sizeof(double);
+    const bool cached_factorization=system_workspace->factor_cache_valid&&system_workspace->factor_graph_identity==graph_identity&&
+      system_workspace->factor_baseline==&baseline&&system_workspace->factor_baseline_generation==baseline.identity_generation&&
+      system_workspace->factor_n==n&&system_workspace->factor_d==d&&system_workspace->factor_r==r&&system_workspace->factor_p==p&&
+      system_workspace->factor_epsilon==epsilon&&system_workspace->factor_theta==parameters&&
+      cholesky_diagonal==nullptr&&shifted_cholesky_diagonal==nullptr;
+    if(cached_factorization){factors_valid=true;factor_theta=parameters;factor_epsilon=epsilon;
+      factor_assembly_generation=assembly_generation;logdet=system_workspace->factor_logdet;
+      shifted_logdet=system_workspace->factor_shifted_logdet;}
+    else assemble(parameters);
     if(traces||shifted_traces){worst_solve_relative_residual=0.0;last_d_trace=CovarianceTraceDiagnostics{};last_d_trace.matrix_kind="D";
       last_shifted_trace=CovarianceTraceDiagnostics{};last_shifted_trace.matrix_kind="D_MINUS_EPSILON_I";}
-    if(cudaMemcpy(shifted,compact,bytes,cudaMemcpyDeviceToDevice)!=cudaSuccess)throw std::runtime_error("native covariance fit shifted matrix copy failed");
-    covariance_subtract_diagonal<<<static_cast<unsigned>((r+255)/256),256>>>(shifted,r,epsilon);
-    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)throw std::runtime_error("native covariance fit epsilon shift failed");
-    if(!factor(shifted,shifted_logdet,shifted_cholesky_diagonal))return false;
-    if(!factor(compact,logdet,cholesky_diagonal))throw std::runtime_error("native covariance fit unshifted matrix is not SPD after shifted Cholesky passed");
+    if(!cached_factorization&&!factor_assembled_pair(parameters,epsilon,logdet,shifted_logdet,cholesky_diagonal,shifted_cholesky_diagonal))return false;
     if(traces)*traces=trace_derivatives(compact,"D",0.0,check_original_residual,strict_solve,edge_traces);
     if(shifted_traces)*shifted_traces=trace_derivatives(shifted,"D_MINUS_EPSILON_I",epsilon,check_original_residual,strict_solve,edge_shifted_traces);return true;
   }
@@ -3551,14 +5554,15 @@ CovarianceJointRaySpectrum covariance_joint_ray_spectrum(cusolverDnHandle_t solv
 
 struct CovarianceLocalHessianTerms
 {
-  std::array<double,36> data{},prior{},barrier{},total{};
+  std::array<double,36> data{},prior{},barrier{},ridge{},total{};
 };
 
 CovarianceLocalHessianTerms covariance_local_group_hessian(const std::array<double,36>& traces_d,
-  const std::array<double,36>& traces_s,const double rho,const double tau,
+  const std::array<double,36>& traces_s,const double rho,const double tau,const double ridge_lambda,
   const std::vector<double>& coordinate_scale,const std::size_t parameter_begin)
 {
-  if(parameter_begin+6>coordinate_scale.size()||!(rho>0.0)||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau))
+  if(parameter_begin+6>coordinate_scale.size()||rho<0.0||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau)||
+     ridge_lambda<0.0||!std::isfinite(ridge_lambda))
     throw std::invalid_argument("native covariance local Hessian inputs are invalid");
   CovarianceLocalHessianTerms result;
   for(int a=0;a<6;++a)for(int b=0;b<6;++b){const std::size_t at=static_cast<std::size_t>(a)*6+b;
@@ -3569,7 +5573,8 @@ CovarianceLocalHessianTerms covariance_local_group_hessian(const std::array<doub
     result.data[at]=0.5*traces_d[at]*scale_a*scale_b;
     result.prior[at]=0.5*rho*traces_d[at]*scale_a*scale_b;
     result.barrier[at]=tau*traces_s[at]*scale_a*scale_b;
-    result.total[at]=result.data[at]+result.prior[at]+result.barrier[at];
+    result.ridge[at]=a==b?ridge_lambda:0.0;
+    result.total[at]=result.data[at]+result.prior[at]+result.barrier[at]+result.ridge[at];
     if(!std::isfinite(result.total[at]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: native covariance local Hessian is non-finite");
   }
   return result;
@@ -3577,7 +5582,7 @@ CovarianceLocalHessianTerms covariance_local_group_hessian(const std::array<doub
 
 struct CovarianceJointHessianTerms
 {
-  std::vector<double> data,prior,barrier,total;
+  std::vector<double> data,prior,barrier,ridge,total;
 };
 
 std::vector<double> covariance_joint_trace_products(const std::vector<double>& inverse,const CovarianceJointGroupBasis& basis)
@@ -3593,16 +5598,16 @@ std::vector<double> covariance_joint_trace_products(const std::vector<double>& i
 }
 
 CovarianceJointHessianTerms covariance_joint_group_hessian(const std::vector<double>& traces_d,const std::vector<double>& traces_s,
-  const double rho,const double tau,const std::vector<double>& coordinate_scale,const std::vector<int>& groups)
+  const double rho,const double tau,const double ridge_lambda,const std::vector<double>& coordinate_scale,const std::vector<int>& groups)
 {
   const std::size_t parameters=6*groups.size();if(traces_d.size()!=parameters*parameters||traces_s.size()!=parameters*parameters||
-      !(rho>0.0)||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau))
+      rho<0.0||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau)||ridge_lambda<0.0||!std::isfinite(ridge_lambda))
     throw std::invalid_argument("native covariance joint Hessian inputs are invalid");
   std::set<int> selected_groups;
   for(const int group:groups)if(group<0||6*static_cast<std::size_t>(group)+6>coordinate_scale.size()||!selected_groups.insert(group).second)
     throw std::invalid_argument("native covariance joint Hessian group ids are invalid");
   CovarianceJointHessianTerms result;result.data.resize(parameters*parameters);result.prior.resize(parameters*parameters);
-  result.barrier.resize(parameters*parameters);result.total.resize(parameters*parameters);
+  result.barrier.resize(parameters*parameters);result.ridge.resize(parameters*parameters);result.total.resize(parameters*parameters);
   for(std::size_t a=0;a<parameters;++a)for(std::size_t b=0;b<parameters;++b){const std::size_t at=a*parameters+b;
     const std::size_t parameter_a=6*static_cast<std::size_t>(groups[a/6])+a%6,parameter_b=6*static_cast<std::size_t>(groups[b/6])+b%6;
     if(parameter_a>=coordinate_scale.size()||parameter_b>=coordinate_scale.size())throw std::invalid_argument("native covariance joint Hessian scale dimensions do not match");
@@ -3610,7 +5615,9 @@ CovarianceJointHessianTerms covariance_joint_group_hessian(const std::vector<dou
     if(!(scale_a>0.0)||!(scale_b>0.0)||!std::isfinite(scale_a)||!std::isfinite(scale_b)||!std::isfinite(traces_d[at])||!std::isfinite(traces_s[at]))
       throw std::runtime_error("NUMERICAL_SOLVE_FAIL: native covariance joint Hessian input is non-finite");
     result.data[at]=0.5*traces_d[at]*scale_a*scale_b;result.prior[at]=0.5*rho*traces_d[at]*scale_a*scale_b;
-    result.barrier[at]=tau*traces_s[at]*scale_a*scale_b;result.total[at]=result.data[at]+result.prior[at]+result.barrier[at];
+    result.barrier[at]=tau*traces_s[at]*scale_a*scale_b;
+    result.ridge[at]=parameter_a==parameter_b?ridge_lambda:0.0;
+    result.total[at]=result.data[at]+result.prior[at]+result.barrier[at]+result.ridge[at];
     if(!std::isfinite(result.total[at]))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: native covariance joint Hessian is non-finite");}
   return result;
 }
@@ -3688,7 +5695,7 @@ CovarianceBlockNewtonResult covariance_local_newton_direction(const std::array<d
 CovarianceBlockNewtonResult covariance_evaluate_joint_block(DeviceCovarianceSystem& system,
   const CovarianceJointGroupTopology& topology,const CovarianceJointGroupSelection& selection,
   const std::vector<double>& theta,const std::vector<double>& gradient,
-  const std::vector<double>& coordinate_scale,const double epsilon,const double rho,const double tau)
+  const std::vector<double>& coordinate_scale,const double epsilon,const double rho,const double tau,const double ridge_lambda)
 {
   CovarianceBlockNewtonResult result;result.status=selection.status;
   if(selection.status!="READY")return result;
@@ -3719,7 +5726,7 @@ CovarianceBlockNewtonResult covariance_evaluate_joint_block(DeviceCovarianceSyst
     double asymmetry_d=0.0,asymmetry_s=0.0;const std::vector<double> inverse_d=covariance_local_inverse(solved_d,basis,system.n,asymmetry_d);
     const std::vector<double> inverse_s=covariance_local_inverse(solved_s,basis,system.n,asymmetry_s);
     const std::vector<double> traces_d=covariance_joint_trace_products(inverse_d,basis),traces_s=covariance_joint_trace_products(inverse_s,basis);
-    const CovarianceJointHessianTerms terms=covariance_joint_group_hessian(traces_d,traces_s,rho,tau,coordinate_scale,selection.groups);
+    const CovarianceJointHessianTerms terms=covariance_joint_group_hessian(traces_d,traces_s,rho,tau,ridge_lambda,coordinate_scale,selection.groups);
     result=covariance_joint_newton_direction(terms.total,local_gradient);result.asymmetry=std::max({result.asymmetry,asymmetry_d,asymmetry_s});
     if(result.status=="PASS"){
       std::vector<double> update(static_cast<std::size_t>(basis.dimension)*basis.dimension,0.0);
@@ -3966,8 +5973,355 @@ CovarianceProbeModes covariance_bounded_inverse_modes(cusolverDnHandle_t solver,
 struct CovarianceBaseline
 {
   std::vector<double> theta,trace;
-  double mu=0.0,logdet=0.0,shifted_logdet=0.0,boundary_mu=0.0;
+  double mu=0.0,logdet=0.0,shifted_logdet=0.0,boundary_mu=0.0,epsilon=0.0;
   bool epsilon_constraint_active=false;
+};
+
+struct CovarianceAnalyticCurvatureCache
+{
+  bool valid=false;
+  std::string status="NOT_REQUESTED",stability_status="NOT_EVALUATED";
+  std::vector<double> theta,coordinate_scale,gram_d,gram_q;
+  double epsilon=std::numeric_limits<double>::quiet_NaN(),seconds=0.0;
+  double relative_matrix_change=std::numeric_limits<double>::quiet_NaN();
+  double relative_step_change=std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t graph_assembly_generation=0,rhs_columns=0;
+  int probes=0,levels_built=0;
+};
+
+struct CovarianceIndependentCurvatureCheck
+{
+  CovarianceAnalyticCurvatureCache primary;
+  CovarianceAnalyticCurvatureCache independent;
+  bool valid=false;
+  std::string status="NOT_EVALUATED";
+  double max_relative_directional_error=std::numeric_limits<double>::quiet_NaN(),seconds=0.0;
+  std::uint64_t independent_rhs_columns=0,independent_batches=0,primary_upgrade_levels=0;
+  int probes=0,directions_checked=0;
+};
+
+double covariance_budget_now_seconds();
+void covariance_budget_observe_or_throw(rpmd_ja_feasibility::Budget* budget,
+  const rpmd_ja_feasibility::Limits* limits);
+
+class CovarianceAnalyticCurvatureWorkspace
+{
+public:
+  static constexpr int max_probes=128;
+  explicit CovarianceAnalyticCurvatureWorkspace(DeviceCovarianceSystem& source,const int probe_capacity):
+    system(source),capacity(probe_capacity),workspace(*source.fit_workspace)
+  {
+    if(capacity<=0||capacity>max_probes)throw std::invalid_argument("analytic covariance workspace probe capacity is invalid");
+    const std::size_t r=static_cast<std::size_t>(system.r),d=static_cast<std::size_t>(system.d),p=static_cast<std::size_t>(system.p);
+    const std::size_t limit=std::numeric_limits<std::size_t>::max();
+    if(r>limit/static_cast<std::size_t>(capacity)||d>limit/static_cast<std::size_t>(capacity)||
+       p>limit/r/static_cast<std::size_t>(capacity)||p>limit/p)
+      throw std::runtime_error("CURVATURE_MEMORY_FAIL: analytic covariance workspace size overflows");
+    const std::size_t ambient_count=d*static_cast<std::size_t>(capacity),compact_count=r*static_cast<std::size_t>(capacity);
+    const std::size_t z_count=p*compact_count,gram_count=p*p,dots_count=3ULL*capacity;
+    const std::size_t double_limit=limit/sizeof(double);
+    if(ambient_count>double_limit/2||compact_count>double_limit/2||z_count>double_limit||gram_count>double_limit||
+       dots_count>double_limit||2*ambient_count>double_limit-2*compact_count||
+       2*ambient_count+2*compact_count>double_limit-z_count||
+       2*ambient_count+2*compact_count+z_count>double_limit-gram_count||
+       2*ambient_count+2*compact_count+z_count+gram_count>double_limit-dots_count)
+      throw std::runtime_error("CURVATURE_MEMORY_FAIL: analytic covariance workspace size overflows");
+    const std::uint64_t growth_bytes=workspace.curvature_growth_transient_bytes(
+      ambient_count,compact_count,z_count,dots_count,gram_count);
+    if(growth_bytes>0){
+      std::size_t free_bytes=0,total_bytes=0;
+      if(cudaMemGetInfo(&free_bytes,&total_bytes)!=cudaSuccess)
+        throw std::runtime_error("CURVATURE_MEMORY_FAIL: covariance workspace memory query failed");
+      rpmd_ja_feasibility::ResourcePlan resource_plan;
+      for(auto& stage:resource_plan.stages)stage.host_known=stage.device_known=stage.disk_known=true;
+      resource_plan.stages[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::CURVATURE)].transient_device_bytes=
+        growth_bytes;
+      const auto peak=rpmd_ja_feasibility::estimate_resource_peaks(resource_plan);
+      const std::uint64_t capacity=free_bytes>128ULL*1024*1024?
+        static_cast<std::uint64_t>(free_bytes)-128ULL*1024*1024:0;
+      if(rpmd_ja_feasibility::resource_capacity_gate(peak,std::numeric_limits<std::uint64_t>::max(),capacity,
+           std::numeric_limits<std::uint64_t>::max())!=rpmd_ja_feasibility::ResourceGateResult::PEAK_WITHIN_CAPACITY_ESTIMATE)
+        throw std::runtime_error("CURVATURE_MEMORY_FAIL: analytic covariance workspace leaves less than 128 MiB free");
+    }
+    workspace.reserve_curvature(ambient_count,compact_count,z_count,dots_count,gram_count);
+    ambient=workspace.curvature_ambient.data();action=workspace.curvature_action.data();
+    compact_rhs=workspace.curvature_compact_rhs.data();rhs_reference=workspace.curvature_rhs_reference.data();
+    z=workspace.curvature_z.data();dots=workspace.curvature_dots.data();gram=workspace.curvature_gram.data();
+  }
+  ~CovarianceAnalyticCurvatureWorkspace()=default;
+  CovarianceAnalyticCurvatureWorkspace(const CovarianceAnalyticCurvatureWorkspace&)=delete;
+  CovarianceAnalyticCurvatureWorkspace& operator=(const CovarianceAnalyticCurvatureWorkspace&)=delete;
+
+  std::vector<double> gram_for_factor(double* factor,const std::vector<double>& omega,const int probes,
+    const std::vector<double>& scale,std::uint64_t& rhs_columns,
+    rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* limits=nullptr)
+  {
+    const std::size_t compact_count=static_cast<std::size_t>(system.r)*probes;
+    const std::size_t ambient_count=static_cast<std::size_t>(system.d)*probes;
+    const double one=1.0,zero=0.0,minus_one=-1.0;
+    if(probes<=0||probes>capacity||omega.size()!=compact_count||scale.size()!=static_cast<std::size_t>(system.p)||
+       compact_count>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::invalid_argument("analytic covariance curvature inputs do not match workspace dimensions");
+    if(cudaMemcpy(system.trace_rhs,omega.data(),compact_count*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
+       cudaMemcpy(rhs_reference,omega.data(),compact_count*sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess||
+       cublasDtrsm(system.blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_T,CUBLAS_DIAG_NON_UNIT,
+         system.r,probes,&one,factor,system.r,system.trace_rhs,system.r)!=CUBLAS_STATUS_SUCCESS||cudaDeviceSynchronize()!=cudaSuccess)
+      throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance L-transpose probe solve failed");
+    rhs_columns+=static_cast<std::uint64_t>(probes);
+    if(cudaMemcpy(action,system.trace_rhs,compact_count*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess||
+       cublasDtrmm(system.blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_T,CUBLAS_DIAG_NON_UNIT,
+         system.r,probes,&one,factor,system.r,action,system.r,compact_rhs,system.r)!=CUBLAS_STATUS_SUCCESS||
+       cublasDaxpy(system.blas,static_cast<int>(compact_count),&minus_one,rhs_reference,1,compact_rhs,1)!=CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance L-transpose probe residual failed");
+    auto require_column_residuals=[&](const double* residuals,const double* rhs,const int columns){
+      covariance_column_relative_residual<<<columns,256>>>(residuals,rhs,dots,system.r,columns);
+      if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)
+        throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance column residual kernel failed");
+      std::vector<double> ratios(static_cast<std::size_t>(columns));
+      if(cudaMemcpy(ratios.data(),dots,ratios.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)
+        throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance column residual read failed");
+      for(const double ratio:ratios)if(!std::isfinite(ratio)||ratio>1e-7)
+        throw std::runtime_error("CURVATURE_SOLVE_RESIDUAL_FAIL: covariance triangular solve column residual exceeds 1e-7");
+    };
+    require_column_residuals(compact_rhs,rhs_reference,probes);
+
+    covariance_expand_solutions<<<static_cast<unsigned>((ambient_count+255)/256),256>>>(
+      system.trace_rhs,ambient,system.full_to_compact,system.d,system.r,probes);
+    if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance probe expansion failed");
+    covariance_householder_dots<<<static_cast<unsigned>((3*probes+255)/256),256>>>(
+      ambient,system.householder,dots,system.n,system.d,probes);
+    if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance probe projection failed");
+    covariance_apply_householder<<<static_cast<unsigned>((ambient_count+255)/256),256>>>(
+      ambient,system.householder,dots,system.n,system.d,probes);
+    if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)
+      throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance probe projection failed");
+
+    for(int parameter=0;parameter<system.p;++parameter){
+      for(int begin=0;begin<probes;begin+=DeviceCovarianceSystem::solve_batch){
+        covariance_budget_observe_or_throw(budget,limits);
+        const int columns=std::min(DeviceCovarianceSystem::solve_batch,probes-begin);
+        const std::size_t ambient_offset=static_cast<std::size_t>(begin)*system.d;
+        const std::size_t compact_offset=static_cast<std::size_t>(begin)*system.r;
+        const std::size_t batch_compact=static_cast<std::size_t>(columns)*system.r;
+        system.apply_parameter_operator(parameter,ambient+ambient_offset,action+ambient_offset,columns);
+        covariance_householder_dots<<<static_cast<unsigned>((3*columns+255)/256),256>>>(
+          action+ambient_offset,system.householder,dots,system.n,system.d,columns);
+        if(cudaGetLastError()!=cudaSuccess)throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance operator projection failed");
+        covariance_apply_householder<<<static_cast<unsigned>((static_cast<std::size_t>(system.d)*columns+255)/256),256>>>(
+          action+ambient_offset,system.householder,dots,system.n,system.d,columns);
+        covariance_gather_compact_batch<<<static_cast<unsigned>((batch_compact+255)/256),256>>>(
+          action+ambient_offset,compact_rhs+compact_offset,system.compact_to_full,system.d,system.r,columns);
+        if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess)
+          throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance operator projection failed");
+        if(cudaMemcpy(rhs_reference+compact_offset,compact_rhs+compact_offset,batch_compact*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess||
+           cublasDtrsm(system.blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_N,CUBLAS_DIAG_NON_UNIT,
+             system.r,columns,&one,factor,system.r,compact_rhs+compact_offset,system.r)!=CUBLAS_STATUS_SUCCESS||cudaDeviceSynchronize()!=cudaSuccess)
+          throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance L probe solve failed");
+        rhs_columns+=static_cast<std::uint64_t>(columns);
+        if(cudaMemcpy(action+compact_offset,compact_rhs+compact_offset,batch_compact*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess||
+           cublasDtrmm(system.blas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,CUBLAS_OP_N,CUBLAS_DIAG_NON_UNIT,
+             system.r,columns,&one,factor,system.r,action+compact_offset,system.r,compact_rhs+compact_offset,system.r)!=CUBLAS_STATUS_SUCCESS||
+           cublasDaxpy(system.blas,static_cast<int>(batch_compact),&minus_one,rhs_reference+compact_offset,1,
+             compact_rhs+compact_offset,1)!=CUBLAS_STATUS_SUCCESS)
+          throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance L probe residual failed");
+        require_column_residuals(compact_rhs+compact_offset,rhs_reference+compact_offset,columns);
+        covariance_scale_parameter_block<<<static_cast<unsigned>((batch_compact+255)/256),256>>>(
+          action+compact_offset,scale[parameter],batch_compact);
+        if(cudaGetLastError()!=cudaSuccess||cudaDeviceSynchronize()!=cudaSuccess||
+           cudaMemcpy(z+static_cast<std::size_t>(parameter)*compact_count+compact_offset,action+compact_offset,
+             batch_compact*sizeof(double),cudaMemcpyDeviceToDevice)!=cudaSuccess)
+          throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance scaled Gram action storage failed");
+      }
+    }
+    if(cublasDgemm(system.blas,CUBLAS_OP_T,CUBLAS_OP_N,system.p,system.p,static_cast<int>(compact_count),
+        &one,z,static_cast<int>(compact_count),z,static_cast<int>(compact_count),&zero,gram,system.p)!=CUBLAS_STATUS_SUCCESS||
+       cudaDeviceSynchronize()!=cudaSuccess)
+      throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance action Gram failed");
+    std::vector<double> result(static_cast<std::size_t>(system.p)*system.p);
+    if(cudaMemcpy(result.data(),gram,result.size()*sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)
+      throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance action Gram read failed");
+    for(int i=0;i<system.p;++i)for(int j=i+1;j<system.p;++j){
+      const std::size_t ij=static_cast<std::size_t>(i)+static_cast<std::size_t>(j)*system.p;
+      const std::size_t ji=static_cast<std::size_t>(j)+static_cast<std::size_t>(i)*system.p;
+      const double symmetric=0.5*result[ij]+0.5*result[ji];result[ij]=result[ji]=symmetric/static_cast<double>(probes);
+    }
+    for(int i=0;i<system.p;++i){const std::size_t diagonal=static_cast<std::size_t>(i)+static_cast<std::size_t>(i)*system.p;
+      result[diagonal]/=static_cast<double>(probes);}
+    if(!std::all_of(result.begin(),result.end(),[](double value){return std::isfinite(value);}))
+      throw std::runtime_error("CURVATURE_SOLVE_FAIL: covariance action Gram is non-finite");
+    return result;
+  }
+
+private:
+  DeviceCovarianceSystem& system;
+  int capacity;
+  rpmd_ja_device::CovarianceFitWorkspace& workspace;
+  double *ambient=nullptr,*action=nullptr,*compact_rhs=nullptr,*rhs_reference=nullptr,*z=nullptr,*dots=nullptr,*gram=nullptr;
+};
+
+constexpr std::uint64_t covariance_primary_curvature_seed=0x8d12e5b7c3a964f1ULL;
+constexpr std::uint64_t covariance_independent_curvature_seed=0x4f1bbcdc6762c9a5ULL;
+constexpr double covariance_independent_directional_tolerance=0.10;
+
+std::vector<double> covariance_curvature_probes(const int rows,const int columns,const std::vector<double>* supplied=nullptr,
+  const std::uint64_t seed=covariance_primary_curvature_seed)
+{
+  if(rows<=0||columns<=0||columns>CovarianceAnalyticCurvatureWorkspace::max_probes)
+    throw std::invalid_argument("analytic covariance probe dimensions are invalid");
+  if(supplied){if(supplied->size()!=static_cast<std::size_t>(rows)*columns||
+      !std::all_of(supplied->begin(),supplied->end(),[](double value){return std::isfinite(value);}))
+      throw std::invalid_argument("supplied analytic covariance probes are invalid");return *supplied;}
+  std::vector<double> probes(static_cast<std::size_t>(rows)*columns);
+  std::mt19937_64 random(seed);std::uniform_int_distribution<int> sign(0,1);
+  for(double& value:probes)value=sign(random)?1.0:-1.0;
+  return probes;
+}
+
+std::vector<double> covariance_analytic_curvature_hessian(const CovarianceAnalyticCurvatureCache& cache,
+  const int parameter_count,const double rho,const double tau,const double ridge_lambda)
+{
+  if(!cache.valid||parameter_count<=0||cache.gram_d.size()!=static_cast<std::size_t>(parameter_count)*parameter_count||
+     cache.gram_q.size()!=cache.gram_d.size()||!std::isfinite(rho)||!std::isfinite(tau)||tau<0.0||
+     !std::isfinite(ridge_lambda)||ridge_lambda<0.0)
+    throw std::invalid_argument("analytic covariance Hessian cache is invalid");
+  std::vector<double> hessian(cache.gram_d.size());
+  for(int j=0;j<parameter_count;++j)for(int i=0;i<parameter_count;++i){
+    const std::size_t index=static_cast<std::size_t>(i)+static_cast<std::size_t>(j)*parameter_count;
+    hessian[index]=0.5*(1.0+rho)*cache.gram_d[index]+tau*cache.gram_q[index]+(i==j?ridge_lambda:0.0);
+  }
+  if(!std::all_of(hessian.begin(),hessian.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("CURVATURE_SOLVE_FAIL: analytic covariance Hessian is non-finite");
+  return hessian;
+}
+
+bool covariance_same_curvature_point(const CovarianceAnalyticCurvatureCache& left,
+  const CovarianceAnalyticCurvatureCache& right)
+{
+  return left.valid&&right.valid&&left.theta==right.theta&&left.coordinate_scale==right.coordinate_scale&&
+    left.epsilon==right.epsilon&&left.graph_assembly_generation==right.graph_assembly_generation&&
+    left.probes==right.probes;
+}
+
+CovarianceAnalyticCurvatureCache covariance_build_analytic_curvature_cache(DeviceCovarianceSystem& system,
+  const std::vector<double>& theta,const double epsilon,const std::vector<double>& scale,const int probes,
+  std::uint64_t& rhs_columns,rpmd_ja_feasibility::Budget* budget=nullptr,
+  const rpmd_ja_feasibility::Limits* limits=nullptr,const std::vector<double>* supplied_omega=nullptr,
+  const std::uint64_t probe_seed=covariance_primary_curvature_seed)
+{
+  if(theta.size()!=static_cast<std::size_t>(system.p)||scale.size()!=theta.size()||
+     !std::all_of(scale.begin(),scale.end(),[](double value){return std::isfinite(value)&&value>0.0;})||
+     !(epsilon>0.0)||!std::isfinite(epsilon))
+    throw std::invalid_argument("analytic covariance curvature cache key is invalid");
+  CovarianceAnalyticCurvatureCache result;result.status="BUILDING";result.levels_built=1;result.theta=theta;result.epsilon=epsilon;
+  result.coordinate_scale=scale;result.graph_assembly_generation=system.graph_assembly_generation;result.probes=probes;
+  const auto started=std::chrono::steady_clock::now();
+  try{
+    if(!system.ensure_factors(theta,epsilon))throw std::runtime_error("current covariance point is not epsilon-positive definite");
+    const std::vector<double> omega=covariance_curvature_probes(system.r,probes,supplied_omega,probe_seed);
+    covariance_budget_observe_or_throw(budget,limits);
+    CovarianceAnalyticCurvatureWorkspace workspace(system,probes);
+    result.gram_d=workspace.gram_for_factor(system.compact,omega,probes,scale,rhs_columns,budget,limits);
+    covariance_budget_observe_or_throw(budget,limits);
+    result.gram_q=workspace.gram_for_factor(system.shifted,omega,probes,scale,rhs_columns,budget,limits);
+    result.valid=true;result.status="PASS";result.rhs_columns=rhs_columns;
+  }catch(const std::exception& error){result.status=std::string("CURVATURE_UNRESOLVED:")+error.what();throw;}
+  result.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();return result;
+}
+
+double covariance_budget_now_seconds()
+{return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+
+const char* covariance_budget_result_name(const rpmd_ja_feasibility::BudgetResult result)
+{
+  using rpmd_ja_feasibility::BudgetResult;
+  switch(result){case BudgetResult::OK:return "OK";case BudgetResult::INVALID_LIMITS:return "INVALID_LIMITS";
+    case BudgetResult::INVALID_CLOCK:return "INVALID_CLOCK";case BudgetResult::CLOCK_BACKWARDS:return "CLOCK_BACKWARDS";
+    case BudgetResult::NOT_STARTED:return "NOT_STARTED";case BudgetResult::ALREADY_STARTED:return "ALREADY_STARTED";
+    case BudgetResult::INVALID_PHASE:return "INVALID_PHASE";case BudgetResult::WALL_LIMIT:return "WALL_LIMIT";
+    case BudgetResult::GRADIENT_LIMIT:return "GRADIENT_LIMIT";case BudgetResult::PHASE_GRADIENT_LIMIT:return "PHASE_GRADIENT_LIMIT";
+    case BudgetResult::FAMILY_GRADIENT_LIMIT:return "FAMILY_GRADIENT_LIMIT";
+    case BudgetResult::FAMILY_WALL_LIMIT:return "FAMILY_WALL_LIMIT";
+    case BudgetResult::A_WALL_LIMIT:return "A_WALL_LIMIT";case BudgetResult::VALIDATION_RESERVED:return "VALIDATION_RESERVED";}
+  return "UNKNOWN";
+}
+
+bool covariance_expected_budget_stop(const std::string& status)
+{
+  return status=="FEASIBILITY_BUDGET_WALL_LIMIT"||status=="FEASIBILITY_BUDGET_GRADIENT_LIMIT"||
+    status=="FEASIBILITY_BUDGET_PHASE_GRADIENT_LIMIT"||
+    status=="FEASIBILITY_BUDGET_FAMILY_GRADIENT_LIMIT"||
+    status=="FEASIBILITY_BUDGET_FAMILY_WALL_LIMIT"||status=="FEASIBILITY_BUDGET_A_WALL_LIMIT"||
+    status=="FEASIBILITY_BUDGET_VALIDATION_RESERVED";
+}
+
+void covariance_require_expected_budget_observation(const rpmd_ja_feasibility::BudgetResult result,const char* context)
+{
+  if(result==rpmd_ja_feasibility::BudgetResult::OK)return;
+  const std::string status=std::string("FEASIBILITY_BUDGET_")+covariance_budget_result_name(result);
+  if(!covariance_expected_budget_stop(status))
+    throw std::runtime_error(std::string("IMPLEMENTATION_FAIL: unexpected feasibility clock status at ")+context+": "+status);
+}
+
+bool covariance_incomplete_candidate_status(const std::string& status)
+{
+  return covariance_expected_budget_stop(status)||status=="EVALUATION_BUDGET_EXHAUSTED"||
+     status=="ITERATION_BUDGET_EXHAUSTED"||
+     status=="NUMERICAL_STAGNATION"||status=="NUMERICAL_STALLED"||
+     status=="NUMERICAL_INCONCLUSIVE_PERFORMANCE_STOP"||
+     status=="CURVATURE_UNRESOLVED"||status=="CURVATURE_UNRESOLVED_ACTUAL_STEP"||
+     status=="CURVATURE_UNRESOLVED_INDEPENDENT_BATCH"||
+     status=="CURVATURE_UNRESOLVED_PRIMARY_MODEL_NOT_POSITIVE"||
+     status=="CURVATURE_UNRESOLVED_PRIMARY_UPGRADE"||
+     status.rfind("CURVATURE_UNRESOLVED: DIRECTIONAL_ARITHMETIC_UNRESOLVED",0)==0||
+     status.rfind("CURVATURE_UNRESOLVED: DIFFERENCE_BELOW_RESOLUTION",0)==0||
+     status.rfind("CURVATURE_UNRESOLVED: STEP_HALVING_UNSTABLE",0)==0||
+     status.rfind("CURVATURE_UNRESOLVED: DIRECTIONAL_STEP_BOUNDARY",0)==0;
+}
+
+bool covariance_expected_candidate_stop(const std::string& status)
+{return status=="BASELINE_SPD_FAIL"||covariance_incomplete_candidate_status(status);}
+
+class CovarianceFeasibilityBudgetError final:public std::runtime_error
+{public:explicit CovarianceFeasibilityBudgetError(const std::string& status):std::runtime_error(status){}};
+
+std::string covariance_independent_budget_stop_or_throw(const CovarianceFeasibilityBudgetError& error)
+{
+  if(!covariance_expected_budget_stop(error.what()))throw error;
+  return error.what();
+}
+
+std::string covariance_independent_failure_status_or_throw(const std::string& status)
+{
+  if(!covariance_incomplete_candidate_status(status))
+    throw std::runtime_error("IMPLEMENTATION_FAIL: unexpected independent-curvature status "+status);
+  return status;
+}
+
+void covariance_budget_observe_or_throw(rpmd_ja_feasibility::Budget* budget,
+  const rpmd_ja_feasibility::Limits* limits)
+{
+  if(!budget)return;
+  if(!limits)throw std::invalid_argument("native covariance feasibility budget has no limits");
+  const auto result=rpmd_ja_feasibility::observe_time(*budget,*limits,covariance_budget_now_seconds());
+  if(result!=rpmd_ja_feasibility::BudgetResult::OK)
+    throw CovarianceFeasibilityBudgetError(std::string("FEASIBILITY_BUDGET_")+covariance_budget_result_name(result));
+}
+
+class CovarianceGradientBudgetReservation
+{
+public:
+  CovarianceGradientBudgetReservation(rpmd_ja_feasibility::Budget* budget,
+    const rpmd_ja_feasibility::Limits* limits)
+  {
+    if(!budget)return;
+    if(!limits)throw std::invalid_argument("native covariance feasibility budget has no limits");
+    const auto result=rpmd_ja_feasibility::reserve_exact_gradient(*budget,*limits,covariance_budget_now_seconds());
+    if(result!=rpmd_ja_feasibility::BudgetResult::OK)
+      throw CovarianceFeasibilityBudgetError(std::string("FEASIBILITY_BUDGET_")+covariance_budget_result_name(result));
+  }
+  ~CovarianceGradientBudgetReservation()=default;
+  CovarianceGradientBudgetReservation(const CovarianceGradientBudgetReservation&)=delete;
+  CovarianceGradientBudgetReservation& operator=(const CovarianceGradientBudgetReservation&)=delete;
 };
 
 double covariance_dot(const std::vector<double>& left,const std::vector<double>& right)
@@ -3976,23 +6330,27 @@ double covariance_dot(const std::vector<double>& left,const std::vector<double>&
   NeumaierAccumulator sum;for(std::size_t i=0;i<left.size();++i)sum.add_product(left[i],right[i]);return sum.value();
 }
 
-std::vector<double> graph_laplacian_direction(const Graph& graph)
+std::vector<double> graph_laplacian_direction(const Graph& graph,const int parameter_count=0)
 {
-  std::vector<double> direction(6*graph.type_pairs.size(),0.0);
+  const std::size_t size=parameter_count>0?static_cast<std::size_t>(parameter_count):6*graph.type_pairs.size();
+  if(size<6*graph.type_pairs.size())throw std::invalid_argument("native covariance graph baseline parameter count is too small");
+  std::vector<double> direction(size,0.0);
   for(std::size_t group=0;group<graph.type_pairs.size();++group){direction[6*group]=1.0;direction[6*group+3]=1.0;direction[6*group+5]=1.0;}
   return direction;
 }
 
 CovarianceBaseline build_graph_covariance_baseline(DeviceCovarianceSystem& system,const std::vector<double>& statistics,
-  const double epsilon,std::uint64_t& objective_evaluations)
+  const double epsilon,std::uint64_t& objective_evaluations,rpmd_ja_feasibility::Budget* budget=nullptr,
+  const rpmd_ja_feasibility::Limits* limits=nullptr,double* objective_seconds=nullptr)
 {
   if(statistics.size()!=static_cast<std::size_t>(system.p)||!(epsilon>0.0)||!std::isfinite(epsilon))
     throw std::invalid_argument("native covariance fit baseline inputs are invalid");
-  const std::vector<double> direction=graph_laplacian_direction(system.graph);
+  const std::vector<double> direction=graph_laplacian_direction(system.graph,system.p);
   const double data_slope=covariance_dot(statistics,direction);
   if(!(data_slope>0.0)||!std::isfinite(data_slope))throw std::runtime_error("BASELINE_SPD_FAIL: training fluctuations do not bound the graph baseline objective");
   auto parameters_at=[&](const double mu){std::vector<double> value(direction.size());for(std::size_t i=0;i<value.size();++i)value[i]=mu*direction[i];return value;};
-  auto evaluate_mu=[&](const double mu,double& value){++objective_evaluations;double logdet=0.0,shifted=0.0;
+  auto evaluate_mu=[&](const double mu,double& value){CovarianceWallSeconds objective_time(objective_seconds);
+    covariance_budget_observe_or_throw(budget,limits);++objective_evaluations;double logdet=0.0,shifted=0.0;
     if(!system.evaluate_factors(parameters_at(mu),epsilon,logdet,shifted,nullptr))return false;
     value=0.5*mu*data_slope-0.5*logdet;if(!std::isfinite(value))throw std::runtime_error("native covariance fit baseline objective is non-finite");return true;};
   const double initial_step=std::max(epsilon,1e-8);
@@ -4047,7 +6405,9 @@ CovarianceBaseline build_graph_covariance_baseline(DeviceCovarianceSystem& syste
   if(!evaluate_mu(x1,f1)||!evaluate_mu(x2,f2))throw std::runtime_error("BASELINE_SPD_FAIL: covariance baseline line search left the feasible interval");
   for(int iteration=0;iteration<48;++iteration){if(f1<=f2){hi=x2;x2=x1;f2=f1;x1=hi-golden*(hi-lo);if(!evaluate_mu(x1,f1))throw std::runtime_error("BASELINE_SPD_FAIL: covariance baseline search lost positive definiteness");}
     else{lo=x1;x1=x2;f1=f2;x2=lo+golden*(hi-lo);if(!evaluate_mu(x2,f2))throw std::runtime_error("BASELINE_SPD_FAIL: covariance baseline search lost positive definiteness");}}
-  CovarianceBaseline result;result.mu=0.5*(lo+hi);result.theta=parameters_at(result.mu);result.boundary_mu=floor;
+  CovarianceBaseline result;result.mu=0.5*(lo+hi);result.theta=parameters_at(result.mu);result.boundary_mu=floor;result.epsilon=epsilon;
+  covariance_budget_observe_or_throw(budget,limits);
+  CovarianceGradientBudgetReservation gradient_budget(budget,limits);
   if(!system.evaluate_factors(result.theta,epsilon,result.logdet,result.shifted_logdet,&result.trace))
     throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline did not retain strict epsilon-positive curvature");
   result.epsilon_constraint_active=result.mu-floor<=1e-4*std::max({epsilon,std::abs(result.mu),std::abs(floor),1e-12});
@@ -4057,8 +6417,9 @@ CovarianceBaseline build_graph_covariance_baseline(DeviceCovarianceSystem& syste
 struct CovarianceFitSnapshot
 {
   bool available=false;
-  std::vector<double> theta,gradient_data,gradient_prior,gradient_barrier,gradient_total;
+  std::vector<double> theta,gradient_data,gradient_prior,gradient_ridge,gradient_barrier,gradient_total;
   double objective_data=std::numeric_limits<double>::quiet_NaN(),objective_prior=std::numeric_limits<double>::quiet_NaN();
+  double objective_ridge=std::numeric_limits<double>::quiet_NaN();
   double objective_barrier=std::numeric_limits<double>::quiet_NaN(),objective=std::numeric_limits<double>::quiet_NaN();
   double tau=std::numeric_limits<double>::quiet_NaN(),scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
   double raw_gradient_inf_norm=std::numeric_limits<double>::quiet_NaN();
@@ -4068,7 +6429,8 @@ struct CovarianceFailedTrial
 {
   bool available=false;std::vector<double> theta;int iteration=-1;double alpha=std::numeric_limits<double>::quiet_NaN();
   double tau=std::numeric_limits<double>::quiet_NaN(),objective_data=std::numeric_limits<double>::quiet_NaN();
-  double objective_prior=std::numeric_limits<double>::quiet_NaN(),objective_barrier=std::numeric_limits<double>::quiet_NaN();
+  double objective_prior=std::numeric_limits<double>::quiet_NaN(),objective_ridge=std::numeric_limits<double>::quiet_NaN();
+  double objective_barrier=std::numeric_limits<double>::quiet_NaN();
   double objective=std::numeric_limits<double>::quiet_NaN();std::string failure_stage="NONE";
 };
 
@@ -4101,11 +6463,15 @@ struct CovarianceBFGSSpectrumDiagnostic
 struct CovarianceFitResult
 {
   bool converged=false;std::string status="NOT_STARTED",reason="none",epsilon_constraint_status="NOT_COMPUTED";
-  std::string initialization_status="NOT_STARTED",start_gradient_solve_status="NOT_RUN",bfgs_seed_source="UNIT_IDENTITY";
+  std::string initialization_status="NOT_STARTED",start_gradient_solve_status="NOT_RUN",start_metrics_point="ORIGINAL_SELECTED_START";
+  std::string bfgs_seed_source="UNIT_IDENTITY";
+  std::string original_residual_initial_status="NOT_REQUIRED",original_residual_final_status="NOT_REQUIRED";
+  bool original_residual_initial_pass=false,original_residual_final_pass=false;
   bool block_newton_enabled=false,joint_block_enabled=false,trust_region_enabled=false,staged_barrier_enabled=false;
   std::string direction_method="BFGS",direction_reason="NOT_REQUESTED";
   std::string line_search_failure_status="NONE",directional_derivative_status="NOT_RUN",directional_derivative_side="NONE";
   std::vector<double> statistics,theta_baseline,theta_start,theta;
+  CovarianceBaseline covariance_baseline;
   std::vector<std::vector<double>> training_block_statistics;
   std::vector<std::uint64_t> training_block_frames;
   std::vector<double> coordinate_scale;
@@ -4115,17 +6481,40 @@ struct CovarianceFitResult
   CovarianceFailedTrial failed_trial;
   CovarianceJointStepAttribution last_joint_attribution;
   CovarianceBFGSSpectrumDiagnostic inverse_bfgs_spectrum;
+  CovarianceBFGSSpectrumDiagnostic analytic_curvature_spectrum;
   double inverse_bfgs_spectrum_seconds=0.0;
+  double analytic_curvature_seconds=0.0;
+  std::uint64_t analytic_curvature_builds=0,analytic_curvature_cache_hits=0,analytic_curvature_rhs_columns=0;
+  std::uint64_t analytic_curvature_workspace_allocations=0,analytic_curvature_workspace_peak_bytes=0;
+  std::string analytic_curvature_status="NOT_REQUESTED";
+  std::string analytic_curvature_stability_status="NOT_EVALUATED";
+  std::string analytic_curvature_exact_hessian_status="NOT_EVALUATED";
+  std::string analytic_curvature_direction_status="NOT_REQUESTED";
+  std::string analytic_curvature_independent_status="NOT_REQUESTED";
+  double analytic_curvature_direction_seconds=0.0,analytic_curvature_direction_max_relative_error=std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t analytic_curvature_direction_checks=0,analytic_curvature_direction_objectives=0;
+  double analytic_curvature_independent_seconds=0.0;
+  double analytic_curvature_independent_max_relative_error=std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t analytic_curvature_independent_rhs_columns=0;
+  int analytic_curvature_independent_probes=0,analytic_curvature_independent_directions=0;
+  double analytic_curvature_model_floor=0.0,analytic_curvature_diagonal_scale_min=std::numeric_limits<double>::quiet_NaN();
+  double analytic_curvature_diagonal_scale_max=std::numeric_limits<double>::quiet_NaN();
+  double analytic_curvature_relative_matrix_change=std::numeric_limits<double>::quiet_NaN();
+  double analytic_curvature_relative_step_change=std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t analytic_curvature_clipped_eigenvalues=0;
   CovarianceRunTraceResidualSummary run_trace_residual_summary;
   CovarianceJointRayProposal joint_ray_attempt,joint_ray_committed;
   CovarianceTraceDiagnostics failed_d_trace,failed_shifted_trace;
   double baseline_mu=std::numeric_limits<double>::quiet_NaN(),objective_data=std::numeric_limits<double>::quiet_NaN();
-  double objective_prior=std::numeric_limits<double>::quiet_NaN(),objective_barrier=std::numeric_limits<double>::quiet_NaN();
+  double objective_prior=std::numeric_limits<double>::quiet_NaN(),objective_ridge=std::numeric_limits<double>::quiet_NaN();
+  double objective_barrier=std::numeric_limits<double>::quiet_NaN();
   double objective_total=std::numeric_limits<double>::quiet_NaN(),scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
   double raw_gradient_inf_norm=std::numeric_limits<double>::quiet_NaN();
-  double start_graph_delta=0.0,start_objective=std::numeric_limits<double>::quiet_NaN(),start_raw_gradient_inf_norm=std::numeric_limits<double>::quiet_NaN();
+  double start_graph_delta=0.0,start_tau=std::numeric_limits<double>::quiet_NaN();
+  double start_objective=std::numeric_limits<double>::quiet_NaN(),start_raw_gradient_inf_norm=std::numeric_limits<double>::quiet_NaN();
   double start_scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
   double start_gradient_data_scaled_inf_norm=std::numeric_limits<double>::quiet_NaN(),start_gradient_prior_scaled_inf_norm=std::numeric_limits<double>::quiet_NaN();
+  double start_gradient_ridge_scaled_inf_norm=std::numeric_limits<double>::quiet_NaN();
   double start_gradient_barrier_scaled_inf_norm=std::numeric_limits<double>::quiet_NaN(),bfgs_seed_gamma=1.0;
   std::size_t bfgs_recent_pairs=0;
   double directional_derivative_slope=std::numeric_limits<double>::quiet_NaN(),directional_derivative_finite_difference=std::numeric_limits<double>::quiet_NaN();
@@ -4135,9 +6524,23 @@ struct CovarianceFitResult
   double direction_block_residual=std::numeric_limits<double>::quiet_NaN(),direction_block_asymmetry=std::numeric_limits<double>::quiet_NaN();
   double direction_block_gradient_inf=std::numeric_limits<double>::quiet_NaN(),direction_block_seconds=0.0;
   double barrier_tau=std::numeric_limits<double>::quiet_NaN(),barrier_gap_estimate=std::numeric_limits<double>::quiet_NaN();
+  double ridge_lambda=0.0,ridge_error_estimate=std::numeric_limits<double>::quiet_NaN();
+  int analytic_curvature_probes=0;std::string ridge_error_bound_status="NOT_AVAILABLE";
+  std::vector<double> ridge_coordinates;
+  std::uint64_t feasibility_budget_exact_gradients=0;
+  std::uint64_t original_residual_gradient_attempts=0;
+  double feasibility_budget_elapsed_seconds=std::numeric_limits<double>::quiet_NaN();
+  std::string feasibility_budget_status="NOT_APPLICABLE";
+  bool numerical_stalled=false;
+  std::uint64_t stagnation_gradient_attempts=0,stagnation_low_progress_windows=0;
+  double stagnation_best_kkt=std::numeric_limits<double>::quiet_NaN();
+  double stagnation_last_window_relative_improvement=std::numeric_limits<double>::quiet_NaN();
+  std::string stagnation_best_point_factor_status="NOT_APPLICABLE";
   double kkt_gradient_denominator=std::numeric_limits<double>::quiet_NaN();
   double worst_solve_relative_residual=std::numeric_limits<double>::quiet_NaN(),optimizer_seconds=0.0;
   double line_search_objective_seconds=0.0,line_search_gradient_seconds=0.0;
+  double objective_evaluation_seconds=0.0,full_gradient_seconds=0.0,last_full_gradient_seconds=0.0;
+  double factorization_seconds=0.0;
   std::uint64_t objective_evaluations=0,initialization_evaluations=0,line_search_trials=0,line_search_evaluations=0;
   std::uint64_t initialization_gradient_calls=0,line_search_gradient_calls=0,full_gradient_evaluations=0;
   std::uint64_t dominant_cap_rescue_attempts=0,dominant_cap_rescue_commits=0;
@@ -4159,15 +6562,61 @@ struct CovarianceFitResult
   int iterations=0;
 };
 
+void rebuild_restored_a0_baseline(CovarianceFitResult& fit,DeviceBaseline& device_baseline,const Graph& graph,
+  const std::vector<double>& sqrt_mass,const std::vector<double>& masses,
+  rpmd_ja_device::CovarianceFitWorkspace* workspace,const double epsilon,
+  rpmd_ja_feasibility::Budget* budget,const rpmd_ja_feasibility::Limits* limits,
+  DeviceCovarianceSystemWorkspace* shared_workspace=nullptr,const bool replay_current_data=false)
+{
+  DeviceCovarianceSystem system(device_baseline,graph,sqrt_mass,masses,workspace,shared_workspace);
+  system.before_factor=[budget,limits](){covariance_budget_observe_or_throw(budget,limits);};
+  if(replay_current_data){
+    std::uint64_t evaluations=0;double seconds=0.0;
+    const CovarianceBaseline recomputed=build_graph_covariance_baseline(system,fit.statistics,epsilon,evaluations,budget,limits,&seconds);
+    auto matches=[](const double first,const double second){return std::isfinite(first)&&std::isfinite(second)&&
+      std::abs(first-second)<=1e-8*std::max({1.0,std::abs(first),std::abs(second)});};
+    if(!matches(recomputed.mu,fit.covariance_baseline.mu)||
+       recomputed.epsilon_constraint_active!=fit.covariance_baseline.epsilon_constraint_active||
+       recomputed.theta.size()!=fit.covariance_baseline.theta.size()||recomputed.trace.size()!=fit.covariance_baseline.trace.size())
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 baseline center or active constraint does not replay");
+    for(std::size_t i=0;i<recomputed.theta.size();++i)
+      if(!matches(recomputed.theta[i],fit.covariance_baseline.theta[i])||!matches(recomputed.trace[i],fit.covariance_baseline.trace[i]))
+        throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 baseline mapping or trace does not replay");
+    const std::vector<double> saved_scale=fit.coordinate_scale;
+    const std::vector<double> recomputed_scale=system.coordinate_scales(recomputed.theta,epsilon);
+    if(saved_scale.size()!=recomputed_scale.size())
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 coordinate scales have the wrong dimension");
+    for(std::size_t i=0;i<saved_scale.size();++i)if(!matches(saved_scale[i],recomputed_scale[i]))
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 coordinate scale does not replay");
+    fit.coordinate_scale=recomputed_scale;fit.covariance_baseline=recomputed;fit.theta_baseline=recomputed.theta;
+    fit.baseline_mu=recomputed.mu;return;
+  }
+  double logdet=0.0,shifted_logdet=0.0;std::vector<double> recomputed_trace;
+  if(!system.evaluate_factors(fit.covariance_baseline.theta,epsilon,logdet,shifted_logdet,&recomputed_trace))
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: restored A0 baseline is not SPD");
+  if(recomputed_trace.size()!=fit.covariance_baseline.trace.size())
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: restored A0 baseline trace dimensions differ");
+  for(std::size_t i=0;i<recomputed_trace.size();++i)
+    if(std::abs(recomputed_trace[i]-fit.covariance_baseline.trace[i])>1e-10*std::max({1.0,std::abs(recomputed_trace[i]),
+         std::abs(fit.covariance_baseline.trace[i])}))
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: restored A0 covariance baseline changed");
+  fit.covariance_baseline.logdet=logdet;fit.covariance_baseline.shifted_logdet=shifted_logdet;
+}
+
+const std::vector<double>& covariance_a0_soft_mode_theta(const CovarianceFitResult& a0)
+{
+  return a0.covariance_baseline.theta;
+}
+
 enum class CovarianceObjectiveStatus { NotEvaluated, ShiftedNotSpd, Feasible };
 
 struct CovarianceObjectiveEvaluation
 {
   bool feasible=false;CovarianceObjectiveStatus status=CovarianceObjectiveStatus::NotEvaluated;
-  double data=0.0,prior=0.0,barrier=0.0,objective=0.0,logdet=0.0,shifted_logdet=0.0;
-  std::vector<double> gradient,gradient_data,gradient_prior,gradient_barrier;
-  std::vector<double> cached_theta,trace,shifted_trace,cholesky_diagonal,shifted_cholesky_diagonal;
-  double cached_epsilon=std::numeric_limits<double>::quiet_NaN();
+  double data=0.0,prior=0.0,ridge=0.0,barrier=0.0,objective=0.0,logdet=0.0,shifted_logdet=0.0;
+  std::vector<double> gradient,gradient_data,gradient_prior,gradient_ridge,gradient_barrier;
+  std::vector<double> cached_theta,cached_coordinate_scale,cached_ridge_coordinates,trace,shifted_trace,cholesky_diagonal,shifted_cholesky_diagonal;
+  double cached_epsilon=std::numeric_limits<double>::quiet_NaN(),cached_ridge_lambda=0.0;
 };
 
 struct CovarianceEdgeAttribution
@@ -4181,6 +6630,7 @@ struct CovarianceEdgeAttribution
   double sum_abs_atom_contribution=std::numeric_limits<double>::quiet_NaN();
   double top_20_atom_abs_fraction=std::numeric_limits<double>::quiet_NaN();
   std::vector<double> edge_data,edge_prior,edge_barrier,edge_total;
+  std::vector<double> parameter_ridge_gradient;
   std::vector<std::size_t> ranked_edges,ranked_atoms;
   std::vector<double> atom_data,atom_prior,atom_barrier,atom_total,atom_absolute_total;
 };
@@ -4198,14 +6648,16 @@ CovarianceEdgeAttribution covariance_edge_gradient_attribution(const Graph& grap
   if(atom_count<=0||parameter_count==0||graph.edges.empty()||edge_statistics.size()!=edge_values||
      baseline_edge_trace.size()!=edge_values||saved_edge_trace.size()!=edge_values||shifted_edge_trace.size()!=edge_values||
      coordinate_scale.size()!=parameter_count||value.gradient.size()!=parameter_count||value.gradient_data.size()!=parameter_count||
-     value.gradient_prior.size()!=parameter_count||value.gradient_barrier.size()!=parameter_count){result.status="DIMENSION_FAIL";return result;}
+     value.gradient_prior.size()!=parameter_count||value.gradient_ridge.size()!=parameter_count||
+     value.gradient_barrier.size()!=parameter_count){result.status="DIMENSION_FAIL";return result;}
   for(const Edge& edge:graph.edges)if(edge.i<0||edge.i>=atom_count||edge.j<0||edge.j>=atom_count||
      edge.group<0||static_cast<std::size_t>(edge.group)>=graph.type_pairs.size()){result.status="DIMENSION_FAIL";return result;}
-  if(!(rho>0.0)||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau)||
+  if(rho<0.0||!std::isfinite(rho)||!(tau>0.0)||!std::isfinite(tau)||
      !std::all_of(coordinate_scale.begin(),coordinate_scale.end(),[](double x){return x>0.0&&std::isfinite(x);})||
      !std::all_of(value.gradient.begin(),value.gradient.end(),[](double x){return std::isfinite(x);})||
      !std::all_of(value.gradient_data.begin(),value.gradient_data.end(),[](double x){return std::isfinite(x);})||
      !std::all_of(value.gradient_prior.begin(),value.gradient_prior.end(),[](double x){return std::isfinite(x);})||
+     !std::all_of(value.gradient_ridge.begin(),value.gradient_ridge.end(),[](double x){return std::isfinite(x);})||
      !std::all_of(value.gradient_barrier.begin(),value.gradient_barrier.end(),[](double x){return std::isfinite(x);})||
      !std::all_of(edge_statistics.begin(),edge_statistics.end(),[](double x){return std::isfinite(x);})||
      !std::all_of(baseline_edge_trace.begin(),baseline_edge_trace.end(),[](double x){return std::isfinite(x);})||
@@ -4213,6 +6665,7 @@ CovarianceEdgeAttribution covariance_edge_gradient_attribution(const Graph& grap
      !std::all_of(shifted_edge_trace.begin(),shifted_edge_trace.end(),[](double x){return std::isfinite(x);})){result.status="NONFINITE_EDGE_TERM";return result;}
 
   result.edge_data.resize(edge_values);result.edge_prior.resize(edge_values);result.edge_barrier.resize(edge_values);result.edge_total.resize(edge_values);
+  result.parameter_ridge_gradient=value.gradient_ridge;
   std::vector<NeumaierAccumulator> data_sums(parameter_count),prior_sums(parameter_count),barrier_sums(parameter_count),total_sums(parameter_count);
   std::vector<NeumaierAccumulator> data_abs(parameter_count),prior_abs(parameter_count),barrier_abs(parameter_count),total_abs(parameter_count);
   for(std::size_t e=0;e<graph.edges.size();++e){const std::size_t group=6*static_cast<std::size_t>(graph.edges[e].group);
@@ -4233,7 +6686,14 @@ CovarianceEdgeAttribution covariance_edge_gradient_attribution(const Graph& grap
       const double tolerance=1e-10*std::max({1.0,std::abs(actual),std::abs(expected[i]),absolute[i].value()});
       if(!std::isfinite(actual)||!std::isfinite(error)||error>tolerance)reconstructed=false;}};
   check(data_sums,data_abs,value.gradient_data);check(prior_sums,prior_abs,value.gradient_prior);
-  check(barrier_sums,barrier_abs,value.gradient_barrier);check(total_sums,total_abs,value.gradient);
+  check(barrier_sums,barrier_abs,value.gradient_barrier);
+  for(std::size_t i=0;i<parameter_count;++i){const double edge_total=total_sums[i].value();
+    const double reconstructed_total=edge_total+value.gradient_ridge[i];
+    const double error=std::abs(reconstructed_total-value.gradient[i]);
+    result.max_reconstruction_error=std::max(result.max_reconstruction_error,error);
+    const double tolerance=1e-10*std::max({1.0,std::abs(reconstructed_total),std::abs(value.gradient[i]),
+      total_abs[i].value(),std::abs(value.gradient_ridge[i])});
+    if(!std::isfinite(reconstructed_total)||!std::isfinite(error)||error>tolerance)reconstructed=false;}
   if(!reconstructed){result.status="RECONSTRUCTION_FAIL";return result;}
 
   result.dominant_parameter=0;double largest=std::abs(value.gradient[0]*coordinate_scale[0]);
@@ -4308,16 +6768,20 @@ double covariance_prior_rho_upper_bound(const double ratio,const double delta)
 
 void write_covariance_prior_calibration(std::ostream& out,const std::vector<double>& statistics,
   const std::vector<double>& baseline_trace,const std::vector<std::vector<double>>& block_statistics,
-  const std::vector<std::uint64_t>& block_frames,const double rho)
+  const std::vector<std::uint64_t>& block_frames,const std::size_t base_parameter_count,const double rho)
 {
   constexpr double bias_allowance=0.1;
-  if(statistics.size()!=baseline_trace.size()||statistics.size()%6!=0)
+  if(statistics.size()!=baseline_trace.size()||base_parameter_count>statistics.size()||base_parameter_count%6!=0)
     throw std::invalid_argument("native covariance prior calibration dimensions do not match");
+  for(const auto& block:block_statistics)if(block.size()!=statistics.size())
+    throw std::invalid_argument("native covariance prior block dimensions do not match");
   double rho_ceiling=std::numeric_limits<double>::infinity();std::size_t supported_groups=0,unsupported_groups=0;
   out<<"COVARIANCE_PRIOR_CALIBRATION selected_rho="<<rho<<" relative_bias_allowance="<<bias_allowance
-    <<" basis=nonnegative_xx_yy_zz parameter_group_statistics=1 fixed_training_R0=1 contiguous_training_blocks=1 interpretation=DIAGNOSTIC_ONLY\n"
+    <<" basis=nonnegative_xx_yy_zz parameter_scope=M0_BASE_PREFIX base_parameter_count="<<base_parameter_count
+    <<" total_parameter_count="<<statistics.size()<<" groups="<<base_parameter_count/6
+    <<" parameter_group_statistics=1 fixed_training_R0=1 contiguous_training_blocks=1 interpretation=DIAGNOSTIC_ONLY\n"
     <<"COVARIANCE_PRIOR_GROUP group training_diag baseline_trace_diag baseline_over_training mixed_proxy rho_ceiling block_min_over_training block_max_over_training status\n";
-  for(std::size_t group=0;group<statistics.size()/6;++group){const std::size_t offset=6*group;
+  for(std::size_t group=0;group<base_parameter_count/6;++group){const std::size_t offset=6*group;
     const double training=statistics[offset]+statistics[offset+3]+statistics[offset+5];
     const double prior=baseline_trace[offset]+baseline_trace[offset+3]+baseline_trace[offset+5];
     if(!(training>0.0)||!(prior>=0.0)||!std::isfinite(training)||!std::isfinite(prior)){
@@ -4327,7 +6791,7 @@ void write_covariance_prior_calibration(std::ostream& out,const std::vector<doub
     const double bound=covariance_prior_rho_upper_bound(ratio,bias_allowance);
     double group_rho_ceiling=bound;
     double block_min=std::numeric_limits<double>::infinity(),block_max=0.0;
-    for(const auto& block:block_statistics){if(block.size()!=statistics.size())throw std::invalid_argument("native covariance prior block dimensions do not match");
+    for(const auto& block:block_statistics){
       const double block_diag=block[offset]+block[offset+3]+block[offset+5];
       if(!std::isfinite(block_diag)||block_diag<0.0)throw std::runtime_error("native covariance prior block statistic is invalid");
       block_min=std::min(block_min,block_diag/training);block_max=std::max(block_max,block_diag/training);
@@ -4354,11 +6818,14 @@ void write_covariance_prior_calibration(std::ostream& out,const std::vector<doub
       else out<<" baseline_over_block=NOT_COMPUTED mixed_proxy=NOT_COMPUTED rho_ceiling=0 NO_BLOCK_SUPPORT\n";
       first_frame+=frames;}
   }
+  if(base_parameter_count<statistics.size())
+    out<<"COVARIANCE_PRIOR_M1_ADDED_DIRECTIONS parameter_count="<<statistics.size()-base_parameter_count
+      <<" status=NOT_APPLICABLE reason=NO_TYPEPAIR_PROXY\n";
   out<<"COVARIANCE_PRIOR_SELECTION rho_ceiling_for_bias_allowance ";
   if(std::isfinite(rho_ceiling))out<<rho_ceiling;else out<<"NO_FINITE_UPPER_BOUND";
   out<<" supported_groups="<<supported_groups<<" unsupported_groups="<<unsupported_groups<<" selected_rho_status="
     <<(supported_groups==0?"NO_SUPPORTED_GROUPS":unsupported_groups>0||rho>rho_ceiling?"ABOVE_ALLOWANCE_OR_UNSUPPORTED":"WITHIN_DECLARED_PROXY_ALLOWANCE")
-    <<" selection=USER_SUPPLIED_POSITIVE_RHO block_spread_is_not_uncertainty=1\n";
+    <<" selection=USER_SUPPLIED_RHO block_spread_is_not_uncertainty=1\n";
 }
 
 std::vector<double> covariance_scaled_gradient(const std::vector<double>& gradient,const std::vector<double>& scale);
@@ -4366,22 +6833,28 @@ double covariance_norm_inf(const std::vector<double>& values);
 
 void covariance_decompose_gradient(CovarianceObjectiveEvaluation& value,const std::vector<double>& statistics,
   const std::vector<double>& baseline_trace,const std::vector<double>& trace,const std::vector<double>& shifted_trace,
-  const double rho,const double tau)
+  const double rho,const double tau,const std::vector<double>* theta=nullptr,const std::vector<double>* theta_baseline=nullptr,
+  const std::vector<double>* coordinate_scale=nullptr,const double ridge_lambda=0.0)
 {
-  const std::size_t count=statistics.size();if(baseline_trace.size()!=count||trace.size()!=count||shifted_trace.size()!=count)
+  const std::size_t count=statistics.size();if(baseline_trace.size()!=count||trace.size()!=count||shifted_trace.size()!=count||
+     !std::isfinite(ridge_lambda)||ridge_lambda<0.0||(ridge_lambda>0.0&&(!theta||!theta_baseline||!coordinate_scale||
+       theta->size()!=count||theta_baseline->size()!=count||coordinate_scale->size()!=count)))
     throw std::invalid_argument("native covariance fit gradient decomposition dimensions do not match");
-  value.gradient.resize(count);value.gradient_data.resize(count);value.gradient_prior.resize(count);value.gradient_barrier.resize(count);
+  value.gradient.resize(count);value.gradient_data.resize(count);value.gradient_prior.resize(count);value.gradient_ridge.assign(count,0.0);value.gradient_barrier.resize(count);
   for(std::size_t i=0;i<count;++i){value.gradient_data[i]=0.5*(statistics[i]-trace[i]);
     value.gradient_prior[i]=0.5*rho*(baseline_trace[i]-trace[i]);value.gradient_barrier[i]=-tau*shifted_trace[i];
-    value.gradient[i]=0.5*(statistics[i]+rho*baseline_trace[i])-0.5*(1.0+rho)*trace[i]-tau*shifted_trace[i];}
+    if(ridge_lambda>0.0){const double scale=(*coordinate_scale)[i];if(!(scale>0.0)||!std::isfinite(scale))
+        throw std::invalid_argument("native covariance ridge coordinate scale is invalid");
+      value.gradient_ridge[i]=ridge_lambda*((*theta)[i]-(*theta_baseline)[i])/(scale*scale);}
+    value.gradient[i]=value.gradient_data[i]+value.gradient_prior[i]+value.gradient_ridge[i]+value.gradient_barrier[i];}
 }
 
 void capture_covariance_snapshot(CovarianceFitSnapshot& snapshot,const std::vector<double>& theta,
   const CovarianceObjectiveEvaluation& value,const std::vector<double>& scale,const double denominator,const double tau)
 {
   snapshot.available=true;snapshot.theta=theta;snapshot.gradient_data=value.gradient_data;snapshot.gradient_prior=value.gradient_prior;
-  snapshot.gradient_barrier=value.gradient_barrier;snapshot.gradient_total=value.gradient;snapshot.objective_data=value.data;
-  snapshot.objective_prior=value.prior;snapshot.objective_barrier=value.barrier;snapshot.objective=value.objective;snapshot.tau=tau;
+  snapshot.gradient_ridge=value.gradient_ridge;snapshot.gradient_barrier=value.gradient_barrier;snapshot.gradient_total=value.gradient;snapshot.objective_data=value.data;
+  snapshot.objective_prior=value.prior;snapshot.objective_ridge=value.ridge;snapshot.objective_barrier=value.barrier;snapshot.objective=value.objective;snapshot.tau=tau;
   snapshot.raw_gradient_inf_norm=covariance_norm_inf(value.gradient);
   snapshot.scaled_kkt_residual=covariance_norm_inf(covariance_scaled_gradient(value.gradient,scale))/denominator;
 }
@@ -4393,10 +6866,24 @@ CovarianceObjectiveEvaluation evaluate_covariance_fit_objective(DeviceCovariance
   const std::vector<double>& theta,const CovarianceBaseline& baseline,const std::vector<double>& statistics,
   const double rho,const double epsilon,const double tau,std::uint64_t& evaluations,const bool compute_gradient=true,
   const bool check_original_residual=false,const bool strict_solve=true,std::vector<double>* edge_traces=nullptr,
-  std::vector<double>* edge_shifted_traces=nullptr)
+  std::vector<double>* edge_shifted_traces=nullptr,const std::vector<double>* coordinate_scale=nullptr,const double ridge_lambda=0.0,
+  rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* budget_limits=nullptr,
+   std::uint64_t* gradient_attempt_counter=nullptr,std::uint64_t* phase_gradient_counter=nullptr,
+   std::uint64_t* original_residual_gradient_counter=nullptr,double* objective_seconds=nullptr,
+   double* full_gradient_seconds=nullptr,double* last_full_gradient_seconds=nullptr)
 {
+  CovarianceWallSeconds objective_time(objective_seconds);
+  if(!std::isfinite(ridge_lambda)||ridge_lambda<0.0||(ridge_lambda>0.0&&(!coordinate_scale||coordinate_scale->size()!=theta.size())))
+    throw std::invalid_argument("native covariance ridge objective inputs are invalid");
+  covariance_budget_observe_or_throw(budget,budget_limits);
+  CovarianceGradientBudgetReservation gradient_budget(compute_gradient?budget:nullptr,budget_limits);
+  CovarianceWallSeconds gradient_time(compute_gradient?full_gradient_seconds:nullptr,
+    compute_gradient?last_full_gradient_seconds:nullptr);
+  if(compute_gradient){if(gradient_attempt_counter)++*gradient_attempt_counter;if(phase_gradient_counter)++*phase_gradient_counter;
+    if(check_original_residual&&original_residual_gradient_counter)++*original_residual_gradient_counter;}
   CovarianceObjectiveEvaluation value;++evaluations;std::vector<double> trace,shifted_trace;
   value.cached_theta=theta;value.cached_epsilon=epsilon;
+  value.cached_ridge_lambda=ridge_lambda;if(ridge_lambda>0.0)value.cached_coordinate_scale=*coordinate_scale;
   if(!system.evaluate_factors(theta,epsilon,value.logdet,value.shifted_logdet,compute_gradient?&trace:nullptr,compute_gradient?&shifted_trace:nullptr,
       check_original_residual,strict_solve,edge_traces,edge_shifted_traces,&value.cholesky_diagonal,&value.shifted_cholesky_diagonal)){
     value.status=CovarianceObjectiveStatus::ShiftedNotSpd;return value;}
@@ -4404,14 +6891,96 @@ CovarianceObjectiveEvaluation evaluate_covariance_fit_objective(DeviceCovariance
   for(std::size_t i=0;i<theta.size();++i)delta[i]=theta[i]-baseline.theta[i];
   value.data=0.5*covariance_dot(delta,statistics)-0.5*delta_logdet;
   value.prior=0.5*rho*covariance_dot(delta,baseline.trace)-0.5*rho*delta_logdet;
+  if(ridge_lambda>0.0){std::vector<double> z(theta.size());for(std::size_t i=0;i<theta.size();++i)
+      z[i]=(theta[i]-baseline.theta[i])/(*coordinate_scale)[i];
+    value.cached_ridge_coordinates=z;
+    value.ridge=0.5*ridge_lambda*covariance_dot(z,z);}
   value.barrier=-tau*(value.shifted_logdet-baseline.shifted_logdet);
-  value.objective=value.data+value.prior+value.barrier;
+  value.objective=value.data+value.prior+value.ridge+value.barrier;
   if(compute_gradient){value.trace=trace;value.shifted_trace=shifted_trace;
-    covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau);}
-  value.feasible=std::isfinite(value.objective)&&std::isfinite(value.data)&&std::isfinite(value.prior)&&
+    covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau,&theta,&baseline.theta,coordinate_scale,ridge_lambda);}
+  value.feasible=std::isfinite(value.objective)&&std::isfinite(value.data)&&std::isfinite(value.prior)&&std::isfinite(value.ridge)&&
     (!compute_gradient||std::all_of(value.gradient.begin(),value.gradient.end(),[](double x){return std::isfinite(x);}));
   if(!value.feasible)throw std::runtime_error("native covariance fit objective or analytic gradient is non-finite");
   value.status=CovarianceObjectiveStatus::Feasible;return value;
+}
+
+void verify_imported_a0_fit(CovarianceFitResult& fit,DeviceBaseline& device_baseline,const Graph& graph,
+  const std::vector<double>& sqrt_mass,const std::vector<double>& masses,const std::vector<double>& statistics,
+  const double rho,const double epsilon,rpmd_ja_device::CovarianceFitWorkspace* workspace,
+  rpmd_ja_feasibility::Budget* budget,const rpmd_ja_feasibility::Limits* limits,
+  DeviceCovarianceSystemWorkspace* shared_workspace)
+{
+  if(!fit.converged||!fit.last_valid.available||fit.theta.empty()||fit.theta!=fit.last_valid.theta||
+     fit.theta.size()!=statistics.size()||fit.coordinate_scale.size()!=statistics.size()||
+     fit.theta_baseline.size()!=statistics.size()||fit.start_tau<=0.0||!std::isfinite(fit.start_tau)||
+     fit.barrier_tau<=0.0||!std::isfinite(fit.barrier_tau)||fit.last_valid.tau!=fit.barrier_tau)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 state lacks its complete converged response point");
+  auto matches=[](const double first,const double second){return std::isfinite(first)&&std::isfinite(second)&&
+    std::abs(first-second)<=1e-8*std::max({1.0,std::abs(first),std::abs(second)});};
+  auto compare_vector=[&](const std::vector<double>& saved,const std::vector<double>& replay,const char* label){
+    if(saved.size()!=replay.size())throw std::runtime_error(std::string("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 ")+label+" dimension differs");
+    for(std::size_t i=0;i<saved.size();++i)if(!matches(saved[i],replay[i]))
+      throw std::runtime_error(std::string("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 ")+label+" does not replay");};
+  const std::vector<double> direction=graph_laplacian_direction(graph,static_cast<int>(fit.theta_baseline.size()));
+  if(fit.start_graph_delta<0.0||!std::isfinite(fit.start_graph_delta)||
+     (fit.start_metrics_point!="ORIGINAL_SELECTED_START"&&fit.start_metrics_point!="RESTORED_ACCEPTED_POINT"))
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 start provenance is incomplete");
+  std::vector<double> expected_start(fit.theta_baseline.size());
+  for(std::size_t i=0;i<expected_start.size();++i)
+    expected_start[i]=fit.theta_baseline[i]+fit.start_graph_delta*direction[i];
+  compare_vector(fit.theta_start,expected_start,"original selected start");
+  if(!fit.covariance_baseline.epsilon_constraint_active){
+    if(fit.start_graph_delta!=0.0||fit.initialization_status!="SKIPPED_BASELINE_INTERIOR")
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 interior-baseline start rule differs");
+  }else if(fit.start_graph_delta>0.0&&fit.initialization_status!="IMPROVED"&&
+           fit.initialization_status!="IMPROVED_EVALUATION_LIMIT")
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 boundary-start search was not qualified");
+
+  DeviceCovarianceSystem system(device_baseline,graph,sqrt_mass,masses,workspace,shared_workspace);
+  system.before_factor=[budget,limits](){covariance_budget_observe_or_throw(budget,limits);};
+  std::uint64_t evaluations=0;
+  if(fit.start_metrics_point=="ORIGINAL_SELECTED_START"){
+    double start_gradient_norm=0.0;
+    const auto start=evaluate_covariance_fit_objective(system,fit.theta_start,fit.covariance_baseline,statistics,rho,epsilon,
+      fit.start_tau,evaluations,true,true,true,nullptr,nullptr,&fit.coordinate_scale,fit.ridge_lambda,budget,limits);
+    if(!start.feasible)throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: imported A0 selected start is not feasible");
+    for(const double value:start.gradient)start_gradient_norm=std::max(start_gradient_norm,std::abs(value));
+    if(!matches(start.objective,fit.start_objective)||!matches(start_gradient_norm,fit.start_raw_gradient_inf_norm))
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 selected-start objective or gradient does not replay");
+    if((fit.start_graph_delta>0.0&&!(start.objective<0.0))||
+       (fit.start_graph_delta==0.0&&fit.covariance_baseline.epsilon_constraint_active&& !matches(start.objective,0.0)))
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 selected start violates the baseline objective rule");
+  }
+
+  const auto replay=evaluate_covariance_fit_objective(system,fit.theta,fit.covariance_baseline,statistics,rho,epsilon,
+    fit.barrier_tau,evaluations,true,true,true,nullptr,nullptr,&fit.coordinate_scale,fit.ridge_lambda,budget,limits);
+  if(!replay.feasible||system.last_d_trace.status!="PASS"||system.last_shifted_trace.status!="PASS")
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: imported A0 final solve residuals are incomplete");
+  double raw_norm=0.0;std::vector<double> normalization(statistics.size());
+  for(std::size_t i=0;i<statistics.size();++i){raw_norm=std::max(raw_norm,std::abs(replay.gradient[i]));
+    normalization[i]=0.5*(statistics[i]+rho*fit.covariance_baseline.trace[i])*fit.coordinate_scale[i];}
+  double denominator=1.0;for(const double value:normalization)denominator=std::max(denominator,std::abs(value));
+  double scaled_norm=0.0;for(std::size_t i=0;i<replay.gradient.size();++i)
+    scaled_norm=std::max(scaled_norm,std::abs(replay.gradient[i]*fit.coordinate_scale[i]));
+  const double scaled_kkt=scaled_norm/denominator;
+  for(const auto& term:std::array<std::pair<double,double>,5>{{{replay.data,fit.objective_data},
+      {replay.prior,fit.objective_prior},{replay.ridge,fit.objective_ridge},{replay.barrier,fit.objective_barrier},
+      {replay.objective,fit.objective_total}}})if(!matches(term.first,term.second))
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 objective components do not replay");
+  if(!matches(raw_norm,fit.raw_gradient_inf_norm)||!matches(denominator,fit.kkt_gradient_denominator)||
+     !matches(scaled_kkt,fit.scaled_kkt_residual)||scaled_kkt>1e-6)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 full gradient or KKT qualification does not replay");
+  compare_vector(fit.last_valid.gradient_data,replay.gradient_data,"saved data gradient");
+  compare_vector(fit.last_valid.gradient_prior,replay.gradient_prior,"saved prior gradient");
+  compare_vector(fit.last_valid.gradient_ridge,replay.gradient_ridge,"saved ridge gradient");
+  compare_vector(fit.last_valid.gradient_barrier,replay.gradient_barrier,"saved barrier gradient");
+  compare_vector(fit.last_valid.gradient_total,replay.gradient,"saved full gradient");
+  if(!matches(fit.last_valid.objective_data,replay.data)||!matches(fit.last_valid.objective_prior,replay.prior)||
+     !matches(fit.last_valid.objective_ridge,replay.ridge)||!matches(fit.last_valid.objective_barrier,replay.barrier)||
+     !matches(fit.last_valid.objective,replay.objective)||!matches(fit.last_valid.raw_gradient_inf_norm,raw_norm)||
+     !matches(fit.last_valid.scaled_kkt_residual,scaled_kkt))
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 saved accepted-point ledger does not replay");
 }
 
 struct CovarianceObjectiveChange
@@ -4440,7 +7009,8 @@ double covariance_paired_log_ratio(const double current,const double candidate)
 CovarianceObjectiveChange covariance_trust_region_objective_change(const CovarianceObjectiveEvaluation& current,
   const CovarianceObjectiveEvaluation& candidate,const std::vector<double>& current_theta,
   const std::vector<double>& candidate_theta,const std::vector<double>& statistics,
-  const std::vector<double>& baseline_trace,const double rho,const double tau)
+  const std::vector<double>& baseline_trace,const double rho,const double tau,
+  const std::vector<double>* coordinate_scale=nullptr,const double ridge_lambda=0.0)
 {
   if(current_theta.size()!=candidate_theta.size()||current_theta.size()!=statistics.size()||statistics.size()!=baseline_trace.size()||
      !current.feasible||!candidate.feasible||current.cached_theta!=current_theta||candidate.cached_theta!=candidate_theta||
@@ -4448,7 +7018,11 @@ CovarianceObjectiveChange covariance_trust_region_objective_change(const Covaria
      current.cached_epsilon!=candidate.cached_epsilon||current.cholesky_diagonal.size()!=candidate.cholesky_diagonal.size()||
      current.cholesky_diagonal.empty()||current.shifted_cholesky_diagonal.size()!=candidate.shifted_cholesky_diagonal.size()||
      current.shifted_cholesky_diagonal.empty()||current.cholesky_diagonal.size()!=current.shifted_cholesky_diagonal.size()||
-     !std::isfinite(rho)||!std::isfinite(tau))
+     !std::isfinite(rho)||!std::isfinite(tau)||!std::isfinite(ridge_lambda)||ridge_lambda<0.0||
+     (ridge_lambda>0.0&&(!coordinate_scale||coordinate_scale->size()!=statistics.size()||
+       current.cached_ridge_lambda!=ridge_lambda||candidate.cached_ridge_lambda!=ridge_lambda||
+       current.cached_coordinate_scale!=*coordinate_scale||candidate.cached_coordinate_scale!=*coordinate_scale||
+       current.cached_ridge_coordinates.size()!=statistics.size()||candidate.cached_ridge_coordinates.size()!=statistics.size())))
     throw std::invalid_argument("native covariance trust-region objective-change dimensions do not match");
   NeumaierAccumulator change,absolute_terms;
   auto add_product=[&](const double left,const double right){const double product=left*right;
@@ -4458,6 +7032,9 @@ CovarianceObjectiveChange covariance_trust_region_objective_change(const Covaria
     const double step=candidate_theta[i]-current_theta[i];
     add_product(0.5*statistics[i],step);
     add_product(0.5*rho*baseline_trace[i],step);
+    if(ridge_lambda>0.0){const double current_z=current.cached_ridge_coordinates[i];
+      const double candidate_z=candidate.cached_ridge_coordinates[i];
+      add_product(0.5*ridge_lambda*(candidate_z+current_z),candidate_z-current_z);}
   }
   const double data_weight=-0.5*(1.0+rho);
   for(std::size_t i=0;i<current.cholesky_diagonal.size();++i){
@@ -4499,20 +7076,215 @@ CovarianceTrustRegionTrialDecision covariance_trust_region_trial_decision(const 
   return result;
 }
 
+struct CovarianceDirectionalCurvatureComparison
+{
+  bool resolved=false;
+  double coarse=std::numeric_limits<double>::quiet_NaN(),fine=std::numeric_limits<double>::quiet_NaN();
+  double coarse_resolution=std::numeric_limits<double>::quiet_NaN(),fine_resolution=std::numeric_limits<double>::quiet_NaN();
+  double extrapolated=std::numeric_limits<double>::quiet_NaN(),relative_error=std::numeric_limits<double>::quiet_NaN();
+  std::string status="NOT_EVALUATED";
+};
+
+CovarianceDirectionalCurvatureComparison covariance_compare_directional_curvature(const double gram_value,
+  const double coarse,const double fine,const double coarse_resolution,const double fine_resolution)
+{
+  CovarianceDirectionalCurvatureComparison result;result.coarse=coarse;result.fine=fine;
+  result.coarse_resolution=coarse_resolution;result.fine_resolution=fine_resolution;
+  if(!std::isfinite(gram_value)||!std::isfinite(coarse)||!std::isfinite(fine)||
+     !std::isfinite(coarse_resolution)||!std::isfinite(fine_resolution)||coarse_resolution<0.0||fine_resolution<0.0){
+    result.status="NONFINITE";return result;}
+  if(!covariance_objective_change_resolved(coarse,coarse_resolution)||
+     !covariance_objective_change_resolved(fine,fine_resolution)){
+    result.status="DIFFERENCE_BELOW_RESOLUTION";return result;}
+  result.extrapolated=(4.0*fine-coarse)/3.0;
+  const double scale=std::max({std::abs(coarse),std::abs(fine),std::abs(result.extrapolated),
+    std::abs(gram_value),std::numeric_limits<double>::min()});
+  const double resolution=8.0*(coarse_resolution+fine_resolution);
+  const bool step_stable=std::abs(coarse-fine)<=0.2*std::max(std::abs(coarse),std::abs(fine))+resolution;
+  const double error=std::abs(gram_value-result.extrapolated);result.relative_error=error/scale;
+  if(!step_stable){result.status="STEP_HALVING_UNSTABLE";return result;}
+  if(error>0.2*scale+resolution){result.status="GRAM_FINITE_DIFFERENCE_MISMATCH";return result;}
+  result.resolved=true;result.status="PASS";return result;
+}
+
+struct CovarianceDirectionalCurvatureSummary
+{
+  std::string status="NOT_RUN";std::uint64_t checks=0,objectives=0;
+  double seconds=0.0,max_relative_error=0.0;
+};
+
+bool covariance_directional_displacements(const std::vector<double>& theta,const std::vector<double>& coordinate_scale,
+  const std::vector<double>& direction,const double step_size,std::vector<double>& plus,std::vector<double>& minus)
+{
+  if(theta.empty()||theta.size()!=coordinate_scale.size()||theta.size()!=direction.size()||
+     !(step_size>0.0)||!std::isfinite(step_size))return false;
+  plus=theta;minus=theta;double direction_norm=0.0,asymmetry_norm=0.0,direction_error_norm=0.0;
+  for(std::size_t parameter=0;parameter<theta.size();++parameter){
+    if(!std::isfinite(theta[parameter])||!std::isfinite(coordinate_scale[parameter])||
+       !(coordinate_scale[parameter]>0.0)||!std::isfinite(direction[parameter]))return false;
+    if(direction[parameter]==0.0)continue;
+    direction_norm=std::hypot(direction_norm,direction[parameter]);
+    const double displacement=step_size*coordinate_scale[parameter]*direction[parameter];
+    plus[parameter]=theta[parameter]+displacement;minus[parameter]=theta[parameter]-displacement;
+    if(!std::isfinite(displacement)||displacement==0.0||!std::isfinite(plus[parameter])||!std::isfinite(minus[parameter])||
+       plus[parameter]==theta[parameter]||minus[parameter]==theta[parameter])return false;
+    const double positive=(plus[parameter]-theta[parameter])/coordinate_scale[parameter];
+    const double negative=(minus[parameter]-theta[parameter])/coordinate_scale[parameter];
+    if(!std::isfinite(positive)||!std::isfinite(negative))return false;
+    asymmetry_norm=std::hypot(asymmetry_norm,0.5*(positive+negative));
+    direction_error_norm=std::hypot(direction_error_norm,0.5*(positive-negative)-step_size*direction[parameter]);
+  }
+  const double tolerance=1.0e-8*step_size*direction_norm;
+  return direction_norm>0.0&&std::isfinite(tolerance)&&asymmetry_norm<=tolerance&&direction_error_norm<=tolerance;
+}
+
+bool covariance_directional_displacement_representable(const std::vector<double>& theta,
+  const std::vector<double>& coordinate_scale,const std::vector<double>& direction,const double step_size)
+{
+  std::vector<double> plus,minus;
+  return covariance_directional_displacements(theta,coordinate_scale,direction,step_size,plus,minus);
+}
+
+CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(DeviceCovarianceSystem& system,
+  const CovarianceObjectiveEvaluation& current,const CovarianceBaseline& baseline,const std::vector<double>& statistics,
+  const double rho,const double epsilon,const double tau,const std::vector<double>& coordinate_scale,
+  const double ridge_lambda,const std::vector<double>& raw_hessian,const std::vector<double>& scaled_gradient,
+  const std::vector<double>* actual_step,std::uint64_t& objective_evaluations,const std::uint64_t max_objective_evaluations,
+  rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* budget_limits=nullptr,
+  std::ostream* trace=nullptr,const char* trigger="INITIAL",const bool include_reference_directions=true)
+{
+  CovarianceDirectionalCurvatureSummary summary;const auto started=std::chrono::steady_clock::now();
+  const int p=system.p;
+  if(!current.feasible||current.cached_theta.size()!=static_cast<std::size_t>(p)||coordinate_scale.size()!=static_cast<std::size_t>(p)||
+     scaled_gradient.size()!=static_cast<std::size_t>(p)||raw_hessian.size()!=static_cast<std::size_t>(p)*p||
+     (actual_step&&actual_step->size()!=static_cast<std::size_t>(p)))
+    throw std::invalid_argument("directional covariance curvature verification dimensions do not match");
+  std::vector<std::pair<std::string,std::vector<double>>> directions;
+  auto append_direction=[&](const char* name,std::vector<double> direction){
+    const double norm=std::sqrt(std::inner_product(direction.begin(),direction.end(),direction.begin(),0.0));
+    if(!std::isfinite(norm)||norm<=1e-14)return false;
+    for(double& value:direction)value/=norm;directions.emplace_back(name,std::move(direction));return true;};
+  if(include_reference_directions){std::vector<double> gradient_direction=scaled_gradient;
+    for(double& value:gradient_direction)value=-value;append_direction("SCALED_GRADIENT",std::move(gradient_direction));}
+  if(actual_step)append_direction("ACTUAL_SUGGESTED_STEP",*actual_step);
+  if(include_reference_directions){std::mt19937_64 random(0x6a09e667f3bcc909ULL);std::uniform_int_distribution<int> sign(0,1);
+    std::vector<double> random_direction(static_cast<std::size_t>(p));for(double& value:random_direction)value=sign(random)?1.0:-1.0;
+    append_direction("FIXED_RANDOM",std::move(random_direction));}
+  if(directions.empty())throw std::runtime_error("CURVATURE_UNRESOLVED: no finite directional curvature probes could be formed");
+  auto evaluate_objective=[&](const std::vector<double>& theta){
+    if(objective_evaluations>=max_objective_evaluations){
+      if(trace)*trace<<"COVARIANCE_CURVATURE_STEP status=EVALUATION_BUDGET_EXHAUSTED objective_evaluations="
+        <<objective_evaluations<<" cap="<<max_objective_evaluations<<'\n';
+      throw std::runtime_error("EVALUATION_BUDGET_EXHAUSTED");}
+    ++summary.objectives;
+    return evaluate_covariance_fit_objective(system,theta,baseline,statistics,rho,epsilon,tau,
+      objective_evaluations,false,false,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,budget,budget_limits);
+  };
+  auto evaluate_second_at=[&](const std::vector<double>& direction,const double step_size,const char* direction_name,
+      const int shrink,CovarianceObjectiveChange& second){
+    std::vector<double> plus,minus;
+    if(!covariance_directional_displacements(current.cached_theta,coordinate_scale,direction,step_size,plus,minus))
+      throw std::runtime_error(std::string("CURVATURE_UNRESOLVED: DIRECTIONAL_ARITHMETIC_UNRESOLVED direction=")+direction_name);
+    const CovarianceObjectiveEvaluation plus_value=evaluate_objective(plus);
+    if(!plus_value.feasible){
+      if(trace)*trace<<"COVARIANCE_CURVATURE_STEP direction="<<direction_name<<" h="<<step_size
+        <<" status=STEP_BOUNDARY side=PLUS shrink="<<shrink<<'\n';return false;}
+    const CovarianceObjectiveEvaluation minus_value=evaluate_objective(minus);
+    if(!minus_value.feasible){
+      if(trace)*trace<<"COVARIANCE_CURVATURE_STEP direction="<<direction_name<<" h="<<step_size
+        <<" status=STEP_BOUNDARY side=MINUS shrink="<<shrink<<'\n';return false;}
+    const CovarianceObjectiveChange plus_change=covariance_trust_region_objective_change(current,plus_value,
+      current.cached_theta,plus,statistics,baseline.trace,rho,tau,&coordinate_scale,ridge_lambda);
+    const CovarianceObjectiveChange minus_change=covariance_trust_region_objective_change(current,minus_value,
+      current.cached_theta,minus,statistics,baseline.trace,rho,tau,&coordinate_scale,ridge_lambda);
+    const double denominator=step_size*step_size;
+    second.value=(plus_change.value+minus_change.value)/denominator;
+    second.resolution=(plus_change.resolution+minus_change.resolution)/denominator+
+      covariance_local_difference_resolution(std::abs(plus_change.value)+std::abs(minus_change.value),4)/denominator;
+    if(!std::isfinite(second.value)||!std::isfinite(second.resolution))
+      throw std::runtime_error(std::string("CURVATURE_UNRESOLVED: NONFINITE_DIFFERENCE direction=")+direction_name);
+    return true;
+  };
+  struct DirectionalSecondPair{CovarianceObjectiveChange coarse,fine;CovarianceDirectionalCurvatureComparison comparison;double h=0.0;};
+  auto evaluate_pair=[&](const std::vector<double>& direction,double step_size,const double gram_value,const char* direction_name){
+    constexpr int maximum_step_halvings=24;std::string last_status="DIRECTIONAL_STEP_BOUNDARY";
+    for(int shrink=0;shrink<=maximum_step_halvings;++shrink){DirectionalSecondPair pair;pair.h=step_size;
+      if(!evaluate_second_at(direction,step_size,direction_name,shrink,pair.coarse)){last_status="DIRECTIONAL_STEP_BOUNDARY";step_size*=0.5;continue;}
+      if(!evaluate_second_at(direction,0.5*step_size,direction_name,shrink,pair.fine)){last_status="DIRECTIONAL_STEP_BOUNDARY";step_size*=0.5;continue;}
+      pair.comparison=covariance_compare_directional_curvature(gram_value,pair.coarse.value,pair.fine.value,
+        pair.coarse.resolution,pair.fine.resolution);++summary.checks;
+      if(pair.comparison.status=="STEP_HALVING_UNSTABLE"){
+        last_status=pair.comparison.status;
+        if(trace)*trace<<"COVARIANCE_CURVATURE_STEP direction="<<direction_name<<" h="<<step_size
+          <<" status=STEP_HALVING_UNSTABLE_RETRY shrink="<<shrink<<'\n';
+        step_size*=0.5;continue;
+      }
+      summary.max_relative_error=std::max(summary.max_relative_error,pair.comparison.relative_error);
+      if(trace)*trace<<"COVARIANCE_CURVATURE_STEP direction="<<direction_name<<" h="<<step_size
+        <<" status="<<pair.comparison.status<<" shrink="<<shrink<<'\n';
+      return pair;
+    }
+    throw std::runtime_error(std::string("CURVATURE_UNRESOLVED: ")+last_status+
+      " direction="+direction_name+" after bounded step reduction");
+  };
+  try{
+    for(const auto& named:directions){const std::vector<double>& direction=named.second;std::vector<double> action(static_cast<std::size_t>(p),0.0);
+      for(int row=0;row<p;++row)for(int column=0;column<p;++column)
+        action[row]+=raw_hessian[static_cast<std::size_t>(row)+static_cast<std::size_t>(column)*p]*direction[column];
+      const double gram_value=std::inner_product(direction.begin(),direction.end(),action.begin(),0.0);
+      const double suggested_norm=actual_step?std::sqrt(std::inner_product(actual_step->begin(),actual_step->end(),actual_step->begin(),0.0)):1.0;
+      const double h=std::min(1.0e-3,std::max(1.0e-6,0.25*std::min(1.0,suggested_norm)));
+      const DirectionalSecondPair pair=evaluate_pair(direction,h,gram_value,named.first.c_str());
+      const CovarianceObjectiveChange& coarse=pair.coarse;const CovarianceObjectiveChange& fine=pair.fine;
+      const CovarianceDirectionalCurvatureComparison& comparison=pair.comparison;
+      if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION trigger="<<trigger<<" direction="<<named.first
+        <<" status="<<comparison.status<<" gram="<<gram_value<<" coarse="<<comparison.coarse
+        <<" fine="<<comparison.fine<<" extrapolated="<<comparison.extrapolated
+        <<" coarse_resolution="<<comparison.coarse_resolution<<" fine_resolution="<<comparison.fine_resolution
+        <<" relative_error="<<comparison.relative_error<<" h="<<pair.h<<" h_half="<<0.5*pair.h<<'\n';
+      if(!comparison.resolved)throw std::runtime_error("CURVATURE_UNRESOLVED: "+comparison.status+" direction="+named.first);
+    }
+    if(!system.ensure_factors(current.cached_theta,epsilon))
+      throw std::runtime_error("CURVATURE_UNRESOLVED: could not restore accepted-point covariance factors after directional checks");
+    summary.status="PASS";
+  }catch(...){
+    const std::exception_ptr original=std::current_exception();
+    summary.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    if(!system.ensure_factors(current.cached_theta,epsilon))
+      throw std::runtime_error("CURVATURE_UNRESOLVED: accepted-point factors could not be restored after directional checks");
+    std::string failure="UNKNOWN";try{std::rethrow_exception(original);}catch(const std::exception& error){failure=error.what();}catch(...){}
+    if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION_SUMMARY trigger="<<trigger<<" status=UNRESOLVED checks="<<summary.checks
+      <<" objective_evaluations="<<summary.objectives<<" elapsed_seconds="<<summary.seconds
+      <<" reason="<<std::quoted(failure)<<" model_floor_excluded 1\n";
+    std::rethrow_exception(original);
+  }
+  summary.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+  if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION_SUMMARY trigger="<<trigger<<" status=PASS checks="<<summary.checks
+    <<" objective_evaluations="<<summary.objectives<<" max_relative_error="<<summary.max_relative_error
+    <<" elapsed_seconds="<<summary.seconds<<" model_floor_excluded 1\n";
+  return summary;
+}
+
 void complete_covariance_fit_gradient_from_factors(DeviceCovarianceSystem& system,CovarianceObjectiveEvaluation& value,
   const CovarianceBaseline& baseline,const std::vector<double>& statistics,const double rho,const double epsilon,
-  const std::vector<double>& theta,const double tau)
+  const std::vector<double>& theta,const double tau,const std::vector<double>& coordinate_scale={},const double ridge_lambda=0.0,
+  rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* budget_limits=nullptr,
+  std::uint64_t* gradient_attempt_counter=nullptr,std::uint64_t* phase_gradient_counter=nullptr)
 {
-  if(value.cached_theta!=theta||value.cached_epsilon!=epsilon||!value.feasible)
+  if(value.cached_theta!=theta||value.cached_epsilon!=epsilon||value.cached_ridge_lambda!=ridge_lambda||!value.feasible)
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance gradient cache does not match the candidate theta and epsilon");
+  covariance_budget_observe_or_throw(budget,budget_limits);
+  CovarianceGradientBudgetReservation gradient_budget(budget,budget_limits);
+  if(gradient_attempt_counter)++*gradient_attempt_counter;if(phase_gradient_counter)++*phase_gradient_counter;
   system.worst_solve_relative_residual=0.0;
   system.last_d_trace=CovarianceTraceDiagnostics{};system.last_d_trace.matrix_kind="D";
   system.last_shifted_trace=CovarianceTraceDiagnostics{};system.last_shifted_trace.matrix_kind="D_MINUS_EPSILON_I";
   std::vector<double> trace,shifted_trace;
-  try{trace=system.trace_derivatives(system.compact,"D");shifted_trace=system.trace_derivatives(system.shifted,"D_MINUS_EPSILON_I");}
+  try{if(!system.ensure_factors(theta,epsilon))throw std::runtime_error("current covariance point is not epsilon-positive definite");
+    trace=system.trace_derivatives(system.compact,"D");shifted_trace=system.trace_derivatives(system.shifted,"D_MINUS_EPSILON_I");}
   catch(CovarianceSolveResidualError& error){error.d_trace=system.last_d_trace;error.shifted_trace=system.last_shifted_trace;throw;}
   value.trace=trace;value.shifted_trace=shifted_trace;
-  covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau);
+  covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau,&theta,&baseline.theta,&coordinate_scale,ridge_lambda);
   if(!std::all_of(value.gradient.begin(),value.gradient.end(),[](double x){return std::isfinite(x);}))
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance fit gradient from accepted Cholesky factors is non-finite");
 }
@@ -4524,13 +7296,14 @@ double covariance_norm_inf(const std::vector<double>& values)
 {double norm=0.0;for(const double value:values)norm=std::max(norm,std::abs(value));return norm;}
 
 void covariance_recompose_objective_for_tau(CovarianceObjectiveEvaluation& value,const std::vector<double>& theta,
-  const CovarianceBaseline& baseline,const std::vector<double>& statistics,const double rho,const double epsilon,const double tau)
+  const CovarianceBaseline& baseline,const std::vector<double>& statistics,const double rho,const double epsilon,const double tau,
+  const std::vector<double>& coordinate_scale={},const double ridge_lambda=0.0)
 {
-  if(!value.feasible||value.cached_theta!=theta||value.cached_epsilon!=epsilon||value.trace.size()!=statistics.size()||
+  if(!value.feasible||value.cached_theta!=theta||value.cached_epsilon!=epsilon||value.cached_ridge_lambda!=ridge_lambda||value.trace.size()!=statistics.size()||
      value.shifted_trace.size()!=statistics.size())
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance tau update has no theta-bound trace cache");
-  value.barrier=-tau*(value.shifted_logdet-baseline.shifted_logdet);value.objective=value.data+value.prior+value.barrier;
-  covariance_decompose_gradient(value,statistics,baseline.trace,value.trace,value.shifted_trace,rho,tau);
+  value.barrier=-tau*(value.shifted_logdet-baseline.shifted_logdet);value.objective=value.data+value.prior+value.ridge+value.barrier;
+  covariance_decompose_gradient(value,statistics,baseline.trace,value.trace,value.shifted_trace,rho,tau,&theta,&baseline.theta,&coordinate_scale,ridge_lambda);
   if(!std::isfinite(value.objective)||!std::all_of(value.gradient.begin(),value.gradient.end(),[](double item){return std::isfinite(item);}))
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance tau cache recomposition is non-finite");
 }
@@ -4545,8 +7318,10 @@ bool covariance_barrier_stage_pass(const CovarianceObjectiveEvaluation& current,
 
 bool covariance_build_scaled_trial(const std::vector<double>& theta,const std::vector<double>& z,const std::vector<double>& scale,
   const std::vector<double>& direction,const double step_scale,std::vector<double>& next_z,std::vector<double>& actual_step,
-  std::vector<double>& next_theta)
+  std::vector<double>& next_theta,const std::vector<double>* center=nullptr)
 {
+  if(theta.size()!=z.size()||theta.size()!=scale.size()||theta.size()!=direction.size()||
+     (center&&center->size()!=theta.size()))throw std::invalid_argument("covariance scaled-coordinate trial dimensions do not match");
   next_z=z;actual_step.resize(z.size());for(std::size_t i=0;i<z.size();++i){next_z[i]=z[i]+step_scale*direction[i];actual_step[i]=next_z[i]-z[i];}
   if(!std::all_of(next_z.begin(),next_z.end(),[](double value){return std::isfinite(value);})||
      !std::all_of(actual_step.begin(),actual_step.end(),[](double value){return std::isfinite(value);}))
@@ -4555,7 +7330,7 @@ bool covariance_build_scaled_trial(const std::vector<double>& theta,const std::v
   next_theta.resize(theta.size());for(std::size_t i=0;i<theta.size();++i){
     next_theta[i]=theta[i]+scale[i]*actual_step[i];
     actual_step[i]=(next_theta[i]-theta[i])/scale[i];
-    next_z[i]=next_theta[i]/scale[i];
+    next_z[i]=(next_theta[i]-(center?(*center)[i]:0.0))/scale[i];
   }
   if(!std::all_of(next_theta.begin(),next_theta.end(),[](double value){return std::isfinite(value);})||
      !std::all_of(next_z.begin(),next_z.end(),[](double value){return std::isfinite(value);})||
@@ -4567,7 +7342,8 @@ bool covariance_build_scaled_trial(const std::vector<double>& theta,const std::v
 // Returns whether a trial was built; any unrepaired over-radius step remains for the caller's strict rejection path.
 bool covariance_build_trust_region_trial(const std::vector<double>& theta,const std::vector<double>& z,
   const std::vector<double>& scale,const std::vector<double>& direction,const double proposal_norm,const double radius,
-  std::vector<double>& next_z,std::vector<double>& actual_step,std::vector<double>& next_theta,bool& repaired)
+  std::vector<double>& next_z,std::vector<double>& actual_step,std::vector<double>& next_theta,bool& repaired,
+  const std::vector<double>* center=nullptr)
 {
   repaired=false;const std::size_t size=theta.size();
   if(z.size()!=size||scale.size()!=size||direction.size()!=size||!std::isfinite(proposal_norm)||proposal_norm<0.0||
@@ -4577,7 +7353,7 @@ bool covariance_build_trust_region_trial(const std::vector<double>& theta,const 
      !std::all_of(scale.begin(),scale.end(),[](double x){return std::isfinite(x)&&x>0.0;})||
      !std::all_of(direction.begin(),direction.end(),[](double x){return std::isfinite(x);}))
     throw std::invalid_argument("trust-region scaled trial has invalid dimensions or non-finite inputs");
-  if(!covariance_build_scaled_trial(theta,z,scale,direction,1.0,next_z,actual_step,next_theta))return false;
+  if(!covariance_build_scaled_trial(theta,z,scale,direction,1.0,next_z,actual_step,next_theta,center))return false;
   auto norm=[](const std::vector<double>& values){double value=0.0;for(const double x:values)value=std::hypot(value,x);return value;};
   const double actual_norm=norm(actual_step);
   if(!std::isfinite(actual_norm))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region actual step norm is non-finite");
@@ -4606,7 +7382,7 @@ bool covariance_build_trust_region_trial(const std::vector<double>& theta,const 
     const double factor=lower+0.5*(upper-lower);
     if(!(factor>lower&&factor<upper))break;
     std::vector<double> candidate_z,candidate_step,candidate_theta;
-    if(!covariance_build_scaled_trial(theta,z,scale,direction,factor,candidate_z,candidate_step,candidate_theta)){lower=factor;continue;}
+    if(!covariance_build_scaled_trial(theta,z,scale,direction,factor,candidate_z,candidate_step,candidate_theta,center)){lower=factor;continue;}
     const double candidate_norm=norm(candidate_step);
     if(!std::isfinite(candidate_norm))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region rebuilt step norm is non-finite");
     if(candidate_norm==0.0){lower=factor;continue;}
@@ -4794,7 +7570,10 @@ CovarianceBFGSSpectrumDiagnostic covariance_inverse_bfgs_spectrum(cusolverDnHand
 struct CovarianceTrustRegionModel
 {
   bool positive_definite=false;std::string status="NOT_EVALUATED";
-  std::vector<double> eigenvalues,eigenvectors;CovarianceBFGSSpectrumDiagnostic spectrum;
+  std::vector<double> eigenvalues,eigenvectors,coordinate_transform,hessian_matrix;
+  double spectral_floor=0.0,diagonal_scale_min=std::numeric_limits<double>::quiet_NaN();
+  double diagonal_scale_max=std::numeric_limits<double>::quiet_NaN();int clipped_eigenvalues=0;
+  CovarianceBFGSSpectrumDiagnostic spectrum;
 };
 
 CovarianceTrustRegionModel covariance_trust_region_model(cusolverDnHandle_t solver,const std::vector<double>& inverse_hessian,const int n)
@@ -4836,6 +7615,56 @@ CovarianceTrustRegionModel covariance_trust_region_model(cusolverDnHandle_t solv
   diagnostic.status=model.status;return model;
 }
 
+CovarianceTrustRegionModel covariance_direct_hessian_trust_region_model(cusolverDnHandle_t solver,
+  const std::vector<double>& hessian,const int n)
+{
+  if(n<=0||hessian.size()!=static_cast<std::size_t>(n)*n)
+    throw std::invalid_argument("analytic covariance direct Hessian dimensions do not match");
+  CovarianceTrustRegionModel model;model.coordinate_transform.resize(static_cast<std::size_t>(n));
+  model.diagonal_scale_min=std::numeric_limits<double>::infinity();model.diagonal_scale_max=0.0;
+  for(int i=0;i<n;++i){const double diagonal=hessian[static_cast<std::size_t>(i)*n+i];
+    if(!(diagonal>0.0)||!std::isfinite(diagonal)){model.status="INVALID_DIAGONAL";model.spectrum.status=model.status;return model;}
+    const double scale=1.0/std::sqrt(diagonal);if(!(scale>0.0)||!std::isfinite(scale)){
+      model.status="INVALID_DIAGONAL_SCALE";model.spectrum.status=model.status;return model;}
+    model.coordinate_transform[static_cast<std::size_t>(i)]=scale;
+    model.diagonal_scale_min=std::min(model.diagonal_scale_min,scale);model.diagonal_scale_max=std::max(model.diagonal_scale_max,scale);}
+  std::vector<double> balanced(hessian.size());double matrix_scale=0.0,asymmetry=0.0;
+  for(int i=0;i<n;++i)for(int j=0;j<n;++j){const double pi=model.coordinate_transform[static_cast<std::size_t>(i)],pj=model.coordinate_transform[static_cast<std::size_t>(j)];
+    const double a=hessian[static_cast<std::size_t>(i)*n+j]*pi*pj,b=hessian[static_cast<std::size_t>(j)*n+i]*pi*pj;
+    if(!std::isfinite(a)||!std::isfinite(b)){model.status="NONFINITE_EQUILIBRATED_HESSIAN";model.spectrum.status=model.status;return model;}
+    balanced[static_cast<std::size_t>(i)*n+j]=0.5*a+0.5*b;
+    matrix_scale=std::max(matrix_scale,std::abs(balanced[static_cast<std::size_t>(i)*n+j]));if(i<j)asymmetry=std::hypot(asymmetry,std::sqrt(2.0)*(a-b));}
+  if(!(matrix_scale>0.0)||!std::isfinite(matrix_scale)){model.status="ZERO_EQUILIBRATED_SCALE";model.spectrum.status=model.status;return model;}
+  std::vector<double> normalized(balanced.size());double norm=0.0;
+  for(std::size_t i=0;i<balanced.size();++i){normalized[i]=balanced[i]/matrix_scale;norm=std::hypot(norm,normalized[i]);}
+  model.spectrum.matrix_scale=matrix_scale;model.spectrum.relative_asymmetry=asymmetry/std::max(norm,1e-300);
+  const SmallEigen eigen=eigen_small(solver,normalized,n);
+  model.spectrum.eigen_residual=covariance_symmetric_eigen_residual(normalized,eigen,n);
+  double eigen_norm=0.0;for(const double value:eigen.values)eigen_norm=std::hypot(eigen_norm,value);
+  const double uncertainty=std::max(model.spectrum.eigen_residual,64.0*std::numeric_limits<double>::epsilon()*n)*
+    std::max({1.0,norm,eigen_norm});
+  if(!std::isfinite(model.spectrum.relative_asymmetry)||model.spectrum.relative_asymmetry>1e-8||
+     !std::isfinite(model.spectrum.eigen_residual)||model.spectrum.eigen_residual>1e-8){
+    model.status="UNVERIFIED_EQUILIBRATED_EIGEN_SYSTEM";model.spectrum.status=model.status;return model;}
+  const double min_scaled=eigen.values.front(),max_scaled=eigen.values.back();
+  if(!std::isfinite(min_scaled)||!std::isfinite(max_scaled)){model.status="NONFINITE_EQUILIBRATED_EIGENVALUE";model.spectrum.status=model.status;return model;}
+  model.spectrum.min_eigenvalue=min_scaled*matrix_scale;model.spectrum.max_eigenvalue=max_scaled*matrix_scale;
+  if(min_scaled < -uncertainty){model.status="INDEFINITE_EQUILIBRATED_HESSIAN";model.spectrum.status=model.status;return model;}
+  const double floor_scaled=uncertainty;model.spectral_floor=floor_scaled*matrix_scale;
+  std::vector<double> clipped=eigen.values;
+  for(double& value:clipped)if(value<floor_scaled){value=floor_scaled;++model.clipped_eigenvalues;}
+  model.hessian_matrix.assign(hessian.size(),0.0);model.eigenvalues.resize(static_cast<std::size_t>(n));
+  for(int k=0;k<n;++k){const double lambda=clipped[static_cast<std::size_t>(k)]*matrix_scale;
+    if(!(lambda>0.0)||!std::isfinite(lambda)||!std::isfinite(1.0/lambda)){model.status="UNRESOLVED_EQUILIBRATED_EIGENVALUE_SCALE";model.spectrum.status=model.status;return model;}
+    model.eigenvalues[static_cast<std::size_t>(k)]=1.0/lambda;
+    for(int i=0;i<n;++i)for(int j=0;j<n;++j)model.hessian_matrix[static_cast<std::size_t>(i)*n+j]+=
+      lambda*eigen.vectors[static_cast<std::size_t>(i)+static_cast<std::size_t>(k)*n]*
+      eigen.vectors[static_cast<std::size_t>(j)+static_cast<std::size_t>(k)*n];}
+  model.eigenvectors=eigen.vectors;model.positive_definite=true;
+  model.status=model.clipped_eigenvalues?"MODEL_REGULARIZED_SOFT_EIGENVALUES":"SPD_VERIFIED_EQUILIBRATED_HESSIAN";
+  model.spectrum.condition_number=max_scaled/std::max(min_scaled,floor_scaled);model.spectrum.status=model.status;return model;
+}
+
 CovarianceTrustRegionModel covariance_identity_trust_region_model(const int n,const double scale)
 {
   if(n<=0||!(scale>0.0)||!std::isfinite(scale)||!std::isfinite(1.0/scale))
@@ -4858,6 +7687,17 @@ double covariance_trust_region_predicted_reduction(const CovarianceTrustRegionMo
 {
   const std::size_t n=gradient.size();if(!model.positive_definite||step.size()!=n||model.eigenvalues.size()!=n||model.eigenvectors.size()!=n*n)
     throw std::invalid_argument("native covariance trust-region prediction dimensions do not match");
+  if(!model.coordinate_transform.empty()){
+    if(model.coordinate_transform.size()!=n||model.hessian_matrix.size()!=n*n)
+      throw std::invalid_argument("preconditioned covariance trust-region model dimensions do not match");
+    std::vector<double> v(n),scaled_gradient(n),action(n);
+    for(std::size_t i=0;i<n;++i){v[i]=step[i]/model.coordinate_transform[i];scaled_gradient[i]=model.coordinate_transform[i]*gradient[i];}
+    for(std::size_t i=0;i<n;++i){NeumaierAccumulator row;
+      for(std::size_t j=0;j<n;++j)row.add_product(model.hessian_matrix[i*n+j],v[j]);action[i]=row.value();}
+    const double predicted=-covariance_dot(scaled_gradient,v)-0.5*covariance_dot(v,action);
+    if(!std::isfinite(predicted))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: preconditioned trust-region prediction is non-finite");
+    return predicted;
+  }
   double model_quadratic=0.0;
   for(std::size_t k=0;k<n;++k){double projected_step=0.0;for(std::size_t i=0;i<n;++i)projected_step+=model.eigenvectors[i+k*n]*step[i];
     model_quadratic+=projected_step*projected_step/model.eigenvalues[k];}
@@ -4872,6 +7712,17 @@ double covariance_trust_region_prediction_resolution(const CovarianceTrustRegion
   const std::size_t n=gradient.size();if(step.size()!=n||model.eigenvalues.size()!=n||model.eigenvectors.size()!=n*n)
     throw std::invalid_argument("native covariance trust-region prediction-resolution dimensions do not match");
   NeumaierAccumulator absolute_terms;
+  if(!model.coordinate_transform.empty()){
+    if(model.coordinate_transform.size()!=n||model.hessian_matrix.size()!=n*n)
+      throw std::invalid_argument("preconditioned covariance trust-region resolution dimensions do not match");
+    std::vector<double> v(n),scaled_gradient(n);
+    for(std::size_t i=0;i<n;++i){v[i]=step[i]/model.coordinate_transform[i];scaled_gradient[i]=model.coordinate_transform[i]*gradient[i];
+      absolute_terms.add(std::abs(scaled_gradient[i]*v[i]));}
+    for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<n;++j)
+      absolute_terms.add(0.5*std::abs(v[i]*model.hessian_matrix[i*n+j]*v[j]));
+    const double sum=absolute_terms.value();if(!std::isfinite(sum))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: preconditioned trust-region prediction scale is non-finite");
+    return covariance_local_difference_resolution(sum,n*n+2*n);
+  }
   for(std::size_t i=0;i<n;++i){const double term=gradient[i]*step[i];
     if(!std::isfinite(term))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region prediction term is non-finite");
     absolute_terms.add(std::abs(term));}
@@ -4893,6 +7744,41 @@ CovarianceTrustRegionStep covariance_trust_region_subproblem(const CovarianceTru
     throw std::invalid_argument("native covariance trust-region subproblem inputs are invalid");
   for(const double value:model.eigenvalues)if(!(value>0.0)||!std::isfinite(value)||!std::isfinite(1.0/value))
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region model lost verified positive definiteness");
+  if(!model.coordinate_transform.empty()){
+    if(model.coordinate_transform.size()!=n||model.hessian_matrix.size()!=n*n||
+       !std::all_of(model.coordinate_transform.begin(),model.coordinate_transform.end(),[](double value){return value>0.0&&std::isfinite(value);}))
+      throw std::invalid_argument("preconditioned covariance trust-region subproblem dimensions are invalid");
+    std::vector<double> scaled_gradient(n);for(std::size_t i=0;i<n;++i)scaled_gradient[i]=model.coordinate_transform[i]*gradient[i];
+    auto make_step=[&](const double lambda){
+      const double sqrt_lambda=std::sqrt(lambda);std::vector<double> s(n),u(n),matrix(n*n),lower(n*n,0.0),rhs(n),work(n),coordinate(n);
+      for(std::size_t i=0;i<n;++i){const double t=sqrt_lambda*model.coordinate_transform[i];
+        if(std::isinf(t)){s[i]=0.0;u[i]=1.0;}else{s[i]=1.0/std::hypot(1.0,t);u[i]=t*s[i];}}
+      for(std::size_t i=0;i<n;++i){rhs[i]=-s[i]*scaled_gradient[i];
+        for(std::size_t j=0;j<n;++j)matrix[i*n+j]=s[i]*model.hessian_matrix[i*n+j]*s[j];
+        matrix[i*n+i]+=u[i]*u[i];}
+      for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<=i;++j){double value=matrix[i*n+j];
+        for(std::size_t k=0;k<j;++k)value-=lower[i*n+k]*lower[j*n+k];
+        if(i==j){if(!(value>0.0)||!std::isfinite(value))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: preconditioned trust-region Cholesky failed");
+          lower[i*n+j]=std::sqrt(value);}else lower[i*n+j]=value/lower[j*n+j];}
+      for(std::size_t i=0;i<n;++i){double value=rhs[i];for(std::size_t j=0;j<i;++j)value-=lower[i*n+j]*work[j];work[i]=value/lower[i*n+i];}
+      for(std::size_t ii=n;ii>0;--ii){const std::size_t i=ii-1;double value=work[i];for(std::size_t j=i+1;j<n;++j)value-=lower[j*n+i]*work[j];work[i]=value/lower[i*n+i];}
+      double norm=0.0;for(std::size_t i=0;i<n;++i){const double v=s[i]*work[i];coordinate[i]=model.coordinate_transform[i]*v;norm=std::hypot(norm,coordinate[i]);}
+      return std::make_pair(std::move(coordinate),norm);
+    };
+    CovarianceTrustRegionStep result;auto unconstrained=make_step(0.0);result.step=std::move(unconstrained.first);result.norm=unconstrained.second;
+    if(!std::isfinite(result.norm)||!std::all_of(result.step.begin(),result.step.end(),[](double value){return std::isfinite(value);}))
+      throw std::runtime_error("NUMERICAL_SOLVE_FAIL: preconditioned unconstrained trust-region step is non-finite");
+    if(result.norm>radius){double low=0.0,high=1.0;auto upper=make_step(high);
+      for(int bracket=0;upper.second>radius&&bracket<1024;++bracket){low=high;high*=2.0;
+        if(!std::isfinite(high))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: preconditioned trust-region multiplier overflowed");upper=make_step(high);}
+      if(!(upper.second<=radius))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: preconditioned trust-region multiplier did not bracket radius");
+      for(int iteration=0;iteration<80;++iteration){const double middle=low+0.5*(high-low);const auto candidate=make_step(middle);
+        if(candidate.second>radius)low=middle;else high=middle;}
+      auto boundary=make_step(high);result.lambda=high;result.step=std::move(boundary.first);result.norm=boundary.second;}
+    result.predicted_reduction=covariance_trust_region_predicted_reduction(model,gradient,result.step);
+    if(!std::isfinite(result.predicted_reduction))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: preconditioned trust-region predicted reduction is non-finite");
+    result.touches_boundary=result.norm>=0.9*radius;return result;
+  }
   std::vector<double> projected_gradient(n,0.0);
   for(std::size_t k=0;k<n;++k)for(std::size_t i=0;i<n;++i)projected_gradient[k]+=model.eigenvectors[i+k*n]*gradient[i];
   auto make_step=[&](const double lambda){std::vector<double> step(n,0.0);
@@ -4916,6 +7802,152 @@ CovarianceTrustRegionStep covariance_trust_region_subproblem(const CovarianceTru
   if(!std::isfinite(result.predicted_reduction)||!std::all_of(result.step.begin(),result.step.end(),[](double value){return std::isfinite(value);}))
     throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region predicted reduction is non-finite");
   result.touches_boundary=result.norm>=0.9*radius;return result;
+}
+
+double covariance_normalized_curvature_change(const std::vector<double>& previous,const std::vector<double>& current,const int n)
+{
+  if(n<=0||previous.size()!=static_cast<std::size_t>(n)*n||current.size()!=previous.size())
+    throw std::invalid_argument("analytic covariance stability matrix dimensions do not match");
+  std::vector<double> previous_diagonal(n),current_diagonal(n);
+  for(int i=0;i<n;++i){const double a=previous[static_cast<std::size_t>(i)*n+i],b=current[static_cast<std::size_t>(i)*n+i];
+    if(!(a>0.0)||!(b>0.0)||!std::isfinite(a)||!std::isfinite(b))
+      throw std::runtime_error("CURVATURE_UNRESOLVED: nonpositive diagonal in nested curvature comparison");
+    previous_diagonal[i]=std::sqrt(a);current_diagonal[i]=std::sqrt(b);}
+  double difference=0.0,norm=0.0;
+  for(int i=0;i<n;++i)for(int j=0;j<n;++j){const std::size_t index=static_cast<std::size_t>(i)*n+j;
+    const double a=previous[index]/(previous_diagonal[i]*previous_diagonal[j]);
+    const double b=current[index]/(current_diagonal[i]*current_diagonal[j]);
+    if(!std::isfinite(a)||!std::isfinite(b))throw std::runtime_error("CURVATURE_UNRESOLVED: nested curvature comparison is non-finite");
+    difference=std::hypot(difference,b-a);norm=std::hypot(norm,b);}
+  return difference/std::max(norm,1e-300);
+}
+
+CovarianceAnalyticCurvatureCache covariance_build_stable_analytic_curvature_cache(DeviceCovarianceSystem& system,
+  const std::vector<double>& theta,const double epsilon,const std::vector<double>& scale,const int minimum_probes,
+  const double rho,const double tau,const double ridge_lambda,const std::vector<double>& gradient,const double radius,
+  std::uint64_t& rhs_columns,rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* limits=nullptr,
+  const std::vector<double>* supplied_omega=nullptr,const CovarianceAnalyticCurvatureCache* previously_verified=nullptr)
+{
+  if((minimum_probes!=16&&minimum_probes!=32&&minimum_probes!=64&&minimum_probes!=128)||gradient.size()!=theta.size()||
+     !(radius>0.0)||!std::isfinite(radius))throw std::invalid_argument("analytic covariance stability request is invalid");
+  const auto started=std::chrono::steady_clock::now();CovarianceAnalyticCurvatureCache previous,current;
+  if(supplied_omega&&supplied_omega->size()!=static_cast<std::size_t>(system.r)*CovarianceAnalyticCurvatureWorkspace::max_probes)
+    throw std::invalid_argument("supplied nested curvature probes must cover the 128-probe prefix");
+  int probes=16,levels=0;
+  if(previously_verified){
+    if(!previously_verified->valid||previously_verified->theta!=theta||previously_verified->epsilon!=epsilon||
+       previously_verified->coordinate_scale!=scale||previously_verified->graph_assembly_generation!=system.graph_assembly_generation||
+       previously_verified->probes<16||previously_verified->probes>=CovarianceAnalyticCurvatureWorkspace::max_probes)
+      throw std::invalid_argument("seeded analytic covariance stability check has no matching verified point");
+    previous=*previously_verified;probes=previous.probes*2;
+    if(minimum_probes!=probes)throw std::invalid_argument("seeded analytic covariance stability check must request the next nested level");
+  }
+  while(probes<=CovarianceAnalyticCurvatureWorkspace::max_probes){
+    std::vector<double> prefix;const std::vector<double>* level_omega=nullptr;
+    if(supplied_omega){prefix.assign(supplied_omega->begin(),supplied_omega->begin()+static_cast<std::ptrdiff_t>(system.r)*probes);level_omega=&prefix;}
+    current=covariance_build_analytic_curvature_cache(system,theta,epsilon,scale,probes,rhs_columns,budget,limits,level_omega);
+    current.levels_built=++levels;
+    if(previous.valid){
+      const std::vector<double> previous_hessian=covariance_analytic_curvature_hessian(previous,system.p,rho,tau,ridge_lambda);
+      const std::vector<double> current_hessian=covariance_analytic_curvature_hessian(current,system.p,rho,tau,ridge_lambda);
+      current.relative_matrix_change=covariance_normalized_curvature_change(previous_hessian,current_hessian,system.p);
+      const CovarianceTrustRegionModel previous_model=covariance_direct_hessian_trust_region_model(system.solver,previous_hessian,system.p);
+      const CovarianceTrustRegionModel current_model=covariance_direct_hessian_trust_region_model(system.solver,current_hessian,system.p);
+      if(previous_model.positive_definite&&current_model.positive_definite){
+        const CovarianceTrustRegionStep previous_step=covariance_trust_region_subproblem(previous_model,gradient,radius);
+        const CovarianceTrustRegionStep current_step=covariance_trust_region_subproblem(current_model,gradient,radius);
+        double delta=0.0;for(std::size_t i=0;i<gradient.size();++i)delta=std::hypot(delta,current_step.step[i]-previous_step.step[i]);
+        current.relative_step_change=delta/std::max({previous_step.norm,current_step.norm,0.01*radius});
+      }
+      if(probes>=minimum_probes&&current.relative_matrix_change<=0.1&&current.relative_step_change<=0.1){
+        current.stability_status="STABLE_10_PERCENT_ENGINEERING_ONLY";current.status="PASS";current.valid=true;
+        current.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();return current;}
+    }
+    current.stability_status="UPGRADE_REQUIRED";previous=current;
+    if(probes==CovarianceAnalyticCurvatureWorkspace::max_probes)break;
+    probes*=2;
+  }
+  current.valid=false;current.status="CURVATURE_UNRESOLVED";current.stability_status="UNSTABLE_AT_128";
+  current.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();return current;
+}
+
+double covariance_directional_hessian_relative_error(const std::vector<double>& primary,const std::vector<double>& independent,
+  const std::vector<double>& direction)
+{
+  const std::size_t n=direction.size();if(n==0||primary.size()!=n*n||independent.size()!=primary.size())
+    throw std::invalid_argument("independent covariance directional Hessian dimensions do not match");
+  double matrix_norm=0.0;for(const double value:primary)matrix_norm=std::hypot(matrix_norm,value);
+  NeumaierAccumulator primary_form,independent_form;
+  for(std::size_t row=0;row<n;++row)for(std::size_t column=0;column<n;++column){
+    const std::size_t index=row+column*n;const double weight=direction[row]*direction[column];
+    primary_form.add_product(weight,primary[index]);independent_form.add_product(weight,independent[index]);}
+  const double a=primary_form.value(),b=independent_form.value();
+  if(!std::isfinite(a)||!std::isfinite(b)||!std::isfinite(matrix_norm))
+    throw std::runtime_error("independent curvature directional form is non-finite");
+  return std::abs(a-b)/std::max({std::abs(a),std::abs(b),1e-12*matrix_norm});
+}
+
+CovarianceIndependentCurvatureCheck covariance_verify_independent_curvature_batch(DeviceCovarianceSystem& system,
+  CovarianceAnalyticCurvatureCache primary,const double epsilon,const std::vector<double>& scale,const double rho,
+  const double tau,const double ridge_lambda,const std::vector<double>& gradient,const double radius,
+  std::uint64_t& rhs_columns,rpmd_ja_feasibility::Budget* budget=nullptr,
+  const rpmd_ja_feasibility::Limits* limits=nullptr,
+  const CovarianceAnalyticCurvatureCache* reusable_independent=nullptr)
+{
+  CovarianceIndependentCurvatureCheck result;result.primary=std::move(primary);
+  if(!result.primary.valid||gradient.size()!=static_cast<std::size_t>(system.p)||!(radius>0.0)||
+     !std::isfinite(radius)||result.primary.epsilon!=epsilon||result.primary.coordinate_scale!=scale||
+     result.primary.graph_assembly_generation!=system.graph_assembly_generation)
+    throw std::invalid_argument("independent covariance curvature check has an invalid primary model");
+  const auto started=std::chrono::steady_clock::now();
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+  if(covariance_fit_test_hooks.independent_curvature_hard_failures_remaining>0){
+    --covariance_fit_test_hooks.independent_curvature_hard_failures_remaining;
+    throw std::runtime_error("CUDA_ERROR: injected independent curvature failure");}
+#endif
+  try{
+    while(true){
+      const int probes=result.primary.probes;const std::uint64_t rhs_before=rhs_columns;
+      CovarianceAnalyticCurvatureCache independent;
+      if(reusable_independent&&covariance_same_curvature_point(result.primary,*reusable_independent))
+        independent=*reusable_independent;
+      else{
+        independent=covariance_build_analytic_curvature_cache(system,result.primary.theta,epsilon,scale,
+          probes,rhs_columns,budget,limits,nullptr,covariance_independent_curvature_seed);
+        ++result.independent_batches;
+      }
+      result.independent_rhs_columns+=rhs_columns-rhs_before;result.probes=probes;
+      const std::vector<double> primary_hessian=covariance_analytic_curvature_hessian(result.primary,system.p,rho,tau,ridge_lambda);
+      const std::vector<double> independent_hessian=covariance_analytic_curvature_hessian(independent,system.p,rho,tau,ridge_lambda);
+      result.independent=std::move(independent);
+      const CovarianceTrustRegionModel model=covariance_direct_hessian_trust_region_model(system.solver,primary_hessian,system.p);
+      if(!model.positive_definite){result.status="CURVATURE_UNRESOLVED_PRIMARY_MODEL_NOT_POSITIVE";break;}
+      const CovarianceTrustRegionStep proposed=covariance_trust_region_subproblem(model,gradient,radius);
+      std::vector<std::vector<double>> directions;
+      auto add_direction=[&](std::vector<double> direction){double norm=0.0;for(const double value:direction)norm=std::hypot(norm,value);
+        if(norm>0.0&&std::isfinite(norm)){for(double& value:direction)value/=norm;directions.push_back(std::move(direction));}};
+      std::vector<double> gradient_direction=gradient;for(double& value:gradient_direction)value=-value;
+      add_direction(std::move(gradient_direction));add_direction(proposed.step);
+      std::mt19937_64 random(covariance_independent_curvature_seed^0xa0761d6478bd642fULL);
+      std::uniform_int_distribution<int> sign(0,1);std::vector<double> fixed_random(static_cast<std::size_t>(system.p));
+      for(double& value:fixed_random)value=sign(random)?1.0:-1.0;add_direction(std::move(fixed_random));
+      if(directions.empty())throw std::runtime_error("independent curvature direction set is empty");
+      double maximum_error=0.0;
+      for(const auto& direction:directions)
+        maximum_error=std::max(maximum_error,covariance_directional_hessian_relative_error(
+          primary_hessian,independent_hessian,direction));
+      result.max_relative_directional_error=maximum_error;result.directions_checked=static_cast<int>(directions.size());
+      if(maximum_error<=covariance_independent_directional_tolerance){result.valid=true;result.status="PASS_INDEPENDENT_OMEGA_DIRECTIONAL";break;}
+      if(probes>=CovarianceAnalyticCurvatureWorkspace::max_probes){result.status="CURVATURE_UNRESOLVED_INDEPENDENT_BATCH";break;}
+      CovarianceAnalyticCurvatureCache upgraded=covariance_build_stable_analytic_curvature_cache(system,
+        result.primary.theta,epsilon,scale,probes*2,rho,tau,ridge_lambda,gradient,radius,rhs_columns,budget,limits,
+        nullptr,&result.primary);
+      result.primary_upgrade_levels+=static_cast<std::uint64_t>(upgraded.levels_built);
+      if(!upgraded.valid){result.primary=std::move(upgraded);result.status="CURVATURE_UNRESOLVED_PRIMARY_UPGRADE";break;}
+      result.primary=std::move(upgraded);
+    }
+  }catch(const CovarianceFeasibilityBudgetError& error){result.status=covariance_independent_budget_stop_or_throw(error);}
+  result.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();return result;
 }
 
 double covariance_trust_region_reduced_radius(const double radius,const double rejected_step_norm)
@@ -5003,7 +8035,8 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
   const std::vector<double>& coordinate_scale,const std::vector<double>& direction,const double current_objective,const double slope,
   const double initial_alpha,const double direction_inf_norm,const std::uint64_t max_evaluations,CovarianceFitResult& fit,
   const int iteration,const double tau,EvaluateObjective&& evaluate_objective,CompleteGradient&& complete_gradient,std::ostream* trace=nullptr,
-  const bool allow_expansion=true,const bool objective_only_expansion=false,const bool joint_bfgs_directional_secant=false)
+  const bool allow_expansion=true,const bool objective_only_expansion=false,const bool joint_bfgs_directional_secant=false,
+  const std::vector<double>* center=nullptr)
 {
   CovarianceBacktrackingResult result;double alpha=initial_alpha;
   bool have_valid_candidate=false,objective_expansion=objective_only_expansion&&allow_expansion&&initial_alpha==1.0;
@@ -5029,7 +8062,7 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
     return false;
   };
   for(int trial=1;trial<=64&&fit.objective_evaluations<max_evaluations;++trial){result.trials=trial;++fit.line_search_trials;
-    if(!covariance_build_scaled_trial(theta,z,coordinate_scale,direction,alpha,result.next_z,result.step,result.next_theta)){
+    if(!covariance_build_scaled_trial(theta,z,coordinate_scale,direction,alpha,result.next_z,result.step,result.next_theta,center)){
       result.step_underflow=true;if(trace)*trace<<"LINE_SEARCH iter="<<iteration<<" tau="<<tau<<" trial="<<trial<<" alpha="<<alpha
         <<" direction_inf_norm="<<direction_inf_norm<<" step_inf_norm="<<covariance_norm_inf(result.step)<<" status=STEP_UNDERFLOW\n";flush_trace();
       if(have_valid_candidate)preserve_valid_candidate();
@@ -5058,9 +8091,12 @@ CovarianceBacktrackingResult covariance_backtrack_armijo(const std::vector<doubl
     if(armijo_accepted){record_covariance_failed_trial(fit.failed_trial,result.next_theta,iteration,alpha,tau,result.next);
       fit.failed_trial.failure_stage="BFGS_COMMIT_PENDING";
       double candidate_slope=std::numeric_limits<double>::quiet_NaN();
-      try{const auto gradient_started=std::chrono::steady_clock::now();++fit.line_search_gradient_calls;++fit.full_gradient_evaluations;
-        try{complete_gradient(result.next);}catch(...){fit.line_search_gradient_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();throw;}
-        fit.line_search_gradient_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+      try{const auto gradient_started=std::chrono::steady_clock::now();
+        try{complete_gradient(result.next);}catch(...){const double seconds=std::chrono::duration<double>(
+            std::chrono::steady_clock::now()-gradient_started).count();fit.line_search_gradient_seconds+=seconds;
+          fit.full_gradient_seconds+=seconds;fit.last_full_gradient_seconds=seconds;throw;}
+        const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+        fit.line_search_gradient_seconds+=seconds;fit.full_gradient_seconds+=seconds;fit.last_full_gradient_seconds=seconds;
         const std::vector<double> candidate_gradient=covariance_scaled_gradient(result.next.gradient,coordinate_scale);
         if(candidate_gradient.size()!=direction.size())throw std::invalid_argument("native covariance fit directional gradient dimensions do not match");
         if(!std::all_of(candidate_gradient.begin(),candidate_gradient.end(),[](double value){return std::isfinite(value);}))
@@ -5216,48 +8252,406 @@ void apply_covariance_directional_diagnostic(CovarianceFitResult& result,const c
   }
 }
 
+struct NativeAdditiveSiteBlock
+{
+  std::vector<SiteEdge> edges;
+  std::vector<double> linear,quadratic;
+};
+
+constexpr std::uint64_t native_additive_package_header_bytes=sizeof(additive_magic)+2*sizeof(std::uint32_t)+
+  2*sizeof(std::int32_t)+sizeof(std::uint64_t)+4*sizeof(double)+2*sizeof(std::uint64_t);
+
+template<typename Emit>
+std::uint64_t stream_native_additive_site_blocks(const Graph& graph,const std::vector<double>& theta,
+  const std::vector<std::array<double,3>>& edge_linear,const int n,Emit&& emit,const bool size_only=false,
+  std::size_t* maximum_site_neighbors=nullptr)
+{
+  const bool m1=has_m1_local_basis(graph);
+  if(n<=0||graph.sites.size()!=static_cast<std::size_t>(n)||theta.size()!=static_cast<std::size_t>(m1?graph.parameter_count:graph.base_parameter_count)||
+     edge_linear.size()!=graph.edges.size())throw std::invalid_argument("native additive site block dimensions do not match");
+  EffectiveM1Parameters effective;const std::vector<double>* base_theta=&theta;const std::vector<double>* local_theta=nullptr;
+  if(m1){effective=effective_m1_parameters(graph,theta);base_theta=&effective.base;local_theta=&effective.raw;}
+  std::vector<std::vector<SiteEdge>> site_edges(static_cast<std::size_t>(n));
+  std::vector<std::map<std::array<int,4>,int>> slot_indices(static_cast<std::size_t>(n));
+  for(int center=0;center<n;++center){site_edges[center]=graph.sites[center];
+    for(std::size_t slot=0;slot<site_edges[center].size();++slot){const SiteEdge& edge=site_edges[center][slot];
+      const std::array<int,4> key={edge.j,edge.image[0],edge.image[1],edge.image[2]};
+      if(edge.j<0||edge.j>=n||edge.j==center||!slot_indices[center].emplace(key,static_cast<int>(slot)).second)
+        throw std::runtime_error("native additive graph has an invalid or duplicate site neighbor");}}
+  std::vector<std::vector<std::pair<int,int>>> center_terms(static_cast<std::size_t>(n));
+  if(m1){
+    if(graph.local_terms.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::runtime_error("native M1 package term count exceeds index limits");
+    for(std::size_t term_index=0;term_index<graph.local_terms.size();++term_index){
+    const rpmd_ja_local_basis::Term& term=graph.local_terms[term_index];
+    if(term.atom_count<2||term.atom_count>3||term.parameter<0||term.parameter>=static_cast<int>(local_theta->size()))
+      throw std::runtime_error("native M1 package term dimensions are invalid");
+    for(int center_site=0;center_site<term.atom_count;++center_site){const auto& center=term.site[center_site];
+      if(center.atom<0||center.atom>=n)throw std::runtime_error("native M1 package center is outside the atom array");
+      center_terms[center.atom].push_back({static_cast<int>(term_index),center_site});
+      for(int neighbor_site=0;neighbor_site<term.atom_count;++neighbor_site)if(neighbor_site!=center_site){const auto& neighbor=term.site[neighbor_site];
+        if(neighbor.atom<0||neighbor.atom>=n||neighbor.atom==center.atom)
+          throw std::runtime_error("native M1 package cannot represent same-atom image neighbors");
+        std::array<int,4> key={neighbor.atom,0,0,0};
+        for(int axis=0;axis<3;++axis){const long long image=static_cast<long long>(neighbor.image[axis])-center.image[axis];
+          if(image<std::numeric_limits<int>::min()||image>std::numeric_limits<int>::max())throw std::runtime_error("native M1 package image offset overflows");
+          key[axis+1]=static_cast<int>(image);}
+        if(slot_indices[center.atom].find(key)==slot_indices[center.atom].end()){
+          SiteEdge edge;edge.j=key[0];edge.group=-1;edge.edge_index=-1;edge.sign=0.0;
+          for(int axis=0;axis<3;++axis)edge.image[axis]=key[axis+1];
+          const int slot=static_cast<int>(site_edges[center.atom].size());site_edges[center.atom].push_back(edge);
+          slot_indices[center.atom].emplace(key,slot);}}}}}
+  std::uint64_t total_bytes=native_additive_package_header_bytes;
+  for(int center=0;center<n;++center){const std::size_t z=site_edges[center].size();
+    if(maximum_site_neighbors)*maximum_site_neighbors=std::max(*maximum_site_neighbors,z);
+    if(z>static_cast<std::size_t>(3*n)||z>static_cast<std::size_t>(std::numeric_limits<int>::max()/3))
+      throw std::runtime_error("native additive site coordination exceeds reader limits");
+    const std::size_t q=3*z;if(q&&q>std::numeric_limits<std::size_t>::max()/q)throw std::runtime_error("native additive site block size overflows");
+    const std::uint64_t linear_bytes=static_cast<std::uint64_t>(q)*sizeof(double),quadratic_bytes=static_cast<std::uint64_t>(q*q)*sizeof(double);
+    if(z>(std::numeric_limits<std::uint64_t>::max()-sizeof(std::int32_t))/16||
+       total_bytes>std::numeric_limits<std::uint64_t>::max()-sizeof(std::int32_t)-16*z||
+       total_bytes+sizeof(std::int32_t)+16*z>std::numeric_limits<std::uint64_t>::max()-linear_bytes-quadratic_bytes)
+      throw std::runtime_error("native additive package byte estimate overflows");
+    total_bytes+=sizeof(std::int32_t)+16*z+linear_bytes+quadratic_bytes;
+  }
+  if(total_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+    throw std::runtime_error("native additive package exceeds stream limits");
+  for(int center=0;center<n;++center)for(const SiteEdge& edge:site_edges[center]){
+    if(edge.image[0]==std::numeric_limits<int>::min()||edge.image[1]==std::numeric_limits<int>::min()||edge.image[2]==std::numeric_limits<int>::min())
+      throw std::runtime_error("native additive image index cannot be negated");
+    const std::array<int,4> reverse={center,-edge.image[0],-edge.image[1],-edge.image[2]};
+    if(slot_indices[edge.j].find(reverse)==slot_indices[edge.j].end())throw std::runtime_error("native additive site graph lacks a reverse image neighbor");}
+  if(size_only)return total_bytes;
+  for(int center=0;center<n;++center){const std::size_t z=site_edges[center].size(),q=3*z;
+    NativeAdditiveSiteBlock block;block.edges=site_edges[center];block.linear.assign(q,0.0);block.quadratic.assign(q*q,0.0);
+    for(std::size_t slot=0;slot<z;++slot){const SiteEdge& edge=block.edges[slot];if(edge.edge_index<0)continue;
+      if(static_cast<std::size_t>(edge.edge_index)>=edge_linear.size()||edge.group<0||6ULL*static_cast<std::size_t>(edge.group)+5>=base_theta->size())
+        throw std::runtime_error("native additive base edge metadata is invalid");
+      for(int axis=0;axis<3;++axis)block.linear[3*slot+axis]=0.5*edge.sign*edge_linear[edge.edge_index][axis];
+      for(int a=0;a<3;++a)for(int b=0;b<3;++b){const int lo=std::min(a,b),hi=std::max(a,b);
+        const int component=lo==0?(hi==0?0:(hi==1?1:2)):(lo==1?(hi==1?3:4):5);
+        block.quadratic[(3*slot+a)*q+3*slot+b]=0.5*(*base_theta)[6*edge.group+component];}}
+    for(const auto& indexed_center:center_terms[center]){const rpmd_ja_local_basis::Term& term=graph.local_terms[indexed_center.first];const int center_site=indexed_center.second;
+    const auto& center_site_ref=term.site[center_site];
+    const double scale=term.energy_share[center_site]*term.weight*(*local_theta)[term.parameter];
+    for(int row_site=0;row_site<term.atom_count;++row_site)if(row_site!=center_site){const auto& row=term.site[row_site];
+      std::array<int,4> row_key={row.atom,0,0,0};for(int axis=0;axis<3;++axis){const long long image=static_cast<long long>(row.image[axis])-center_site_ref.image[axis];
+        if(image<std::numeric_limits<int>::min()||image>std::numeric_limits<int>::max())throw std::runtime_error("native M1 package image offset overflows");row_key[axis+1]=static_cast<int>(image);}
+      const auto row_it=slot_indices[center_site_ref.atom].find(row_key);if(row_it==slot_indices[center_site_ref.atom].end())throw std::runtime_error("native M1 package row neighbor is missing");
+      const double row_coefficient[3]={term.coefficient[row_site].x,term.coefficient[row_site].y,term.coefficient[row_site].z};
+      for(int column_site=0;column_site<term.atom_count;++column_site)if(column_site!=center_site){const auto& column=term.site[column_site];
+        std::array<int,4> column_key={column.atom,0,0,0};for(int axis=0;axis<3;++axis){const long long image=static_cast<long long>(column.image[axis])-center_site_ref.image[axis];
+          if(image<std::numeric_limits<int>::min()||image>std::numeric_limits<int>::max())throw std::runtime_error("native M1 package image offset overflows");column_key[axis+1]=static_cast<int>(image);}
+        const auto column_it=slot_indices[center_site_ref.atom].find(column_key);if(column_it==slot_indices[center_site_ref.atom].end())throw std::runtime_error("native M1 package column neighbor is missing");
+        const double column_coefficient[3]={term.coefficient[column_site].x,term.coefficient[column_site].y,term.coefficient[column_site].z};
+        for(int a=0;a<3;++a)for(int b=0;b<3;++b)
+          block.quadratic[(3*row_it->second+a)*q+3*column_it->second+b]+=scale*row_coefficient[a]*column_coefficient[b];}}
+    }
+    emit(center,block);
+  }
+  return total_bytes;
+}
+
+struct NativeAdditivePackageEstimate{std::uint64_t bytes=0;std::size_t maximum_site_neighbors=0;};
+
+NativeAdditivePackageEstimate estimate_native_additive_package_size(const Graph& graph,const int n)
+{
+  const std::size_t parameter_count=static_cast<std::size_t>(has_m1_local_basis(graph)?graph.parameter_count:graph.base_parameter_count);
+  std::vector<double> zero_theta(parameter_count,0.0);
+  std::vector<std::array<double,3>> zero_edge_linear(graph.edges.size());
+  NativeAdditivePackageEstimate estimate;
+  estimate.bytes=stream_native_additive_site_blocks(graph,zero_theta,zero_edge_linear,n,
+    [](const int,const NativeAdditiveSiteBlock&){},true,&estimate.maximum_site_neighbors);
+  return estimate;
+}
+
+std::vector<NativeAdditiveSiteBlock> build_native_additive_site_blocks(const Graph& graph,const std::vector<double>& theta,
+  const std::vector<std::array<double,3>>& edge_linear,const int n)
+{
+  std::vector<NativeAdditiveSiteBlock> blocks;blocks.reserve(static_cast<std::size_t>(n));
+  stream_native_additive_site_blocks(graph,theta,edge_linear,n,[&](const int,const NativeAdditiveSiteBlock& block){blocks.push_back(block);});
+  return blocks;
+}
+
+std::uint64_t write_native_additive_site_blocks(std::ostream& out,const Graph& graph,const std::vector<double>& theta,
+  const std::vector<std::array<double,3>>& edge_linear,const int n)
+{
+  return stream_native_additive_site_blocks(graph,theta,edge_linear,n,[&](const int,const NativeAdditiveSiteBlock& block){
+    write(out,std::int32_t(block.edges.size()));for(const SiteEdge& edge:block.edges){write(out,std::int32_t(edge.j));
+      for(int axis=0;axis<3;++axis)write(out,std::int32_t(edge.image[axis]));}
+    for(double value:block.linear)write(out,value);for(double value:block.quadratic)write(out,value);});
+}
+
+std::array<double,4> verify_native_additive_package_entries(const RpmdJAAdditiveData& package,const Graph& graph,
+  const std::vector<double>& theta,const std::vector<double>& positions,const Box& box,const int n)
+{
+  constexpr double native_additive_entry_relative_tolerance=2.0e-9;
+  constexpr double native_additive_entry_roundoff_operations_per_contribution=8.0;
+  if(n<=0||n>std::numeric_limits<int>::max()/3)
+    throw std::runtime_error("NATIVE_ADDITIVE_ENTRIES_FAIL: atom count is invalid");
+  const int d=3*n;if(positions.size()!=static_cast<std::size_t>(d)||graph.sites.size()!=static_cast<std::size_t>(n))
+    throw std::runtime_error("NATIVE_ADDITIVE_ENTRIES_FAIL: package or geometry dimensions do not match candidate");
+  const EffectiveM1Parameters effective=effective_m1_parameters(graph,theta);
+  const RpmdJASparseRows* matrices[4]={&package.k,&package.h[0],&package.h[1],&package.h[2]};
+  const char* labels[4]={"K","H0","H1","H2"};std::array<double,4> maximum_error_over_limit{};
+  auto component=[](const int first,const int second){const int low=std::min(first,second),high=std::max(first,second);
+    return low==0?(high==0?0:(high==1?1:2)):(low==1?(high==1?3:4):5);};
+  auto coefficient=[](const rpmd_ja_local_basis::Term& term,const int site,const int axis){
+    const auto& value=term.coefficient[site];return axis==0?value.x:axis==1?value.y:value.z;};
+  for(int matrix=0;matrix<4;++matrix){
+    const RpmdJASparseRows& sparse=*matrices[matrix];
+    if(sparse.offsets.size()!=static_cast<std::size_t>(d)+1||sparse.columns.size()!=sparse.values.size()||
+       sparse.offsets.front()!=0||sparse.offsets.back()!=sparse.values.size())
+      throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" sparse dimensions are invalid");
+    std::vector<RpmdJAAdditiveEntry> expected;
+    auto add=[&](const int row,const int column,const double value){
+      if(row<0||row>=d||column<0||column>=d||!std::isfinite(value))
+        throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" independent entry is invalid");
+      if(value!=0.0)expected.push_back({row,column,value});};
+    for(int center=0;center<n;++center)for(const SiteEdge& edge:graph.sites[center]){
+      if(edge.edge_index<0||edge.group<0)continue;
+      if(edge.j<0||edge.j>=n||edge.j==center||6ULL*static_cast<std::size_t>(edge.group)+5>=effective.base.size())
+        throw std::runtime_error("NATIVE_ADDITIVE_ENTRIES_FAIL: base edge metadata is invalid");
+      double geometry[3]={};if(matrix>0)for(int alpha=0;alpha<3;++alpha){
+        geometry[alpha]=positions[alpha*n+edge.j]-positions[alpha*n+center];
+        for(int cell_axis=0;cell_axis<3;++cell_axis)geometry[alpha]+=box.cpu_h[3*alpha+cell_axis]*edge.image[cell_axis];}
+      for(int mu=0;mu<3;++mu)for(int axis=0;axis<3;++axis){
+        const double block=0.5*effective.base[6*edge.group+component(mu,axis)];
+        if(matrix==0){const int row[2]={axis*n+edge.j,axis*n+center},column[2]={mu*n+edge.j,mu*n+center};
+          const double sign[2]={1.0,-1.0};for(int first=0;first<2;++first)for(int second=0;second<2;++second)
+            add(row[first],column[second],sign[first]*block*sign[second]);}
+        else{const int velocity=mu*n+edge.j;add(velocity,axis*n+edge.j,-geometry[matrix-1]*block);
+          add(velocity,axis*n+center,geometry[matrix-1]*block);}
+      }
+    }
+    for(const auto& term:graph.local_terms){
+      if(term.atom_count<2||term.atom_count>3||term.parameter<0||term.parameter>=static_cast<int>(effective.raw.size()))
+        throw std::runtime_error("NATIVE_ADDITIVE_ENTRIES_FAIL: M1 parameter index is invalid");
+      for(int site=0;site<term.atom_count;++site)if(term.site[site].atom<0||term.site[site].atom>=n)
+        throw std::runtime_error("NATIVE_ADDITIVE_ENTRIES_FAIL: M1 atom index is invalid");
+      const double parameter=term.weight*effective.raw[term.parameter];
+      if(matrix==0){
+        for(int row=0;row<term.atom_count;++row)for(int column=0;column<term.atom_count;++column)
+          for(int a=0;a<3;++a)for(int b=0;b<3;++b)
+            add(a*n+term.site[row].atom,b*n+term.site[column].atom,
+              parameter*coefficient(term,row,a)*coefficient(term,column,b));
+      }else{
+        const int alpha=matrix-1;
+        for(int center=0;center<term.atom_count;++center)for(int anchor=0;anchor<term.atom_count;++anchor)if(anchor!=center){
+          double geometry=positions[alpha*n+term.site[anchor].atom]-positions[alpha*n+term.site[center].atom];
+          for(int cell_axis=0;cell_axis<3;++cell_axis)geometry+=box.cpu_h[3*alpha+cell_axis]*
+            (term.site[anchor].image[cell_axis]-term.site[center].image[cell_axis]);
+          const double scale=parameter*term.energy_share[center];
+          for(int mu=0;mu<3;++mu)for(int displacement=0;displacement<term.atom_count;++displacement)if(displacement!=center)
+            for(int axis=0;axis<3;++axis){
+              const double value=-geometry*scale*coefficient(term,anchor,mu)*coefficient(term,displacement,axis);
+              const int velocity=mu*n+term.site[anchor].atom;
+              add(velocity,axis*n+term.site[displacement].atom,value);
+              add(velocity,axis*n+term.site[center].atom,-value);
+            }
+        }
+      }
+    }
+    std::sort(expected.begin(),expected.end(),[](const auto& left,const auto& right){
+      return left.row<right.row||(left.row==right.row&&left.column<right.column);});
+    std::size_t expected_pos=0;
+    for(int row=0;row<d;++row){
+      if(sparse.offsets[row]>sparse.offsets[row+1]||sparse.offsets[row+1]>sparse.values.size())
+        throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" sparse row offsets are invalid");
+      std::size_t actual_pos=sparse.offsets[row],actual_end=sparse.offsets[row+1];
+      for(std::size_t index=actual_pos;index<actual_end;++index){
+        if(sparse.columns[index]<0||sparse.columns[index]>=d||!std::isfinite(sparse.values[index])||
+           (index>actual_pos&&sparse.columns[index-1]>=sparse.columns[index]))
+          throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" sparse row is invalid or unsorted");}
+      if(expected_pos<expected.size()&&expected[expected_pos].row<row)
+        throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" expected sparse rows are invalid");
+      while((expected_pos<expected.size()&&expected[expected_pos].row==row)||actual_pos<actual_end){
+        int expected_column=std::numeric_limits<int>::max();double expected_value=0.0,expected_abs_sum=0.0;
+        std::size_t expected_contribution_count=0;
+        if(expected_pos<expected.size()&&expected[expected_pos].row==row){
+          expected_column=expected[expected_pos].column;
+          do{const double value=expected[expected_pos++].value;expected_value+=value;expected_abs_sum+=std::abs(value);
+            ++expected_contribution_count;}
+          while(expected_pos<expected.size()&&expected[expected_pos].row==row&&expected[expected_pos].column==expected_column);
+          if(!std::isfinite(expected_value)||!std::isfinite(expected_abs_sum))
+            throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" expected coefficient or contribution scale is non-finite");}
+        const int actual_column=actual_pos<actual_end?sparse.columns[actual_pos]:std::numeric_limits<int>::max();
+        const int column=std::min(expected_column,actual_column);
+        const double reference=expected_column==column?expected_value:0.0;
+        const double actual=actual_column==column?sparse.values[actual_pos++]:0.0;
+        const double absolute_error=std::abs(actual-reference);
+        const double relative_scale=std::max(std::abs(actual),std::abs(reference));
+        const double roundoff_product=native_additive_entry_roundoff_operations_per_contribution*
+          static_cast<double>(expected_contribution_count)*std::numeric_limits<double>::epsilon();
+        if(!(roundoff_product<0.5))
+          throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" entry contribution count exceeds the numerical bound");
+        // Cancellation-heavy entries use their pre-cancellation mass; production shares sum exactly, so only the FP gamma bound applies.
+        const double absolute_tolerance=roundoff_product/(1.0-roundoff_product)*expected_abs_sum;
+        const double allowed_error=absolute_tolerance+native_additive_entry_relative_tolerance*relative_scale;
+        if(absolute_error>allowed_error)throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+
+          " sparse entry differs from the independent local-energy formula at row "+std::to_string(row)+
+          ", column "+std::to_string(column));
+        const double error_over_limit=allowed_error>0.0?absolute_error/allowed_error:0.0;
+        if(!std::isfinite(error_over_limit))
+          throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" entry error-over-limit is non-finite");
+        maximum_error_over_limit[matrix]=std::max(maximum_error_over_limit[matrix],error_over_limit);
+      }
+    }
+    if(expected_pos!=expected.size())
+      throw std::runtime_error(std::string("NATIVE_ADDITIVE_ENTRIES_FAIL: ")+labels[matrix]+" expected rows were not fully compared");
+    std::vector<RpmdJAAdditiveEntry>().swap(expected);
+  }
+  return maximum_error_over_limit;
+}
+
 CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,const std::vector<double>& statistics,
   const double epsilon,const double rho,const int max_iterations,std::ostream* trace=nullptr,const bool block_newton=false,
   const bool joint_block=false,const bool trust_region=false,const bool staged_barrier=false,
-  const std::vector<std::vector<double>>& training_block_statistics={},const std::vector<std::uint64_t>& training_block_frames={})
+  const std::vector<std::vector<double>>& training_block_statistics={},const std::vector<std::uint64_t>& training_block_frames={},
+  const double ridge_lambda=0.0,const int analytic_curvature_probes=0,
+  const CovarianceBaseline* supplied_baseline=nullptr,const std::vector<double>* supplied_coordinate_scale=nullptr,
+  const std::vector<double>* initial_theta=nullptr,const double initial_tau=1.0,const bool fixed_tau=false,
+  rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* budget_limits=nullptr,
+  const rpmd_ja_covariance_checkpoint::AcceptedPoint* resume_state=nullptr,
+  const rpmd_ja_covariance_checkpoint::AcceptedPoint* checkpoint_metadata=nullptr,
+  const std::function<void(const rpmd_ja_covariance_checkpoint::AcceptedPoint&)>& checkpoint_sink={})
 {
-  if(static_cast<int>(block_newton)+static_cast<int>(joint_block)+static_cast<int>(trust_region)>1)
+  if(static_cast<int>(block_newton)+static_cast<int>(joint_block)+static_cast<int>(trust_region)>1||
+     !std::isfinite(ridge_lambda)||ridge_lambda<0.0||
+     (analytic_curvature_probes!=0&&analytic_curvature_probes!=16&&analytic_curvature_probes!=32&&
+       analytic_curvature_probes!=64&&analytic_curvature_probes!=128)||
+     (analytic_curvature_probes>0&&!trust_region)||!std::isfinite(initial_tau)||!(initial_tau>0.0)||
+     (fixed_tau&&(initial_tau!=1.0||staged_barrier)))
     throw std::invalid_argument("covariance optimizer step modes are mutually exclusive");
   CovarianceFitResult result;system.run_trace_residual_summary=CovarianceRunTraceResidualSummary{};
   result.statistics=statistics;result.training_block_statistics=training_block_statistics;result.training_block_frames=training_block_frames;
   result.block_newton_enabled=block_newton;result.joint_block_enabled=joint_block;result.trust_region_enabled=trust_region;
-  result.staged_barrier_enabled=staged_barrier;const auto started=std::chrono::steady_clock::now();
+  result.staged_barrier_enabled=staged_barrier;result.ridge_lambda=ridge_lambda;result.analytic_curvature_probes=analytic_curvature_probes;
+  result.ridge_coordinates.clear();
+  const auto started=std::chrono::steady_clock::now();
   bool initialization_complete=false,start_gradient_attempted=false;
+  CovarianceBaseline baseline;std::vector<double> coordinate_scale;double tau=initial_tau;
+  rpmd_ja_feasibility::CurvaturePerformanceWindow curvature_performance_window;
+  const double factorization_seconds_at_start=system.factorization_wall_seconds;
+  if(resume_state){
+    if(!trust_region||joint_block||block_newton||!checkpoint_metadata||!checkpoint_sink||
+       resume_state->theta.size()!=statistics.size()||resume_state->coordinate_scale.size()!=statistics.size()||
+       resume_state->bfgs_inverse.size()!=statistics.size()*statistics.size()||
+       resume_state->epsilon!=epsilon||resume_state->rho!=rho||resume_state->ridge_lambda!=ridge_lambda||
+       resume_state->family!=checkpoint_metadata->family||resume_state->branch!=checkpoint_metadata->branch||
+       resume_state->candidate_index!=checkpoint_metadata->candidate_index||
+       resume_state->lambda!=checkpoint_metadata->lambda||resume_state->max_objective_evaluations==0||
+       (resume_state->performance_window_initialized&&resume_state->performance_window_tau!=resume_state->tau))
+      throw std::runtime_error("covariance checkpoint does not match this trust-region branch and objective");
+    result.objective_evaluations=resume_state->objective_evaluations;
+    result.initialization_evaluations=resume_state->initialization_evaluations;
+    result.objective_evaluation_seconds=resume_state->objective_evaluation_seconds;
+    result.full_gradient_seconds=resume_state->full_gradient_seconds;
+    result.last_full_gradient_seconds=resume_state->last_full_gradient_seconds;
+    result.factorization_seconds=resume_state->factorization_seconds;
+    result.analytic_curvature_seconds=resume_state->analytic_curvature_seconds;
+    curvature_performance_window.initialized=resume_state->performance_window_initialized;
+    curvature_performance_window.curvature_builds=resume_state->performance_window_curvature_builds;
+    curvature_performance_window.tau=resume_state->performance_window_tau;
+    curvature_performance_window.start_objective=resume_state->performance_window_start_objective;
+    curvature_performance_window.curvature_seconds=resume_state->performance_window_curvature_seconds;
+    curvature_performance_window.reference_gradient_seconds=resume_state->performance_window_reference_gradient_seconds;
+    result.full_gradient_evaluations=resume_state->gradient_evaluations;
+    result.iterations=static_cast<int>(resume_state->iterations);tau=resume_state->tau;
+    if(budget){
+      if(!budget->started||resume_state->active_phase>=8||!budget_limits||
+         resume_state->active_phase!=rpmd_ja_feasibility::phase_index(budget->phase)||
+         resume_state->elapsed_seconds>budget->elapsed_seconds||
+         resume_state->total_budget_gradients>budget->exact_gradients)
+        throw std::runtime_error("covariance checkpoint has an invalid cumulative budget phase");
+      for(std::size_t phase=0;phase<resume_state->phase_gradients.size();++phase){
+        if(resume_state->phase_gradients[phase]>budget->phase_gradients[phase]||
+           resume_state->phase_seconds[phase]>budget->phase_seconds[phase])
+          throw std::runtime_error("covariance checkpoint budget counters are newer than the outer controller journal");}
+      if(trace)*trace<<"COVARIANCE_RESUME_BUDGET active_elapsed_seconds "<<budget->elapsed_seconds
+        <<" checkpoint_elapsed_seconds "<<resume_state->elapsed_seconds
+        <<" interrupted_operation_charge "<<(resume_state->operation_in_progress?"OUTER_JOURNAL_RECONCILED":"NONE")<<'\n';
+    }
+  }
   auto flush_trace=[&](){if(trace){trace->flush();if(!*trace)throw std::runtime_error("failed writing covariance optimizer trace");}};
   try{
-    CovarianceBaseline baseline;try{baseline=build_graph_covariance_baseline(system,statistics,epsilon,result.objective_evaluations);}
+    try{baseline=supplied_baseline?*supplied_baseline:
+        build_graph_covariance_baseline(system,statistics,epsilon,result.objective_evaluations,budget,budget_limits,
+          &result.objective_evaluation_seconds);}
     catch(const std::exception& error){result.status=std::string(error.what()).find("BASELINE_SPD_FAIL")!=std::string::npos?"BASELINE_SPD_FAIL":"NUMERICAL_SOLVE_FAIL";result.reason=error.what();throw;}
-    result.theta_baseline=baseline.theta;result.theta_start=baseline.theta;result.theta=baseline.theta;result.baseline_mu=baseline.mu;
+    if(statistics.size()!=static_cast<std::size_t>(system.p)||baseline.theta.size()!=statistics.size()||
+       baseline.trace.size()!=statistics.size()||!std::isfinite(baseline.mu)||!std::isfinite(baseline.logdet)||
+       !std::isfinite(baseline.shifted_logdet)||baseline.epsilon!=epsilon||
+       (initial_theta&&(initial_theta->size()!=statistics.size()||!std::all_of(initial_theta->begin(),initial_theta->end(),
+         [](double value){return std::isfinite(value);}))))
+      throw std::invalid_argument("native covariance supplied baseline or start dimensions do not match the system");
+    result.covariance_baseline=baseline;result.theta_baseline=baseline.theta;result.theta_start=baseline.theta;result.theta=baseline.theta;result.baseline_mu=baseline.mu;
     result.epsilon_constraint_status=baseline.epsilon_constraint_active?"ACTIVE":"INACTIVE";
     if(trace)*trace<<"BASELINE_SPD_PASS baseline_mu "<<baseline.mu<<" epsilon_constraint_status "<<result.epsilon_constraint_status<<'\n';flush_trace();
     if(trace)*trace<<"COVARIANCE_PRIOR_ANCHOR prior_center=theta_baseline initialization_point=theta_start fixed_training_R0=1 initialization_search_moves_only_theta_start=1\n";flush_trace();
-    if(trace){write_covariance_prior_calibration(*trace,statistics,baseline.trace,training_block_statistics,training_block_frames,rho);flush_trace();}
+    if(trace){const std::size_t calibration_parameter_count=system.graph.raw_local_parameter_count>0?
+        static_cast<std::size_t>(system.graph.base_parameter_count):statistics.size();
+      write_covariance_prior_calibration(*trace,statistics,baseline.trace,training_block_statistics,training_block_frames,
+        calibration_parameter_count,rho);flush_trace();}
     if(trust_region){if(trace)*trace<<"COVARIANCE_DIRECTION_MODE trust_region=ENABLED legacy_block_newton=DISABLED joint_block=DISABLED\n";flush_trace();}
     else if(joint_block){if(trace)*trace<<"COVARIANCE_DIRECTION_MODE joint_block=ENABLED legacy_block_newton=DISABLED default_method=BFGS\n";flush_trace();}
     else{if(trace)*trace<<"COVARIANCE_DIRECTION_MODE block_newton="<<(block_newton?"ENABLED":"DISABLED")<<" default_method=BFGS\n";flush_trace();}
+    if(trace)*trace<<"COVARIANCE_RIDGE lambda="<<ridge_lambda<<" center=theta_baseline scale=frozen_coordinate_scale physical_attribution=EXCLUDED\n";
     if(trace)*trace<<"COVARIANCE_BARRIER_POLICY staged_barrier="<<(staged_barrier?"ENABLED":"DISABLED")
       <<" eta0=0.01 final_kkt=1e-6 transition tau_multiplier=0.2\n";flush_trace();
-    const std::vector<double> coordinate_scale=system.coordinate_scales(baseline.theta,epsilon);result.coordinate_scale=coordinate_scale;
-    double tau=1.0;std::uint64_t max_evaluations=result.objective_evaluations+std::max<std::uint64_t>(100,20ULL*static_cast<std::uint64_t>(max_iterations));
+    if(trace&&trust_region&&analytic_curvature_probes>0)*trace<<"COVARIANCE_PERFORMANCE_STOP_POLICY rule="
+      <<rpmd_ja_feasibility::candidate_performance_stop_rule<<" curvature_window="
+      <<rpmd_ja_feasibility::candidate_performance_curvature_window<<" min_relative_objective_improvement="
+      <<rpmd_ja_feasibility::candidate_performance_min_relative_objective_improvement<<" curvature_to_gradient_cost_ratio="
+      <<rpmd_ja_feasibility::candidate_performance_curvature_to_gradient_cost_ratio<<" objective_normalizer="
+      <<rpmd_ja_feasibility::candidate_performance_objective_normalizer<<" gradient_cost_rule="
+      <<rpmd_ja_feasibility::candidate_performance_gradient_cost_rule<<" clock=STEADY_CLOCK_HOST_WALL heuristic_only=1\n";flush_trace();
+    coordinate_scale=supplied_coordinate_scale?*supplied_coordinate_scale:
+      system.coordinate_scales(baseline.theta,epsilon);
+    if(coordinate_scale.size()!=statistics.size()||!std::all_of(coordinate_scale.begin(),coordinate_scale.end(),
+       [](double value){return std::isfinite(value)&&value>0.0;}))
+      throw std::invalid_argument("native covariance frozen coordinate scale dimensions are invalid");
+    if(resume_state&&resume_state->coordinate_scale!=coordinate_scale)
+      throw std::runtime_error("covariance checkpoint frozen coordinate scale does not match the rebuilt graph");
+    result.coordinate_scale=coordinate_scale;
+    std::uint64_t max_evaluations=resume_state?resume_state->max_objective_evaluations:
+      result.objective_evaluations+std::max<std::uint64_t>(100,20ULL*static_cast<std::uint64_t>(max_iterations));
+    if(resume_state&&max_evaluations<=result.objective_evaluations)
+      throw std::runtime_error("covariance checkpoint has no remaining objective-evaluation allowance");
 #ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
     if(covariance_fit_test_hooks.objective_evaluation_budget_after_baseline>0)
       max_evaluations=std::min(max_evaluations,result.objective_evaluations+covariance_fit_test_hooks.objective_evaluation_budget_after_baseline);
 #endif
     constexpr std::uint64_t max_initialization_evaluations=16;
+    const bool verify_original_residuals=budget||ridge_lambda>0.0||analytic_curvature_probes>0;
+    if(verify_original_residuals)result.original_residual_initial_status="CHECKING";
+    auto record_performance_gradient=[&](const double seconds){
+      if(curvature_performance_window.initialized&&
+         !rpmd_ja_feasibility::record_curvature_performance_gradient(curvature_performance_window,tau,seconds))
+        throw std::runtime_error("NUMERICAL_SOLVE_FAIL: invalid measured full-gradient performance sample");};
     auto evaluate_initialization=[&](const std::vector<double>& theta,const bool compute_gradient){++result.initialization_evaluations;
-      if(compute_gradient){++result.initialization_gradient_calls;++result.full_gradient_evaluations;}
-      return evaluate_covariance_fit_objective(system,theta,baseline,statistics,rho,epsilon,tau,result.objective_evaluations,compute_gradient);};
-    const bool search_start=baseline.epsilon_constraint_active;
-    start_gradient_attempted=!search_start;CovarianceObjectiveEvaluation current=evaluate_initialization(result.theta,!search_start);
+      const std::uint64_t gradients_before=result.full_gradient_evaluations;
+      try{CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(system,theta,baseline,statistics,rho,epsilon,tau,
+          result.objective_evaluations,compute_gradient,compute_gradient&&verify_original_residuals,true,nullptr,nullptr,
+          &coordinate_scale,ridge_lambda,budget,budget_limits,compute_gradient?&result.full_gradient_evaluations:nullptr,
+          compute_gradient?&result.initialization_gradient_calls:nullptr,
+          compute_gradient&&verify_original_residuals?&result.original_residual_gradient_attempts:nullptr,
+          &result.objective_evaluation_seconds,compute_gradient?&result.full_gradient_seconds:nullptr,
+          compute_gradient?&result.last_full_gradient_seconds:nullptr);
+        if(compute_gradient&&result.full_gradient_evaluations>gradients_before)
+          record_performance_gradient(result.last_full_gradient_seconds);return value;
+      }catch(...){if(compute_gradient&&result.full_gradient_evaluations>gradients_before)
+          record_performance_gradient(result.last_full_gradient_seconds);throw;}};
+    const bool search_start=!resume_state&&!initial_theta&&baseline.epsilon_constraint_active;
+    const std::vector<double>& requested_start=resume_state?resume_state->theta_start:(initial_theta?*initial_theta:baseline.theta);
+    result.theta_start=requested_start;result.theta=resume_state?resume_state->theta:requested_start;
+    result.start_tau=tau;
+    start_gradient_attempted=resume_state||!search_start;
+    CovarianceObjectiveEvaluation current=evaluate_initialization(result.theta,resume_state||!search_start);
     if(!current.feasible)throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance optimizer baseline is not a feasible interior point");
-    std::vector<double> start_theta=baseline.theta;double start_delta=0.0;
-    std::string initialization_stop_reason=search_start?"NOT_STARTED":"SKIPPED_BASELINE_INTERIOR",initialization_phase="NONE";
-    if(search_start){const std::vector<double> direction=graph_laplacian_direction(system.graph);
+    std::vector<double> start_theta=requested_start;double start_delta=0.0;
+    std::string initialization_stop_reason=resume_state?"RESTORED_ACCEPTED_POINT":search_start?"NOT_STARTED":"SKIPPED_BASELINE_INTERIOR",initialization_phase="NONE";
+    if(search_start){const std::vector<double> direction=graph_laplacian_direction(system.graph,system.p);
       double delta_scale=std::numeric_limits<double>::infinity();for(std::size_t i=0;i<direction.size();++i)if(direction[i]>0.0)delta_scale=std::min(delta_scale,coordinate_scale[i]/direction[i]);
       double delta=0.01*delta_scale;std::uint64_t trial=0;bool found_decrease=false;
       auto can_probe=[&](){if(result.initialization_evaluations+1>=max_initialization_evaluations){initialization_stop_reason="INITIALIZATION_EVALUATION_LIMIT";return false;}
@@ -5301,24 +8695,49 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         "IMPROVED_EVALUATION_LIMIT":"IMPROVED";
       else result.initialization_status="NO_IMPROVEMENT_"+initialization_stop_reason;
     }else result.initialization_status="SKIPPED_BASELINE_INTERIOR";
-    result.theta_start=start_theta;result.theta=result.theta_start;result.start_graph_delta=start_delta;
+    result.theta_start=resume_state?resume_state->theta_start:start_theta;
+    result.theta=resume_state?resume_state->theta:result.theta_start;
+    result.start_graph_delta=resume_state?resume_state->start_graph_delta:start_delta;
+    result.start_metrics_point=resume_state?"RESTORED_ACCEPTED_POINT":"ORIGINAL_SELECTED_START";
     if(search_start){start_gradient_attempted=true;current=evaluate_initialization(result.theta,true);
       if(!current.feasible)throw std::runtime_error("NUMERICAL_SOLVE_FAIL: selected covariance optimizer start is not feasible");}
+    if(verify_original_residuals){
+      if(system.last_d_trace.status!="PASS"||system.last_shifted_trace.status!="PASS")
+        throw std::runtime_error("native covariance original-matrix start residual gate did not pass");
+      result.original_residual_initial_pass=true;result.original_residual_initial_status="PASS";}
     result.start_gradient_solve_status="PASS";
+    if(trust_region&&analytic_curvature_probes>0&&!curvature_performance_window.initialized&&
+       !rpmd_ja_feasibility::reset_curvature_performance_window(curvature_performance_window,tau,current.objective,
+         result.last_full_gradient_seconds))
+      throw std::runtime_error("NUMERICAL_SOLVE_FAIL: cannot initialize curvature performance window");
     result.start_objective=current.objective;result.start_raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
     if(trace){*trace<<"COVARIANCE_INITIALIZATION status "<<result.initialization_status<<" phase="<<initialization_phase<<" stop_reason "<<initialization_stop_reason<<" tau "<<tau<<" initialization_evaluations "<<result.initialization_evaluations
         <<" initialization_gradient_calls "<<result.initialization_gradient_calls
+        <<" start_metrics_point "<<result.start_metrics_point
         <<" start_graph_delta "<<result.start_graph_delta<<" start_objective "<<result.start_objective
         <<" start_raw_gradient_inf_norm "<<result.start_raw_gradient_inf_norm<<"\ntheta_start "<<result.theta_start.size();
       for(const double value:result.theta_start)*trace<<' '<<value;*trace<<'\n';}flush_trace();
     initialization_complete=true;
-    std::vector<double> z(result.theta.size());for(std::size_t i=0;i<z.size();++i)z[i]=result.theta[i]/coordinate_scale[i];
+    std::vector<double> z(result.theta.size());for(std::size_t i=0;i<z.size();++i)z[i]=(result.theta[i]-baseline.theta[i])/coordinate_scale[i];
     std::vector<double> objective_gradient_scale(statistics.size());for(std::size_t i=0;i<statistics.size();++i)
       objective_gradient_scale[i]=0.5*(statistics[i]+rho*baseline.trace[i])*coordinate_scale[i];
     const double gradient_scale=std::max(1.0,covariance_norm_inf(objective_gradient_scale));
     result.kkt_gradient_denominator=gradient_scale;
     const double target_gap=1e-6,tau_min=std::nextafter(target_gap/static_cast<double>(system.r),0.0);
     CovarianceBFGSHistory bfgs;covariance_reset_bfgs_history(bfgs,z.size(),true);
+    if(resume_state){
+      bfgs.inverse_hessian=resume_state->bfgs_inverse;bfgs.seed_gamma=resume_state->bfgs_seed_gamma;
+      bfgs.last_valid_gamma=resume_state->bfgs_last_valid_gamma;bfgs.stage_seeded=resume_state->bfgs_stage_seeded;
+      bfgs.seed_source=resume_state->bfgs_seed_source;
+      const std::size_t dimension=z.size(),pair_size=2*dimension;
+      for(unsigned pair=0;pair<resume_state->bfgs_recent_secant_count;++pair){
+        CovarianceBFGSHistory::Secant secant;const auto offset=static_cast<std::size_t>(pair)*pair_size;
+        secant.step.assign(resume_state->bfgs_recent_secants.begin()+static_cast<std::ptrdiff_t>(offset),
+          resume_state->bfgs_recent_secants.begin()+static_cast<std::ptrdiff_t>(offset+dimension));
+        secant.gradient_change.assign(resume_state->bfgs_recent_secants.begin()+static_cast<std::ptrdiff_t>(offset+dimension),
+          resume_state->bfgs_recent_secants.begin()+static_cast<std::ptrdiff_t>(offset+pair_size));
+        bfgs.recent_secants.push_back(std::move(secant));}
+    }
     result.bfgs_seed_gamma=bfgs.seed_gamma;result.bfgs_seed_source=bfgs.seed_source;
     auto sync_bfgs_seed=[&](){result.bfgs_seed_gamma=bfgs.seed_gamma;result.bfgs_seed_source=bfgs.seed_source;
       result.bfgs_recent_pairs=bfgs.recent_secants.size();};
@@ -5327,6 +8746,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     result.start_scaled_kkt_residual=kkt(current);
     result.start_gradient_data_scaled_inf_norm=covariance_norm_inf(covariance_scaled_gradient(current.gradient_data,coordinate_scale));
     result.start_gradient_prior_scaled_inf_norm=covariance_norm_inf(covariance_scaled_gradient(current.gradient_prior,coordinate_scale));
+    result.start_gradient_ridge_scaled_inf_norm=covariance_norm_inf(covariance_scaled_gradient(current.gradient_ridge,coordinate_scale));
     result.start_gradient_barrier_scaled_inf_norm=covariance_norm_inf(covariance_scaled_gradient(current.gradient_barrier,coordinate_scale));
     if(trace)*trace<<"COVARIANCE_START_GRADIENT status="<<result.start_gradient_solve_status<<" start_scaled_kkt_residual="<<result.start_scaled_kkt_residual
       <<" start_gradient_data_scaled_inf_norm="<<result.start_gradient_data_scaled_inf_norm
@@ -5335,6 +8755,60 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     if(trace)*trace<<"BFGS_CURVATURE_SEED tau="<<tau<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source<<" reason=START\n";flush_trace();
     capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);
     result.status="OPTIMIZING";
+    const bool bounded_stagnation=ridge_lambda>0.0&&analytic_curvature_probes>0&&budget!=nullptr;
+    std::uint64_t progress_attempts_in_window=bounded_stagnation?1:0;
+    if(bounded_stagnation)result.stagnation_gradient_attempts=1;
+    double progress_window_start_kkt=kkt(current),best_progress_kkt=progress_window_start_kkt;
+    std::vector<double> best_progress_theta=result.theta;CovarianceObjectiveEvaluation best_progress_value=current;
+    CovarianceFitSnapshot best_progress_snapshot=result.last_valid;
+    result.stagnation_best_kkt=best_progress_kkt;
+    if(bounded_stagnation&&resume_state){
+      if(resume_state->stagnation_best_theta.size()!=result.theta.size()||
+         !std::isfinite(resume_state->stagnation_best_kkt)||!std::isfinite(resume_state->stagnation_window_start_kkt))
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: accepted-point checkpoint lacks stagnation recovery state");
+      result.stagnation_gradient_attempts=resume_state->stagnation_gradient_attempts;
+      result.stagnation_low_progress_windows=resume_state->stagnation_low_progress_windows;
+      result.stagnation_last_window_relative_improvement=resume_state->stagnation_last_window_relative_improvement;
+      progress_attempts_in_window=resume_state->stagnation_progress_attempts_in_window;
+      progress_window_start_kkt=resume_state->stagnation_window_start_kkt;
+      best_progress_kkt=resume_state->stagnation_best_kkt;best_progress_theta=resume_state->stagnation_best_theta;
+      if(best_progress_theta==result.theta)best_progress_value=current;
+      else{
+        best_progress_value=evaluate_covariance_fit_objective(system,best_progress_theta,baseline,statistics,rho,epsilon,tau,
+          result.objective_evaluations,true,verify_original_residuals,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,
+          budget,budget_limits,&result.full_gradient_evaluations,nullptr,
+          verify_original_residuals?&result.original_residual_gradient_attempts:nullptr,
+          &result.objective_evaluation_seconds,&result.full_gradient_seconds,&result.last_full_gradient_seconds);
+        record_performance_gradient(result.last_full_gradient_seconds);
+        if(!best_progress_value.feasible)
+          throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: saved best stagnation point is no longer feasible");
+        if(budget)covariance_budget_observe_or_throw(budget,budget_limits);
+        capture_covariance_snapshot(best_progress_snapshot,best_progress_theta,best_progress_value,coordinate_scale,gradient_scale,tau);
+      }
+      result.stagnation_best_kkt=best_progress_kkt;
+    }
+    auto record_progress_attempt=[&](const CovarianceObjectiveEvaluation* value,const std::vector<double>* theta){
+      if(!bounded_stagnation)return;
+      ++result.stagnation_gradient_attempts;++progress_attempts_in_window;
+      if(value&&theta){const double candidate_kkt=kkt(*value);if(candidate_kkt<best_progress_kkt){
+          best_progress_kkt=candidate_kkt;best_progress_theta=*theta;best_progress_value=*value;result.stagnation_best_kkt=candidate_kkt;
+          capture_covariance_snapshot(best_progress_snapshot,*theta,*value,coordinate_scale,gradient_scale,tau);}}
+      if(progress_attempts_in_window<12)return;
+      result.stagnation_last_window_relative_improvement=(progress_window_start_kkt-best_progress_kkt)/
+        std::max(progress_window_start_kkt,1e-12);
+      if(result.stagnation_last_window_relative_improvement<0.5)++result.stagnation_low_progress_windows;
+      else result.stagnation_low_progress_windows=0;
+      progress_window_start_kkt=best_progress_kkt;progress_attempts_in_window=0;
+      if(result.stagnation_low_progress_windows>=2){result.numerical_stalled=true;result.status="NUMERICAL_STALLED";
+        result.reason="two consecutive 12-attempt exact-gradient windows failed to reduce best KKT by a factor of two at unchanged tau";
+        result.theta=best_progress_theta;current=best_progress_value;z.resize(result.theta.size());
+        result.last_valid=best_progress_snapshot;result.stagnation_best_point_factor_status="FACTORS_NOT_REBUILT_AFTER_RESTORE";
+        for(std::size_t i=0;i<z.size();++i)z[i]=(result.theta[i]-baseline.theta[i])/coordinate_scale[i];
+        if(trace)*trace<<"COVARIANCE_NUMERICAL_STALLED status=NUMERICAL_STALLED best_kkt="<<best_progress_kkt
+          <<" last_window_relative_improvement="<<result.stagnation_last_window_relative_improvement
+          <<" gradient_attempts="<<result.stagnation_gradient_attempts<<" tau="<<tau
+          <<" point=BEST_ACCEPTED_GRADIENT factors=FACTORS_NOT_REBUILT_AFTER_RESTORE\n";flush_trace();}
+    };
     CovarianceJointGroupTopology joint_topology;std::vector<CovarianceBFGSHistory> group_bfgs_history;
     if(joint_block){joint_topology=covariance_joint_group_topology(system.graph);const std::size_t groups=joint_topology.atoms.size();
       group_bfgs_history.resize(groups);result.group_bfgs_gamma.resize(groups);result.group_bfgs_source.resize(groups);
@@ -5347,31 +8821,308 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
       *trace<<"COVARIANCE_GROUP_BFGS_HISTORY group="<<group<<" support="<<result.group_bfgs_supports[group]
         <<" gamma="<<group_bfgs_history[group].seed_gamma<<" source="<<group_bfgs_history[group].seed_source
         <<" update_status="<<result.group_bfgs_update_status[group]<<" committed_updates=0 tau="<<tau<<'\n';flush_trace();
-    double trust_radius=1.0;if(trust_region)result.trust_region_radius=trust_radius;
+    double trust_radius=resume_state?resume_state->trust_radius:1.0;if(trust_region)result.trust_region_radius=trust_radius;
+    CovarianceAnalyticCurvatureCache analytic_curvature_cache;
+    int working_analytic_curvature_probes=resume_state&&resume_state->curvature_probe_count?
+      static_cast<int>(resume_state->curvature_probe_count):analytic_curvature_probes;
+    bool working_probe_count_verified=resume_state&&resume_state->curvature_probe_count_verified;
+    int same_point_curvature_rejections=resume_state?static_cast<int>(resume_state->same_point_curvature_rejections):0;
+    double curvature_direction_checked_tau=std::numeric_limits<double>::quiet_NaN();
+    CovarianceAnalyticCurvatureCache independent_curvature_cache;
+    double independent_curvature_checked_tau=std::numeric_limits<double>::quiet_NaN();
+    auto persist_accepted_point=[&](const bool operation_in_progress=false){
+      if(!checkpoint_sink)return;
+      if(!checkpoint_metadata)throw std::runtime_error("checkpoint writer has no frozen branch metadata");
+      if(budget){
+        const auto clock=rpmd_ja_feasibility::advance_clock(*budget,covariance_budget_now_seconds());
+        if(clock!=rpmd_ja_feasibility::BudgetResult::OK)
+          throw std::runtime_error(std::string("FEASIBILITY_BUDGET_")+covariance_budget_result_name(clock));}
+      auto saved=*checkpoint_metadata;saved.epsilon=epsilon;saved.rho=rho;saved.ridge_lambda=ridge_lambda;
+      saved.tau=tau;saved.trust_radius=trust_radius;saved.start_graph_delta=result.start_graph_delta;
+      saved.theta=result.theta;saved.theta_start=result.theta_start;
+      saved.coordinate_scale=coordinate_scale;saved.stagnation_best_theta=best_progress_theta;
+      saved.stagnation_gradient_attempts=result.stagnation_gradient_attempts;
+      saved.stagnation_low_progress_windows=result.stagnation_low_progress_windows;
+      saved.stagnation_progress_attempts_in_window=progress_attempts_in_window;
+      saved.same_point_curvature_rejections=static_cast<std::uint64_t>(std::max(0,same_point_curvature_rejections));
+      saved.stagnation_best_kkt=std::isfinite(best_progress_kkt)?best_progress_kkt:0.0;
+      saved.stagnation_window_start_kkt=std::isfinite(progress_window_start_kkt)?progress_window_start_kkt:0.0;
+      saved.stagnation_last_window_relative_improvement=std::isfinite(result.stagnation_last_window_relative_improvement)?
+        result.stagnation_last_window_relative_improvement:0.0;
+      saved.max_objective_evaluations=max_evaluations;saved.objective_evaluations=result.objective_evaluations;
+      saved.initialization_evaluations=result.initialization_evaluations;saved.gradient_evaluations=result.full_gradient_evaluations;
+      saved.iterations=static_cast<std::uint64_t>(std::max(0,result.iterations));
+      saved.bfgs_inverse=bfgs.inverse_hessian;saved.bfgs_seed_gamma=bfgs.seed_gamma;
+      saved.bfgs_last_valid_gamma=bfgs.last_valid_gamma;saved.bfgs_stage_seeded=bfgs.stage_seeded;
+      saved.bfgs_seed_source=bfgs.seed_source;saved.bfgs_recent_secant_count=static_cast<unsigned>(bfgs.recent_secants.size());
+      saved.bfgs_recent_secants.clear();for(const auto& secant:bfgs.recent_secants){
+        saved.bfgs_recent_secants.insert(saved.bfgs_recent_secants.end(),secant.step.begin(),secant.step.end());
+        saved.bfgs_recent_secants.insert(saved.bfgs_recent_secants.end(),secant.gradient_change.begin(),secant.gradient_change.end());}
+      saved.curvature_probe_count=static_cast<unsigned>(working_analytic_curvature_probes);
+      saved.curvature_probe_count_verified=working_probe_count_verified;
+      saved.performance_window_initialized=curvature_performance_window.initialized;
+      saved.performance_window_curvature_builds=curvature_performance_window.curvature_builds;
+      saved.performance_window_tau=curvature_performance_window.tau;
+      saved.performance_window_start_objective=curvature_performance_window.start_objective;
+      saved.performance_window_curvature_seconds=curvature_performance_window.curvature_seconds;
+      saved.performance_window_reference_gradient_seconds=curvature_performance_window.reference_gradient_seconds;
+      saved.objective_evaluation_seconds=result.objective_evaluation_seconds;
+      saved.full_gradient_seconds=result.full_gradient_seconds;
+      saved.last_full_gradient_seconds=result.last_full_gradient_seconds;
+      saved.factorization_seconds=result.factorization_seconds+
+        std::max(0.0,system.factorization_wall_seconds-factorization_seconds_at_start);
+      saved.analytic_curvature_seconds=result.analytic_curvature_seconds;
+      saved.operation_in_progress=operation_in_progress;
+      saved.operation_start_epoch_seconds=std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+      if(budget){saved.elapsed_seconds=budget->elapsed_seconds;saved.total_budget_gradients=budget->exact_gradients;
+        saved.active_phase=rpmd_ja_feasibility::phase_index(budget->phase);
+        for(std::size_t phase=0;phase<saved.phase_gradients.size();++phase){
+          saved.phase_gradients[phase]=budget->phase_gradients[phase];saved.phase_seconds[phase]=budget->phase_seconds[phase];}}
+      else{saved.elapsed_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+        saved.total_budget_gradients=result.full_gradient_evaluations;}
+      checkpoint_sink(saved);
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+      if(result.iterations>0&&covariance_fit_test_hooks.checkpoint_interruptions_remaining>0){
+        --covariance_fit_test_hooks.checkpoint_interruptions_remaining;
+        throw std::runtime_error("TEST_CHECKPOINT_INTERRUPT");}
+#endif
+    };
+    auto persist_operation_start=[&](){persist_accepted_point(true);};
+    auto with_checkpointed_operation=[&](const std::function<void()>& operation){
+      persist_operation_start();
+      try{operation();}catch(...){persist_accepted_point();throw;}
+      persist_accepted_point();};
+    auto run_directional_curvature_check=[&](const std::vector<double>& hessian,const std::vector<double>* actual_step,
+        const char* trigger,const std::vector<double>& scaled_gradient,const bool include_reference_directions){
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+      if(include_reference_directions)++covariance_fit_test_hooks.directional_curvature_reference_checks;
+      else ++covariance_fit_test_hooks.directional_curvature_step_checks;
+#endif
+      const auto started=std::chrono::steady_clock::now();const std::uint64_t objective_before=result.objective_evaluations;
+      const std::uint64_t factors_before=system.factorizations;
+      if(actual_step&&std::string(trigger)=="SUGGESTED_STEP"){
+        if(!covariance_same_curvature_point(analytic_curvature_cache,independent_curvature_cache)||
+           independent_curvature_checked_tau!=tau)
+          throw std::runtime_error("CURVATURE_SOLVE_FAIL: independent batch has not checked this point and tau");
+        const std::vector<double> independent_curvature_hessian=covariance_analytic_curvature_hessian(
+          independent_curvature_cache,static_cast<int>(z.size()),rho,tau,ridge_lambda);
+        double norm=0.0;for(const double value:*actual_step)norm=std::hypot(norm,value);
+        if(!(norm>0.0)||!std::isfinite(norm)){result.analytic_curvature_independent_status="CURVATURE_UNRESOLVED_ACTUAL_STEP";
+          result.status="CURVATURE_UNRESOLVED";result.reason="actual trust-region step has no representable direction";return false;}
+        std::vector<double> normalized=*actual_step;for(double& value:normalized)value/=norm;
+        const double error=covariance_directional_hessian_relative_error(hessian,independent_curvature_hessian,normalized);
+        ++result.analytic_curvature_independent_directions;
+        result.analytic_curvature_independent_max_relative_error=std::max(
+          std::isfinite(result.analytic_curvature_independent_max_relative_error)?result.analytic_curvature_independent_max_relative_error:0.0,error);
+        if(trace)*trace<<"COVARIANCE_CURVATURE_INDEPENDENT_ACTUAL_STEP error="<<error<<" tolerance="
+          <<covariance_independent_directional_tolerance<<" status="
+          <<(error<=covariance_independent_directional_tolerance?"PASS":"CURVATURE_UNRESOLVED")<<'\n';flush_trace();
+        if(error>covariance_independent_directional_tolerance){result.analytic_curvature_independent_status="CURVATURE_UNRESOLVED_ACTUAL_STEP";
+          result.status="CURVATURE_UNRESOLVED";result.reason="actual trust-region step disagrees across independent curvature batches";return false;}}
+      try{
+        const CovarianceDirectionalCurvatureSummary check=covariance_verify_directional_curvature(system,current,baseline,statistics,
+          rho,epsilon,tau,coordinate_scale,ridge_lambda,hessian,scaled_gradient,actual_step,result.objective_evaluations,max_evaluations,
+          budget,budget_limits,trace,trigger,include_reference_directions);
+        result.analytic_curvature_direction_status=check.status;result.analytic_curvature_direction_checks+=check.checks;
+        result.analytic_curvature_direction_max_relative_error=std::max(
+          std::isfinite(result.analytic_curvature_direction_max_relative_error)?result.analytic_curvature_direction_max_relative_error:0.0,
+          check.max_relative_error);
+      }catch(const std::exception& error){
+        const std::string detail=error.what();result.analytic_curvature_direction_status=
+          covariance_incomplete_candidate_status(detail)?detail:"NUMERICAL_FAIL";
+        result.status=covariance_incomplete_candidate_status(detail)?detail:"NUMERICAL_SOLVE_FAIL";
+        result.reason=detail;
+      }
+      result.analytic_curvature_direction_objectives+=result.objective_evaluations-objective_before;
+      result.analytic_curvature_direction_seconds+=std::chrono::duration<double>(
+        std::chrono::steady_clock::now()-started).count();
+      if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION_COST trigger="<<trigger
+        <<" objective_evaluations="<<(result.objective_evaluations-objective_before)
+        <<" factorizations="<<(system.factorizations-factors_before)
+        <<" status="<<result.analytic_curvature_direction_status<<'\n';flush_trace();
+      return result.analytic_curvature_direction_status=="PASS";
+    };
+    auto run_independent_curvature_check=[&](const char* trigger,const std::vector<double>& scaled_gradient){
+      CovarianceIndependentCurvatureCheck check=covariance_verify_independent_curvature_batch(system,analytic_curvature_cache,
+        epsilon,coordinate_scale,rho,tau,ridge_lambda,scaled_gradient,trust_radius,result.analytic_curvature_rhs_columns,
+        budget,budget_limits,&independent_curvature_cache);
+      analytic_curvature_cache=std::move(check.primary);result.analytic_curvature_independent_status=check.status;
+      independent_curvature_cache=std::move(check.independent);
+      result.analytic_curvature_builds+=check.independent_batches+check.primary_upgrade_levels;
+      result.analytic_curvature_independent_seconds+=check.seconds;
+      result.analytic_curvature_independent_rhs_columns+=check.independent_rhs_columns;
+      result.analytic_curvature_independent_probes=check.probes;
+      result.analytic_curvature_independent_directions=check.directions_checked;
+      result.analytic_curvature_independent_max_relative_error=check.max_relative_directional_error;
+      if(analytic_curvature_cache.valid){working_analytic_curvature_probes=analytic_curvature_cache.probes;
+        result.analytic_curvature_probes=analytic_curvature_cache.probes;
+        result.analytic_curvature_stability_status=analytic_curvature_cache.stability_status;
+        result.analytic_curvature_relative_matrix_change=analytic_curvature_cache.relative_matrix_change;
+        result.analytic_curvature_relative_step_change=analytic_curvature_cache.relative_step_change;}
+      if(trace)*trace<<"COVARIANCE_CURVATURE_INDEPENDENT trigger="<<trigger<<" seed="
+        <<covariance_independent_curvature_seed<<" probes="<<check.probes<<" directions="<<check.directions_checked
+        <<" rhs_columns="<<check.independent_rhs_columns<<" max_directional_error="
+        <<check.max_relative_directional_error<<" tolerance="<<covariance_independent_directional_tolerance
+        <<" status="<<check.status<<'\n';flush_trace();
+      if(!check.valid){result.analytic_curvature_status="CURVATURE_UNRESOLVED";
+        result.status=covariance_independent_failure_status_or_throw(check.status);
+        result.reason="independent random-batch directional curvature check did not resolve";return false;}
+      result.analytic_curvature_independent_status=check.status;working_probe_count_verified=true;
+      if(result.analytic_curvature_status=="PROBE_COUNT_REUSED_PENDING_LOCAL_CHECK"){
+        result.analytic_curvature_status="PROBE_COUNT_REUSED_LOCAL_CHECKED";
+        analytic_curvature_cache.status=result.analytic_curvature_status;}
+      independent_curvature_checked_tau=tau;return true;
+    };
+    auto check_curvature_performance_stop=[&](){
+      if(!trust_region||analytic_curvature_probes<=0||!curvature_performance_window.initialized||
+         curvature_performance_window.curvature_builds<rpmd_ja_feasibility::candidate_performance_curvature_window)return false;
+      const auto completed_window=curvature_performance_window;
+      const double relative_improvement=(completed_window.start_objective-current.objective)/
+        std::max(1.0,std::abs(completed_window.start_objective));
+      const auto decision=rpmd_ja_feasibility::finish_curvature_performance_window(curvature_performance_window,
+        tau,current.objective,result.last_full_gradient_seconds);
+      if(trace)*trace<<"COVARIANCE_PERFORMANCE_STOP_WINDOW tau="<<tau<<" curvature_builds="
+        <<completed_window.curvature_builds<<" curvature_seconds="<<completed_window.curvature_seconds
+        <<" max_full_gradient_seconds="<<completed_window.reference_gradient_seconds
+        <<" relative_objective_improvement="<<relative_improvement<<" status="
+        <<(decision==rpmd_ja_feasibility::CurvaturePerformanceDecision::NUMERICAL_INCONCLUSIVE?
+          "NUMERICAL_INCONCLUSIVE_PERFORMANCE_STOP":"CONTINUE")<<'\n';flush_trace();
+      if(decision==rpmd_ja_feasibility::CurvaturePerformanceDecision::NUMERICAL_INCONCLUSIVE){
+        result.status="NUMERICAL_INCONCLUSIVE_PERFORMANCE_STOP";
+        result.reason="three same-tau curvature builds cost more than one measured full exact gradient while relative objective improvement stayed below the predeclared 0.001 heuristic threshold";
+        return true;}
+      persist_accepted_point();return false;
+    };
+    persist_accepted_point();
     while(result.iterations<max_iterations&&result.objective_evaluations<max_evaluations){
+      if(result.numerical_stalled)break;
       result.scaled_kkt_residual=kkt(current);result.raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
       if(covariance_barrier_stage_pass(current,result.scaled_kkt_residual,tau,tau_min,staged_barrier)){
+        if(fixed_tau){result.converged=true;result.status="COVARIANCE_FIXED_TAU_CONVERGED";break;}
         if(tau<=tau_min){result.converged=true;result.barrier_center_condition_pass=true;result.status="COVARIANCE_OPTIMIZER_CONVERGED";break;}
-        tau=std::max(tau*0.2,tau_min);covariance_recompose_objective_for_tau(current,result.theta,baseline,statistics,rho,epsilon,tau);
+        tau=std::max(tau*0.2,tau_min);covariance_recompose_objective_for_tau(current,result.theta,baseline,statistics,rho,epsilon,tau,coordinate_scale,ridge_lambda);
         capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);
+        if(bounded_stagnation){progress_attempts_in_window=0;result.stagnation_low_progress_windows=0;
+          progress_window_start_kkt=kkt(current);best_progress_kkt=progress_window_start_kkt;best_progress_theta=result.theta;
+          best_progress_value=current;best_progress_snapshot=result.last_valid;result.stagnation_best_kkt=best_progress_kkt;}
         covariance_reset_bfgs_history(bfgs,z.size(),true);sync_bfgs_seed();
         for(std::size_t group=0;group<group_bfgs_history.size();++group){covariance_reset_bfgs_history(group_bfgs_history[group],6,true);
           result.group_bfgs_gamma[group]=group_bfgs_history[group].seed_gamma;result.group_bfgs_source[group]=group_bfgs_history[group].seed_source;
           result.group_bfgs_update_status[group]="TAU_RESET";}
         result.dominant_cap_rescue_next=false;
         if(trust_region){trust_radius=1.0;result.trust_region_radius=trust_radius;}
+        if(trust_region&&analytic_curvature_probes>0){
+          if(!rpmd_ja_feasibility::reset_curvature_performance_window(curvature_performance_window,tau,current.objective))
+            throw std::runtime_error("NUMERICAL_SOLVE_FAIL: cannot reset curvature performance window at a tau change");
+          result.last_full_gradient_seconds=0.0;}
         if(trace)*trace<<"BFGS_STAGE_RESET tau="<<tau<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source
-          <<" recent_pairs="<<bfgs.recent_secants.size()<<" reason=TAU_CHANGE\n";flush_trace();continue;}
+          <<" recent_pairs="<<bfgs.recent_secants.size()<<" reason=TAU_CHANGE\n";flush_trace();persist_accepted_point();continue;}
+      if(check_curvature_performance_stop())break;
       if(trust_region){
         const int iteration=result.iterations;const std::vector<double> g=scaled_gradient(current);
-        const auto model_started=std::chrono::steady_clock::now();
-        CovarianceTrustRegionModel model=covariance_trust_region_model(system.solver,bfgs.inverse_hessian,static_cast<int>(z.size()));
-        ++result.trust_region_model_decompositions;
-        model.spectrum.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-model_started).count();
-        result.inverse_bfgs_spectrum=model.spectrum;result.inverse_bfgs_spectrum.snapshot_stage="TRUST_REGION_MODEL";
-        result.inverse_bfgs_spectrum.iteration=iteration;result.inverse_bfgs_spectrum.tau=tau;
-        result.inverse_bfgs_spectrum_seconds+=model.spectrum.seconds;
-        if(!model.positive_definite){const std::string reset_reason=model.status;
+        CovarianceTrustRegionModel model;
+        if(analytic_curvature_probes>0){
+          const auto curvature_started=std::chrono::steady_clock::now();
+          const bool cache_hit=analytic_curvature_cache.valid&&analytic_curvature_cache.theta==result.theta&&
+            analytic_curvature_cache.epsilon==epsilon&&analytic_curvature_cache.coordinate_scale==coordinate_scale&&
+            analytic_curvature_cache.graph_assembly_generation==system.graph_assembly_generation&&
+            analytic_curvature_cache.probes>=working_analytic_curvature_probes;
+          if(cache_hit){++result.analytic_curvature_cache_hits;result.analytic_curvature_status="CACHE_HIT";}
+          else{
+            try{
+              with_checkpointed_operation([&](){
+                if(working_probe_count_verified){
+                  analytic_curvature_cache=covariance_build_analytic_curvature_cache(system,result.theta,epsilon,coordinate_scale,
+                    working_analytic_curvature_probes,result.analytic_curvature_rhs_columns,budget,budget_limits);
+                  analytic_curvature_cache.levels_built=1;
+                  analytic_curvature_cache.stability_status="PREVIOUSLY_VERIFIED_PROBE_COUNT_REUSED";
+                  analytic_curvature_cache.status="PROBE_COUNT_REUSED_PENDING_LOCAL_CHECK";
+                }else{
+                  analytic_curvature_cache=covariance_build_stable_analytic_curvature_cache(system,result.theta,epsilon,coordinate_scale,
+                    working_analytic_curvature_probes,rho,tau,ridge_lambda,g,trust_radius,result.analytic_curvature_rhs_columns,budget,budget_limits);
+                  if(analytic_curvature_cache.valid)working_analytic_curvature_probes=analytic_curvature_cache.probes;
+                }
+                result.analytic_curvature_builds+=static_cast<std::uint64_t>(analytic_curvature_cache.levels_built);
+                result.analytic_curvature_status=analytic_curvature_cache.status;});}
+            catch(const CovarianceFeasibilityBudgetError& error){
+              result.analytic_curvature_status="NOT_BUILT_BUDGET_LIMIT";result.status=error.what();
+              result.reason=error.what();result.analytic_curvature_seconds+=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-curvature_started).count();break;}
+            catch(const std::exception& error){
+              result.analytic_curvature_status="CURVATURE_NUMERICAL_FAIL";
+              result.status=covariance_incomplete_candidate_status(error.what())?error.what():"NUMERICAL_SOLVE_FAIL";
+              result.reason=error.what();result.analytic_curvature_seconds+=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-curvature_started).count();break;}
+            if(!analytic_curvature_cache.valid){result.analytic_curvature_status="CURVATURE_UNRESOLVED";
+              result.analytic_curvature_stability_status=analytic_curvature_cache.stability_status;
+              result.analytic_curvature_probes=analytic_curvature_cache.probes;
+              result.analytic_curvature_relative_matrix_change=analytic_curvature_cache.relative_matrix_change;
+              result.analytic_curvature_relative_step_change=analytic_curvature_cache.relative_step_change;
+              result.status="CURVATURE_UNRESOLVED";result.reason="nested curvature estimates did not stabilize by 128 probes";
+              result.analytic_curvature_seconds+=analytic_curvature_cache.seconds;break;}
+            result.analytic_curvature_stability_status=analytic_curvature_cache.stability_status;
+            result.analytic_curvature_probes=analytic_curvature_cache.probes;
+            result.analytic_curvature_relative_matrix_change=analytic_curvature_cache.relative_matrix_change;
+            result.analytic_curvature_relative_step_change=analytic_curvature_cache.relative_step_change;
+          }
+          if(!covariance_same_curvature_point(analytic_curvature_cache,independent_curvature_cache)||
+             independent_curvature_checked_tau!=tau){
+            bool independent_check_pass=false;
+            with_checkpointed_operation([&](){independent_check_pass=run_independent_curvature_check(
+              working_probe_count_verified?"POINT_OR_TAU":"INITIAL",g);});
+            if(!independent_check_pass){result.analytic_curvature_seconds+=std::chrono::duration<double>(
+              std::chrono::steady_clock::now()-curvature_started).count();break;}}
+          const std::vector<double> hessian=covariance_analytic_curvature_hessian(analytic_curvature_cache,
+            static_cast<int>(z.size()),rho,tau,ridge_lambda);
+          if(curvature_direction_checked_tau!=tau){
+            const char* trigger=std::isfinite(curvature_direction_checked_tau)?"TAU_STAGE":"INITIAL";
+            bool directional_check_pass=false;
+            with_checkpointed_operation([&](){directional_check_pass=run_directional_curvature_check(hessian,nullptr,trigger,g,true);});
+            if(!directional_check_pass)break;
+            curvature_direction_checked_tau=tau;
+            result.analytic_curvature_exact_hessian_status="INDEPENDENT_OMEGA_AND_FD_DIRECTIONALLY_CROSSCHECKED";
+          }
+          model=covariance_direct_hessian_trust_region_model(system.solver,hessian,static_cast<int>(z.size()));
+          ++result.trust_region_model_decompositions;
+          model.spectrum.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-curvature_started).count();
+          result.analytic_curvature_seconds+=model.spectrum.seconds;result.analytic_curvature_spectrum=model.spectrum;
+          result.analytic_curvature_spectrum.snapshot_stage="ANALYTIC_HESSIAN_TRUST_REGION_MODEL";
+          result.analytic_curvature_spectrum.iteration=iteration;result.analytic_curvature_spectrum.tau=tau;
+          result.analytic_curvature_model_floor=model.spectral_floor;
+          result.analytic_curvature_diagonal_scale_min=model.diagonal_scale_min;
+          result.analytic_curvature_diagonal_scale_max=model.diagonal_scale_max;
+          result.analytic_curvature_clipped_eigenvalues=static_cast<std::uint64_t>(model.clipped_eigenvalues);
+          result.analytic_curvature_exact_hessian_status=model.clipped_eigenvalues?"MODEL_SOFT_EIGENVALUE_FLOOR_APPLIED":"NOT_CERTIFIED_STOCHASTIC_CURVATURE";
+          result.analytic_curvature_status=model.positive_definite?model.status:"CURVATURE_UNRESOLVED";
+          if(!model.positive_definite){result.status="CURVATURE_UNRESOLVED";result.reason="analytic Hessian did not pass the positive-definite spectral gate";
+            break;}
+           if(analytic_curvature_probes>0&&!cache_hit){
+             if(!rpmd_ja_feasibility::record_curvature_performance_build(curvature_performance_window,tau,current.objective,
+                model.spectrum.seconds))
+               throw std::runtime_error("NUMERICAL_SOLVE_FAIL: invalid measured curvature performance sample");
+             persist_accepted_point();if(check_curvature_performance_stop())break;}
+          if(trace){*trace<<"COVARIANCE_ANALYTIC_CURVATURE iteration="<<iteration<<" probes="<<working_analytic_curvature_probes
+              <<" rhs_columns="<<result.analytic_curvature_rhs_columns<<" cache_hit="<<(cache_hit?1:0)
+              <<" status="<<result.analytic_curvature_status<<" exact_hessian_status="<<result.analytic_curvature_exact_hessian_status
+              <<" stability_status="<<result.analytic_curvature_stability_status
+              <<" matrix_change="<<result.analytic_curvature_relative_matrix_change
+              <<" step_change="<<result.analytic_curvature_relative_step_change
+              <<" model_spectral_floor="<<model.spectral_floor<<" clipped_eigenvalues="<<model.clipped_eigenvalues
+              <<" diagonal_scale_min="<<model.diagonal_scale_min<<" diagonal_scale_max="<<model.diagonal_scale_max
+              <<" seconds="<<model.spectrum.seconds;
+            write_covariance_bfgs_spectrum_diagnostic(*trace,result.analytic_curvature_spectrum,"analytic_hessian_",' ','=');
+            *trace<<'\n';}flush_trace();
+        }else{
+          const auto model_started=std::chrono::steady_clock::now();
+          model=covariance_trust_region_model(system.solver,bfgs.inverse_hessian,static_cast<int>(z.size()));
+          ++result.trust_region_model_decompositions;
+          model.spectrum.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-model_started).count();
+          result.inverse_bfgs_spectrum=model.spectrum;result.inverse_bfgs_spectrum.snapshot_stage="TRUST_REGION_MODEL";
+          result.inverse_bfgs_spectrum.iteration=iteration;result.inverse_bfgs_spectrum.tau=tau;
+          result.inverse_bfgs_spectrum_seconds+=model.spectrum.seconds;
+        }
+        if(!model.positive_definite&&analytic_curvature_probes==0){const std::string reset_reason=model.status;
           covariance_reset_bfgs_history(bfgs,z.size(),false);sync_bfgs_seed();
           if(!(bfgs.seed_gamma>0.0)||!std::isfinite(bfgs.seed_gamma)||!std::isfinite(1.0/bfgs.seed_gamma)){
             bfgs.seed_gamma=1.0;bfgs.last_valid_gamma=1.0;bfgs.seed_source="UNIT_IDENTITY_UNREPRESENTABLE_SCALE";
@@ -5383,7 +9134,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           result.inverse_bfgs_spectrum.iteration=iteration;result.inverse_bfgs_spectrum.tau=tau;
           if(trace)*trace<<"TRUST_REGION_MODEL_RESET iteration="<<iteration<<" tau="<<tau
             <<" previous_status="<<reset_reason<<" gamma="<<bfgs.seed_gamma<<" source="<<bfgs.seed_source<<'\n';flush_trace();}
-        if(trace){*trace<<"COVARIANCE_BFGS_SPECTRUM";
+        if(analytic_curvature_probes==0&&trace){*trace<<"COVARIANCE_BFGS_SPECTRUM";
           write_covariance_bfgs_spectrum_diagnostic(*trace,result.inverse_bfgs_spectrum,"",' ','=');*trace<<'\n';}flush_trace();
         bool committed=false;constexpr double minimum_radius=1e-12;constexpr int maximum_radius_retries=32;
         for(int retry=0;retry<maximum_radius_retries&&result.objective_evaluations<max_evaluations;++retry){
@@ -5393,7 +9144,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           std::vector<double> next_z,step,next_theta;
           bool roundoff_repaired=false;
           if(!covariance_build_trust_region_trial(result.theta,z,coordinate_scale,proposal.step,proposal.norm,radius,
-              next_z,step,next_theta,roundoff_repaired)){
+              next_z,step,next_theta,roundoff_repaired,&baseline.theta)){
             ++result.trust_region_rejections;trust_radius*=0.5;result.trust_region_radius=trust_radius;
             if(trace)*trace<<"TRUST_REGION_TRIAL iteration="<<iteration<<" retry="<<retry<<" radius="<<radius
               <<" status=STEP_UNDERFLOW next_radius="<<trust_radius<<'\n';flush_trace();
@@ -5420,21 +9171,40 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             if(!(trust_radius>minimum_radius)){result.status="TRUST_REGION_TOO_SMALL";result.line_search_failure_status=result.status;
               result.reason="trust-region model predicted no positive decrease at a representable step";break;}continue;}
           const double predicted_resolution=covariance_trust_region_prediction_resolution(model,g,step);
+          if(analytic_curvature_probes>0){
+            if(trace)*trace<<"COVARIANCE_CURVATURE_SUGGESTED_STEP iteration="<<iteration<<" retry="<<retry
+              <<" tau="<<tau<<" radius="<<radius<<" step_norm="<<actual_norm<<'\n';flush_trace();
+            bool directional_check_pass=false;
+            with_checkpointed_operation([&](){directional_check_pass=run_directional_curvature_check(
+              covariance_analytic_curvature_hessian(analytic_curvature_cache,static_cast<int>(z.size()),rho,tau,ridge_lambda),
+              &step,"SUGGESTED_STEP",g,false);});
+            if(!directional_check_pass)break;
+            if(result.objective_evaluations>=max_evaluations){result.status="EVALUATION_BUDGET_EXHAUSTED";
+              result.reason="suggested-step directional curvature check used the remaining objective budget";break;}}
           const auto objective_started=std::chrono::steady_clock::now();++result.line_search_trials;++result.line_search_evaluations;
 #ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
           if(covariance_fit_test_hooks.gradient_residual_failures_remaining>0&&iteration==covariance_fit_test_hooks.gradient_residual_failure_iteration)
             covariance_fit_test_hooks.current_trial_theta=next_theta;
 #endif
-          CovarianceObjectiveEvaluation candidate=evaluate_covariance_fit_objective(system,next_theta,baseline,statistics,rho,epsilon,tau,
-            result.objective_evaluations,false);
+          CovarianceObjectiveEvaluation candidate;
+          with_checkpointed_operation([&](){candidate=evaluate_covariance_fit_objective(system,next_theta,baseline,statistics,rho,epsilon,tau,
+            result.objective_evaluations,false,false,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,budget,budget_limits,
+            nullptr,nullptr,nullptr,&result.objective_evaluation_seconds);});
           result.line_search_objective_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-objective_started).count();
           double actual=std::numeric_limits<double>::quiet_NaN(),ratio=-std::numeric_limits<double>::infinity();
           CovarianceObjectiveChange actual_change;CovarianceTrustRegionTrialDecision decision;
-          if(candidate.feasible){actual_change=covariance_trust_region_objective_change(current,candidate,result.theta,next_theta,statistics,baseline.trace,rho,tau);
+          if(candidate.feasible){actual_change=covariance_trust_region_objective_change(current,candidate,result.theta,next_theta,statistics,baseline.trace,rho,tau,&coordinate_scale,ridge_lambda);
             actual=-actual_change.value;
             if(!std::isfinite(actual))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: trust-region actual decrease is non-finite");
             decision=covariance_trust_region_trial_decision(predicted,predicted_resolution,actual,actual_change.resolution);
             ratio=decision.ratio;
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+            if(covariance_fit_test_hooks.trust_region_forced_rejections_remaining>0){
+              --covariance_fit_test_hooks.trust_region_forced_rejections_remaining;
+              decision.disposition=CovarianceTrustRegionTrialDisposition::PoorRatio;decision.ratio=-1.0;ratio=-1.0;
+              if(trace)*trace<<"COVARIANCE_TEST_FORCED_TRUST_REGION_REJECTION iteration="<<iteration
+                <<" retry="<<retry<<" tau="<<tau<<'\n';flush_trace();}
+#endif
             if(decision.disposition==CovarianceTrustRegionTrialDisposition::ModelStagnation){
               ++result.trust_region_rejections;result.trust_region_last_actual=actual;
               result.status="NUMERICAL_STAGNATION";result.line_search_failure_status=result.status;
@@ -5448,6 +9218,58 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           if(!candidate.feasible||decision.disposition==CovarianceTrustRegionTrialDisposition::UnresolvedActual||
              decision.disposition==CovarianceTrustRegionTrialDisposition::PoorRatio){++result.trust_region_rejections;
             trust_radius=covariance_trust_region_reduced_radius(radius,actual_norm);result.trust_region_radius=trust_radius;
+            if(analytic_curvature_probes>0&&++same_point_curvature_rejections>=5){
+              if(working_analytic_curvature_probes>=CovarianceAnalyticCurvatureWorkspace::max_probes){
+                result.analytic_curvature_status="CURVATURE_UNRESOLVED";result.analytic_curvature_stability_status="PERSISTENT_REJECTIONS_AT_128";
+                result.status="CURVATURE_UNRESOLVED";result.reason="five same-point SPD or poor-ratio rejections persisted at the 128-probe limit";
+                if(trace)*trace<<"COVARIANCE_CURVATURE_REVERIFY status=CURVATURE_UNRESOLVED probes="
+                  <<working_analytic_curvature_probes<<" same_point_rejections="<<same_point_curvature_rejections<<'\n';flush_trace();break;}
+              const auto reverify_started=std::chrono::steady_clock::now();
+              with_checkpointed_operation([&](){analytic_curvature_cache=covariance_build_stable_analytic_curvature_cache(
+                system,result.theta,epsilon,coordinate_scale,working_analytic_curvature_probes*2,rho,tau,ridge_lambda,g,
+                trust_radius,result.analytic_curvature_rhs_columns,budget,budget_limits,nullptr,&analytic_curvature_cache);});
+              result.analytic_curvature_builds+=static_cast<std::uint64_t>(analytic_curvature_cache.levels_built);
+              result.analytic_curvature_seconds+=analytic_curvature_cache.seconds;
+              result.analytic_curvature_probes=analytic_curvature_cache.probes;
+              result.analytic_curvature_stability_status=analytic_curvature_cache.stability_status;
+              result.analytic_curvature_relative_matrix_change=analytic_curvature_cache.relative_matrix_change;
+              result.analytic_curvature_relative_step_change=analytic_curvature_cache.relative_step_change;
+              if(!analytic_curvature_cache.valid){result.analytic_curvature_status="CURVATURE_UNRESOLVED";
+                result.status="CURVATURE_UNRESOLVED";result.reason="curvature failed to restabilize after five same-point rejections by 128 probes";
+                if(trace)*trace<<"COVARIANCE_CURVATURE_REVERIFY status=CURVATURE_UNRESOLVED probes="
+                  <<analytic_curvature_cache.probes<<" matrix_change="<<analytic_curvature_cache.relative_matrix_change
+                  <<" step_change="<<analytic_curvature_cache.relative_step_change<<'\n';flush_trace();break;}
+              working_analytic_curvature_probes=analytic_curvature_cache.probes;same_point_curvature_rejections=0;
+              bool independent_check_pass=false;
+              with_checkpointed_operation([&](){independent_check_pass=run_independent_curvature_check("PERSISTENT_REJECTIONS",g);});
+              if(!independent_check_pass)break;
+              const std::vector<double> upgraded_hessian=covariance_analytic_curvature_hessian(analytic_curvature_cache,
+                static_cast<int>(z.size()),rho,tau,ridge_lambda);
+              bool directional_check_pass=false;
+              with_checkpointed_operation([&](){directional_check_pass=run_directional_curvature_check(
+                upgraded_hessian,nullptr,"PERSISTENT_REJECTIONS",g,true);});
+              if(!directional_check_pass)break;
+              curvature_direction_checked_tau=tau;
+              model=covariance_direct_hessian_trust_region_model(system.solver,upgraded_hessian,static_cast<int>(z.size()));
+              ++result.trust_region_model_decompositions;model.spectrum.seconds=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-reverify_started).count();
+              result.analytic_curvature_seconds+=model.spectrum.seconds;result.analytic_curvature_spectrum=model.spectrum;
+              result.analytic_curvature_spectrum.snapshot_stage="ANALYTIC_HESSIAN_REVERIFIED_MODEL";
+              result.analytic_curvature_spectrum.iteration=iteration;result.analytic_curvature_spectrum.tau=tau;
+              result.analytic_curvature_model_floor=model.spectral_floor;
+              result.analytic_curvature_diagonal_scale_min=model.diagonal_scale_min;
+              result.analytic_curvature_diagonal_scale_max=model.diagonal_scale_max;
+              result.analytic_curvature_clipped_eigenvalues=static_cast<std::uint64_t>(model.clipped_eigenvalues);
+              result.analytic_curvature_exact_hessian_status=model.clipped_eigenvalues?"MODEL_SOFT_EIGENVALUE_FLOOR_APPLIED":"NOT_CERTIFIED_STOCHASTIC_CURVATURE";
+              result.analytic_curvature_status=model.positive_definite?model.status:"CURVATURE_UNRESOLVED";
+              if(!model.positive_definite){result.status="CURVATURE_UNRESOLVED";
+                result.reason="reverified analytic Hessian did not pass the positive-definite spectral gate";
+                if(trace)*trace<<"COVARIANCE_CURVATURE_REVERIFY status=CURVATURE_UNRESOLVED probes="
+                  <<working_analytic_curvature_probes<<" model_status="<<model.status<<'\n';flush_trace();break;}
+              if(trace)*trace<<"COVARIANCE_CURVATURE_REVERIFY status=PASS probes="<<working_analytic_curvature_probes
+                <<" same_point_rejections=5 matrix_change="<<result.analytic_curvature_relative_matrix_change
+                <<" step_change="<<result.analytic_curvature_relative_step_change
+                <<" extra_rhs_columns="<<analytic_curvature_cache.rhs_columns<<'\n';flush_trace();}
             if(trace)*trace<<"TRUST_REGION_TRIAL iteration="<<iteration<<" retry="<<retry<<" radius="<<radius
               <<" lambda="<<proposal.lambda<<" step_norm="<<actual_norm<<" predicted="<<predicted<<" actual="<<actual
               <<" ratio="<<ratio<<" predicted_difference_resolution="<<predicted_resolution
@@ -5458,7 +9280,8 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               result.reason="trust-region radius fell below the rejection threshold";break;}continue;}
           record_covariance_failed_trial(result.failed_trial,next_theta,iteration,1.0,tau,candidate);
           result.failed_trial.failure_stage="TRUST_REGION_GRADIENT_PENDING";
-          const auto gradient_started=std::chrono::steady_clock::now();++result.line_search_gradient_calls;++result.full_gradient_evaluations;
+          const auto gradient_started=std::chrono::steady_clock::now();
+          const std::uint64_t gradient_attempts_before=result.full_gradient_evaluations;
           try{
 #ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
             if(covariance_fit_test_hooks.gradient_residual_failures_remaining>0&&iteration==covariance_fit_test_hooks.gradient_residual_failure_iteration){
@@ -5468,11 +9291,17 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               diagnostic.first_failure_batch_start=0;diagnostic.first_failure_columns=1;diagnostic.worst_factor_solve_relative_residual=2e-7;
               throw CovarianceSolveResidualError(diagnostic);}
 #endif
-            complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,next_theta,tau);
+            with_checkpointed_operation([&](){complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,
+              epsilon,next_theta,tau,coordinate_scale,ridge_lambda,budget,budget_limits,
+              &result.full_gradient_evaluations,&result.line_search_gradient_calls);});
           }catch(const CovarianceSolveResidualError& error){
-            result.line_search_gradient_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+            const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+            result.line_search_gradient_seconds+=seconds;result.full_gradient_seconds+=seconds;result.last_full_gradient_seconds=seconds;
+            if(result.full_gradient_evaluations>gradient_attempts_before){record_performance_gradient(seconds);persist_accepted_point();}
             ++result.gradient_residual_reject_trials;++result.trust_region_gradient_residual_rejects;
             result.failed_d_trace=error.d_trace;result.failed_shifted_trace=error.shifted_trace;result.failed_trial.failure_stage="GRADIENT_RESIDUAL_REJECT";
+            if(result.full_gradient_evaluations>gradient_attempts_before)record_progress_attempt(nullptr,nullptr);
+            if(result.numerical_stalled)break;
             trust_radius=covariance_trust_region_reduced_radius(radius,actual_norm);result.trust_region_radius=trust_radius;
             const CovarianceTraceDiagnostics& failure=error.d_trace.status=="RESIDUAL_FAIL"?error.d_trace:error.shifted_trace;
             if(trace)*trace<<"GRADIENT_RESIDUAL_REJECT iteration="<<iteration<<" retry="<<retry<<" trust_radius="<<radius
@@ -5483,10 +9312,14 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             if(!(trust_radius>minimum_radius)){result.status="TRUST_REGION_TOO_SMALL";result.line_search_failure_status=result.status;
               result.reason="gradient residual rejections reduced the trust-region radius below the threshold";break;}continue;
           }catch(...){
-            result.line_search_gradient_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+            const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+            result.line_search_gradient_seconds+=seconds;result.full_gradient_seconds+=seconds;result.last_full_gradient_seconds=seconds;
+            if(result.full_gradient_evaluations>gradient_attempts_before){record_performance_gradient(seconds);persist_accepted_point();}
             result.failed_trial.failure_stage="GRADIENT_SOLVE_FAIL";result.failed_d_trace=system.last_d_trace;
             result.failed_shifted_trace=system.last_shifted_trace;throw;}
-          result.line_search_gradient_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+          const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-gradient_started).count();
+          result.line_search_gradient_seconds+=seconds;result.full_gradient_seconds+=seconds;result.last_full_gradient_seconds=seconds;
+          if(result.full_gradient_evaluations>gradient_attempts_before){record_performance_gradient(seconds);persist_accepted_point();}
           const std::vector<double> next_gradient=scaled_gradient(candidate),current_gradient=scaled_gradient(current);
           std::vector<double> change(next_gradient.size());for(std::size_t i=0;i<change.size();++i)change[i]=next_gradient[i]-current_gradient[i];
           if(!std::all_of(change.begin(),change.end(),[](double value){return std::isfinite(value);}))
@@ -5496,9 +9329,12 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           result.failed_trial.available=false;result.failed_trial.failure_stage="NONE";
           result.failed_d_trace=CovarianceTraceDiagnostics{};result.failed_shifted_trace=CovarianceTraceDiagnostics{};
           z=std::move(next_z);result.theta=std::move(next_theta);current=std::move(candidate);++result.iterations;
+          same_point_curvature_rejections=0;
+          if(result.full_gradient_evaluations>gradient_attempts_before)record_progress_attempt(&current,&result.theta);
           if(ratio<0.25)trust_radius*=0.5;else if(ratio>0.75&&actual_norm>=0.9*radius)trust_radius*=2.0;
           result.trust_region_radius=trust_radius;result.direction_method="TRUST_REGION";result.direction_reason=model.status;
           result.direction_selected_slope=covariance_dot(g,step);
+          persist_accepted_point();
           if(trace)*trace<<"TRUST_REGION_STEP_ACCEPT iteration="<<iteration<<" tau="<<tau<<" lambda="<<proposal.lambda
             <<" radius="<<radius<<" next_radius="<<trust_radius<<" step_norm="<<actual_norm
             <<" predicted="<<predicted<<" actual="<<actual<<" ratio="<<ratio
@@ -5566,7 +9402,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             const std::vector<double> inverse_d=covariance_local_inverse(solved_d,local,system.n,asymmetry_d);
             const std::vector<double> inverse_s=covariance_local_inverse(solved_s,local,system.n,asymmetry_s);
             const auto traces_d=covariance_local_trace_products(inverse_d,local),traces_s=covariance_local_trace_products(inverse_s,local);
-            const CovarianceLocalHessianTerms terms=covariance_local_group_hessian(traces_d,traces_s,rho,tau,coordinate_scale,6*group);
+            const CovarianceLocalHessianTerms terms=covariance_local_group_hessian(traces_d,traces_s,rho,tau,ridge_lambda,coordinate_scale,6*group);
             block=covariance_local_newton_direction(terms.total,local_gradient);
             block.asymmetry=std::max({block.asymmetry,asymmetry_d,asymmetry_s});
           }catch(const CovarianceLocalInverseAsymmetryError& error){block.status="LOCAL_INVERSE_ASYMMETRY";block.asymmetry=error.relative_asymmetry;}
@@ -5579,7 +9415,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         if(joint_selection.dominant_group>=0&&joint_selection.dominant_group_support<=32)
           support_atoms=joint_topology.atoms[static_cast<std::size_t>(joint_selection.dominant_group)];
         if(joint_selection.status=="READY"){
-          joint_direction_result=covariance_evaluate_joint_block(system,joint_topology,joint_selection,result.theta,g,coordinate_scale,epsilon,rho,tau);
+          joint_direction_result=covariance_evaluate_joint_block(system,joint_topology,joint_selection,result.theta,g,coordinate_scale,epsilon,rho,tau,ridge_lambda);
           std::vector<double> selected_gradient;selected_gradient.reserve(6*joint_selection.groups.size());
           for(const int selected_group:joint_selection.groups)for(int component=0;component<6;++component)
             selected_gradient.push_back(g[6*static_cast<std::size_t>(selected_group)+component]);
@@ -5707,7 +9543,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
           ray_attempt.cheap_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-proposal_started).count();
           ray_attempt.iteration=result.iterations;ray_attempt.tau=tau;
           if(ray_attempt.usable){std::vector<double> proposal_z,proposal_step,proposal_theta;
-            if(!covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,ray_attempt.proposed_alpha,proposal_z,proposal_step,proposal_theta)){
+            if(!covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,ray_attempt.proposed_alpha,proposal_z,proposal_step,proposal_theta,&baseline.theta)){
               ray_attempt.usable=false;ray_attempt.status="FALLBACK_STEP_UNDERFLOW";ray_attempt.reason=ray_attempt.status;}
             else alpha=ray_attempt.proposed_alpha;}
         }else{ray_attempt.status="NOT_USED_"+choice.method;ray_attempt.reason=choice.reason;ray_attempt.iteration=result.iterations;ray_attempt.tau=tau;
@@ -5736,7 +9572,8 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             if(covariance_fit_test_hooks.gradient_residual_failures_remaining>0&&iteration==covariance_fit_test_hooks.gradient_residual_failure_iteration)
               covariance_fit_test_hooks.current_trial_theta=trial_theta;
 #endif
-            return evaluate_covariance_fit_objective(system,trial_theta,baseline,statistics,rho,epsilon,tau,evaluations,false);},
+            return evaluate_covariance_fit_objective(system,trial_theta,baseline,statistics,rho,epsilon,tau,evaluations,false,
+              false,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,budget,budget_limits);},
           [&](CovarianceObjectiveEvaluation& candidate){
 #ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
             if(covariance_fit_test_hooks.gradient_residual_failures_remaining>0&&iteration==covariance_fit_test_hooks.gradient_residual_failure_iteration){
@@ -5746,8 +9583,9 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               diagnostic.first_failure_batch_start=0;diagnostic.first_failure_columns=1;diagnostic.worst_factor_solve_relative_residual=2e-7;
               throw CovarianceSolveResidualError(diagnostic);}
 #endif
-            complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,candidate.cached_theta,tau);},trace,!joint_block||!ray_attempt.usable,
-          joint_bfgs_line_search,joint_bfgs_line_search);}
+            complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,candidate.cached_theta,tau,
+              coordinate_scale,ridge_lambda,budget,budget_limits,&result.full_gradient_evaluations,&result.line_search_gradient_calls);},trace,!joint_block||!ray_attempt.usable,
+          joint_bfgs_line_search,joint_bfgs_line_search,&baseline.theta);}
       catch(...){if(joint_block){ray_attempt.line_status="ACTUAL_TRIAL_EXCEPTION";result.joint_ray_attempt=ray_attempt;}
         if(result.failed_trial.failure_stage=="GRADIENT_SOLVE_FAIL"){
           result.failed_d_trace=system.last_d_trace;result.failed_shifted_trace=system.last_shifted_trace;}throw;}
@@ -5786,9 +9624,10 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             bool have_previous=false;double previous_fd=0.0;int stable_halvings=0;
             for(int probe=0;probe<8&&result.directional_diagnostic_evaluations<16&&result.objective_evaluations<max_evaluations;++probe){
               std::vector<double> probe_z,probe_step,probe_theta;
-              if(!covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,side*h,probe_z,probe_step,probe_theta)){
+              if(!covariance_build_scaled_trial(result.theta,z,coordinate_scale,direction,side*h,probe_z,probe_step,probe_theta,&baseline.theta)){
                 saw_step_underflow=true;if(trace)*trace<<"DIRECTIONAL_DIAGNOSTIC side="<<(side>0?"POSITIVE":"NEGATIVE")<<" step="<<h<<" status=INCONCLUSIVE_STEP\n";flush_trace();break;}
-              const CovarianceObjectiveEvaluation probe_value=evaluate_covariance_fit_objective(system,probe_theta,baseline,statistics,rho,epsilon,tau,result.objective_evaluations,false);
+              const CovarianceObjectiveEvaluation probe_value=evaluate_covariance_fit_objective(system,probe_theta,baseline,statistics,rho,epsilon,tau,result.objective_evaluations,false,
+                false,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,budget,budget_limits);
               ++result.directional_diagnostic_evaluations;const char* side_name=side>0?"POSITIVE":"NEGATIVE";
               if(trace)*trace<<"DIRECTIONAL_DIAGNOSTIC side="<<side_name<<" step="<<h<<" status="<<covariance_objective_status_name(probe_value.status)<<'\n';flush_trace();
               if(probe_value.feasible){
@@ -5923,6 +9762,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         result.dominant_cap_rescue_next=choice.method=="GROUP_BFGS";}
       if(joint_block){ray_attempt.line_status="STEP_COMMITTED";result.joint_ray_attempt=ray_attempt;
         if(ray_attempt.usable)result.joint_ray_committed=ray_attempt;}
+      persist_accepted_point();
       if(trace)*trace<<"STEP_COMMITTED iteration="<<iteration<<" tau="<<tau<<" alpha="<<alpha
         <<" scaled_kkt_residual="<<result.last_valid.scaled_kkt_residual<<" objective="<<result.last_valid.objective
         <<" line_search_objective_seconds="<<result.line_search_objective_seconds
@@ -5970,13 +9810,35 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     }
     if(!result.converged&&result.status=="OPTIMIZING"){
       result.scaled_kkt_residual=kkt(current);result.raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
-      if(covariance_barrier_stage_pass(current,result.scaled_kkt_residual,tau,tau_min,staged_barrier)&&tau<=tau_min){
-        result.converged=true;result.barrier_center_condition_pass=true;result.status="COVARIANCE_OPTIMIZER_CONVERGED";}
+      if(covariance_barrier_stage_pass(current,result.scaled_kkt_residual,tau,tau_min,staged_barrier)&&(fixed_tau||tau<=tau_min)){
+        result.converged=true;result.barrier_center_condition_pass=!fixed_tau;result.status=fixed_tau?"COVARIANCE_FIXED_TAU_CONVERGED":"COVARIANCE_OPTIMIZER_CONVERGED";}
       else{
         if(result.objective_evaluations>=max_evaluations)result.status="EVALUATION_BUDGET_EXHAUSTED";else result.status="ITERATION_BUDGET_EXHAUSTED";
         result.reason="the covariance optimizer exhausted its explicit iteration/evaluation budget before satisfying KKT and barrier-gap criteria";}
     }
-    result.objective_data=current.data;result.objective_prior=current.prior;result.objective_barrier=current.barrier;result.objective_total=current.objective;result.barrier_tau=tau;
+    if(result.converged&&verify_original_residuals){
+      const std::string converged_status=result.status;result.converged=false;result.original_residual_final_status="CHECKING";
+      CovarianceObjectiveEvaluation original=evaluate_covariance_fit_objective(system,result.theta,baseline,statistics,rho,epsilon,tau,
+        result.objective_evaluations,true,true,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,budget,budget_limits,
+        &result.full_gradient_evaluations,nullptr,&result.original_residual_gradient_attempts,&result.objective_evaluation_seconds,
+        &result.full_gradient_seconds,&result.last_full_gradient_seconds);
+      if(!original.feasible)throw std::runtime_error("NUMERICAL_SOLVE_FAIL: final original-matrix objective gradient is infeasible");
+      if(system.last_d_trace.status!="PASS"||system.last_shifted_trace.status!="PASS"){
+        result.original_residual_final_status="FAIL";result.status="ORIGINAL_RESIDUAL_FAIL";
+        result.reason="final original-matrix residual diagnostics did not pass";}
+      else{
+        result.original_residual_final_pass=true;result.original_residual_final_status="PASS";current=std::move(original);
+        capture_covariance_snapshot(result.last_valid,result.theta,current,coordinate_scale,gradient_scale,tau);
+        result.scaled_kkt_residual=kkt(current);result.raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
+        if(covariance_barrier_stage_pass(current,result.scaled_kkt_residual,tau,tau_min,staged_barrier)){
+          result.converged=true;result.status=converged_status;}
+        else{
+          result.barrier_center_condition_pass=false;result.status="ORIGINAL_KKT_FAIL";
+          result.reason="fresh original-matrix gradient did not satisfy the convergence KKT and barrier conditions";}
+      }
+    }
+    result.objective_data=current.data;result.objective_prior=current.prior;result.objective_ridge=current.ridge;
+    result.objective_barrier=current.barrier;result.objective_total=current.objective;result.barrier_tau=tau;
     result.barrier_gap_estimate=result.barrier_center_condition_pass?system.r*tau:std::numeric_limits<double>::quiet_NaN();
     result.scaled_kkt_residual=kkt(current);result.raw_gradient_inf_norm=covariance_norm_inf(current.gradient);
   }catch(const std::exception& error){
@@ -5984,27 +9846,68 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     else if(result.line_search_failure_status!="NONE")result.reason+="; numerical failure during line-search diagnosis: "+std::string(error.what());
     if(start_gradient_attempted&&result.start_gradient_solve_status=="NOT_RUN")result.start_gradient_solve_status="FAIL";
     if(!initialization_complete&&!result.theta_baseline.empty())result.initialization_status="NUMERICAL_FAILURE";
-    if(result.status!="BASELINE_SPD_FAIL")result.status="NUMERICAL_SOLVE_FAIL";
+    const auto* residual_error=dynamic_cast<const CovarianceSolveResidualError*>(&error);
+    const bool original_start_pending=result.original_residual_initial_status=="CHECKING";
+    const bool original_final_pending=result.original_residual_final_status=="CHECKING";
+    if(residual_error&&(original_start_pending||original_final_pending)){
+      if(result.original_residual_initial_status=="CHECKING")result.original_residual_initial_status="FAIL";
+      if(result.original_residual_final_status=="CHECKING")result.original_residual_final_status="FAIL";
+      result.converged=false;result.status="ORIGINAL_RESIDUAL_FAIL";result.reason=residual_error->what();
+      if(result.start_gradient_solve_status=="NOT_RUN"&&result.original_residual_initial_status=="FAIL")
+        result.start_gradient_solve_status="ORIGINAL_RESIDUAL_FAIL";
+      result.failed_d_trace=residual_error->d_trace;result.failed_shifted_trace=residual_error->shifted_trace;
+    }else if(const auto* budget_error=dynamic_cast<const CovarianceFeasibilityBudgetError*>(&error)){
+      if(result.original_residual_initial_status=="CHECKING")result.original_residual_initial_status="BUDGET_LIMIT";
+      if(result.original_residual_final_status=="CHECKING")result.original_residual_final_status="BUDGET_LIMIT";
+      result.converged=false;result.status=budget_error->what();result.feasibility_budget_status=budget_error->what();}
+    else if(result.status!="BASELINE_SPD_FAIL"&&!covariance_incomplete_candidate_status(result.status))result.status="NUMERICAL_SOLVE_FAIL";
+    if(result.original_residual_initial_status=="CHECKING")result.original_residual_initial_status="SOLVE_FAIL";
+    if(result.original_residual_final_status=="CHECKING")result.original_residual_final_status="SOLVE_FAIL";
     if(result.failed_trial.available&&result.failed_trial.failure_stage=="GRADIENT_VALIDATION_PENDING")result.failed_trial.failure_stage="GRADIENT_SOLVE_FAIL";
     else if(result.failed_trial.available&&result.failed_trial.failure_stage=="BFGS_COMMIT_PENDING")result.failed_trial.failure_stage="STEP_COMMIT_FAIL";
     if(system.last_d_trace.status=="RUNNING")system.last_d_trace.status="SOLVE_EXCEPTION";
     if(system.last_shifted_trace.status=="RUNNING")system.last_shifted_trace.status="SOLVE_EXCEPTION";
     if(result.last_valid.available){result.theta=result.last_valid.theta;result.objective_data=result.last_valid.objective_data;
-      result.objective_prior=result.last_valid.objective_prior;result.objective_barrier=result.last_valid.objective_barrier;
+      result.objective_prior=result.last_valid.objective_prior;result.objective_ridge=result.last_valid.objective_ridge;
+      result.objective_barrier=result.last_valid.objective_barrier;
       result.objective_total=result.last_valid.objective;result.barrier_tau=result.last_valid.tau;
       result.scaled_kkt_residual=result.last_valid.scaled_kkt_residual;result.raw_gradient_inf_norm=result.last_valid.raw_gradient_inf_norm;}
     result.failed_d_trace=system.last_d_trace;result.failed_shifted_trace=system.last_shifted_trace;}
   result.factorizations=system.factorizations;result.solve_rhs_columns=system.solve_rhs_columns;
+  result.factorization_seconds+=std::max(0.0,system.factorization_wall_seconds-factorization_seconds_at_start);
   result.trace_solve_calls=system.trace_solve_calls;
   result.trace_solve_batch=DeviceCovarianceSystem::trace_solve_batch;
   result.trace_residual_batch=DeviceCovarianceSystem::trace_residual_batch;
   result.worst_solve_relative_residual=system.worst_solve_relative_residual;
   result.run_trace_residual_summary=system.run_trace_residual_summary;
+  if(budget){result.feasibility_budget_exact_gradients=budget->exact_gradients;
+    result.feasibility_budget_elapsed_seconds=budget->elapsed_seconds;
+    if(result.feasibility_budget_status=="NOT_APPLICABLE")
+      result.feasibility_budget_status=covariance_expected_budget_stop(result.status)?result.status:"ACTIVE";}
+  if(ridge_lambda>0.0&&result.theta.size()==baseline.theta.size()&&coordinate_scale.size()==baseline.theta.size()){
+    result.ridge_coordinates.resize(result.theta.size());
+    for(std::size_t i=0;i<result.theta.size();++i)result.ridge_coordinates[i]=(result.theta[i]-baseline.theta[i])/coordinate_scale[i];}
+  result.ridge_error_estimate=std::numeric_limits<double>::quiet_NaN();
+  result.ridge_error_bound_status="NOT_AVAILABLE_NO_VALID_POINT";
+  if(ridge_lambda>0.0&&result.last_valid.available&&result.last_valid.gradient_total.size()==coordinate_scale.size()){
+    double gradient_norm=0.0;for(std::size_t i=0;i<coordinate_scale.size();++i)
+      gradient_norm=std::hypot(gradient_norm,coordinate_scale[i]*result.last_valid.gradient_total[i]);
+    const double estimate=static_cast<double>(system.r)*result.last_valid.tau+gradient_norm*gradient_norm/(2.0*ridge_lambda);
+    if(std::isfinite(estimate)){result.ridge_error_estimate=estimate;result.ridge_error_bound_status="ESTIMATED";}
+    else result.ridge_error_bound_status="NOT_AVAILABLE_NONFINITE";}
+  result.analytic_curvature_workspace_allocations=system.fit_workspace->curvature_allocation_count;
+  result.analytic_curvature_workspace_peak_bytes=system.fit_workspace->curvature_peak_bytes;
   result.optimizer_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
   if(trace)*trace<<"COVARIANCE_OPTIMIZER_SUMMARY status="<<result.status
+    <<" objective_evaluation_seconds="<<result.objective_evaluation_seconds
+    <<" full_gradient_seconds="<<result.full_gradient_seconds
+    <<" factorization_seconds="<<result.factorization_seconds
+    <<" analytic_curvature_seconds="<<result.analytic_curvature_seconds
     <<" bfgs_recent_pairs="<<result.bfgs_recent_pairs
     <<" trace_solve_batch="<<result.trace_solve_batch<<" trace_residual_batch="<<result.trace_residual_batch
-    <<" trace_solve_calls="<<result.trace_solve_calls;
+    <<" trace_solve_calls="<<result.trace_solve_calls
+    <<" curvature_workspace_allocations="<<result.analytic_curvature_workspace_allocations
+    <<" curvature_workspace_peak_bytes="<<result.analytic_curvature_workspace_peak_bytes;
   if(trace){write_covariance_bfgs_spectrum_diagnostic(*trace,result.inverse_bfgs_spectrum,"inverse_bfgs_spectrum_",' ','=');
     *trace<<" inverse_bfgs_spectrum_total_seconds="<<result.inverse_bfgs_spectrum_seconds;
     write_covariance_run_trace_residual_summary(*trace,result.run_trace_residual_summary,"trace_residual_",' ','=');*trace<<'\n';}flush_trace();
@@ -6026,9 +9929,65 @@ void write_covariance_group_bfgs_diagnostics(std::ostream& out,const CovarianceF
        <<"\ngroup_bfgs_group_"<<group<<"_committed_updates "<<fit.group_bfgs_committed_updates[group];
 }
 
+std::uint64_t covariance_m1_basis_fingerprint(const Graph& graph)
+{
+  std::uint64_t hash=14695981039346656037ULL;
+  auto bytes=[&](const void* data,const std::size_t size){const auto* source=static_cast<const unsigned char*>(data);
+    for(std::size_t index=0;index<size;++index){hash^=source[index];hash*=1099511628211ULL;}};
+  auto number=[&](const auto& value){bytes(&value,sizeof(value));};
+  auto string=[&](const std::string& value){const std::uint64_t size=value.size();number(size);bytes(value.data(),value.size());};
+  number(graph.base_parameter_count);number(graph.parameter_count);number(graph.raw_local_parameter_count);
+  string(graph.m1.a0_rule);string(graph.m1.frozen_bridge_rule);string(graph.m1.support_policy);
+  number(graph.edges.size());for(const Edge& edge:graph.edges){number(edge.i);number(edge.j);number(edge.group);for(int image:edge.image)number(image);}
+  number(graph.local_terms.size());for(const rpmd_ja_local_basis::Term& term:graph.local_terms){
+    number(term.parameter);number(term.atom_count);number(term.weight);
+    for(int site=0;site<term.atom_count;++site){number(term.site[site].atom);for(int image:term.site[site].image)number(image);
+      number(term.coefficient[site].x);number(term.coefficient[site].y);number(term.coefficient[site].z);number(term.energy_share[site]);}}
+  auto doubles=[&](const std::vector<double>& values){const std::uint64_t size=values.size();number(size);
+    for(const double value:values)number(value);};
+  doubles(graph.local_transform);doubles(graph.local_base_mix);doubles(graph.parameter_basis_norms);
+  const std::uint64_t names=graph.parameter_names.size();number(names);for(const std::string& name:graph.parameter_names)string(name);
+  const std::uint64_t bridges=graph.m1.frozen_bridges.size();number(bridges);
+  for(const Graph::FrozenBridge& bridge:graph.m1.frozen_bridges){
+    auto site=[&](const rpmd_ja_local_basis::Site& value){number(value.atom);for(int image:value.image)number(image);};
+    site(bridge.oxygen1);site(bridge.hydrogen);site(bridge.oxygen2);number(bridge.group);number(bridge.oh1);number(bridge.oh2);
+    number(bridge.oo);number(bridge.third_gap);number(bridge.a0);number(bridge.ambiguous);number(bridge.accepted);
+    const std::uint64_t candidates=bridge.oxygen_candidates.size();number(candidates);for(const auto& candidate:bridge.oxygen_candidates)site(candidate);}
+  return hash;
+}
+
+std::string covariance_graph_content_sha256(const Graph& graph)
+{
+  rpmd_ja_sha256::Digest digest;
+  auto bytes=[&](const void* value,const std::size_t size){digest.update(static_cast<const unsigned char*>(value),size);};
+  auto number=[&](const auto& value){bytes(&value,sizeof(value));};
+  auto string=[&](const std::string& value){const std::uint64_t size=value.size();number(size);bytes(value.data(),value.size());};
+  number(graph.base_parameter_count);number(graph.parameter_count);number(graph.raw_local_parameter_count);
+  number(graph.type_pairs.size());for(const auto& pair:graph.type_pairs){number(pair.first);number(pair.second);}
+  number(graph.group_by_type.size());for(const auto& entry:graph.group_by_type){number(entry.first.first);number(entry.first.second);number(entry.second);}
+  number(graph.edges.size());for(const Edge& edge:graph.edges){number(edge.i);number(edge.j);number(edge.group);for(const int image:edge.image)number(image);}
+  number(graph.sites.size());for(const auto& site:graph.sites){number(site.size());for(const SiteEdge& edge:site){
+      number(edge.j);number(edge.group);number(edge.edge_index);for(const int image:edge.image)number(image);number(edge.sign);}}
+  number(graph.local_terms.size());for(const auto& term:graph.local_terms){number(term.parameter);number(term.atom_count);number(term.weight);
+    for(int index=0;index<term.atom_count;++index){number(term.site[index].atom);for(const int image:term.site[index].image)number(image);
+      number(term.coefficient[index].x);number(term.coefficient[index].y);number(term.coefficient[index].z);number(term.energy_share[index]);}}
+  auto doubles=[&](const std::vector<double>& values){number(values.size());for(const double value:values)number(value);};
+  doubles(graph.local_transform);doubles(graph.local_base_mix);doubles(graph.parameter_basis_norms);
+  number(graph.parameter_names.size());for(const auto& name:graph.parameter_names)string(name);
+  string(graph.m1.a0_rule);string(graph.m1.frozen_bridge_rule);string(graph.m1.support_policy);
+  number(graph.m1.minimum_support_count);number(graph.m1.cutoff);number(graph.m1.third_gap_ambiguity_tolerance);
+  number(graph.m1.frozen_bridges.size());for(const auto& bridge:graph.m1.frozen_bridges){
+    auto site=[&](const rpmd_ja_local_basis::Site& value){number(value.atom);for(const int image:value.image)number(image);};
+    site(bridge.oxygen1);site(bridge.hydrogen);site(bridge.oxygen2);number(bridge.group);number(bridge.oh1);
+    number(bridge.oh2);number(bridge.oo);number(bridge.third_gap);number(bridge.a0);number(bridge.ambiguous);number(bridge.accepted);
+    number(bridge.oxygen_candidates.size());for(const auto& candidate:bridge.oxygen_candidates)site(candidate);}
+  return digest.finish_hex();
+}
+
 void write_covariance_state(const std::string& path,const CovarianceFitResult& fit,const double rho,
   const std::string& samples,const std::string& raw,const RpmdJANativeFitOptions& options,const SampleHeader& header,
-  const QrawIdentity& identity,const Graph& graph,const std::uint64_t frame_count,const std::uint64_t training_frames)
+  const QrawIdentity& identity,const Graph& graph,const std::uint64_t frame_count,const std::uint64_t training_frames,
+  const double ridge_lambda=std::numeric_limits<double>::quiet_NaN(),const bool outer_resume_supported=false)
 {
   auto write_vector=[](std::ostream& stream,const char* key,const std::vector<double>& values){stream<<'\n'<<key<<' '<<values.size();for(double value:values)stream<<' '<<value;};
   auto write_integer_vector=[](std::ostream& stream,const char* key,const std::vector<int>& values){stream<<'\n'<<key<<' '<<values.size();for(int value:values)stream<<' '<<value;};
@@ -6049,7 +10008,7 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
       <<'\n'<<prefix<<"_worst_original_batch_start "<<diagnostic.worst_original_batch_start
       <<'\n'<<prefix<<"_worst_original_batch_columns "<<diagnostic.worst_original_batch_columns
       <<'\n'<<prefix<<"_original_residual_checked "<<(diagnostic.original_residual_checked?1:0);};
-  std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja Gaussian covariance shrinkage state\nstate_format_version 2\nfit_method gaussian_covariance_shrinkage\nstatus "<<fit.status
+  std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja Gaussian covariance shrinkage state\nstate_format_version 4\nfit_method gaussian_covariance_shrinkage\nstatus "<<fit.status
     <<"\nreason "<<fit.reason<<"\nsamples "<<std::quoted(samples)<<"\nqraw "<<std::quoted(raw)<<"\nshrinkage_strength "<<rho
     <<"\nfit_trace_path "<<std::quoted(options.output_path+".fit_trace.txt")
     <<"\ncutoff_A "<<options.cutoff<<"\nepsilon "<<options.epsilon<<"\nfd_step "<<options.fd_step<<"\ntemperature_K "<<header.temperature
@@ -6058,6 +10017,7 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\nsample_interval "<<options.sample_interval<<"\nbeads "<<header.beads
     <<"\nqraw_identity_version "<<identity.version<<"\nqraw_data_offset "<<identity.data_offset<<"\nqraw_k_offset "<<identity.k_offset
     <<"\nqraw_model_fingerprint "<<identity.model<<"\nqraw_config_fingerprint "<<identity.config
+    <<"\nqraw_source_fnv64 "<<identity.source_fnv64<<"\nsamples_source_fnv64 "<<rpmd_ja_model_fingerprint(samples)
     <<"\nqraw_charge_mode "<<identity.charge<<"\nqraw_kspace_flag "<<identity.kspace<<"\nqraw_mesh_spacing "<<identity.mesh
     <<"\nactive_pppm_mesh_spacing "<<identity.active_mesh
     <<"\nbaseline_mu "<<fit.baseline_mu<<"\nbaseline_epsilon_constraint_status "<<fit.epsilon_constraint_status
@@ -6065,10 +10025,16 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\nobjective_barrier "<<fit.objective_barrier<<"\nobjective_total "<<fit.objective_total
     <<"\noptimizer_scaled_kkt_residual "<<fit.scaled_kkt_residual<<"\noptimizer_raw_gradient_inf_norm "<<fit.raw_gradient_inf_norm<<"\nbarrier_tau "<<fit.barrier_tau
     <<"\nbarrier_center_condition_status "<<(fit.barrier_center_condition_pass?"PASS":"NOT_VERIFIED")
+    <<"\noriginal_residual_initial_status "<<fit.original_residual_initial_status
+    <<"\noriginal_residual_initial_pass "<<(fit.original_residual_initial_pass?1:0)
+    <<"\noriginal_residual_final_status "<<fit.original_residual_final_status
+    <<"\noriginal_residual_final_pass "<<(fit.original_residual_final_pass?1:0)
+    <<"\noriginal_residual_gradient_attempts "<<fit.original_residual_gradient_attempts
     <<"\nbarrier_gap_estimate "<<fit.barrier_gap_estimate<<"\nobjective_evaluations "<<fit.objective_evaluations
     <<"\ninitialization_status "<<fit.initialization_status<<"\ninitialization_evaluations "<<fit.initialization_evaluations
     <<"\ninitialization_gradient_calls "<<fit.initialization_gradient_calls
-    <<"\nstart_graph_delta "<<fit.start_graph_delta<<"\nstart_objective "<<fit.start_objective
+    <<"\nstart_metrics_point "<<fit.start_metrics_point<<"\nstart_graph_delta "<<fit.start_graph_delta
+    <<"\nstart_tau "<<fit.start_tau<<"\nstart_objective "<<fit.start_objective
     <<"\nstart_raw_gradient_inf_norm "<<fit.start_raw_gradient_inf_norm<<"\nstart_gradient_solve_status "<<fit.start_gradient_solve_status
     <<"\nstart_scaled_kkt_residual "<<fit.start_scaled_kkt_residual
     <<"\nstart_gradient_data_scaled_inf_norm "<<fit.start_gradient_data_scaled_inf_norm
@@ -6133,9 +10099,13 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\ndominant_cap_rescue_commits "<<fit.dominant_cap_rescue_commits
     <<"\ndominant_cap_rescue_next "<<(fit.dominant_cap_rescue_next?1:0)
     <<"\nline_search_objective_seconds "<<fit.line_search_objective_seconds
+     <<"\nobjective_evaluation_seconds "<<fit.objective_evaluation_seconds
     <<"\nline_search_gradient_calls "<<fit.line_search_gradient_calls
     <<"\nfull_gradient_evaluations "<<fit.full_gradient_evaluations
     <<"\nline_search_gradient_seconds "<<fit.line_search_gradient_seconds
+     <<"\nfull_gradient_seconds "<<fit.full_gradient_seconds
+     <<"\nlast_full_gradient_seconds "<<fit.last_full_gradient_seconds
+     <<"\nfactorization_seconds "<<fit.factorization_seconds
     <<"\nline_search_failure_status "<<fit.line_search_failure_status<<"\nline_search_trials "<<fit.line_search_trials
     <<"\nline_search_evaluations "<<fit.line_search_evaluations
     <<"\nshifted_not_spd_trials "<<fit.shifted_not_spd_trials<<"\narmijo_reject_trials "<<fit.armijo_reject_trials
@@ -6150,7 +10120,8 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\nworst_solve_relative_residual "<<fit.worst_solve_relative_residual<<"\noptimizer_seconds "<<fit.optimizer_seconds<<"\niterations "<<fit.iterations
     <<"\nkkt_gradient_denominator "<<fit.kkt_gradient_denominator
     <<"\nlast_valid_available "<<(fit.last_valid.available?1:0)<<"\nlast_valid_objective_data "<<fit.last_valid.objective_data
-    <<"\nlast_valid_objective_prior "<<fit.last_valid.objective_prior<<"\nlast_valid_objective_barrier "<<fit.last_valid.objective_barrier
+    <<"\nlast_valid_objective_prior "<<fit.last_valid.objective_prior<<"\nlast_valid_objective_ridge "<<fit.last_valid.objective_ridge
+    <<"\nlast_valid_objective_barrier "<<fit.last_valid.objective_barrier
     <<"\nlast_valid_objective "<<fit.last_valid.objective<<"\nlast_valid_tau "<<fit.last_valid.tau
     <<"\nlast_valid_scaled_kkt_residual "<<fit.last_valid.scaled_kkt_residual
     <<"\nlast_valid_raw_gradient_inf_norm "<<fit.last_valid.raw_gradient_inf_norm
@@ -6163,39 +10134,1115 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
   out<<"\ntheta_start "<<fit.theta_start.size();for(double value:fit.theta_start)out<<' '<<value;
   out<<"\ntheta "<<fit.theta.size();for(double value:fit.theta)out<<' '<<value;
   out<<"\ntraining_statistics "<<fit.statistics.size();for(double value:fit.statistics)out<<' '<<value;
-  write_vector(out,"coordinate_scale",fit.coordinate_scale);write_vector(out,"last_valid_theta",fit.last_valid.theta);
+  write_vector(out,"coordinate_scale",fit.coordinate_scale);write_vector(out,"ridge_coordinates",fit.ridge_coordinates);
+  write_vector(out,"baseline_trace",fit.covariance_baseline.trace);write_vector(out,"last_valid_theta",fit.last_valid.theta);
   write_vector(out,"last_valid_gradient_data",fit.last_valid.gradient_data);write_vector(out,"last_valid_gradient_prior",fit.last_valid.gradient_prior);
-  write_vector(out,"last_valid_gradient_barrier",fit.last_valid.gradient_barrier);write_vector(out,"last_valid_gradient_total",fit.last_valid.gradient_total);
+  write_vector(out,"last_valid_gradient_ridge",fit.last_valid.gradient_ridge);write_vector(out,"last_valid_gradient_barrier",fit.last_valid.gradient_barrier);
+  write_vector(out,"last_valid_gradient_total",fit.last_valid.gradient_total);
   write_vector(out,"failed_trial_theta",fit.failed_trial.theta);
   out<<"\nparameter_map "<<graph.type_pairs.size()<<" components xx xy xz yy yz zz";
   for(const auto& pair:graph.type_pairs)out<<' '<<pair.first<<' '<<pair.second;
+  out<<"\nparameter_family "<<(graph.parameter_count>graph.base_parameter_count?"M1":"M0")
+    <<"\ntarget_objective "<<((std::isfinite(ridge_lambda)?ridge_lambda:options.covariance_ridge_lambda)>0.0?"FROZEN_CENTER_RIDGE":"COVARIANCE_SHRINKAGE")
+    <<"\nresume_supported "<<(outer_resume_supported?1:0)
+    <<"\nresume_requires_controller_journal "<<(outer_resume_supported?1:0)
+    <<"\nridge_lambda "<<(std::isfinite(ridge_lambda)?ridge_lambda:options.covariance_ridge_lambda)
+    <<"\nobjective_ridge "<<fit.objective_ridge
+    <<"\nridge_error_estimate "<<fit.ridge_error_estimate
+    <<"\nridge_error_bound_status "<<fit.ridge_error_bound_status
+    <<"\nanalytic_curvature_probes "<<fit.analytic_curvature_probes
+    <<"\nanalytic_curvature_status "<<fit.analytic_curvature_status
+    <<"\nanalytic_curvature_direction_status "<<fit.analytic_curvature_direction_status
+    <<"\nanalytic_curvature_direction_checks "<<fit.analytic_curvature_direction_checks
+    <<"\nanalytic_curvature_direction_objectives "<<fit.analytic_curvature_direction_objectives
+    <<"\nanalytic_curvature_direction_max_relative_error "<<fit.analytic_curvature_direction_max_relative_error
+    <<"\nanalytic_curvature_direction_seconds "<<fit.analytic_curvature_direction_seconds
+    <<"\nanalytic_curvature_independent_status "<<fit.analytic_curvature_independent_status
+    <<"\nanalytic_curvature_independent_probes "<<fit.analytic_curvature_independent_probes
+    <<"\nanalytic_curvature_independent_directions "<<fit.analytic_curvature_independent_directions
+    <<"\nanalytic_curvature_independent_seed "<<covariance_independent_curvature_seed
+    <<"\nanalytic_curvature_independent_tolerance "<<covariance_independent_directional_tolerance
+    <<"\nanalytic_curvature_independent_rhs_columns "<<fit.analytic_curvature_independent_rhs_columns
+    <<"\nanalytic_curvature_independent_max_relative_error "<<fit.analytic_curvature_independent_max_relative_error
+    <<"\nanalytic_curvature_independent_seconds "<<fit.analytic_curvature_independent_seconds
+    <<"\nanalytic_curvature_exact_hessian_status "<<fit.analytic_curvature_exact_hessian_status
+    <<"\nanalytic_curvature_stability_status "<<fit.analytic_curvature_stability_status
+    <<"\nanalytic_curvature_model_floor "<<fit.analytic_curvature_model_floor
+    <<"\nanalytic_curvature_clipped_eigenvalues "<<fit.analytic_curvature_clipped_eigenvalues
+    <<"\nanalytic_curvature_diagonal_scale_min "<<fit.analytic_curvature_diagonal_scale_min
+    <<"\nanalytic_curvature_diagonal_scale_max "<<fit.analytic_curvature_diagonal_scale_max
+    <<"\nanalytic_curvature_relative_matrix_change "<<fit.analytic_curvature_relative_matrix_change
+    <<"\nanalytic_curvature_relative_step_change "<<fit.analytic_curvature_relative_step_change
+    <<"\nnumerical_stalled "<<(fit.numerical_stalled?1:0)
+    <<"\nstagnation_gradient_attempts "<<fit.stagnation_gradient_attempts
+    <<"\nstagnation_low_progress_windows "<<fit.stagnation_low_progress_windows
+    <<"\nstagnation_best_kkt "<<fit.stagnation_best_kkt
+    <<"\nstagnation_last_window_relative_improvement "<<fit.stagnation_last_window_relative_improvement
+    <<"\nstagnation_best_point_factor_status "<<fit.stagnation_best_point_factor_status
+    <<"\nfeasibility_budget_elapsed_seconds "<<fit.feasibility_budget_elapsed_seconds
+    <<"\nfeasibility_budget_exact_gradients "<<fit.feasibility_budget_exact_gradients
+    <<"\nfeasibility_budget_status "<<fit.feasibility_budget_status
+    <<"\nanalytic_curvature_spectral_floor "<<fit.analytic_curvature_model_floor;
+  if(graph.parameter_count>graph.base_parameter_count){
+    out<<"\nM1_base_parameter_count "<<graph.base_parameter_count<<"\nM1_raw_local_parameter_count "<<graph.raw_local_parameter_count
+      <<"\nM1_parameter_count "<<graph.parameter_count<<"\nM1_operator_map_entry_count "<<graph.m1.operator_map_entry_count
+      <<"\nM1_operator_map_bytes_estimate "<<graph.m1.operator_map_bytes_estimate
+      <<"\nM1_operator_map_estimate_scope "<<std::quoted(graph.m1.operator_map_estimate_scope)
+      <<"\nM1_support_policy "<<std::quoted(graph.m1.support_policy)
+      <<"\nM1_frozen_bridge_rule "<<std::quoted(graph.m1.frozen_bridge_rule)
+      <<"\nM1_minimum_support_count "<<graph.m1.minimum_support_count
+      <<"\nM1_third_gap_ambiguity_tolerance "<<graph.m1.third_gap_ambiguity_tolerance
+      <<"\nM1_a0_rule "<<std::quoted(graph.m1.a0_rule)
+      <<"\nM1_basis_fingerprint_fnv64 "<<covariance_m1_basis_fingerprint(graph)
+      <<"\nM1_diagnose_attribution_status SKIPPED_M1_NOT_APPLICABLE\nM1_replay_status REBUILD_AND_VERIFY_FROZEN_BASIS"
+      <<"\nM1_parameter_names "<<graph.parameter_names.size();
+    for(const std::string& name:graph.parameter_names)out<<' '<<std::quoted(name);
+    write_vector(out,"M1_parameter_basis_norms",graph.parameter_basis_norms);
+    write_vector(out,"M1_local_transform",graph.local_transform);write_vector(out,"M1_local_base_mix",graph.local_base_mix);
+    out<<"\nM1_raw_support "<<graph.m1.raw_parameters.size();
+    for(const auto& support:graph.m1.raw_parameters)out<<' '<<std::quoted(support.name)<<' '<<std::quoted(support.status)
+      <<' '<<support.support_count<<' '<<support.term_count<<' '<<support.residual_relative_norm;
+  }
   write_trace_diagnostic(out,"failed_d_trace",fit.failed_d_trace);write_trace_diagnostic(out,"failed_shifted_trace",fit.failed_shifted_trace);out<<'\n';
   write_text_exclusive(path,out.str(),"covariance optimizer state");
 }
 
+std::map<std::string,std::string> read_feasibility_manifest(const std::string& path)
+{
+  rpmd_ja_file_io::ifstream in(path);std::string line;
+  if(!std::getline(in,line))throw std::runtime_error("BLIND_PROVENANCE_FAIL: manifest version must be RPJAFEAS9");
+  if(!line.empty()&&line.back()=='\r')line.pop_back();
+  if(line!="RPJAFEAS9")throw std::runtime_error("BLIND_PROVENANCE_FAIL: manifest version must be RPJAFEAS9");
+  std::map<std::string,std::string> fields;
+  while(std::getline(in,line)){
+    if(!line.empty()&&line.back()=='\r')line.pop_back();
+    if(line.empty())continue;std::istringstream row(line);std::string key,value;
+    if(!(row>>key>>std::quoted(value)))throw std::runtime_error("BLIND_PROVENANCE_FAIL: malformed manifest key-value row");
+    row>>std::ws;if(!row.eof()||!fields.emplace(key,value).second)
+      throw std::runtime_error("BLIND_PROVENANCE_FAIL: duplicate or trailing manifest field");
+  }
+  if(!in.eof())throw std::runtime_error("BLIND_PROVENANCE_FAIL: manifest read failed");
+  return fields;
+}
+
+std::map<std::string,std::string> read_feasibility_manifest_bytes(const std::string& bytes)
+{
+  std::istringstream in(bytes);std::string line;
+  if(!std::getline(in,line))throw std::runtime_error("BLIND_PROVENANCE_FAIL: manifest version must be RPJAFEAS9");
+  if(!line.empty()&&line.back()=='\r')line.pop_back();
+  if(line!="RPJAFEAS9")throw std::runtime_error("BLIND_PROVENANCE_FAIL: manifest version must be RPJAFEAS9");
+  std::map<std::string,std::string> fields;
+  while(std::getline(in,line)){
+    if(!line.empty()&&line.back()=='\r')line.pop_back();if(line.empty())continue;
+    std::istringstream row(line);std::string key,value;
+    if(!(row>>key>>std::quoted(value)))throw std::runtime_error("BLIND_PROVENANCE_FAIL: malformed manifest key-value row");
+    row>>std::ws;if(!row.eof()||!fields.emplace(key,value).second)
+      throw std::runtime_error("BLIND_PROVENANCE_FAIL: duplicate or trailing manifest field");
+  }
+  if(!in.eof())throw std::runtime_error("BLIND_PROVENANCE_FAIL: manifest read failed");
+  return fields;
+}
+
+void verify_frozen_fit_input_fingerprints(const std::string& raw_path,const std::string& kernel_path,
+  const std::uint64_t raw_fingerprint,const std::uint64_t kernel_fingerprint)
+{
+  if(rpmd_ja_model_fingerprint(raw_path)!=raw_fingerprint)
+    throw std::runtime_error("FEASIBILITY_INPUT_CHANGED: qraw content changed during native fitting");
+  if(rpmd_ja_model_fingerprint(kernel_path)!=kernel_fingerprint)
+    throw std::runtime_error("FEASIBILITY_INPUT_CHANGED: kernel table content changed during native fitting");
+}
+
+const std::string& feasibility_manifest_value(const std::map<std::string,std::string>& fields,const std::string& key)
+{
+  const auto found=fields.find(key);if(found==fields.end()||found->second.empty())
+    throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: missing manifest field ")+key);
+  return found->second;
+}
+
+std::string read_feasibility_file_bytes(const std::string& path)
+{
+  rpmd_ja_file_io::ifstream in(path,std::ios::binary);
+  if(!in)throw std::runtime_error("A0 reuse package file could not be opened: "+path);
+  return std::string(std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>());
+}
+
+void verify_a0_reuse_package(const std::map<std::string,std::string>& manifest,
+  const std::map<std::string,std::string>& receipt,const std::string& current_manifest_path,const std::string& current_job_id,
+  std::string& verified_state_bytes)
+{
+  const auto package_path=manifest.find("a0_reuse_package_path"),package_digest=manifest.find("a0_reuse_package_sha256");
+  const std::string status=feasibility_manifest_value(receipt,"a0_reuse_status");
+  if(package_path==manifest.end()&&package_digest==manifest.end()){
+    if(status!="NOT_REQUESTED")throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: unexpected A0 reuse receipt");
+    return;
+  }
+  if(package_path==manifest.end()||package_digest==manifest.end()||status!="VERIFIED")
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: incomplete A0 reuse manifest/receipt contract");
+  std::string expected_digest=package_digest->second;
+  std::transform(expected_digest.begin(),expected_digest.end(),expected_digest.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+  if(feasibility_manifest_value(receipt,"a0_reuse_package_path")!=package_path->second||
+     feasibility_manifest_value(receipt,"a0_reuse_package_sha256")!=expected_digest)
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: A0 reuse package path or digest differs from the manifest");
+  const std::string resolved_package_path=feasibility_manifest_value(receipt,"a0_reuse_resolved_package_path");
+  const std::string package_bytes=read_feasibility_file_bytes(resolved_package_path);
+  if(rpmd_ja_a0_reuse::sha256(package_bytes)!=expected_digest)
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: A0 reuse package changed after launcher validation");
+  const auto package=rpmd_ja_a0_reuse::parse_package(package_bytes);
+  const std::string& record_bytes=package.record_bytes;
+  const std::string& source_manifest_bytes=package.manifest_bytes;
+  const std::string& state_bytes=package.state_bytes;
+  const auto& record=package.record;
+  const auto source_manifest=read_feasibility_manifest_bytes(source_manifest_bytes);
+  const std::string current_manifest_bytes=read_feasibility_file_bytes(current_manifest_path);
+  const std::string current_manifest_sha256=rpmd_ja_a0_reuse::sha256(current_manifest_bytes);
+  rpmd_ja_a0_reuse::verify_import(record,record_bytes,rpmd_ja_a0_reuse::sha256(record_bytes),source_manifest_bytes,source_manifest,
+    state_bytes,manifest,current_manifest_sha256,feasibility_manifest_value(receipt,"cost_baseline_machine_fingerprint"),current_job_id);
+  const std::map<std::string,std::string> expected_receipt={{"a0_reuse_source_manifest_sha256",record.source_manifest_sha256},
+    {"a0_reuse_contract_sha256",record.contract_sha256},{"a0_reuse_state_sha256",record.state_sha256},
+    {"a0_reuse_source_machine_fingerprint",record.source_machine_fingerprint},{"a0_reuse_source_job_id",record.source_job_id},
+    {"a0_reuse_historical_origin_job_id",record.historical_origin_job_id}};
+  for(const auto& field:expected_receipt)if(feasibility_manifest_value(receipt,field.first)!=field.second)
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: A0 reuse receipt identity changed after launcher validation");
+  verified_state_bytes=state_bytes;
+}
+
+int feasibility_manifest_minimum_support(const std::map<std::string,std::string>& fields)
+{
+  const std::string& value=feasibility_manifest_value(fields,"m1_minimum_support_count");
+  std::size_t consumed=0;int count=0;
+  try{count=std::stoi(value,&consumed);}catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid M1 minimum-support rule");}
+  if(consumed!=value.size()||count<1||count>1000)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: M1 minimum-support count must be an integer from 1 through 1000");
+  return count;
+}
+
+std::map<std::string,std::string> read_feasibility_preflight_receipt(const std::string& path)
+{
+  rpmd_ja_file_io::ifstream in(path);
+  if(!in)throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt could not be opened");
+  return rpmd_ja_preflight_receipt::read(in);
+}
+
+bool feasibility_same_file_path(const std::string& first,const std::string& second)
+{
+#ifdef _WIN32
+  const DWORD share=FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE;
+  const std::wstring first_wide=rpmd_ja_file_io::utf8_to_wide_path(first);
+  const std::wstring second_wide=rpmd_ja_file_io::utf8_to_wide_path(second);
+  const HANDLE first_handle=CreateFileW(first_wide.c_str(),FILE_READ_ATTRIBUTES,share,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+  if(first_handle==INVALID_HANDLE_VALUE)return false;
+  const HANDLE second_handle=CreateFileW(second_wide.c_str(),FILE_READ_ATTRIBUTES,share,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+  if(second_handle==INVALID_HANDLE_VALUE){CloseHandle(first_handle);return false;}
+  BY_HANDLE_FILE_INFORMATION first_info{},second_info{};
+  const bool first_ok=GetFileInformationByHandle(first_handle,&first_info)!=0;
+  const bool second_ok=GetFileInformationByHandle(second_handle,&second_info)!=0;
+  CloseHandle(second_handle);CloseHandle(first_handle);
+  if(!first_ok||!second_ok)return false;
+  const bool first_has_id=first_info.nFileIndexHigh!=0||first_info.nFileIndexLow!=0;
+  const bool second_has_id=second_info.nFileIndexHigh!=0||second_info.nFileIndexLow!=0;
+  if(!first_has_id||!second_has_id)return false;
+  return first_info.dwVolumeSerialNumber==second_info.dwVolumeSerialNumber&&
+    first_info.nFileIndexHigh==second_info.nFileIndexHigh&&first_info.nFileIndexLow==second_info.nFileIndexLow;
+#else
+  struct stat first_info{},second_info{};
+  if(::stat(first.c_str(),&first_info)!=0||::stat(second.c_str(),&second_info)!=0)return false;
+  return first_info.st_dev==second_info.st_dev&&first_info.st_ino==second_info.st_ino;
+#endif
+}
+
+double feasibility_manifest_response_delta_tolerance(const std::map<std::string,std::string>& fields)
+{
+  const std::string& value=feasibility_manifest_value(fields,"response_delta_tolerance");
+  std::size_t consumed=0;double tolerance=0.0;
+  try{tolerance=std::stod(value,&consumed);}catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid response delta tolerance");}
+  if(consumed!=value.size()||!std::isfinite(tolerance)||tolerance<=0.0)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: response delta tolerance must be finite and positive");
+  return tolerance;
+}
+
+std::uint64_t parse_feasibility_hex64(const std::string& value,const char* key)
+{
+  if(value.size()!=16)throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: invalid 64-bit hex field ")+key);
+  std::size_t used=0;std::uint64_t parsed=0;
+  try{parsed=std::stoull(value,&used,16);}catch(...){throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: invalid 64-bit hex field ")+key);}
+  if(used!=value.size())throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: invalid 64-bit hex field ")+key);
+  return parsed;
+}
+
+struct FeasibilityCurvatureContract
+{
+  std::uint64_t primary_seed=0,independent_seed=0;
+  int probe_cap=0;
+  double directional_tolerance=0.0;
+};
+
+struct FeasibilityCandidateCostContract
+{
+  std::string rule;
+  double safety_factor=0.0;
+};
+
+struct FeasibilityPerformanceStopContract
+{
+  std::string rule,objective_normalizer,gradient_cost_rule;
+  unsigned curvature_window=0;
+  double min_relative_objective_improvement=0.0,curvature_to_gradient_cost_ratio=0.0;
+};
+
+struct FeasibilityExperimentContract
+{
+  std::vector<double> lambda_factors;
+  int max_development_blocks=0,min_development_blocks=0;
+  std::uint64_t statistics_storage_budget_bytes=0;
+};
+
+FeasibilityExperimentContract feasibility_manifest_experiment_contract(
+  const std::map<std::string,std::string>& fields)
+{
+  FeasibilityExperimentContract result;
+  std::string lambda_text=feasibility_manifest_value(fields,"lambda_factors");
+  std::replace(lambda_text.begin(),lambda_text.end(),',',' ');
+  std::istringstream lambda_stream(lambda_text);double lambda=0.0;
+  while(lambda_stream>>lambda)result.lambda_factors.push_back(lambda);
+  const std::vector<double> expected_lambdas={1.0e-2,1.0e-4,1.0e-6};
+  if(!lambda_stream.eof()||result.lambda_factors!=expected_lambdas)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: lambda_factors differ from the executable's frozen three-point sequence");
+  auto parse_double=[&](const char* key){const std::string& value=feasibility_manifest_value(fields,key);std::size_t used=0;double parsed=0.0;
+    try{parsed=std::stod(value,&used);}catch(...){throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: invalid experiment field ")+key);}
+    if(used!=value.size()||!std::isfinite(parsed))throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: invalid experiment field ")+key);
+    return parsed;};
+  auto parse_int=[&](const char* key){const std::string& value=feasibility_manifest_value(fields,key);std::size_t used=0;int parsed=0;
+    try{parsed=std::stoi(value,&used);}catch(...){throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: invalid experiment field ")+key);}
+    if(used!=value.size())throw std::runtime_error(std::string("BLIND_PROVENANCE_FAIL: invalid experiment field ")+key);
+    return parsed;};
+  const rpmd_ja_feasibility::Limits expected_limits;
+  if(parse_double("wall_seconds")!=expected_limits.wall_seconds||
+     parse_double("validation_reserve_fraction")!=expected_limits.validation_reserve_fraction||
+     parse_double("a_wall_fraction")!=expected_limits.a_wall_fraction||
+     parse_int("max_exact_gradients")!=expected_limits.max_exact_gradients||
+     parse_int("max_a_branch_gradients")!=expected_limits.max_a_branch_gradients||
+     parse_int("max_fit_family_gradients")!=expected_limits.max_fit_family_gradients||
+     feasibility_manifest_value(fields,"family_wall_split_rule")!="EQUAL_REMAINING_FIT_TIME_V1"||
+     feasibility_manifest_value(fields,"family_gradient_split_rule")!="EQUAL_REMAINING_EXACT_GRADIENTS_V1")
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: budget values or B/C split rules differ from the executable's frozen contract");
+  result.max_development_blocks=parse_int("development_max_blocks");
+  result.min_development_blocks=parse_int("development_min_blocks");
+  const std::string& storage=feasibility_manifest_value(fields,"statistics_storage_budget_bytes");std::size_t used=0;
+  try{result.statistics_storage_budget_bytes=std::stoull(storage,&used);}catch(...){
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid statistics storage budget");}
+  if(result.max_development_blocks!=8||result.min_development_blocks!=4||used!=storage.size()||
+     result.statistics_storage_budget_bytes!=512ULL*1024*1024||
+     feasibility_manifest_value(fields,"development_block_rule")!="CONTIGUOUS_EQUAL_FRAME_COUNTS_V1")
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: development block or statistics storage rule differs from the executable's frozen contract");
+  return result;
+}
+
+bool same_feasibility_experiment_contract(const FeasibilityExperimentContract& left,
+  const FeasibilityExperimentContract& right)
+{
+  return left.lambda_factors==right.lambda_factors&&left.max_development_blocks==right.max_development_blocks&&
+    left.min_development_blocks==right.min_development_blocks&&
+    left.statistics_storage_budget_bytes==right.statistics_storage_budget_bytes;
+}
+
+FeasibilityCandidateCostContract feasibility_manifest_candidate_cost_contract(
+  const std::map<std::string,std::string>& fields)
+{
+  FeasibilityCandidateCostContract result;
+  result.rule=feasibility_manifest_value(fields,"candidate_cost_stop_rule");
+  if(result.rule!="MAX_COMPLETE_OR_PARTIAL_LOWER_BOUND_SECONDS_V1")
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: unsupported measured candidate-cost stop rule");
+  const std::string& value=feasibility_manifest_value(fields,"candidate_cost_safety_factor");std::size_t consumed=0;
+  try{result.safety_factor=std::stod(value,&consumed);}catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid candidate-cost safety factor");}
+  if(consumed!=value.size()||!std::isfinite(result.safety_factor)||result.safety_factor<1.0||result.safety_factor>10.0)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: candidate-cost safety factor must be between 1 and 10");
+  return result;
+}
+
+bool same_feasibility_candidate_cost_contract(const FeasibilityCandidateCostContract& left,
+  const FeasibilityCandidateCostContract& right)
+{
+  return left.rule==right.rule&&left.safety_factor==right.safety_factor;
+}
+
+FeasibilityPerformanceStopContract feasibility_manifest_performance_stop_contract(
+  const std::map<std::string,std::string>& fields)
+{
+  FeasibilityPerformanceStopContract result;
+  result.rule=feasibility_manifest_value(fields,"performance_stop_rule");
+  result.objective_normalizer=feasibility_manifest_value(fields,"performance_stop_objective_normalizer");
+  result.gradient_cost_rule=feasibility_manifest_value(fields,"performance_stop_gradient_cost_rule");
+  const std::string& window=feasibility_manifest_value(fields,"performance_stop_curvature_window");std::size_t consumed=0;
+  try{result.curvature_window=static_cast<unsigned>(std::stoul(window,&consumed));}
+  catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid performance-stop curvature window");}
+  if(consumed!=window.size()||std::to_string(result.curvature_window)!=window)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid performance-stop curvature window");
+  const std::string& improvement=feasibility_manifest_value(fields,"performance_stop_min_relative_objective_improvement");consumed=0;
+  try{result.min_relative_objective_improvement=std::stod(improvement,&consumed);}
+  catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid performance-stop objective threshold");}
+  if(consumed!=improvement.size())throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid performance-stop objective threshold");
+  const std::string& ratio=feasibility_manifest_value(fields,"performance_stop_curvature_to_gradient_cost_ratio");consumed=0;
+  try{result.curvature_to_gradient_cost_ratio=std::stod(ratio,&consumed);}
+  catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid performance-stop cost ratio");}
+  if(consumed!=ratio.size()||result.rule!=rpmd_ja_feasibility::candidate_performance_stop_rule||
+     result.objective_normalizer!=rpmd_ja_feasibility::candidate_performance_objective_normalizer||
+     result.gradient_cost_rule!=rpmd_ja_feasibility::candidate_performance_gradient_cost_rule||
+     result.curvature_window!=rpmd_ja_feasibility::candidate_performance_curvature_window||
+     !std::isfinite(result.min_relative_objective_improvement)||
+     result.min_relative_objective_improvement!=rpmd_ja_feasibility::candidate_performance_min_relative_objective_improvement||
+     !std::isfinite(result.curvature_to_gradient_cost_ratio)||
+     result.curvature_to_gradient_cost_ratio!=rpmd_ja_feasibility::candidate_performance_curvature_to_gradient_cost_ratio)
+  throw std::runtime_error("BLIND_PROVENANCE_FAIL: performance-stop policy differs from the frozen RPJAFEAS9 heuristic");
+  return result;
+}
+
+bool same_feasibility_performance_stop_contract(const FeasibilityPerformanceStopContract& left,
+  const FeasibilityPerformanceStopContract& right)
+{
+  return left.rule==right.rule&&left.objective_normalizer==right.objective_normalizer&&
+    left.gradient_cost_rule==right.gradient_cost_rule&&left.curvature_window==right.curvature_window&&
+    left.min_relative_objective_improvement==right.min_relative_objective_improvement&&
+    left.curvature_to_gradient_cost_ratio==right.curvature_to_gradient_cost_ratio;
+}
+
+FeasibilityCurvatureContract feasibility_manifest_curvature_contract(const std::map<std::string,std::string>& fields)
+{
+  FeasibilityCurvatureContract result;
+  result.primary_seed=parse_feasibility_hex64(feasibility_manifest_value(fields,"curvature_primary_seed"),"curvature_primary_seed");
+  result.independent_seed=parse_feasibility_hex64(feasibility_manifest_value(fields,"curvature_independent_seed"),"curvature_independent_seed");
+  const std::string& cap=feasibility_manifest_value(fields,"curvature_probe_cap");std::size_t consumed=0;
+  try{result.probe_cap=std::stoi(cap,&consumed);}catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid curvature probe cap");}
+  if(consumed!=cap.size()||result.probe_cap!=CovarianceAnalyticCurvatureWorkspace::max_probes)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: curvature probe cap differs from the executable's frozen 128-probe limit");
+  const std::string& tolerance=feasibility_manifest_value(fields,"curvature_directional_tolerance");consumed=0;
+  try{result.directional_tolerance=std::stod(tolerance,&consumed);}catch(...){throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid independent curvature tolerance");}
+  if(consumed!=tolerance.size()||!std::isfinite(result.directional_tolerance)||
+     result.directional_tolerance!=covariance_independent_directional_tolerance)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: independent curvature tolerance differs from the executable's frozen value");
+  if(result.primary_seed!=covariance_primary_curvature_seed||result.independent_seed!=covariance_independent_curvature_seed)
+  throw std::runtime_error("BLIND_PROVENANCE_FAIL: curvature seeds differ from the executable's frozen RPJAFEAS9 contract");
+  return result;
+}
+
+bool same_feasibility_curvature_contract(const FeasibilityCurvatureContract& left,const FeasibilityCurvatureContract& right)
+{
+  return left.primary_seed==right.primary_seed&&left.independent_seed==right.independent_seed&&
+    left.probe_cap==right.probe_cap&&left.directional_tolerance==right.directional_tolerance;
+}
+
+bool is_sha256_hex(const std::string& value)
+{
+  return value.size()==64&&std::all_of(value.begin(),value.end(),[](const unsigned char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');});
+}
+
+struct FrozenQpFixture{const char* name;const char* sha256;};
+constexpr FrozenQpFixture frozen_qp_fixtures[]={
+  {"ja_reference_resample.bin.qp_state.txt","e2dc03d21aa1ddc16a744f5f42edd0f2973f657d0b47892fd47976870559a895"},
+  {"ja_reference_replay_v1.bin.qp_state.txt","011250eb6624846818b5ca92780d33409d1e63547b067eb94b86d80d126168d7"},
+  {"ja_reference_replay_v2.bin.qp_state.txt","6db931e9782a43d0393428f07b5c17679f8ae72c492d2670140cb00d95125ff9"},
+  {"ja_reference_replay_v4.bin.qp_state.txt","0c91d4d2e120bc8073a1bbddd438db4c21b93ca8551658ee8823b018cbb4dc12"},
+  {"ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt","43aac0ebde38101937ec184722f48c64b01523706347bc93d465ae6a6655b9d6"}};
+
+struct FitInputContentIdentity
+{
+  std::uint64_t fnv64=0;
+  std::string sha256;
+};
+
+FitInputContentIdentity fit_input_content_identity(const std::string& path,const bool compute_sha256=true)
+{
+  rpmd_ja_file_io::ifstream input(path,std::ios::binary);
+  if(!input)throw std::runtime_error("cannot open fit input for SHA-256/FNV identity: "+path);
+  rpmd_ja_sha256::Digest sha;
+  std::uint64_t fnv=14695981039346656037ULL;
+  char buffer[65536];
+  while(input.read(buffer,sizeof(buffer))||input.gcount()!=0){
+    const std::streamsize count=input.gcount();
+    if(compute_sha256)sha.update(reinterpret_cast<const unsigned char*>(buffer),static_cast<std::size_t>(count));
+    for(std::streamsize i=0;i<count;++i)fnv=(fnv^static_cast<unsigned char>(buffer[i]))*1099511628211ULL;
+  }
+  if(!input.eof())throw std::runtime_error("failed reading fit input for SHA-256/FNV identity: "+path);
+  return {fnv,compute_sha256?sha.finish_hex():std::string{}};
+}
+
+std::map<std::string,std::string> read_simple_key_value_file(const std::string& path)
+{
+  rpmd_ja_file_io::ifstream input(path,std::ios::binary);if(!input)throw std::runtime_error("cannot open committed feasibility artifact: "+path);
+  std::map<std::string,std::string> fields;std::string line;
+  while(std::getline(input,line)){std::istringstream row(line);std::string key,value,extra;if(!(row>>key))continue;
+    if(!(row>>std::quoted(value)))continue;row>>std::ws;if(!row.eof())continue;
+    if(fields.count(key))throw std::runtime_error("committed feasibility artifact has a duplicate identity field: "+key);
+    fields.emplace(std::move(key),std::move(value));}
+  return fields;
+}
+
+void verify_published_feasibility_artifacts(const RpmdJANativeFitOptions& options,
+  const rpmd_ja_covariance_checkpoint::ControllerJournal& journal)
+{
+  const std::string output=options.output_path,sidecar=output+".stability",fit=output+".fit.txt",trace=output+".fit_trace.txt";
+  const auto require_hash=[&](const std::string& path,const std::string& expected,const char* name){
+    if(!rpmd_ja_covariance_checkpoint::is_sha256(expected)||fit_input_content_identity(path,true).sha256!=expected)
+      throw std::runtime_error(std::string("FEASIBILITY_RESUME_IDENTITY_FAIL: published ")+name+" content differs from its committed journal digest");};
+  require_hash(output,journal.published_output_sha256,"reference");require_hash(sidecar,journal.published_sidecar_sha256,"sidecar");
+  require_hash(fit,journal.published_fit_sha256,"fit diagnostics");require_hash(trace,journal.published_trace_sha256,"fit trace");
+  const RpmdJAReference reference=read_rpmd_ja_reference(output);
+  if(!reference.stability_checked||reference.stability_certificate!="additive_shifted_frobenius_v1"||
+     !(reference.minimum_cholesky_pivot>0.0)||!std::isfinite(reference.minimum_cholesky_pivot)||
+     !(reference.additive_epsilon>0.0)||!std::isfinite(reference.additive_reconstruction_bound)||
+     !(reference.additive_reconstruction_bound<0.5*reference.additive_epsilon))
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: committed reference no longer has the additive stored-D certificate");
+  const auto side_fields=read_simple_key_value_file(sidecar);
+  auto get=[&](const std::map<std::string,std::string>& fields,const char* key)->const std::string&{
+    const auto found=fields.find(key);if(found==fields.end())throw std::runtime_error(std::string("FEASIBILITY_RESUME_IDENTITY_FAIL: committed artifact is missing ")+key);
+    return found->second;};
+  std::uint64_t side_fingerprint=0;try{side_fingerprint=std::stoull(get(side_fields,"fingerprint"),nullptr,16);}catch(...){
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: committed stability sidecar fingerprint is invalid");}
+  const double side_epsilon=std::stod(get(side_fields,"epsilon_num")),side_eta=std::stod(get(side_fields,"reconstruction_bound"));
+  if(side_fingerprint!=reference.model_fingerprint||get(side_fields,"certificate")!="additive_shifted_frobenius_v1"||
+     side_epsilon!=reference.additive_epsilon||side_eta!=reference.additive_reconstruction_bound)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: reference and stability certificate identities disagree");
+  const auto fit_fields=read_simple_key_value_file(fit);
+  const std::string expected_family=journal.frozen_candidate_branch[0]=='B'?"M0":"M1";
+  if(get(fit_fields,"selected_family")!=expected_family||
+     get(fit_fields,"selected_candidate_branch")!=journal.frozen_candidate_branch||
+     get(fit_fields,"selected_candidate_index")!=std::to_string(journal.frozen_candidate_index)||
+     get(fit_fields,"frozen_candidate_identity_sha256")!=journal.frozen_candidate_identity_sha256||
+     std::stod(get(fit_fields,"selected_lambda"))!=journal.frozen_candidate_lambda)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: fit diagnostics do not bind the frozen candidate");
+  const std::string trace_bytes=[&](){rpmd_ja_file_io::ifstream in(trace,std::ios::binary);std::ostringstream bytes;bytes<<in.rdbuf();return bytes.str();}();
+  const std::string selected="FEASIBILITY_SELECTION frozen 1 family "+expected_family+" index "+
+    std::to_string(journal.frozen_candidate_index);
+  if(trace_bytes.find("status REFERENCE_WRITTEN ")==std::string::npos||trace_bytes.find(selected)==std::string::npos||
+     trace_bytes.find("frozen_candidate_identity_sha256 "+journal.frozen_candidate_identity_sha256)==std::string::npos)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: fit trace does not contain the committed selection and publication");
+}
+
+void verify_publishing_artifact_pair(const std::string& output,const std::string& staged_output,
+  const std::string& output_digest,const std::string& sidecar_digest)
+{
+  if(output_digest.empty()!=sidecar_digest.empty())
+    throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: publication journal has only one staged artifact digest");
+  const auto verify_one=[](const std::string& final_path,const std::string& staged_path,const std::string& expected){
+    auto present=[](const std::string& path){rpmd_ja_file_io::ifstream input(path,std::ios::binary);return input.good();};
+    const bool final_exists=present(final_path),staged_exists=present(staged_path);
+    if(expected.empty()){
+      if(final_exists)throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: uncommitted publication cannot overwrite a final output");
+      return;}
+    if(!rpmd_ja_covariance_checkpoint::is_sha256(expected)||(!final_exists&&!staged_exists))
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: committed publication artifact is missing or has an invalid digest");
+    if((final_exists&&fit_input_content_identity(final_path,true).sha256!=expected)||
+       (staged_exists&&fit_input_content_identity(staged_path,true).sha256!=expected))
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: foreign or modified final/staged publication artifact");};
+  verify_one(output,staged_output,output_digest);
+  verify_one(output+".stability",staged_output+".stability",sidecar_digest);
+}
+
+template<typename AfterOutputRename>
+void publish_verified_prepared_artifacts(const std::string& output,const std::string& staged_output,
+  const std::string& output_digest,const std::string& sidecar_digest,AfterOutputRename after_output_rename)
+{
+  verify_publishing_artifact_pair(output,staged_output,output_digest,sidecar_digest);
+  const auto publish_one=[](const std::string& final_path,const std::string& staged_path,const std::string& expected){
+    const bool final_exists=[&](){rpmd_ja_file_io::ifstream final(final_path,std::ios::binary);return final.good();}();
+    if(final_exists)return;
+    const bool stage_exists=[&](){rpmd_ja_file_io::ifstream stage(staged_path,std::ios::binary);return stage.good();}();
+    if(!stage_exists)throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: prepared stage artifact disappeared before commit");
+    if(fit_input_content_identity(staged_path,true).sha256!=expected)
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: prepared stage bytes differ from the journal digest");
+    if(rpmd_ja_file_io::atomic_replace_file(staged_path,final_path)!=0)
+      throw std::runtime_error("FEASIBILITY_PUBLISH_RETRYABLE: staged artifact atomic replace failed");
+    if(fit_input_content_identity(final_path,true).sha256!=expected)
+      throw std::runtime_error("FEASIBILITY_PUBLISH_FAIL: final artifact bytes differ from the prepared stage digest");};
+  publish_one(output,staged_output,output_digest);after_output_rename();
+  publish_one(output+".stability",staged_output+".stability",sidecar_digest);
+  verify_publishing_artifact_pair(output,staged_output,output_digest,sidecar_digest);
+  for(const auto& staged:std::vector<std::pair<std::string,std::string>>{{staged_output,output_digest},
+      {staged_output+".stability",sidecar_digest}}){
+    const bool matching_duplicate=[&](){
+      rpmd_ja_file_io::ifstream input(staged.first,std::ios::binary);
+      if(!input.good())return false;
+      input.close();return fit_input_content_identity(staged.first,true).sha256==staged.second;
+    }();
+    if(matching_duplicate&&rpmd_ja_file_io::remove_file(staged.first)!=0)
+      throw std::runtime_error("FEASIBILITY_PUBLISH_RETRYABLE: committed staging duplicate remove failed");}
+}
+
+std::string normalized_sha256(std::string value)
+{
+  for(char& c:value)if(c>='A'&&c<='F')c=static_cast<char>(c-'A'+'a');
+  return value;
+}
+
+void verify_feasibility_source_content_hashes(const std::map<std::string,std::string>& manifest,
+  const FitInputContentIdentity& kernel,const FitInputContentIdentity& raw)
+{
+  const std::string& expected_kernel=feasibility_manifest_value(manifest,"kernel_sha256");
+  const std::string& expected_raw=feasibility_manifest_value(manifest,"raw_sha256");
+  if(!is_sha256_hex(expected_kernel)||normalized_sha256(expected_kernel)!=kernel.sha256)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: qNEP kernel content differs from the frozen manifest SHA-256");
+  if(!is_sha256_hex(expected_raw)||normalized_sha256(expected_raw)!=raw.sha256)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: qraw content differs from the frozen manifest SHA-256");
+}
+
+void verify_frozen_qp_fixture_receipt(const std::map<std::string,std::string>& receipt)
+{
+  std::string fixture_set_bytes;
+  for(unsigned i=0;i<5;++i){
+    const std::string prefix="cuda_regression_fixture_"+std::to_string(i+1);
+    if(feasibility_manifest_value(receipt,prefix+"_name")!=frozen_qp_fixtures[i].name||
+       normalized_sha256(feasibility_manifest_value(receipt,prefix+"_sha256"))!=frozen_qp_fixtures[i].sha256)
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: CUDA regression fixture identity differs from the frozen contract");
+    fixture_set_bytes+=frozen_qp_fixtures[i].name;fixture_set_bytes.push_back('\0');
+    fixture_set_bytes+=frozen_qp_fixtures[i].sha256;fixture_set_bytes.push_back('\n');
+  }
+  rpmd_ja_sha256::Digest fixture_set_sha;
+  fixture_set_sha.update(reinterpret_cast<const unsigned char*>(fixture_set_bytes.data()),fixture_set_bytes.size());
+  if(normalized_sha256(feasibility_manifest_value(receipt,"cuda_regression_fixture_set_sha256"))!=
+     fixture_set_sha.finish_hex())
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: CUDA regression fixture-set digest differs from the frozen contract");
+}
+
+std::map<std::string,std::string> verify_feasibility_preflight(const std::string& expected_output_path)
+{
+  const char* receipt_env=std::getenv("GPUMD_RPMD_JA_PREFLIGHT_RECEIPT");
+  const char* manifest_env=std::getenv("GPUMD_RPMD_JA_PREFLIGHT_MANIFEST");
+  if(receipt_env==nullptr||*receipt_env=='\0'||manifest_env==nullptr||*manifest_env=='\0')
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: feasibility mode must be launched by rpmd_ja_feasibility_preflight.py");
+  const auto manifest=read_feasibility_manifest(manifest_env);
+  const auto receipt=read_feasibility_preflight_receipt(receipt_env);
+  if(!same_feasibility_curvature_contract(feasibility_manifest_curvature_contract(manifest),
+      feasibility_manifest_curvature_contract(receipt)))
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt curvature contract differs from the manifest");
+  if(!same_feasibility_candidate_cost_contract(feasibility_manifest_candidate_cost_contract(manifest),
+      feasibility_manifest_candidate_cost_contract(receipt)))
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt candidate-cost contract differs from the manifest");
+  if(!same_feasibility_performance_stop_contract(feasibility_manifest_performance_stop_contract(manifest),
+      feasibility_manifest_performance_stop_contract(receipt)))
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt performance-stop contract differs from the manifest");
+  if(!same_feasibility_experiment_contract(feasibility_manifest_experiment_contract(manifest),
+      feasibility_manifest_experiment_contract(receipt)))
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt experiment contract differs from the manifest");
+  const auto baseline_status_field=manifest.find("cost_baseline_status");
+  const std::string expected_baseline_status=baseline_status_field==manifest.end()?"NOT_PROVIDED":baseline_status_field->second;
+  if(expected_baseline_status!="NOT_PROVIDED"&&expected_baseline_status!="VERIFIED")
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: manifest cost baseline status is invalid");
+  if(feasibility_manifest_value(receipt,"cost_baseline_status")!=expected_baseline_status)
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt cost baseline status differs from the manifest");
+  if(expected_baseline_status=="VERIFIED"){
+    if(feasibility_manifest_value(receipt,"cost_baseline_path")!=feasibility_manifest_value(manifest,"cost_baseline_path")||
+       normalized_sha256(feasibility_manifest_value(receipt,"cost_baseline_sha256"))!=
+         normalized_sha256(feasibility_manifest_value(manifest,"cost_baseline_sha256"))||
+       !is_sha256_hex(feasibility_manifest_value(receipt,"cost_baseline_machine_fingerprint")))
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt cost baseline identity differs from the frozen manifest");
+    const FitInputContentIdentity baseline_identity=fit_input_content_identity(
+      feasibility_manifest_value(receipt,"cost_baseline_resolved_path"),true);
+    if(normalized_sha256(baseline_identity.sha256)!=
+       normalized_sha256(feasibility_manifest_value(receipt,"cost_baseline_sha256")))
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: cost baseline bytes changed after launcher preflight");
+    for(const char* key:{"candidate_seconds","fit_seconds","curvature_seconds","blind_seconds",
+        "package_write_seconds","prepare_seconds","readback_seconds"}){
+      const std::string& stored=feasibility_manifest_value(receipt,std::string("cost_baseline_")+key);
+      std::istringstream value(stored);double seconds=0.0;std::string extra;
+      if(!(value>>seconds)||(value>>extra)||!std::isfinite(seconds)||seconds<=0.0)
+        throw std::runtime_error(std::string("FEASIBILITY_PREFLIGHT_FAIL: invalid cost baseline ")+key);}
+  }
+  if(feasibility_manifest_value(manifest,"independence_attested")!="YES"||
+     feasibility_manifest_value(manifest,"wrapper_checksum_status")!="VERIFIED"||
+     feasibility_manifest_value(manifest,"cuda_regression_status")!="PASS"||
+     feasibility_manifest_value(manifest,"cuda_integration_status")!="PASS"||
+     feasibility_manifest_value(manifest,"native_output_path")!=expected_output_path||
+     feasibility_manifest_value(receipt,"status")!="PASS"||
+     feasibility_manifest_value(receipt,"cuda_regression_status")!="PASS"||
+     feasibility_manifest_value(receipt,"cuda_regression_exit_code")!="0"||
+     feasibility_manifest_value(receipt,"cuda_regression_fixture_status")!="PASS"||
+     feasibility_manifest_value(receipt,"cuda_regression_fixture_count")!="5"||
+     feasibility_manifest_value(receipt,"cuda_integration_status")!="PASS"||
+     feasibility_manifest_value(receipt,"cuda_integration_exit_code")!="0"||
+     feasibility_manifest_value(receipt,"manifest_path")!=manifest_env||
+     feasibility_manifest_value(receipt,"native_executable_path")!=feasibility_manifest_value(manifest,"native_executable_path")||
+     feasibility_manifest_value(receipt,"cuda_regression_executable")!=feasibility_manifest_value(manifest,"cuda_regression_executable")||
+     feasibility_manifest_value(receipt,"cuda_integration_executable")!=feasibility_manifest_value(manifest,"cuda_integration_executable")||
+     feasibility_manifest_value(receipt,"m1_minimum_support_count")!=feasibility_manifest_value(manifest,"m1_minimum_support_count")||
+     feasibility_manifest_value(receipt,"native_output_path")!=expected_output_path||
+     parse_feasibility_hex64(feasibility_manifest_value(receipt,"manifest_fnv64"),"manifest_fnv64")!=rpmd_ja_model_fingerprint(manifest_env))
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt, manifest, or native output identity does not match");
+  verify_frozen_qp_fixture_receipt(receipt);
+  auto verify_sample_provenance=[&](const char* sample,const char* manifest_sha){
+    const std::string prefix=sample;
+    const std::string& status=feasibility_manifest_value(receipt,prefix+"_provenance_status");
+    const std::string& integrity_status=feasibility_manifest_value(receipt,prefix+"_integrity_status");
+    const std::string& checksum_status=feasibility_manifest_value(receipt,prefix+"_provenance_checksum_status");
+    const std::string& sample_sha=feasibility_manifest_value(receipt,prefix+"_provenance_sample_sha256");
+    const std::string& configuration_status=feasibility_manifest_value(receipt,prefix+"_configuration_match_status");
+    const std::string& expected_model=feasibility_manifest_value(manifest,prefix+"_model_sha256");
+    const std::string& expected_force=feasibility_manifest_value(manifest,prefix+"_physical_force_configuration_sha256");
+    const std::string& expected_integrator=feasibility_manifest_value(manifest,prefix+"_integrator_configuration_sha256");
+    const std::string& reported_model=feasibility_manifest_value(receipt,prefix+"_model_sha256");
+    const std::string& reported_force=feasibility_manifest_value(receipt,prefix+"_physical_force_configuration_sha256");
+    const std::string& reported_integrator=feasibility_manifest_value(receipt,prefix+"_integrator_configuration_sha256");
+    const bool model_declared=expected_model!="NOT_VERIFIABLE";
+    const bool force_declared=expected_force!="NOT_VERIFIABLE";
+    const bool integrator_declared=expected_integrator!="NOT_VERIFIABLE";
+    const bool any_configuration_declared=model_declared||force_declared||integrator_declared;
+    if(status=="LEGACY_DECLARED_UNVERIFIED"){
+      if(any_configuration_declared||
+         integrity_status!="NOT_PRESENT"||checksum_status!="NOT_PRESENT"||sample_sha!="NOT_AVAILABLE"||
+         configuration_status!="NOT_VERIFIABLE"||reported_model!="NOT_VERIFIABLE"||
+         reported_force!="NOT_VERIFIABLE"||reported_integrator!="NOT_VERIFIABLE")
+        throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: legacy sample provenance receipt is inconsistent");
+      return;
+    }
+    if(status!="PRODUCER_OBSERVED"||checksum_status!="VERIFIED"||
+       integrity_status!="VERIFIED"||
+       normalized_sha256(sample_sha)!=normalized_sha256(feasibility_manifest_value(manifest,manifest_sha)))
+      throw std::runtime_error(std::string("FEASIBILITY_PREFLIGHT_FAIL: ")+sample+" provenance receipt does not bind the frozen sample");
+    if(configuration_status=="MATCHED_DECLARED_VALUES"){
+      if(!any_configuration_declared||(model_declared&&normalized_sha256(reported_model)!=normalized_sha256(expected_model))||
+         (force_declared&&normalized_sha256(reported_force)!=normalized_sha256(expected_force))||
+         (integrator_declared&&normalized_sha256(reported_integrator)!=normalized_sha256(expected_integrator)))
+        throw std::runtime_error(std::string("FEASIBILITY_PREFLIGHT_FAIL: ")+sample+" model/configuration identity differs from the manifest");
+    }else if(configuration_status!="NOT_VERIFIABLE"||any_configuration_declared||
+       reported_model!="NOT_VERIFIABLE"||reported_force!="NOT_VERIFIABLE"||reported_integrator!="NOT_VERIFIABLE")
+      throw std::runtime_error(std::string("FEASIBILITY_PREFLIGHT_FAIL: ")+sample+" provenance configuration status is invalid or lacks declared evidence");
+  };
+  verify_sample_provenance("training","training_sha256");
+  verify_sample_provenance("blind","blind_sha256");
+  const std::string& source_relation=feasibility_manifest_value(receipt,"provenance_source_relation_status");
+  if(source_relation!="SIDECAR_SOURCE_IDS_DISTINCT_DECLARED"&&source_relation!="NOT_VERIFIABLE")
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: sample provenance source-relation status is invalid");
+  if(feasibility_manifest_response_delta_tolerance(manifest)!=
+     feasibility_manifest_response_delta_tolerance(receipt))
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: response-delta sensitivity threshold differs from the frozen manifest");
+  const std::string& native_sha=feasibility_manifest_value(manifest,"native_executable_sha256");
+  const std::string& cuda_sha=feasibility_manifest_value(manifest,"cuda_regression_sha256");
+  const std::string& integration_sha=feasibility_manifest_value(manifest,"cuda_integration_sha256");
+  const std::string& config_sha=feasibility_manifest_value(manifest,"run_config_sha256");
+  if(!is_sha256_hex(native_sha)||!is_sha256_hex(cuda_sha)||!is_sha256_hex(integration_sha)||!is_sha256_hex(config_sha)||
+     feasibility_manifest_value(receipt,"native_executable_sha256")!=native_sha||
+     feasibility_manifest_value(receipt,"cuda_regression_sha256")!=cuda_sha||
+     feasibility_manifest_value(receipt,"cuda_integration_sha256")!=integration_sha||
+     feasibility_manifest_value(receipt,"run_config_sha256")!=config_sha||
+     feasibility_manifest_value(receipt,"run_config_path")!=feasibility_manifest_value(manifest,"run_config_path"))
+    throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: executable or run configuration identity differs from the frozen manifest");
+  return manifest;
+}
+
+std::map<std::string,std::string> verify_feasibility_manifest(const std::map<std::string,std::string>& fields,
+  const std::string& training_path,
+  const std::string& blind_path,const std::string& kernel_path,const std::string& raw_path,const QrawIdentity& qraw)
+{
+  (void)feasibility_manifest_minimum_support(fields);
+  (void)feasibility_manifest_response_delta_tolerance(fields);
+  (void)feasibility_manifest_candidate_cost_contract(fields);
+  (void)feasibility_manifest_performance_stop_contract(fields);
+  (void)feasibility_manifest_experiment_contract(fields);
+  if(feasibility_manifest_value(fields,"independence_attested")!="YES"||
+     feasibility_manifest_value(fields,"wrapper_checksum_status")!="VERIFIED"||
+     feasibility_manifest_value(fields,"cuda_regression_status")!="PASS"||
+     feasibility_manifest_value(fields,"cuda_integration_status")!="PASS"||
+     feasibility_manifest_value(fields,"cuda_regression_executable").empty()||
+     feasibility_manifest_value(fields,"cuda_integration_executable").empty())
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: independent-data, wrapper-checksum, and real CUDA-regression attestations are required");
+  const std::string& training_source=feasibility_manifest_value(fields,"training_source_id");
+  const std::string& blind_source=feasibility_manifest_value(fields,"blind_source_id");
+  if(training_source==blind_source)throw std::runtime_error("BLIND_PROVENANCE_FAIL: training and blind source IDs must differ");
+  if(feasibility_same_file_path(training_path,blind_path))
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: training and blind inputs resolve to the same file");
+  if(!feasibility_same_file_path(feasibility_manifest_value(fields,"training_path"),training_path)||
+     !feasibility_same_file_path(feasibility_manifest_value(fields,"blind_path"),blind_path)||
+     !feasibility_same_file_path(feasibility_manifest_value(fields,"kernel_path"),kernel_path)||
+     !feasibility_same_file_path(feasibility_manifest_value(fields,"raw_path"),raw_path))
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: manifest input paths differ from native command paths");
+  if(parse_feasibility_hex64(feasibility_manifest_value(fields,"training_fnv64"),"training_fnv64")!=rpmd_ja_model_fingerprint(training_path)||
+     parse_feasibility_hex64(feasibility_manifest_value(fields,"blind_fnv64"),"blind_fnv64")!=rpmd_ja_model_fingerprint(blind_path))
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: training or blind data checksum does not match the frozen manifest");
+  if(parse_feasibility_hex64(feasibility_manifest_value(fields,"declared_model_fingerprint"),"declared_model_fingerprint")!=qraw.model||
+     parse_feasibility_hex64(feasibility_manifest_value(fields,"declared_config_fingerprint"),"declared_config_fingerprint")!=qraw.config)
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: declared model/config fingerprint differs from runtime qraw identity");
+  const std::string& training_model_sha256=feasibility_manifest_value(fields,"training_model_sha256");
+  const std::string& blind_model_sha256=feasibility_manifest_value(fields,"blind_model_sha256");
+  const auto sample_identity_complete=[&](const char* prefix){
+    const std::string& model=feasibility_manifest_value(fields,std::string(prefix)+"_model_sha256");
+    const std::string& force=feasibility_manifest_value(fields,std::string(prefix)+"_physical_force_configuration_sha256");
+    const std::string& integrator=feasibility_manifest_value(fields,std::string(prefix)+"_integrator_configuration_sha256");
+    return (model=="NOT_VERIFIABLE"&&force=="NOT_VERIFIABLE"&&integrator=="NOT_VERIFIABLE")||
+      (is_sha256_hex(model)&&is_sha256_hex(force)&&is_sha256_hex(integrator));};
+  if((training_model_sha256=="NOT_VERIFIABLE")!=(blind_model_sha256=="NOT_VERIFIABLE")||
+     (training_model_sha256!="NOT_VERIFIABLE"&&
+      (!is_sha256_hex(training_model_sha256)||!is_sha256_hex(blind_model_sha256)||
+       normalized_sha256(training_model_sha256)!=normalized_sha256(blind_model_sha256)||
+       qraw.model_sha256.empty()||normalized_sha256(training_model_sha256)!=normalized_sha256(qraw.model_sha256)))||
+     !sample_identity_complete("training")||!sample_identity_complete("blind"))
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: source model SHA-256 does not match the active qraw model content");
+  feasibility_manifest_value(fields,"training_sha256");feasibility_manifest_value(fields,"blind_sha256");
+  feasibility_manifest_value(fields,"training_model_sha256");
+  feasibility_manifest_value(fields,"training_physical_force_configuration_sha256");
+  feasibility_manifest_value(fields,"training_integrator_configuration_sha256");
+  feasibility_manifest_value(fields,"blind_model_sha256");
+  feasibility_manifest_value(fields,"blind_physical_force_configuration_sha256");
+  feasibility_manifest_value(fields,"blind_integrator_configuration_sha256");
+  feasibility_manifest_value(fields,"run_config_sha256");feasibility_manifest_value(fields,"kernel_sha256");
+  feasibility_manifest_value(fields,"raw_sha256");feasibility_manifest_value(fields,"cuda_regression_sha256");
+  feasibility_manifest_value(fields,"cuda_integration_sha256");
+  feasibility_manifest_value(fields,"native_executable_path");feasibility_manifest_value(fields,"native_executable_sha256");
+  feasibility_manifest_value(fields,"cuda_integration_executable");
+  if(feasibility_manifest_value(fields,"native_output_path").empty()||
+     !is_sha256_hex(feasibility_manifest_value(fields,"training_sha256"))||
+     !is_sha256_hex(feasibility_manifest_value(fields,"blind_sha256"))||
+     !((feasibility_manifest_value(fields,"training_model_sha256")=="NOT_VERIFIABLE"&&
+        feasibility_manifest_value(fields,"blind_model_sha256")=="NOT_VERIFIABLE")||
+       (is_sha256_hex(feasibility_manifest_value(fields,"training_model_sha256"))&&
+        is_sha256_hex(feasibility_manifest_value(fields,"blind_model_sha256"))&&
+        normalized_sha256(feasibility_manifest_value(fields,"training_model_sha256"))==
+          normalized_sha256(feasibility_manifest_value(fields,"blind_model_sha256"))))||
+     !((feasibility_manifest_value(fields,"training_physical_force_configuration_sha256")=="NOT_VERIFIABLE"&&
+        feasibility_manifest_value(fields,"training_integrator_configuration_sha256")=="NOT_VERIFIABLE")||
+       (is_sha256_hex(feasibility_manifest_value(fields,"training_physical_force_configuration_sha256"))&&
+        is_sha256_hex(feasibility_manifest_value(fields,"training_integrator_configuration_sha256"))))||
+     !((feasibility_manifest_value(fields,"blind_physical_force_configuration_sha256")=="NOT_VERIFIABLE"&&
+        feasibility_manifest_value(fields,"blind_integrator_configuration_sha256")=="NOT_VERIFIABLE")||
+       (is_sha256_hex(feasibility_manifest_value(fields,"blind_physical_force_configuration_sha256"))&&
+        is_sha256_hex(feasibility_manifest_value(fields,"blind_integrator_configuration_sha256"))))||
+     !is_sha256_hex(feasibility_manifest_value(fields,"run_config_sha256"))||
+     !is_sha256_hex(feasibility_manifest_value(fields,"kernel_sha256"))||
+     !is_sha256_hex(feasibility_manifest_value(fields,"raw_sha256"))||
+     !is_sha256_hex(feasibility_manifest_value(fields,"cuda_regression_sha256"))||
+     !is_sha256_hex(feasibility_manifest_value(fields,"cuda_integration_sha256"))||
+     !is_sha256_hex(feasibility_manifest_value(fields,"native_executable_sha256")))
+    throw std::runtime_error("BLIND_PROVENANCE_FAIL: invalid SHA-256 field in feasibility manifest");
+  feasibility_manifest_value(fields,"run_config_path");
+  return fields;
+}
+
 } // namespace
+
+struct NativeFitScratchOwnership
+{
+  std::string raw,pack,output,sidecar,output_tmp,sidecar_tmp,fit,fit_tmp;
+  std::string staged_output,staged_sidecar,staged_output_tmp,staged_sidecar_tmp;
+  bool raw_owned=false,pack_owned=false,output_owned=false,sidecar_owned=false;
+  bool output_tmp_owned=false,sidecar_tmp_owned=false,fit_owned=false,fit_tmp_owned=false;
+  bool staged_output_owned=false,staged_sidecar_owned=false,staged_output_tmp_owned=false,staged_sidecar_tmp_owned=false;
+  ~NativeFitScratchOwnership(){if(raw_owned)rpmd_ja_file_io::remove_file(raw);if(pack_owned)rpmd_ja_file_io::remove_file(pack);
+    if(output_owned)rpmd_ja_file_io::remove_file(output);if(sidecar_owned)rpmd_ja_file_io::remove_file(sidecar);
+    if(output_tmp_owned)rpmd_ja_file_io::remove_file(output_tmp);if(sidecar_tmp_owned)rpmd_ja_file_io::remove_file(sidecar_tmp);
+    if(staged_output_owned)rpmd_ja_file_io::remove_file(staged_output);if(staged_sidecar_owned)rpmd_ja_file_io::remove_file(staged_sidecar);
+    if(staged_output_tmp_owned)rpmd_ja_file_io::remove_file(staged_output_tmp);
+    if(staged_sidecar_tmp_owned)rpmd_ja_file_io::remove_file(staged_sidecar_tmp);
+    if(fit_owned)rpmd_ja_file_io::remove_file(fit);if(fit_tmp_owned)rpmd_ja_file_io::remove_file(fit_tmp);}
+};
+
+void take_published_prepare_ownership(NativeFitScratchOwnership& ownership)
+{
+  ownership.output_owned=true;ownership.sidecar_owned=true;
+  ownership.output_tmp_owned=true;ownership.sidecar_tmp_owned=true;
+}
+
+void take_staged_prepare_ownership(NativeFitScratchOwnership& ownership)
+{
+  ownership.staged_output_owned=true;ownership.staged_sidecar_owned=true;
+  ownership.staged_output_tmp_owned=true;ownership.staged_sidecar_tmp_owned=true;
+}
+
+template<typename Prepare,typename AfterPublish>
+void prepare_and_take_published_ownership(NativeFitScratchOwnership& ownership,Prepare prepare,AfterPublish after_publish)
+{
+  prepare();
+  take_published_prepare_ownership(ownership);
+  after_publish();
+}
+
+template<typename Prepare,typename AfterPrepare>
+void prepare_and_take_staged_ownership(NativeFitScratchOwnership& ownership,Prepare prepare,AfterPrepare after_prepare)
+{
+  prepare();
+  take_staged_prepare_ownership(ownership);
+  after_prepare();
+}
+
+struct FeasibilityStageTimer
+{
+  std::ostream& trace;
+  const char* stage;
+  std::function<void(double,bool)> record_cost;
+  std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
+  const char* status="INCOMPLETE";
+  FeasibilityStageTimer(std::ostream& output,const char* name,std::function<void(double,bool)> recorder={})
+    :trace(output),stage(name),record_cost(std::move(recorder)){}
+  void complete(){status="PASS";}
+  ~FeasibilityStageTimer() noexcept
+  {
+    const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    try{trace<<"MEASURED_STAGE_COST stage "<<stage<<" status "<<status<<" seconds "<<seconds
+      <<" source CURRENT_RUN_MEASUREMENT hard_wall_budget_authoritative 1\n";trace.flush();}
+    catch(...){}
+    if(record_cost)try{record_cost(seconds,std::string(status)=="PASS");}catch(...){}
+  }
+};
+
+std::map<std::string,std::string> read_covariance_state_fields(std::istream& input);
+void verify_imported_a0_parameter_map(const std::string& state_bytes,const Graph& graph)
+{
+  std::istringstream input(state_bytes);const auto fields=read_covariance_state_fields(input);
+  const auto found=fields.find("parameter_map");
+  if(found==fields.end())throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 has no saved parameter map");
+  std::istringstream row(found->second);std::size_t count=0;std::string label;
+  const std::array<const char*,6> components={{"xx","xy","xz","yy","yz","zz"}};
+  if(!(row>>count>>label)||count!=graph.type_pairs.size()||label!="components")
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 parameter map dimensions differ");
+  for(const char* component:components){std::string saved;if(!(row>>saved)||saved!=component)
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 component mapping differs");}
+  for(const auto& pair:graph.type_pairs){int first=0,second=0;if(!(row>>first>>second)||first!=pair.first||second!=pair.second)
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 graph parameter mapping differs");}
+  row>>std::ws;if(!row.eof())throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 parameter map has trailing data");
+}
+
+CovarianceFitResult restore_covariance_fit_state(const std::string& path,const std::vector<double>& statistics,
+  const std::vector<std::vector<double>>& training_blocks,const std::vector<std::uint64_t>& training_block_frames,
+  const double epsilon,const double expected_rho,const double expected_lambda,const std::string& expected_family,
+  const std::string& expected_samples_path={},const std::string& expected_qraw_path={});
+CovarianceFitResult restore_covariance_fit_state(std::istream& input,const std::string& identity_label,
+  const std::vector<double>& statistics,const std::vector<std::vector<double>>& training_blocks,
+  const std::vector<std::uint64_t>& training_block_frames,const double epsilon,const double expected_rho,
+  const double expected_lambda,const std::string& expected_family,const std::string& expected_samples_path={},
+  const std::string& expected_qraw_path={});
 
 static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& options,const std::string& spool_path,
   const std::uint64_t frame_count,Atom& atom,Box& box,Force& force,const bool sample_beads_from_header=false)
 {
   const bool covariance_method=options.method==RpmdJANativeFitMethod::GaussianCovarianceShrinkage;
+  const double effective_covariance_rho=options.covariance_ridge_lambda>0.0?0.0:options.covariance_shrinkage;
+  double selected_covariance_rho=effective_covariance_rho,selected_covariance_lambda=options.covariance_ridge_lambda;
+  std::string selected_covariance_family="M0";
+  int frozen_m1_minimum_support_count=3;
+  double feasibility_response_delta_tolerance=options.response_tolerance;
+  double feasibility_candidate_cost_safety_factor=1.0;
+  std::vector<double> feasibility_lambda_factors={1.0e-2,1.0e-4,1.0e-6};
+  int feasibility_development_max_blocks=8,feasibility_development_min_blocks=4;
+  std::uint64_t feasibility_statistics_storage_budget_bytes=0;
+  const char* resume_mode_env=std::getenv("GPUMD_RPMD_JA_RESUME_MODE");
+  const bool resume_requested=options.covariance_feasibility&&resume_mode_env!=nullptr&&std::string(resume_mode_env)=="1";
+  const char* checkpoint_path_env=std::getenv("GPUMD_RPMD_JA_CHECKPOINT_PATH");
+  const char* job_id_env=std::getenv("GPUMD_RPMD_JA_JOB_ID");
+  rpmd_ja_covariance_checkpoint::ControllerJournal controller_journal;
+  std::vector<std::string> saved_recovery_witness_paths;
+  rpmd_ja_feasibility::CandidateCostProfile measured_candidate_costs;
+  rpmd_ja_feasibility::StageCostProfile measured_stage_costs[rpmd_ja_feasibility::resource_stage_count];
+  bool controller_resume=false;
+  std::string controller_checkpoint_path,solver_checkpoint_path;
+  bool frozen_selection_resume=false,restored_development_response_present=false,restored_blind_response_present=false;
+  bool publication_payload_restored=false;
+  BlindResponseSnapshot restored_development_response,restored_blind_response;
+  const bool standalone_development_candidate=covariance_method&&!options.covariance_feasibility&&
+    (options.covariance_ridge_lambda>0.0||options.covariance_analytic_curvature_probes>0);
+  rpmd_ja_feasibility::Budget feasibility_budget;
+  rpmd_ja_feasibility::Limits feasibility_limits{};
+  rpmd_ja_feasibility::Budget* const budget=options.covariance_feasibility?&feasibility_budget:nullptr;
+  std::map<std::string,std::string> feasibility_manifest_fields;
+  std::map<std::string,std::string> feasibility_receipt_fields;
+  std::string a0_reuse_verified_state_bytes;
+  if(budget){
+    const auto result=rpmd_ja_feasibility::begin(*budget,feasibility_limits,covariance_budget_now_seconds());
+    if(result!=rpmd_ja_feasibility::BudgetResult::OK)
+      throw std::runtime_error(std::string("FEASIBILITY_BUDGET_")+covariance_budget_result_name(result));
+  }
+  auto enter_budget_phase=[&](const rpmd_ja_feasibility::Phase phase){
+    if(!budget)return;
+    const auto result=rpmd_ja_feasibility::enter_phase(*budget,feasibility_limits,phase,covariance_budget_now_seconds());
+    if(result!=rpmd_ja_feasibility::BudgetResult::OK)
+      throw std::runtime_error(std::string("FEASIBILITY_BUDGET_")+covariance_budget_result_name(result));
+  };
+  auto update_controller_journal_budget=[&](){
+    const auto ignored=rpmd_ja_feasibility::advance_clock(feasibility_budget,covariance_budget_now_seconds());(void)ignored;
+    controller_journal.elapsed_seconds=feasibility_budget.elapsed_seconds;
+    controller_journal.exact_gradients=feasibility_budget.exact_gradients;
+    controller_journal.active_phase=rpmd_ja_feasibility::phase_index(feasibility_budget.phase);
+    for(std::size_t phase=0;phase<controller_journal.phase_gradients.size();++phase){
+      controller_journal.phase_gradients[phase]=feasibility_budget.phase_gradients[phase];
+      controller_journal.phase_seconds[phase]=feasibility_budget.phase_seconds[phase];}
+    controller_journal.max_fit_family_gradients=static_cast<unsigned>(std::max(0,feasibility_limits.max_fit_family_gradients));
+    controller_journal.max_fit_family_wall_seconds=feasibility_limits.max_fit_family_wall_seconds;
+    controller_journal.candidate_cost_samples=measured_candidate_costs.samples;
+    controller_journal.candidate_cost_max_seconds=measured_candidate_costs.maximum_seconds;
+    controller_journal.candidate_cost_partial_seconds=measured_candidate_costs.partial_elapsed_lower_bound_seconds;
+    for(unsigned stage=0;stage<rpmd_ja_feasibility::resource_stage_count;++stage){
+      controller_journal.stage_completed_calls[stage]=measured_stage_costs[stage].completed_calls;
+      controller_journal.stage_max_seconds[stage]=measured_stage_costs[stage].max_seconds;
+      controller_journal.stage_partial_seconds[stage]=measured_stage_costs[stage].partial_elapsed_lower_bound_seconds;}
+  };
+  auto persist_publication_controller_journal=[&](){
+    update_controller_journal_budget();
+    if(controller_journal.operation_in_progress)controller_journal.operation_start_epoch_seconds=
+      std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    rpmd_ja_covariance_checkpoint::write_controller_journal(controller_checkpoint_path,controller_journal);
+  };
   if(options.output_path.empty()||options.kernel_table.empty()||spool_path.empty()||!std::isfinite(options.temperature)||options.temperature<=0.0||
      !std::isfinite(options.cutoff)||options.cutoff<=0.0||!std::isfinite(options.epsilon)||options.epsilon<=0.0||
      !std::isfinite(options.response_tolerance)||options.response_tolerance<0.0||!std::isfinite(options.ibp_tolerance)||options.ibp_tolerance<0.0||!std::isfinite(options.fd_step)||options.fd_step<=0.0||
      options.sample_interval<=0||(!covariance_method&&options.max_stability_rounds<=0)||
-     (covariance_method&&(!std::isfinite(options.covariance_shrinkage)||options.covariance_shrinkage<=0.0||options.max_covariance_iterations<=0||options.raw_input_path.empty()))||frame_count<3)
+     (covariance_method&&(!std::isfinite(options.covariance_shrinkage)||options.covariance_shrinkage<=0.0||options.max_covariance_iterations<=0||
+       options.raw_input_path.empty()||!std::isfinite(options.covariance_ridge_lambda)||options.covariance_ridge_lambda<0.0||
+       (options.covariance_analytic_curvature_probes!=0&&options.covariance_analytic_curvature_probes!=16&&
+        options.covariance_analytic_curvature_probes!=32&&options.covariance_analytic_curvature_probes!=64&&
+        options.covariance_analytic_curvature_probes!=128)||
+       (options.covariance_analytic_curvature_probes>0&&!options.covariance_trust_region)||
+       (options.covariance_feasibility&&(!options.covariance_structured_basis||options.covariance_ridge_lambda!=0.0||
+         options.covariance_analytic_curvature_probes!=0||
+         options.covariance_block_newton||options.covariance_joint_block||
+         options.covariance_staged_barrier||std::abs(options.covariance_shrinkage-0.1)>8.0*std::numeric_limits<double>::epsilon()||options.covariance_blind_samples.empty()!=
+         options.covariance_blind_manifest_path.empty()))||
+       (!options.covariance_feasibility&&(options.covariance_structured_basis||!options.covariance_blind_samples.empty()||
+         !options.covariance_blind_manifest_path.empty()))))||frame_count<3)
     throw std::invalid_argument("invalid native rpmd_ja fit options");
   if(covariance_method&&static_cast<int>(options.covariance_block_newton)+static_cast<int>(options.covariance_joint_block)+
      static_cast<int>(options.covariance_trust_region)>1)
     throw std::invalid_argument("covariance optimizer step modes are mutually exclusive");
+  if(options.covariance_feasibility){
+    feasibility_manifest_fields=verify_feasibility_preflight(options.output_path);
+    const char* manifest_path_env=std::getenv("GPUMD_RPMD_JA_PREFLIGHT_MANIFEST");
+    if(manifest_path_env==nullptr||*manifest_path_env=='\0'||checkpoint_path_env==nullptr||*checkpoint_path_env=='\0'||
+       job_id_env==nullptr||*job_id_env=='\0')
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: controller checkpoint identity environment is incomplete");
+    controller_checkpoint_path=checkpoint_path_env;solver_checkpoint_path=controller_checkpoint_path+".solver";
+    const std::string manifest_identity=fit_input_content_identity(manifest_path_env,true).sha256;
+    const char* preflight_receipt_env=std::getenv("GPUMD_RPMD_JA_PREFLIGHT_RECEIPT");
+    if(preflight_receipt_env==nullptr||*preflight_receipt_env=='\0')
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: preflight receipt path is missing during controller startup");
+    const auto launch_receipt=read_feasibility_preflight_receipt(preflight_receipt_env);
+    feasibility_receipt_fields=launch_receipt;
+    verify_a0_reuse_package(feasibility_manifest_fields,launch_receipt,manifest_path_env,job_id_env,
+      a0_reuse_verified_state_bytes);
+    if(feasibility_manifest_value(launch_receipt,"job_id")!=job_id_env||
+       feasibility_manifest_value(launch_receipt,"manifest_path")!=manifest_path_env||
+       feasibility_manifest_value(launch_receipt,"resume_mode")!=(resume_requested?"1":"0")||
+       feasibility_manifest_value(launch_receipt,"checkpoint_path")!=controller_checkpoint_path)
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt does not bind the requested resume job and controller journal");
+    if(resume_requested){
+      if(feasibility_manifest_value(launch_receipt,"checkpoint_sha256")!=
+         fit_input_content_identity(controller_checkpoint_path,true).sha256)
+        throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: receipt checkpoint digest differs from the outer controller journal");
+      controller_journal=rpmd_ja_covariance_checkpoint::read_controller_journal(controller_checkpoint_path,manifest_identity);
+      if(controller_journal.job_id!=job_id_env)
+        throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: original job ID differs from the controller journal");
+      frozen_selection_resume=rpmd_ja_covariance_checkpoint::controller_has_frozen_selection(controller_journal);
+      if(controller_journal.selection_state=="FAILED_CLOSED")
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: journal records a terminal failed-closed selection");
+      if(frozen_selection_resume){
+        const auto frozen=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+          [&](const auto& candidate){return candidate.branch==controller_journal.frozen_candidate_branch;});
+        if(frozen==controller_journal.candidates.end()||!frozen->fit_complete||!frozen->converged||
+           frozen->theta.empty()||frozen->fit_state_sha256!=controller_journal.frozen_candidate_fit_state_sha256||
+           rpmd_ja_covariance_checkpoint::frozen_candidate_identity_sha256(controller_journal)!=
+             controller_journal.frozen_candidate_identity_sha256)
+          throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: frozen candidate or final probe identity changed");
+        const std::string frozen_state_path=options.output_path+".covariance_state.txt."+
+          controller_journal.frozen_candidate_branch;
+        if(fit_input_content_identity(frozen_state_path,true).sha256!=controller_journal.frozen_candidate_fit_state_sha256)
+          throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: frozen candidate fit state changed after selection");
+        const std::string development_input_identity=fit_input_content_identity(spool_path,true).sha256;
+        restored_development_response=read_blind_response_checkpoint(options.output_path+".development_checkpoint.txt",manifest_identity,
+          controller_journal.frozen_candidate_identity_sha256,development_input_identity,controller_journal.development_response_sha256,
+          controller_journal.common_probe_sources,controller_journal.common_probe_origins);
+        restored_development_response_present=true;
+        if(restored_development_response.theta!=frozen->theta)
+          throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: development response theta differs from the frozen candidate");
+        if(controller_journal.selection_state=="BLIND_PASSED"||controller_journal.selection_state=="PUBLISHING"||
+           controller_journal.selection_state=="PUBLISHED"){
+          const std::string blind_identity=fit_input_content_identity(options.covariance_blind_samples,true).sha256;
+          restored_blind_response=read_blind_response_checkpoint(options.output_path+".blind_checkpoint.txt",manifest_identity,
+            controller_journal.frozen_candidate_identity_sha256,blind_identity,controller_journal.blind_response_sha256,
+            controller_journal.common_probe_sources,controller_journal.common_probe_origins);
+          restored_blind_response_present=true;
+          if(restored_blind_response.theta!=frozen->theta)
+            throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: blind response theta differs from the frozen candidate");}
+        else if(controller_journal.selection_state=="BLIND_OPENED"&&!controller_journal.operation_in_progress)
+          throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: opened blind stage has no recoverable in-progress operation");
+        if(controller_journal.selection_state=="PUBLISHING"&&!controller_journal.operation_in_progress)
+          throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: publication stage has no recoverable in-progress operation");
+        if(controller_journal.selection_state=="PUBLISHING"){
+          const std::string staged=options.output_path+".stage."+
+            rpmd_ja_covariance_checkpoint::sha256(controller_journal.job_id).substr(0,16);
+          verify_publishing_artifact_pair(options.output_path,staged,controller_journal.publication_stage_output_sha256,
+            controller_journal.publication_stage_sidecar_sha256);
+          publication_payload_restored=!controller_journal.publication_stage_output_sha256.empty();
+          const std::string fit=options.output_path+".fit.txt",fit_tmp=fit+".tmp";
+          auto present=[](const std::string& path){rpmd_ja_file_io::ifstream input(path,std::ios::binary);return input.good();};
+          const bool fit_exists=present(fit),fit_tmp_exists=present(fit_tmp);
+          if(controller_journal.published_fit_sha256.empty()){
+            if(fit_exists)throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: uncommitted fit diagnostics cannot be overwritten");}
+          else if((!fit_exists&&!fit_tmp_exists)||
+              (fit_exists&&fit_input_content_identity(fit,true).sha256!=controller_journal.published_fit_sha256)||
+              (fit_tmp_exists&&fit_input_content_identity(fit_tmp,true).sha256!=controller_journal.published_fit_sha256))
+            throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: fit diagnostics do not match the publication journal");}
+        if(controller_journal.selection_state=="PUBLISHED"){
+          verify_published_feasibility_artifacts(options,controller_journal);
+          return false;}}
+      feasibility_limits.max_fit_family_gradients=static_cast<int>(controller_journal.max_fit_family_gradients);
+      feasibility_limits.max_fit_family_wall_seconds=controller_journal.max_fit_family_wall_seconds;
+      const rpmd_ja_covariance_checkpoint::ControllerJournal saved_controller_operation=controller_journal;
+      const bool controller_operation_interrupted=saved_controller_operation.operation_in_progress;
+      rpmd_ja_covariance_checkpoint::AcceptedPoint active_solver_checkpoint;
+      bool solver_operation_interrupted=false,solver_checkpoint_loaded=false;
+      const std::string active_branch_state=options.output_path+".covariance_state.txt."+controller_journal.branch;
+      rpmd_ja_file_io::ifstream completed_branch(active_branch_state,std::ios::binary);
+      rpmd_ja_file_io::ifstream active_solver_file(solver_checkpoint_path,std::ios::binary);
+      if(!completed_branch.good()){
+        if(active_solver_file.good()&&!controller_journal.active_candidate_started)
+          throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: stale solver checkpoint is not the active controller candidate");
+        if(active_solver_file.good()){
+          active_solver_checkpoint=rpmd_ja_covariance_checkpoint::read_checkpoint(solver_checkpoint_path,manifest_identity);
+          if(active_solver_checkpoint.job_id!=controller_journal.job_id||active_solver_checkpoint.branch!=controller_journal.branch||
+             active_solver_checkpoint.family!=controller_journal.family||active_solver_checkpoint.selection_state!="NOT_FROZEN"||
+             active_solver_checkpoint.active_phase!=controller_journal.active_phase||
+             active_solver_checkpoint.candidate_index!=controller_journal.next_candidate_index)
+            throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: active solver cursor differs from its outer controller journal");
+          solver_operation_interrupted=active_solver_checkpoint.operation_in_progress;
+          solver_checkpoint_loaded=true;
+        }
+      }
+      // Reconcile system-clock operation time through this boundary; the later steady-clock sample charges only the uncovered tail.
+      const double resume_epoch=std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+      const double resume_boundary=covariance_budget_now_seconds();
+      if(solver_checkpoint_loaded)rpmd_ja_covariance_checkpoint::reconcile_controller_resume_budget(controller_journal,
+        active_solver_checkpoint,feasibility_limits,feasibility_limits.wall_seconds,resume_epoch);
+      rpmd_ja_covariance_checkpoint::reconcile_controller_operation_budget(controller_journal,
+        saved_controller_operation,feasibility_limits,feasibility_limits.wall_seconds,resume_epoch);
+      const double budget_now=covariance_budget_now_seconds();
+      const double process_elapsed=rpmd_ja_covariance_checkpoint::resume_startup_elapsed(
+        feasibility_budget.start_seconds,resume_boundary,budget_now,solver_operation_interrupted||controller_operation_interrupted);
+      feasibility_budget.elapsed_seconds=controller_journal.elapsed_seconds+process_elapsed;
+      feasibility_budget.exact_gradients=static_cast<unsigned>(controller_journal.exact_gradients);
+      for(std::size_t phase=0;phase<controller_journal.phase_gradients.size();++phase){
+        feasibility_budget.phase_gradients[phase]=controller_journal.phase_gradients[phase];
+        feasibility_budget.phase_seconds[phase]=controller_journal.phase_seconds[phase];}
+      feasibility_budget.phase=static_cast<rpmd_ja_feasibility::Phase>(controller_journal.active_phase);
+      feasibility_budget.phase_seconds[controller_journal.active_phase]+=process_elapsed;
+      if(controller_journal.active_candidate_started)
+        controller_journal.active_candidate_elapsed_seconds+=process_elapsed;
+      feasibility_budget.last_seconds=budget_now;
+      feasibility_budget.start_seconds=budget_now-feasibility_budget.elapsed_seconds;
+      covariance_budget_observe_or_throw(budget,&feasibility_limits);
+      controller_resume=true;
+    }else{
+      controller_journal.job_id=job_id_env;controller_journal.identity_sha256=manifest_identity;
+    }
+    frozen_m1_minimum_support_count=feasibility_manifest_minimum_support(feasibility_manifest_fields);
+    feasibility_response_delta_tolerance=feasibility_manifest_response_delta_tolerance(feasibility_manifest_fields);
+    feasibility_candidate_cost_safety_factor=feasibility_manifest_candidate_cost_contract(feasibility_manifest_fields).safety_factor;
+    const auto experiment=feasibility_manifest_experiment_contract(feasibility_manifest_fields);
+    feasibility_lambda_factors=experiment.lambda_factors;
+    feasibility_development_max_blocks=experiment.max_development_blocks;
+    feasibility_development_min_blocks=experiment.min_development_blocks;
+    feasibility_statistics_storage_budget_bytes=experiment.statistics_storage_budget_bytes;
+  }
   double cut_guard=0.0,cut_target=0.0;
   if(!covariance_method){cut_guard=options.epsilon*stability_cut_guard_fraction;cut_target=options.epsilon+cut_guard;
     if(!std::isfinite(cut_guard)||!(cut_guard>0.0)||!std::isfinite(cut_target)||!(cut_target>options.epsilon))throw std::invalid_argument("native fit epsilon cannot represent the stability cut guard");}
   const int max_rounds=options.max_stability_rounds;
   if(!covariance_method){std::printf("rpmd_ja fit stability round limit=%d\n",max_rounds);
     std::printf("rpmd_ja fit stability cut epsilon=%.17g cut_guard=%.17g cut_target=%.17g\n",options.epsilon,cut_guard,cut_target);}
-  else std::printf("rpmd_ja fit method=gaussian_covariance_shrinkage rho=%.17g max_iter=%d direction=%s staged_barrier=%s; exact dense Cholesky is enabled\n",
-    options.covariance_shrinkage,options.max_covariance_iterations,options.covariance_trust_region?"trust_region":
+  else std::printf("rpmd_ja fit method=gaussian_covariance_shrinkage rho_effective=%.17g rho_configured=%.17g max_iter=%d direction=%s staged_barrier=%s; exact dense Cholesky is enabled\n",
+    effective_covariance_rho,options.covariance_shrinkage,options.max_covariance_iterations,options.covariance_trust_region?"trust_region":
       options.covariance_joint_block?"joint_block":options.covariance_block_newton?"block_newton":"BFGS",
       options.covariance_staged_barrier?"enabled":"disabled");
   const int n=atom.number_of_atoms;
@@ -6203,39 +11250,232 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const int d=3*n,train=static_cast<int>(2*frame_count/3),validation=static_cast<int>(frame_count)-train;
   if(n<2||atom.cpu_mass.size()!=static_cast<std::size_t>(n)||atom.cpu_type.size()!=static_cast<std::size_t>(n)||validation<1)
     throw std::runtime_error("native rpmd_ja fit requires initialized atom masses/types and at least three frames");
-  std::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
+  if(options.covariance_feasibility&&(train<feasibility_development_min_blocks||validation<feasibility_development_min_blocks))
+    throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: training or development split is smaller than the frozen minimum statistical block count");
+  rpmd_ja_file_io::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
   const SampleHeader header=read_header(in,frame_count,atom,box,options.temperature,false,sample_beads_from_header);
-  std::set<int> unique_types(header.types.begin(),header.types.end());
-  const int expected_probes=std::min(3*n-3,16+std::min(4,static_cast<int>(unique_types.size()))+4);
-  if(validation<=expected_probes)throw std::runtime_error("native fit requires at least " + std::to_string(expected_probes+1) + " held-out frames for its fixed probe policy");
+  const bool generate_raw=options.raw_input_path.empty();
+  const std::string generated_raw_path=options.output_path+".qraw",raw_path=generate_raw?generated_raw_path:options.raw_input_path;
+  const FitInputContentIdentity kernel_content_identity=fit_input_content_identity(options.kernel_table,options.covariance_feasibility);
+  FitInputContentIdentity raw_content_identity;
+  if(!generate_raw)raw_content_identity=fit_input_content_identity(raw_path,options.covariance_feasibility);
+  const std::uint64_t kernel_source_fingerprint=kernel_content_identity.fnv64;
+  std::uint64_t raw_source_fingerprint=raw_content_identity.fnv64;
+  if(options.covariance_feasibility)
+    verify_feasibility_source_content_hashes(feasibility_manifest_fields,kernel_content_identity,raw_content_identity);
+  covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
   std::vector<double> position(3*n),force_frame(3*n),r0(3*n,0.0);double step=0.0,previous=-std::numeric_limits<double>::infinity();
   read_training_r0(in,header,frame_count,static_cast<double>(options.sample_interval),r0);
+  std::vector<double> sqrt_atom_for_probes(static_cast<std::size_t>(n));
+  for(int atom_index=0;atom_index<n;++atom_index)sqrt_atom_for_probes[atom_index]=std::sqrt(header.masses[atom_index]);
+  std::vector<FixedPhysicalProbe> common_physical_probes;
+  if(options.covariance_feasibility)common_physical_probes=make_internal_statistics_probes(
+    make_fixed_physical_probes(r0,header.types,atom.cpu_atom_symbol,sqrt_atom_for_probes,box,options.cutoff),
+    sqrt_atom_for_probes,n);
+  const int base_probe_count=static_cast<int>(make_probes({},sqrt_atom_for_probes,header.types,n,
+    nullptr,nullptr,&common_physical_probes).size());
+  const int expected_probes=options.covariance_feasibility?base_probe_count:
+    std::min(3*n-3,base_probe_count+4);
+  if(validation<=expected_probes)throw std::runtime_error("native fit requires at least " + std::to_string(expected_probes+1) + " held-out frames for its fixed probe policy");
+  covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
   if(covariance_method)validate_fit_branches(in,header,frame_count,box,r0);
-  const std::string generated_raw_path=options.output_path+".qraw",raw_path=options.raw_input_path.empty()?generated_raw_path:options.raw_input_path;
   const std::string pack_path=options.output_path+".additive.tmp",fit_path=options.output_path+".fit.txt",fit_tmp=fit_path+".tmp",trace_path=options.output_path+".fit_trace.txt",witness_path=options.output_path+".cg_witness.txt",qp_state_path=options.output_path+".qp_state.txt",response_state_path=options.output_path+".response_state.txt";
+  const std::string publication_stage_output_path=options.output_path+".stage."+
+    rpmd_ja_covariance_checkpoint::sha256(controller_journal.job_id).substr(0,16);
   const std::string covariance_state_path=options.output_path+".covariance_state.txt";
-  const bool generate_raw=options.raw_input_path.empty();
-  {std::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(generated_raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),qp_state_old(qp_state_path),response_state_old(response_state_path),covariance_state_old(covariance_state_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
-    if(!kernel)throw std::runtime_error("native fit cannot read its qNEP kernel table");kernel.seekg(0,std::ios::end);const auto kernel_bytes=kernel.tellg();if(kernel_bytes<=0||kernel_bytes>std::numeric_limits<std::streamoff>::max())throw std::runtime_error("native fit qNEP kernel table has invalid or overflowing byte length");if(old.good()||side.good()||raw_old.good()||pack_old.good()||fit_old.good()||fit_tmp_old.good()||trace_old.good()||witness_old.good()||qp_state_old.good()||response_state_old.good()||covariance_state_old.good()||failure.good()||tmp.good()||side_tmp.good())throw std::runtime_error("native fit refuses to overwrite an existing output or scratch artifact");}
+  {rpmd_ja_file_io::ifstream kernel(options.kernel_table),old(options.output_path,std::ios::binary),side(options.output_path+".stability"),raw_old(generated_raw_path,std::ios::binary),pack_old(pack_path,std::ios::binary),fit_old(fit_path),fit_tmp_old(fit_tmp),trace_old(trace_path),witness_old(witness_path),qp_state_old(qp_state_path),response_state_old(response_state_path),covariance_state_old(covariance_state_path),failure(options.output_path+".failure.txt"),tmp(options.output_path+".tmp"),side_tmp(options.output_path+".stability.tmp");
+    if(!kernel)throw std::runtime_error("native fit cannot read its qNEP kernel table");kernel.seekg(0,std::ios::end);const auto kernel_bytes=kernel.tellg();if(kernel_bytes<=0||kernel_bytes>std::numeric_limits<std::streamoff>::max())throw std::runtime_error("native fit qNEP kernel table has invalid or overflowing byte length");
+    rpmd_ja_file_io::ifstream outer_checkpoint(controller_checkpoint_path,std::ios::binary),solver_checkpoint(solver_checkpoint_path,std::ios::binary);
+    const bool publishing_resume=controller_resume&&controller_journal.selection_state=="PUBLISHING";
+    const auto committed_file_matches=[](const std::string& path,const std::string& digest){
+      rpmd_ja_file_io::ifstream input(path,std::ios::binary);return !input.good()||
+        (!digest.empty()&&fit_input_content_identity(path,true).sha256==digest);};
+    const bool final_output_allowed=publishing_resume&&committed_file_matches(options.output_path,controller_journal.publication_stage_output_sha256);
+    const bool final_sidecar_allowed=publishing_resume&&committed_file_matches(options.output_path+".stability",controller_journal.publication_stage_sidecar_sha256);
+    const bool fit_output_allowed=publishing_resume&&
+      committed_file_matches(fit_path,controller_journal.published_fit_sha256)&&
+      committed_file_matches(fit_tmp,controller_journal.published_fit_sha256);
+    const bool committed_snapshots_allowed=frozen_selection_resume;
+    rpmd_ja_file_io::ifstream development_snapshot(options.output_path+".development_checkpoint.txt",std::ios::binary),
+      blind_snapshot(options.output_path+".blind_checkpoint.txt",std::ios::binary);
+    if((old.good()&&!final_output_allowed)||(side.good()&&!final_sidecar_allowed)||raw_old.good()||
+       (pack_old.good()&&!publishing_resume)||
+       ((fit_old.good()||fit_tmp_old.good())&&!fit_output_allowed)||witness_old.good()||qp_state_old.good()||response_state_old.good()||covariance_state_old.good()||failure.good()||tmp.good()||side_tmp.good()||
+       ((development_snapshot.good()||blind_snapshot.good())&&!committed_snapshots_allowed)||
+       (!controller_resume&&(outer_checkpoint.good()||solver_checkpoint.good()))||
+       (!controller_resume&&trace_old.good()))
+      throw std::runtime_error("native fit refuses to overwrite an existing output or scratch artifact");
+    if(controller_resume&&!trace_old.good())throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: native fit trace is missing from the interrupted job");}
+  if(options.covariance_feasibility){
+    const char* branch_labels[]={"A0","A1","B0","B1","B2","C0","C1","C2"};
+    for(const char* label:branch_labels){rpmd_ja_file_io::ifstream state(covariance_state_path+"."+label,std::ios::binary);
+      if(state.good()&&!controller_resume)throw std::runtime_error("native fit refuses to overwrite an existing feasibility branch checkpoint");}
+  }
+  covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
   const auto sample_statistics_started=std::chrono::steady_clock::now();
-  const FixedProbeStatistics sample_statistics=collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance,&box);
+  const FixedProbeStatistics sample_statistics=collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance,&box,&common_physical_probes);
   const double sample_statistics_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-sample_statistics_started).count();
   print_fixed_probe_summary(sample_statistics,header,static_cast<double>(options.sample_interval),static_cast<std::uint64_t>(train),options.ibp_tolerance,sample_statistics_seconds);
-  std::ofstream trace(trace_path,std::ios::out|std::ios::trunc);if(!trace)throw std::runtime_error("cannot create native fit trace: "+trace_path);
+  rpmd_ja_file_io::ofstream trace(trace_path,std::ios::out|(controller_resume?std::ios::app:std::ios::trunc));if(!trace)throw std::runtime_error("cannot create native fit trace: "+trace_path);
+  std::uint64_t observed_live_disk_peak_bytes=0,observed_min_host_available_bytes=std::numeric_limits<std::uint64_t>::max();
+  std::string observed_live_disk_peak_stage="NOT_OBSERVED";
+  auto observe_storage_lifetime=[&](const char* stage,const std::uint64_t minimum_free_disk){
+    const std::vector<std::string> files={pack_path,pack_path+".tmp",options.output_path,options.output_path+".stability",
+      options.output_path+".a0_reuse.record",
+      publication_stage_output_path,publication_stage_output_path+".stability",
+      publication_stage_output_path+".tmp",publication_stage_output_path+".stability.tmp",
+      options.output_path+".tmp",options.output_path+".stability.tmp",fit_path,fit_tmp,trace_path,witness_path,
+      qp_state_path,response_state_path,covariance_state_path,controller_checkpoint_path,solver_checkpoint_path,
+      options.output_path+".failure.txt"};
+    std::uint64_t live_bytes=0;
+    auto add_file=[&](const std::string& path){rpmd_ja_file_io::ifstream input(path,std::ios::binary);if(!input)return;
+      input.seekg(0,std::ios::end);const std::streamoff size=input.tellg();
+      if(size<0||live_bytes>std::numeric_limits<std::uint64_t>::max()-static_cast<std::uint64_t>(size))
+        throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: live disk-file size accounting overflow");
+      live_bytes+=static_cast<std::uint64_t>(size);};
+    for(const std::string& path:files)add_file(path);
+    for(const char* label:{"A0","A1","B0","B1","B2","C0","C1","C2"})
+      add_file(covariance_state_path+"."+label);
+    if(generate_raw)add_file(generated_raw_path);
+    for(const std::string& path:saved_recovery_witness_paths)add_file(path);
+    const std::uint64_t free_disk=rpmd_ja_file_io::available_disk_bytes_for_path(options.output_path);
+    const std::uint64_t free_host=rpmd_ja_file_io::available_physical_memory_bytes();
+    if(live_bytes>observed_live_disk_peak_bytes){observed_live_disk_peak_bytes=live_bytes;observed_live_disk_peak_stage=stage;}
+    observed_min_host_available_bytes=std::min(observed_min_host_available_bytes,free_host);
+    trace<<"RESOURCE_LIFETIME stage "<<stage<<" tracked_output_files_live_bytes "<<live_bytes
+      <<" host_available_bytes "<<free_host<<" host_known_object_lifecycle_bound_bytes "<<host_required
+      <<" host_allocator_peak_complete 0 host_certificate_precision CONSERVATIVE_KNOWN_OBJECTS_NOT_COMPLETE"
+      <<" disk_available_bytes "<<free_disk<<" disk_certificate_precision CONSERVATIVE_WRITE_RESERVE_NOT_COMPLETE"
+      <<" minimum_free_disk_for_remaining_writes_bytes "<<minimum_free_disk
+      <<" observed_live_disk_peak_bytes "<<observed_live_disk_peak_bytes
+      <<" observed_live_disk_peak_stage "<<observed_live_disk_peak_stage
+      <<" observed_min_host_available_bytes "<<observed_min_host_available_bytes
+      <<" tracked_names "<<files.size()+8+saved_recovery_witness_paths.size()+(generate_raw?1:0)<<'\n';trace.flush();
+    if(free_host<host_required)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: available host memory fell below the tracked prepare/readback working-set bound");
+    if(free_disk<minimum_free_disk)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: available disk space fell below the remaining write reserve");
+  };
+  if(controller_resume)trace<<"\nFEASIBILITY_RESUME stage "<<controller_journal.stage<<" branch "<<controller_journal.branch
+    <<" family "<<controller_journal.family<<" next_candidate_index "<<controller_journal.next_candidate_index
+    <<" elapsed_seconds_before_rebuild "<<controller_journal.elapsed_seconds
+    <<" exact_gradients_before_rebuild "<<controller_journal.exact_gradients
+    <<" selection_state "<<controller_journal.selection_state<<"\n";
+  auto persist_measured_costs=[&](){
+    if(!budget||controller_checkpoint_path.empty())return;
+    const auto clock_status=rpmd_ja_feasibility::advance_clock(feasibility_budget,covariance_budget_now_seconds());
+    if(clock_status!=rpmd_ja_feasibility::BudgetResult::OK)
+      throw std::runtime_error(std::string("FEASIBILITY_CHECKPOINT_FAIL: invalid cost-accounting clock: ")+
+        covariance_budget_result_name(clock_status));
+    controller_journal.elapsed_seconds=feasibility_budget.elapsed_seconds;
+    controller_journal.exact_gradients=feasibility_budget.exact_gradients;
+    controller_journal.active_phase=rpmd_ja_feasibility::phase_index(feasibility_budget.phase);
+    for(std::size_t phase=0;phase<controller_journal.phase_gradients.size();++phase){
+      controller_journal.phase_gradients[phase]=feasibility_budget.phase_gradients[phase];
+      controller_journal.phase_seconds[phase]=feasibility_budget.phase_seconds[phase];}
+    controller_journal.max_fit_family_gradients=static_cast<unsigned>(std::max(0,feasibility_limits.max_fit_family_gradients));
+    controller_journal.max_fit_family_wall_seconds=feasibility_limits.max_fit_family_wall_seconds;
+    controller_journal.candidate_cost_samples=measured_candidate_costs.samples;
+    controller_journal.candidate_cost_max_seconds=measured_candidate_costs.maximum_seconds;
+    controller_journal.candidate_cost_partial_seconds=measured_candidate_costs.partial_elapsed_lower_bound_seconds;
+    for(unsigned stage=0;stage<rpmd_ja_feasibility::resource_stage_count;++stage){
+      controller_journal.stage_completed_calls[stage]=measured_stage_costs[stage].completed_calls;
+      controller_journal.stage_max_seconds[stage]=measured_stage_costs[stage].max_seconds;
+      controller_journal.stage_partial_seconds[stage]=measured_stage_costs[stage].partial_elapsed_lower_bound_seconds;}
+    rpmd_ja_covariance_checkpoint::write_controller_journal(controller_checkpoint_path,controller_journal);
+  };
+  bool stage_cost_record_failure=false;
+  auto stage_cost_recorder=[&](const rpmd_ja_feasibility::ResourceStage stage){
+    return std::function<void(double,bool)>([&,stage](const double seconds,const bool complete){
+      if(!budget)return;
+      auto& profile=measured_stage_costs[rpmd_ja_feasibility::resource_stage_index(stage)];
+      const bool recorded=complete?rpmd_ja_feasibility::record_stage_cost(profile,seconds):
+        rpmd_ja_feasibility::record_partial_stage_cost(profile,seconds);
+      try{
+        if(!recorded)throw std::runtime_error("measured stage duration could not be recorded");
+        persist_measured_costs();
+      }catch(const std::exception& error){
+        stage_cost_record_failure=true;
+        trace<<"MEASURED_STAGE_COST_PERSIST_FAIL stage "<<static_cast<unsigned>(stage)
+          <<" detail "<<std::quoted(error.what())<<"\n";trace.flush();}
+    });
+  };
+  auto check_remaining_cost=[&](const char* boundary,const rpmd_ja_feasibility::RemainingWork& work){
+    const auto prediction=rpmd_ja_feasibility::predict_remaining_cost(feasibility_budget,feasibility_limits,
+      measured_stage_costs,work,feasibility_candidate_cost_safety_factor);
+    const char* status=prediction.status==rpmd_ja_feasibility::CostPlanStatus::ESTIMATED_WITHIN_BUDGET?
+      "ESTIMATED_WITHIN_BUDGET":prediction.status==rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET?
+      "INSUFFICIENT_REMAINING_BUDGET":prediction.status==rpmd_ja_feasibility::CostPlanStatus::INCONCLUSIVE_NO_STAGE_BASELINE?
+      "INCONCLUSIVE_NO_STAGE_BASELINE":"INVALID";
+    unsigned unknown=0;
+    for(unsigned stage=0;stage<rpmd_ja_feasibility::resource_stage_count;++stage)
+      if(work.calls[stage]&&measured_stage_costs[stage].completed_calls==0)++unknown;
+    trace<<"REMAINING_COST_PLAN boundary "<<boundary<<" status "<<status
+      <<" unknown_required_stages "<<unknown<<" projected_fit_seconds "<<prediction.fit_seconds
+      <<" projected_validation_seconds "<<prediction.validation_seconds
+      <<" lower_bound_validation_seconds ";
+    for(unsigned stage=0;stage<rpmd_ja_feasibility::resource_stage_count;++stage)
+      if(work.calls[stage])trace<<stage<<':'<<prediction.stage_lower_bound_seconds[stage]<<',';
+    trace<<" available_fit_seconds "<<prediction.available_fit_seconds
+      <<" available_total_seconds "<<prediction.available_total_seconds
+      <<" safety_factor "<<prediction.safety_factor<<" unknown_is_not_zero_cost 1"
+      <<" hard_budget_still_authoritative 1\n";trace.flush();
+    if(prediction.status==rpmd_ja_feasibility::CostPlanStatus::INVALID)
+      throw std::runtime_error(std::string("IMPLEMENTATION_FAIL: invalid remaining-cost plan at ")+boundary);
+    return prediction.status;
+  };
   trace<<std::setprecision(17)<<"evidence SAMPLED; "<<(covariance_method?"exact covariance SPD, held-out response, prepare and stored-D certificate remain required; no stability-cut feedback is used; IBP is diagnostic only":"QP_PASS is current finite cut-set only; Ritz/CG, held-out response and final stored-D Cholesky remain required; IBP is diagnostic only")
     <<"\nfit_method "<<(covariance_method?"gaussian_covariance_shrinkage":"force_least_squares_cut_qp")
     <<"\nreference_class finite_temperature_additive\n";
+  if(budget){
+    (void)verify_feasibility_preflight(options.output_path);
+    const char* receipt_path=std::getenv("GPUMD_RPMD_JA_PREFLIGHT_RECEIPT");
+    if(receipt_path==nullptr||*receipt_path=='\0')throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: receipt path disappeared after validation");
+    const auto receipt=read_feasibility_preflight_receipt(receipt_path);
+    const char* provenance_samples[]={"training","blind"};
+    for(const char* sample:provenance_samples){
+      trace<<"FEASIBILITY_SOURCE_PROVENANCE sample "<<sample
+        <<" byte_integrity "<<feasibility_manifest_value(receipt,std::string(sample)+"_integrity_status")
+        <<" metadata_status "<<feasibility_manifest_value(receipt,std::string(sample)+"_provenance_status")
+        <<" configuration_match "<<feasibility_manifest_value(receipt,std::string(sample)+"_configuration_match_status")
+        <<" source_job_id "<<std::quoted(feasibility_manifest_value(receipt,std::string(sample)+"_source_job_id"))
+        <<" source_run_id "<<std::quoted(feasibility_manifest_value(receipt,std::string(sample)+"_source_run_id"))<<'\n';}
+    trace<<"FEASIBILITY_SOURCE_RELATION status "
+      <<feasibility_manifest_value(receipt,"provenance_source_relation_status")<<'\n';
+  }
   if(!covariance_method)trace<<"rpmd_ja fit stability round limit="<<max_rounds<<'\n';
   trace<<"candidate_identity strategy native_additive_fixed_cutoff_graph output "<<std::quoted(options.output_path)<<" samples "<<std::quoted(spool_path)<<" raw "<<std::quoted(raw_path)
     <<"\ncandidate_parameters cutoff_A="<<options.cutoff<<" epsilon="<<options.epsilon<<" response_tolerance="<<options.response_tolerance
     <<" fd_step="<<options.fd_step<<" temperature_K="<<options.temperature<<" sample_interval="<<options.sample_interval;
-  if(covariance_method)trace<<" shrinkage_strength="<<options.covariance_shrinkage<<" max_covariance_iterations="<<options.max_covariance_iterations;
+  if(covariance_method)trace<<(options.covariance_feasibility?" rho_A":" rho_effective")<<'='<<(options.covariance_feasibility?options.covariance_shrinkage:effective_covariance_rho)
+    <<" max_covariance_iterations="<<options.max_covariance_iterations;
   if(covariance_method)trace<<"\nstability_cut_policy NONE covariance_cholesky_enforces_D_minus_epsilon_I_SPD";
   else trace<<"\nstability_cut_policy epsilon="<<options.epsilon<<" cut_guard="<<cut_guard<<" cut_target="<<cut_target<<" guard_fraction="<<stability_cut_guard_fraction;
   trace<<"\nsample_IBP_status "<<sample_statistics.ibp_band.status<<" estimate "<<sample_statistics.ibp_band.estimate<<" q99_radius "<<sample_statistics.ibp_band.radius
     <<" interval "<<sample_statistics.ibp_band.lower<<' '<<sample_statistics.ibp_band.upper<<" tolerance "<<options.ibp_tolerance<<'\n';
   write_bootstrap_diagnostic(trace,"sample_IBP_DIAGNOSTIC",sample_statistics.ibp_band);
-  write_probe_origin_diagnostics(trace,sample_statistics);trace.flush();if(!trace)throw std::runtime_error("failed writing native fit evidence header: "+trace_path);
+  write_probe_origin_diagnostics(trace,sample_statistics);
+  const std::string physical_probe_prefix="FIXED_PHYSICAL_";
+  const int physical_probe_rank=static_cast<int>(std::count_if(sample_statistics.sources.begin(),sample_statistics.sources.end(),
+    [&](const std::string& source){return source.compare(0,physical_probe_prefix.size(),physical_probe_prefix)==0;}));
+  trace<<"FIXED_PROBE_POLICY physical_channel_candidates "<<common_physical_probes.size()<<" physical_channel_rank "
+    <<physical_probe_rank<<" total_common_rank "<<sample_statistics.probes<<" frozen_for_all_candidates 1\n";
+  if(budget)trace<<"\nfeasibility_policy version=RPJAFEAS9 wall_seconds="<<feasibility_limits.wall_seconds
+    <<" max_exact_gradients="<<feasibility_limits.max_exact_gradients<<" validation_reserve_fraction="<<feasibility_limits.validation_reserve_fraction
+    <<" a_branch_gradients="<<feasibility_limits.max_a_branch_gradients<<" family_gradient_cap="<<feasibility_limits.max_fit_family_gradients
+    <<" a_wall_fraction="<<feasibility_limits.a_wall_fraction
+    <<" candidate_cost_stop_rule MAX_COMPLETE_OR_PARTIAL_LOWER_BOUND_SECONDS_V1 candidate_cost_safety_factor="
+    <<feasibility_candidate_cost_safety_factor<<" lambda_factors";
+  if(budget){for(const double factor:feasibility_lambda_factors)trace<<' '<<factor;
+    trace<<" development_blocks_max "<<feasibility_development_max_blocks
+      <<" development_blocks_min "<<feasibility_development_min_blocks
+      <<" development_block_rule CONTIGUOUS_EQUAL_FRAME_COUNTS_V1"
+      <<" statistics_storage_budget_bytes "<<feasibility_statistics_storage_budget_bytes
+      <<" b_c_wall_split EQUAL_REMAINING_FIT_TIME_V1"
+      <<" b_c_gradient_split EQUAL_REMAINING_EXACT_GRADIENTS_V1 resume_supported=1"
+      <<" resume_scope FROZEN_SELECTION_BLIND_PUBLISH controller_journal_and_accepted_point_required=1\n";}
+  trace.flush();if(!trace)throw std::runtime_error("failed writing native fit evidence header: "+trace_path);
+  covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
   if(ibp_statistics_numerically_invalid(sample_statistics.ibp_band)){
     trace<<"PREFLIGHT_NUMERICAL_FAILURE sample_IBP_status "<<sample_statistics.ibp_band.status<<"\n";trace.flush();
     std::ostringstream failure;failure<<std::setprecision(17)<<"NATIVE_FIT_SAMPLE_IBP_NUMERICAL_FAILURE candidate_identity=native_additive_fixed_cutoff_graph output="
@@ -6246,9 +11486,57 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   // Rewind to the first frame for streaming block-QR fitting.
   in.clear();in.seekg(header.frames);
   previous=-std::numeric_limits<double>::infinity();
-  const Graph graph=make_graph(r0,header.types,box,options.cutoff);
-  const std::size_t psize=6*graph.type_pairs.size();
+  Graph graph=make_graph(r0,header.types,box,options.cutoff);
+  std::size_t psize=static_cast<std::size_t>(graph.base_parameter_count);
+  Graph structured_graph;
+  if(options.covariance_feasibility){
+    covariance_budget_observe_or_throw(budget,&feasibility_limits);
+    if(atom.cpu_atom_symbol.size()!=static_cast<std::size_t>(n))
+      throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: M1 requires explicit per-atom symbols");
+    structured_graph=graph;
+    const auto& m1=build_m1_local_basis(structured_graph,r0,header.types,atom.cpu_atom_symbol,atom.cpu_mass,box,
+      options.cutoff,frozen_m1_minimum_support_count);
+    trace<<"M1_BASIS status "<<m1.status<<" base_parameters "<<m1.base_parameter_count<<" raw_local_parameters "<<m1.raw_parameter_count
+      <<" added_parameters "<<m1.added_parameter_count<<" accepted_bridges "<<m1.accepted_bridge_count
+      <<" ambiguous_bridges "<<m1.ambiguous_bridge_count<<" unclassified_edges "<<m1.unclassified_edge_count
+      <<" support_policy "<<std::quoted(m1.support_policy)<<" frozen_bridge_rule "<<std::quoted(m1.frozen_bridge_rule)
+      <<" minimum_support_count "<<m1.minimum_support_count<<" third_gap_ambiguity_tolerance "<<m1.third_gap_ambiguity_tolerance
+      <<" a0_rule "<<std::quoted(m1.a0_rule)<<" operator_map_entry_count "<<m1.operator_map_entry_count
+      <<" operator_map_bytes_estimate "<<m1.operator_map_bytes_estimate
+      <<" operator_map_estimate_scope "<<std::quoted(m1.operator_map_estimate_scope)<<'\n';
+    trace.flush();
+    covariance_budget_observe_or_throw(budget,&feasibility_limits);
+  }
   if(psize==0||psize>static_cast<std::size_t>(std::numeric_limits<int>::max()))throw std::runtime_error("native fit has an invalid parameter count");
+  if(options.covariance_feasibility&&feasibility_manifest_value(feasibility_receipt_fields,"cost_baseline_status")=="VERIFIED"){
+    auto baseline_count=[&](const char* key){const std::string& text=feasibility_manifest_value(feasibility_receipt_fields,key);
+      std::size_t consumed=0;unsigned long long value=0;try{value=std::stoull(text,&consumed);}catch(...){
+        throw std::runtime_error(std::string("FEASIBILITY_COST_BASELINE_FAIL: invalid ")+key);}
+      if(consumed!=text.size())throw std::runtime_error(std::string("FEASIBILITY_COST_BASELINE_FAIL: invalid ")+key);
+      return value;};
+    if(baseline_count("cost_baseline_atom_count")!=static_cast<unsigned long long>(n)||
+       baseline_count("cost_baseline_sample_frames")!=frame_count||
+       baseline_count("cost_baseline_training_frames")!=static_cast<unsigned long long>(train)||
+       baseline_count("cost_baseline_development_frames")!=static_cast<unsigned long long>(validation)||
+       baseline_count("cost_baseline_m0_parameter_count")!=psize||
+       baseline_count("cost_baseline_m1_parameter_count")!=static_cast<unsigned long long>(structured_graph.parameter_count))
+      throw std::runtime_error("FEASIBILITY_COST_BASELINE_FAIL: verified baseline does not match the native graph dimensions");
+    trace<<"COST_BASELINE status IDENTITY_AND_DIMENSIONS_VERIFIED candidate_seconds "
+      <<feasibility_manifest_value(feasibility_receipt_fields,"cost_baseline_candidate_seconds")
+      <<" m0_parameters "<<psize<<" m1_parameters "<<structured_graph.parameter_count
+      <<" machine_fingerprint "<<feasibility_manifest_value(feasibility_receipt_fields,"cost_baseline_machine_fingerprint")<<'\n';trace.flush();
+  }else if(options.covariance_feasibility)
+    trace<<"COST_BASELINE status NOT_PROVIDED predictor_uses_current_run_measurements_and_reports_unknown_stages 1 hard_budget_still_authoritative 1\n";
+  covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
+  const NativeAdditivePackageEstimate package_estimate_m0=estimate_native_additive_package_size(graph,n);
+  const NativeAdditivePackageEstimate package_estimate_m1=options.covariance_feasibility?
+    estimate_native_additive_package_size(structured_graph,n):package_estimate_m0;
+  const std::uint64_t estimated_package_bytes=std::max(package_estimate_m0.bytes,package_estimate_m1.bytes);
+  const std::size_t estimated_package_max_neighbors=std::max(package_estimate_m0.maximum_site_neighbors,
+    package_estimate_m1.maximum_site_neighbors);
+  covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
+  trace<<"RESOURCE_PREFLIGHT additive_package_bytes "<<estimated_package_bytes<<" maximum_site_neighbors "
+    <<estimated_package_max_neighbors<<" estimate_scope MAX_M0_M1_EXACT_SERIALIZED_BYTES\n";trace.flush();
   std::uint64_t design_bytes=0,qr_bytes=0;
   if(!covariance_method){const std::uint64_t frame_design=static_cast<std::uint64_t>(d)*psize,padded_rows=std::max<std::uint64_t>(d,psize);
     if(frame_design>std::numeric_limits<std::size_t>::max()/sizeof(double)||padded_rows>std::numeric_limits<std::size_t>::max()/psize/sizeof(double)||psize>std::numeric_limits<std::size_t>::max()/psize/sizeof(double))
@@ -6266,15 +11554,222 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const std::uint64_t raw_elements=2*vd64+7*dd64+18;if(raw_elements>std::numeric_limits<std::uint64_t>::max()/sizeof(double))throw std::runtime_error("native fit qraw byte estimate overflows");
   const std::uint64_t raw_bytes=raw_elements*sizeof(double);
   if(dd64>std::numeric_limits<std::size_t>::max()/sizeof(double)||raw_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))throw std::runtime_error("native fit qraw/Hessian exceeds host or file-offset limits");
+  constexpr std::uint64_t disk_margin_bytes=1024ULL*1024*1024;
+  std::uint64_t disk_required=disk_margin_bytes;
+  auto add_disk_requirement=[&](const std::uint64_t bytes){if(disk_required>std::numeric_limits<std::uint64_t>::max()-bytes)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: disk-space estimate overflows");disk_required+=bytes;};
+  auto checked_multiplicity_bytes=[&](const std::uint64_t bytes,const std::uint64_t copies){
+    if(copies&&bytes>std::numeric_limits<std::uint64_t>::max()/copies)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: known-object lifecycle estimate overflows");
+    return bytes*copies;};
+  if(generate_raw)add_disk_requirement(raw_bytes);
+  const std::uint64_t package_staging_peak_bytes=checked_multiplicity_bytes(estimated_package_bytes,2);
+  const std::uint64_t reference_staging_peak_bytes=checked_multiplicity_bytes(raw_bytes,2);
+  constexpr std::uint64_t feasibility_controller_disk_reserve_bytes=64ULL*1024*1024;
+  add_disk_requirement(package_staging_peak_bytes);
+  add_disk_requirement(reference_staging_peak_bytes);
+  if(options.covariance_feasibility)add_disk_requirement(feasibility_controller_disk_reserve_bytes);
+  covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
+  const std::uint64_t disk_available=rpmd_ja_file_io::available_disk_bytes_for_path(options.output_path);
+  trace<<"RESOURCE_PREFLIGHT disk_available_bytes "<<disk_available<<" disk_required_bytes "<<disk_required
+    <<" reference_staging_lifecycle_bytes "<<reference_staging_peak_bytes
+    <<" generated_qraw_bytes "<<(generate_raw?raw_bytes:0)
+    <<" additive_package_staging_lifecycle_bytes "<<package_staging_peak_bytes
+    <<" feasibility_controller_snapshot_checkpoint_and_A0_reuse_reserve_bytes "<<
+      (options.covariance_feasibility?feasibility_controller_disk_reserve_bytes:0)
+    <<" safety_margin_bytes "<<disk_margin_bytes
+    <<" certificate_precision CONSERVATIVE_KNOWN_DISK_OBJECTS_NOT_COMPLETE\n";trace.flush();
+  if(disk_available<disk_required)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: available disk space is below the package, reference, and safety-margin estimate");
+  auto host_package_working_set=[&](const Graph& candidate,const NativeAdditivePackageEstimate& estimate){
+    const std::uint64_t edge_count=static_cast<std::uint64_t>(candidate.edges.size());
+    const std::uint64_t term_count=static_cast<std::uint64_t>(candidate.local_terms.size());
+    if(edge_count>std::numeric_limits<std::uint64_t>::max()/2||term_count>std::numeric_limits<std::uint64_t>::max()/6)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host graph estimate overflows");
+    const std::uint64_t base_slots=2*edge_count,local_slots=6*term_count;
+    if(base_slots>std::numeric_limits<std::uint64_t>::max()-local_slots)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host graph estimate overflows");
+    const std::uint64_t slots=base_slots+local_slots;
+    if(slots>std::numeric_limits<std::uint64_t>::max()/256)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host graph estimate overflows");
+    std::uint64_t bytes=slots*256;
+    const std::uint64_t containers=static_cast<std::uint64_t>(n)*
+      (3*sizeof(std::vector<SiteEdge>)+sizeof(std::map<std::array<int,4>,int>));
+    if(bytes>std::numeric_limits<std::uint64_t>::max()-containers)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host graph estimate overflows");
+    bytes+=containers;
+    if(estimate.maximum_site_neighbors>static_cast<std::size_t>(std::numeric_limits<std::uint64_t>::max()/3))
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host site-block estimate overflows");
+    const std::uint64_t q=3*static_cast<std::uint64_t>(estimate.maximum_site_neighbors);
+    if(q&&q>std::numeric_limits<std::uint64_t>::max()/q/sizeof(double))
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host site-block estimate overflows");
+    const std::uint64_t quadratic_bytes=q*q*sizeof(double),linear_bytes=q*sizeof(double);
+    const std::uint64_t edge_bytes=static_cast<std::uint64_t>(estimate.maximum_site_neighbors)*sizeof(SiteEdge);
+    if(quadratic_bytes>std::numeric_limits<std::uint64_t>::max()-linear_bytes||
+       quadratic_bytes+linear_bytes>std::numeric_limits<std::uint64_t>::max()-edge_bytes)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host site-block estimate overflows");
+    const std::uint64_t block_bytes=quadratic_bytes+linear_bytes+edge_bytes;
+    if(bytes>std::numeric_limits<std::uint64_t>::max()-block_bytes)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host site-block estimate overflows");
+    return bytes+block_bytes;
+  };
+  const std::uint64_t host_graph_m0_bytes=host_package_working_set(graph,package_estimate_m0);
+  const std::uint64_t host_graph_m1_bytes=options.covariance_feasibility?
+    host_package_working_set(structured_graph,package_estimate_m1):0;
+  if(host_graph_m0_bytes>std::numeric_limits<std::uint64_t>::max()-host_graph_m1_bytes)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: simultaneous graph estimate overflows");
+  const std::uint64_t host_graph_lifecycle_bytes=host_graph_m0_bytes+host_graph_m1_bytes;
+  const std::uint64_t host_raw_reference_lifecycle_bytes=checked_multiplicity_bytes(raw_bytes,2);
+  constexpr std::uint64_t host_safety_margin_bytes=512ULL*1024*1024;
+  std::uint64_t host_required=host_safety_margin_bytes;
+  auto add_host_requirement=[&](const std::uint64_t bytes){if(host_required>std::numeric_limits<std::uint64_t>::max()-bytes)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: host memory estimate overflows");host_required+=bytes;};
+  add_host_requirement(host_raw_reference_lifecycle_bytes);
+  add_host_requirement(estimated_package_bytes);
+  add_host_requirement(host_graph_lifecycle_bytes);
+  if(options.covariance_feasibility)add_host_requirement(feasibility_statistics_storage_budget_bytes);
+  const std::uint64_t host_available=rpmd_ja_file_io::available_physical_memory_bytes();
+  trace<<"RESOURCE_PREFLIGHT host_available_bytes "<<host_available<<" host_required_bytes "<<host_required
+    <<" raw_and_reference_lifecycle_bytes "<<host_raw_reference_lifecycle_bytes
+    <<" additive_package_object_bytes "<<estimated_package_bytes
+    <<" simultaneous_m0_m1_graph_working_set_bytes "<<host_graph_lifecycle_bytes
+    <<" statistics_storage_budget_bytes "<<(options.covariance_feasibility?feasibility_statistics_storage_budget_bytes:0)
+    <<" safety_margin_bytes "<<host_safety_margin_bytes
+    <<" certificate_precision CONSERVATIVE_KNOWN_HOST_OBJECTS_NOT_COMPLETE\n";trace.flush();
+  if(host_available<host_required)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: available host memory is below the prepare/readback and package working-set estimate");
   std::size_t free_before=0,total_before=0;if(cudaMemGetInfo(&free_before,&total_before)!=cudaSuccess)throw std::runtime_error("native fit CUDA memory preflight failed");
+  const RpmdJAPrepareWorkspaceSizes prepare_workspace=query_rpmd_ja_qnep_prepare_workspace_sizes(n);
+  const std::uint64_t matrix_bytes=dd64*sizeof(double),internal_dimension=d64-3;
+  if(internal_dimension>std::numeric_limits<std::uint64_t>::max()/internal_dimension/sizeof(double))
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: prepare GPU estimate overflows");
+  const std::uint64_t physical_bytes=internal_dimension*internal_dimension*sizeof(double);
+  constexpr std::uint64_t prepare_gpu_margin_bytes=128ULL*1024*1024;
+  auto checked_gpu_product=[&](const std::uint64_t left,const std::uint64_t right){
+    if(right&&left>std::numeric_limits<std::uint64_t>::max()/right)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: curvature workspace estimate overflows");
+    return left*right;};
+  auto checked_gpu_sum=[&](const std::uint64_t left,const std::uint64_t right){
+    if(left>std::numeric_limits<std::uint64_t>::max()-right)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: curvature workspace estimate overflows");
+    return left+right;};
+  std::uint64_t fit_system_auxiliary_bytes=0;
+  if(options.covariance_feasibility){
+    constexpr std::uint64_t solve_batch=32,trace_batch=128;
+    const std::uint64_t parameters=static_cast<std::uint64_t>(structured_graph.parameter_count);
+    const std::uint64_t raw_parameters=static_cast<std::uint64_t>(structured_graph.raw_local_parameter_count);
+    const std::uint64_t base_parameters=raw_parameters?
+      static_cast<std::uint64_t>(structured_graph.base_parameter_count):parameters;
+    if(parameters<base_parameters)
+      throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: graph parameter workspace estimate is invalid");
+    const std::uint64_t added_parameters=parameters-base_parameters;
+    const std::uint64_t edges=static_cast<std::uint64_t>(std::max(graph.edges.size(),structured_graph.edges.size()));
+    const std::uint64_t terms=static_cast<std::uint64_t>(structured_graph.local_terms.size());
+    auto add_fit_workspace=[&](const std::uint64_t bytes){fit_system_auxiliary_bytes=checked_gpu_sum(fit_system_auxiliary_bytes,bytes);};
+    add_fit_workspace(checked_gpu_product(checked_gpu_product(5,checked_gpu_product(d64,solve_batch)),sizeof(double)));
+    add_fit_workspace(checked_gpu_product(checked_gpu_product(internal_dimension,trace_batch),sizeof(double)));
+    add_fit_workspace(checked_gpu_product(checked_gpu_product(edges,18),sizeof(double)));
+    add_fit_workspace(checked_gpu_product(terms,sizeof(rpmd_ja_local_basis::Term)));
+    add_fit_workspace(checked_gpu_product(checked_gpu_product(base_parameters,added_parameters),sizeof(double)));
+    add_fit_workspace(checked_gpu_product(checked_gpu_product(raw_parameters,added_parameters),sizeof(double)));
+    add_fit_workspace(checked_gpu_product(raw_parameters,sizeof(double)));
+    add_fit_workspace(checked_gpu_product(raw_parameters,sizeof(double)));
+    add_fit_workspace(checked_gpu_product(checked_gpu_product(7,d64),sizeof(double)));
+    add_fit_workspace(checked_gpu_product(checked_gpu_product(edges,3),sizeof(int)));
+    add_fit_workspace(sizeof(int));
+    add_fit_workspace(checked_gpu_product(checked_gpu_sum(d64,internal_dimension),sizeof(int)));
+    add_fit_workspace(checked_gpu_product(checked_gpu_sum(parameters,internal_dimension),sizeof(double)));
+  }
+  std::uint64_t curvature_workspace_bytes=0;
+  if(options.covariance_feasibility){
+    const std::uint64_t probes=128,parameters=static_cast<std::uint64_t>(structured_graph.parameter_count);
+    std::uint64_t curvature_doubles=checked_gpu_product(2,checked_gpu_product(d64,probes));
+    curvature_doubles=checked_gpu_sum(curvature_doubles,checked_gpu_product(2,checked_gpu_product(internal_dimension,probes)));
+    curvature_doubles=checked_gpu_sum(curvature_doubles,checked_gpu_product(checked_gpu_product(parameters,internal_dimension),probes));
+    curvature_doubles=checked_gpu_sum(curvature_doubles,checked_gpu_product(parameters,parameters));
+    curvature_doubles=checked_gpu_sum(curvature_doubles,checked_gpu_product(3,probes));
+    curvature_workspace_bytes=checked_gpu_product(curvature_doubles,sizeof(double));
+  }
+  std::uint64_t prepare_gpu_lower_bound=prepare_gpu_margin_bytes;
+  for(const std::uint64_t bytes:{matrix_bytes,matrix_bytes,physical_bytes,physical_bytes,estimated_package_bytes,
+      prepare_workspace.potrf_workspace_bytes,prepare_workspace.svd_workspace_bytes})
+    prepare_gpu_lower_bound=checked_gpu_sum(prepare_gpu_lower_bound,bytes);
+  std::uint64_t fit_gpu_lower_bound=prepare_gpu_margin_bytes;
+  for(const std::uint64_t bytes:{matrix_bytes,matrix_bytes,physical_bytes,physical_bytes,fit_system_auxiliary_bytes,
+      prepare_workspace.potrf_workspace_bytes,curvature_workspace_bytes})
+    fit_gpu_lower_bound=checked_gpu_sum(fit_gpu_lower_bound,bytes);
+  trace<<"RESOURCE_PREFLIGHT gpu_available_bytes "<<free_before<<" prepare_gpu_lower_bound_bytes "
+    <<prepare_gpu_lower_bound<<" fit_gpu_lower_bound_bytes "<<fit_gpu_lower_bound
+    <<" fit_system_auxiliary_bytes "<<fit_system_auxiliary_bytes<<" scope BASELINE_PREPARE_FIT_PACKAGE_AND_CURVATURE_WORKSPACES"
+    <<" cuSOLVER_POTRF_workspace_bytes "<<prepare_workspace.potrf_workspace_bytes
+    <<" cuSOLVER_SVD_workspace_bytes "<<prepare_workspace.svd_workspace_bytes
+    <<" maximum_curvature_workspace_bytes "<<curvature_workspace_bytes<<'\n';trace.flush();
+  if(std::max(prepare_gpu_lower_bound,fit_gpu_lower_bound)>free_before)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: free GPU memory is below the known prepare or fit workspace estimate");
+  if(generate_raw&&raw_bytes>std::numeric_limits<std::uint64_t>::max()/2)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: simultaneous qraw disk estimate overflows");
+  const std::uint64_t persistent_disk_bytes=generate_raw?2*raw_bytes:raw_bytes;
+  if(persistent_disk_bytes>disk_required||prepare_gpu_lower_bound<matrix_bytes||fit_gpu_lower_bound<matrix_bytes)
+    throw std::runtime_error("IMPLEMENTATION_FAIL: acceptance-stage resource lifetime estimates are inconsistent");
+  rpmd_ja_feasibility::ResourcePlan acceptance_resource_plan;
+  for(auto& stage:acceptance_resource_plan.stages){stage.host_known=false;stage.device_known=true;stage.disk_known=true;}
+  const rpmd_ja_feasibility::ResourceStage acceptance_stages[]={rpmd_ja_feasibility::ResourceStage::FIT,
+    rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE,
+    rpmd_ja_feasibility::ResourceStage::PREPARE,rpmd_ja_feasibility::ResourceStage::READBACK};
+  for(const rpmd_ja_feasibility::ResourceStage stage:acceptance_stages){
+    auto& usage=acceptance_resource_plan.stages[rpmd_ja_feasibility::resource_stage_index(stage)];
+    usage.host_known=false;
+    usage.persistent_host_bytes=raw_bytes;
+    usage.transient_host_bytes=host_required-raw_bytes;
+    usage.persistent_disk_bytes=persistent_disk_bytes;
+    usage.transient_disk_bytes=disk_required-persistent_disk_bytes;
+    if(stage==rpmd_ja_feasibility::ResourceStage::FIT){
+      usage.persistent_device_bytes=matrix_bytes;
+      usage.transient_device_bytes=fit_gpu_lower_bound-matrix_bytes;
+    }else if(stage!=rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE){
+      usage.persistent_device_bytes=matrix_bytes;
+      usage.transient_device_bytes=prepare_gpu_lower_bound-matrix_bytes;}
+    if(stage==rpmd_ja_feasibility::ResourceStage::PREPARE||stage==rpmd_ja_feasibility::ResourceStage::READBACK){
+      usage.device_known=false;usage.disk_known=false;}
+  }
+  const auto acceptance_resource_peak=rpmd_ja_feasibility::estimate_resource_peaks(acceptance_resource_plan);
+  const auto acceptance_resource_gate=rpmd_ja_feasibility::resource_capacity_gate(acceptance_resource_peak,
+    host_available,free_before,disk_available);
+  trace<<"RESOURCE_POLICY_PREFLIGHT scope FIT_PACKAGE_WRITE_PREPARE_READBACK status "
+    <<(acceptance_resource_peak.status==rpmd_ja_feasibility::ResourcePlanStatus::COMPLETE_ESTIMATE?"COMPLETE_ESTIMATE":"INCONCLUSIVE")
+    <<" host_peak_bytes "<<acceptance_resource_peak.host_peak_bytes
+    <<" device_peak_bytes "<<acceptance_resource_peak.device_peak_bytes
+    <<" disk_peak_bytes "<<acceptance_resource_peak.disk_peak_bytes
+    <<" gate "<<(acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::PEAK_WITHIN_CAPACITY_ESTIMATE?"PEAK_WITHIN_CAPACITY_ESTIMATE":
+      acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::PEAK_EXCEEDS_CAPACITY?"PEAK_EXCEEDS_CAPACITY":
+      acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::INCONCLUSIVE?"INCONCLUSIVE":"INVALID")
+    <<" simultaneous_prepare_readback_matrices_included 1 prepare_gpu_lower_bound_bytes "<<prepare_gpu_lower_bound
+    <<" fit_gpu_lower_bound_bytes "<<fit_gpu_lower_bound
+    <<" prepare_library_workspace_query exact_before_A0 1 host_allocator_peak_complete 0"
+    <<" final_reference_disk_bytes_exact_before_prepare 0 runtime_disk_file_lifecycle_rechecks 1"
+    <<" known_host_disk_and_gpu_lower_bound_gates_passed 1\n";trace.flush();
+  if(acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::PEAK_EXCEEDS_CAPACITY||
+     acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::INVALID)
+    throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: known acceptance-stage resource estimate exceeds capacity or is invalid");
   std::printf("    rpmd_ja native fit preflight: qraw %.2f GiB, GPU baseline %.2f GiB, free GPU %.2f GiB, host design+QR %.2f MiB\n",static_cast<double>(raw_bytes)/(1024.0*1024.0*1024.0),static_cast<double>(dd64*sizeof(double))/(1024.0*1024.0*1024.0),static_cast<double>(free_before)/(1024.0*1024.0*1024.0),static_cast<double>(design_bytes+qr_bytes)/(1024.0*1024.0));
   if(dd64*sizeof(double)>free_before||free_before-dd64*sizeof(double)<256ULL*1024*1024)throw std::runtime_error("native fit baseline matrix does not fit current GPU memory with a 256 MiB safety margin");
-  struct OwnScratch{std::string raw,pack,output,sidecar,fit,fit_tmp;bool raw_owned=false,pack_owned=false,output_owned=false,sidecar_owned=false,fit_owned=false,fit_tmp_owned=false;~OwnScratch(){if(raw_owned)std::remove(raw.c_str());if(pack_owned)std::remove(pack.c_str());if(output_owned)std::remove(output.c_str());if(sidecar_owned)std::remove(sidecar.c_str());if(fit_owned)std::remove(fit.c_str());if(fit_tmp_owned)std::remove(fit_tmp.c_str());}} own_scratch{generated_raw_path,pack_path,options.output_path,options.output_path+".stability",fit_path,fit_tmp};
+  NativeFitScratchOwnership own_scratch{generated_raw_path,pack_path,options.output_path,options.output_path+".stability",
+      options.output_path+".tmp",options.output_path+".stability.tmp",fit_path,fit_tmp};
+  own_scratch.staged_output=publication_stage_output_path;own_scratch.staged_sidecar=publication_stage_output_path+".stability";
+  own_scratch.staged_output_tmp=publication_stage_output_path+".tmp";
+  own_scratch.staged_sidecar_tmp=publication_stage_output_path+".stability.tmp";
   std::printf("    rpmd_ja fit reference policy: %s; raw qraw remains the unmodified native derivative source\n",
     options.internal_mass_com?"internal_mass_com_pullback_v1 (raw net force diagnostic only)":"strict raw zero-net gradient");
   if(generate_raw){generate_rpmd_ja_qnep_raw(generated_raw_path,options.temperature,options.fd_step,options.kernel_table,atom,box,force,!options.internal_mass_com);own_scratch.raw_owned=true;}
-  std::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("native fit cannot read qNEP raw reference: "+raw_path);
-  const QrawIdentity qraw_identity=validate_qraw_identity(raw,options,header,r0,box,force);
+  rpmd_ja_file_io::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("native fit cannot read qNEP raw reference: "+raw_path);
+  if(generate_raw){raw_content_identity=fit_input_content_identity(raw_path,options.covariance_feasibility);raw_source_fingerprint=raw_content_identity.fnv64;}
+  QrawIdentity qraw_identity=validate_qraw_identity(raw,options,header,r0,box,force);
+  qraw_identity.source_fnv64=raw_source_fingerprint;
+  verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
+  trace<<"\ninput_content_fnv64 qraw "<<raw_source_fingerprint<<" kernel "<<kernel_source_fingerprint<<'\n';
+  if(options.covariance_feasibility)
+    (void)verify_feasibility_manifest(feasibility_manifest_fields,spool_path,
+      options.covariance_blind_samples,options.kernel_table,raw_path,qraw_identity);
   const std::streamoff data=qraw_identity.data_offset,k_offset=qraw_identity.k_offset;
   const auto raw_model=qraw_identity.model,raw_config=qraw_identity.config;
   const std::uint32_t rawver=qraw_identity.version;const auto expected_model=raw_model,expected_config=raw_config;
@@ -6326,9 +11821,23 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" force_fit_cost_definition=relative_squared_residual_delta_from_unconstrained svd_sigma_min="<<svd_sigma_min
       <<" svd_sigma_max="<<svd_sigma_max<<" design_condition="<<design_condition<<'\n';trace.flush();
     if(!trace)throw std::runtime_error("failed writing native fit unconstrained training diagnostic: "+trace_path);}
-  bool fit_converged=false;ResponseCheck response;std::vector<std::string> saved_recovery_witness_paths;
+  bool fit_converged=false;ResponseCheck response;
   CovarianceFitResult covariance_fit;double covariance_baseline_force_residual=std::numeric_limits<double>::quiet_NaN();
   double training_force_residual=std::numeric_limits<double>::quiet_NaN(),force_fit_cost_increase=std::numeric_limits<double>::quiet_NaN();
+  if(options.covariance_feasibility){
+    for(int segment:{1,2}){const ProbeMoments& moments=sample_statistics.segments[segment];
+      const char* label=segment==1?"DEVELOPMENT_TRAIN":"DEVELOPMENT_HELDOUT";
+      const double count=static_cast<double>(moments.frames);std::vector<double> means(moments.m,0.0);
+      if(moments.frames)for(int probe=0;probe<moments.m;++probe)means[probe]=moments.sum_q[probe]/count;
+      trace<<label<<"_FIXED_R0_MOMENTS frames "<<moments.frames<<" probe_count "<<moments.m<<" centering NONE\n";
+      for(int probe=0;probe<moments.m;++probe){const std::size_t diagonal=static_cast<std::size_t>(probe)*moments.m+probe;
+        trace<<label<<"_PROBE "<<probe<<" mean_q "<<(moments.frames?means[probe]:std::numeric_limits<double>::quiet_NaN())
+          <<" centered_variance "<<moments.variance_q()[probe]<<" second_moment "
+          <<(moments.frames?moments.sum_qq[diagonal]/count:std::numeric_limits<double>::quiet_NaN())<<'\n';}
+      write_matrix(trace,(std::string(label)+"_CENTERED_COVARIANCE").c_str(),moments.covariance_q(),moments.m);
+      write_matrix(trace,(std::string(label)+"_SECOND_MOMENT_ABOUT_FIXED_R0").c_str(),moments.second_moment_q(),moments.m);
+    }
+  }
   auto add_cut=[&](const std::vector<double>& v,const double base_value,const int outer,const char* source){
     const auto row=spectral_row(graph,v,sqrt_mass,n,static_cast<int>(psize));const double row_norm=std::sqrt(std::inner_product(row.begin(),row.end(),row.begin(),0.0));const double rhs=cut_target-base_value;const double value=std::inner_product(row.begin(),row.end(),theta.begin(),0.0)+base_value;
     double scale=0.0;const double curvature_tolerance=curvature_rounding_tolerance(options.epsilon,base_value,row,theta,scale);
@@ -6356,15 +11865,1489 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(!trace)throw std::runtime_error("failed writing native fit QP trace: "+trace_path);
     return fitted_theta;
   };
-  if(covariance_method){
-    std::vector<std::vector<double>> training_block_statistics;std::vector<std::uint64_t> training_block_frames;
-    const std::vector<double> statistics=collect_covariance_fit_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),
+  if(covariance_method&&options.covariance_feasibility){
+    std::vector<std::vector<double>> m1_blocks;std::vector<std::uint64_t> block_frames;
+    M1SampleStructureDiagnostic structure_diagnostic;
+    std::vector<double> m1_development_statistics;double development_baseline_statistic=0.0;
+    RpmdJAStatistics admission_statistics;
+    std::vector<double> m1_statistics;
+    try{m1_statistics=collect_covariance_fit_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),
+        structured_graph,r0,options.temperature,nullptr,&m1_blocks,&block_frames,&structure_diagnostic,&box,&baseline,
+        &sqrt_mass,&sqrt_mass_atom,&m1_development_statistics,&development_baseline_statistic,
+        nullptr,nullptr,nullptr,
+        static_cast<std::size_t>(feasibility_development_max_blocks),&admission_statistics,&common_physical_probes,
+        feasibility_statistics_storage_budget_bytes,[budget,&feasibility_limits](){
+          covariance_budget_observe_or_throw(budget,&feasibility_limits);});}
+    catch(const std::exception& error){
+      if(!covariance_expected_budget_stop(error.what()))throw;
+      trace<<"STATISTICAL_ADMISSION status DATA_INCONCLUSIVE reason STATISTICS_BUDGET_OBSERVATION detail "
+        <<std::quoted(error.what())<<" production_reference 0\n";trace.flush();
+      throw std::runtime_error(std::string("FEASIBILITY_DATA_INCONCLUSIVE: statistics collection exhausted the frozen budget: ")+error.what());}
+    trace<<"STATISTICAL_ADMISSION status "<<admission_statistics.status<<" reason "<<std::quoted(admission_statistics.reason)
+      <<" policy "<<admission_statistics.policy_version<<" internal_physical_channels "<<common_physical_probes.size()
+      <<" storage_budget_bytes "<<admission_statistics.storage_budget_bytes
+      <<" estimated_storage_bytes "<<admission_statistics.estimated_storage_bytes
+      <<" autocorrelation_tau_frames "<<admission_statistics.training_block_plan.tau_frames
+      <<" block_length "<<admission_statistics.training_block_plan.block_length
+      <<" common_training_covered_frames "<<admission_statistics.training_block_plan.common_covered_frame_count
+      <<" training_tail_frames "<<admission_statistics.training_block_plan.discarded_tail_frames
+      <<" drift_reason "<<std::quoted(admission_statistics.fixed_r0_mean_drift.reason)<<'\n';trace.flush();
+    if(admission_statistics.status!="PASS")
+      throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: fixed-R0 statistical admission did not pass: "+
+        admission_statistics.reason);
+    const auto& frozen_training_plan=admission_statistics.training_block_plan;
+    if(frozen_training_plan.block_length>std::numeric_limits<unsigned>::max()/2||
+       frozen_training_plan.adjacent_block_length>std::numeric_limits<unsigned>::max())
+      throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: frozen training block plan exceeds journal dimensions");
+    std::vector<std::string> training_channel_names;training_channel_names.reserve(frozen_training_plan.channels.size());
+    for(const auto& channel:frozen_training_plan.channels)training_channel_names.push_back(channel.name);
+    if(controller_resume){
+      if(!controller_journal.training_statistics_frozen||
+         controller_journal.training_statistics_policy_version!=frozen_training_plan.policy_version||
+         controller_journal.training_frame_count!=static_cast<std::uint64_t>(train)||
+         controller_journal.development_frame_count!=static_cast<std::uint64_t>(validation)||
+         controller_journal.training_block_length!=frozen_training_plan.block_length||
+         controller_journal.training_adjacent_block_length!=frozen_training_plan.adjacent_block_length||
+         controller_journal.training_covered_frame_count!=frozen_training_plan.common_covered_frame_count||
+         controller_journal.training_discarded_tail_frames!=frozen_training_plan.discarded_tail_frames||
+         controller_journal.training_channel_names!=training_channel_names)
+        throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: recomputed training statistics differ from the frozen B/2B plan");
+    }else{
+      controller_journal.training_statistics_frozen=true;
+      controller_journal.training_statistics_policy_version=frozen_training_plan.policy_version;
+      controller_journal.training_frame_count=train;controller_journal.development_frame_count=validation;
+      controller_journal.training_block_length=static_cast<unsigned>(frozen_training_plan.block_length);
+      controller_journal.training_adjacent_block_length=static_cast<unsigned>(frozen_training_plan.adjacent_block_length);
+      controller_journal.training_covered_frame_count=frozen_training_plan.common_covered_frame_count;
+      controller_journal.training_discarded_tail_frames=frozen_training_plan.discarded_tail_frames;
+      controller_journal.training_channel_names=std::move(training_channel_names);
+    }
+    if(m1_statistics.size()!=static_cast<std::size_t>(structured_graph.parameter_count)||
+       structured_graph.parameter_count>92||structured_graph.parameter_count<static_cast<int>(psize))
+      throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: frozen M1 basis dimensions exceed the declared experiment limit");
+    std::vector<double> m0_statistics(m1_statistics.begin(),m1_statistics.begin()+static_cast<std::ptrdiff_t>(psize));
+    std::vector<double> m0_development_statistics(m1_development_statistics.begin(),
+      m1_development_statistics.begin()+static_cast<std::ptrdiff_t>(psize));
+    std::vector<std::vector<double>> m0_blocks(m1_blocks.size());
+    for(std::size_t block=0;block<m1_blocks.size();++block)
+      m0_blocks[block].assign(m1_blocks[block].begin(),m1_blocks[block].begin()+static_cast<std::ptrdiff_t>(psize));
+    trace<<"M1_TRAIN_STRUCTURE frames "<<structure_diagnostic.frames<<" hydrogen_observations "<<structure_diagnostic.hydrogen_frame_observations
+      <<" candidate_covered "<<structure_diagnostic.candidate_covered_hydrogen_frames<<" pair_comparison_hydrogen_frames "<<structure_diagnostic.pair_comparison_hydrogen_frames
+      <<" nearest_pair_changes "<<structure_diagnostic.nearest_pair_change_observations
+      <<" candidate_coverage_fraction "<<structure_diagnostic.candidate_coverage_fraction
+      <<" nearest_pair_change_fraction "<<structure_diagnostic.nearest_pair_change_fraction
+      <<" scope frozen_cutoff_graph_candidates_not_rate\n";trace.flush();
+    covariance_budget_observe_or_throw(budget,&feasibility_limits);
+    struct FeasibilityCandidate
+    {
+      rpmd_ja_feasibility::Family family=rpmd_ja_feasibility::Family::M0;
+      unsigned index=0;double lambda=0.0,development_objective=std::numeric_limits<double>::quiet_NaN();
+      double development_uncertainty=std::numeric_limits<double>::quiet_NaN();
+      std::vector<double> development_block_scores_b,development_block_scores_2b;
+      CovarianceFitResult fit;ResponseCheck development;
+      bool development_pass=false,development_scored=false,development_response_fail=false;
+    };
+    std::vector<FeasibilityCandidate> candidates;std::vector<rpmd_ja_feasibility::Candidate> development_candidates;
+    rpmd_ja_device::CovarianceFitWorkspace feasibility_curvature_workspace;
+    DeviceCovarianceSystemWorkspace feasibility_device_workspace;
+    std::vector<RitzMode> common_soft_union;
+    std::vector<std::vector<double>> frozen_common_probe_vectors;
+    std::vector<std::string> frozen_common_probe_sources;std::vector<ProbeOrigin> frozen_common_probe_origins;
+    bool common_probe_set_frozen=false;
+    if(controller_resume){
+      measured_candidate_costs.samples=controller_journal.candidate_cost_samples;
+      measured_candidate_costs.maximum_seconds=controller_journal.candidate_cost_max_seconds;
+      measured_candidate_costs.partial_elapsed_lower_bound_seconds=controller_journal.candidate_cost_partial_seconds;
+      for(unsigned stage=0;stage<rpmd_ja_feasibility::resource_stage_count;++stage){
+        measured_stage_costs[stage].completed_calls=controller_journal.stage_completed_calls[stage];
+        measured_stage_costs[stage].max_seconds=controller_journal.stage_max_seconds[stage];
+        measured_stage_costs[stage].partial_elapsed_lower_bound_seconds=controller_journal.stage_partial_seconds[stage];}
+      feasibility_limits.max_fit_family_gradients=static_cast<int>(controller_journal.max_fit_family_gradients);
+      feasibility_limits.max_fit_family_wall_seconds=controller_journal.max_fit_family_wall_seconds;
+      if(controller_journal.common_probe_set_frozen){
+        frozen_common_probe_vectors=controller_journal.common_probe_vectors;
+        frozen_common_probe_sources=controller_journal.common_probe_sources;
+        for(std::size_t index=0;index<controller_journal.common_probe_origins.size();++index){
+          try{frozen_common_probe_origins.push_back(parse_probe_origin(controller_journal.common_probe_sources[index],
+              controller_journal.common_probe_origins[index]));}
+          catch(const std::invalid_argument&){throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: malformed frozen common-probe origin");}}
+        common_probe_set_frozen=true;
+      }
+    }
+    if(feasibility_receipt_fields.count("cost_baseline_status")&&
+       feasibility_receipt_fields.at("cost_baseline_status")=="VERIFIED"){
+      auto baseline_seconds=[&](const char* key){const std::string& text=feasibility_manifest_value(feasibility_receipt_fields,
+          std::string("cost_baseline_")+key);std::istringstream row(text);double value=0.0;std::string extra;
+        if(!(row>>value)||(row>>extra)||!std::isfinite(value)||value<=0.0)
+          throw std::runtime_error(std::string("FEASIBILITY_COST_BASELINE_FAIL: invalid ")+key);return value;};
+      const char* keys[]={"fit_seconds","curvature_seconds","blind_seconds","package_write_seconds","prepare_seconds","readback_seconds"};
+      for(unsigned stage=0;stage<rpmd_ja_feasibility::resource_stage_count;++stage){
+        auto& profile=measured_stage_costs[stage];profile.completed_calls=std::max(1u,profile.completed_calls);
+        profile.max_seconds=std::max(profile.max_seconds,baseline_seconds(keys[stage]));}
+      measured_candidate_costs.samples=std::max(1u,measured_candidate_costs.samples);
+      measured_candidate_costs.maximum_seconds=std::max(measured_candidate_costs.maximum_seconds,
+        baseline_seconds("candidate_seconds"));
+      trace<<"COST_BASELINE predictor_seed status IDENTITY_AND_DIMENSIONS_VERIFIED"
+        <<" source_sha256 "<<feasibility_manifest_value(feasibility_receipt_fields,"cost_baseline_sha256")
+        <<" sample_count 1 unmeasured_current_run_costs_not_inferred 1\n";trace.flush();
+    }
+    std::chrono::steady_clock::time_point active_candidate_started;
+    bool active_candidate_timer=false;double active_candidate_prior_elapsed=0.0;
+    auto last_controller_journal_write=std::chrono::steady_clock::now();
+    auto persist_controller_journal=[&](){
+      controller_journal.common_probe_set_frozen=common_probe_set_frozen;
+      if(common_probe_set_frozen){
+        controller_journal.common_probe_sources=frozen_common_probe_sources;
+        controller_journal.common_probe_vectors=frozen_common_probe_vectors;
+        controller_journal.common_probe_origins.clear();
+        for(const ProbeOrigin& origin:frozen_common_probe_origins)
+          controller_journal.common_probe_origins.push_back(encode_probe_origin(origin));}
+      update_controller_journal_budget();
+      if(active_candidate_timer)controller_journal.active_candidate_elapsed_seconds=active_candidate_prior_elapsed+
+        std::chrono::duration<double>(std::chrono::steady_clock::now()-active_candidate_started).count();
+      if(controller_journal.operation_in_progress)controller_journal.operation_start_epoch_seconds=
+        std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+      rpmd_ja_covariance_checkpoint::write_controller_journal(controller_checkpoint_path,controller_journal);
+      last_controller_journal_write=std::chrono::steady_clock::now();
+    };
+    auto run_controller_operation=[&](const std::function<void()>& operation){
+      controller_journal.operation_in_progress=true;persist_controller_journal();
+      auto preserve_interrupted_selection_operation=[&](){
+        return controller_journal.selection_state=="BLIND_OPENED"||controller_journal.selection_state=="PUBLISHING";};
+      try{operation();}catch(...){controller_journal.operation_in_progress=preserve_interrupted_selection_operation();
+        persist_controller_journal();throw;}
+      controller_journal.operation_in_progress=preserve_interrupted_selection_operation();persist_controller_journal();
+    };
+    if(frozen_selection_resume&&(controller_journal.selection_state=="BLIND_OPENED"||
+       controller_journal.selection_state=="PUBLISHING")){
+      controller_journal.operation_in_progress=true;persist_controller_journal();}
+    auto observe_controller_budget=[&](){
+      covariance_budget_observe_or_throw(budget,&feasibility_limits);
+      if(std::chrono::duration<double>(std::chrono::steady_clock::now()-last_controller_journal_write).count()>=30.0)
+        persist_controller_journal();
+    };
+    auto save_controller_candidate=[&](const std::string& branch,const unsigned index,const double lambda,
+        const CovarianceFitResult& fit,const bool fit_complete,const bool score_complete,const bool score_pass,
+        const double objective,const double uncertainty,const std::vector<double>& scores_b,const std::vector<double>& scores_2b,
+        const char* score_generation){
+      auto found=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+        [&](const auto& value){return value.branch==branch;});
+      if(found==controller_journal.candidates.end()){
+        rpmd_ja_covariance_checkpoint::ControllerCandidate value;value.branch=branch;
+        controller_journal.candidates.push_back(std::move(value));found=std::prev(controller_journal.candidates.end());}
+      found->index=index;found->lambda=lambda;found->fit_complete=fit_complete;found->score_complete=score_complete;
+      found->response_replay_required=score_complete;
+      found->score_generation=score_complete?score_generation:"NONE";
+      found->converged=fit.converged;found->development_pass=score_pass;
+      if(score_complete&&std::string(score_generation)=="B_GATE")found->b_gate_pass=score_pass;
+      found->objective=std::isfinite(objective)?objective:0.0;
+      found->uncertainty=std::isfinite(uncertainty)?uncertainty:0.0;found->theta=fit.theta;
+      found->block_scores_b=scores_b;found->block_scores_2b=scores_2b;
+      if(fit_complete){const std::string state_path=covariance_state_path+"."+branch;
+        found->fit_state_sha256=fit_input_content_identity(state_path,true).sha256;}
+      persist_controller_journal();
+    };
+    auto solve_branch=[&](Graph& branch_graph,const std::vector<double>& branch_statistics,
+        const std::vector<std::vector<double>>& branch_blocks,const rpmd_ja_feasibility::Phase phase,
+        const double rho,const double ridge,const bool trust_region,const bool staged,const int analytic_probes,
+        const CovarianceBaseline* supplied_baseline,const std::vector<double>* supplied_scales,
+        const std::vector<double>* initial_theta,const bool fixed_tau,const std::string& checkpoint_branch,
+        const unsigned candidate_index,const double candidate_lambda)->CovarianceFitResult{
+      const bool resume_this_branch=controller_resume&&controller_journal.active_candidate_started&&
+        controller_journal.branch==checkpoint_branch&&
+        controller_journal.next_candidate_index==candidate_index;
+      controller_journal.branch=checkpoint_branch;controller_journal.family=
+        branch_graph.parameter_count>branch_graph.base_parameter_count?"M1":"M0";
+      controller_journal.stage=phase==rpmd_ja_feasibility::Phase::A0?"A0":phase==rpmd_ja_feasibility::Phase::A1?"A1":
+        phase==rpmd_ja_feasibility::Phase::B?"B":"C";
+      controller_journal.next_candidate_index=candidate_index;
+      controller_journal.active_candidate_started=true;
+      active_candidate_prior_elapsed=resume_this_branch?
+        controller_journal.active_candidate_elapsed_seconds:0.0;
+      active_candidate_started=std::chrono::steady_clock::now();active_candidate_timer=true;
+      rpmd_ja_covariance_checkpoint::AcceptedPoint checkpoint_metadata;
+      checkpoint_metadata.job_id=controller_journal.job_id;checkpoint_metadata.identity_sha256=controller_journal.identity_sha256;
+      checkpoint_metadata.branch=checkpoint_branch;checkpoint_metadata.family=controller_journal.family;
+      checkpoint_metadata.candidate_index=candidate_index;checkpoint_metadata.selection_state="NOT_FROZEN";
+      checkpoint_metadata.lambda=candidate_lambda;checkpoint_metadata.epsilon=options.epsilon;
+      checkpoint_metadata.rho=rho;checkpoint_metadata.ridge_lambda=ridge;checkpoint_metadata.tau=1.0;
+      checkpoint_metadata.trust_radius=1.0;
+      std::vector<rpmd_ja_covariance_checkpoint::AcceptedPoint> resume_storage(1);
+      const rpmd_ja_covariance_checkpoint::AcceptedPoint* resume_point=nullptr;
+      const std::string completed_path=covariance_state_path+"."+checkpoint_branch;
+      rpmd_ja_file_io::ifstream completed_state(completed_path,std::ios::binary);
+      rpmd_ja_file_io::ifstream solver_state_file(solver_checkpoint_path,std::ios::binary);
+      if(resume_this_branch&&!completed_state.good()&&solver_state_file.good()){
+        resume_storage[0]=rpmd_ja_covariance_checkpoint::read_checkpoint(solver_checkpoint_path,controller_journal.identity_sha256);
+        if(resume_storage[0].job_id!=controller_journal.job_id||resume_storage[0].branch!=checkpoint_branch||
+           resume_storage[0].family!=controller_journal.family||resume_storage[0].candidate_index!=candidate_index||
+           resume_storage[0].lambda!=candidate_lambda||resume_storage[0].selection_state!="NOT_FROZEN")
+          throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: active solver checkpoint does not match its scheduled candidate");
+        resume_point=&resume_storage[0];
+      }
+      persist_controller_journal();
+      enter_budget_phase(phase);persist_controller_journal();
+      if(resume_point&&budget){
+        auto& restored=resume_storage[0];restored.elapsed_seconds=budget->elapsed_seconds;
+        restored.total_budget_gradients=budget->exact_gradients;restored.active_phase=rpmd_ja_feasibility::phase_index(budget->phase);
+        restored.phase_gradients=budget->phase_gradients;restored.phase_seconds=budget->phase_seconds;
+        restored.operation_in_progress=false;restored.operation_start_epoch_seconds=std::chrono::duration<double>(
+          std::chrono::system_clock::now().time_since_epoch()).count();}
+      DeviceCovarianceSystem system(baseline,branch_graph,sqrt_mass,atom.cpu_mass,
+        &feasibility_curvature_workspace,&feasibility_device_workspace);
+      system.before_factor=[budget,&feasibility_limits](){covariance_budget_observe_or_throw(budget,&feasibility_limits);};
+      const auto checkpoint_sink=[&](const rpmd_ja_covariance_checkpoint::AcceptedPoint& saved){
+        rpmd_ja_covariance_checkpoint::write_checkpoint(solver_checkpoint_path,saved);
+        controller_journal.elapsed_seconds=saved.elapsed_seconds;controller_journal.exact_gradients=saved.total_budget_gradients;
+        controller_journal.active_phase=saved.active_phase;controller_journal.phase_gradients=saved.phase_gradients;
+        controller_journal.phase_seconds=saved.phase_seconds;controller_journal.active_candidate_elapsed_seconds=
+          active_candidate_prior_elapsed+std::chrono::duration<double>(std::chrono::steady_clock::now()-active_candidate_started).count();
+        persist_controller_journal();
+      };
+      CovarianceFitResult fit;
+      run_controller_operation([&](){fit=solve_covariance_reference(system,branch_statistics,options.epsilon,rho,
+        options.max_covariance_iterations,&trace,false,false,trust_region,staged,branch_blocks,block_frames,
+        ridge,analytic_probes,supplied_baseline,supplied_scales,initial_theta,1.0,fixed_tau,budget,&feasibility_limits,
+        resume_point,&checkpoint_metadata,checkpoint_sink);});
+      return fit;
+    };
+    cusolverDnHandle_t dev_solver=nullptr;if(cusolverDnCreate(&dev_solver)!=CUSOLVER_STATUS_SUCCESS)
+      throw std::runtime_error("feasibility response cuSOLVER handle creation failed");
+    auto save_feasibility_cg_witness=[&](const char* stage,const char* generation,const std::string& candidate,
+        const CGWitness& witness,const std::vector<double>& candidate_theta,const Graph& branch_graph){
+      if(witness.classification.empty())return;
+      const std::uint64_t attempt=rpmd_ja_covariance_checkpoint::next_cg_witness_attempt(controller_journal);
+      persist_controller_journal();
+      const std::string path=rpmd_ja_feasibility::feasibility_cg_witness_path(witness_path,stage,candidate,generation,
+        witness.probe,attempt);
+      rpmd_ja_file_io::ifstream existing(path,std::ios::binary);
+      if(existing)throw std::runtime_error("IMPLEMENTATION_FAIL: feasibility CG witness output already exists: "+path);
+      write_cg_witness(path,witness,candidate_theta,raw_path,spool_path,cg_replay,&branch_graph);
+      saved_recovery_witness_paths.push_back(path);
+      trace<<"FEASIBILITY_CG_WITNESS stage "<<stage<<" generation "<<generation<<" candidate "<<candidate
+        <<" probe "<<witness.probe<<" attempt "<<attempt<<" path "<<std::quoted(path)
+        <<" family "<<(branch_graph.parameter_count>branch_graph.base_parameter_count?"M1":"M0")<<'\n';trace.flush();
+    };
+    auto score_development=[&](const char* label,const char* witness_generation,const std::string& witness_candidate,const Graph& branch_graph,
+        const std::vector<double>& branch_development_statistics,const CovarianceFitResult& fit,
+        const rpmd_ja_feasibility::Phase phase,ResponseCheck& scored,double& development_objective,
+        double& development_uncertainty,std::vector<double>* development_block_scores_b,
+        std::vector<double>* development_block_scores_2b)->bool{
+      if(!fit.converged||fit.theta.size()!=static_cast<std::size_t>(branch_graph.parameter_count?branch_graph.parameter_count:branch_graph.base_parameter_count))return false;
+      if(branch_development_statistics.size()!=fit.theta.size())
+        throw std::runtime_error("IMPLEMENTATION_FAIL: fixed-R0 development statistics do not match the frozen candidate basis");
+      enter_budget_phase(phase);
+      observe_controller_budget();
+      DeviceCovarianceSystem development_system(baseline,branch_graph,sqrt_mass,atom.cpu_mass,
+        &feasibility_curvature_workspace,&feasibility_device_workspace);
+      development_system.before_factor=observe_controller_budget;
+      double development_logdet=0.0,development_shifted_logdet=0.0;
+      if(!development_system.evaluate_factors(fit.theta,options.epsilon,development_logdet,development_shifted_logdet))
+        throw std::runtime_error("IMPLEMENTATION_FAIL: converged development candidate is not epsilon-positive definite");
+      development_objective=0.5*(development_baseline_statistic+covariance_dot(branch_development_statistics,fit.theta))-
+        0.5*development_logdet;
+      if(!std::isfinite(development_objective))
+        throw std::runtime_error("NONFINITE_RESPONSE_VALIDATION: unregularized fixed-R0 development objective is non-finite");
+      development_uncertainty=std::numeric_limits<double>::quiet_NaN();
+      if(development_block_scores_b)development_block_scores_b->clear();
+      if(development_block_scores_2b)development_block_scores_2b->clear();
+      const std::size_t block_length=admission_statistics.training_block_plan.block_length;
+      const std::size_t development_frames=static_cast<std::size_t>(frame_count-static_cast<std::uint64_t>(train));
+      const std::size_t covered=rpmd_ja_statistics_policy::detail::common_block_coverage(development_frames,block_length);
+      if(block_length==0||covered==0||fit.theta.size()!=static_cast<std::size_t>(branch_graph.parameter_count))
+        throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: common B and 2B development blocks are unavailable");
+      const std::size_t byte_stride=(1+2*r0.size())*sizeof(double);
+      if(byte_stride>static_cast<std::size_t>(std::numeric_limits<std::streamoff>::max())/static_cast<std::size_t>(train))
+        throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: common development block offset overflows the sample stream");
+      in.clear();in.seekg(header.frames+static_cast<std::streamoff>(static_cast<std::size_t>(train)*byte_stride));
+      if(!in)throw std::runtime_error("IMPLEMENTATION_FAIL: could not seek to the common development sample prefix");
+      std::vector<double> score_position(r0.size()),score_force(r0.size()),score_sums(fit.theta.size(),0.0),
+        frame_sums(fit.theta.size(),0.0);
+      std::vector<double> block_sums(fit.theta.size(),0.0),adjacent_sums(fit.theta.size(),0.0);
+      const double frame_scale=1.0/(K_B*options.temperature);
+      const std::size_t adjacent_length=2*block_length;
+      if(development_block_scores_b)development_block_scores_b->reserve(covered/block_length);
+      if(development_block_scores_2b)development_block_scores_2b->reserve(covered/adjacent_length);
+      for(std::size_t frame=0;frame<covered;++frame){
+        if((frame&63u)==0)observe_controller_budget();
+        double sample_step=0.0;read_frame(in,score_position,score_force,sample_step);
+        std::fill(frame_sums.begin(),frame_sums.end(),0.0);
+        add_covariance_frame_statistics(branch_graph,score_position,r0,n,score_sums,nullptr,nullptr,&frame_sums);
+        for(std::size_t parameter=0;parameter<fit.theta.size();++parameter){
+          const double value=frame_sums[parameter]*frame_scale;block_sums[parameter]+=value;adjacent_sums[parameter]+=value;}
+        if((frame+1)%block_length==0&&development_block_scores_b){
+          const double score=0.5*covariance_dot(block_sums,fit.theta)/static_cast<double>(block_length)-0.5*development_logdet;
+          if(!std::isfinite(score))throw std::runtime_error("NONFINITE_RESPONSE_VALIDATION: B-block score is non-finite");
+          development_block_scores_b->push_back(score);std::fill(block_sums.begin(),block_sums.end(),0.0);}
+        if((frame+1)%adjacent_length==0&&development_block_scores_2b){
+          const double score=0.5*covariance_dot(adjacent_sums,fit.theta)/static_cast<double>(adjacent_length)-0.5*development_logdet;
+          if(!std::isfinite(score))throw std::runtime_error("NONFINITE_RESPONSE_VALIDATION: 2B-block score is non-finite");
+          development_block_scores_2b->push_back(score);std::fill(adjacent_sums.begin(),adjacent_sums.end(),0.0);}}
+      if(!development_block_scores_b||!development_block_scores_2b||
+         development_block_scores_b->size()<feasibility_development_min_blocks||
+         development_block_scores_2b->size()<feasibility_development_min_blocks)
+        throw std::runtime_error("FEASIBILITY_DATA_INCONCLUSIVE: common B and 2B development blocks are below the frozen minimum");
+      const double score_mean=std::accumulate(development_block_scores_b->begin(),development_block_scores_b->end(),0.0)/
+        static_cast<double>(development_block_scores_b->size());
+      double score_sum2=0.0;for(const double score:*development_block_scores_b)score_sum2+=(score-score_mean)*(score-score_mean);
+      development_uncertainty=2.0*std::sqrt(score_sum2/
+        (static_cast<double>(development_block_scores_b->size()-1)*development_block_scores_b->size()));
+      const std::function<void()> budget_observer=observe_controller_budget;
+      auto budgeted_cg=[&](const int probe,const std::vector<double>& direction){
+        budget_observer();
+        return solve_projected_cg(baseline,branch_graph,direction,sqrt_mass,sqrt_mass_atom,fit.theta,n,probe,
+          options.epsilon,1e-8,20000,false,budget_observer);};
+      ResponseCheck progress;
+      std::vector<std::vector<double>> generated_probes;
+      std::vector<std::string> generated_sources;std::vector<ProbeOrigin> generated_origins;
+      const auto* expected_probes=&frozen_common_probe_vectors;
+      const auto* expected_sources=&frozen_common_probe_sources;
+      const auto* expected_origins=&frozen_common_probe_origins;
+      if(!common_probe_set_frozen){
+        generated_probes=make_common_probe_set(common_soft_union,sqrt_mass_atom,header.types,n,&generated_sources,
+          &generated_origins,&common_physical_probes,validation-1);
+        expected_probes=&generated_probes;expected_sources=&generated_sources;expected_origins=&generated_origins;
+      }
+      try{scored=validate_probes(dev_solver,baseline,branch_graph,fit.theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,
+          header.frames,frame_count,train,options.sample_interval,options.temperature,common_soft_union,options.epsilon,&progress,
+          options.response_tolerance,options.ibp_tolerance,0,budgeted_cg,true,&common_physical_probes,true,validation-1,
+          expected_probes,expected_sources,expected_origins,budget_observer);}
+      catch(...){save_feasibility_cg_witness(label,witness_generation,witness_candidate,progress.witness,fit.theta,branch_graph);throw;}
+      save_feasibility_cg_witness(label,witness_generation,witness_candidate,scored.witness,fit.theta,branch_graph);
+      if(scored.probe_sources!=*expected_sources)
+        throw std::runtime_error("IMPLEMENTATION_FAIL: branch development probes differ from the frozen common finite probe set");
+      trace<<label<<"_DEVELOPMENT status "<<(scored.witness.classification.empty()?scored.response_band.status:"CG_FAIL")
+        <<" objective_unregularized "<<development_objective<<" development_objective_uncertainty_2se "<<development_uncertainty
+        <<" paired_B_blocks "<<(development_block_scores_b?development_block_scores_b->size():0)
+        <<" paired_2B_blocks "<<(development_block_scores_2b?development_block_scores_2b->size():0)
+        <<" response "<<scored.response<<" q99_radius "<<scored.response_band.radius
+        <<" response_statistic fixed_R0_second_moment mean_norm ";
+      if(scored.mean_q.size()==static_cast<std::size_t>(std::max(0,scored.probes)))
+        trace<<std::sqrt(std::inner_product(scored.mean_q.begin(),scored.mean_q.end(),scored.mean_q.begin(),0.0));
+      else trace<<"NOT_COMPUTED";
+      trace<<' ';
+      write_response_stats(trace,scored);trace<<'\n';
+      if(!write_response_consumer_statistics(trace,std::string(label)+"_DEVELOPMENT",scored))return false;
+      const bool numerical=std::isfinite(scored.response)&&scored.response_band.status!="NUMERICAL_FAILURE"&&
+        std::isfinite(scored.ibp)&&!ibp_statistics_numerically_invalid(scored.ibp_band);
+      if(!numerical)throw std::runtime_error("NONFINITE_RESPONSE_VALIDATION: feasibility development statistics are numerically invalid");
+      return scored.witness.classification.empty()&&scored.response<=options.response_tolerance&&
+        scored.response_band.status=="RESPONSE_PASS";
+    };
+    const double old_rho=options.covariance_shrinkage;
+    auto checkpoint_branch=[&](const std::string& label,const CovarianceFitResult& fit,const double rho,const Graph& branch_graph,
+        const double ridge=0.0,const unsigned index=0){
+      write_covariance_state(covariance_state_path+"."+label,fit,rho,spool_path,raw_path,options,header,
+        qraw_identity,branch_graph,frame_count,static_cast<std::uint64_t>(train),ridge,true);
+      save_controller_candidate(label,index,ridge,fit,true,false,false,
+        std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN(),{}, {},"NONE");
+      const bool solver_state_exists=[&](){rpmd_ja_file_io::ifstream solver_state(solver_checkpoint_path,std::ios::binary);
+        return solver_state.good();}();
+      if(solver_state_exists&&rpmd_ja_file_io::remove_file(solver_checkpoint_path)!=0)
+        throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: cannot retire completed solver checkpoint");
+    };
+    auto restore_branch=[&](const std::string& label,const unsigned index,const double rho,const double lambda,
+        const Graph& branch_graph,const std::vector<double>& branch_statistics,
+        const std::vector<std::vector<double>>& branch_blocks,const std::vector<std::uint64_t>& branch_block_frames){
+      const auto record=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+        [&](const auto& value){return value.branch==label;});
+      const bool active_cursor=controller_resume&&controller_journal.active_candidate_started&&
+        controller_journal.branch==label&&controller_journal.next_candidate_index==index;
+      const std::string path=covariance_state_path+"."+label;
+      if(record!=controller_journal.candidates.end()&&record->fit_complete){
+        if(record->index!=index||record->lambda!=lambda||fit_input_content_identity(path,true).sha256!=record->fit_state_sha256)
+          throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: completed branch state differs from its controller record");}
+      else if(!active_cursor)
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: completed branch is absent from its controller journal");
+      CovarianceFitResult fit=restore_covariance_fit_state(path,branch_statistics,branch_blocks,branch_block_frames,
+        options.epsilon,rho,lambda,branch_graph.parameter_count>branch_graph.base_parameter_count?"M1":"M0");
+      if(record==controller_journal.candidates.end()||!record->fit_complete)
+        save_controller_candidate(label,index,lambda,fit,true,false,false,std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::quiet_NaN(),{}, {},"NONE");
+      const bool retire_stale_solver=[&](){
+        rpmd_ja_file_io::ifstream stale_solver_file(solver_checkpoint_path,std::ios::binary);
+        if(!stale_solver_file.good())return false;
+        const auto stale_solver=rpmd_ja_covariance_checkpoint::read_checkpoint(solver_checkpoint_path,controller_journal.identity_sha256);
+        return stale_solver.job_id==controller_journal.job_id&&stale_solver.branch==label&&
+          stale_solver.candidate_index==index&&stale_solver.lambda==lambda;
+      }();
+      if(retire_stale_solver&&rpmd_ja_file_io::remove_file(solver_checkpoint_path)!=0)
+        throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: cannot retire a matching completed solver checkpoint");
+      if(label=="A0")rebuild_restored_a0_baseline(fit,baseline,branch_graph,sqrt_mass,atom.cpu_mass,
+        &feasibility_curvature_workspace,options.epsilon,budget,&feasibility_limits,&feasibility_device_workspace);
+      return fit;
+    };
+    auto restore_frozen_candidate=[&](const Graph& branch_graph,const std::vector<double>& branch_statistics,
+        const std::vector<std::vector<double>>& branch_blocks){
+      if(!frozen_selection_resume||!restored_development_response_present)
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: frozen selection lacks its committed development response");
+      const std::string& label=controller_journal.frozen_candidate_branch;
+      const auto record=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+        [&](const auto& value){return value.branch==label;});
+      if(record==controller_journal.candidates.end()||!record->fit_complete||!record->score_complete||
+         !record->development_pass||record->score_generation!="FINAL_M0_M1")
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: frozen candidate record is incomplete");
+      FeasibilityCandidate candidate;candidate.family=label[0]=='B'?rpmd_ja_feasibility::Family::M0:rpmd_ja_feasibility::Family::M1;
+      candidate.index=record->index;candidate.lambda=record->lambda;candidate.development_pass=true;
+      candidate.development_scored=true;candidate.development_objective=record->objective;
+      candidate.development_uncertainty=record->uncertainty;
+      candidate.development_block_scores_b=record->block_scores_b;
+      candidate.development_block_scores_2b=record->block_scores_2b;
+      run_controller_operation([&](){candidate.fit=restore_branch(label,record->index,0.0,record->lambda,
+        branch_graph,branch_statistics,branch_blocks,block_frames);});
+      candidate.development=restored_development_response.response;
+      if(!restored_development_response.passed||!response_consumer_statistics_ready(candidate.development))
+        throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: frozen development response is not complete");
+      development_candidates.push_back({candidate.family,candidate.index,candidate.fit.converged,
+        candidate.development_objective,candidate.development_uncertainty});
+      development_candidates.back().development_block_scores_b=candidate.development_block_scores_b;
+      development_candidates.back().development_block_scores_2b=candidate.development_block_scores_2b;
+      candidates.push_back(std::move(candidate));
+    };
+    auto reject_unexpected_stop=[&](const char* label,const CovarianceFitResult& fit,const bool destroy_on_throw=true){
+      if(!fit.converged&&!covariance_expected_candidate_stop(fit.status)){
+        trace<<"FEASIBILITY_HARD_STOP branch "<<label<<" status "<<std::quoted(fit.status)
+          <<" reason "<<std::quoted(fit.reason)<<'\n';trace.flush();
+        if(destroy_on_throw)cusolverDnDestroy(dev_solver);
+        throw std::runtime_error("IMPLEMENTATION_FAIL: feasibility fit stopped on an unexpected solver error: "+
+          fit.status+": "+fit.reason);
+      }
+    };
+    auto record_complete_pilot_stage_cost=[&](const CovarianceFitResult& fit,const double total_seconds){
+      const double curvature_seconds=std::min(total_seconds,fit.analytic_curvature_seconds);
+      const double fit_seconds=total_seconds-curvature_seconds;
+      return rpmd_ja_feasibility::record_stage_cost(
+          measured_stage_costs[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::FIT)],fit_seconds)&&
+        (curvature_seconds==0.0||rpmd_ja_feasibility::record_stage_cost(
+          measured_stage_costs[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::CURVATURE)],
+          curvature_seconds));
+    };
+    const auto a0_candidate_started=std::chrono::steady_clock::now();
+    const auto a0_saved_score=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+      [](const auto& value){return value.branch=="A0";});
+    const bool a0_score_restored=controller_resume&&a0_saved_score!=controller_journal.candidates.end()&&
+      a0_saved_score->score_complete;
+    const bool a0_active_resume=controller_resume&&controller_journal.branch=="A0"&&!a0_score_restored;
+    const bool a0_imported=!controller_resume&&feasibility_manifest_value(feasibility_receipt_fields,"a0_reuse_status")=="VERIFIED";
+    rpmd_ja_file_io::ifstream a0_state_file(covariance_state_path+".A0",std::ios::binary);
+    const bool a0_restored=controller_resume&&a0_state_file.good();
+    if(a0_restored&&a0_active_resume){active_candidate_prior_elapsed=controller_journal.active_candidate_elapsed_seconds;
+      active_candidate_started=a0_candidate_started;active_candidate_timer=true;}
+    if(a0_imported){active_candidate_started=a0_candidate_started;active_candidate_timer=true;}
+    CovarianceFitResult a0;
+    if(frozen_selection_resume&&!a0_restored)
+      throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: frozen selection is missing its committed A0 baseline state");
+    if(frozen_selection_resume)enter_budget_phase(rpmd_ja_feasibility::Phase::FREEZE);
+    if(a0_imported)run_controller_operation([&](){
+      verify_imported_a0_parameter_map(a0_reuse_verified_state_bytes,graph);
+      std::istringstream imported_state(a0_reuse_verified_state_bytes);
+      a0=restore_covariance_fit_state(imported_state,"verified A0 reuse package state",m0_statistics,m0_blocks,block_frames,
+        options.epsilon,old_rho,0.0,"M0",
+        spool_path,raw_path);
+      if(!a0.converged)throw std::runtime_error("A0 reuse source did not converge");
+      rebuild_restored_a0_baseline(a0,baseline,graph,sqrt_mass,atom.cpu_mass,&feasibility_curvature_workspace,
+        options.epsilon,budget,&feasibility_limits,&feasibility_device_workspace,true);
+      verify_imported_a0_fit(a0,baseline,graph,sqrt_mass,atom.cpu_mass,m0_statistics,old_rho,options.epsilon,
+        &feasibility_curvature_workspace,budget,&feasibility_limits,&feasibility_device_workspace);
+    });
+    else if(a0_restored)run_controller_operation([&](){a0=restore_branch("A0",0,old_rho,0.0,graph,m0_statistics,m0_blocks,block_frames);});
+    else a0=solve_branch(graph,m0_statistics,m0_blocks,rpmd_ja_feasibility::Phase::A0,
+      old_rho,0.0,true,false,0,nullptr,nullptr,nullptr,true,"A0",0,0.0);
+    trace<<"FEASIBILITY_BRANCH A0 status "<<a0.status<<" converged "<<(a0.converged?1:0)<<" rho "<<old_rho
+      <<" tau "<<a0.barrier_tau<<" exact_gradients "<<feasibility_budget.phase_gradients[rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::A0)]<<'\n';trace.flush();
+    if(!a0_restored)checkpoint_branch("A0",a0,old_rho,graph);
+    reject_unexpected_stop("A0",a0);
+    double a0_import_validation_seconds=0.0;
+    if(a0_imported)a0_import_validation_seconds=
+      std::chrono::duration<double>(std::chrono::steady_clock::now()-a0_candidate_started).count();
+    if(a0.covariance_baseline.theta.size()!=psize||a0.coordinate_scale.size()!=psize||a0.theta_start.size()!=psize){
+      const bool budget_stop=covariance_expected_budget_stop(a0.status);
+      trace<<"FEASIBILITY_STOP status "<<(budget_stop?a0.status:"A0_BASELINE_UNAVAILABLE")<<" production_reference 0\n";trace.flush();
+      cusolverDnDestroy(dev_solver);throw std::runtime_error(budget_stop?a0.status:
+        "A0 could not establish the shared M0 baseline, start, and scales");}
+    if(!frozen_selection_resume){
+    ResponseCheck a0_response;bool a0_response_pass=false;
+    double a0_development_objective=std::numeric_limits<double>::quiet_NaN();
+    double a0_development_uncertainty=std::numeric_limits<double>::quiet_NaN();
+    bool a0_response_complete=false;double a0_response_seconds=0.0;const auto a0_response_started=std::chrono::steady_clock::now();
+    std::vector<double> a0_development_scores_b,a0_development_scores_2b;
+    try{run_controller_operation([&](){a0_response_pass=score_development("A0","A0","M0_A0",graph,m0_development_statistics,a0,
+        rpmd_ja_feasibility::Phase::A0,a0_response,a0_development_objective,a0_development_uncertainty,
+        &a0_development_scores_b,&a0_development_scores_2b);
+      a0_response_complete=response_consumer_statistics_ready(a0_response);});}
+    catch(const std::exception& error){const std::string detail=error.what();if(!covariance_expected_budget_stop(detail)){cusolverDnDestroy(dev_solver);throw;}
+      trace<<"FEASIBILITY_BRANCH A0_RESPONSE status "<<std::quoted(detail)<<" diagnostic_skipped 1\n";trace.flush();}
+    save_controller_candidate("A0",0,0.0,a0,true,a0_response_complete,a0_response_pass,
+      a0_development_objective,a0_development_uncertainty,a0_development_scores_b,a0_development_scores_2b,"A0");
+    a0_response_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-a0_response_started).count();
+    const double a0_cost_seconds=a0_imported?a0_import_validation_seconds+a0_response_seconds:
+      a0_score_restored&&!a0_active_resume?0.0:active_candidate_prior_elapsed+
+        std::chrono::duration<double>(std::chrono::steady_clock::now()-active_candidate_started).count();
+    const bool a0_new_cost_sample=!a0_score_restored&&!a0_imported;
+    const bool a0_cost_sample_complete=a0.converged&&a0_response_complete&&a0_new_cost_sample&&
+      rpmd_ja_feasibility::record_candidate_cost(measured_candidate_costs,a0_cost_seconds);
+    if(a0_new_cost_sample&&!a0_cost_sample_complete)rpmd_ja_feasibility::record_partial_candidate_elapsed(measured_candidate_costs,a0_cost_seconds);
+    if(a0_cost_sample_complete&&!record_complete_pilot_stage_cost(a0,a0_cost_seconds))
+      throw std::runtime_error("IMPLEMENTATION_FAIL: completed A0 stage timing could not be recorded");
+    if(active_candidate_timer||controller_journal.branch=="A0"){
+      active_candidate_timer=false;controller_journal.active_candidate_started=false;
+      controller_journal.active_candidate_elapsed_seconds=0.0;}
+    persist_controller_journal();
+    const double a0_source_optimizer_seconds=a0_imported?
+      std::stod(feasibility_manifest_value(feasibility_receipt_fields,"a0_reuse_source_optimizer_seconds")):a0.optimizer_seconds;
+    const double a0_source_fit_elapsed_seconds=a0_imported?
+      std::stod(feasibility_manifest_value(feasibility_receipt_fields,"a0_reuse_source_fit_elapsed_seconds")):a0_cost_seconds;
+    if(a0.converged&&a0_response_complete){
+      const char* source_manifest_path=std::getenv("GPUMD_RPMD_JA_PREFLIGHT_MANIFEST");
+      const std::string record_path=options.output_path+".a0_reuse.record";
+      if(source_manifest_path==nullptr||*source_manifest_path=='\0'||job_id_env==nullptr||*job_id_env=='\0')
+        throw std::runtime_error("A0 reuse export lacks its frozen manifest or job identity");
+      const std::string manifest_bytes=read_feasibility_file_bytes(source_manifest_path);
+      const std::string state_bytes=read_feasibility_file_bytes(covariance_state_path+".A0");
+      const auto record=rpmd_ja_a0_reuse::make_export_record(manifest_bytes,feasibility_manifest_fields,state_bytes,
+        feasibility_manifest_value(feasibility_receipt_fields,"cost_baseline_machine_fingerprint"),job_id_env,
+        a0_source_optimizer_seconds,a0_source_fit_elapsed_seconds,a0.converged,a0_response_complete,a0_response_pass,
+        a0_import_validation_seconds,a0_response_seconds,a0_imported?
+          feasibility_manifest_value(feasibility_receipt_fields,"a0_reuse_historical_origin_job_id"):job_id_env);
+      rpmd_ja_a0_reuse::write_package_atomic(record_path,manifest_bytes,state_bytes,record);
+    }
+    trace<<"MEASURED_CANDIDATE_COST pilot A0 source_optimizer_seconds "
+      <<a0_source_optimizer_seconds<<" source_fit_elapsed_seconds "<<a0_source_fit_elapsed_seconds
+      <<" current_optimizer_seconds "<<(a0_imported?0.0:a0.optimizer_seconds)
+      <<" current_import_validation_seconds "<<a0_import_validation_seconds
+      <<" current_response_seconds "<<a0_response_seconds<<" current_a0_validation_response_seconds "<<a0_cost_seconds
+      <<" response_statistics_complete "<<(a0_response_complete?1:0)
+      <<" complete_cost_sample "<<(a0_cost_sample_complete?1:0)
+      <<" partial_elapsed_lower_bound_seconds "<<measured_candidate_costs.partial_elapsed_lower_bound_seconds
+      <<" accepted_steps "<<a0.iterations<<" objective_evaluations "<<a0.objective_evaluations
+      <<" full_gradient_evaluations "<<a0.full_gradient_evaluations
+      <<" curvature_seconds "<<a0.analytic_curvature_seconds<<" measured_max_seconds "<<measured_candidate_costs.maximum_seconds<<'\n';trace.flush();
+    trace<<"FEASIBILITY_A0_RESPONSE admissible_diagnostic_only "<<(a0_response_pass?1:0)<<'\n';
+    CovarianceFitResult a1;ResponseCheck a1_response;bool a1_response_pass=false;
+    bool a1_response_complete=false;double a1_response_seconds=0.0;std::chrono::steady_clock::time_point a1_response_started;bool a1_response_started_valid=false;
+    const auto a1_candidate_started=std::chrono::steady_clock::now();
+    const auto a1_saved_score=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+      [](const auto& value){return value.branch=="A1";});
+    const bool a1_score_restored=controller_resume&&a1_saved_score!=controller_journal.candidates.end()&&a1_saved_score->score_complete;
+    const bool a1_active_resume=controller_resume&&controller_journal.branch=="A1"&&!a1_score_restored;
+    rpmd_ja_file_io::ifstream a1_state_file(covariance_state_path+".A1",std::ios::binary);
+    const bool a1_restored=controller_resume&&a1_state_file.good();
+    if(a1_restored&&a1_active_resume){active_candidate_prior_elapsed=controller_journal.active_candidate_elapsed_seconds;
+      active_candidate_started=a1_candidate_started;active_candidate_timer=true;}
+    double a1_development_objective=std::numeric_limits<double>::quiet_NaN();
+    double a1_development_uncertainty=std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> a1_development_scores_b,a1_development_scores_2b;
+    try{
+      if(a1_restored)run_controller_operation([&](){a1=restore_branch("A1",0,old_rho,0.0,graph,m0_statistics,m0_blocks,block_frames);});
+      else a1=solve_branch(graph,m0_statistics,m0_blocks,rpmd_ja_feasibility::Phase::A1,old_rho,0.0,true,false,16,
+        &a0.covariance_baseline,&a0.coordinate_scale,&a0.theta_start,true,"A1",0,0.0);
+      if(!a1_restored)checkpoint_branch("A1",a1,old_rho,graph);
+      reject_unexpected_stop("A1",a1,false);
+      trace<<"FEASIBILITY_BRANCH A1 status "<<a1.status<<" converged "<<(a1.converged?1:0)<<" rho "<<old_rho
+        <<" tau "<<a1.barrier_tau<<" analytic_probes 16 exact_gradients "
+        <<feasibility_budget.phase_gradients[rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::A1)]<<'\n';trace.flush();
+      {a1_response_started=std::chrono::steady_clock::now();a1_response_started_valid=true;
+        run_controller_operation([&](){a1_response_pass=score_development("A1","A1","M0_A1",graph,m0_development_statistics,a1,
+          rpmd_ja_feasibility::Phase::A1,a1_response,a1_development_objective,a1_development_uncertainty,
+          &a1_development_scores_b,&a1_development_scores_2b);
+          a1_response_complete=response_consumer_statistics_ready(a1_response);});}
+    }catch(const std::exception& error){
+      const std::string detail=error.what();if(!covariance_expected_budget_stop(detail)){cusolverDnDestroy(dev_solver);throw;}
+      trace<<"FEASIBILITY_BRANCH A1 status "<<std::quoted(detail)<<" diagnostic_skipped 1\n";trace.flush();
+    }
+    if(!a1_restored||!a1_score_restored)
+      save_controller_candidate("A1",0,0.0,a1,true,a1_response_complete,a1_response_pass,
+        a1_development_objective,a1_development_uncertainty,a1_development_scores_b,a1_development_scores_2b,"A1");
+    if(a1_response_started_valid)
+      a1_response_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-a1_response_started).count();
+    const double a1_cost_seconds=a1_score_restored&&!a1_active_resume?0.0:active_candidate_prior_elapsed+
+      std::chrono::duration<double>(std::chrono::steady_clock::now()-active_candidate_started).count();
+    const bool a1_new_cost_sample=!a1_score_restored;
+    const bool a1_cost_sample_complete=a1.converged&&a1_response_complete&&a1_new_cost_sample&&
+      rpmd_ja_feasibility::record_candidate_cost(measured_candidate_costs,a1_cost_seconds);
+    if(a1_new_cost_sample&&!a1_cost_sample_complete)rpmd_ja_feasibility::record_partial_candidate_elapsed(measured_candidate_costs,a1_cost_seconds);
+    if(a1_cost_sample_complete&&!record_complete_pilot_stage_cost(a1,a1_cost_seconds))
+      throw std::runtime_error("IMPLEMENTATION_FAIL: completed A1 stage timing could not be recorded");
+    if(active_candidate_timer||controller_journal.branch=="A1"){
+      active_candidate_timer=false;controller_journal.active_candidate_started=false;
+      controller_journal.active_candidate_elapsed_seconds=0.0;}
+    persist_controller_journal();
+    trace<<"MEASURED_CANDIDATE_COST pilot A1 optimizer_seconds "<<a1.optimizer_seconds
+      <<" response_seconds "<<a1_response_seconds<<" total_seconds "<<a1_cost_seconds
+      <<" response_statistics_complete "<<(a1_response_complete?1:0)
+      <<" complete_cost_sample "<<(a1_cost_sample_complete?1:0)
+      <<" partial_elapsed_lower_bound_seconds "<<measured_candidate_costs.partial_elapsed_lower_bound_seconds
+      <<" accepted_steps "<<a1.iterations<<" objective_evaluations "<<a1.objective_evaluations
+      <<" full_gradient_evaluations "<<a1.full_gradient_evaluations
+      <<" curvature_seconds "<<a1.analytic_curvature_seconds<<" measured_max_seconds "<<measured_candidate_costs.maximum_seconds<<'\n';trace.flush();
+    trace<<"FEASIBILITY_A_COMPARISON can_compare_a_tau1 "<<(rpmd_ja_feasibility::can_compare_a_tau1(a0.barrier_tau,a1.barrier_tau)?1:0)
+      <<" a0_dev_pass "<<(a0_response_pass?1:0)<<" a1_dev_pass "<<(a1_response_pass?1:0)<<" selection_eligible 0\n";trace.flush();
+    }
+    std::vector<double> common_start=a0.theta_start,common_scales=a0.coordinate_scale;
+    if(!controller_resume||controller_journal.stage=="A0"||controller_journal.stage=="A1"){
+      feasibility_limits.max_fit_family_gradients=std::min(feasibility_limits.max_fit_family_gradients,
+        rpmd_ja_feasibility::equal_remaining_family_gradient_cap(feasibility_budget,feasibility_limits));
+      feasibility_limits.max_fit_family_wall_seconds=
+        rpmd_ja_feasibility::equal_remaining_family_wall_cap(feasibility_budget,feasibility_limits);}
+    trace<<"FEASIBILITY_BUDGET family_gradient_cap "<<feasibility_limits.max_fit_family_gradients
+      <<" family_wall_cap_seconds "<<feasibility_limits.max_fit_family_wall_seconds
+      <<" exact_gradients_after_A "<<feasibility_budget.exact_gradients<<" split_B_C_equally 1\n";trace.flush();
+    auto family_budget_stop=[](const std::string& status){
+      return status=="FEASIBILITY_BUDGET_WALL_LIMIT"||status=="FEASIBILITY_BUDGET_GRADIENT_LIMIT"||
+        status=="FEASIBILITY_BUDGET_PHASE_GRADIENT_LIMIT"||status=="FEASIBILITY_BUDGET_FAMILY_GRADIENT_LIMIT"||
+        status=="FEASIBILITY_BUDGET_FAMILY_WALL_LIMIT"||
+        status=="FEASIBILITY_BUDGET_VALIDATION_RESERVED";
+    };
+    unsigned m0_attempted=0,m1_attempted=0;
+    auto run_family=[&](const rpmd_ja_feasibility::Family family,Graph& branch_graph,const std::vector<double>& branch_statistics,
+        const std::vector<double>& branch_development_statistics,
+        const std::vector<std::vector<double>>& branch_blocks,const CovarianceBaseline* branch_baseline,
+        const std::vector<double>* branch_scales,const std::vector<double>* start,const rpmd_ja_feasibility::Phase phase){
+      const bool replay_prior_family=controller_resume&&
+        ((phase==rpmd_ja_feasibility::Phase::B&&(controller_journal.stage=="C"||controller_journal.stage=="FREEZE"))||
+         (phase==rpmd_ja_feasibility::Phase::C&&controller_journal.stage=="FREEZE"));
+      if(frozen_selection_resume){
+        const auto frozen_family=controller_journal.frozen_candidate_branch[0]=='B'?
+          rpmd_ja_feasibility::Family::M0:rpmd_ja_feasibility::Family::M1;
+        if(family!=frozen_family)return;}
+      try{if(!replay_prior_family)enter_budget_phase(phase);}catch(const std::exception& error){const std::string detail=error.what();
+        if(!family_budget_stop(detail))throw;
+        trace<<"MEASURED_COST_STOP phase "<<(phase==rpmd_ja_feasibility::Phase::B?"B":"C")
+          <<" status "<<std::quoted(detail)<<" next_candidate_not_started 1\n";trace.flush();return;}
+      std::vector<double> warm=start?*start:common_start;
+      for(unsigned index=0;index<feasibility_lambda_factors.size();++index){
+        if(frozen_selection_resume&&index!=controller_journal.frozen_candidate_index)continue;
+        const double lambda=static_cast<double>(d-3)*feasibility_lambda_factors[index];
+        const std::string candidate_label=std::string(family==rpmd_ja_feasibility::Family::M0?"B":"C")+
+          std::to_string(index);
+        const std::string family_label=family==rpmd_ja_feasibility::Family::M0?"M0":"M1";
+        const std::string family_stage=phase==rpmd_ja_feasibility::Phase::B?"B":"C";
+        const bool preserve_later_resume_cursor=rpmd_ja_covariance_checkpoint::preserve_later_family_cursor(
+          controller_journal,controller_resume,family_stage,family_label,index);
+        const std::string candidate_state_path=covariance_state_path+"."+candidate_label;
+        rpmd_ja_file_io::ifstream candidate_state_file(candidate_state_path,std::ios::binary);
+        const bool candidate_restored=controller_resume&&candidate_state_file.good();
+        const bool candidate_resume_cursor=controller_resume&&controller_journal.active_candidate_started&&
+          controller_journal.branch==candidate_label&&
+          controller_journal.next_candidate_index==index;
+        const auto clock_status=rpmd_ja_feasibility::observe_time(feasibility_budget,feasibility_limits,covariance_budget_now_seconds());
+        covariance_require_expected_budget_observation(clock_status,"run_family candidate entry");
+        if(clock_status!=rpmd_ja_feasibility::BudgetResult::OK){
+          trace<<"MEASURED_COST_STOP phase "<<(phase==rpmd_ja_feasibility::Phase::B?"B":"C")
+            <<" index "<<index<<" status BUDGET_GATE_"<<covariance_budget_result_name(clock_status)
+            <<" next_candidate_not_started 1 measured_max_seconds "<<measured_candidate_costs.maximum_seconds<<'\n';trace.flush();break;}
+        if(!candidate_restored&&!candidate_resume_cursor){
+        rpmd_ja_feasibility::RemainingWork remaining_work;
+        remaining_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::FIT)]=1;
+        remaining_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::CURVATURE)]=1;
+        remaining_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::BLIND)]=1;
+        remaining_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE)]=1;
+        remaining_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::PREPARE)]=1;
+        remaining_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::READBACK)]=1;
+        const auto remaining_cost=rpmd_ja_feasibility::predict_remaining_cost(feasibility_budget,feasibility_limits,
+          measured_stage_costs,remaining_work,feasibility_candidate_cost_safety_factor);
+        const char* remaining_cost_status=remaining_cost.status==rpmd_ja_feasibility::CostPlanStatus::ESTIMATED_WITHIN_BUDGET?
+          "ESTIMATED_WITHIN_BUDGET":remaining_cost.status==rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET?
+          "INSUFFICIENT_REMAINING_BUDGET":remaining_cost.status==rpmd_ja_feasibility::CostPlanStatus::INCONCLUSIVE_NO_STAGE_BASELINE?
+          "INCONCLUSIVE_NO_STAGE_BASELINE":"INVALID";
+        unsigned unknown_stages=0;
+        for(unsigned stage=0;stage<rpmd_ja_feasibility::resource_stage_count;++stage)
+          if(remaining_work.calls[stage]>0&&measured_stage_costs[stage].completed_calls==0)++unknown_stages;
+        trace<<"REMAINING_COST_PLAN phase "<<(phase==rpmd_ja_feasibility::Phase::B?"B":"C")
+          <<" candidate_index "<<index<<" status "<<remaining_cost_status<<" measured_fit_calls "
+          <<measured_stage_costs[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::FIT)].completed_calls
+          <<" measured_curvature_calls "
+          <<measured_stage_costs[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::CURVATURE)].completed_calls
+          <<" unknown_required_stages "<<unknown_stages<<" projected_fit_seconds "<<remaining_cost.fit_seconds
+          <<" projected_validation_seconds "<<remaining_cost.validation_seconds
+          <<" available_fit_seconds "<<remaining_cost.available_fit_seconds
+          <<" available_total_seconds "<<remaining_cost.available_total_seconds
+          <<" safety_factor "<<remaining_cost.safety_factor
+          <<" unknown_is_not_zero_cost 1 next_candidate_only 1 hard_budget_still_authoritative 1\n";trace.flush();
+        if(remaining_cost.status==rpmd_ja_feasibility::CostPlanStatus::INVALID)
+          throw std::runtime_error("IMPLEMENTATION_FAIL: remaining-cost stage prediction is invalid");
+        if(remaining_cost.status==rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET){
+          trace<<"MEASURED_COST_STOP phase "<<(phase==rpmd_ja_feasibility::Phase::B?"B":"C")
+            <<" index "<<index<<" reason CONSERVATIVE_NEXT_CANDIDATE_STAGE_LOWER_BOUND next_candidate_not_started 1\n";trace.flush();break;}
+        if(measured_candidate_costs.samples==0&&measured_candidate_costs.partial_elapsed_lower_bound_seconds<=0.0)
+          trace<<"MEASURED_COST_GUARD status NO_MEASURED_BASELINE hard_global_and_family_limits_only 1\n";
+        const auto cost_gate=rpmd_ja_feasibility::measured_candidate_cost_gate(feasibility_budget,feasibility_limits,
+          measured_candidate_costs,feasibility_candidate_cost_safety_factor);
+        if(cost_gate.result==rpmd_ja_feasibility::CandidateCostGateResult::INSUFFICIENT_REMAINING_FIT_TIME){
+          trace<<"MEASURED_COST_STOP phase "<<(phase==rpmd_ja_feasibility::Phase::B?"B":"C")
+            <<" index "<<index<<" result INSUFFICIENT_REMAINING_FIT_TIME observed_candidate_samples "<<measured_candidate_costs.samples
+            <<" observed_candidate_max_seconds "<<measured_candidate_costs.maximum_seconds
+            <<" partial_elapsed_lower_bound_seconds "<<measured_candidate_costs.partial_elapsed_lower_bound_seconds
+            <<" safety_factor "<<feasibility_candidate_cost_safety_factor
+            <<" projected_candidate_seconds "<<cost_gate.projected_seconds
+            <<" available_fit_seconds "<<cost_gate.available_seconds
+            <<" next_candidate_not_started 1 interpretation CANDIDATE_NOT_COMPLETED_NOT_REFERENCE_FAMILY_FAILURE\n";trace.flush();break;}
+        if(cost_gate.result==rpmd_ja_feasibility::CandidateCostGateResult::INVALID_ESTIMATE)
+          throw std::runtime_error("IMPLEMENTATION_FAIL: measured candidate-cost estimate is invalid");
+        }
+        if(family==rpmd_ja_feasibility::Family::M0)++m0_attempted;else ++m1_attempted;
+        FeasibilityCandidate candidate;candidate.family=family;candidate.index=index;candidate.lambda=lambda;
+        const auto candidate_started=std::chrono::steady_clock::now();
+        active_candidate_prior_elapsed=candidate_resume_cursor?controller_journal.active_candidate_elapsed_seconds:0.0;
+        if(candidate_restored&&!candidate_resume_cursor){active_candidate_prior_elapsed=0.0;active_candidate_timer=false;}
+        else if(candidate_restored){active_candidate_started=candidate_started;active_candidate_timer=true;}
+        try{
+          if(candidate_restored)run_controller_operation([&](){candidate.fit=restore_branch(candidate_label,index,0.0,lambda,
+            branch_graph,branch_statistics,branch_blocks,block_frames);});
+          else candidate.fit=solve_branch(branch_graph,branch_statistics,branch_blocks,phase,0.0,lambda,true,true,16,
+            branch_baseline,branch_scales,&warm,false,candidate_label,index,lambda);
+        }
+        catch(const std::exception& error){
+          const std::string detail=error.what();
+          if(!family_budget_stop(detail))throw;
+          const double partial_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-candidate_started).count();
+          rpmd_ja_feasibility::record_partial_candidate_elapsed(measured_candidate_costs,partial_seconds);
+          trace<<"FEASIBILITY_CANDIDATE family "<<(family==rpmd_ja_feasibility::Family::M0?"M0":"M1")
+            <<" index "<<index<<" lambda "<<lambda<<" status "<<std::quoted(detail)
+            <<" complete_cost_sample 0 partial_measured_seconds "<<partial_seconds
+            <<" partial_elapsed_lower_bound_seconds "<<measured_candidate_costs.partial_elapsed_lower_bound_seconds
+            <<"\n";trace.flush();break;
+        }
+        trace<<"FEASIBILITY_CANDIDATE family "<<(family==rpmd_ja_feasibility::Family::M0?"M0":"M1")<<" index "<<index
+          <<" lambda "<<lambda<<" rho 0 status "<<candidate.fit.status<<" converged "<<(candidate.fit.converged?1:0)
+          <<" iterations "<<candidate.fit.iterations<<" gradients "<<candidate.fit.full_gradient_evaluations<<'\n';trace.flush();
+        if(!candidate_restored)checkpoint_branch(candidate_label,candidate.fit,0.0,branch_graph,lambda,index);
+        reject_unexpected_stop(family==rpmd_ja_feasibility::Family::M0?"B":"C",candidate.fit);
+        const auto candidate_saved_record=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+          [&](const auto& value){return value.branch==candidate_label;});
+        if(candidate_saved_record==controller_journal.candidates.end())
+          throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: candidate state is absent from the outer journal");
+        const bool candidate_score_was_complete=candidate_restored&&candidate_saved_record->score_complete;
+        if(candidate_restored&&!candidate_score_was_complete&&!candidate_resume_cursor)
+          throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: incomplete candidate score is not the active controller cursor");
+        bool development_budget_stop=false;double development_seconds=0.0;
+        if(candidate_score_was_complete){
+          candidate.development_pass=candidate_saved_record->development_pass;candidate.development_scored=false;
+          candidate.development_objective=candidate_saved_record->objective;
+          candidate.development_uncertainty=candidate_saved_record->uncertainty;
+          candidate.development_block_scores_b=candidate_saved_record->block_scores_b;
+          candidate.development_block_scores_2b=candidate_saved_record->block_scores_2b;
+          development_candidates.push_back({family,index,candidate.development_pass,candidate.development_objective,
+            candidate.development_uncertainty});
+          development_candidates.back().development_block_scores_b=candidate.development_block_scores_b;
+          development_candidates.back().development_block_scores_2b=candidate.development_block_scores_2b;
+          warm=candidate.fit.theta;
+        }else if(candidate.fit.converged){
+          const auto development_started=std::chrono::steady_clock::now();
+          const std::string witness_candidate=(family==rpmd_ja_feasibility::Family::M0?"M0_B":"M1_C")+
+            std::to_string(index);
+          try{run_controller_operation([&](){candidate.development_pass=score_development("CANDIDATE","CANDIDATE",witness_candidate,
+              branch_graph,branch_development_statistics,candidate.fit,phase,candidate.development,
+              candidate.development_objective,candidate.development_uncertainty,&candidate.development_block_scores_b,
+              &candidate.development_block_scores_2b);
+            candidate.development_scored=response_consumer_statistics_ready(candidate.development);
+            candidate.development_response_fail=!candidate.development_pass&&candidate.development.witness.classification.empty()&&
+              candidate.development.response_band.status=="RESPONSE_FAIL"&&std::isfinite(candidate.development.response)&&
+              candidate.development.response>options.response_tolerance;});}
+          catch(const std::exception& error){
+            const std::string detail=error.what();
+            if(!family_budget_stop(detail))throw;
+            development_budget_stop=true;
+            trace<<"FEASIBILITY_DEVELOPMENT status "<<std::quoted(detail)<<" candidate_not_scored 1\n";trace.flush();
+          }
+          development_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-development_started).count();
+          development_candidates.push_back({family,index,candidate.development_pass,candidate.development_objective,
+            candidate.development_uncertainty});
+          development_candidates.back().development_block_scores_b=candidate.development_block_scores_b;
+          development_candidates.back().development_block_scores_2b=candidate.development_block_scores_2b;
+          warm=candidate.fit.theta;}
+        else development_candidates.push_back({family,index,false,std::numeric_limits<double>::infinity(),
+          std::numeric_limits<double>::quiet_NaN()});
+        if(!candidate_score_was_complete||!candidate_restored)
+          save_controller_candidate(candidate_label,index,lambda,candidate.fit,true,candidate.development_scored,
+            candidate.development_pass,candidate.development_objective,candidate.development_uncertainty,
+            candidate.development_block_scores_b,candidate.development_block_scores_2b,"CANDIDATE");
+        const bool stop_family=family_budget_stop(candidate.fit.status)||development_budget_stop||
+          candidate.fit.status=="NUMERICAL_INCONCLUSIVE_PERFORMANCE_STOP";
+        const double candidate_total_seconds=candidate_score_was_complete?0.0:
+          active_candidate_prior_elapsed+std::chrono::duration<double>(std::chrono::steady_clock::now()-candidate_started).count();
+        const bool candidate_new_cost_sample=!candidate_score_was_complete;
+        const bool cost_sample_complete=candidate_new_cost_sample&&candidate.fit.converged&&candidate.development_scored&&!development_budget_stop&&
+          rpmd_ja_feasibility::record_candidate_cost(measured_candidate_costs,candidate_total_seconds);
+        if(candidate_new_cost_sample&&!cost_sample_complete)
+          rpmd_ja_feasibility::record_partial_candidate_elapsed(measured_candidate_costs,candidate_total_seconds);
+        const double curvature_stage_seconds=std::min(candidate_total_seconds,candidate.fit.analytic_curvature_seconds);
+        const double fit_stage_seconds=candidate_total_seconds-curvature_stage_seconds;
+        auto& fit_stage_profile=measured_stage_costs[
+          rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::FIT)];
+        auto& curvature_stage_profile=measured_stage_costs[
+          rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::CURVATURE)];
+        if(candidate_new_cost_sample&&cost_sample_complete){
+          if(!rpmd_ja_feasibility::record_stage_cost(fit_stage_profile,fit_stage_seconds)||
+             (curvature_stage_seconds>0.0&&!rpmd_ja_feasibility::record_stage_cost(
+               curvature_stage_profile,curvature_stage_seconds)))
+            throw std::runtime_error("IMPLEMENTATION_FAIL: completed B/C stage timings could not be recorded");
+        }else if(candidate_new_cost_sample){
+          rpmd_ja_feasibility::record_partial_stage_cost(fit_stage_profile,fit_stage_seconds);
+          if(curvature_stage_seconds>0.0)
+            rpmd_ja_feasibility::record_partial_stage_cost(curvature_stage_profile,curvature_stage_seconds);
+        }
+        trace<<"MEASURED_CANDIDATE_COST family "<<(family==rpmd_ja_feasibility::Family::M0?"M0":"M1")
+          <<" index "<<index<<" optimizer_seconds "<<candidate.fit.optimizer_seconds
+          <<" status "<<candidate.fit.status<<" initialization_status "<<candidate.fit.initialization_status
+          <<" initialization_evaluations "<<candidate.fit.initialization_evaluations
+          <<" response_seconds "<<development_seconds<<" total_seconds "<<candidate_total_seconds
+          <<" response_statistics_complete "<<(candidate.development_scored?1:0)
+          <<" complete_cost_sample "<<(cost_sample_complete?1:0)
+          <<" partial_elapsed_lower_bound_seconds "<<measured_candidate_costs.partial_elapsed_lower_bound_seconds
+          <<" accepted_steps "<<candidate.fit.iterations
+          <<" total_cost_per_accepted_step_seconds "<<(candidate.fit.iterations?candidate_total_seconds/candidate.fit.iterations:
+            std::numeric_limits<double>::quiet_NaN())
+          <<" objective_evaluations "<<candidate.fit.objective_evaluations
+          <<" full_gradient_evaluations "<<candidate.fit.full_gradient_evaluations
+          <<" objective_evaluation_seconds "<<candidate.fit.objective_evaluation_seconds
+          <<" full_gradient_seconds "<<candidate.fit.full_gradient_seconds
+          <<" factorization_seconds "<<candidate.fit.factorization_seconds
+          <<" line_search_objective_seconds "<<candidate.fit.line_search_objective_seconds
+          <<" line_search_gradient_seconds "<<candidate.fit.line_search_gradient_seconds
+          <<" curvature_seconds "<<candidate.fit.analytic_curvature_seconds
+          <<" measured_candidate_max_seconds "<<measured_candidate_costs.maximum_seconds<<'\n';trace.flush();
+        candidates.push_back(std::move(candidate));
+        if(!preserve_later_resume_cursor&&(active_candidate_timer||controller_journal.branch==candidate_label)){
+          active_candidate_timer=false;controller_journal.active_candidate_started=false;
+          controller_journal.active_candidate_elapsed_seconds=0.0;}
+        if(!replay_prior_family&&!preserve_later_resume_cursor&&index+1<feasibility_lambda_factors.size()){
+          controller_journal.branch=std::string(family==rpmd_ja_feasibility::Family::M0?"B":"C")+
+            std::to_string(index+1);controller_journal.family=family==rpmd_ja_feasibility::Family::M0?"M0":"M1";
+          controller_journal.next_candidate_index=index+1;}
+        persist_controller_journal();
+        if(feasibility_budget.phase_gradients[rpmd_ja_feasibility::phase_index(phase)]>=
+           static_cast<unsigned>(feasibility_limits.max_fit_family_gradients)||stop_family)break;
+      }
+    };
+    if(frozen_selection_resume){
+      if(controller_journal.frozen_candidate_branch[0]=='B')
+        restore_frozen_candidate(graph,m0_statistics,m0_blocks);
+    }else run_family(rpmd_ja_feasibility::Family::M0,graph,m0_statistics,m0_development_statistics,
+      m0_blocks,&a0.covariance_baseline,&common_scales,&common_start,rpmd_ja_feasibility::Phase::B);
+    const std::size_t m0_candidate_count=static_cast<std::size_t>(std::count_if(candidates.begin(),candidates.end(),
+      [](const FeasibilityCandidate& candidate){return candidate.family==rpmd_ja_feasibility::Family::M0;}));
+    const std::size_t soft_capacity=static_cast<std::size_t>(rpmd_ja_feasibility::common_soft_probe_capacity(
+      d-3,validation,4*(1+3+3)));
+    double max_common_soft_lanczos_iteration_seconds=0.0;
+    auto add_reliable_soft_modes=[&](const Graph& mode_graph,const std::vector<double>& mode_theta,const char* source){
+      if(common_soft_union.size()>=soft_capacity||mode_theta.size()!=static_cast<std::size_t>(mode_graph.parameter_count))return;
+      covariance_budget_observe_or_throw(budget,&feasibility_limits);
+      const int steps=std::min(64,d-3);
+      const std::function<void(int,double)> iteration_budget_check=[&](const int,double step_seconds){
+        max_common_soft_lanczos_iteration_seconds=std::max(max_common_soft_lanczos_iteration_seconds,step_seconds);
+        covariance_budget_observe_or_throw(budget,&feasibility_limits);
+      };
+      std::vector<RitzMode> modes;
+      run_controller_operation([&](){modes=lanczos_low_modes(dev_solver,baseline,mode_graph,mode_theta,sqrt_mass,
+        sqrt_mass_atom,n,steps,4,options.epsilon,{},nullptr,iteration_budget_check);});
+      covariance_budget_observe_or_throw(budget,&feasibility_limits);
+      for(const RitzMode& mode:modes){
+        const double residual_limit=1.0e-6*std::max(std::abs(mode.actual_rayleigh),options.epsilon);
+        if(!std::isfinite(mode.residual)||mode.residual>residual_limit)continue;
+        bool duplicate=false;
+        for(const RitzMode& existing:common_soft_union)
+          if(std::abs(covariance_dot(existing.vector,mode.vector))>=1.0-1.0e-8){duplicate=true;break;}
+        if(duplicate)continue;
+        common_soft_union.push_back(mode);
+        trace<<"COMMON_SOFT_DIRECTION source "<<source<<" index "<<common_soft_union.size()-1
+          <<" rayleigh "<<mode.actual_rayleigh<<" residual "<<mode.residual<<" residual_limit "<<residual_limit
+          <<" union_cap "<<soft_capacity<<'\n';
+        if(common_soft_union.size()>=soft_capacity)break;
+      }
+    };
+    auto collect_candidate_soft_modes=[&](const std::size_t first_candidate,const bool include_baseline){
+      if(include_baseline)add_reliable_soft_modes(graph,covariance_a0_soft_mode_theta(a0),"A0_BASELINE");
+      for(std::size_t index=first_candidate;index<candidates.size();++index){
+        const FeasibilityCandidate& candidate=candidates[index];if(!candidate.fit.converged)continue;
+        const Graph& mode_graph=candidate.family==rpmd_ja_feasibility::Family::M1?structured_graph:graph;
+        add_reliable_soft_modes(mode_graph,candidate.fit.theta,
+          candidate.family==rpmd_ja_feasibility::Family::M1?"M1_CANDIDATE":"M0_CANDIDATE");
+        if(common_soft_union.size()>=soft_capacity)break;
+      }
+    };
+    auto freeze_common_probes=[&](const char* stage){
+      if(controller_resume&&controller_journal.common_probe_set_frozen&&controller_journal.common_probe_stage==stage){
+        common_probe_set_frozen=true;
+        trace<<"COMMON_SOFT_PROBE_UNION stage "<<stage<<" status RESTORED_FROZEN_PROBE_SET"
+          <<" probe_rank "<<frozen_common_probe_vectors.size()<<" no_reselection 1\n";trace.flush();return;}
+      frozen_common_probe_sources.clear();frozen_common_probe_origins.clear();
+      frozen_common_probe_vectors=make_common_probe_set(common_soft_union,sqrt_mass_atom,header.types,n,
+        &frozen_common_probe_sources,&frozen_common_probe_origins,&common_physical_probes,validation-1);
+      common_probe_set_frozen=true;
+      controller_journal.common_probe_stage=stage;
+      std::vector<std::string> fixed_probe_sources;
+      (void)make_probes({},sqrt_mass_atom,header.types,n,&fixed_probe_sources,nullptr,&common_physical_probes);
+      const std::size_t low_ritz_probe_rank=static_cast<std::size_t>(std::count(frozen_common_probe_sources.begin(),
+        frozen_common_probe_sources.end(),"LOW_RITZ"));
+      const std::size_t fixed_probe_rank=frozen_common_probe_sources.size()-low_ritz_probe_rank;
+      const std::size_t fixed_channels_displaced=fixed_probe_sources.size()>fixed_probe_rank?
+        fixed_probe_sources.size()-fixed_probe_rank:0;
+      const char* low_ritz_status=common_soft_union.empty()?"NO_RELIABLE_SOFT_DIRECTIONS":
+        low_ritz_probe_rank==0?"NO_LOW_RITZ_PROBES_FIT":
+        low_ritz_probe_rank==common_soft_union.size()?"INCLUDED":"RANK_LIMITED";
+      trace<<"COMMON_SOFT_PROBE_UNION stage "<<stage<<" status "<<low_ritz_status
+        <<" reliable_soft_rank "<<common_soft_union.size()<<" low_ritz_probe_rank "<<low_ritz_probe_rank
+        <<" probe_rank "<<frozen_common_probe_sources.size()<<" fixed_probe_rank "<<fixed_probe_rank
+        <<" fixed_probe_rank_without_soft "<<fixed_probe_sources.size()
+        <<" fixed_channels_displaced "<<fixed_channels_displaced
+        <<" source_candidates baseline_and_converged_M0_M1 residual_relative_limit 1e-6"
+        <<" response_frame_cap "<<validation-1<<" frozen_for_candidates_in_current_stage 1\n";trace.flush();
+      persist_controller_journal();
+    };
+    auto rescore_candidates=[&](const rpmd_ja_feasibility::Phase phase,const char* generation,
+        const bool only_missing_response){
+      if(frozen_selection_resume)return;
+      if(candidates.size()!=development_candidates.size())
+        throw std::runtime_error("IMPLEMENTATION_FAIL: candidate and development-score ledgers lost alignment");
+      for(std::size_t index=0;index<candidates.size();++index){
+        FeasibilityCandidate& candidate=candidates[index];if(!candidate.fit.converged)continue;
+        if(!development_response_needs_replay(only_missing_response,candidate.development_scored,
+             candidate.development))continue;
+        const std::string candidate_label=std::string(candidate.family==rpmd_ja_feasibility::Family::M0?"B":"C")+
+          std::to_string(candidate.index);
+        const Graph& branch_graph=candidate.family==rpmd_ja_feasibility::Family::M1?structured_graph:graph;
+        const std::vector<double>& branch_statistics=candidate.family==rpmd_ja_feasibility::Family::M1?
+          m1_development_statistics:m0_development_statistics;
+        try{run_controller_operation([&](){
+          const std::string witness_candidate=(candidate.family==rpmd_ja_feasibility::Family::M0?"M0_B":"M1_C")+
+            std::to_string(candidate.index);
+          candidate.development_pass=score_development("COMMON_PROBE_RESCORING",generation,witness_candidate,branch_graph,branch_statistics,candidate.fit,
+            phase,candidate.development,
+            candidate.development_objective,candidate.development_uncertainty,&candidate.development_block_scores_b,
+            &candidate.development_block_scores_2b);
+          candidate.development_scored=response_consumer_statistics_ready(candidate.development);
+          candidate.development_response_fail=!candidate.development_pass&&candidate.development.witness.classification.empty()&&
+            candidate.development.response_band.status=="RESPONSE_FAIL"&&std::isfinite(candidate.development.response)&&
+            candidate.development.response>options.response_tolerance;
+          development_candidates[index].development_objective=candidate.development_objective;
+          development_candidates[index].development_objective_uncertainty=candidate.development_uncertainty;
+          development_candidates[index].development_block_scores_b=candidate.development_block_scores_b;
+          development_candidates[index].development_block_scores_2b=candidate.development_block_scores_2b;
+          save_controller_candidate(candidate_label,candidate.index,
+            candidate.lambda,candidate.fit,true,candidate.development_scored,candidate.development_pass,
+            candidate.development_objective,candidate.development_uncertainty,candidate.development_block_scores_b,
+            candidate.development_block_scores_2b,generation);});
+          const auto replayed_score=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+            [&](const auto& value){return value.branch==candidate_label;});
+          development_candidates[index].converged=replayed_score!=controller_journal.candidates.end()&&
+            rpmd_ja_covariance_checkpoint::controller_candidate_pass_for_generation(*replayed_score,generation);
+        }catch(const std::exception& error){
+          const std::string detail=error.what();if(!family_budget_stop(detail))throw;
+          candidate.development_scored=false;development_candidates[index].converged=false;
+          development_candidates[index].development_objective=std::numeric_limits<double>::infinity();
+          development_candidates[index].development_objective_uncertainty=std::numeric_limits<double>::quiet_NaN();
+          trace<<"COMMON_PROBE_RESCORING status "<<std::quoted(detail)<<" candidate_ineligible 1\n";trace.flush();
+        }
+      }
+    };
+    const bool resuming_c_or_freeze_cursor=
+      rpmd_ja_covariance_checkpoint::controller_has_committed_b_gate_for_resume(controller_journal,controller_resume);
+    const bool final_probe_state_restored=controller_resume&&controller_journal.common_probe_set_frozen&&
+      controller_journal.common_probe_stage=="FINAL_M0_M1";
+    const bool b_gate_probe_set_restored=controller_resume&&controller_journal.common_probe_set_frozen&&
+      (controller_journal.common_probe_stage=="B_GATE"||final_probe_state_restored);
+    if(!b_gate_probe_set_restored){
+      try{collect_candidate_soft_modes(0,true);}
+      catch(const std::exception& error){const std::string detail=error.what();if(!family_budget_stop(detail))throw;
+        trace<<"COMMON_PROBE_B_GATE status "<<std::quoted(detail)<<" c_dispatch_pending 1\n";trace.flush();}}
+    if(!resuming_c_or_freeze_cursor&&!final_probe_state_restored){
+      freeze_common_probes("B_GATE");
+      rescore_candidates(rpmd_ja_feasibility::Phase::B,"B_GATE",false);}
+    const auto b_gate_accounting_status=rpmd_ja_feasibility::observe_time(feasibility_budget,feasibility_limits,
+      covariance_budget_now_seconds());
+    covariance_require_expected_budget_observation(b_gate_accounting_status,"COMMON_PROBE_B_GATE_ACCOUNTING");
+    const double b_phase_elapsed=feasibility_budget.phase_seconds[rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::B)];
+    const double b_family_cap=feasibility_limits.max_fit_family_wall_seconds;
+    const double b_gate_overrun_seconds=b_family_cap>=0.0?std::max(0.0,b_phase_elapsed-b_family_cap):0.0;
+    const double validation_reserve_seconds=feasibility_limits.wall_seconds*feasibility_limits.validation_reserve_fraction;
+    const double c_wall_available_before_dispatch=std::max(0.0,feasibility_limits.wall_seconds-
+      feasibility_budget.elapsed_seconds-validation_reserve_seconds);
+    trace<<"COMMON_PROBE_B_GATE_ACCOUNTING status "<<covariance_budget_result_name(b_gate_accounting_status)
+      <<" B_elapsed_seconds "<<b_phase_elapsed
+      <<" B_family_cap_seconds "<<b_family_cap<<" B_overrun_seconds "<<b_gate_overrun_seconds
+      <<" max_uninterruptible_lanczos_iteration_seconds "<<max_common_soft_lanczos_iteration_seconds
+      <<" C_wall_available_before_dispatch_seconds "<<c_wall_available_before_dispatch
+      <<" dispatch_attempted 1\n";trace.flush();
+    if(!resuming_c_or_freeze_cursor){
+      controller_journal.stage="C";controller_journal.branch="C0";controller_journal.family="M1";
+      controller_journal.next_candidate_index=0;controller_journal.active_candidate_started=false;
+      controller_journal.active_candidate_elapsed_seconds=0.0;persist_controller_journal();}
+    bool b_admissible=false;
+    for(const auto& value:development_candidates){
+      if(value.family!=rpmd_ja_feasibility::Family::M0)continue;
+      bool candidate_admissible=value.converged;
+      const std::string label="B"+std::to_string(value.index);
+      const auto record=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+        [&](const auto& candidate){return candidate.branch==label;});
+      if(record!=controller_journal.candidates.end()&&
+         (record->b_gate_pass||record->score_generation=="B_GATE"||record->score_generation=="FINAL_M0_M1"))
+        candidate_admissible=record->b_gate_pass;
+      b_admissible=b_admissible||candidate_admissible;
+    }
+    bool m1_phase_started=frozen_selection_resume&&controller_journal.branch[0]=='C';
+    std::string m1_not_tested_reason="NO_INDEPENDENT_ADDITIONS";
+    const bool frozen_m1_selection=frozen_selection_resume&&controller_journal.frozen_candidate_branch[0]=='C';
+    if(frozen_m1_selection||(!frozen_selection_resume&&
+       rpmd_ja_feasibility::should_run_structured_family(structured_graph.parameter_count>psize,b_admissible))){
+      try{
+      m1_phase_started=true;
+      CovarianceBaseline m1_baseline=a0.covariance_baseline;m1_baseline.theta.resize(static_cast<std::size_t>(structured_graph.parameter_count),0.0);
+      m1_baseline.trace.resize(static_cast<std::size_t>(structured_graph.parameter_count),0.0);
+      std::vector<double> m1_scales;
+      enter_budget_phase(frozen_selection_resume?rpmd_ja_feasibility::Phase::FREEZE:rpmd_ja_feasibility::Phase::C);
+      persist_controller_journal();
+      {
+        DeviceCovarianceSystem m1_system(baseline,structured_graph,sqrt_mass,atom.cpu_mass);
+        m1_system.before_factor=[budget,&feasibility_limits](){covariance_budget_observe_or_throw(budget,&feasibility_limits);};
+        CovarianceGradientBudgetReservation trace_reservation(budget,&feasibility_limits);
+        if(!m1_system.evaluate_factors(m1_baseline.theta,options.epsilon,m1_baseline.logdet,m1_baseline.shifted_logdet,&m1_baseline.trace))
+          throw std::runtime_error("BASELINE_SPD_FAIL: M1 zero-extension does not preserve the A baseline");
+        m1_scales=m1_system.coordinate_scales(m1_baseline.theta,options.epsilon);
+        std::copy(common_scales.begin(),common_scales.end(),m1_scales.begin());
+      }
+      std::vector<double> m1_start=common_start;m1_start.resize(static_cast<std::size_t>(structured_graph.parameter_count),0.0);
+      if(frozen_selection_resume)restore_frozen_candidate(structured_graph,m1_statistics,m1_blocks);
+      else run_family(rpmd_ja_feasibility::Family::M1,structured_graph,m1_statistics,m1_development_statistics,
+        m1_blocks,&m1_baseline,&m1_scales,&m1_start,rpmd_ja_feasibility::Phase::C);
+      }catch(const std::exception& error){
+        const std::string detail=error.what();if(!covariance_expected_budget_stop(detail))throw;
+        m1_not_tested_reason=detail;
+        trace<<"FEASIBILITY_C status "<<std::quoted(detail)<<" M1_not_tested 1\n";trace.flush();
+      }
+    }else if(!b_admissible)trace<<"FEASIBILITY_C status M1_NO_INDEPENDENT_ADDITIONS_NOT_TESTED m1_parameters "
+      <<structured_graph.parameter_count<<" m0_parameters "<<psize<<'\n';
+    else if(structured_graph.parameter_count>psize){
+      m1_not_tested_reason="M0_COMMON_PROBE_ADMISSIBLE_MINIMUM_FAMILY_SUFFICIENT";
+      trace<<"FEASIBILITY_C status SKIPPED_M0_COMMON_PROBE_ADMISSIBLE reason MINIMUM_FAMILY_SUFFICIENT"
+        <<" M1_not_tested 1 does_not_claim_M1_unhelpful 1\n";trace.flush();
+    }
+    const bool has_m1_candidates=candidates.size()>m0_candidate_count;
+    if(!frozen_selection_resume){
+      enter_budget_phase(rpmd_ja_feasibility::Phase::FREEZE);
+      rpmd_ja_covariance_checkpoint::commit_final_development_generation(controller_journal,has_m1_candidates,[&](){
+        if(!final_probe_state_restored){
+          if(controller_resume&&controller_journal.common_probe_stage=="B_GATE")collect_candidate_soft_modes(0,true);
+          else collect_candidate_soft_modes(m0_candidate_count,false);
+          freeze_common_probes("FINAL_M0_M1");}
+        rescore_candidates(rpmd_ja_feasibility::Phase::FREEZE,"FINAL_M0_M1",false);});
+      if(!has_m1_candidates)
+        rescore_candidates(rpmd_ja_feasibility::Phase::FREEZE,"FINAL_M0_M1",true);
+      persist_controller_journal();
+    }
+    trace<<"DEVELOPMENT_SCORE_UNCERTAINTY rule common_prefix_B_and_2B"
+      <<" B_blocks minimum 4 2B_blocks minimum 4 paired_difference 2SE"
+      <<" scale_disagreement DATA_INCONCLUSIVE"
+      <<" response_delta_tolerance "<<feasibility_response_delta_tolerance
+      <<" response_delta_metric FROBENIUS_RELATIVE_MAX_NORM_V1"
+      <<" response_delta_near_zero_rule INCONCLUSIVE_IF_GLOBAL_NORM_LE_MIN_NORMAL_NO_ELEMENTWISE_NORMALIZATION"
+      <<" response_delta_spd_relative_floor 1e-12"
+      <<" interpretation BLOCK_SCATTER_NOT_A_UNIVERSAL_CONFIDENCE_INTERVAL\n";trace.flush();
+    bool regularization_sensitive=false,regularization_sensitivity_inconclusive=false;
+    unsigned regularization_pairs=0;
+    const char* regularization_sensitivity_status=nullptr;
+    rpmd_ja_feasibility::FrozenSelection frozen;
+    rpmd_ja_feasibility::SelectionResult selection=rpmd_ja_feasibility::SelectionResult::INVALID_INPUT;
+    if(frozen_selection_resume){
+      frozen.frozen=true;frozen.family=controller_journal.frozen_candidate_branch[0]=='B'?
+        rpmd_ja_feasibility::Family::M0:rpmd_ja_feasibility::Family::M1;
+      frozen.candidate_index=controller_journal.frozen_candidate_index;
+      frozen.blind_opened=controller_journal.selection_state!="FROZEN";
+      selection=rpmd_ja_feasibility::SelectionResult::SELECTED;
+      regularization_pairs=1;
+      regularization_sensitivity_status="RESTORED_FROZEN";
+    }else try{
+    for(const FeasibilityCandidate& left:candidates)for(const FeasibilityCandidate& right:candidates)
+      if(left.family==right.family&&right.index==left.index+1){
+        double parameter_delta=std::numeric_limits<double>::quiet_NaN();
+        if(left.fit.theta.size()==right.fit.theta.size()&&left.fit.coordinate_scale.size()==left.fit.theta.size()){
+          double difference=0.0,reference_norm=0.0;
+          for(std::size_t parameter=0;parameter<left.fit.theta.size();++parameter){const double scale=left.fit.coordinate_scale[parameter];
+            if(!(scale>0.0)||!std::isfinite(scale)){difference=std::numeric_limits<double>::quiet_NaN();break;}
+            difference=std::hypot(difference,(left.fit.theta[parameter]-right.fit.theta[parameter])/scale);
+            reference_norm=std::hypot(reference_norm,left.fit.theta[parameter]/scale);}
+          if(std::isfinite(difference))parameter_delta=difference/std::max(1.0,reference_norm);
+        }
+        double paired_score_delta=std::numeric_limits<double>::quiet_NaN();
+        double paired_score_uncertainty=std::numeric_limits<double>::quiet_NaN();
+        double paired_score_delta_2b=std::numeric_limits<double>::quiet_NaN();
+        double paired_score_uncertainty_2b=std::numeric_limits<double>::quiet_NaN();
+        std::string sensitivity_status="INCONCLUSIVE_INCOMPLETE_CANDIDATE_OR_BLOCKS";
+        NormalizedResponseMatrixDelta matrix_delta;
+        if(left.development.probes!=right.development.probes||left.development.probe_sources!=right.development.probe_sources||
+           left.development.probe_sources.size()!=static_cast<std::size_t>(std::max(0,left.development.probes)))
+          matrix_delta.status="PROBE_SPACE_MISMATCH";
+        else matrix_delta=normalized_response_matrix_delta(left.development.predicted_matrix,right.development.predicted_matrix,left.development.probes);
+        if(left.fit.converged&&right.fit.converged&&left.development_scored&&right.development_scored){
+          rpmd_ja_feasibility::Candidate left_policy,right_policy;
+          left_policy.development_block_scores_b=left.development_block_scores_b;
+          left_policy.development_block_scores_2b=left.development_block_scores_2b;
+          right_policy.development_block_scores_b=right.development_block_scores_b;
+          right_policy.development_block_scores_2b=right.development_block_scores_2b;
+          const auto paired=rpmd_ja_feasibility::compare_candidates_at_both_scales(left_policy,right_policy,
+            paired_score_delta,paired_score_uncertainty,paired_score_delta_2b,paired_score_uncertainty_2b,
+            [budget,&feasibility_limits](){covariance_budget_observe_or_throw(budget,&feasibility_limits);});
+          if(paired==rpmd_ja_feasibility::PairedCandidateResult::INVALID){
+            sensitivity_status="INCONCLUSIVE_INCOMPLETE_CANDIDATE_OR_BLOCKS";regularization_sensitivity_inconclusive=true;}
+          else if(paired==rpmd_ja_feasibility::PairedCandidateResult::DATA_INCONCLUSIVE){
+            sensitivity_status="DATA_INCONCLUSIVE_BLOCK_SCALE_DISAGREEMENT";regularization_sensitivity_inconclusive=true;}
+          else if(!matrix_delta.available){sensitivity_status="INCONCLUSIVE_RESPONSE_MATRIX_"+matrix_delta.status;regularization_sensitivity_inconclusive=true;}
+          else{
+            ++regularization_pairs;
+            const bool response_shift=matrix_delta.relative>feasibility_response_delta_tolerance;
+            const bool score_shift=paired!=rpmd_ja_feasibility::PairedCandidateResult::UNRESOLVED;
+            if(score_shift&&response_shift){sensitivity_status="REGULARIZATION_SENSITIVE";regularization_sensitive=true;}
+            else if(!score_shift&&response_shift){
+              sensitivity_status="INCONCLUSIVE_RESPONSE_SHIFT_WITH_UNRESOLVED_SCORE";
+              regularization_sensitivity_inconclusive=true;}
+            else if(!score_shift)sensitivity_status="NO_RESOLVED_PAIRED_SCORE_SHIFT";
+            else sensitivity_status="RESOLVED_SCORE_SHIFT_RESPONSE_WITHIN_TOLERANCE";
+          }
+        }else regularization_sensitivity_inconclusive=true;
+        trace<<"LAMBDA_ADJACENT family "<<(left.family==rpmd_ja_feasibility::Family::M0?"M0":"M1")
+          <<" lower_index "<<left.index<<" higher_index "<<right.index<<" parameter_relative_distance "<<parameter_delta
+          <<" paired_development_objective_delta "<<paired_score_delta<<" paired_development_objective_uncertainty_2se "<<paired_score_uncertainty
+          <<" paired_development_objective_delta_2B "<<paired_score_delta_2b
+          <<" paired_development_objective_uncertainty_2se_2B "<<paired_score_uncertainty_2b
+          <<" development_objective_unregularized_delta "<<(right.development_objective-left.development_objective)
+          <<" predicted_response_matrix_delta_status "<<matrix_delta.status
+          <<" predicted_response_matrix_frobenius_delta "<<matrix_delta.absolute
+          <<" predicted_response_matrix_relative_delta "<<matrix_delta.relative
+          <<" predicted_response_matrix_left_frobenius_norm "<<matrix_delta.left_norm
+          <<" predicted_response_matrix_right_frobenius_norm "<<matrix_delta.right_norm
+          <<" dev_response_error_delta_aux "<<(right.development.response-left.development.response)
+          <<" response_delta_tolerance "<<feasibility_response_delta_tolerance<<" sensitivity_status "<<sensitivity_status<<'\n';
+      }
+    regularization_sensitivity_status=regularization_sensitive?"REGULARIZATION_SENSITIVE":
+      regularization_sensitivity_inconclusive||regularization_pairs==0?"INCONCLUSIVE":
+      "NO_SENSITIVE_RESPONSE_SHIFT_RESOLVED";
+    trace<<"REGULARIZATION_SENSITIVITY status "<<regularization_sensitivity_status
+      <<" resolved_adjacent_pairs "<<regularization_pairs<<" response_delta_tolerance "<<feasibility_response_delta_tolerance
+      <<" response_delta_metric FROBENIUS_RELATIVE_MAX_NORM_V1"
+      <<" response_delta_near_zero_rule INCONCLUSIVE_IF_GLOBAL_NORM_LE_MIN_NORMAL_NO_ELEMENTWISE_NORMALIZATION"
+      <<" response_delta_spd_relative_floor 1e-12"
+      <<" no_blind_reselection 1\n";
+    trace.flush();
+    for(std::size_t left_index=0;left_index<development_candidates.size();++left_index)
+      for(std::size_t right_index=left_index+1;right_index<development_candidates.size();++right_index){
+        const auto& left=development_candidates[left_index];const auto& right=development_candidates[right_index];
+         const auto selection_budget_observer=observe_controller_budget;
+         if(!rpmd_ja_feasibility::eligible(left,selection_budget_observer)||
+            !rpmd_ja_feasibility::eligible(right,selection_budget_observer))continue;
+        double paired_delta=0.0,paired_uncertainty=0.0,paired_delta_2b=0.0,paired_uncertainty_2b=0.0;
+        const auto paired=rpmd_ja_feasibility::compare_candidates_at_both_scales(left,right,
+           paired_delta,paired_uncertainty,paired_delta_2b,paired_uncertainty_2b,selection_budget_observer);
+        if(paired==rpmd_ja_feasibility::PairedCandidateResult::INVALID)
+          throw std::runtime_error("IMPLEMENTATION_FAIL: selectable candidates do not share aligned finite development blocks");
+        const char* comparison=paired==rpmd_ja_feasibility::PairedCandidateResult::LEFT_WINS?"LEFT_RESOLVED_BETTER":
+          paired==rpmd_ja_feasibility::PairedCandidateResult::RIGHT_WINS?"RIGHT_RESOLVED_BETTER":
+          paired==rpmd_ja_feasibility::PairedCandidateResult::DATA_INCONCLUSIVE?"DATA_INCONCLUSIVE":"UNRESOLVED_AT_B_AND_2B";
+        trace<<"DEVELOPMENT_CANDIDATE_PAIRED_COMPARISON left_family "
+          <<(left.family==rpmd_ja_feasibility::Family::M0?"M0":"M1")<<" left_index "<<left.index
+          <<" right_family "<<(right.family==rpmd_ja_feasibility::Family::M0?"M0":"M1")<<" right_index "<<right.index
+          <<" B_common_blocks "<<left.development_block_scores_b.size()<<" left_minus_right_score_B "<<paired_delta
+          <<" paired_uncertainty_2se_B "<<paired_uncertainty
+          <<" 2B_common_blocks "<<left.development_block_scores_2b.size()<<" left_minus_right_score_2B "<<paired_delta_2b
+          <<" paired_uncertainty_2se_2B "<<paired_uncertainty_2b<<" status "<<comparison<<'\n';
+      }
+    trace.flush();
+    selection=rpmd_ja_feasibility::choose_development_candidate(development_candidates.data(),
+      static_cast<unsigned>(development_candidates.size()),frozen,
+      observe_controller_budget);
+    }catch(const CovarianceFeasibilityBudgetError& error){
+      trace<<"FEASIBILITY_SELECTION status DATA_INCONCLUSIVE reason STATISTICS_BUDGET_OBSERVATION detail "
+        <<std::quoted(error.what())<<" production_reference 0 blind_opened 0\n"
+        <<"FEASIBILITY_ENDPOINT status DATA_INCONCLUSIVE production_reference 0 resume_supported 1 resume_scope PREBLIND_CONTROLLER\n";trace.flush();
+      cusolverDnDestroy(dev_solver);
+      throw std::runtime_error(std::string("FEASIBILITY_DATA_INCONCLUSIVE: candidate comparison exhausted the frozen budget: ")+error.what());}
+    if(selection==rpmd_ja_feasibility::SelectionResult::INVALID_INPUT||
+       selection==rpmd_ja_feasibility::SelectionResult::INVALID_PAIRED_BLOCKS){
+      trace<<"FEASIBILITY_SELECTION status IMPLEMENTATION_FAIL selection_result "<<static_cast<int>(selection)
+        <<" reason invalid_or_misaligned_common_development_blocks\n";trace.flush();
+      cusolverDnDestroy(dev_solver);
+      throw std::runtime_error("IMPLEMENTATION_FAIL: candidate selection received invalid or misaligned common development blocks");
+    }
+    if(selection!=rpmd_ja_feasibility::SelectionResult::SELECTED){
+      auto report_family=[&](const rpmd_ja_feasibility::Family family,const char* name,const unsigned attempted){
+        unsigned converged=0,scored=0,response_fail=0,inconclusive=0;
+        for(const FeasibilityCandidate& candidate:candidates)if(candidate.family==family){
+          converged+=candidate.fit.converged?1u:0u;scored+=candidate.development_scored?1u:0u;
+          response_fail+=candidate.development_response_fail?1u:0u;
+          inconclusive+=candidate.development_scored&&!candidate.development_response_fail&&!candidate.development_pass?1u:0u;
+        }
+        const bool decisive=attempted==3&&converged==3&&scored==3&&response_fail==3;
+        trace<<"FEASIBILITY_FAMILY family "<<name<<" attempted "<<attempted<<" converged "<<converged
+          <<" response_scored "<<scored<<" response_fail "<<response_fail<<" inconclusive "<<inconclusive
+          <<" decisive_response_fail "<<(decisive?1:0)<<'\n';
+        return decisive;
+      };
+      const bool m0_decisive=report_family(rpmd_ja_feasibility::Family::M0,"M0",m0_attempted);
+      const bool m1_decisive=report_family(rpmd_ja_feasibility::Family::M1,"M1",m1_attempted);
+      const bool decisive_response_fail=m1_phase_started&&m0_decisive&&m1_decisive;
+      const bool numerical_inconclusive=m0_attempted>0||m1_phase_started;
+      const bool paired_scale_inconclusive=selection==rpmd_ja_feasibility::SelectionResult::DATA_INCONCLUSIVE;
+      const bool paired_order_inconclusive=selection==rpmd_ja_feasibility::SelectionResult::NO_PAIRED_WINNER;
+      const char* endpoint=paired_scale_inconclusive?"DATA_INCONCLUSIVE":paired_order_inconclusive?"REGULARIZATION_INCONCLUSIVE":
+        decisive_response_fail?"RESPONSE_FAIL_M0_M1":numerical_inconclusive?"NUMERICAL_INCONCLUSIVE":"DATA_INCONCLUSIVE";
+      trace<<"FEASIBILITY_SELECTION status "<<(paired_scale_inconclusive?"DATA_INCONCLUSIVE_BLOCK_SCALE_DISAGREEMENT":
+        paired_order_inconclusive?"PAIRED_ORDER_INCONCLUSIVE":"NO_ADMISSIBLE_DEVELOPMENT_CANDIDATE")
+        <<" selection_result "<<static_cast<int>(selection)
+        <<" m1_phase_started "<<(m1_phase_started?1:0)<<" m1_not_tested_reason "<<std::quoted(m1_not_tested_reason)<<'\n';
+      trace<<"FEASIBILITY_ENDPOINT status "<<endpoint
+        <<" production_reference 0 resume_supported 1 resume_scope PREBLIND_CONTROLLER current_correlation NOT_TESTED\n";trace.flush();
+      cusolverDnDestroy(dev_solver);throw std::runtime_error(paired_scale_inconclusive?
+        std::string("DATA_INCONCLUSIVE: paired development score differences disagree between B and 2B"):
+        paired_order_inconclusive?
+        std::string("REGULARIZATION_INCONCLUSIVE: paired development comparisons have no consistent resolved winner"):
+        decisive_response_fail?
+        std::string("RESPONSE_FAIL_M0_M1: all candidates in both complete families failed fixed-probe development response"):
+        numerical_inconclusive?std::string("NUMERICAL_INCONCLUSIVE: candidate schedules did not establish decisive response failures"):
+        std::string("DATA_INCONCLUSIVE: no admissible candidate and M1 was not evaluated: ")+m1_not_tested_reason);}
+    const auto chosen=std::find_if(candidates.begin(),candidates.end(),[&](const FeasibilityCandidate& value){
+      return value.family==frozen.family&&value.index==frozen.candidate_index;});
+    if(chosen==candidates.end()){cusolverDnDestroy(dev_solver);throw std::runtime_error("IMPLEMENTATION_FAIL: frozen development candidate was lost");}
+    const auto chosen_policy=std::find_if(development_candidates.begin(),development_candidates.end(),[&](const auto& value){
+      return value.family==frozen.family&&value.index==frozen.candidate_index;});
+    if(chosen_policy==development_candidates.end()){cusolverDnDestroy(dev_solver);throw std::runtime_error("IMPLEMENTATION_FAIL: frozen development score ledger was lost");}
+    if(restored_development_response_present){
+      chosen->development=restored_development_response.response;chosen->development_scored=true;chosen->development_pass=true;}
+    if(!frozen_selection_resume&&!rpmd_ja_feasibility::regularization_sensitivity_allows_blind(regularization_sensitive,
+       regularization_sensitivity_inconclusive||regularization_pairs==0)){
+      covariance_fit=chosen->fit;response=chosen->development;theta=covariance_fit.theta;
+      if(frozen.family==rpmd_ja_feasibility::Family::M1){graph=structured_graph;psize=static_cast<std::size_t>(graph.parameter_count);}
+      selected_covariance_family=frozen.family==rpmd_ja_feasibility::Family::M0?"M0":"M1";
+      selected_covariance_rho=0.0;selected_covariance_lambda=chosen->lambda;
+      covariance_fit.statistics=frozen.family==rpmd_ja_feasibility::Family::M1?m1_statistics:m0_statistics;
+      const bool sensitive=std::string(regularization_sensitivity_status)=="REGULARIZATION_SENSITIVE";
+      trace<<"FEASIBILITY_SELECTION status "<<(sensitive?"REGULARIZATION_SENSITIVE":"REGULARIZATION_INCONCLUSIVE")
+        <<" candidate_frozen 1 selected_family "<<selected_covariance_family<<" selected_index "<<frozen.candidate_index
+        <<" selected_lambda "<<selected_covariance_lambda<<" blind_opened 0 selection_eligible_for_blind 0\n";
+      trace<<"FEASIBILITY_ENDPOINT status "<<(sensitive?"REGULARIZATION_SENSITIVE":"REGULARIZATION_INCONCLUSIVE")
+        <<" production_reference 0 blind_opened 0 no_reselection 1\n";trace.flush();
+      write_covariance_state(covariance_state_path,covariance_fit,0.0,spool_path,raw_path,options,header,qraw_identity,graph,
+        frame_count,static_cast<std::uint64_t>(train),chosen->lambda);
+      cusolverDnDestroy(dev_solver);
+      throw std::runtime_error(sensitive?
+        "REGULARIZATION_SENSITIVE: development response changed beyond its manifest-frozen tolerance across adjacent lambdas; blind data remains unopened":
+        "REGULARIZATION_INCONCLUSIVE: adjacent-lambda sensitivity could not be resolved under the manifest-frozen rule; blind data remains unopened");
+    }
+    if(!frozen_selection_resume&&!options.covariance_blind_samples.empty()){
+      rpmd_ja_feasibility::RemainingWork preblind_work;
+      preblind_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::BLIND)]=1;
+      preblind_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE)]=1;
+      preblind_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::PREPARE)]=1;
+      preblind_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::READBACK)]=1;
+      const auto preblind_cost_status=check_remaining_cost("PRE_BLIND_AND_PUBLICATION",preblind_work);
+      if(preblind_cost_status==rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET){
+        trace<<"FEASIBILITY_ENDPOINT status DATA_INCONCLUSIVE reason KNOWN_REMAINING_COST_EXCEEDS_BUDGET"
+          <<" production_reference 0 blind_opened 0 candidate_selection_frozen 0\n";trace.flush();
+        throw std::runtime_error("DATA_INCONCLUSIVE: measured lower-bound cost for blind validation and publication exceeds remaining budget");}
+    }
+    if(!frozen_selection_resume){
+      const std::string branch=frozen.family==rpmd_ja_feasibility::Family::M0?"B":"C";
+      const std::string selected_branch=branch+std::to_string(frozen.candidate_index);
+      const auto selected_record=std::find_if(controller_journal.candidates.begin(),controller_journal.candidates.end(),
+        [&](const auto& candidate){return candidate.branch==selected_branch;});
+      if(selected_record==controller_journal.candidates.end()||!selected_record->fit_complete||
+         selected_record->fit_state_sha256.empty()||!chosen->development_scored||!chosen->development_pass){
+        cusolverDnDestroy(dev_solver);throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: frozen candidate or development response is incomplete");}
+      const std::string frozen_candidate_identity=rpmd_ja_covariance_checkpoint::begin_controller_selection_freeze(
+        controller_journal,selected_branch,frozen.candidate_index);
+      const std::string development_response_sha256=write_blind_response_checkpoint(options.output_path+".development_checkpoint.txt",
+        chosen->development,chosen->fit.theta,controller_journal.identity_sha256,
+        frozen_candidate_identity,fit_input_content_identity(spool_path,true).sha256,chosen->development_pass);
+      rpmd_ja_covariance_checkpoint::commit_controller_selection_freeze(controller_journal,development_response_sha256);
+      persist_controller_journal();
+    }
+    if(controller_journal.selection_state=="FROZEN"){
+      if(!rpmd_ja_feasibility::open_blind_once(frozen)){cusolverDnDestroy(dev_solver);throw std::runtime_error("IMPLEMENTATION_FAIL: candidate selection could not freeze exactly once");}
+      controller_journal.selection_state="BLIND_OPENED";controller_journal.stage="FREEZE";
+      controller_journal.active_phase=rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::BLIND);
+      controller_journal.operation_in_progress=true;persist_controller_journal();
+    }
+    frozen.blind_opened=controller_journal.selection_state!="FROZEN";
+    covariance_fit=chosen->fit;response=chosen->development;theta=covariance_fit.theta;
+    if(frozen.family==rpmd_ja_feasibility::Family::M1){graph=structured_graph;psize=static_cast<std::size_t>(graph.parameter_count);}
+    selected_covariance_family=frozen.family==rpmd_ja_feasibility::Family::M1?"M1":"M0";
+    selected_covariance_rho=0.0;selected_covariance_lambda=chosen->lambda;
+    covariance_fit.statistics=frozen.family==rpmd_ja_feasibility::Family::M1?m1_statistics:m0_statistics;
+    trace<<"FEASIBILITY_SELECTION frozen 1 family "<<(frozen.family==rpmd_ja_feasibility::Family::M0?"M0":"M1")
+      <<" index "<<frozen.candidate_index<<" lambda "<<chosen->lambda
+      <<" development_objective_unregularized "<<chosen->development_objective
+      <<" development_objective_uncertainty_2se "<<chosen->development_uncertainty
+      <<" development_paired_B_block_count "<<chosen_policy->development_block_scores_b.size()
+      <<" development_paired_2B_block_count "<<chosen_policy->development_block_scores_2b.size()
+      <<" selection_rule paired_B_and_2B_difference_2SE unresolved_cross_family_prefers_M0 frozen_candidate_identity_sha256 "
+      <<controller_journal.frozen_candidate_identity_sha256<<" dev_response "<<chosen->development.response
+      <<" dev_q99_radius "<<chosen->development.response_band.radius
+      <<" probe_policy shared_random_type_physical_and_common_candidate_soft_union\n";trace.flush();
+    bool blind_response_pass_completed=false;
+    std::string completed_blind_response_sha256;
+    if(!restored_blind_response_present){
+    if(options.covariance_blind_samples.empty()){
+      const auto state=rpmd_ja_feasibility::classify_blind_result(frozen,false,false);
+      trace<<"FEASIBILITY_ENDPOINT status DATA_INCONCLUSIVE reason INDEPENDENT_BLIND_DATA_ABSENT production_reference 0 resume_supported 0\n";trace.flush();
+      write_covariance_state(covariance_state_path,covariance_fit,0.0,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train),chosen->lambda);
+      cusolverDnDestroy(dev_solver);throw std::runtime_error(state==rpmd_ja_feasibility::BlindStatus::DATA_INCONCLUSIVE?
+        "DATA_INCONCLUSIVE: no independently attested blind trajectory was supplied":"IMPLEMENTATION_FAIL: blind state classification failed");}
+    FeasibilityStageTimer blind_stage_timer(trace,"BLIND",
+      stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::BLIND));
+    enter_budget_phase(rpmd_ja_feasibility::Phase::BLIND);
+    if(verify_feasibility_preflight(options.output_path)!=feasibility_manifest_fields)
+      throw std::runtime_error("FEASIBILITY_PREFLIGHT_FAIL: manifest fields changed after native fit startup");
+    const auto manifest=verify_feasibility_manifest(feasibility_manifest_fields,spool_path,
+      options.covariance_blind_samples,options.kernel_table,raw_path,qraw_identity);
+    rpmd_ja_file_io::ifstream blind(options.covariance_blind_samples,std::ios::binary);
+    if(!blind){cusolverDnDestroy(dev_solver);throw std::runtime_error("BLIND_PROVENANCE_FAIL: cannot open the attested independent trajectory");}
+    const SampleHeader blind_header=read_header(blind,0,atom,box,options.temperature,true,false);
+    if(std::abs(blind_header.temperature-header.temperature)>1.0e-10*header.temperature||
+       blind_header.beads!=header.beads||blind_header.types!=header.types||blind_header.masses!=header.masses)
+      throw std::runtime_error("BLIND_PROVENANCE_FAIL: blind temperature, bead count, types, or masses differ from training identity");
+    validate_fit_branches(blind,blind_header,blind_header.frame_count,box,r0);
+    const std::function<void()> blind_budget_observer=[budget,&feasibility_limits](){
+      covariance_budget_observe_or_throw(budget,&feasibility_limits);};
+    const std::uint64_t blind_training_frames=static_cast<std::uint64_t>(train);
+    const std::uint64_t blind_parameter_count=static_cast<std::uint64_t>(structured_graph.parameter_count);
+    const std::uint64_t blind_channel_count=3+common_physical_probes.size()+blind_parameter_count;
+    const std::uint64_t blind_statistics_bytes=estimate_fixed_r0_drift_storage_bytes(blind_training_frames,
+      blind_header.frame_count,blind_channel_count,admission_statistics.training_block_plan.block_length);
+    if(blind_statistics_bytes>feasibility_statistics_storage_budget_bytes){
+      trace<<"BLIND_STATISTICAL_ADMISSION status DATA_INCONCLUSIVE reason STORAGE_BUDGET_EXCEEDED training_block_length "
+        <<admission_statistics.training_block_plan.block_length<<" blind_frames "<<blind_header.frame_count
+        <<" estimated_peak_bytes "<<blind_statistics_bytes
+        <<" production_reference 0 no_reselection 1\n";trace.flush();
+      write_covariance_state(covariance_state_path,covariance_fit,0.0,spool_path,raw_path,options,header,qraw_identity,graph,
+        frame_count,static_cast<std::uint64_t>(train),chosen->lambda);
+      cusolverDnDestroy(dev_solver);
+      throw std::runtime_error("DATA_INCONCLUSIVE: blind fixed-R0 channel storage exceeds the frozen statistics budget");}
+    rpmd_ja_statistics_policy::TrainingChannels blind_training_channels,blind_channels;
+    try{
+      blind_training_channels=collect_fixed_r0_admission_channels(in,header,static_cast<std::uint64_t>(train),
+        structured_graph,r0,options.temperature,common_physical_probes,sqrt_mass,feasibility_statistics_storage_budget_bytes,
+        blind_budget_observer);
+      blind_channels=collect_fixed_r0_admission_channels(blind,blind_header,blind_header.frame_count,structured_graph,
+        r0,options.temperature,common_physical_probes,sqrt_mass,feasibility_statistics_storage_budget_bytes,
+        blind_budget_observer);
+    }catch(const CovarianceFeasibilityBudgetError& error){
+      trace<<"BLIND_STATISTICAL_ADMISSION status DATA_INCONCLUSIVE reason BUDGET_EXHAUSTED detail "
+        <<std::quoted(error.what())<<" production_reference 0 no_reselection 1\n";trace.flush();
+      write_covariance_state(covariance_state_path,covariance_fit,0.0,spool_path,raw_path,options,header,qraw_identity,graph,
+        frame_count,static_cast<std::uint64_t>(train),chosen->lambda);
+      cusolverDnDestroy(dev_solver);
+      throw std::runtime_error(std::string("DATA_INCONCLUSIVE: blind fixed-R0 statistics exhausted the frozen budget: ")+error.what());}
+    std::vector<std::string> frozen_channel_names;frozen_channel_names.reserve(admission_statistics.training_block_plan.channels.size());
+    for(const auto& channel:admission_statistics.training_block_plan.channels)frozen_channel_names.push_back(channel.name);
+    if(blind_training_channels.names!=blind_channels.names||blind_training_channels.names!=frozen_channel_names)
+      throw std::runtime_error("IMPLEMENTATION_FAIL: blind fixed-R0 channels differ from the training-frozen definitions");
+    const std::vector<std::string> no_expected_zero_mean_channels;
+    const auto blind_statistical_drift=rpmd_ja_statistics_policy::assess_fixed_r0_means(blind_training_channels,
+      blind_channels,admission_statistics.training_block_plan,rpmd_ja_statistics_policy::frozen_config(),
+      &no_expected_zero_mean_channels,blind_budget_observer);
+    trace<<"BLIND_STATISTICAL_ADMISSION status "<<blind_statistical_drift.status
+      <<" reason "<<std::quoted(blind_statistical_drift.reason)<<" policy "<<admission_statistics.policy_version
+      <<" channels "<<blind_training_channels.names.size()<<" training_frames "<<train
+      <<" blind_frames "<<blind_header.frame_count
+      <<" estimated_statistics_peak_bytes "<<blind_statistics_bytes
+      <<" frozen_B "<<admission_statistics.training_block_plan.block_length
+      <<" frozen_2B "<<admission_statistics.training_block_plan.adjacent_block_length
+      <<" maximum_z "<<blind_statistical_drift.maximum_z
+      <<" adjacent_se_relative_change "<<blind_statistical_drift.development_adjacent_se_relative_change
+      <<" no_blind_block_reselection 1 no_reselection 1\n";trace.flush();
+    if(blind_statistical_drift.status!="PASS"){
+      const bool rejected=rpmd_ja_feasibility::blind_statistics_declares_drift(
+        blind_statistical_drift.status,blind_statistical_drift.reason);
+      trace<<"FEASIBILITY_ENDPOINT status "<<(rejected?"BLIND_FAILED":"DATA_INCONCLUSIVE")
+        <<" reason BLIND_FIXED_R0_STATISTICAL_ADMISSION production_reference 0 no_reselection 1\n";trace.flush();
+      write_covariance_state(covariance_state_path,covariance_fit,0.0,spool_path,raw_path,options,header,qraw_identity,graph,
+        frame_count,static_cast<std::uint64_t>(train),chosen->lambda);
+      cusolverDnDestroy(dev_solver);
+      throw std::runtime_error(std::string(rejected?"BLIND_FAILED: ":"DATA_INCONCLUSIVE: ")+
+        "independent blind trajectory failed fixed-R0 B/2B admission: "+blind_statistical_drift.reason);
+    }
+    auto blind_cg=[&](const int probe,const std::vector<double>& direction){
+      blind_budget_observer();
+      return solve_projected_cg(baseline,graph,direction,sqrt_mass,sqrt_mass_atom,theta,n,probe,
+        options.epsilon,1e-8,20000,false,blind_budget_observer);};
+    ResponseCheck blind_progress;
+    const std::string blind_witness_candidate=(frozen.family==rpmd_ja_feasibility::Family::M0?"M0_B":"M1_C")+
+      std::to_string(frozen.candidate_index);
+    try{response=validate_probes(dev_solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,blind_header.types,n,r0,blind,
+        blind_header.frames,blind_header.frame_count,0,options.sample_interval,options.temperature,common_soft_union,options.epsilon,&blind_progress,
+        options.response_tolerance,options.ibp_tolerance,0,blind_cg,true,&common_physical_probes,true,validation-1,
+        &frozen_common_probe_vectors,&frozen_common_probe_sources,&frozen_common_probe_origins,blind_budget_observer);}
+    catch(...){save_feasibility_cg_witness("BLIND","FINAL_BLIND",blind_witness_candidate,blind_progress.witness,theta,graph);throw;}
+    save_feasibility_cg_witness("BLIND","FINAL_BLIND",blind_witness_candidate,response.witness,theta,graph);
+    if(response.probe_sources!=frozen_common_probe_sources)throw std::runtime_error("IMPLEMENTATION_FAIL: blind probe set differs from the frozen development set");
+    if(!write_response_consumer_statistics(trace,"BLIND",response)){
+      write_response_stats(trace,response);
+      trace<<"\nFEASIBILITY_BLIND status DATA_INCONCLUSIVE reason CG_RESPONSE_NOT_COMPUTED production_reference 0 no_reselection 1\n";trace.flush();
+      cusolverDnDestroy(dev_solver);
+      throw std::runtime_error("NUMERICAL_INCONCLUSIVE: blind CG failure prevented response statistics from being computed");}
+    trace<<"BLIND_FIXED_R0_MOMENTS frames "<<response.statistical_frames<<" probe_count "<<response.probes<<" centering NONE\n";
+    for(int probe=0;probe<response.probes;++probe)trace<<"BLIND_PROBE "<<probe<<" mean_q "<<response.mean_q[probe]<<'\n';
+    const bool blind_numerically_valid=std::isfinite(response.response)&&response.response_band.status!="NUMERICAL_FAILURE"&&
+      std::isfinite(response.ibp)&&!ibp_statistics_numerically_invalid(response.ibp_band);
+    if(!blind_numerically_valid){
+      trace<<"FEASIBILITY_ENDPOINT status NUMERICAL_INCONCLUSIVE reason BLIND_RESPONSE_OR_IBP_STATISTICS_INVALID production_reference 0 no_reselection 1\n";trace.flush();
+      write_response_state(response_state_path,response,theta,options.temperature,options.response_tolerance,options.ibp_tolerance);
+      write_covariance_state(covariance_state_path,covariance_fit,0.0,spool_path,raw_path,options,header,qraw_identity,graph,
+        frame_count,static_cast<std::uint64_t>(train),chosen->lambda);
+      cusolverDnDestroy(dev_solver);throw std::runtime_error("NUMERICAL_INCONCLUSIVE: blind response or IBP statistics are numerically invalid");
+    }
+    const bool blind_pass=response.witness.classification.empty()&&
+      response.response<=options.response_tolerance&&response.response_band.status=="RESPONSE_PASS";
+    trace<<"BLIND_PROVENANCE status USER_ATTESTED_MATCHED_TO_QRAW_RUNTIME source_id "
+      <<std::quoted(feasibility_manifest_value(manifest,"blind_source_id"))
+      <<" model_config_origin DECLARED_UNVERIFIED_QRAW_RUNTIME_MATCH checksum FNV64_MATCHED_WRAPPER_SHA256_ATTESTED\n";
+    trace<<"FEASIBILITY_BLIND status "<<(blind_pass?"BLIND_PASSED":"BLIND_FAILED")<<" response "<<response.response
+      <<" q99_radius "<<response.response_band.radius<<" fixed_R0_second_moment 1 no_reselection 1 ";write_response_stats(trace,response);trace<<'\n';trace.flush();
+    if(!blind_pass){const auto state=rpmd_ja_feasibility::classify_blind_result(frozen,true,false);
+      trace<<"FEASIBILITY_ENDPOINT status BLIND_FAILED production_reference 0 no_reselection 1\n";trace.flush();
+      write_response_state(response_state_path,response,theta,options.temperature,options.response_tolerance,options.ibp_tolerance);
+      write_covariance_state(covariance_state_path,covariance_fit,0.0,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train),chosen->lambda);
+      cusolverDnDestroy(dev_solver);throw std::runtime_error(state==rpmd_ja_feasibility::BlindStatus::BLIND_FAILED?
+        "BLIND_FAILED: frozen candidate failed independent response validation":"IMPLEMENTATION_FAIL: blind state classification failed");}
+    const auto blind_state=rpmd_ja_feasibility::classify_blind_result(frozen,true,true);
+    if(blind_state!=rpmd_ja_feasibility::BlindStatus::BLIND_PASSED){cusolverDnDestroy(dev_solver);throw std::runtime_error("IMPLEMENTATION_FAIL: blind acceptance state is invalid");}
+    auto residuals=compare_covariance_training_force_residuals(in,header,frame_count,static_cast<std::uint64_t>(train),graph,r0,
+      baseline,sqrt_mass,sqrt_mass_atom,theta,covariance_fit.theta_baseline);
+    training_force_residual=residuals.first;covariance_baseline_force_residual=residuals.second;
+    blind_stage_timer.complete();
+    completed_blind_response_sha256=write_blind_response_checkpoint(options.output_path+".blind_checkpoint.txt",response,theta,
+      controller_journal.identity_sha256,controller_journal.frozen_candidate_identity_sha256,
+      fit_input_content_identity(options.covariance_blind_samples,true).sha256,true);
+    blind_response_pass_completed=true;
+    fit_converged=true;cusolverDnDestroy(dev_solver);
+    trace<<"FEASIBILITY_PRODUCTION_GATE status BLIND_PASSED package_prepare_readback PENDING production_reference 0\n";trace.flush();
+    }
+  if(stage_cost_record_failure)
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: completed blind-stage measurement could not be persisted");
+  if(blind_response_pass_completed){
+    controller_journal.blind_response_sha256=completed_blind_response_sha256;
+    controller_journal.selection_state="BLIND_PASSED";controller_journal.operation_in_progress=false;
+    persist_controller_journal();}
+  if(restored_blind_response_present){
+    response=restored_blind_response.response;theta=restored_blind_response.theta;fit_converged=true;
+    const auto residuals=compare_covariance_training_force_residuals(in,header,frame_count,static_cast<std::uint64_t>(train),
+      graph,r0,baseline,sqrt_mass,sqrt_mass_atom,theta,covariance_fit.theta_baseline);
+    training_force_residual=residuals.first;covariance_baseline_force_residual=residuals.second;
+    trace<<"FEASIBILITY_BLIND status RESTORED_BLIND_PASSED response "<<response.response
+      <<" no_reselection 1 response_snapshot "<<std::quoted(options.output_path+".blind_checkpoint.txt")<<'\n';trace.flush();}
+  }
+  if(covariance_method&&!options.covariance_feasibility){
+    std::vector<std::vector<double>> training_block_statistics;
+    std::vector<std::uint64_t> training_block_frames;
+    std::vector<double> statistics;
+    covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
+    statistics=collect_covariance_fit_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),
       graph,r0,options.temperature,nullptr,&training_block_statistics,&training_block_frames);
+    covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
     covariance_fit.statistics=statistics;
     try{DeviceCovarianceSystem covariance_system(baseline,graph,sqrt_mass,atom.cpu_mass);
-      covariance_fit=solve_covariance_reference(covariance_system,statistics,options.epsilon,options.covariance_shrinkage,
+      covariance_fit=solve_covariance_reference(covariance_system,statistics,options.epsilon,effective_covariance_rho,
         options.max_covariance_iterations,&trace,options.covariance_block_newton,options.covariance_joint_block,
-        options.covariance_trust_region,options.covariance_staged_barrier,training_block_statistics,training_block_frames);}
+        options.covariance_trust_region,options.covariance_staged_barrier,training_block_statistics,training_block_frames,
+        options.covariance_ridge_lambda,options.covariance_analytic_curvature_probes);}
     catch(const std::exception& error){if(covariance_fit.reason=="none"){covariance_fit.status="NUMERICAL_SOLVE_FAIL";covariance_fit.reason=error.what();}}
     if(covariance_fit.theta_baseline.empty())
       trace<<"BASELINE_SPD_FAIL status "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)<<'\n';
@@ -6405,7 +13388,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" directional_derivative_status "<<covariance_fit.directional_derivative_status
       <<" barrier_center_condition_status "<<(covariance_fit.barrier_center_condition_pass?"PASS":"NOT_VERIFIED")
       <<" barrier_gap_estimate "<<covariance_fit.barrier_gap_estimate<<'\n';trace.flush();
-    if(!covariance_fit.converged){write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
+    if(!covariance_fit.converged){write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
       throw std::runtime_error(covariance_fit.reason.empty()?"COVARIANCE_OPTIMIZER_FAILED: inspect covariance state":covariance_fit.reason);}
     theta=covariance_fit.theta;
     trace<<"COVARIANCE_OPTIMIZER_CONVERGED scaled_kkt_residual "<<covariance_fit.scaled_kkt_residual
@@ -6414,7 +13397,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" raw_gradient_inf_norm "<<covariance_fit.raw_gradient_inf_norm<<'\n';trace.flush();
     cusolverDnHandle_t response_solver=nullptr;if(cusolverDnCreate(&response_solver)!=CUSOLVER_STATUS_SUCCESS){
       covariance_fit.status="FIT_RESPONSE_NUMERICAL_FAIL";covariance_fit.reason="native covariance fit response cuSOLVER handle creation failed";
-      write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
+      write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
       throw std::runtime_error(covariance_fit.reason);}
     try{const int steps=std::min(96,d-3);DeviceLanczosWorkspace response_lanczos;
       response_lanczos.initialize(graph,sqrt_mass,sqrt_mass_atom,steps,psize);
@@ -6427,7 +13410,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       response=validate_probes(response_solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,
           options.sample_interval,options.temperature,modes,options.epsilon,&response_progress,options.response_tolerance,options.ibp_tolerance,0);
       if(!response.witness.classification.empty()){
-        write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay);
+        write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay,&graph);
         trace<<"FIT_RESPONSE_FAIL status CG_FAILURE classification "<<response.witness.classification<<'\n';trace.flush();
         throw std::runtime_error("COVARIANCE_RESPONSE_CG_FAIL: exact covariance fit did not pass held-out probe CG; no stability feedback was applied");}
       const bool numerically_valid=std::isfinite(response.response)&&std::isfinite(response.ibp)&&response.response_band.status!="NUMERICAL_FAILURE"&&
@@ -6445,9 +13428,15 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       fit_converged=true;
     }catch(const std::exception& error){covariance_fit.status="FIT_RESPONSE_FAIL";covariance_fit.reason=error.what();
       trace<<"FIT_RESPONSE_ABORT detail "<<std::quoted(error.what())<<'\n';trace.flush();
-      std::ifstream state_exists(covariance_state_path);if(!state_exists.good())write_covariance_state(covariance_state_path,covariance_fit,options.covariance_shrinkage,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));cusolverDnDestroy(response_solver);throw;}
+      rpmd_ja_file_io::ifstream state_exists(covariance_state_path);if(!state_exists.good())write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));cusolverDnDestroy(response_solver);throw;}
     cusolverDnDestroy(response_solver);
-  }else{
+    if(standalone_development_candidate){
+      trace<<"FEASIBILITY_ENDPOINT status DEVELOPMENT_CANDIDATE production_reference 0 reason INDEPENDENT_BLIND_GATE_REQUIRED resume_supported 0\n";trace.flush();
+      write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,
+        qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train),options.covariance_ridge_lambda);
+      throw std::runtime_error("DEVELOPMENT_CANDIDATE: standalone ridge/analytic-curvature fit is not eligible for prepare or production reference writing");
+    }
+  }else if(!covariance_method){
   int search_depth=std::min(96,d-3),consecutive_cg_feedback=0;
   std::vector<double> previous_low_ritz,cg_witness_seed;
   const int max_search_depth=std::min(384,d-3);
@@ -6512,10 +13501,10 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(observed_violation){consecutive_cg_feedback=0;if(!added_cut)throw std::runtime_error("STABILITY_CUT_STALLED: sampled Ritz violation added no new cut");if(outer==max_rounds-1)throw std::runtime_error("STABILITY_CUT_LIMIT: sampled Ritz violations remain after "+std::to_string(max_rounds)+" rounds");theta=solve_qp_and_trace(outer);continue;}
     ResponseCheck response_progress;
     try{response=validate_probes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,options.sample_interval,options.temperature,modes,options.epsilon,&response_progress,options.response_tolerance,options.ibp_tolerance,outer);}
-    catch(const std::exception& e){if(!response_progress.witness.classification.empty())write_cg_witness(witness_path,response_progress.witness,theta,raw_path,spool_path,cg_replay);
-      write_recovered_cg_witnesses(response_progress,witness_path,theta,raw_path,spool_path,cg_replay,saved_recovery_witness_paths);
+    catch(const std::exception& e){if(!response_progress.witness.classification.empty())write_cg_witness(witness_path,response_progress.witness,theta,raw_path,spool_path,cg_replay,&graph);
+      write_recovered_cg_witnesses(response_progress,witness_path,theta,raw_path,spool_path,cg_replay,saved_recovery_witness_paths,&graph);
       trace<<"outer "<<outer<<" status PROBE_VALIDATION_FAIL detail "<<e.what()<<" ";write_response_stats(trace,response_progress);trace<<'\n';trace.flush();throw;}
-    write_recovered_cg_witnesses(response,witness_path,theta,raw_path,spool_path,cg_replay,saved_recovery_witness_paths);
+    write_recovered_cg_witnesses(response,witness_path,theta,raw_path,spool_path,cg_replay,saved_recovery_witness_paths,&graph);
     if(response.witness.classification.empty()){
       if(!std::isfinite(response.response)||response.response_band.status=="NUMERICAL_FAILURE"||!std::isfinite(response.ibp)||ibp_statistics_numerically_invalid(response.ibp_band)){
         trace<<"outer "<<outer<<" status RESPONSE_NUMERICAL_FAILURE ";write_response_stats(trace,response);trace<<'\n';trace.flush();
@@ -6540,7 +13529,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         <<" tolerance="<<options.response_tolerance<<" response_ratio_min="<<response.response_ratio_min<<" response_ratio_max="<<response.response_ratio_max<<'\n';trace.flush();
       if(!trace)throw std::runtime_error("failed writing native fit response pass status: "+trace_path);
       fit_converged=true;break;}
-    write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay);const bool feedback_eligible=response.witness.finite&&(response.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION"||response.witness.classification=="UNRESOLVED_SOFT_DIRECTION");
+    write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay,&graph);const bool feedback_eligible=response.witness.finite&&(response.witness.classification=="NONPOSITIVE_OPERATOR_DIRECTION"||response.witness.classification=="UNRESOLVED_SOFT_DIRECTION");
     if(response.witness.classification=="TRUE_RESIDUAL_FAILURE")std::printf("    rpmd_ja fit CG_FEEDBACK FAIL: %s probe=%d iteration=%d recursive_residual=%.3g true_residual=%.3g restarts=%d; witness=%s\n",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.recursive_relative_residual,response.witness.relative_residual,response.witness.residual_restarts,witness_path.c_str());
     else std::printf("    rpmd_ja fit CG_FEEDBACK %s: %s probe=%d iteration=%d lambda=%.17g base=%.17g add=%.17g tol=%.3g repeat_delta=%.3g recursive_residual=%.3g restarts=%d; witness=%s\n",feedback_eligible?"RETRY":"FAIL",response.witness.classification.c_str(),response.witness.probe,response.witness.iteration,response.witness.rayleigh,response.witness.base_rayleigh,response.witness.add_rayleigh,response.witness.curvature_tolerance,response.witness.repeat_diff_norm,response.witness.recursive_relative_residual,response.witness.residual_restarts,witness_path.c_str());
     if(!feedback_eligible){trace<<"outer "<<outer<<" status CG_FAILURE classification="<<response.witness.classification<<" probe="<<response.witness.probe<<" iteration="<<response.witness.iteration<<" restarts="<<response.witness.residual_restarts<<" snapshot="<<std::quoted(witness_path)<<' ';write_response_stats(trace,response);trace<<'\n';trace.flush();if(!trace)throw std::runtime_error("failed writing native fit CG failure diagnostics: "+trace_path);throw std::runtime_error("CG stability feedback failed with classification "+response.witness.classification+"; inspect "+witness_path);}
@@ -6558,40 +13547,220 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     throw std::runtime_error("NONFINITE_RESPONSE_VALIDATION: held-out response or IBP arithmetic failed numerically");
   if(response.response>options.response_tolerance||response.response_band.status!="RESPONSE_PASS")
     throw std::runtime_error("native fit held-out probe response exceeds the declared tolerance");
-  std::uint64_t estimated=88;
-  for(int i=0;i<n;++i){const std::uint64_t zsite=graph.sites[i].size();estimated+=sizeof(std::int32_t)+zsite*16+zsite*3*sizeof(double)+9*zsite*zsite*sizeof(double);}
-  if(estimated>std::numeric_limits<std::streamsize>::max())throw std::runtime_error("native additive package byte estimate overflows");
-  {
-    std::ofstream out(pack_path,std::ios::binary|std::ios::trunc);if(!out)throw std::runtime_error("cannot create native additive package");own_scratch.pack_owned=true;
-    out.write(additive_magic,8);write(out,std::uint32_t(options.internal_mass_com?2:1));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(header.beads));write(out,rpmd_ja_model_fingerprint(raw_path));
-    write(out,options.temperature);write(out,options.epsilon);write(out,response.response);write(out,options.response_tolerance);write(out,std::uint64_t(train));write(out,std::uint64_t(validation));
-    for(int i=0;i<n;++i){const int zs=static_cast<int>(graph.sites[i].size());write(out,std::int32_t(zs));for(const auto&e:graph.sites[i]){write(out,std::int32_t(e.j));for(int a=0;a<3;++a)write(out,std::int32_t(e.image[a]));}
-      for(const auto&e:graph.sites[i])for(int a=0;a<3;++a)write(out,.5*e.sign*edge_linear[e.edge_index][a]);
-      const int qdim=3*zs;for(int a=0;a<qdim;++a)for(int b=0;b<qdim;++b){double v=0.0;if(a/3==b/3&&a%3<=b%3){const int group=graph.sites[i][a/3].group;const int lo=std::min(a%3,b%3),hi=std::max(a%3,b%3);const int ci=lo==0?(hi==0?0:(hi==1?1:2)):(lo==1?(hi==1?3:4):5);v=.5*theta[static_cast<std::size_t>(6*group+ci)];}else if(a/3==b/3){const int group=graph.sites[i][a/3].group;const int lo=std::min(a%3,b%3),hi=std::max(a%3,b%3);const int ci=lo==0?(hi==0?0:(hi==1?1:2)):(lo==1?(hi==1?3:4):5);v=.5*theta[static_cast<std::size_t>(6*group+ci)];}write(out,v);}
-    }
-    out.close();if(!out)throw std::runtime_error("failed closing native additive package");
+  auto observe_prepare_budget=[&](const char* stage){
+    if(!budget)return;
+    const auto result=rpmd_ja_feasibility::observe_time(*budget,feasibility_limits,covariance_budget_now_seconds());
+    if(result!=rpmd_ja_feasibility::BudgetResult::OK){
+      trace<<"FEASIBILITY_BUDGET_OVERSHOOT stage "<<stage<<" status "<<covariance_budget_result_name(result)
+        <<" elapsed_seconds "<<budget->elapsed_seconds<<" exact_gradients "<<budget->exact_gradients<<" production_reference 0\n";trace.flush();
+      throw std::runtime_error(std::string("FEASIBILITY_BUDGET_")+covariance_budget_result_name(result));}
+  };
+  if(options.covariance_feasibility){
+    if(controller_journal.selection_state!="BLIND_PASSED"&&controller_journal.selection_state!="PUBLISHING")
+      throw std::runtime_error("FEASIBILITY_RESUME_STATE_FAIL: publication requires the committed passing blind response");
+    controller_journal.selection_state="PUBLISHING";controller_journal.active_phase=
+      rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::PREPARE);
+    controller_journal.operation_in_progress=true;persist_publication_controller_journal();}
+  std::string prepared_reference_path=options.covariance_feasibility?publication_stage_output_path:options.output_path;
+  if(publication_payload_restored){
+    publish_verified_prepared_artifacts(options.output_path,publication_stage_output_path,
+      controller_journal.publication_stage_output_sha256,controller_journal.publication_stage_sidecar_sha256,[&](){
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+      maybe_fail_between_publication_renames_for_test();
+#endif
+    });
+    controller_journal.published_output_sha256=controller_journal.publication_stage_output_sha256;
+    controller_journal.published_sidecar_sha256=controller_journal.publication_stage_sidecar_sha256;
+    persist_publication_controller_journal();prepared_reference_path=options.output_path;}
+  if(budget)enter_budget_phase(rpmd_ja_feasibility::Phase::PREPARE);
+  if(options.covariance_feasibility&&!publication_payload_restored){
+    if(controller_journal.publication_stage_output_sha256.empty()){
+      for(const std::string& path:{publication_stage_output_path,publication_stage_output_path+".stability",
+          publication_stage_output_path+".tmp",publication_stage_output_path+".stability.tmp"}){
+        const bool exists=[&](){rpmd_ja_file_io::ifstream existing(path,std::ios::binary);return existing.good();}();
+        if(exists&&rpmd_ja_file_io::remove_file(path)!=0)
+          throw std::runtime_error("FEASIBILITY_PUBLISH_RETRYABLE: job staging file cleanup failed");}}
   }
-  std::printf("    rpmd_ja fit/probe validation complete; preparing reference: family=shared_lab_frame_typepair_edge_blocks parameters=%zu; restricted family, probes=%d seed=0x243f6a8885a308d3; train/heldout force residual=%.6g/%.6g response=%.6g IBP=%.6g CG residual=%.3g; stability cuts=%zu; estimated additive bytes=%llu\n",psize,response.probes,training_force_residual,response.force_residual,response.response,response.ibp,response.cg,cut_rows.size(),static_cast<unsigned long long>(estimated));
+  std::uint64_t estimated=0;
+  if(publication_payload_restored){rpmd_ja_file_io::ifstream committed(prepared_reference_path,std::ios::binary);
+    committed.seekg(0,std::ios::end);const std::streamoff bytes=committed.tellg();
+    if(bytes<=0)throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: committed prepared reference is empty");
+    estimated=static_cast<std::uint64_t>(bytes);}
+  if(!publication_payload_restored){
+  rpmd_ja_feasibility::RemainingWork before_package_work;
+  before_package_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE)]=1;
+  before_package_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::PREPARE)]=1;
+  before_package_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::READBACK)]=1;
+  observe_storage_lifetime("BEFORE_PACKAGE_WRITE",disk_required);
+  if(budget&&check_remaining_cost("BEFORE_PACKAGE_WRITE",before_package_work)==
+     rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET)
+    throw std::runtime_error("DATA_INCONCLUSIVE: measured lower-bound package/prepare/readback cost exceeds remaining budget");
+  observe_prepare_budget("before_package_write");
+  verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
+  {
+    FeasibilityStageTimer package_write_timer(trace,"PACKAGE_WRITE",
+      stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE));
+    rpmd_ja_file_io::ofstream out(pack_path,std::ios::binary|std::ios::trunc);if(!out)throw std::runtime_error("cannot create native additive package");own_scratch.pack_owned=true;
+    out.write(additive_magic,8);write(out,std::uint32_t(options.internal_mass_com?2:1));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(header.beads));write(out,raw_source_fingerprint);
+    write(out,options.temperature);write(out,options.epsilon);write(out,response.response);write(out,options.response_tolerance);write(out,std::uint64_t(train));write(out,std::uint64_t(validation));
+    estimated=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);
+    const std::streamoff actual_bytes=out.tellp();
+    if(actual_bytes<0||static_cast<std::uint64_t>(actual_bytes)!=estimated)
+      throw std::runtime_error("native additive package size estimate does not match bytes written");
+    out.close();if(!out)throw std::runtime_error("failed closing native additive package");
+    package_write_timer.complete();
+  }
+  if(stage_cost_record_failure)
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: package-write measurement could not be persisted");
+  observe_prepare_budget("after_package_write");
+   std::printf("    rpmd_ja fit/probe validation complete; preparing reference: selected_family=%s lambda=%.9g rho=%.9g parameters=%zu probes=%d seed=0x243f6a8885a308d3; training/development force residual=%.6g/%.6g response=%.6g IBP=%.6g CG residual=%.3g; stability cuts=%zu; estimated additive bytes=%llu\n",
+     covariance_method?selected_covariance_family.c_str():"M0",selected_covariance_lambda,selected_covariance_rho,psize,response.probes,
+     training_force_residual,response.force_residual,response.response,response.ibp,response.cg,cut_rows.size(),static_cast<unsigned long long>(estimated));
   qr.release();baseline.release();
-  try{prepare_rpmd_ja_qnep_reference(raw_path,options.output_path,options.kernel_table,make_rpmd_ja_qnep_mode_validator(atom,box,force),pack_path);}
+  const auto verify_package_entries=[&](const RpmdJAAdditiveData& package){
+    observe_prepare_budget("before_independent_package_entries");
+    verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
+    const auto errors=verify_native_additive_package_entries(package,graph,theta,r0,box,n);
+    observe_prepare_budget("after_independent_package_entries");
+    trace<<"ADDITIVE_PACKAGE_SPARSE_ENTRYWISE_PASS method independent_local_energy_formula selected_family "
+      <<(covariance_method?selected_covariance_family:"M0")<<" max_entry_error_over_limit_K "<<errors[0]
+      <<" max_entry_error_over_limit_H0 "<<errors[1]<<" max_entry_error_over_limit_H1 "<<errors[2]
+      <<" max_entry_error_over_limit_H2 "<<errors[3]<<" production_reference 0\n";trace.flush();
+  };
+  rpmd_ja_feasibility::RemainingWork before_prepare_work;
+  before_prepare_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::PREPARE)]=1;
+  before_prepare_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::READBACK)]=1;
+  observe_storage_lifetime("BEFORE_PREPARE",disk_margin_bytes+reference_staging_peak_bytes);
+  if(budget&&check_remaining_cost("BEFORE_PREPARE",before_prepare_work)==
+     rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET)
+    throw std::runtime_error("DATA_INCONCLUSIVE: measured lower-bound prepare/readback cost exceeds remaining budget");
+  observe_prepare_budget("before_prepare");
+  {
+  FeasibilityStageTimer prepare_stage_timer(trace,"PREPARE",
+    stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::PREPARE));
+  try{const auto prepare=[&](){
+    prepare_rpmd_ja_qnep_reference(raw_path,prepared_reference_path,options.kernel_table,
+      make_rpmd_ja_qnep_mode_validator(atom,box,force),pack_path,verify_package_entries,
+      [&](const RpmdJAPrepareResourcePlan& plan){
+        if(plan.potrf_workspace_bytes!=prepare_workspace.potrf_workspace_bytes||
+           plan.svd_workspace_bytes!=prepare_workspace.svd_workspace_bytes)
+          throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: prepare library workspaces changed after the pre-fit query");
+        trace<<"RESOURCE_PREPARE_EXACT_GPU_PLAN status "
+          <<(plan.planned_peak_gpu_bytes<=plan.free_gpu_bytes?"WITHIN_CURRENT_FREE_CAPACITY":"EXCEEDS_CURRENT_FREE_CAPACITY")
+          <<" planned_peak_bytes "<<plan.planned_peak_gpu_bytes<<" free_bytes "<<plan.free_gpu_bytes
+          <<" cartesian_matrix_bytes "<<plan.cartesian_matrix_bytes<<" internal_matrix_bytes "<<plan.internal_matrix_bytes
+          <<" potrf_workspace_bytes "<<plan.potrf_workspace_bytes<<" svd_workspace_bytes "<<plan.svd_workspace_bytes
+          <<" svd_live_peak_bytes "<<plan.svd_peak_bytes<<" allocator_safety_margin_bytes "
+          <<plan.allocator_safety_margin_bytes<<" source QNEP_PREPARE_ACTUAL_LIFETIME_AND_CUSOLVER_QUERIES\n";
+        trace.flush();if(!trace)throw std::runtime_error("failed writing exact prepare resource plan");
+      },
+      [&](const char* name,const std::uint64_t bytes){
+        trace<<"RESOURCE_PREPARE_ALLOCATION_REQUEST name "<<std::quoted(name)<<" bytes "<<bytes<<" actual_request 1\n";
+        trace.flush();if(!trace)throw std::runtime_error("failed writing prepare allocation request");
+      });};
+    const auto after_prepare=[&](){
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+    maybe_fail_after_prepare_publication_for_test();
+#endif
+    };
+    if(options.covariance_feasibility)prepare_and_take_staged_ownership(own_scratch,prepare,after_prepare);
+    else prepare_and_take_published_ownership(own_scratch,prepare,after_prepare);
+  }
   catch(const std::exception& e){
     if(preserve_candidate_package_on_full_spd_failure(e.what(),own_scratch.pack_owned)){
       trace<<"FULL_CERTIFICATE FAIL reason stored_D_cholesky candidate_additive_package "<<pack_path<<" qraw "<<raw_path<<"; full candidate direction and unshifted-D curvature are in "<<options.output_path<<".failure.txt; no automatic stability cut was added\n";trace.flush();
     }
     throw;
   }
-  own_scratch.output_owned=true;own_scratch.sidecar_owned=true;
-  double certificate_epsilon=0.0,certificate_eta=0.0;{std::ifstream stability(options.output_path+".stability");std::string key;while(stability>>key){if(key=="epsilon_num")stability>>certificate_epsilon;else if(key=="reconstruction_bound")stability>>certificate_eta;else{std::string value;stability>>value;}}if(!stability.eof()||!std::isfinite(certificate_epsilon)||!std::isfinite(certificate_eta)||!(certificate_epsilon>0.0)||!(certificate_eta<0.5*certificate_epsilon))throw std::runtime_error("native fit could not read a valid stored-D Cholesky certificate");}
+  prepare_stage_timer.complete();
+  }
+  if(stage_cost_record_failure)
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: prepare measurement could not be persisted");
+  observe_prepare_budget("after_prepare");
+  verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
+  }
+  verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
+  double certificate_epsilon=0.0,certificate_eta=0.0;{rpmd_ja_file_io::ifstream stability(prepared_reference_path+".stability");std::string key;while(stability>>key){if(key=="epsilon_num")stability>>certificate_epsilon;else if(key=="reconstruction_bound")stability>>certificate_eta;else{std::string value;stability>>value;}}if(!stability.eof()||!std::isfinite(certificate_epsilon)||!std::isfinite(certificate_eta)||!(certificate_epsilon>0.0)||!(certificate_eta<0.5*certificate_epsilon))throw std::runtime_error("native fit could not read a valid stored-D Cholesky certificate");}
   trace<<"FULL_CERTIFICATE_PASS stored_D_cholesky epsilon_num "<<certificate_epsilon<<" reconstruction_bound "<<certificate_eta<<'\n'
     <<"FULL_CERTIFICATE PASS stored_D_cholesky epsilon_num "<<certificate_epsilon<<" reconstruction_bound "<<certificate_eta<<'\n';trace.flush();
-  std::ifstream written_reference(options.output_path,std::ios::binary);if(!written_reference)throw std::runtime_error("native fit prepare returned without writing the reference package");
+  rpmd_ja_file_io::ifstream written_reference(prepared_reference_path,std::ios::binary);if(!written_reference)throw std::runtime_error("native fit prepare returned without writing the reference package");
   written_reference.seekg(0,std::ios::end);if(written_reference.tellg()<=std::streampos(0))throw std::runtime_error("native fit prepare wrote an empty reference package");
+  if(options.covariance_feasibility){
+    rpmd_ja_feasibility::RemainingWork before_readback_work;
+    before_readback_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::READBACK)]=1;
+    observe_storage_lifetime("BEFORE_READBACK",disk_margin_bytes);
+    if(check_remaining_cost("BEFORE_READBACK",before_readback_work)==
+       rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET)
+      throw std::runtime_error("DATA_INCONCLUSIVE: measured lower-bound readback cost exceeds remaining budget");
+    FeasibilityStageTimer readback_stage_timer(trace,"READBACK",
+      stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::READBACK));
+    observe_prepare_budget("before_readback");
+    const RpmdJAReference readback=read_rpmd_ja_reference(prepared_reference_path);
+    observe_prepare_budget("after_readback");
+    auto same_value=[](const double left,const double right){return std::isfinite(left)&&std::isfinite(right)&&
+      std::abs(left-right)<=1e-10*std::max({1.0,std::abs(left),std::abs(right)});};
+    bool identity_match=readback.number_of_atoms==n&&readback.types==header.types&&readback.masses.size()==header.masses.size()&&
+      readback.positions.size()==r0.size()&&same_value(readback.temperature,header.temperature)&&same_value(readback.fd_step,options.fd_step)&&
+      readback.model_fingerprint==qraw_identity.model&&readback.mechanical_config_fingerprint==qraw_identity.config&&
+      readback.q_charge_mode==qraw_identity.charge&&readback.q_uses_pppm==(qraw_identity.kspace!=0)&&
+      same_value(readback.q_mesh_spacing,qraw_identity.active_mesh)&&readback.additive_beads==header.beads;
+    const int expected_pbc[3]={box.pbc_x,box.pbc_y,box.pbc_z};
+    for(int index=0;index<9&&identity_match;++index)identity_match=same_value(readback.cell[index],box.cpu_h[index]);
+    for(int axis=0;axis<3&&identity_match;++axis)identity_match=readback.pbc[axis]==expected_pbc[axis];
+    for(int atom_index=0;atom_index<n&&identity_match;++atom_index)
+      identity_match=same_value(readback.masses[atom_index],header.masses[atom_index]);
+    for(std::size_t index=0;index<r0.size()&&identity_match;++index)identity_match=same_value(readback.positions[index],r0[index]);
+    if(!identity_match||!readback.stability_checked||readback.stability_certificate.empty()||
+       !(readback.minimum_cholesky_pivot>0.0)||!std::isfinite(readback.minimum_cholesky_pivot)||
+       !same_value(readback.additive_epsilon,options.epsilon)||!std::isfinite(readback.additive_reconstruction_bound)||
+       readback.additive_reconstruction_bound<0.0||!(readback.additive_reconstruction_bound<0.5*options.epsilon))
+      throw std::runtime_error("REFERENCE_READBACK_FAIL: stored reference identity or full-SPD certificate differs from the prepared candidate");
+     trace<<"REFERENCE_READBACK_PASS atoms "<<readback.number_of_atoms
+       <<" model_config_match 1 R0_match 1 stable_certificate 1 stored_D_Bt_action_probes 3_each\n";trace.flush();
+    readback_stage_timer.complete();
+  }
+  if(stage_cost_record_failure)
+    throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: readback measurement could not be persisted");
+  if(options.covariance_feasibility){
+    if(!publication_payload_restored){
+      controller_journal.publication_stage_output_sha256=fit_input_content_identity(publication_stage_output_path,true).sha256;
+      controller_journal.publication_stage_sidecar_sha256=fit_input_content_identity(publication_stage_output_path+".stability",true).sha256;
+      persist_publication_controller_journal();
+      own_scratch.staged_output_owned=false;own_scratch.staged_sidecar_owned=false;
+      own_scratch.staged_output_tmp_owned=false;own_scratch.staged_sidecar_tmp_owned=false;
+    }
+    publish_verified_prepared_artifacts(options.output_path,publication_stage_output_path,
+      controller_journal.publication_stage_output_sha256,controller_journal.publication_stage_sidecar_sha256,[&](){
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+      maybe_fail_between_publication_renames_for_test();
+#endif
+    });
+    controller_journal.published_output_sha256=controller_journal.publication_stage_output_sha256;
+    controller_journal.published_sidecar_sha256=controller_journal.publication_stage_sidecar_sha256;
+    persist_publication_controller_journal();
+  }
+  if(budget)trace<<"MEASURED_FINALIZATION_COST prepare_package_prepare_readback_seconds "
+    <<feasibility_budget.phase_seconds[rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::PREPARE)]
+    <<" exact_gradients "<<feasibility_budget.exact_gradients
+    <<" note includes_additive_write_independent_package_check_prepare_certificate_and_final_readback\n";
   std::printf("    rpmd_ja fit FULL_CERTIFICATE PASS: stored-D Cholesky epsilon_num=%.6g reconstruction_bound=%.6g\n",certificate_epsilon,certificate_eta);
-  {std::ofstream fitout(fit_tmp,std::ios::out|std::ios::trunc);if(!fitout)throw std::runtime_error("cannot create native fit diagnostics");own_scratch.fit_tmp_owned=true;
+  if(!options.covariance_feasibility||controller_journal.published_fit_sha256.empty()){
+  {rpmd_ja_file_io::ofstream fitout(fit_tmp,std::ios::out|std::ios::trunc);if(!fitout)throw std::runtime_error("cannot create native fit diagnostics");own_scratch.fit_tmp_owned=true;
     fitout<<std::setprecision(17)<<"candidate_identity strategy native_additive_fixed_cutoff_graph output "<<std::quoted(options.output_path)<<" samples "<<std::quoted(spool_path)<<" raw "<<std::quoted(raw_path)
       <<"\nreference_class finite_temperature_additive\nfit_response_status FIT_RESPONSE_PASS\nfull_certificate_status FULL_CERTIFICATE_PASS\nreference_write_status REFERENCE_WRITTEN"
       <<"\nparameter_count "<<psize;
-    if(covariance_method){fitout<<"\nfit_method gaussian_covariance_shrinkage\nshrinkage_strength "<<options.covariance_shrinkage
+     if(covariance_method){fitout<<"\nfit_method gaussian_covariance_shrinkage\nselected_family "<<selected_covariance_family;
+       if(options.covariance_feasibility)fitout<<"\nselected_candidate_branch "<<controller_journal.frozen_candidate_branch
+         <<"\nselected_candidate_index "<<controller_journal.frozen_candidate_index
+         <<"\nfrozen_candidate_identity_sha256 "<<controller_journal.frozen_candidate_identity_sha256;
+       fitout<<"\nselected_lambda "<<selected_covariance_lambda
+       <<"\nselected_rho "<<selected_covariance_rho
+       <<"\nshrinkage_strength "<<selected_covariance_rho<<"\nridge_lambda "<<selected_covariance_lambda
+       <<"\nridge_center_theta_baseline "<<covariance_fit.theta_baseline.size();
+       for(double value:covariance_fit.theta_baseline)fitout<<' '<<value;
+       fitout<<"\nfrozen_coordinate_scale "<<covariance_fit.coordinate_scale.size();
+       for(double value:covariance_fit.coordinate_scale)fitout<<' '<<value;
+       fitout
       <<"\nbaseline_mu "<<covariance_fit.baseline_mu<<"\nbaseline_epsilon_constraint_status "<<covariance_fit.epsilon_constraint_status
       <<"\ninitialization_status "<<covariance_fit.initialization_status<<"\ninitialization_evaluations "<<covariance_fit.initialization_evaluations
       <<"\ninitialization_gradient_calls "<<covariance_fit.initialization_gradient_calls
@@ -6607,6 +13776,19 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<"\nstaged_barrier_enabled "<<(covariance_fit.staged_barrier_enabled?1:0)
       <<"\nbarrier_stage_policy "<<(covariance_fit.staged_barrier_enabled?"STAGED_BARRIER_OPT_IN":"STRICT_KKT_EACH_STAGE")
       <<"\ntrust_region_model_decompositions "<<covariance_fit.trust_region_model_decompositions
+       <<"\nanalytic_curvature_direction_status "<<covariance_fit.analytic_curvature_direction_status
+       <<"\nanalytic_curvature_direction_checks "<<covariance_fit.analytic_curvature_direction_checks
+       <<"\nanalytic_curvature_direction_objectives "<<covariance_fit.analytic_curvature_direction_objectives
+       <<"\nanalytic_curvature_direction_max_relative_error "<<covariance_fit.analytic_curvature_direction_max_relative_error
+       <<"\nanalytic_curvature_direction_seconds "<<covariance_fit.analytic_curvature_direction_seconds
+       <<"\nanalytic_curvature_independent_status "<<covariance_fit.analytic_curvature_independent_status
+       <<"\nanalytic_curvature_independent_probes "<<covariance_fit.analytic_curvature_independent_probes
+       <<"\nanalytic_curvature_independent_directions "<<covariance_fit.analytic_curvature_independent_directions
+       <<"\nanalytic_curvature_independent_seed "<<covariance_independent_curvature_seed
+       <<"\nanalytic_curvature_independent_tolerance "<<covariance_independent_directional_tolerance
+       <<"\nanalytic_curvature_independent_rhs_columns "<<covariance_fit.analytic_curvature_independent_rhs_columns
+       <<"\nanalytic_curvature_independent_max_relative_error "<<covariance_fit.analytic_curvature_independent_max_relative_error
+       <<"\nanalytic_curvature_independent_seconds "<<covariance_fit.analytic_curvature_independent_seconds
       <<"\ntrust_region_model_resets "<<covariance_fit.trust_region_model_resets
       <<"\ntrust_region_rejections "<<covariance_fit.trust_region_rejections
       <<"\ntrust_region_radius_resolves "<<covariance_fit.trust_region_radius_resolves
@@ -6680,19 +13862,69 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       fitout<<"cg_recovery_sample_spool "<<std::quoted(spool_path)<<"\ncg_recovery_qraw "<<std::quoted(raw_path)<<'\n';
       for(const std::string& path:saved_recovery_witness_paths)fitout<<"cg_recovery_witness "<<std::quoted(path)<<'\n';
     }
-    fitout<<"family shared_lab_frame_symmetric_typepair_edge_blocks\ncoordinate_convention "<<(options.internal_mass_com?"x=R-R0; raw_eval=R0+A*x; U0(x)=Taylor_raw(A*x)+Uadd(x); P=I-tt^T internal mass-COM coordinates":"raw Cartesian coordinates")<<"\ntransport_convention "<<(options.internal_mass_com?"Bt_internal=P(Bt_raw+Bt_add)P; ambient H tiles retained and interpreted by internal E^T Bt E":"raw native reference transport")<<"\nmechanical_policy "<<(options.internal_mass_com?"native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1":"native_reference_transport;finite_temperature_additive_v1")<<";beads="<<header.beads<<";derivative="<<rawver<<"\nraw_gradient_net_xyz "<<raw_net.net[0]<<' '<<raw_net.net[1]<<' '<<raw_net.net[2]<<"\nraw_gradient_net_norm "<<raw_net.net_norm<<"\ninternal_gradient_net_xyz "<<internal_net.net[0]<<' '<<internal_net.net[1]<<' '<<internal_net.net[2]<<"\ninternal_gradient_net_norm "<<internal_net.net_norm<<"\ninternal_gradient_net_limit "<<internal_net.limit<<"\ninternal_gradient_net_status "<<(internal_net.within_limit?"PASS":"FAIL")<<"\nremoved_mass_normal_norm "<<removed_normal_norm<<"\ncoordinate_scope_note finite-grid derivative errors remain; auxiliary reference definition only; pimd_fix_com removes PILE momentum and does not constrain the production Hamiltonian\nparameters "<<psize<<"\ntype_pairs "<<graph.type_pairs.size()<<"\ncutoff_A "<<options.cutoff<<"\ntraining_frames "<<train<<"\nvalidation_frames "<<validation<<"\nprobe_policy fixed_seeded_random16_type_local_up_to4_low_ritz4\nprobe_seed 0x243f6a8885a308d3\nprobe_count "<<response.probes<<"\nprobe_subspace_only 1\nforce_residual_normalization massweighted_projected_physical_force_norm\ntraining_force_residual_relative "<<training_force_residual<<"\nheldout_force_residual_relative "<<response.force_residual<<"\nresponse_ratio_min "<<response.response_ratio_min<<"\nresponse_ratio_max "<<response.response_ratio_max<<"\nprobe_response_error "<<response.response<<"\nforce_position_ibp_error "<<response.ibp<<"\nprobe_cg_max_true_relative_residual "<<response.cg<<"\n";write_response_stats(fitout,response);write_probe_origin_table(fitout,response.probe_sources,response.probe_origins);fitout<<"\nresponse_tolerance "<<options.response_tolerance<<"\nibp_tolerance "<<options.ibp_tolerance<<"\nepsilon_fit "<<options.epsilon<<"\nspectral_cuts "<<cut_rows.size()<<"\ncertificate stored_D_additive_shifted_frobenius_SPD_bound\ncertificate_epsilon_num "<<certificate_epsilon<<"\ncertificate_reconstruction_bound "<<certificate_eta<<"\ncertificate_lambda_min_lower_bound "<<0.5*certificate_epsilon-certificate_eta<<"\ncertificate_note SPD lower bound only; not an epsilon eigenvalue floor\n";fitout.close();if(!fitout)throw std::runtime_error("failed closing native fit diagnostics");}
-  if(std::rename(fit_tmp.c_str(),fit_path.c_str())!=0)throw std::runtime_error("native fit could not publish its diagnostics");own_scratch.fit_tmp_owned=false;own_scratch.fit_owned=true;
-  in.close();raw.close();if(std::remove(pack_path.c_str())!=0||(generate_raw&&saved_recovery_witness_paths.empty()&&std::remove(generated_raw_path.c_str())!=0))throw std::runtime_error("native fit succeeded but could not remove its own additive/qraw scratch files");own_scratch.pack_owned=false;own_scratch.raw_owned=false;own_scratch.output_owned=false;own_scratch.sidecar_owned=false;own_scratch.fit_owned=false;
+   fitout<<"family "<<(graph.parameter_count>graph.base_parameter_count?"shared_lab_frame_m1_local_basis":"shared_lab_frame_symmetric_typepair_edge_blocks")<<"\nselected_covariance_family "<<selected_covariance_family<<"\ncoordinate_convention "<<(options.internal_mass_com?"x=R-R0; raw_eval=R0+A*x; U0(x)=Taylor_raw(A*x)+Uadd(x); P=I-tt^T internal mass-COM coordinates":"raw Cartesian coordinates")<<"\ntransport_convention "<<(options.internal_mass_com?"Bt_internal=P(Bt_raw+Bt_add)P; ambient H tiles retained and interpreted by internal E^T Bt E":"raw native reference transport")<<"\nmechanical_policy "<<(options.internal_mass_com?"native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1":"native_reference_transport;finite_temperature_additive_v1")<<";beads="<<header.beads<<";derivative="<<rawver<<"\nraw_gradient_net_xyz "<<raw_net.net[0]<<' '<<raw_net.net[1]<<' '<<raw_net.net[2]<<"\nraw_gradient_net_norm "<<raw_net.net_norm<<"\ninternal_gradient_net_xyz "<<internal_net.net[0]<<' '<<internal_net.net[1]<<' '<<internal_net.net[2]<<"\ninternal_gradient_net_norm "<<internal_net.net_norm<<"\ninternal_gradient_net_limit "<<internal_net.limit<<"\ninternal_gradient_net_status "<<(internal_net.within_limit?"PASS":"FAIL")<<"\nremoved_mass_normal_norm "<<removed_normal_norm<<"\ncoordinate_scope_note finite-grid derivative errors remain; auxiliary reference definition only; pimd_fix_com removes PILE momentum and does not constrain the production Hamiltonian\nparameters "<<psize<<"\ntype_pairs "<<graph.type_pairs.size()<<"\ncutoff_A "<<options.cutoff<<"\ntraining_frames "<<train<<"\nvalidation_frames "<<validation<<"\nprobe_policy "<<(options.covariance_feasibility?"fixed_seeded_random16_type_local_up_to4_physical_oho_oxygen_salt_common":"fixed_seeded_random16_type_local_up_to4_low_ritz4")<<"\nprobe_seed 0x243f6a8885a308d3\nprobe_count "<<response.probes<<"\nprobe_subspace_only 1\nforce_residual_normalization massweighted_projected_physical_force_norm\ntraining_force_residual_relative "<<training_force_residual<<"\nheldout_force_residual_relative "<<response.force_residual<<"\nresponse_ratio_min "<<response.response_ratio_min<<"\nresponse_ratio_max "<<response.response_ratio_max<<"\nprobe_response_error "<<response.response<<"\nforce_position_ibp_error "<<response.ibp<<"\nprobe_cg_max_true_relative_residual "<<response.cg<<"\n";write_response_stats(fitout,response);write_probe_origin_table(fitout,response.probe_sources,response.probe_origins);fitout<<"\nresponse_tolerance "<<options.response_tolerance<<"\nibp_tolerance "<<options.ibp_tolerance<<"\nepsilon_fit "<<options.epsilon<<"\nspectral_cuts "<<cut_rows.size()<<"\ncertificate stored_D_additive_shifted_frobenius_SPD_bound\ncertificate_epsilon_num "<<certificate_epsilon<<"\ncertificate_reconstruction_bound "<<certificate_eta<<"\ncertificate_lambda_min_lower_bound "<<0.5*certificate_epsilon-certificate_eta<<"\ncertificate_note SPD lower bound only; not an epsilon eigenvalue floor\n";fitout.close();if(!fitout)throw std::runtime_error("failed closing native fit diagnostics");}
+  if(options.covariance_feasibility){
+    controller_journal.published_fit_sha256=fit_input_content_identity(fit_tmp,true).sha256;
+    persist_publication_controller_journal();own_scratch.fit_tmp_owned=false;}
+  if(rpmd_ja_file_io::atomic_replace_file(fit_tmp,fit_path)!=0)
+    throw std::runtime_error(options.covariance_feasibility?
+      "FEASIBILITY_PUBLISH_RETRYABLE: fit diagnostics replace failed":"native fit could not publish its diagnostics");
+  own_scratch.fit_tmp_owned=false;own_scratch.fit_owned=!options.covariance_feasibility;
+  }else{
+    const bool committed_fit_exists=[&](){rpmd_ja_file_io::ifstream committed_fit(fit_path,std::ios::binary);
+      return committed_fit.good();}();
+    if(!committed_fit_exists){
+      const bool prepared_fit_exists=[&](){rpmd_ja_file_io::ifstream prepared_fit(fit_tmp,std::ios::binary);
+        return prepared_fit.good();}();
+      if(!prepared_fit_exists)
+        throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: committed fit diagnostics staging file is missing");
+      if(fit_input_content_identity(fit_tmp,true).sha256!=controller_journal.published_fit_sha256)
+        throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: committed fit diagnostics staging digest changed");
+      if(rpmd_ja_file_io::atomic_replace_file(fit_tmp,fit_path)!=0)
+        throw std::runtime_error("FEASIBILITY_PUBLISH_RETRYABLE: fit diagnostics replace failed");}
+    else if(fit_input_content_identity(fit_path,true).sha256!=controller_journal.published_fit_sha256)
+      throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: final fit diagnostics differ from their committed digest");
+    const bool matching_duplicate_fit=[&](){rpmd_ja_file_io::ifstream duplicate_fit(fit_tmp,std::ios::binary);
+      if(!duplicate_fit.good())return false;
+      duplicate_fit.close();return fit_input_content_identity(fit_tmp,true).sha256==controller_journal.published_fit_sha256;}();
+    if(matching_duplicate_fit)
+      rpmd_ja_file_io::remove_file(fit_tmp);
+  }
+   in.close();raw.close();
+   for(const std::string& scratch:{pack_path,generate_raw&&saved_recovery_witness_paths.empty()?generated_raw_path:std::string{}}){
+     if(scratch.empty())continue;
+     const bool exists=[&](){rpmd_ja_file_io::ifstream input(scratch,std::ios::binary);return input.good();}();
+     if(exists&&rpmd_ja_file_io::remove_file(scratch)!=0)
+       throw std::runtime_error("native fit succeeded but could not remove its own additive/qraw scratch files");}
+   own_scratch.pack_owned=false;own_scratch.raw_owned=false;
+   if(options.covariance_feasibility)trace<<"FEASIBILITY_ENDPOINT status REFERENCE_WRITTEN selected_family "<<selected_covariance_family
+     <<" selected_lambda "<<selected_covariance_lambda<<" selected_rho "<<selected_covariance_rho
+     <<" blind_response_pass 1 package_prepare_readback PASS production_reference 1 resume_supported 1 resume_scope FROZEN_SELECTION_BLIND_PUBLISH"
+     <<" J_A_relation NOT_TESTED thermal_conductivity NOT_TESTED current_correlation NOT_TESTED reference_transport NOT_TESTED\n";
   trace<<"REFERENCE_WRITTEN reference_class=finite_temperature_additive output "<<std::quoted(options.output_path)<<" stability "<<std::quoted(options.output_path+".stability")<<" fit_diagnostics "<<std::quoted(fit_path)<<'\n';
   trace<<"FIT_STATUS ACCEPTED_REFERENCE response=PASS full_spd=PASS sample_IBP_DIAGNOSTIC="<<sample_statistics.ibp_band.status
     <<" response_IBP_DIAGNOSTIC="<<response.ibp_band.status<<" recovery_witnesses="<<saved_recovery_witness_paths.size();
   if(!saved_recovery_witness_paths.empty())trace<<" replay_samples="<<std::quoted(spool_path)<<" replay_qraw="<<std::quoted(raw_path);
   trace<<'\n';for(const std::string& path:saved_recovery_witness_paths)trace<<"CG_RECOVERY_WITNESS "<<std::quoted(path)<<'\n';
-  trace.flush();trace.close();if(!trace)throw std::runtime_error("failed finalizing native fit trace: "+trace_path);
+   trace.flush();trace.close();if(!trace)throw std::runtime_error("failed finalizing native fit trace: "+trace_path);
+   if(options.covariance_feasibility){
+     controller_journal.published_trace_sha256=fit_input_content_identity(trace_path,true).sha256;
+     controller_journal.selection_state="PUBLISHED";controller_journal.operation_in_progress=false;
+     persist_publication_controller_journal();}
+   own_scratch.output_owned=false;own_scratch.sidecar_owned=false;own_scratch.output_tmp_owned=false;
+   own_scratch.sidecar_tmp_owned=false;own_scratch.fit_owned=false;
   std::printf("    rpmd_ja native reference ACCEPTED_REFERENCE; response and full SPD passed; IBP remains diagnostic (sample=%s, validation=%s); stability sidecar and fit diagnostics published.\n",
     sample_statistics.ibp_band.status.c_str(),response.ibp_band.status.c_str());
   if(!saved_recovery_witness_paths.empty())std::printf("    rpmd_ja fit retained CG replay inputs: samples=%s qraw=%s; witnesses=%zu\n",spool_path.c_str(),raw_path.c_str(),saved_recovery_witness_paths.size());
   return !saved_recovery_witness_paths.empty();
+}
+
+bool retryable_publication_io_failure(const std::string& detail)
+{
+  return detail=="FEASIBILITY_PUBLISH_RETRYABLE: staged artifact atomic replace failed"||
+    detail=="FEASIBILITY_PUBLISH_RETRYABLE: committed staging duplicate remove failed"||
+    detail=="FEASIBILITY_PUBLISH_RETRYABLE: fit diagnostics replace failed"||
+    detail=="FEASIBILITY_PUBLISH_RETRYABLE: job staging file cleanup failed";
 }
 
 static bool fit_rpmd_ja_native_reference_checked(const RpmdJANativeFitOptions& options,const std::string& spool_path,
@@ -6701,9 +13933,13 @@ static bool fit_rpmd_ja_native_reference_checked(const RpmdJANativeFitOptions& o
   try{return fit_rpmd_ja_native_reference_impl(options,spool_path,frame_count,atom,box,force,sample_beads_from_header);}
   catch(const std::exception& e){
     if(!options.output_path.empty()){
-      const std::string failure=options.output_path+".failure.txt";std::ifstream exists(failure);
-      if(!exists.good()){std::ofstream out(failure,std::ios::out|std::ios::trunc);if(out)out<<"native finite-temperature reference fit failed\n"<<e.what()<<'\n';}
-      const std::string raw_path=options.raw_input_path.empty()?options.output_path+".qraw":options.raw_input_path;std::ifstream trace_exists(options.output_path+".fit_trace.txt"),raw_exists(raw_path,std::ios::binary),qp_state_exists(options.output_path+".qp_state.txt",std::ios::binary),samples_exist(spool_path,std::ios::binary);const std::string trace_path=options.output_path+".fit_trace.txt",qp_state_path=options.output_path+".qp_state.txt";std::printf("    rpmd_ja fit FAIL: %s; failure=%s trace=%s qraw=%s qp_state=%s samples=%s\n",e.what(),failure.c_str(),trace_exists.good()?trace_path.c_str():"unavailable",raw_exists.good()?raw_path.c_str():"unavailable",qp_state_exists.good()?qp_state_path.c_str():"unavailable",samples_exist.good()?spool_path.c_str():"unavailable");
+      const std::string detail=e.what();
+      const bool retryable_publication_io=retryable_publication_io_failure(detail);
+      const std::string failure=options.output_path+".failure.txt";
+      if(!retryable_publication_io){rpmd_ja_file_io::ifstream exists(failure);
+        if(!exists.good()){rpmd_ja_file_io::ofstream out(failure,std::ios::out|std::ios::trunc);
+          if(out)out<<"native finite-temperature reference fit failed\n"<<detail<<'\n';}}
+      const std::string raw_path=options.raw_input_path.empty()?options.output_path+".qraw":options.raw_input_path;rpmd_ja_file_io::ifstream trace_exists(options.output_path+".fit_trace.txt"),raw_exists(raw_path,std::ios::binary),qp_state_exists(options.output_path+".qp_state.txt",std::ios::binary),samples_exist(spool_path,std::ios::binary);const std::string trace_path=options.output_path+".fit_trace.txt",qp_state_path=options.output_path+".qp_state.txt";std::printf("    rpmd_ja fit FAIL: %s; failure=%s trace=%s qraw=%s qp_state=%s samples=%s\n",detail.c_str(),retryable_publication_io?"deferred_retryable_publication":failure.c_str(),trace_exists.good()?trace_path.c_str():"unavailable",raw_exists.good()?raw_path.c_str():"unavailable",qp_state_exists.good()?qp_state_path.c_str():"unavailable",samples_exist.good()?spool_path.c_str():"unavailable");
     }
     throw;
   }
@@ -6720,10 +13956,12 @@ void fit_rpmd_ja_native_reference_from_samples(const RpmdJANativeFitOptions& opt
 {
   if(options.output_path.empty())throw std::invalid_argument("native fit_samples requires an output path");
   const std::string lock_path=options.output_path+".fit.lock";
-  std::FILE* lock=std::fopen(lock_path.c_str(),"wx");
-  if(!lock)throw std::runtime_error("rpmd_ja fit_samples could not acquire its output lock: "+lock_path);
-  struct ReleaseLock{std::FILE* file;std::string path;~ReleaseLock(){std::fclose(file);std::remove(path.c_str());}} release{lock,lock_path};
-  std::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
+  std::FILE* lock=rpmd_ja_file_io::open_file(lock_path,"a+b");
+  if(!lock||!rpmd_ja_process_lock::try_lock(lock)){
+    if(lock)std::fclose(lock);
+    throw std::runtime_error("rpmd_ja fit_samples could not acquire its output lock: "+lock_path);}
+  struct ReleaseLock{std::FILE* file;~ReleaseLock(){rpmd_ja_process_lock::unlock(file);std::fclose(file);}} release{lock};
+  rpmd_ja_file_io::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
   const SampleHeader header=read_header(in,0,atom,box,0.0,true);
   std::vector<double> position(static_cast<std::size_t>(3)*header.n),force_frame(position.size());double first_step=0.0,next_step=0.0;
   read_frame(in,position,force_frame,first_step);read_frame(in,position,force_frame,next_step);
@@ -6742,7 +13980,7 @@ void diagnose_rpmd_ja_native_fit_samples(const std::string& spool_path, const do
 {
   if (spool_path.empty() || !std::isfinite(fd_step) || fd_step <= 0.0)
     throw std::invalid_argument("native fit sample diagnostic requires a spool path and positive finite fd_step");
-  std::ifstream in(spool_path, std::ios::binary);
+  rpmd_ja_file_io::ifstream in(spool_path, std::ios::binary);
   if (!in) throw std::runtime_error("cannot open native rpmd_ja sample spool: " + spool_path);
   const SampleHeader header = read_header(in, 0, atom, box, 0.0, true);
   if (header.frame_count > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
@@ -6778,7 +14016,7 @@ void check_rpmd_ja_native_fit_samples(const std::string& spool_path,const std::s
 {
   if(spool_path.empty()||report_path.empty()||spool_path==report_path)
     throw std::invalid_argument("rpmd_ja check_samples requires distinct nonempty input and report paths");
-  std::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
+  rpmd_ja_file_io::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
   const SampleHeader header=read_header(in,0,atom,box,0.0,true);
   const std::uint64_t train=2*header.frame_count/3;std::vector<double> r0(static_cast<std::size_t>(3)*header.n,0.0);
   const double interval=read_training_r0(in,header,header.frame_count,std::numeric_limits<double>::quiet_NaN(),r0);
@@ -6844,6 +14082,141 @@ std::map<std::string,std::string> read_covariance_state_fields(std::istream& inp
   return fields;
 }
 
+CovarianceFitResult restore_covariance_fit_state(std::istream& input,const std::string& identity_label,
+  const std::vector<double>& statistics,const std::vector<std::vector<double>>& training_blocks,
+  const std::vector<std::uint64_t>& training_block_frames,const double epsilon,const double expected_rho,
+  const double expected_lambda,const std::string& expected_family,
+  const std::string& expected_samples_path,const std::string& expected_qraw_path)
+{
+  if(!input)throw std::runtime_error("cannot read verified completed feasibility fit state: "+identity_label);
+  const auto fields=read_covariance_state_fields(input);
+  auto required=[&](const char* key)->const std::string&{const auto found=fields.find(key);
+    if(found==fields.end())throw std::runtime_error(std::string("completed feasibility state is missing ")+key);return found->second;};
+  auto parse_string=[&](const char* key){std::istringstream row(required(key));std::string value;
+    if(!(row>>std::quoted(value))||value.empty())throw std::runtime_error(std::string("invalid feasibility state string ")+key);return value;};
+  auto parse_double=[&](const char* key){std::istringstream row(required(key));double value=0.0;std::string extra;
+    if(!(row>>value)||!std::isfinite(value)||(row>>extra))throw std::runtime_error(std::string("invalid feasibility state scalar ")+key);return value;};
+  auto parse_u64=[&](const char* key){std::istringstream row(required(key));std::uint64_t value=0;std::string extra;
+    if(!(row>>value)||(row>>extra))throw std::runtime_error(std::string("invalid feasibility state counter ")+key);return value;};
+  auto parse_vector=[&](const char* key){std::istringstream row(required(key));std::size_t count=0;
+    if(!(row>>count)||count>1000000)throw std::runtime_error(std::string("invalid feasibility state vector ")+key);
+    std::vector<double> values(count);for(double& value:values)if(!(row>>value)||!std::isfinite(value))
+      throw std::runtime_error(std::string("invalid feasibility state vector ")+key);
+    row>>std::ws;if(!row.eof())throw std::runtime_error(std::string("trailing feasibility state vector data ")+key);return values;};
+  auto optional_double=[&](const char* key,double& value){const auto found=fields.find(key);if(found==fields.end())return;
+    std::istringstream row(found->second);double parsed=0.0;if(!(row>>parsed))throw std::runtime_error(std::string("invalid feasibility state scalar ")+key);
+    row>>std::ws;if(!row.eof())throw std::runtime_error(std::string("trailing feasibility state scalar ")+key);
+    if(std::isfinite(parsed))value=parsed;};
+  auto optional_counter=[&](const char* key,std::uint64_t& value){const auto found=fields.find(key);if(found==fields.end())return;
+    std::istringstream row(found->second);std::uint64_t parsed=0;std::string extra;
+    if(!(row>>parsed)||(row>>extra))throw std::runtime_error(std::string("invalid feasibility state counter ")+key);value=parsed;};
+  auto matches=[&](const double actual,const double expected){return std::abs(actual-expected)<=1e-12*std::max({1.0,std::abs(actual),std::abs(expected)});};
+  const std::vector<double> saved_statistics=parse_vector("training_statistics");
+  const std::string expected_target=expected_lambda>0.0?"FROZEN_CENTER_RIDGE":"COVARIANCE_SHRINKAGE";
+  if(required("target_objective")!=expected_target)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 target_objective differs from the frozen contract");
+  if(parse_string("parameter_family")!=expected_family||!matches(parse_double("epsilon"),epsilon)||
+     !matches(parse_double("shrinkage_strength"),expected_rho)||!matches(parse_double("ridge_lambda"),expected_lambda)||
+     parse_u64("samples_source_fnv64")!=rpmd_ja_model_fingerprint(expected_samples_path.empty()?parse_string("samples"):expected_samples_path)||
+     parse_u64("qraw_source_fnv64")!=rpmd_ja_model_fingerprint(expected_qraw_path.empty()?parse_string("qraw"):expected_qraw_path))
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: completed covariance state differs from the frozen candidate identity: "+identity_label);
+  if(saved_statistics.size()!=statistics.size())
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: completed covariance state training-statistic dimensions differ");
+  for(std::size_t i=0;i<statistics.size();++i)if(!matches(saved_statistics[i],statistics[i]))
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: completed covariance state training statistics changed");
+  CovarianceFitResult fit;fit.status=required("status");fit.reason=required("reason");
+  fit.converged=fit.status=="COVARIANCE_OPTIMIZER_CONVERGED"||fit.status=="COVARIANCE_FIXED_TAU_CONVERGED";
+  fit.statistics=statistics;fit.training_block_statistics=training_blocks;fit.training_block_frames=training_block_frames;
+  fit.theta_baseline=parse_vector("theta_baseline");fit.theta_start=parse_vector("theta_start");fit.theta=parse_vector("theta");
+  fit.coordinate_scale=parse_vector("coordinate_scale");fit.covariance_baseline.theta=fit.theta_baseline;
+  fit.covariance_baseline.trace=parse_vector("baseline_trace");fit.covariance_baseline.mu=parse_double("baseline_mu");
+  fit.covariance_baseline.epsilon=epsilon;
+  if(required("baseline_epsilon_constraint_status")!="ACTIVE"&&required("baseline_epsilon_constraint_status")!="INACTIVE")
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: imported A0 baseline constraint status is invalid");
+  fit.covariance_baseline.epsilon_constraint_active=required("baseline_epsilon_constraint_status")=="ACTIVE";
+  fit.ridge_lambda=expected_lambda;fit.baseline_mu=fit.covariance_baseline.mu;
+  fit.barrier_tau=parse_double("barrier_tau");fit.objective_total=parse_double("objective_total");
+  fit.objective_data=parse_double("objective_data");fit.objective_prior=parse_double("objective_prior");
+  optional_double("objective_barrier",fit.objective_barrier);optional_double("objective_ridge",fit.objective_ridge);
+  fit.scaled_kkt_residual=parse_double("optimizer_scaled_kkt_residual");
+  fit.raw_gradient_inf_norm=parse_double("optimizer_raw_gradient_inf_norm");
+  fit.kkt_gradient_denominator=parse_double("kkt_gradient_denominator");
+  fit.objective_evaluations=parse_u64("objective_evaluations");fit.initialization_evaluations=parse_u64("initialization_evaluations");
+  fit.full_gradient_evaluations=parse_u64("full_gradient_evaluations");fit.iterations=static_cast<int>(parse_u64("iterations"));
+  fit.optimizer_seconds=parse_double("optimizer_seconds");fit.initialization_status=required("initialization_status");
+  fit.start_gradient_solve_status=required("start_gradient_solve_status");
+  fit.trust_region_enabled=required("trust_region_enabled")=="1";
+  fit.staged_barrier_enabled=required("staged_barrier_enabled")=="1";
+  fit.block_newton_enabled=required("block_newton_enabled")=="1";fit.joint_block_enabled=required("joint_block_enabled")=="1";
+  fit.direction_method=required("direction_method");fit.direction_reason=required("direction_reason");
+  fit.line_search_failure_status=required("line_search_failure_status");
+  fit.directional_derivative_status=required("directional_derivative_status");
+  fit.epsilon_constraint_status=required("baseline_epsilon_constraint_status");
+  fit.barrier_center_condition_pass=required("barrier_center_condition_status")=="PASS";
+  optional_counter("factorizations",fit.factorizations);optional_counter("solve_rhs_columns",fit.solve_rhs_columns);
+  optional_counter("initialization_gradient_calls",fit.initialization_gradient_calls);
+  optional_counter("line_search_gradient_calls",fit.line_search_gradient_calls);
+  optional_counter("line_search_trials",fit.line_search_trials);optional_counter("line_search_evaluations",fit.line_search_evaluations);
+  optional_counter("dominant_cap_rescue_attempts",fit.dominant_cap_rescue_attempts);
+  optional_counter("dominant_cap_rescue_commits",fit.dominant_cap_rescue_commits);
+  optional_counter("trust_region_model_decompositions",fit.trust_region_model_decompositions);
+  optional_counter("trust_region_model_resets",fit.trust_region_model_resets);
+  optional_counter("trust_region_rejections",fit.trust_region_rejections);
+  optional_counter("trust_region_radius_resolves",fit.trust_region_radius_resolves);
+  optional_counter("trust_region_gradient_residual_rejects",fit.trust_region_gradient_residual_rejects);
+  optional_double("trust_region_radius",fit.trust_region_radius);optional_double("trust_region_last_ratio",fit.trust_region_last_ratio);
+  optional_double("trust_region_last_predicted",fit.trust_region_last_predicted);optional_double("trust_region_last_actual",fit.trust_region_last_actual);
+  optional_double("line_search_objective_seconds",fit.line_search_objective_seconds);
+  optional_double("line_search_gradient_seconds",fit.line_search_gradient_seconds);
+  optional_double("objective_evaluation_seconds",fit.objective_evaluation_seconds);
+  optional_double("full_gradient_seconds",fit.full_gradient_seconds);
+  optional_double("last_full_gradient_seconds",fit.last_full_gradient_seconds);
+  optional_double("factorization_seconds",fit.factorization_seconds);
+  fit.start_metrics_point=required("start_metrics_point");fit.start_tau=parse_double("start_tau");
+  optional_double("start_graph_delta",fit.start_graph_delta);optional_double("start_objective",fit.start_objective);
+  optional_double("start_raw_gradient_inf_norm",fit.start_raw_gradient_inf_norm);
+  optional_double("barrier_gap_estimate",fit.barrier_gap_estimate);optional_double("analytic_curvature_seconds",fit.analytic_curvature_seconds);
+  fit.analytic_curvature_status=fields.count("analytic_curvature_status")?fields.at("analytic_curvature_status"):"NOT_REQUESTED";
+  fit.analytic_curvature_independent_status=fields.count("analytic_curvature_independent_status")?
+    fields.at("analytic_curvature_independent_status"):"NOT_REQUESTED";
+  fit.original_residual_initial_status=fields.count("original_residual_initial_status")?
+    fields.at("original_residual_initial_status"):"NOT_REQUIRED";
+  fit.original_residual_final_status=fields.count("original_residual_final_status")?
+    fields.at("original_residual_final_status"):"NOT_REQUIRED";
+  fit.last_valid.available=required("last_valid_available")=="1";
+  if(!fit.last_valid.available&&fit.converged)
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: converged A0 state has no committed objective/gradient snapshot");
+  if(fit.last_valid.available){
+    fit.last_valid.theta=parse_vector("last_valid_theta");
+    fit.last_valid.gradient_data=parse_vector("last_valid_gradient_data");
+    fit.last_valid.gradient_prior=parse_vector("last_valid_gradient_prior");
+    fit.last_valid.gradient_ridge=parse_vector("last_valid_gradient_ridge");
+    fit.last_valid.gradient_barrier=parse_vector("last_valid_gradient_barrier");
+    fit.last_valid.gradient_total=parse_vector("last_valid_gradient_total");
+    fit.last_valid.objective_data=parse_double("last_valid_objective_data");
+    fit.last_valid.objective_prior=parse_double("last_valid_objective_prior");
+    fit.last_valid.objective_ridge=parse_double("last_valid_objective_ridge");
+    fit.last_valid.objective_barrier=parse_double("last_valid_objective_barrier");
+    fit.last_valid.objective=parse_double("last_valid_objective");fit.last_valid.tau=parse_double("last_valid_tau");
+    fit.last_valid.scaled_kkt_residual=parse_double("last_valid_scaled_kkt_residual");
+    fit.last_valid.raw_gradient_inf_norm=parse_double("last_valid_raw_gradient_inf_norm");
+  }
+  if(fit.converged&&(fit.theta.empty()||fit.theta.size()!=statistics.size()||fit.coordinate_scale.size()!=statistics.size()||
+     fit.theta_baseline.size()!=statistics.size()||fit.covariance_baseline.trace.size()!=statistics.size()))
+    throw std::runtime_error("FEASIBILITY_RESUME_IDENTITY_FAIL: completed covariance fit vectors have inconsistent dimensions");
+  return fit;
+}
+
+CovarianceFitResult restore_covariance_fit_state(const std::string& path,const std::vector<double>& statistics,
+  const std::vector<std::vector<double>>& training_blocks,const std::vector<std::uint64_t>& training_block_frames,
+  const double epsilon,const double expected_rho,const double expected_lambda,const std::string& expected_family,
+  const std::string& expected_samples_path,const std::string& expected_qraw_path)
+{
+  rpmd_ja_file_io::ifstream input(path);if(!input)throw std::runtime_error("cannot open completed feasibility fit state: "+path);
+  return restore_covariance_fit_state(input,path,statistics,training_blocks,training_block_frames,epsilon,expected_rho,
+    expected_lambda,expected_family,expected_samples_path,expected_qraw_path);
+}
+
 bool covariance_state_tau_matches(const double saved_tau,const double tau)
 {
   if(!(saved_tau>0.0)||!std::isfinite(saved_tau)||!(tau>0.0)||!std::isfinite(tau))return false;
@@ -6858,14 +14231,16 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   if(state_path.empty()||report_path.empty()||state_path==report_path||!(cutoff>0.0)||!(epsilon>0.0)||!(tau>0.0)||!(fd_step>0.0)||
      !std::isfinite(cutoff)||!std::isfinite(epsilon)||!std::isfinite(tau)||!std::isfinite(fd_step))
     throw std::invalid_argument("rpmd_ja diagnose_covariance requires distinct paths and positive finite numeric arguments");
-  std::ifstream existing_report(report_path,std::ios::binary);if(existing_report.good())throw std::runtime_error("rpmd_ja diagnose_covariance report already exists: "+report_path);
-  std::ifstream state_in(state_path);if(!state_in)throw std::runtime_error("cannot open covariance state: "+state_path);
+  rpmd_ja_file_io::ifstream existing_report(report_path,std::ios::binary);if(existing_report.good())throw std::runtime_error("rpmd_ja diagnose_covariance report already exists: "+report_path);
+  rpmd_ja_file_io::ifstream state_in(state_path);if(!state_in)throw std::runtime_error("cannot open covariance state: "+state_path);
   const std::map<std::string,std::string> fields=read_covariance_state_fields(state_in);
   auto required=[&](const char* key)->const std::string&{const auto it=fields.find(key);if(it==fields.end())throw std::runtime_error(std::string("covariance state is missing ")+key);return it->second;};
   auto parse_vector=[&](const char* key){std::istringstream values(required(key));std::size_t count=0;if(!(values>>count)||count>static_cast<std::size_t>(std::numeric_limits<int>::max()))
       throw std::runtime_error(std::string("covariance state has an invalid ")+key);std::vector<double> out(count);for(double& value:out)if(!(values>>value)||!std::isfinite(value))
       throw std::runtime_error(std::string("covariance state has an invalid ")+key);return out;};
   auto parse_double=[&](const char* key){std::istringstream value(required(key));double out=0.0;if(!(value>>out)||!std::isfinite(out))
+      throw std::runtime_error(std::string("covariance state has an invalid ")+key);return out;};
+  auto parse_u64=[&](const char* key){std::istringstream value(required(key));std::uint64_t out=0;if(!(value>>out))
       throw std::runtime_error(std::string("covariance state has an invalid ")+key);return out;};
   auto optional_double=[&](const char* key,const double value){const auto it=fields.find(key);if(it!=fields.end()){
       std::istringstream stored(it->second);double parsed=0.0;if(!(stored>>parsed)||!std::isfinite(parsed)||std::abs(parsed-value)>1e-10*std::max({1.0,std::abs(parsed),std::abs(value)}))
@@ -6881,8 +14256,33 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
       throw std::runtime_error(std::string("covariance state has an invalid ")+key);return value?std::string("1"):std::string("0");};
   auto parse_quoted=[&](const char* key){std::istringstream value(required(key));std::string out;if(!(value>>std::quoted(out))||out.empty())
       throw std::runtime_error(std::string("covariance state has an invalid ")+key);return out;};
+  int state_version=1;if(fields.count("state_format_version")){std::istringstream version(fields.at("state_format_version"));
+    if(!(version>>state_version)||state_version<1||state_version>4)throw std::runtime_error("covariance state has an unsupported state_format_version");}
+  const bool complete_state=state_version>=3;
+  if(complete_state)for(const char* key:{"target_objective","ridge_lambda","coordinate_scale","last_valid_gradient_data",
+       "last_valid_gradient_prior","last_valid_gradient_ridge","last_valid_gradient_barrier","last_valid_gradient_total",
+       "ridge_coordinates","original_residual_initial_status","original_residual_final_status","feasibility_budget_elapsed_seconds",
+       "feasibility_budget_exact_gradients","qraw_source_fnv64","samples_source_fnv64"})required(key);
+  const auto family_field=fields.find("parameter_family");
+  const bool m1_family=family_field!=fields.end()&&family_field->second=="M1";
+  if(family_field!=fields.end()&&family_field->second!="M0"&&family_field->second!="M1")
+    throw std::runtime_error("covariance state has an invalid parameter_family");
+  int saved_m1_minimum_support_count=3;
+  if(m1_family){const auto support=fields.find("M1_minimum_support_count");
+    if(complete_state&&support==fields.end())throw std::runtime_error("M1_DIAGNOSE_FAIL: complete state is missing its frozen support rule");
+    if(complete_state)for(const char* key:{"M1_basis_fingerprint_fnv64","M1_parameter_names",
+        "M1_parameter_basis_norms","M1_local_transform","M1_local_base_mix","M1_raw_support"})required(key);
+    if(support!=fields.end()){std::size_t consumed=0;try{saved_m1_minimum_support_count=std::stoi(support->second,&consumed);}
+      catch(...){throw std::runtime_error("M1_DIAGNOSE_FAIL: invalid frozen support rule in state");}
+      if(consumed!=support->second.size()||saved_m1_minimum_support_count<1||saved_m1_minimum_support_count>1000)
+        throw std::runtime_error("M1_DIAGNOSE_FAIL: invalid frozen support rule in state");}}
+  const double ridge_lambda=fields.count("ridge_lambda")?parse_double("ridge_lambda"):0.0;
+  if(ridge_lambda<0.0)throw std::runtime_error("covariance state has an invalid ridge_lambda");
+  if(complete_state){const std::string expected_target=ridge_lambda>0.0?"FROZEN_CENTER_RIDGE":"COVARIANCE_SHRINKAGE";
+    if(required("target_objective")!=expected_target)
+      throw std::runtime_error("covariance state target_objective disagrees with rho/ridge_lambda");}
   const std::string spool_path=parse_quoted("samples"),raw_path=parse_quoted("qraw");
-  std::ifstream spool(spool_path,std::ios::binary);if(!spool)throw std::runtime_error("cannot open covariance state sample spool: "+spool_path);
+  rpmd_ja_file_io::ifstream spool(spool_path,std::ios::binary);if(!spool)throw std::runtime_error("cannot open covariance state sample spool: "+spool_path);
   const SampleHeader header=read_header(spool,0,atom,box,0.0,true,true);
   if(header.frame_count>static_cast<std::uint64_t>(std::numeric_limits<int>::max()))throw std::runtime_error("covariance diagnostic sample count exceeds supported indexing limits");
   const std::uint64_t frame_count=header.frame_count,training_frames=2*frame_count/3;
@@ -6901,7 +14301,8 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   if(last_valid_available){const double saved_tau=parse_double("last_valid_tau");
     if(!covariance_state_tau_matches(saved_tau,tau))
       throw std::runtime_error("diagnose_covariance tau does not match last_valid_tau in covariance state");}
-  const double rho=parse_double("shrinkage_strength");if(!(rho>0.0))throw std::runtime_error("covariance state shrinkage strength must be positive");
+  const double rho=parse_double("shrinkage_strength");
+  if(rho<0.0||(rho>0.0&&ridge_lambda>0.0))throw std::runtime_error("covariance state objective mode has incompatible rho/ridge values");
   const std::string saved_optimizer_mode=fields.count("optimizer_step_mode")?fields.at("optimizer_step_mode"):"LEGACY_UNKNOWN";
   if(saved_optimizer_mode!="BFGS_DEFAULT"&&saved_optimizer_mode!="BLOCK_NEWTON_OPT_IN"&&
      saved_optimizer_mode!="JOINT_BLOCK_OPT_IN"&&saved_optimizer_mode!="TRUST_REGION_OPT_IN"&&saved_optimizer_mode!="LEGACY_UNKNOWN")
@@ -6909,7 +14310,16 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   const std::string saved_trust_region=optional_flag("trust_region_enabled");
   if(saved_trust_region!="LEGACY_UNKNOWN"&&(saved_trust_region=="1")!=(saved_optimizer_mode=="TRUST_REGION_OPT_IN"))
     throw std::runtime_error("covariance state trust_region_enabled disagrees with optimizer_step_mode");
-  const Graph graph=make_graph(r0,header.types,box,cutoff);const std::size_t parameter_count=6*graph.type_pairs.size();
+  Graph graph=make_graph(r0,header.types,box,cutoff);
+  if(m1_family){
+    if(atom.cpu_atom_symbol.size()!=static_cast<std::size_t>(header.n)||atom.cpu_mass.size()!=static_cast<std::size_t>(header.n))
+      throw std::runtime_error("M1_DIAGNOSE_FAIL: runtime atom symbols or masses are unavailable for frozen-basis reconstruction");
+    build_m1_local_basis(graph,r0,header.types,atom.cpu_atom_symbol,atom.cpu_mass,box,cutoff,saved_m1_minimum_support_count);
+    if(fields.count("M1_basis_fingerprint_fnv64")&&
+       parse_u64("M1_basis_fingerprint_fnv64")!=covariance_m1_basis_fingerprint(graph))
+      throw std::runtime_error("M1_DIAGNOSE_FAIL: frozen local terms, periodic images, or parameter transform differ from saved basis identity");
+  }
+  const std::size_t parameter_count=static_cast<std::size_t>(graph.parameter_count?graph.parameter_count:6*graph.type_pairs.size());
   std::vector<double> theta_baseline=parse_vector("theta_baseline");
   std::vector<double> theta=fields.count("last_valid_available")&&fields.at("last_valid_available")=="1"&&fields.count("last_valid_theta")?
     parse_vector("last_valid_theta"):parse_vector("theta");
@@ -6921,6 +14331,24 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     if(actual.size()!=expected.size())throw std::runtime_error(std::string("covariance state ")+what+" dimensions do not match");
     for(std::size_t i=0;i<actual.size();++i)if(std::abs(actual[i]-expected[i])>1e-8*std::max({1.0,std::abs(actual[i]),std::abs(expected[i])}))
       throw std::runtime_error(std::string("covariance state ")+what+" does not match the rebuilt sample graph at parameter "+std::to_string(i));};
+  if(m1_family){
+    if(fields.count("M1_local_transform"))compare_saved_vector(parse_vector("M1_local_transform"),graph.local_transform,"M1 local transform");
+    if(fields.count("M1_local_base_mix"))compare_saved_vector(parse_vector("M1_local_base_mix"),graph.local_base_mix,"M1 base mix");
+    if(fields.count("M1_parameter_basis_norms"))compare_saved_vector(parse_vector("M1_parameter_basis_norms"),graph.parameter_basis_norms,"M1 parameter scales");
+    if(fields.count("M1_parameter_names")){std::istringstream names(fields.at("M1_parameter_names"));std::size_t count=0;
+      if(!(names>>count)||count!=graph.parameter_names.size())throw std::runtime_error("M1_DIAGNOSE_FAIL: saved parameter-name count differs from rebuilt basis");
+      for(const std::string& expected:graph.parameter_names){std::string value;if(!(names>>std::quoted(value))||value!=expected)
+          throw std::runtime_error("M1_DIAGNOSE_FAIL: saved parameter names differ from rebuilt basis");}}
+    if(fields.count("M1_raw_support")){std::istringstream support(fields.at("M1_raw_support"));std::size_t count=0;
+      if(!(support>>count)||count!=graph.m1.raw_parameters.size())
+        throw std::runtime_error("M1_DIAGNOSE_FAIL: saved local support count differs from rebuilt basis");
+      for(const auto& expected:graph.m1.raw_parameters){std::string name,status;std::size_t support_count=0,term_count=0;double residual=0.0;
+        if(!(support>>std::quoted(name)>>std::quoted(status)>>support_count>>term_count>>residual)||
+           name!=expected.name||status!=expected.status||support_count!=expected.support_count||
+           term_count!=expected.term_count||!std::isfinite(residual)||
+           std::abs(residual-expected.residual_relative_norm)>1e-8*std::max({1.0,std::abs(residual),std::abs(expected.residual_relative_norm)}))
+          throw std::runtime_error("M1_DIAGNOSE_FAIL: saved local support differs from rebuilt basis");}}
+  }
   if(fields.count("parameter_map")){std::istringstream mapping(fields.at("parameter_map"));std::size_t groups=0;std::string marker,components;
     if(!(mapping>>groups>>marker)||marker!="components")throw std::runtime_error("covariance state parameter map is malformed");
     for(const char* expected:{"xx","xy","xz","yy","yz","zz"})if(!(mapping>>components)||components!=expected)throw std::runtime_error("covariance state component map does not match xx/xy/xz/yy/yz/zz order");
@@ -6929,12 +14357,14 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   if(fields.count("last_valid_available")&&fields.at("last_valid_available")=="1")compare_saved_vector(parse_vector("theta"),theta,"committed last-valid parameters");
   auto number_of=[&](const char* key){const auto it=fields.find(key);if(it==fields.end())return std::string("NOT_STORED");return it->second;};
   std::string optimizer_trace_status="NOT_AVAILABLE";CovarianceOptimizerTraceSummary optimizer_trace;
-  if(fields.count("fit_trace_path")){const std::string trace_path=parse_quoted("fit_trace_path");std::ifstream fit_trace(trace_path);
+  if(fields.count("fit_trace_path")){const std::string trace_path=parse_quoted("fit_trace_path");rpmd_ja_file_io::ifstream fit_trace(trace_path);
     if(fit_trace){optimizer_trace_status="PASS";optimizer_trace=covariance_parse_optimizer_trace(fit_trace);}
     else optimizer_trace_status="MISSING_FILE";}
   RpmdJANativeFitOptions options;options.temperature=header.temperature;options.cutoff=cutoff;options.epsilon=epsilon;options.fd_step=fd_step;
   options.internal_mass_com=internal_mass_com;options.sample_interval=static_cast<int>(std::llround(interval));
-  std::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("cannot open covariance state qraw source: "+raw_path);
+  rpmd_ja_file_io::ifstream raw(raw_path,std::ios::binary);if(!raw)throw std::runtime_error("cannot open covariance state qraw source: "+raw_path);
+  optional_u64("samples_source_fnv64",rpmd_ja_model_fingerprint(spool_path));
+  optional_u64("qraw_source_fnv64",rpmd_ja_model_fingerprint(raw_path));
   const QrawIdentity identity=validate_qraw_identity(raw,options,header,r0,box,force);
   optional_integer("qraw_identity_version",identity.version);optional_integer("qraw_data_offset",static_cast<long long>(identity.data_offset));
   optional_integer("qraw_k_offset",static_cast<long long>(identity.k_offset));optional_u64("qraw_model_fingerprint",identity.model);
@@ -6959,7 +14389,9 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     <<"\nsample_spool "<<std::quoted(spool_path)<<"\nqraw_source "<<std::quoted(raw_path)<<"\nstate_format_version "<<number_of("state_format_version")
     <<"\nmetadata_assumption "<<(fields.count("cutoff_A")?"STATE_METADATA_VALIDATED":"LEGACY_STATE_MISSING_METADATA; supplied arguments and current run.in COM setting used")
     <<"\ntau_metadata_validation "<<tau_metadata_status
-    <<"\ncutoff_A "<<cutoff<<"\nepsilon "<<epsilon<<"\nfd_step "<<fd_step<<"\ntau "<<tau<<"\nrho "<<rho
+     <<"\ncutoff_A "<<cutoff<<"\nepsilon "<<epsilon<<"\nfd_step "<<fd_step<<"\ntau "<<tau<<"\nrho "<<rho
+     <<"\nridge_lambda "<<ridge_lambda<<"\ntarget_objective "<<(ridge_lambda>0.0?"FROZEN_CENTER_RIDGE":"COVARIANCE_SHRINKAGE")
+     <<"\nparameter_family "<<(m1_family?"M1":"M0")
     <<"\ntemperature_K "<<header.temperature<<"\ninternal_mass_com "<<(internal_mass_com?1:0)
     <<"\ncom_convention "<<(internal_mass_com?"internal_mass_com_pullback_v1":"strict_raw_zero_net")<<"\nsample_interval "<<interval
     <<"\nsample_frames "<<frame_count<<"\ntraining_frames "<<training_frames<<"\nbeads "<<header.beads
@@ -6967,33 +14399,79 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     <<"\nqraw_model_fingerprint "<<identity.model<<"\nqraw_config_fingerprint "<<identity.config<<"\nqraw_charge_mode "<<identity.charge
     <<"\nqraw_kspace_flag "<<identity.kspace<<"\nqraw_mesh_spacing "<<identity.mesh<<"\nactive_pppm_mesh_spacing "<<identity.active_mesh
     <<"\ntraining_statistics_validation PASS\nparameter_map_validation "<<(fields.count("parameter_map")?"PASS":"LEGACY_UNAVAILABLE")<<'\n';
+  if(m1_family)report<<"M1_basis_replay_status "<<(fields.count("M1_basis_fingerprint_fnv64")?"FINGERPRINT_AND_TRANSFORM_PASS":"LEGACY_REBUILD_WITHOUT_FINGERPRINT")
+    <<"\nM1_edge_attribution_status SKIPPED_NOT_APPLICABLE\n";
+  report<<"feasibility_budget_elapsed_seconds "<<number_of("feasibility_budget_elapsed_seconds")
+    <<"\nfeasibility_budget_exact_gradients "<<number_of("feasibility_budget_exact_gradients")
+    <<"\nfeasibility_budget_status "<<number_of("feasibility_budget_status")<<'\n';
   DeviceCovarianceSystem covariance_system(baseline_device,graph,sqrt_mass,header.masses);
   const auto diagnostic_started=std::chrono::steady_clock::now();
   const std::uint64_t diagnostic_factor_start=covariance_system.factorizations,diagnostic_rhs_start=covariance_system.solve_rhs_columns;
   std::uint64_t diagnostic_evaluations=0;CovarianceBaseline base;base.theta=theta_baseline;base.mu=parse_double("baseline_mu");
-  std::vector<double> expected_baseline=graph_laplacian_direction(graph);for(double& value:expected_baseline)value*=base.mu;
+  std::vector<double> expected_baseline=graph_laplacian_direction(graph,static_cast<int>(parameter_count));for(double& value:expected_baseline)value*=base.mu;
   compare_saved_vector(theta_baseline,expected_baseline,"graph-Laplacian baseline parameters");
   std::vector<double> baseline_shifted_trace,baseline_edge_trace;CovarianceObjectiveEvaluation baseline_value;++diagnostic_evaluations;
   if(!covariance_system.evaluate_factors(base.theta,epsilon,base.logdet,base.shifted_logdet,&base.trace,&baseline_shifted_trace,true,false,
       &baseline_edge_trace,nullptr))
     throw std::runtime_error("saved graph-Laplacian baseline is not epsilon-positive definite");
   const CovarianceTraceDiagnostics baseline_d=covariance_system.last_d_trace,baseline_shifted=covariance_system.last_shifted_trace;
+  std::vector<double> coordinate_scale=covariance_system.coordinate_scales(base.theta,epsilon);
+  if(fields.count("coordinate_scale")){const std::vector<double> stored_scale=parse_vector("coordinate_scale");
+    compare_saved_vector(stored_scale,coordinate_scale,"frozen coordinate scales");coordinate_scale=stored_scale;}
   baseline_value.feasible=true;baseline_value.status=CovarianceObjectiveStatus::Feasible;
-  covariance_decompose_gradient(baseline_value,statistics,base.trace,base.trace,baseline_shifted_trace,rho,tau);
+  covariance_decompose_gradient(baseline_value,statistics,base.trace,base.trace,baseline_shifted_trace,rho,tau,
+    &base.theta,&base.theta,&coordinate_scale,ridge_lambda);
   optional_double("baseline_mu",base.mu);
   report<<"baseline_mu "<<base.mu<<"\nbaseline_source SAVED_STATE_REASSEMBLED; TRACE_STATUS_REPORTED_SEPARATELY\n";
-  write_covariance_prior_calibration(report,statistics,base.trace,training_block_statistics,training_block_frames,rho);
-  const std::vector<double> coordinate_scale=covariance_system.coordinate_scales(base.theta,epsilon);
+  const std::size_t calibration_parameter_count=m1_family?static_cast<std::size_t>(graph.base_parameter_count):parameter_count;
+  write_covariance_prior_calibration(report,statistics,base.trace,training_block_statistics,training_block_frames,
+    calibration_parameter_count,rho);
   std::vector<double> normalization_vector(parameter_count);
   for(std::size_t i=0;i<parameter_count;++i)normalization_vector[i]=0.5*(statistics[i]+rho*base.trace[i])*coordinate_scale[i];
-  const double kkt_denominator=std::max(1.0,covariance_norm_inf(normalization_vector));
+  const double recomputed_kkt_denominator=std::max(1.0,covariance_norm_inf(normalization_vector));
+  const double kkt_denominator=fields.count("kkt_gradient_denominator")?parse_double("kkt_gradient_denominator"):
+    recomputed_kkt_denominator;
   struct DiagnosedPoint{CovarianceObjectiveEvaluation evaluation;CovarianceTraceDiagnostics d,shifted;std::vector<double> edge_d,edge_shifted;};
   auto diagnose_point=[&](const std::vector<double>& parameters){DiagnosedPoint point;
-    point.evaluation=evaluate_covariance_fit_objective(covariance_system,parameters,base,statistics,rho,epsilon,tau,diagnostic_evaluations,true,true,false,
-      &point.edge_d,&point.edge_shifted);
+     point.evaluation=evaluate_covariance_fit_objective(covariance_system,parameters,base,statistics,rho,epsilon,tau,diagnostic_evaluations,true,true,false,
+       &point.edge_d,&point.edge_shifted,&coordinate_scale,ridge_lambda);
     point.d=covariance_system.last_d_trace;point.shifted=covariance_system.last_shifted_trace;return point;};
   DiagnosedPoint baseline_point;baseline_point.evaluation=std::move(baseline_value);baseline_point.d=baseline_d;baseline_point.shifted=baseline_shifted;
   const DiagnosedPoint saved_point=diagnose_point(theta);
+  std::string saved_point_replay_status=complete_state?"PASS":"LEGACY_STATE_TARGET_RECONSTRUCTED";
+  auto compare_saved_scalar=[&](const char* key,const double actual){const double stored=parse_double(key);
+    if(std::abs(stored-actual)>1e-8*std::max({1.0,std::abs(stored),std::abs(actual)}))
+      throw std::runtime_error(std::string("saved covariance point replay differs for ")+key);};
+  if(complete_state){
+    if(!last_valid_available)throw std::runtime_error("covariance state v3 has no committed point to replay");
+    compare_saved_scalar("objective_data",saved_point.evaluation.data);
+    compare_saved_scalar("objective_prior",saved_point.evaluation.prior);
+    compare_saved_scalar("objective_ridge",saved_point.evaluation.ridge);
+    compare_saved_scalar("objective_barrier",saved_point.evaluation.barrier);
+    compare_saved_scalar("objective_total",saved_point.evaluation.objective);
+    compare_saved_scalar("last_valid_objective_data",saved_point.evaluation.data);
+    compare_saved_scalar("last_valid_objective_prior",saved_point.evaluation.prior);
+    compare_saved_scalar("last_valid_objective_ridge",saved_point.evaluation.ridge);
+    compare_saved_scalar("last_valid_objective_barrier",saved_point.evaluation.barrier);
+    compare_saved_scalar("last_valid_objective",saved_point.evaluation.objective);
+    compare_saved_vector(parse_vector("last_valid_gradient_data"),saved_point.evaluation.gradient_data,"saved data gradient");
+    compare_saved_vector(parse_vector("last_valid_gradient_prior"),saved_point.evaluation.gradient_prior,"saved prior gradient");
+    compare_saved_vector(parse_vector("last_valid_gradient_ridge"),saved_point.evaluation.gradient_ridge,"saved ridge gradient");
+    compare_saved_vector(parse_vector("last_valid_gradient_barrier"),saved_point.evaluation.gradient_barrier,"saved barrier gradient");
+    compare_saved_vector(parse_vector("last_valid_gradient_total"),saved_point.evaluation.gradient,"saved total gradient");
+    const double stored_denominator=parse_double("kkt_gradient_denominator");
+    if(std::abs(stored_denominator-recomputed_kkt_denominator)>1e-8*std::max({1.0,std::abs(stored_denominator),
+        std::abs(recomputed_kkt_denominator)}))throw std::runtime_error("saved covariance KKT normalization does not replay");
+    const std::vector<double> saved_ridge_coordinates=parse_vector("ridge_coordinates");
+    std::vector<double> expected_ridge_coordinates(parameter_count,0.0);
+    if(ridge_lambda>0.0){for(std::size_t index=0;index<parameter_count;++index)
+        expected_ridge_coordinates[index]=(theta[index]-theta_baseline[index])/coordinate_scale[index];
+      compare_saved_vector(saved_ridge_coordinates,expected_ridge_coordinates,"saved ridge coordinates");}
+    else if(!saved_ridge_coordinates.empty())
+      compare_saved_vector(saved_ridge_coordinates,expected_ridge_coordinates,"zero-ridge coordinates");
+  }
+  report<<"state_replay_status "<<saved_point_replay_status<<"\nkkt_denominator_recomputed "<<recomputed_kkt_denominator
+    <<"\nkkt_denominator_saved "<<kkt_denominator<<'\n';
   const int total_rhs_columns=3*header.n;
   auto solve_passes=[&](const DiagnosedPoint& point){return point.evaluation.feasible&&
     covariance_trace_diagnostics_pass(point.d,total_rhs_columns)&&covariance_trace_diagnostics_pass(point.shifted,total_rhs_columns);};
@@ -7012,24 +14490,32 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
       <<" worst_original_batch_start="<<diag.worst_original_batch_start<<" worst_original_batch_columns="<<diag.worst_original_batch_columns
       <<" original_residual_checked="<<(diag.original_residual_checked?1:0)<<'\n';};
   constexpr const char* components[6]={"xx","xy","xz","yy","yz","zz"};
+  auto parameter_name=[&](const std::size_t index){
+    if(graph.parameter_names.size()==parameter_count)return graph.parameter_names[index];
+    if(index<graph.base_parameter_count){const auto pair=graph.type_pairs[index/6];
+      return std::string("type")+std::to_string(pair.first)+"_type"+std::to_string(pair.second)+"_"+components[index%6];}
+    return std::string("parameter_")+std::to_string(index);
+  };
   auto write_gradient=[&](const char* label,const DiagnosedPoint& point,const bool validated){const auto& value=point.evaluation;
     report<<"\npoint "<<label<<" objective_status="<<covariance_objective_status_name(value.status)<<" solve_status="<<(validated?"PASS":"RESIDUAL_OR_OBJECTIVE_FAIL")
-      <<" objective_data="<<value.data<<" objective_prior="<<value.prior<<" objective_barrier="<<value.barrier<<" objective_total="<<value.objective;
+      <<" objective_data="<<value.data<<" objective_prior="<<value.prior<<" objective_ridge="<<value.ridge
+      <<" objective_barrier="<<value.barrier<<" objective_total="<<value.objective;
     if(value.gradient.size()!=parameter_count){report<<"\ngradient_status NOT_AVAILABLE\n";return;}
     const std::vector<double> scaled=covariance_scaled_gradient(value.gradient,coordinate_scale);double max_raw=0.0,max_scaled=0.0,component_sum_error=0.0;
     std::size_t max_raw_index=0,max_scaled_index=0;
     for(std::size_t i=0;i<parameter_count;++i){if(std::abs(value.gradient[i])>max_raw){max_raw=std::abs(value.gradient[i]);max_raw_index=i;}
       if(std::abs(scaled[i])>max_scaled){max_scaled=std::abs(scaled[i]);max_scaled_index=i;}
-      component_sum_error=std::max(component_sum_error,std::abs(value.gradient_data[i]+value.gradient_prior[i]+value.gradient_barrier[i]-value.gradient[i]));}
-    const auto raw_pair=graph.type_pairs[max_raw_index/6],scaled_pair=graph.type_pairs[max_scaled_index/6];
+      component_sum_error=std::max(component_sum_error,std::abs(value.gradient_data[i]+value.gradient_prior[i]+
+        value.gradient_ridge[i]+value.gradient_barrier[i]-value.gradient[i]));}
     report<<" scaled_kkt_denominator="<<kkt_denominator<<" scaled_kkt_residual="<<max_scaled/kkt_denominator
       <<" raw_gradient_inf_norm="<<max_raw<<" raw_gradient_max_index="<<max_raw_index
       <<" scaled_gradient_inf_norm="<<max_scaled<<" scaled_gradient_max_index="<<max_scaled_index
-      <<" raw_gradient_max_parameter="<<raw_pair.first<<':'<<raw_pair.second<<':'<<components[max_raw_index%6]
-      <<" scaled_gradient_max_parameter="<<scaled_pair.first<<':'<<scaled_pair.second<<':'<<components[max_scaled_index%6]
-      <<" component_sum_max_abs_error="<<component_sum_error<<"\ngradient_table index type_i type_j component g_data g_prior g_barrier g_total scale scaled_g\n";
-    for(std::size_t i=0;i<parameter_count;++i){const auto pair=graph.type_pairs[i/6];report<<i<<' '<<pair.first<<' '<<pair.second<<' '<<components[i%6]<<' '
-        <<value.gradient_data[i]<<' '<<value.gradient_prior[i]<<' '<<value.gradient_barrier[i]<<' '<<value.gradient[i]<<' '
+      <<" raw_gradient_max_parameter="<<std::quoted(parameter_name(max_raw_index))
+      <<" scaled_gradient_max_parameter="<<std::quoted(parameter_name(max_scaled_index))
+      <<" component_sum_max_abs_error="<<component_sum_error<<"\ngradient_table index parameter g_data g_prior g_ridge g_barrier g_total scale scaled_g\n";
+    for(std::size_t i=0;i<parameter_count;++i){report<<i<<' '<<std::quoted(parameter_name(i))<<' '
+        <<value.gradient_data[i]<<' '<<value.gradient_prior[i]<<' '<<value.gradient_ridge[i]<<' '
+        <<value.gradient_barrier[i]<<' '<<value.gradient[i]<<' '
         <<coordinate_scale[i]<<' '<<scaled[i]<<'\n';}
     report<<"gradient_status "<<(validated?"VALIDATED":"PARTIAL_UNVALIDATED_SOLVES")<<'\n';};
   CovarianceEdgeAttribution mode_edge_attribution;
@@ -7047,9 +14533,10 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
       <<" dominant_group_edge_count="<<attribution.dominant_group_edge_count
       <<" sum_abs_scaled_edge_contribution="<<attribution.sum_abs_scaled_edge_contribution
       <<" top_20_abs_fraction="<<attribution.top_20_abs_fraction
-      <<"\natom_attribution_convention each_edge_component_is_split_half_to_each_endpoint; accounting_only_not_a_unique_physical_cause\n";
+      <<"\nparameter_ridge_gradient_excluded_from_edges "<<attribution.parameter_ridge_gradient[parameter]
+      <<"\natom_attribution_convention each_edge_component_is_split_half_to_each_endpoint; parameter_ridge_is_reported_separately; accounting_only_not_a_unique_physical_cause\n";
     report<<"edge_image_convention image=(nx,ny,nz) is the stored lattice translation added to r_j-r_i\n";
-    report<<"edge_attribution_top_edges limit=20 edge_id_zero_based rank atom_i atom_j type_i type_j reference_distance_A image_x image_y image_z g_data g_prior g_barrier g_total scaled_g_total\n";
+    report<<"edge_attribution_top_edges limit=20 edge_id_zero_based rank atom_i atom_j type_i type_j reference_distance_A image_x image_y image_z g_data g_prior g_barrier g_edge_total scaled_g_edge_total\n";
     for(std::size_t rank=0;rank<std::min<std::size_t>(20,attribution.ranked_edges.size());++rank){const std::size_t edge_id=attribution.ranked_edges[rank];
       const Edge& edge=graph.edges[edge_id];double distance_squared=0.0;
       for(int a=0;a<3;++a){double displacement=r0[static_cast<std::size_t>(a)*header.n+edge.j]-r0[static_cast<std::size_t>(a)*header.n+edge.i];
@@ -7061,7 +14548,7 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
         <<scale*attribution.edge_total[index]<<'\n';}
     report<<"atom_abs_contribution_sum="<<attribution.sum_abs_atom_contribution
       <<" atom_top_20_abs_fraction="<<attribution.top_20_atom_abs_fraction<<'\n';
-    report<<"edge_attribution_top_atoms limit=20 atom_id type g_data g_prior g_barrier g_total g_abs_total scaled_g_total\n";
+    report<<"edge_attribution_top_atoms limit=20 atom_id type g_data g_prior g_barrier g_edge_total g_abs_total scaled_g_edge_total\n";
     for(std::size_t rank=0;rank<attribution.ranked_atoms.size();++rank){const std::size_t atom=attribution.ranked_atoms[rank];
       report<<atom<<' '<<header.types[atom]<<' '<<attribution.atom_data[atom]<<' '<<attribution.atom_prior[atom]<<' '
         <<attribution.atom_barrier[atom]<<' '<<attribution.atom_total[atom]<<' '<<attribution.atom_absolute_total[atom]<<' '
@@ -7069,7 +14556,9 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   };
   write_gradient("BASELINE",baseline_point,solve_passes(baseline_point));write_residual("BASELINE_SOLVE",baseline_point.d);write_residual("BASELINE_SHIFTED_SOLVE",baseline_point.shifted);
   write_gradient("SAVED_LAST_VALID",saved_point,saved_gradient_passes());write_residual("SAVED_D_SOLVE",saved_point.d);write_residual("SAVED_SHIFTED_SOLVE",saved_point.shifted);
-  write_edge_attribution();
+  if(m1_family){mode_edge_attribution.status="SKIPPED_M1_NOT_APPLICABLE";
+    report<<"\nedge_attribution_status SKIPPED_M1_NOT_APPLICABLE\nedge_attribution_note M0_type_pair_edge_attribution_does_not_cover_local_bridge_parameters\n";}
+  else write_edge_attribution();
   report<<"\noptimizer_residual_reference kappa=||scale*g||_inf/max(1,||scale*0.5*(a+rho*b)||_inf) denominator="<<kkt_denominator
     <<"\nkkt_denominator_validation_status "<<(prior_trace_passes()?"PASS":"UNVALIDATED_BASELINE_D_TRACE")
     <<"\nprior_baseline_trace_validation_status "<<(prior_trace_passes()?"PASS":"UNVALIDATED_BASELINE_D_TRACE")
@@ -7091,7 +14580,8 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
     for(std::size_t i=0;i<parameter_count;++i)z[i]=theta[i]/coordinate_scale[i];
     const CovarianceFixedCoordinateFDResult fd=covariance_fixed_coordinate_fd(theta,z,coordinate_scale,fd_index,fd_slope,
       saved_point.evaluation.objective,[&](const std::vector<double>& trial_theta){return evaluate_covariance_fit_objective(
-        covariance_system,trial_theta,base,statistics,rho,epsilon,tau,diagnostic_evaluations,false);},&report);
+        covariance_system,trial_theta,base,statistics,rho,epsilon,tau,diagnostic_evaluations,false,false,true,
+        nullptr,nullptr,&coordinate_scale,ridge_lambda);},&report);
     fd_status=fd.status;fd_one_percent_check=fd.one_percent_check;fd_value=fd.value;fd_initial_step=fd.initial_step;
     fd_final_step=fd.nominal_step;fd_effective_step=fd.effective_step;fd_side=fd.side>0?"POSITIVE":fd.side<0?"NEGATIVE":"NONE";
     fd_evaluations=fd.evaluations;fd_relative_error=fd.relative_error;
@@ -7132,7 +14622,8 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   std::string saved_probe_status="NOT_RUN",baseline_probe_status="NOT_RUN",mode_search_status="NOT_RUN",probe_error,baseline_probe_error;
   std::string hessian_status="NOT_EVALUATED_SOLVE_RESIDUAL_FAIL";
   int hessian_group=-1;double hessian_d_asymmetry=std::numeric_limits<double>::quiet_NaN(),hessian_s_asymmetry=std::numeric_limits<double>::quiet_NaN();
-  std::vector<double> hessian_data(36,std::numeric_limits<double>::quiet_NaN()),hessian_prior=hessian_data,hessian_barrier=hessian_data,hessian_total=hessian_data;
+  std::vector<double> hessian_data(36,std::numeric_limits<double>::quiet_NaN()),hessian_prior=hessian_data,hessian_barrier=hessian_data,
+    hessian_ridge=hessian_data,hessian_total=hessian_data;
   std::vector<double> hessian_eigenvalues;double hessian_newton_slope=std::numeric_limits<double>::quiet_NaN(),hessian_newton_decrement=std::numeric_limits<double>::quiet_NaN();
   std::string hessian_fd_status="NOT_EVALUATED",hessian_fd_stability="NOT_EVALUATED",hessian_fd_consistency="NOT_EVALUATED",hessian_fd_error;
   std::vector<double> hessian_fd_analytic,hessian_fd_coarse,hessian_fd_fine,hessian_fd_relative_change,hessian_fd_step,hessian_fd_coarse_error,hessian_fd_fine_error;
@@ -7173,10 +14664,11 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
             const std::vector<double> inverse_d=covariance_local_inverse(local_d,local,header.n,hessian_d_asymmetry);
             const std::vector<double> inverse_s=covariance_local_inverse(local_s,local,header.n,hessian_s_asymmetry);
             const auto traces_d=covariance_local_trace_products(inverse_d,local),traces_s=covariance_local_trace_products(inverse_s,local);
-            const CovarianceLocalHessianTerms terms=covariance_local_group_hessian(traces_d,traces_s,rho,tau,coordinate_scale,
+            const CovarianceLocalHessianTerms terms=covariance_local_group_hessian(traces_d,traces_s,rho,tau,ridge_lambda,coordinate_scale,
               static_cast<std::size_t>(6*hessian_group));
             hessian_data.assign(terms.data.begin(),terms.data.end());hessian_prior.assign(terms.prior.begin(),terms.prior.end());
-            hessian_barrier.assign(terms.barrier.begin(),terms.barrier.end());hessian_total.assign(terms.total.begin(),terms.total.end());
+            hessian_barrier.assign(terms.barrier.begin(),terms.barrier.end());hessian_ridge.assign(terms.ridge.begin(),terms.ridge.end());
+            hessian_total.assign(terms.total.begin(),terms.total.end());
             const SmallEigen eigen=eigen_small(covariance_system.solver,hessian_total,6);hessian_eigenvalues=eigen.values;hessian_status="EVALUATED_CONDITIONAL_FIXED_OTHER_THETA_TAU";
             double top=0.0;for(double value:hessian_eigenvalues)top=std::max(top,std::abs(value));
         if(top>0.0&&hessian_eigenvalues.front()>top*1e-10){NeumaierAccumulator decrement2;const double* gradient=saved_point.evaluation.gradient.data()+6*hessian_group;
@@ -7189,7 +14681,8 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
                 for(int sign_index=0;sign_index<2;++sign_index){const double sign=sign_index==0?1.0:-1.0;std::vector<double> trial=theta;
                   for(int a=0;a<6;++a){const std::size_t parameter=static_cast<std::size_t>(6*hessian_group+a);
                     trial[parameter]+=sign*step_size*coordinate_scale[parameter]*eigen.vectors[static_cast<std::size_t>(a)+static_cast<std::size_t>(direction)*6];}
-                  const CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(covariance_system,trial,base,statistics,rho,epsilon,tau,diagnostic_evaluations,false);
+                  const CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(covariance_system,trial,base,statistics,rho,epsilon,tau,
+                    diagnostic_evaluations,false,false,true,nullptr,nullptr,&coordinate_scale,ridge_lambda);
                   ++hessian_fd_evaluations;if(!value.feasible)throw std::runtime_error("bounded Hessian finite-difference trial is not epsilon-positive definite");values[sign_index]=value.objective;}
                 const double numerator=values[0]-2.0*saved_point.evaluation.objective+values[1];
                 const double roundoff=32.0*std::numeric_limits<double>::epsilon()*std::max({std::abs(values[0]),std::abs(values[1]),std::abs(saved_point.evaluation.objective),1.0});
@@ -7276,13 +14769,14 @@ void diagnose_rpmd_ja_native_covariance(const std::string& state_path,const std:
   if(hessian_group>=0){const auto pair=graph.type_pairs[static_cast<std::size_t>(hessian_group)];report<<"conditional_group_hessian_status "<<hessian_status
       <<" group="<<hessian_group<<" type_i="<<pair.first<<" type_j="<<pair.second<<" support_cap_atoms=32"
       <<" pre_sym_relative_asymmetry_D="<<hessian_d_asymmetry<<" pre_sym_relative_asymmetry_S="<<hessian_s_asymmetry
-      <<" rho_fixed=1 tau_fixed=1 other_theta_fixed=1 interpretation=conditional_not_full_optimum\n";}
+      <<" rho_fixed="<<rho<<" tau_fixed="<<tau<<" ridge_lambda="<<ridge_lambda
+      <<" other_theta_fixed=1 interpretation=conditional_not_full_optimum\n";}
   else report<<"conditional_group_hessian_status "<<hessian_status<<" support_cap_atoms=32\n";
   report<<"conditional_group_hessian_eigenvalues_scaled_ascending";for(double value:hessian_eigenvalues)report<<' '<<value;report<<'\n';
-  report<<"conditional_group_hessian_definition h_data=.5*Tr(Dinv*Da*Dinv*Db) is the likelihood -0.5logdet curvature; the training trace term is linear and has zero curvature; h_prior=.5*rho*same_trace; h_barrier=tau*Tr(Sinv*Da*Sinv*Db)\n";
-  report<<"conditional_group_hessian_blocks index data prior barrier total\n";
+  report<<"conditional_group_hessian_definition h_data=.5*Tr(Dinv*Da*Dinv*Db) is the likelihood -0.5logdet curvature; the training trace term is linear and has zero curvature; h_prior=.5*rho*same_trace; h_barrier=tau*Tr(Sinv*Da*Sinv*Db); h_ridge=lambda*I in scaled parameter coordinates\n";
+  report<<"conditional_group_hessian_blocks index data prior barrier ridge total\n";
   for(int a=0;a<6;++a)for(int b=0;b<6;++b){const std::size_t at=static_cast<std::size_t>(a)*6+b;
-    report<<a<<' '<<b<<' '<<hessian_data[at]<<' '<<hessian_prior[at]<<' '<<hessian_barrier[at]<<' '<<hessian_total[at]<<'\n';}
+    report<<a<<' '<<b<<' '<<hessian_data[at]<<' '<<hessian_prior[at]<<' '<<hessian_barrier[at]<<' '<<hessian_ridge[at]<<' '<<hessian_total[at]<<'\n';}
   report<<"conditional_group_newton_slope "<<hessian_newton_slope<<" decrement="<<hessian_newton_decrement<<" diagnostic_only\n";
   report<<"conditional_group_hessian_fd_status "<<hessian_fd_status<<" stability="<<hessian_fd_stability
     <<" analytic_comparison="<<hessian_fd_consistency<<" stable_relative_threshold=0.1 analytic_relative_threshold=0.1"
@@ -7457,10 +14951,10 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
 {
   if(witness_path.empty()||report_path.empty()||witness_path==report_path)
     throw std::invalid_argument("rpmd_ja replay_cg requires distinct nonempty witness and report paths");
-  std::ifstream existing_report(report_path,std::ios::binary);
+  rpmd_ja_file_io::ifstream existing_report(report_path,std::ios::binary);
   if(existing_report.good())throw std::runtime_error("rpmd_ja replay_cg report already exists: "+report_path);
   const auto paths=read_cg_witness_paths(witness_path);
-  std::ifstream spool(paths.second,std::ios::binary);
+  rpmd_ja_file_io::ifstream spool(paths.second,std::ios::binary);
   if(!spool)throw std::runtime_error("cannot open CG witness sample spool: "+paths.second);
   const SampleHeader header=read_header(spool,0,atom,box,0.0,true,true);
   if(header.frame_count>static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
@@ -7475,14 +14969,30 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
      snapshot.training_frames!=train||std::abs(snapshot.temperature-header.temperature)>1e-10*header.temperature||
      std::abs(static_cast<double>(snapshot.sample_interval)-interval)>1e-9||snapshot.internal_mass_com!=(internal_mass_com?1:0))
     throw std::runtime_error("CG witness sample metadata or COM convention does not match the supplied sample/configuration");
-  const Graph candidate_graph=make_graph(r0,header.types,box,snapshot.cutoff);
-  const int parameter_count=6*static_cast<int>(candidate_graph.type_pairs.size());
-  if(snapshot.theta.size()!=static_cast<std::size_t>(parameter_count))
+  Graph candidate_graph=make_graph(r0,header.types,box,snapshot.cutoff);
+  if(snapshot.witness_format_version>=2&&snapshot.parameter_family=="M1"){
+    if(atom.cpu_atom_symbol.size()!=header.types.size())
+      throw std::runtime_error("M1 CG replay requires runtime atom symbols to rebuild its frozen local basis");
+    build_m1_local_basis(candidate_graph,r0,header.types,atom.cpu_atom_symbol,header.masses,box,snapshot.cutoff,
+      snapshot.m1_minimum_support_count);
+    rpmd_ja_file_io::ifstream basis_in(snapshot.m1_basis_sidecar,std::ios::in|std::ios::binary);
+    if(!basis_in)throw std::runtime_error("M1 basis snapshot is missing: "+snapshot.m1_basis_sidecar);
+    std::ostringstream basis_buffer(std::ios::out|std::ios::binary);basis_buffer<<basis_in.rdbuf();
+    if(!basis_in.eof()&&basis_in.fail())throw std::runtime_error("M1 basis snapshot read failed: "+snapshot.m1_basis_sidecar);
+    const std::string saved_basis=basis_buffer.str();
+    if(cg_basis_snapshot_hash(saved_basis)!=snapshot.m1_basis_snapshot_fnv64||
+       covariance_m1_basis_fingerprint(candidate_graph)!=snapshot.m1_basis_fingerprint||
+       serialize_m1_cg_basis(candidate_graph)!=saved_basis)
+      throw std::runtime_error("M1 basis snapshot identity differs from the reconstructed support, images, allocation, or operator map");
+  }
+  const int parameter_count=candidate_graph.parameter_count;
+  if(snapshot.theta.size()!=static_cast<std::size_t>(parameter_count)||
+     (snapshot.witness_format_version>=2&&snapshot.parameter_count!=parameter_count))
     throw std::runtime_error("CG witness theta dimension does not match the graph rebuilt from sample R0 and cutoff");
   RpmdJANativeFitOptions options;options.temperature=snapshot.temperature;options.cutoff=snapshot.cutoff;
   options.epsilon=snapshot.epsilon;options.fd_step=snapshot.fd_step;options.sample_interval=snapshot.sample_interval;
   options.internal_mass_com=internal_mass_com;
-  std::ifstream raw(paths.first,std::ios::binary);
+  rpmd_ja_file_io::ifstream raw(paths.first,std::ios::binary);
   if(!raw)throw std::runtime_error("cannot open CG witness qraw source: "+paths.first);
   const QrawIdentity identity=validate_qraw_identity(raw,options,header,r0,box,force);
   if(snapshot.qraw_model!=identity.model||snapshot.qraw_config!=identity.config||snapshot.active_model!=identity.model||
@@ -7552,6 +15062,9 @@ void replay_rpmd_ja_native_cg(const std::string& witness_path,const std::string&
     <<"\nsample_spool "<<std::quoted(paths.second)<<"\nframes "<<header.frame_count<<"\ntraining_frames "<<train
     <<"\nprobe "<<snapshot.probe<<"\ncutoff_A "<<snapshot.cutoff<<"\ntemperature_K "<<snapshot.temperature
     <<"\nfd_step "<<snapshot.fd_step<<"\nepsilon "<<snapshot.epsilon<<"\ninternal_mass_com "<<snapshot.internal_mass_com
+    <<"\nparameter_family "<<snapshot.parameter_family
+    <<"\nM1_basis_replay_status "<<(snapshot.parameter_family=="M1"?"PASS":"NOT_APPLICABLE")
+    <<"\nM1_minimum_support_count "<<(snapshot.parameter_family=="M1"?std::to_string(snapshot.m1_minimum_support_count):"NOT_APPLICABLE")
     <<"\nqraw_model_fingerprint "<<identity.model<<"\nqraw_config_fingerprint "<<identity.config
     <<"\npppm_mesh_spacing "<<identity.mesh<<"\nprojected_rhs_consistency_difference_norm "<<projected_rhs_diff
     <<"\nsaved_x_translation_removed_norm "<<saved_x_translation

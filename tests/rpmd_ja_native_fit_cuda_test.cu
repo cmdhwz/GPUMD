@@ -1,22 +1,28 @@
 #ifdef NDEBUG
-#error "This test requires assertions enabled"
+#undef NDEBUG
 #endif
 
 #define GPUMD_RPMD_JA_NATIVE_FIT_TEST
 #include "../src/measure/rpmd_ja_native_fit.cu"
+#include "../src/measure/rpmd_ja_additive.cuh"
 
 #include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
+#include <map>
 #include <random>
 #include <sstream>
+#include <tuple>
 
 static std::vector<double> diagnostic_expected_r0;
 static bool diagnostic_should_throw = false;
+static std::string covariance_fit_test_fixture_directory;
 
+#ifndef GPUMD_RPMD_JA_NATIVE_FIT_TEST_REAL_PREPARE
 Force::Force(void) {}
 int Force::get_number_of_potentials() const { return 0; }
 Potential& Force::get_potential(const int) { throw std::runtime_error("unexpected potential lookup in native fit regression"); }
@@ -29,16 +35,57 @@ void diagnose_rpmd_ja_qnep_reference(double, Atom& atom, Box&, Force&, bool)
 }
 void generate_rpmd_ja_qnep_raw(const std::string&, double, double, const std::string&, Atom&, Box&, Force&, bool) {}
 void prepare_rpmd_ja_qnep_reference(const std::string&, const std::string&, const std::string&,
-                                    const RpmdJAModeValidator&, const std::string&) {}
+                                    const RpmdJAModeValidator&, const std::string&,
+                                    const std::function<void(const RpmdJAAdditiveData&)>&,
+                                    const RpmdJAPrepareResourceObserver&,
+                                    const RpmdJAPrepareAllocationObserver&) {}
+RpmdJAPrepareWorkspaceSizes query_rpmd_ja_qnep_prepare_workspace_sizes(int) { return {}; }
 RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom&, Box&, Force&) { return {}; }
 std::uint64_t rpmd_ja_model_fingerprint(const std::string&) { return 0; }
 std::uint64_t rpmd_ja_qnep_config_fingerprint(Force&) { return 0; }
+RpmdJAReference read_rpmd_ja_reference(const std::string&) { throw std::runtime_error("unexpected reference readback in native fit regression"); }
+#endif
 
 namespace
 {
 void check_close(const double a,const double b,const double tol=2e-9);
 std::vector<double> solve_dense_reference(std::vector<double> matrix,std::vector<double> rhs,const int n);
 std::vector<std::vector<double>> internal_basis(const std::vector<double>& sqrt_atom);
+
+void test_covariance_checkpoint_round_trip_and_corruption_rejection()
+{
+  using namespace rpmd_ja_covariance_checkpoint;
+  AcceptedPoint saved;saved.job_id="resume-test-job";saved.identity_sha256=std::string(64,'a');
+  saved.branch="B0";saved.family="M0";saved.candidate_index=0;saved.lambda=2.0;saved.epsilon=1e-5;
+  saved.rho=0.0;saved.ridge_lambda=2.0;saved.tau=0.2;saved.trust_radius=0.375;
+  saved.elapsed_seconds=91.5;saved.max_objective_evaluations=1000;saved.objective_evaluations=23;
+  saved.gradient_evaluations=7;saved.total_budget_gradients=7;saved.iterations=6;
+  saved.phase_gradients[5]=7;saved.phase_seconds[5]=90.0;
+  saved.theta={1.25,-0.5};saved.theta_start={1.0,-0.25};saved.stagnation_best_theta=saved.theta;
+  saved.coordinate_scale={2.0,4.0};saved.bfgs_inverse={1.0,0.125,0.125,2.0};
+  saved.bfgs_seed_gamma=1.5;saved.bfgs_last_valid_gamma=0.75;saved.bfgs_stage_seeded=true;
+  saved.bfgs_seed_source="FIRST_VALID_SECANT";
+  const std::string path="rpmd_ja_covariance_checkpoint_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";
+  write_checkpoint(path,saved);
+  const AcceptedPoint loaded=read_checkpoint(path,saved.identity_sha256);
+  assert(loaded.job_id==saved.job_id&&loaded.branch==saved.branch&&loaded.family==saved.family);
+  assert(loaded.iterations==saved.iterations&&loaded.objective_evaluations==saved.objective_evaluations);
+  assert(loaded.gradient_evaluations==saved.gradient_evaluations&&loaded.phase_gradients==saved.phase_gradients);
+  assert(loaded.elapsed_seconds==saved.elapsed_seconds&&loaded.tau==saved.tau&&loaded.trust_radius==saved.trust_radius);
+  assert(loaded.theta==saved.theta&&loaded.theta_start==saved.theta_start&&
+    loaded.coordinate_scale==saved.coordinate_scale&&loaded.bfgs_inverse==saved.bfgs_inverse);
+  assert(loaded.bfgs_seed_gamma==saved.bfgs_seed_gamma&&loaded.bfgs_last_valid_gamma==saved.bfgs_last_valid_gamma&&
+    loaded.bfgs_stage_seeded==saved.bfgs_stage_seeded&&loaded.bfgs_seed_source==saved.bfgs_seed_source);
+  bool wrong_identity_rejected=false;try{(void)read_checkpoint(path,std::string(64,'b'));}
+  catch(const std::runtime_error&){wrong_identity_rejected=true;}assert(wrong_identity_rejected);
+  std::ifstream input(path,std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(input)),{});input.close();
+  assert(bytes.size()>20);bytes[bytes.find("trust_radius")]='X';
+  {std::ofstream out(path,std::ios::binary|std::ios::trunc);out.write(bytes.data(),static_cast<std::streamsize>(bytes.size()));}
+  bool tamper_rejected=false;try{(void)read_checkpoint(path,saved.identity_sha256);}
+  catch(const std::runtime_error&){tamper_rejected=true;}assert(tamper_rejected);
+  std::remove(path.c_str());
+}
 
 std::string write_sample_spool(const std::string& suffix, const int frames, const double interval=2.5,
                                const bool random_internal_samples=false, const double last_frame_shift=0.0)
@@ -78,7 +125,33 @@ std::string write_sample_spool(const std::string& suffix, const int frames, cons
   return path;
 }
 
-struct RemoveTestFile { std::string path; ~RemoveTestFile() { std::remove(path.c_str()); } };
+std::string write_covariance_replay_spool(const std::string& suffix,const bool m1=false)
+{
+  const std::string path="rpmd_ja_covariance_replay_"+std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count())+suffix;
+  std::ofstream out(path,std::ios::binary);assert(out.good());
+  const char magic[8]={'G','P','J','A','S','M','P','1'};const std::uint32_t version=1,endian=native_endian;
+  const std::int32_t n=m1?3:2,beads=4;const double temperature=300.0;
+  const double cell[9]={10,0,0,0,10,0,0,0,10};
+  const double masses_m0[2]={1.0,2.0},masses_m1[3]={16.0,1.0,16.0};
+  const std::int32_t types_m0[2]={0,1},types_m1[3]={0,1,0};
+  out.write(magic,sizeof(magic));out.write(reinterpret_cast<const char*>(&version),sizeof(version));
+  out.write(reinterpret_cast<const char*>(&endian),sizeof(endian));out.write(reinterpret_cast<const char*>(&n),sizeof(n));
+  out.write(reinterpret_cast<const char*>(&beads),sizeof(beads));out.write(reinterpret_cast<const char*>(&temperature),sizeof(temperature));
+  out.write(reinterpret_cast<const char*>(cell),sizeof(cell));
+  out.write(reinterpret_cast<const char*>(m1?masses_m1:masses_m0),static_cast<std::streamsize>(n*sizeof(double)));
+  out.write(reinterpret_cast<const char*>(m1?types_m1:types_m0),static_cast<std::streamsize>(n*sizeof(std::int32_t)));
+  for(int frame=0;frame<3;++frame){const double step=frame;const double shift=0.01*frame;
+    const double position_m0[6]={5.0+shift,5.5+shift,5.0,5.0,5.0,5.0},force_m0[6]={};
+    const double position_m1[9]={3.0+shift,0.1-shift,7.5+shift,0.01*frame,-0.01*frame,0.005*frame,
+      0.002*frame,-0.003*frame,0.001*frame},force_m1[9]={};
+    out.write(reinterpret_cast<const char*>(&step),sizeof(step));
+    out.write(reinterpret_cast<const char*>(m1?position_m1:position_m0),static_cast<std::streamsize>(n*3*sizeof(double)));
+    out.write(reinterpret_cast<const char*>(m1?force_m1:force_m0),static_cast<std::streamsize>(n*3*sizeof(double)));}
+  assert(out.good());return path;
+}
+
+struct RemoveTestFile { std::string path; ~RemoveTestFile() { rpmd_ja_file_io::remove_file(path); } };
 
 std::string read_test_file(const std::string& path)
 {
@@ -109,9 +182,33 @@ struct CutQPFixture
   double primal_tolerance=0.0;
 };
 
+std::string covariance_fit_test_fixture_path(const std::string& name)
+{
+  if(covariance_fit_test_fixture_directory.empty())throw std::runtime_error("native fit CUDA regression requires --fixture-dir");
+  const char last=covariance_fit_test_fixture_directory.back();
+  return covariance_fit_test_fixture_directory+(last=='/'||last=='\\'?"":"/")+name;
+}
+
+void verify_qp_fixture_bytes(const std::string& path,const std::string& bytes)
+{
+  const FrozenQpFixture* expected=nullptr;
+  for(const auto& item:frozen_qp_fixtures){const std::string suffix=item.name;
+    if(path.size()>suffix.size()&&path.compare(path.size()-suffix.size(),suffix.size(),suffix)==0&&
+       (path[path.size()-suffix.size()-1]=='/'||path[path.size()-suffix.size()-1]=='\\')){expected=&item;break;}}
+  if(!expected)throw std::runtime_error("unknown QP regression fixture: "+path);
+  rpmd_ja_sha256::Digest sha;
+  sha.update(reinterpret_cast<const unsigned char*>(bytes.data()),bytes.size());
+  if(sha.finish_hex()!=expected->sha256)throw std::runtime_error("QP regression fixture SHA-256 mismatch: "+path);
+}
+
 CutQPFixture read_cut_qp_fixture(const std::string& path)
 {
-  std::ifstream in(path);if(!in)throw std::runtime_error("cannot open QP regression fixture: "+path);CutQPFixture fixture;std::string line;
+  std::ifstream file(path,std::ios::binary);
+  if(!file)throw std::runtime_error("cannot open QP regression fixture: "+path);
+  const std::string bytes((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
+  if(file.bad())throw std::runtime_error("cannot read QP regression fixture: "+path);
+  verify_qp_fixture_bytes(path,bytes);
+  std::istringstream in(bytes);CutQPFixture fixture;std::string line;
   auto read_vector=[](std::istringstream& fields,std::vector<double>& values){std::size_t count=0;if(!(fields>>count))throw std::runtime_error("invalid QP fixture vector header");values.resize(count);for(double& value:values)if(!(fields>>value))throw std::runtime_error("truncated QP fixture vector");};
   while(std::getline(in,line)){std::istringstream fields(line);std::string key;fields>>key;
     if(key=="parameters")fields>>fixture.svd.p;
@@ -134,14 +231,15 @@ CutQPFixture read_cut_qp_fixture(const std::string& path)
 
 void test_fit_samples_entry_preserves_inputs()
 {
-  const std::string spool=write_sample_spool(".fit_samples",3,2.0),raw=spool+".qraw",output=spool+".out";
-  RemoveTestFile clean_spool{spool},clean_raw{raw},clean_failure{output+".failure.txt"},clean_lock{output+".fit.lock"};
+  const std::string spool=write_sample_spool(".fit_samples",3,2.0),raw=spool+".qraw",output=spool+".out",kernel=output+".kernel";
+  RemoveTestFile clean_spool{spool},clean_raw{raw},clean_kernel{kernel},clean_failure{output+".failure.txt"},clean_lock{output+".fit.lock"};
   {std::ofstream out(raw,std::ios::binary);out<<"external qraw sentinel";assert(out.good());}
+  {std::ofstream out(kernel,std::ios::binary);out<<"kernel fixture";assert(out.good());}
   const std::string saved_spool=read_test_file(spool),saved_raw=read_test_file(raw);
   Atom atom;atom.number_of_atoms=2;atom.cpu_mass={1.0,2.0};atom.cpu_type={0,1};atom.number_of_beads=0;atom.position_per_atom.resize(6);
   const std::vector<double> original_position={0.7,0.8,0.9,1.0,1.1,1.2};atom.position_per_atom.copy_from_host(original_position.data());
   Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;Force force;
-  RpmdJANativeFitOptions options;assert(options.max_stability_rounds==160);options.output_path=output;options.kernel_table="unused-before-validation";options.raw_input_path=raw;options.cutoff=2.0;options.epsilon=1e-3;options.response_tolerance=0.15;options.fd_step=1e-3;
+  RpmdJANativeFitOptions options;assert(options.max_stability_rounds==160);options.output_path=output;options.kernel_table=kernel;options.raw_input_path=raw;options.cutoff=2.0;options.epsilon=1e-3;options.response_tolerance=0.15;options.fd_step=1e-3;
   atom.cpu_mass[0]=3.0;bool identity_rejected=false;
   try{fit_rpmd_ja_native_reference_from_samples(options,spool,atom,box,force);}catch(const std::runtime_error&){identity_rejected=true;}
   assert(identity_rejected&&read_test_file(spool)==saved_spool&&read_test_file(raw)==saved_raw);
@@ -183,6 +281,144 @@ void test_response_uncomputed_values_are_explicit()
   with_radii.response_ratio_min=0.8;with_radii.response_ratio_max=1.2;std::ostringstream radii_summary;write_response_stats(radii_summary,with_radii);
   const std::string radii_text=radii_summary.str();const auto radii=radii_text.find("response_block_radii=1:0.25");
   const auto ratio=radii_text.find("response_ratio_status=AVAILABLE");assert(radii!=std::string::npos&&ratio>radii);
+}
+
+void test_m0_only_resume_replays_only_a_missing_development_response()
+{
+  ResponseCheck missing;
+  assert(development_response_needs_replay(true,true,missing));
+  ResponseCheck complete;complete.probes=1;complete.cg_residual_status="CG_PASS";
+  complete.cg_residual_available=true;complete.observed_cov_available=true;complete.predicted_cov_available=true;
+  complete.response_ibp_available=true;complete.force_residual_available=true;complete.mean_q={0.0};
+  complete.observed_matrix={1.0};complete.centered_covariance_matrix={1.0};
+  complete.predicted_matrix={1.0};complete.ibp_matrix={0.0};
+  assert(response_consumer_statistics_ready(complete));
+  assert(!development_response_needs_replay(true,true,complete));
+  assert(development_response_needs_replay(true,false,complete));
+  assert(development_response_needs_replay(false,true,complete));
+}
+
+void test_frozen_response_snapshot_round_trip_and_identity_rejection()
+{
+  const std::string path="rpmd_ja_frozen_response_snapshot_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";
+  RemoveTestFile cleanup{path};
+  ResponseCheck response;response.probes=4;response.total_frames=8;response.validation_frames=4;
+  response.statistical_frames=4;response.response=0.1;response.ibp=0.2;response.cg=1.0e-12;
+  response.force_residual=0.03;response.response_ratio_min=0.9;response.response_ratio_max=1.1;
+  response.observed_cov_min=0.8;response.observed_cov_max=1.2;response.observed_cov_condition=1.5;
+  response.predicted_cov_min=0.9;response.predicted_cov_max=1.1;response.predicted_cov_condition=1.3;
+  response.baseline_apply_seconds=0.01;response.block_variance_max_relative_delta=0.0;
+  response.block_variance_relative_delta={0.0,0.0,0.0,0.0};response.cg_residual_status="CG_PASS";
+  response.cg_verification_method="COMPENSATED";response.observed_cov_available=true;
+  response.predicted_cov_available=true;response.cg_residual_available=true;
+  response.response_ibp_available=true;response.force_residual_available=true;
+  response.probe_sources={"LOW_RITZ","FIXED_PHYSICAL_OXYGEN_SKELETON_X","FIXED_RANDOM","TYPE_LOCAL"};
+  response.probe_origins={{},{},{},{0,0,1.0}};response.mean_q={0.25,0.1,-0.2,0.3};
+  response.observed_matrix.assign(16,0.0);response.centered_covariance_matrix.assign(16,0.0);
+  response.predicted_matrix.assign(16,0.0);response.ibp_matrix.assign(16,0.0);response.whitened_matrix.assign(16,0.0);
+  for(int index=0;index<4;++index){const std::size_t diagonal=static_cast<std::size_t>(index)*4+index;
+    response.observed_matrix[diagonal]=1.0;response.centered_covariance_matrix[diagonal]=0.75;
+    response.predicted_matrix[diagonal]=0.95;response.ibp_matrix[diagonal]=0.02;response.whitened_matrix[diagonal]=0.05;}
+  response.worst_response_coefficients={1.0,0.0,0.0,0.0};response.worst_ibp_coefficients={1.0,0.0,0.0,0.0};
+  response.response_band.estimate=0.1;response.response_band.radius=0.01;
+  response.response_band.lower=0.09;response.response_band.upper=0.11;response.response_band.frames=4;
+  response.response_band.block_lengths_stable=true;response.response_band.status="RESPONSE_PASS";
+  response.response_band.diagnostic_stage="INTERVAL_CHECK";response.response_band.rejection_reason="NONE";
+  response.response_band.bootstrap_started=true;response.response_band.level_radii={{1,0.01}};
+  response.ibp_band.estimate=0.2;response.ibp_band.radius=0.02;response.ibp_band.lower=0.18;
+  response.ibp_band.upper=0.22;response.ibp_band.frames=4;response.ibp_band.block_lengths_stable=true;
+  response.ibp_band.status="IBP_INCONCLUSIVE";response.ibp_band.diagnostic_stage="INTERVAL_CHECK";
+  response.ibp_band.rejection_reason="NOT_RESOLVED";response.ibp_band.bootstrap_started=true;
+  response.ibp_band.level_radii={{1,0.02}};
+  const std::vector<double> theta={0.5};const std::string manifest(64,'a'),candidate(64,'b'),input(64,'c');
+  const std::string digest=write_blind_response_checkpoint(path,response,theta,manifest,candidate,input,true);
+  const std::vector<std::string> expected_sources=response.probe_sources;
+  const std::vector<std::string> expected_origins={"-1,-1,NA","-1,-1,NA","-1,-1,NA","0,0,1"};
+  const BlindResponseSnapshot restored=read_blind_response_checkpoint(path,manifest,candidate,input,digest,
+    expected_sources,expected_origins);
+  assert(restored.passed&&restored.theta==theta&&restored.response.mean_q==response.mean_q&&
+    restored.response.observed_matrix==response.observed_matrix&&restored.response.centered_covariance_matrix==response.centered_covariance_matrix);
+  auto rejects=[&](const std::string& expected_candidate,const std::vector<std::string>& expected_sources){bool rejected=false;
+    try{(void)read_blind_response_checkpoint(path,manifest,expected_candidate,input,digest,expected_sources,expected_origins);}
+    catch(const std::runtime_error&){rejected=true;}assert(rejected);};
+  rejects(std::string(64,'d'),expected_sources);rejects(candidate,{"TYPE_LOCAL"});
+  ResponseCheck wrong_dimensions=response;wrong_dimensions.whitened_matrix.clear();bool dimensions_rejected=false;
+  try{(void)write_blind_response_checkpoint(path,wrong_dimensions,theta,manifest,candidate,input,true);}
+  catch(const std::runtime_error& error){dimensions_rejected=
+    std::string(error.what()).find("vector dimensions")!=std::string::npos;}
+  assert(dimensions_rejected);
+  ResponseCheck invalid_nonlocal=response;invalid_nonlocal.probe_origins[0]={0,0,1.0};
+  bool invalid_origin_rejected=false;
+  try{(void)write_blind_response_checkpoint(path,invalid_nonlocal,theta,manifest,candidate,input,true);}
+  catch(const std::runtime_error& error){invalid_origin_rejected=
+    std::string(error.what()).find("source kind")!=std::string::npos;}
+  assert(invalid_origin_rejected);
+  ResponseCheck missing_type_local=response;missing_type_local.probe_origins[3]={};
+  bool missing_type_local_rejected=false;
+  try{(void)write_blind_response_checkpoint(path,missing_type_local,theta,manifest,candidate,input,true);}
+  catch(const std::runtime_error& error){missing_type_local_rejected=
+    std::string(error.what()).find("source kind")!=std::string::npos;}
+  assert(missing_type_local_rejected);
+  ResponseCheck massless_type_local=response;massless_type_local.probe_origins[3]={0,0,0.0};
+  bool massless_type_local_rejected=false;
+  try{(void)write_blind_response_checkpoint(path,massless_type_local,theta,manifest,candidate,input,true);}
+  catch(const std::runtime_error& error){massless_type_local_rejected=
+    std::string(error.what()).find("source kind")!=std::string::npos;}
+  assert(massless_type_local_rejected);
+  {std::ofstream altered(path,std::ios::binary|std::ios::app);altered<<"tampered\n";}
+  bool digest_rejected=false;try{(void)read_blind_response_checkpoint(path,manifest,candidate,input,digest,
+      expected_sources,expected_origins);}
+  catch(const std::runtime_error& error){digest_rejected=
+    std::string(error.what()).find("checksum differs")!=std::string::npos;}
+  assert(digest_rejected);
+}
+
+void test_publication_io_classification_and_two_rename_recovery()
+{
+  const std::string output="rpmd_ja_publication_io_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::string staged=output+".stage",sidecar=output+".stability",staged_sidecar=staged+".stability";
+  RemoveTestFile remove_output{output},remove_stage{staged},remove_sidecar{sidecar},remove_staged_sidecar{staged_sidecar};
+  const auto write=[](const std::string& path,const std::string& bytes){
+    std::ofstream file(path,std::ios::binary|std::ios::trunc);assert(file.good());file.write(bytes.data(),bytes.size());
+    file.close();assert(file.good());};
+  const std::string output_bytes="prepared reference",sidecar_bytes="prepared sidecar";
+  write(staged,output_bytes);write(staged_sidecar,"foreign sidecar");
+  const std::string output_digest=fit_input_content_identity(staged,true).sha256;
+  const std::string sidecar_digest=rpmd_ja_covariance_checkpoint::sha256("prepared sidecar");
+  bool hard_digest_failure=false;
+  try{publish_verified_prepared_artifacts(output,staged,output_digest,sidecar_digest,[](){});}
+  catch(const std::runtime_error& error){hard_digest_failure=
+    !retryable_publication_io_failure(error.what())&&
+    std::string(error.what()).find("foreign or modified")!=std::string::npos;}
+  assert(hard_digest_failure);
+  write(staged,output_bytes);write(staged_sidecar,sidecar_bytes);
+  bool first_rename_interrupted=false;
+  try{publish_verified_prepared_artifacts(output,staged,output_digest,sidecar_digest,[](){
+      throw std::runtime_error("FEASIBILITY_PUBLISH_RETRYABLE: staged artifact atomic replace failed");});}
+  catch(const std::runtime_error& error){first_rename_interrupted=
+    retryable_publication_io_failure(error.what())&&fit_input_content_identity(output,true).sha256==output_digest;}
+  assert(first_rename_interrupted);
+  publish_verified_prepared_artifacts(output,staged,output_digest,sidecar_digest,[](){});
+  assert(fit_input_content_identity(output,true).sha256==output_digest&&
+    fit_input_content_identity(sidecar,true).sha256==sidecar_digest);
+  assert(!retryable_publication_io_failure("FEASIBILITY_PUBLISH_FAIL: final artifact bytes differ from the prepared stage digest"));
+  assert(!retryable_publication_io_failure("FEASIBILITY_RESUME_IDENTITY_FAIL: prepared stage artifact disappeared before commit"));
+}
+
+void test_regularization_response_delta_uses_full_predicted_matrix()
+{
+  const double predicted_low=1.0/1.1,predicted_high=1.0/0.9;
+  const double error_low=std::abs(1.0/predicted_low-1.0),error_high=std::abs(1.0/predicted_high-1.0);
+  const auto one_dimensional=normalized_response_matrix_delta({predicted_low},{predicted_high},1);
+  assert(std::abs(error_low-error_high)<1e-14&&one_dimensional.available&&one_dimensional.status=="AVAILABLE");
+  assert(one_dimensional.relative>0.1&&std::abs(one_dimensional.relative-2.0/11.0)<1e-14);
+
+  const auto off_diagonal=normalized_response_matrix_delta({2.0,0.25,0.25,1.0},{2.0,-0.25,-0.25,1.0},2);
+  assert(off_diagonal.available&&off_diagonal.absolute>0.7&&off_diagonal.relative>0.3);
+  const auto zero=normalized_response_matrix_delta({0.0},{0.0},1);
+  assert(!zero.available&&zero.status=="NEAR_ZERO_GLOBAL_NORM");
 }
 
 void test_probe_moments_centering_and_small_segments()
@@ -763,6 +999,350 @@ void test_covariance_training_statistics_include_symmetric_cross_terms()
     check_close(direct,expected[parameter],1e-14);}
 }
 
+void test_m1_gpu_chain_matches_cpu_and_dense_reference()
+{
+  constexpr int n=3,d=3*n,base=6,raw=4,added=2,p=base+added;
+  const std::vector<double> masses={1.0,4.0,9.0};std::vector<double> sqrt_atom(n),sqrt_mass(d);
+  for(int atom=0;atom<n;++atom){sqrt_atom[atom]=std::sqrt(masses[atom]);for(int axis=0;axis<3;++axis)sqrt_mass[axis*n+atom]=sqrt_atom[atom];}
+  Graph graph;graph.type_pairs={{0,0}};graph.edges={{0,1,0,{0,0,0}},{1,2,0,{0,0,0}}};
+  graph.base_parameter_count=base;graph.parameter_count=p;graph.raw_local_parameter_count=raw;
+  graph.local_base_mix={0.12,-0.03,0.04,0.02,0.0,0.0,-0.02,0.0,0.05,0.0,0.0,-0.04};
+  graph.local_transform={1.0,0.2,-0.3,0.8,0.4,-0.1,0.2,1.0};
+  rpmd_ja_local_basis::BridgeInput bridge{};bridge.oxygen1={0,{0,0,0}};bridge.hydrogen={1,{0,0,0}};
+  bridge.oxygen2={2,{1,-1,0}};bridge.axis={0.4,0.5,0.7681145747868608};bridge.a0=0.31;
+  bridge.s_parameter=0;bridge.ell_parameter=1;bridge.cross_parameter=2;bridge.transverse_parameter=3;
+  graph.local_terms=rpmd_ja_local_basis::make_bridge_terms(bridge);graph.parameter_basis_norms.assign(p,1.0);
+
+  std::vector<double> raw_hessian(static_cast<std::size_t>(d)*d,0.0);const double mass_sum=std::accumulate(masses.begin(),masses.end(),0.0);
+  for(int axis=0;axis<3;++axis)for(int i=0;i<n;++i)for(int j=0;j<n;++j){
+    const double pi=(i==j?1.0:0.0)-sqrt_atom[i]*sqrt_atom[j]/mass_sum;
+    raw_hessian[static_cast<std::size_t>(axis*n+i)*d+axis*n+j]=sqrt_atom[i]*sqrt_atom[j]*pi;}
+  std::stringstream raw_stream(std::ios::in|std::ios::out|std::ios::binary);
+  raw_stream.write(reinterpret_cast<const char*>(raw_hessian.data()),raw_hessian.size()*sizeof(double));raw_stream.seekg(0);
+  DeviceBaseline baseline;baseline.initialize(raw_stream,0,d,n,masses,sqrt_mass);
+  std::vector<double> baseline_host(static_cast<std::size_t>(d)*d);
+  assert(cudaMemcpy(baseline_host.data(),baseline.k,baseline_host.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const std::vector<double> theta={0.12,0.01,-0.02,0.15,0.025,0.18,0.04,-0.035};
+
+  std::vector<rpmd_ja_local_basis::Term> input_terms;
+  for(const Edge& edge:graph.edges){const rpmd_ja_local_basis::Site first{edge.i,{0,0,0}};
+    const rpmd_ja_local_basis::Site second{edge.j,{edge.image[0],edge.image[1],edge.image[2]}};
+    const auto terms=rpmd_ja_local_basis::make_symmetric_edge_terms(first,second,6*edge.group);
+    input_terms.insert(input_terms.end(),terms.begin(),terms.end());}
+  for(rpmd_ja_local_basis::Term term:graph.local_terms){term.parameter+=base;input_terms.push_back(term);}
+  const EffectiveM1Parameters effective=effective_m1_parameters(graph,theta);
+  std::vector<double> input_theta(static_cast<std::size_t>(base+raw));
+  std::copy(effective.base.begin(),effective.base.end(),input_theta.begin());
+  std::copy(effective.raw.begin(),effective.raw.end(),input_theta.begin()+base);
+  const auto blocks=rpmd_ja_local_basis::hessian_blocks(input_terms,input_theta.data(),base+raw,n,masses.data());
+  std::vector<double> expected_matrix=baseline_host;
+  for(const auto& block:blocks)for(int a=0;a<3;++a)for(int b=0;b<3;++b)
+    expected_matrix[static_cast<std::size_t>(a*n+block.row.atom)*d+b*n+block.column.atom]+=block.value[3*a+b];
+  system.assemble(theta);std::vector<double> assembled(expected_matrix.size());
+  assert(cudaMemcpy(assembled.data(),system.full,assembled.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  for(std::size_t i=0;i<assembled.size();++i)check_close(assembled[i],expected_matrix[i],2e-11);
+
+  std::vector<double> vectors(static_cast<std::size_t>(d)*2);
+  for(std::size_t i=0;i<vectors.size();++i)vectors[i]=std::sin(0.31*(i+1))-0.2*std::cos(0.17*(i+3));
+  double *device_vectors=nullptr,*device_actions=nullptr;
+  assert(cudaMalloc(reinterpret_cast<void**>(&device_vectors),vectors.size()*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&device_actions),vectors.size()*sizeof(double))==cudaSuccess);
+  assert(cudaMemcpy(device_vectors,vectors.data(),vectors.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  system.apply_parameter_operator(p-1,device_vectors,device_actions,2);
+  std::vector<double> gpu_actions(vectors.size());assert(cudaMemcpy(gpu_actions.data(),device_actions,gpu_actions.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  std::vector<double> unit_theta(p,0.0);unit_theta[p-1]=1.0;
+  for(int column=0;column<2;++column){std::vector<double> input(d),expected(d),actual(d);
+    std::copy(vectors.begin()+column*d,vectors.begin()+(column+1)*d,input.begin());
+    apply_additive(graph,input,sqrt_mass,sqrt_atom,unit_theta,n,expected);
+    std::copy(gpu_actions.begin()+column*d,gpu_actions.begin()+(column+1)*d,actual.begin());
+    for(int i=0;i<d;++i)check_close(actual[i],expected[i],2e-11);}
+  cudaFree(device_vectors);cudaFree(device_actions);
+  DeviceLanczosWorkspace lanczos;lanczos.initialize(graph,sqrt_mass,sqrt_atom,1,theta.size());lanczos.set_theta(theta);
+  assert(cudaMemcpy(lanczos.v,vectors.data(),static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  lanczos.additive_action(lanczos.v);std::vector<double> lanczos_action(d),cpu_action(d),lanczos_input(vectors.begin(),vectors.begin()+d);
+  assert(cudaMemcpy(lanczos_action.data(),lanczos.add,static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  apply_additive(graph,lanczos_input,sqrt_mass,sqrt_atom,theta,n,cpu_action);
+  for(int i=0;i<d;++i)check_close(lanczos_action[i],cpu_action[i],2e-10);
+
+  const std::vector<double> position={0.1,0.7,-0.2,0.3,-0.1,0.6,0.2,0.8,-0.4},r0(d,0.0);
+  std::vector<double> statistics(p,0.0),block_statistics(p,0.0);
+  add_covariance_frame_statistics(graph,position,r0,n,statistics,nullptr,&block_statistics);
+  for(int output=0;output<p;++output){std::vector<double> basis_theta(p,0.0);basis_theta[output]=1.0;
+    const EffectiveM1Parameters basis_effective=effective_m1_parameters(graph,basis_theta);
+    std::vector<double> mapped(static_cast<std::size_t>(base+raw));
+    std::copy(basis_effective.base.begin(),basis_effective.base.end(),mapped.begin());
+    std::copy(basis_effective.raw.begin(),basis_effective.raw.end(),mapped.begin()+base);
+    const auto value=rpmd_ja_local_basis::evaluate(input_terms,mapped.data(),base+raw,position.data(),n);
+    check_close(statistics[output],2.0*value.energy,2e-11);
+    check_close(block_statistics[output],statistics[output],2e-14);}
+
+  Graph m0=graph;m0.parameter_count=base;m0.raw_local_parameter_count=0;m0.local_terms.clear();
+  m0.local_transform.clear();m0.local_base_mix.clear();m0.parameter_basis_norms.clear();
+  DeviceCovarianceSystem m0_system(baseline,m0,sqrt_mass,masses);
+  std::vector<double> zero_extra=theta;zero_extra[base]=zero_extra[base+1]=0.0;
+  system.assemble(zero_extra);std::vector<double> m1_zero(assembled.size());
+  assert(cudaMemcpy(m1_zero.data(),system.full,m1_zero.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  const std::vector<double> m0_theta(theta.begin(),theta.begin()+base);m0_system.assemble(m0_theta);
+  std::vector<double> m0_matrix(assembled.size());assert(cudaMemcpy(m0_matrix.data(),m0_system.full,m0_matrix.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  for(std::size_t i=0;i<m0_matrix.size();++i)check_close(m1_zero[i],m0_matrix[i],2e-12);
+  std::vector<double> m1_action(d),m0_action(d);std::vector<double> q(vectors.begin(),vectors.begin()+d);
+  apply_additive(graph,q,sqrt_mass,sqrt_atom,zero_extra,n,m1_action);apply_additive(m0,q,sqrt_mass,sqrt_atom,m0_theta,n,m0_action);
+  for(int i=0;i<d;++i)check_close(m1_action[i],m0_action[i],2e-14);
+
+  constexpr double epsilon=0.05;double logdet=0.0,shifted_logdet=0.0;std::vector<double> trace,shifted_trace;
+  assert(system.evaluate_factors(theta,epsilon,logdet,shifted_logdet,&trace,&shifted_trace,false,true));
+  std::vector<double> full_matrix(expected_matrix.size());
+  assert(cudaMemcpy(full_matrix.data(),system.full,full_matrix.size()*sizeof(double),cudaMemcpyDeviceToHost)==cudaSuccess);
+  const auto basis=internal_basis(sqrt_atom);const int r=static_cast<int>(basis.size());
+  std::vector<double> restricted(static_cast<std::size_t>(r)*r,0.0);
+  for(int column=0;column<r;++column){std::vector<double> action(d,0.0);
+    for(int i=0;i<d;++i)for(int j=0;j<d;++j)action[i]+=full_matrix[static_cast<std::size_t>(i)*d+j]*basis[column][j];
+    for(int row=0;row<r;++row)restricted[static_cast<std::size_t>(row)*r+column]=compensated_dot(basis[row],action);}
+  auto dense_inverse=[&](const double shift){std::vector<double> matrix=restricted;
+    for(int i=0;i<r;++i)matrix[static_cast<std::size_t>(i)*r+i]-=shift;std::vector<double> inverse(static_cast<std::size_t>(d)*d,0.0);
+    for(int column=0;column<r;++column){std::vector<double> unit(static_cast<std::size_t>(r),0.0);unit[column]=1.0;
+      const auto solved=solve_dense_reference(matrix,unit,r);
+      for(int row=0;row<r;++row)for(int i=0;i<d;++i)for(int j=0;j<d;++j)
+        inverse[static_cast<std::size_t>(i)*d+j]+=basis[row][i]*solved[row]*basis[column][j];}
+    return inverse;};
+  const auto inverse=dense_inverse(0.0),shifted_inverse=dense_inverse(epsilon);
+  for(int output=0;output<p;++output){std::vector<double> basis_theta(p,0.0);basis_theta[output]=1.0;
+    const EffectiveM1Parameters basis_effective=effective_m1_parameters(graph,basis_theta);
+    std::vector<double> mapped(static_cast<std::size_t>(base+raw));
+    std::copy(basis_effective.base.begin(),basis_effective.base.end(),mapped.begin());
+    std::copy(basis_effective.raw.begin(),basis_effective.raw.end(),mapped.begin()+base);
+    const auto basis_blocks=rpmd_ja_local_basis::hessian_blocks(input_terms,mapped.data(),base+raw,n,masses.data());
+    double expected_trace=0.0,expected_shifted_trace=0.0;
+    for(const auto& block:basis_blocks)for(int a=0;a<3;++a)for(int b=0;b<3;++b){
+      const int row=a*n+block.row.atom,column=b*n+block.column.atom;const double value=block.value[3*a+b];
+      expected_trace+=value*inverse[static_cast<std::size_t>(column)*d+row];
+      expected_shifted_trace+=value*shifted_inverse[static_cast<std::size_t>(column)*d+row];}
+    check_close(trace[output],expected_trace,3e-7);check_close(shifted_trace[output],expected_shifted_trace,3e-7);}
+}
+
+void test_m1_bridge_images_share_hydrogen_anchored_branch()
+{
+  constexpr int n=3;Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;
+  box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;
+  const std::vector<double> r0={3.0,0.1,7.5,0.0,0.0,0.0,0.0,0.0,0.0};
+  const std::vector<int> types={0,1,0};const std::vector<std::string> symbols={"O","H","O"};
+  const std::vector<double> masses={16.0,1.0,16.0};constexpr double cutoff=5.2;
+  Graph graph=make_graph(r0,types,box,cutoff);
+  const auto& metadata=build_m1_local_basis(graph,r0,types,symbols,masses,box,cutoff,1);
+  assert(metadata.hydrogen_count==1&&metadata.bridge_candidate_count==1&&metadata.accepted_bridge_count==1);
+  assert(metadata.frozen_bridges.size()==1);
+  const Graph::FrozenBridge& bridge=metadata.frozen_bridges.front();
+  assert(bridge.accepted&&!bridge.ambiguous&&bridge.oxygen_candidates.size()==2);
+  assert(bridge.oxygen1.atom==2&&bridge.oxygen1.image[0]==-1);
+  assert(bridge.hydrogen.atom==1&&bridge.hydrogen.image[0]==0);
+  assert(bridge.oxygen2.atom==0&&bridge.oxygen2.image[0]==0);
+  int independent_image[3];const auto independent_oo=mic_displacement(r0,n,0,2,box,independent_image);
+  const double independent_distance=std::sqrt(independent_oo[0]*independent_oo[0]+independent_oo[1]*independent_oo[1]+independent_oo[2]*independent_oo[2]);
+  check_close(bridge.oo,5.5,1e-14);check_close(independent_distance,4.5,1e-14);
+  assert(bridge.oo>independent_distance+0.9);
+
+  Graph low_support=make_graph(r0,types,box,cutoff);
+  const auto& low_metadata=build_m1_local_basis(low_support,r0,types,symbols,masses,box,cutoff,3);
+  assert(low_metadata.minimum_support_count==3);
+  assert(low_metadata.added_parameter_count==0&&low_support.parameter_count==low_support.base_parameter_count);
+  assert(low_support.local_terms.empty());
+  assert(low_metadata.support_policy.find("DROP_BEFORE_OPERATOR_RESIDUALIZATION")!=std::string::npos);
+}
+
+void test_fixed_physical_response_probes_are_frozen_and_ranked()
+{
+  constexpr int n=5;Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=12.0;
+  box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=1.0/12.0;
+  const std::vector<double> r0={1.0,2.0,3.0,2.0,7.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0};
+  const std::vector<int> types={0,1,0,2,3};
+  const std::vector<std::string> symbols={"O","H","O","Na","Cl"};
+  const std::vector<double> sqrt_mass={4.0,1.0,4.0,std::sqrt(22.989769),std::sqrt(35.45)};
+  constexpr double cutoff=4.0;
+  const auto channels=make_fixed_physical_probes(r0,types,symbols,sqrt_mass,box,cutoff);
+  const auto repeated=make_fixed_physical_probes(r0,types,symbols,sqrt_mass,box,cutoff);
+  assert(channels.size()==7&&repeated.size()==channels.size());
+  bool found_oho_near=false,found_oxygen_x=false,found_salt_z=false;
+  for(std::size_t i=0;i<channels.size();++i){
+    assert(channels[i].source==repeated[i].source&&channels[i].vector==repeated[i].vector);
+    found_oho_near=found_oho_near||channels[i].source=="FIXED_PHYSICAL_OHO_NEAR_SALT";
+    found_oxygen_x=found_oxygen_x||channels[i].source=="FIXED_PHYSICAL_OXYGEN_SKELETON_X";
+    found_salt_z=found_salt_z||channels[i].source=="FIXED_PHYSICAL_SALT_POLARITY_Z";}
+  assert(found_oho_near&&found_oxygen_x&&found_salt_z);
+  std::vector<std::string> first_sources,second_sources;
+  std::vector<ProbeOrigin> first_origins,second_origins;
+  const auto first=make_probes({},sqrt_mass,types,n,&first_sources,&first_origins,&channels);
+  const auto second=make_probes({},sqrt_mass,types,n,&second_sources,&second_origins,&channels);
+  assert(first_sources==second_sources&&first.size()==second.size());
+  assert(first_sources.size()>=channels.size());
+  for(std::size_t i=0;i<channels.size();++i)assert(first_sources[i]==channels[i].source);
+  for(std::size_t i=0;i<first.size();++i)assert(first[i]==second[i]);
+}
+
+struct IndependentAdditiveOperators
+{
+  std::vector<double> k;
+  std::array<std::vector<double>,3> h;
+};
+
+IndependentAdditiveOperators independently_assemble_additive_operators(const Graph& graph,
+  const std::vector<double>& theta,const std::vector<double>& positions,const Box& box,const int n)
+{
+  const int d=3*n;const EffectiveM1Parameters effective=effective_m1_parameters(graph,theta);
+  IndependentAdditiveOperators result;result.k.assign(static_cast<std::size_t>(d)*d,0.0);
+  for(auto& matrix:result.h)matrix.assign(static_cast<std::size_t>(d)*d,0.0);
+  auto coefficient=[](const rpmd_ja_local_basis::Term& term,const int site,const int axis){
+    const auto& value=term.coefficient[site];return axis==0?value.x:axis==1?value.y:value.z;};
+  auto symmetric_component=[](const int first,const int second){const int low=std::min(first,second),high=std::max(first,second);
+    return low==0?(high==0?0:(high==1?1:2)):(low==1?(high==1?3:4):5);};
+  for(int center=0;center<n;++center)for(const SiteEdge& edge:graph.sites[center]){
+    if(edge.edge_index<0||edge.group<0)continue;double geometry[3]={};
+    for(int alpha=0;alpha<3;++alpha){geometry[alpha]=positions[alpha*n+edge.j]-positions[alpha*n+center];
+      for(int cell_axis=0;cell_axis<3;++cell_axis)geometry[alpha]+=box.cpu_h[3*alpha+cell_axis]*edge.image[cell_axis];}
+    for(int mu=0;mu<3;++mu)for(int axis=0;axis<3;++axis){
+      const double block=0.5*effective.base[6*edge.group+symmetric_component(mu,axis)];
+      const int row[2]={axis*n+edge.j,axis*n+center},column[2]={mu*n+edge.j,mu*n+center};
+      const double sign[2]={1.0,-1.0};
+      for(int first=0;first<2;++first)for(int second=0;second<2;++second)
+        result.k[static_cast<std::size_t>(row[first])*d+column[second]]+=sign[first]*block*sign[second];
+      for(int alpha=0;alpha<3;++alpha){const int velocity=mu*n+edge.j;
+        result.h[alpha][static_cast<std::size_t>(velocity)*d+axis*n+edge.j]-=geometry[alpha]*block;
+        result.h[alpha][static_cast<std::size_t>(velocity)*d+axis*n+center]+=geometry[alpha]*block;}
+    }
+  }
+  for(const auto& term:graph.local_terms){
+    const double parameter=effective.raw[static_cast<std::size_t>(term.parameter)]*term.weight;
+    for(int row=0;row<term.atom_count;++row)for(int column=0;column<term.atom_count;++column)
+      for(int a=0;a<3;++a)for(int b=0;b<3;++b)
+        result.k[static_cast<std::size_t>(a*n+term.site[row].atom)*d+b*n+term.site[column].atom]+=
+          parameter*coefficient(term,row,a)*coefficient(term,column,b);
+    for(int center=0;center<term.atom_count;++center){const double scale=parameter*term.energy_share[center];
+      for(int anchor=0;anchor<term.atom_count;++anchor)if(anchor!=center){
+        const int velocity_atom=term.site[anchor].atom;double geometry[3]={};
+        for(int alpha=0;alpha<3;++alpha){geometry[alpha]=positions[alpha*n+velocity_atom]-positions[alpha*n+term.site[center].atom];
+          for(int cell_axis=0;cell_axis<3;++cell_axis)
+            geometry[alpha]+=box.cpu_h[3*alpha+cell_axis]*(term.site[anchor].image[cell_axis]-term.site[center].image[cell_axis]);}
+        for(int mu=0;mu<3;++mu)for(int displacement=0;displacement<term.atom_count;++displacement)if(displacement!=center)
+          for(int alpha=0;alpha<3;++alpha)for(int axis=0;axis<3;++axis){
+            const double value=-geometry[alpha]*scale*coefficient(term,anchor,mu)*coefficient(term,displacement,axis);
+            const int velocity=mu*n+velocity_atom;
+            result.h[alpha][static_cast<std::size_t>(velocity)*d+axis*n+term.site[displacement].atom]+=value;
+            result.h[alpha][static_cast<std::size_t>(velocity)*d+axis*n+term.site[center].atom]-=value;
+          }
+      }
+    }
+  }
+  return result;
+}
+
+void test_native_m1_writer_reader_cross_neighbor_images_and_transport()
+{
+  constexpr int n=3,d=3*n;Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;
+  box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;
+  const std::vector<double> r0={3.0,0.1,7.5,0.0,0.0,0.0,0.0,0.0,0.0};
+  const std::vector<int> types={0,1,0};const std::vector<std::string> symbols={"O","H","O"};
+  const std::vector<double> masses={16.0,1.0,16.0};constexpr double cutoff=5.2;
+  Graph third=make_graph(r0,types,box,cutoff);
+  const auto& metadata=build_m1_local_basis(third,r0,types,symbols,masses,box,cutoff,1);
+  assert(metadata.accepted_bridge_count==1&&metadata.added_parameter_count>0);
+  const int p=third.parameter_count,base=third.base_parameter_count;
+  std::vector<double> theta(static_cast<std::size_t>(p),0.0);
+  for(int column=base;column<p;++column)theta[column]=0.13+0.07*(column-base);
+  std::vector<std::array<double,3>> edge_linear(third.edges.size());
+  for(const auto& term:third.local_terms){double share_sum=0.0;for(int site=0;site<term.atom_count;++site)share_sum+=term.energy_share[site];
+    assert(std::abs(share_sum-1.0)<1e-12);}
+  Graph half=third;
+  for(auto& term:half.local_terms)if(term.atom_count==3){
+    term.energy_share[0]=0.5;term.energy_share[1]=0.25;term.energy_share[2]=0.25;}
+  RpmdJAReference reference;reference.number_of_atoms=n;reference.temperature=300.0;
+  reference.positions=r0;for(int i=0;i<9;++i)reference.cell[i]=box.cpu_h[i];
+  const std::vector<double> raw_gradient(d,0.0);
+  struct RoundTrip{RpmdJAAdditiveData package;std::vector<NativeAdditiveSiteBlock> blocks;};
+  auto round_trip=[&](const Graph& graph,const char* suffix){
+    const std::string path=std::string("rpmd_ja_native_m1_writer_")+suffix+"_"+
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".bin";
+    std::vector<NativeAdditiveSiteBlock> blocks;std::uint64_t estimated_bytes=0;
+    {
+      std::ofstream out(path,std::ios::binary);assert(out.good());out.write(additive_magic,8);
+      write(out,std::uint32_t(1));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(4));
+      write(out,std::uint64_t(0));write(out,300.0);write(out,0.05);write(out,0.01);write(out,0.02);
+      write(out,std::uint64_t(1));write(out,std::uint64_t(1));
+      estimated_bytes=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);assert(out.good());
+    }
+    const NativeAdditivePackageEstimate prefit_estimate=estimate_native_additive_package_size(graph,n);
+    assert(prefit_estimate.bytes==estimated_bytes&&prefit_estimate.maximum_site_neighbors>0);
+    std::ifstream sized(path,std::ios::binary|std::ios::ate);assert(sized.good());
+    assert(static_cast<std::uint64_t>(sized.tellg())==estimated_bytes);sized.close();
+    blocks=build_native_additive_site_blocks(graph,theta,edge_linear,n);
+    const RpmdJAAdditiveData package=read_rpmd_ja_additive(path,"test-raw.qraw",reference,4,raw_gradient);
+    assert(std::remove(path.c_str())==0);return RoundTrip{package,std::move(blocks)};
+  };
+  const RoundTrip one_third=round_trip(third,"third");const RoundTrip one_half=round_trip(half,"half");
+  auto dense=[](const RpmdJASparseRows& sparse){
+    const int dimension=static_cast<int>(sparse.offsets.size())-1;std::vector<double> result(static_cast<std::size_t>(dimension)*dimension,0.0);
+    for(int row=0;row<dimension;++row)for(std::size_t index=sparse.offsets[row];index<sparse.offsets[row+1];++index)
+      result[static_cast<std::size_t>(row)*dimension+sparse.columns[index]]=sparse.values[index];return result;};
+  const IndependentAdditiveOperators expected=independently_assemble_additive_operators(third,theta,r0,box,n);
+  const IndependentAdditiveOperators expected_half=independently_assemble_additive_operators(half,theta,r0,box,n);
+  const std::string state_path="rpmd_ja_m1_mapping_replay_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";
+  RemoveTestFile state_cleanup{state_path};
+  CovarianceFitResult saved_fit;saved_fit.theta=theta;saved_fit.theta_start=theta;
+  saved_fit.theta_baseline.assign(theta.size(),0.0);saved_fit.coordinate_scale.assign(theta.size(),1.0);
+  saved_fit.statistics.assign(theta.size(),0.0);saved_fit.barrier_tau=1.0;
+  RpmdJANativeFitOptions saved_options;saved_options.cutoff=cutoff;saved_options.epsilon=0.01;
+  saved_options.fd_step=1e-4;saved_options.sample_interval=1;
+  SampleHeader saved_header{};saved_header.temperature=300.0;saved_header.beads=4;
+  {
+    Graph to_save=third;QrawIdentity identity{};
+    write_covariance_state(state_path,saved_fit,0.0,"test.samples","test.qraw",saved_options,
+      saved_header,identity,to_save,6,4,0.01);
+    to_save=Graph{};
+  }
+  std::ifstream state_file(state_path);const auto saved_fields=read_covariance_state_fields(state_file);
+  assert(saved_fields.at("state_format_version")=="4"&&saved_fields.at("parameter_family")=="M1");
+  Graph rebuilt=make_graph(r0,types,box,cutoff);
+  build_m1_local_basis(rebuilt,r0,types,symbols,masses,box,cutoff,1);
+  assert(std::stoull(saved_fields.at("M1_basis_fingerprint_fnv64"))==covariance_m1_basis_fingerprint(rebuilt));
+  std::istringstream saved_theta(saved_fields.at("theta"));std::size_t saved_count=0;saved_theta>>saved_count;
+  assert(saved_count==theta.size());std::vector<double> replay_theta(saved_count);
+  for(double& value:replay_theta)assert(static_cast<bool>(saved_theta>>value));
+  const auto replay=independently_assemble_additive_operators(rebuilt,replay_theta,r0,box,n);
+  for(std::size_t i=0;i<expected.k.size();++i)check_close(replay.k[i],expected.k[i],1e-12);
+  for(int axis=0;axis<3;++axis)for(std::size_t i=0;i<expected.h[axis].size();++i)
+    check_close(replay.h[axis][i],expected.h[axis][i],1e-12);
+  Graph changed_share=rebuilt;changed_share.local_terms.front().energy_share[0]+=0.01;
+  assert(covariance_m1_basis_fingerprint(changed_share)!=covariance_m1_basis_fingerprint(rebuilt));
+  Graph changed_image=rebuilt;changed_image.local_terms.front().site[0].image[0]+=1;
+  assert(covariance_m1_basis_fingerprint(changed_image)!=covariance_m1_basis_fingerprint(rebuilt));
+  Graph changed_transform=rebuilt;changed_transform.local_transform[0]+=0.01;
+  assert(covariance_m1_basis_fingerprint(changed_transform)!=covariance_m1_basis_fingerprint(rebuilt));
+  const auto k_third=dense(one_third.package.k),k_half=dense(one_half.package.k);
+  for(std::size_t i=0;i<expected.k.size();++i){check_close(k_third[i],expected.k[i],3e-10);check_close(k_half[i],expected_half.k[i],3e-10);}
+  for(int axis=0;axis<3;++axis)for(int row=0;row<d;++row){double sum=0.0;
+    for(int atom=0;atom<n;++atom)sum+=k_third[static_cast<std::size_t>(row)*d+axis*n+atom];check_close(sum,0.0,3e-10);}
+  bool cross_neighbor=false;
+  for(int a=0;a<3;++a)cross_neighbor|=std::abs(k_third[static_cast<std::size_t>(a*n+0)*d+a*n+2])>1e-10;
+  assert(cross_neighbor);
+  bool image_edge=false,off_diagonal_site_block=false;
+  for(const auto& block:one_third.blocks){
+    for(const SiteEdge& edge:block.edges)image_edge|=edge.image[0]!=0||edge.image[1]!=0||edge.image[2]!=0;
+    const int q=static_cast<int>(block.edges.size())*3;
+    for(std::size_t left=0;left<block.edges.size();++left)for(std::size_t right=0;right<block.edges.size();++right)
+      if(left!=right&&block.edges[left].j!=block.edges[right].j)
+        for(int a=0;a<3;++a)for(int b=0;b<3;++b)
+          off_diagonal_site_block|=std::abs(block.quadratic[(3*left+a)*q+3*right+b])>1e-10;
+  }
+  assert(image_edge&&off_diagonal_site_block);
+  bool nonsymmetric=false,gauge_h_changed=false;
+  for(int alpha=0;alpha<3;++alpha){const auto h_third=dense(one_third.package.h[alpha]);const auto h_half=dense(one_half.package.h[alpha]);
+    for(std::size_t i=0;i<expected.h[alpha].size();++i)check_close(h_third[i],expected.h[alpha][i],3e-10);
+    for(int row=0;row<d;++row)for(int column=0;column<d;++column){
+      nonsymmetric|=std::abs(h_third[static_cast<std::size_t>(row)*d+column]-h_third[static_cast<std::size_t>(column)*d+row])>1e-10;
+      gauge_h_changed|=std::abs(h_third[static_cast<std::size_t>(row)*d+column]-h_half[static_cast<std::size_t>(row)*d+column])>1e-10;}}
+  assert(nonsymmetric&&gauge_h_changed);
+}
+
 Graph make_two_atom_covariance_graph()
 {
   Graph graph;graph.type_pairs={{0,1}};Edge edge;edge.i=0;edge.j=1;edge.group=0;graph.edges.push_back(edge);return graph;
@@ -780,6 +1360,39 @@ void test_covariance_statistics_read_only_training_frames()
   assert(statistics.size()==6);check_close(statistics[0],5.0/(K_B*300.0*2.0),1e-12);
   assert(blocks.size()==2&&block_frames==std::vector<std::uint64_t>({1,1}));
   check_close(blocks[0][0],1.0/(K_B*300.0),1e-12);check_close(blocks[1][0],4.0/(K_B*300.0),1e-12);
+}
+
+void test_blind_fixed_r0_admission_reuses_training_channels_and_block_plan()
+{
+  SampleHeader header{};header.n=2;header.masses={1.0,1.0};header.frames=0;
+  const Graph graph=make_two_atom_covariance_graph();const std::vector<double> r0(6,0.0);
+  const std::vector<double> sqrt_mass(6,1.0);
+  const std::vector<FixedPhysicalProbe> probes={{"frozen_probe",{1.0,-1.0,0.0,0.0,0.0,0.0}}};
+  auto samples=[&](const double shift){std::stringstream stream(std::ios::in|std::ios::out|std::ios::binary);
+    for(int frame=0;frame<8;++frame){const double step=frame;const double x=1.0+0.05*(frame%3);
+      const double position[6]={shift,shift+x,0.0,0.0,0.0,0.0};const double force[6]={};
+      stream.write(reinterpret_cast<const char*>(&step),sizeof(step));
+      stream.write(reinterpret_cast<const char*>(position),sizeof(position));
+      stream.write(reinterpret_cast<const char*>(force),sizeof(force));}
+    return stream;};
+  std::stringstream training=samples(0.0),blind_pass=samples(0.0),blind_shifted=samples(10.0);
+  const auto training_channels=collect_fixed_r0_admission_channels(training,header,8,graph,r0,300.0,
+    probes,sqrt_mass,1ULL<<20);
+  const auto matching_channels=collect_fixed_r0_admission_channels(blind_pass,header,8,graph,r0,300.0,
+    probes,sqrt_mass,1ULL<<20);
+  const auto shifted_channels=collect_fixed_r0_admission_channels(blind_shifted,header,8,graph,r0,300.0,
+    probes,sqrt_mass,1ULL<<20);
+  assert(training_channels.names==matching_channels.names&&training_channels.names==shifted_channels.names);
+  rpmd_ja_statistics_policy::BlockPlan frozen_plan;frozen_plan.status="PASS";frozen_plan.block_length=1;
+  frozen_plan.adjacent_block_length=2;frozen_plan.tau_frames=1.0;
+  const auto config=rpmd_ja_statistics_policy::frozen_config();
+  const std::vector<std::string> no_expected_zero_mean_channels;
+  const auto matching=rpmd_ja_statistics_policy::assess_fixed_r0_means(training_channels,matching_channels,
+    frozen_plan,config,&no_expected_zero_mean_channels);
+  assert(matching.status=="PASS"&&frozen_plan.block_length==1);
+  const auto shifted=rpmd_ja_statistics_policy::assess_fixed_r0_means(training_channels,shifted_channels,
+    frozen_plan,config,&no_expected_zero_mean_channels);
+  assert(shifted.status!="PASS"&&frozen_plan.block_length==1);
 }
 
 void initialize_two_atom_covariance_baseline(DeviceBaseline& baseline,const bool identity_internal)
@@ -806,6 +1419,60 @@ void initialize_identity_covariance_baseline(DeviceBaseline& baseline,const int 
     const int row=axis*n+i,column=axis*n+j;
     matrix[static_cast<std::size_t>(row)*baseline.d+column]=(i==j?1.0:0.0)-1.0/n;}
   assert(cudaMemcpy(baseline.k,matrix.data(),matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+}
+
+void test_nonconverged_a0_baseline_restore_rebuilds_factors()
+{
+  const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
+  DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::uint64_t evaluations=0;
+  const CovarianceBaseline reference=build_graph_covariance_baseline(system,statistics,1e-6,evaluations);
+  CovarianceFitResult fit;fit.converged=false;fit.status="MAX_ITERATIONS";fit.covariance_baseline=reference;
+  fit.objective_data=1.25;fit.objective_prior=0.5;fit.objective_total=1.75;
+  rpmd_ja_device::CovarianceFitWorkspace workspace;
+  rebuild_restored_a0_baseline(fit,baseline,graph,sqrt_mass,masses,&workspace,1e-6,nullptr,nullptr);
+  assert(!fit.converged&&fit.covariance_baseline.logdet==reference.logdet&&
+    fit.covariance_baseline.shifted_logdet==reference.shifted_logdet);
+  assert(fit.objective_data==1.25&&fit.objective_prior==0.5&&fit.objective_total==1.75);
+}
+
+void test_covariance_development_statistics_keep_fixed_training_center()
+{
+  SampleHeader header{};header.n=2;header.temperature=300.0;header.masses={1.0,4.0};
+  header.types={0,1};header.frames=0;const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> r0(6,0.0),sqrt_atom={1.0,2.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.batch_q),static_cast<std::size_t>(6)*DeviceBaseline::batch_capacity*sizeof(double))==cudaSuccess);
+  assert(cudaMalloc(reinterpret_cast<void**>(&baseline.batch_out),static_cast<std::size_t>(6)*DeviceBaseline::batch_capacity*sizeof(double))==cudaSuccess);
+  std::stringstream spool(std::ios::in|std::ios::out|std::ios::binary);
+  for(int frame=0;frame<10;++frame){const double step=static_cast<double>(frame);
+    const double position[6]={0.0,static_cast<double>(frame+1),0.0,0.0,0.0,0.0};const double force[6]={};
+    spool.write(reinterpret_cast<const char*>(&step),sizeof(step));
+    spool.write(reinterpret_cast<const char*>(position),sizeof(position));spool.write(reinterpret_cast<const char*>(force),sizeof(force));}
+  std::vector<std::vector<double>> blocks;std::vector<std::uint64_t> block_frames;
+  std::vector<double> development;double development_baseline=0.0;
+  std::vector<std::vector<double>> development_blocks;std::vector<double> development_baselines;
+  std::vector<std::uint64_t> development_frames;
+  const std::vector<double> training=collect_covariance_fit_statistics(spool,header,10,6,graph,r0,300.0,
+    nullptr,&blocks,&block_frames,nullptr,nullptr,&baseline,&sqrt_mass,&sqrt_atom,&development,&development_baseline,
+    &development_blocks,&development_baselines,&development_frames);
+  check_close(training[0],91.0/(K_B*300.0*6.0),1e-12);
+  check_close(development[0],294.0/(K_B*300.0*4.0),1e-12);
+  check_close(development_baseline,235.2/(K_B*300.0*4.0),2e-12);
+  assert(block_frames.size()==6&&blocks.size()==6);
+  assert(development_frames==std::vector<std::uint64_t>({1,1,1,1})&&development_blocks.size()==4);
+  const double development_squares[]={49.0,64.0,81.0,100.0};
+  double development_block_mean=0.0,development_baseline_block_mean=0.0;
+  for(std::size_t block=0;block<development_blocks.size();++block){
+    check_close(development_blocks[block][0],development_squares[block]/(K_B*300.0),1e-12);
+    check_close(development_baselines[block],0.8*development_squares[block]/(K_B*300.0),2e-12);
+    development_block_mean+=development_blocks[block][0]/development_blocks.size();
+    development_baseline_block_mean+=development_baselines[block]/development_baselines.size();}
+  check_close(development_block_mean,development[0],1e-12);
+  check_close(development_baseline_block_mean,development_baseline,1e-12);
+  baseline.release();
 }
 
 void test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly()
@@ -879,7 +1546,7 @@ void test_covariance_local_group_hessian_matches_tiny_objective_fd(cusolverDnHan
   const std::vector<double> sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0},sqrt_atom={1.0,2.0};
   DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
   DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);const std::vector<double> theta={0.2,0.01,-0.02,0.25,0.03,0.3};
-  constexpr double epsilon=0.01,rho=0.7,tau=0.2;const CovarianceLocalGroupBasis local=covariance_local_group_basis(graph,sqrt_mass,2,0,32);
+  constexpr double epsilon=0.01,rho=0.0,tau=0.2,ridge_lambda=0.35;const CovarianceLocalGroupBasis local=covariance_local_group_basis(graph,sqrt_mass,2,0,32);
   assert(local.status=="READY"&&local.dimension==6);
   CovarianceProbeSolveSession session(system,sqrt_atom);session.factor(theta,epsilon,true,true);
   std::vector<std::vector<double>> rhs(6,std::vector<double>(6,0.0));
@@ -904,20 +1571,26 @@ void test_covariance_local_group_hessian_matches_tiny_objective_fd(cusolverDnHan
     NeumaierAccumulator sum;for(int i=0;i<d;++i)for(int j=0;j<d;++j)sum.add_product(xa[static_cast<std::size_t>(i)*d+j],xb[static_cast<std::size_t>(j)*d+i]);return sum.value();};
   for(const auto& op:{std::make_pair(0.0,&trace_d),std::make_pair(epsilon,&trace_s)}){const std::vector<double> inverse=full_inverse(op.first);
     for(int a=0;a<6;++a)for(int b=0;b<6;++b)check_close((*op.second)[static_cast<std::size_t>(a)*6+b],full_trace(inverse,a,b),2e-7);}
-  const CovarianceLocalHessianTerms hessian=covariance_local_group_hessian(trace_d,trace_s,rho,tau,std::vector<double>(6,1.0),0);
+  const std::vector<double> scale={0.5,1.25,1.5,0.75,2.0,0.6};
+  const CovarianceLocalHessianTerms hessian=covariance_local_group_hessian(trace_d,trace_s,rho,tau,ridge_lambda,scale,0);
+  for(int a=0;a<6;++a)for(int b=0;b<6;++b)
+    check_close(hessian.ridge[static_cast<std::size_t>(a)*6+b],a==b?ridge_lambda:0.0,1e-15);
   const double analytic=hessian.total[0];
   std::vector<double> extended_scale(12);for(std::size_t i=0;i<extended_scale.size();++i)extended_scale[i]=0.25+0.125*i;
-  const CovarianceLocalHessianTerms scaled_hessian=covariance_local_group_hessian(trace_d,trace_s,rho,tau,extended_scale,6);
+  const CovarianceLocalHessianTerms scaled_hessian=covariance_local_group_hessian(trace_d,trace_s,rho,tau,ridge_lambda,extended_scale,6);
   for(int a=0;a<6;++a)for(int b=0;b<6;++b){const std::size_t at=static_cast<std::size_t>(a)*6+b;
-    const double expected=(0.5*(1.0+rho)*trace_d[at]+tau*trace_s[at])*extended_scale[6+a]*extended_scale[6+b];
+    const double expected=(0.5*(1.0+rho)*trace_d[at]+tau*trace_s[at])*extended_scale[6+a]*extended_scale[6+b]+
+      (a==b?ridge_lambda:0.0);
     check_close(scaled_hessian.total[at],expected,2e-15);}
   CovarianceBaseline reference;reference.theta=theta;std::vector<double> shifted_trace;
   assert(system.evaluate_factors(theta,epsilon,reference.logdet,reference.shifted_logdet,&reference.trace,&shifted_trace,false,true));
   const std::vector<double> statistics={0.2,-0.03,0.04,0.25,0.01,0.3};std::uint64_t evaluations=0;
-  const CovarianceObjectiveEvaluation center=evaluate_covariance_fit_objective(system,theta,reference,statistics,rho,epsilon,tau,evaluations,false);
+  const CovarianceObjectiveEvaluation center=evaluate_covariance_fit_objective(system,theta,reference,statistics,rho,epsilon,tau,evaluations,false,
+    false,true,nullptr,nullptr,&scale,ridge_lambda);
   constexpr double h=1e-4;double values[2];
-  for(int side=0;side<2;++side){std::vector<double> trial=theta;trial[0]+=(side==0?1.0:-1.0)*h;
-    const CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(system,trial,reference,statistics,rho,epsilon,tau,evaluations,false);
+  for(int side=0;side<2;++side){std::vector<double> trial=theta;trial[0]+=(side==0?1.0:-1.0)*h*scale[0];
+    const CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(system,trial,reference,statistics,rho,epsilon,tau,evaluations,false,
+      false,true,nullptr,nullptr,&scale,ridge_lambda);
     assert(value.feasible);values[side]=value.objective;}
   const double finite_difference=(values[0]-2.0*center.objective+values[1])/(h*h);
   check_close(analytic,finite_difference,3e-5);
@@ -1023,9 +1696,12 @@ void test_covariance_joint_block_includes_cross_group_hessian()
   for(int a=0;a<12;++a)for(int b=0;b<12;++b){const std::size_t at=static_cast<std::size_t>(a)*12+b;
     check_close(trace_d[at],direct_trace(inverse_d,a,b),2e-13);check_close(trace_s[at],direct_trace(inverse_s,a,b),2e-13);}
   std::vector<double> scale(18);for(std::size_t i=0;i<scale.size();++i)scale[i]=0.4+0.07*i;
-  const CovarianceJointHessianTerms hessian=covariance_joint_group_hessian(trace_d,trace_s,0.6,0.3,scale,selection.groups);
+  constexpr double ridge_lambda=0.4;
+  const CovarianceJointHessianTerms hessian=covariance_joint_group_hessian(trace_d,trace_s,0.0,0.3,ridge_lambda,scale,selection.groups);
   const std::size_t cross=6;assert(std::abs(hessian.total[cross])>1e-5);
-  check_close(hessian.total[cross],(0.5*(1.0+0.6)*trace_d[cross]+0.3*trace_s[cross])*scale[12]*scale[0],2e-14);
+  check_close(hessian.total[cross],(0.5*trace_d[cross]+0.3*trace_s[cross])*scale[12]*scale[0],2e-14);
+  check_close(hessian.ridge[0],ridge_lambda,1e-15);
+  check_close(hessian.ridge[cross],0.0,1e-15);
   std::vector<double> selected_gradient(12);for(int component=0;component<6;++component){
     selected_gradient[component]=gradient[12+component];selected_gradient[6+component]=gradient[component];}
   const CovarianceBlockNewtonResult joint=covariance_joint_newton_direction(hessian.total,selected_gradient);
@@ -1496,6 +2172,36 @@ void test_covariance_baseline_brackets_both_signs_and_zero()
   }
 }
 
+void test_a0_soft_modes_use_covariance_baseline_point(cusolverDnHandle_t solver)
+{
+  CovarianceFitResult a0;
+  a0.theta={0.1,0.0,0.0,10.0,0.0,10.0};
+  a0.covariance_baseline.theta={10.0,0.0,0.0,10.0,0.0,0.1};
+  assert(a0.theta!=a0.covariance_baseline.theta);
+  const std::vector<double>& mode_theta=covariance_a0_soft_mode_theta(a0);
+  assert(&mode_theta==&a0.covariance_baseline.theta&&mode_theta!=a0.theta);
+
+  constexpr int n=2,d=3*n;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);
+  std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<d;++i)raw[static_cast<std::size_t>(i)*d+i]=1.0;
+  std::stringstream raw_stream(std::ios::in|std::ios::out|std::ios::binary);
+  raw_stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));raw_stream.seekg(0);
+  DeviceBaseline baseline;baseline.initialize(raw_stream,0,d,n,masses,sqrt_mass);
+  Graph graph;graph.edges.push_back({0,1,0,{0,0,0}});
+  const auto solved_modes=lanczos_low_modes(solver,baseline,graph,a0.theta,sqrt_mass,sqrt_atom,n,8,4,0.0);
+  const auto baseline_modes=lanczos_low_modes(solver,baseline,graph,mode_theta,sqrt_mass,sqrt_atom,n,8,4,0.0);
+  assert(!solved_modes.empty()&&!baseline_modes.empty());
+  const auto reliable=[](const RitzMode& mode){return std::isfinite(mode.residual)&&
+    mode.residual<=1.0e-6*std::max(std::abs(mode.actual_rayleigh),1.0e-12);};
+  assert(reliable(solved_modes.front())&&reliable(baseline_modes.front()));
+  assert(std::abs(covariance_dot(solved_modes.front().vector,baseline_modes.front().vector))<1.0e-8);
+  std::vector<std::string> sources;const std::vector<int> types={0,1};
+  const auto common=make_common_probe_set({baseline_modes.front()},sqrt_atom,types,n,&sources);
+  assert(!common.empty()&&!sources.empty()&&sources.front()=="LOW_RITZ");
+  assert(std::abs(covariance_dot(common.front(),baseline_modes.front().vector))>1.0-1.0e-10);
+  assert(std::abs(covariance_dot(common.front(),solved_modes.front().vector))<1.0e-8);
+}
+
 void test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_solution()
 {
   DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);const Graph graph=make_two_atom_covariance_graph();
@@ -1553,11 +2259,60 @@ void test_covariance_trust_region_staged_barrier_harmonic_solve()
   const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};
   DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
   std::ostringstream trace;covariance_fit_test_hooks={};
-  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,300,&trace,false,false,true,true);
+  covariance_fit_test_hooks.trust_region_forced_rejections_remaining=1;
+  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,1e-6,0.1,300,&trace,false,false,true,true,
+    {},{},0.0,16);
+  const int full_directional_checks=covariance_fit_test_hooks.directional_curvature_reference_checks;
+  const int step_directional_checks=covariance_fit_test_hooks.directional_curvature_step_checks;
+  const int forced_rejections_remaining=covariance_fit_test_hooks.trust_region_forced_rejections_remaining;
   covariance_fit_test_hooks={};const std::string log=trace.str();
   assert(fit.converged&&fit.status=="COVARIANCE_OPTIMIZER_CONVERGED"&&fit.trust_region_enabled&&fit.staged_barrier_enabled);
   assert(fit.scaled_kkt_residual<=1e-6&&fit.barrier_center_condition_pass&&fit.barrier_gap_estimate<=1e-6);
   assert(log.find("BFGS_STAGE_RESET tau=0.2")!=std::string::npos&&log.find("BFGS_STAGE_RESET tau=0.04")!=std::string::npos);
+  int full_summaries=0,step_summaries=0,tau_stage_summaries=0,step_summaries_with_one_direction=0;
+  std::istringstream lines(log);std::string line;
+  while(std::getline(lines,line)){if(line.find("COVARIANCE_CURVATURE_DIRECTION_SUMMARY ")==std::string::npos)continue;
+    if(line.find("trigger=SUGGESTED_STEP")!=std::string::npos){++step_summaries;
+      if(line.find("checks=1")!=std::string::npos)++step_summaries_with_one_direction;}
+    else{++full_summaries;if(line.find("trigger=TAU_STAGE")!=std::string::npos)++tau_stage_summaries;}}
+  const auto count_text=[&](const std::string& needle){int count=0;std::size_t position=0;
+    while((position=log.find(needle,position))!=std::string::npos){++count;position+=needle.size();}return count;};
+  assert(full_directional_checks==full_summaries&&step_directional_checks==step_summaries&&step_summaries>0);
+  assert(step_summaries==static_cast<int>(fit.line_search_trials));
+  assert(count_text("COVARIANCE_CURVATURE_SUGGESTED_STEP iteration=")==static_cast<int>(fit.line_search_trials));
+  assert(forced_rejections_remaining==0);
+  assert(step_summaries_with_one_direction==step_summaries);
+  assert(tau_stage_summaries==count_text("BFGS_STAGE_RESET tau="));
+  const auto field_value=[](const std::string& text,const std::string& name){
+    const std::string key=name+"=";const std::size_t begin=text.find(key);
+    if(begin==std::string::npos)throw std::runtime_error("trust-region trace is missing field "+name);
+    const std::size_t value_begin=begin+key.size(),end=text.find(' ',value_begin);
+    return std::stod(text.substr(value_begin,end-value_begin));};
+  const std::size_t forced_rejection=log.find("COVARIANCE_TEST_FORCED_TRUST_REGION_REJECTION ");
+  assert(forced_rejection!=std::string::npos);
+  const std::string forced_line=log.substr(forced_rejection,log.find('\n',forced_rejection)-forced_rejection);
+  const int injected_iteration=static_cast<int>(field_value(forced_line,"iteration"));
+  const int injected_retry=static_cast<int>(field_value(forced_line,"retry"));
+  const std::string rejected_prefix="TRUST_REGION_TRIAL iteration="+std::to_string(injected_iteration)+
+    " retry="+std::to_string(injected_retry);
+  const std::size_t rejected_trial=log.find(rejected_prefix,forced_rejection);
+  const std::string retry_prefix="COVARIANCE_CURVATURE_SUGGESTED_STEP iteration="+std::to_string(injected_iteration)+
+    " retry="+std::to_string(injected_retry+1);
+  const std::size_t retry_direction=log.find(retry_prefix,rejected_trial);
+  assert(rejected_trial!=std::string::npos&&retry_direction!=std::string::npos);
+  const std::string rejected_line=log.substr(rejected_trial,log.find('\n',rejected_trial)-rejected_trial);
+  const std::string retry_line=log.substr(retry_direction,log.find('\n',retry_direction)-retry_direction);
+  assert(rejected_line.find("status=RATIO_REJECT")!=std::string::npos);
+  assert(field_value(rejected_line,"next_radius")<field_value(rejected_line,"radius"));
+  assert(field_value(retry_line,"radius")==field_value(rejected_line,"next_radius"));
+  std::vector<std::string> accepted_taus;std::istringstream accepted_lines(log);
+  while(std::getline(accepted_lines,line))if(line.find("TRUST_REGION_STEP_ACCEPT ")==0){
+    const std::size_t tau_at=line.find(" tau=");if(tau_at!=std::string::npos){const std::size_t value_at=tau_at+5;
+      const std::size_t end=line.find(' ',value_at);accepted_taus.push_back(line.substr(value_at,end-value_at));}}
+  bool two_accepts_same_tau=false;
+  for(std::size_t i=0;i<accepted_taus.size();++i)for(std::size_t j=0;j<i;++j)
+    if(accepted_taus[i]==accepted_taus[j])two_accepts_same_tau=true;
+  assert(two_accepts_same_tau);
 
   std::uint64_t evaluations=0;const CovarianceBaseline reference=build_graph_covariance_baseline(system,statistics,1e-6,evaluations);
   std::vector<double> expected=fit.theta_baseline;
@@ -1585,6 +2340,71 @@ void test_covariance_trust_region_staged_barrier_harmonic_solve()
   covariance_fit_test_hooks={};
   assert(!bounded.converged&&bounded.status=="EVALUATION_BUDGET_EXHAUSTED"&&bounded.trust_region_enabled&&bounded.staged_barrier_enabled);
   assert(bounded.last_valid.available);
+}
+
+void test_native_covariance_mid_a0_resume_preserves_original_start_and_stagnation_window()
+{
+  constexpr double epsilon=0.01,ridge=0.7;
+  const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};
+  DeviceBaseline device;initialize_two_atom_covariance_baseline(device,true);
+  DeviceCovarianceSystem system(device,graph,sqrt_mass,masses);std::uint64_t evaluations=0;
+  const CovarianceBaseline baseline=build_graph_covariance_baseline(system,statistics,epsilon,evaluations);
+  const std::vector<double> scales=system.coordinate_scales(baseline.theta,epsilon);
+  const std::vector<double> original_start=baseline.theta;
+  rpmd_ja_feasibility::Budget budget;rpmd_ja_feasibility::Limits limits;
+  const double now=covariance_budget_now_seconds();
+  assert(rpmd_ja_feasibility::begin(budget,limits,now)==rpmd_ja_feasibility::BudgetResult::OK);
+  assert(rpmd_ja_feasibility::enter_phase(budget,limits,rpmd_ja_feasibility::Phase::A0,now)==
+    rpmd_ja_feasibility::BudgetResult::OK);
+  rpmd_ja_covariance_checkpoint::AcceptedPoint metadata;metadata.job_id="native-mid-a0-resume";
+  metadata.identity_sha256=std::string(64,'a');metadata.branch="A0";metadata.family="M0";
+  metadata.candidate_index=0;metadata.selection_state="NOT_FROZEN";metadata.epsilon=epsilon;
+  metadata.ridge_lambda=ridge;metadata.tau=1.0;metadata.trust_radius=1.0;
+  const std::string path="rpmd_ja_mid_a0_resume_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".checkpoint";
+  rpmd_ja_covariance_checkpoint::AcceptedPoint saved;
+  const auto sink=[&](const rpmd_ja_covariance_checkpoint::AcceptedPoint& point){saved=point;};
+  covariance_fit_test_hooks={};covariance_fit_test_hooks.checkpoint_interruptions_remaining=1;
+  const CovarianceFitResult interrupted=solve_covariance_reference(system,statistics,epsilon,0.0,1,nullptr,
+    false,false,true,false,{}, {},ridge,16,&baseline,&scales,&original_start,1.0,true,&budget,&limits,nullptr,&metadata,sink);
+  covariance_fit_test_hooks={};
+  assert(saved.iterations>=1&&saved.theta_start==original_start&&saved.theta.size()==original_start.size());
+  assert(saved.theta!=saved.theta_start);
+  assert(interrupted.reason.find("TEST_CHECKPOINT_INTERRUPT")!=std::string::npos);
+  rpmd_ja_covariance_checkpoint::write_checkpoint(path,saved);
+  const auto restored=rpmd_ja_covariance_checkpoint::read_checkpoint(path,metadata.identity_sha256);
+  rpmd_ja_covariance_checkpoint::AcceptedPoint first_resumed;
+  bool captured_first_resume_checkpoint=false;
+  const auto resume_sink=[&](const rpmd_ja_covariance_checkpoint::AcceptedPoint& point){
+    if(!captured_first_resume_checkpoint){first_resumed=point;captured_first_resume_checkpoint=true;}};
+  const CovarianceFitResult resumed=solve_covariance_reference(system,statistics,epsilon,0.0,2,nullptr,
+    false,false,true,false,{}, {},ridge,16,&baseline,&scales,&original_start,1.0,true,&budget,&limits,&restored,&metadata,resume_sink);
+  std::remove(path.c_str());
+  assert(captured_first_resume_checkpoint&&resumed.theta_start==original_start&&first_resumed.theta_start==original_start);
+  assert(first_resumed.theta==saved.theta&&first_resumed.stagnation_gradient_attempts==saved.stagnation_gradient_attempts&&
+    first_resumed.stagnation_low_progress_windows==saved.stagnation_low_progress_windows&&
+    first_resumed.stagnation_progress_attempts_in_window==saved.stagnation_progress_attempts_in_window&&
+    first_resumed.same_point_curvature_rejections==saved.same_point_curvature_rejections);
+  assert(resumed.start_metrics_point=="RESTORED_ACCEPTED_POINT");
+  std::uint64_t independent_evaluations=0;
+  const CovarianceObjectiveEvaluation independent=evaluate_covariance_fit_objective(system,first_resumed.theta,baseline,statistics,
+    0.0,epsilon,1.0,independent_evaluations,true,false,true,nullptr,nullptr,&scales,ridge);
+  check_close(resumed.start_objective,independent.objective,1e-12);
+  check_close(resumed.start_raw_gradient_inf_norm,covariance_norm_inf(independent.gradient),1e-12);
+  DeviceBaseline continuous_device;initialize_two_atom_covariance_baseline(continuous_device,true);
+  DeviceCovarianceSystem continuous_system(continuous_device,graph,sqrt_mass,masses);
+  rpmd_ja_feasibility::Budget continuous_budget;
+  const double continuous_now=covariance_budget_now_seconds();
+  assert(rpmd_ja_feasibility::begin(continuous_budget,limits,continuous_now)==rpmd_ja_feasibility::BudgetResult::OK);
+  assert(rpmd_ja_feasibility::enter_phase(continuous_budget,limits,rpmd_ja_feasibility::Phase::A0,continuous_now)==
+    rpmd_ja_feasibility::BudgetResult::OK);
+  const CovarianceFitResult continuous=solve_covariance_reference(continuous_system,statistics,epsilon,0.0,2,nullptr,
+    false,false,true,false,{}, {},ridge,16,&baseline,&scales,&original_start,1.0,true,&continuous_budget,&limits);
+  assert(resumed.theta.size()==continuous.theta.size());
+  for(std::size_t parameter=0;parameter<resumed.theta.size();++parameter)
+    check_close(resumed.theta[parameter],continuous.theta[parameter],1e-9);
 }
 
 void test_covariance_inverse_bfgs_spectrum_statuses()
@@ -1739,6 +2559,678 @@ void test_covariance_trust_region_subproblem_and_barrier_cache()
   assert(covariance_barrier_stage_pass(current,5e-3,1.0,1e-8,true));
   assert(covariance_barrier_stage_pass(current,5e-7,1e-12,1e-8,true));
   current.feasible=false;assert(!covariance_barrier_stage_pass(current,0.0,1.0,1e-8,true));
+}
+
+void test_covariance_direct_hessian_preconditioner(cusolverDnHandle_t solver)
+{
+  const CovarianceTrustRegionModel diagonal=covariance_direct_hessian_trust_region_model(solver,{2.0,0.0,0.0,8.0},2);
+  assert(diagonal.positive_definite&&diagonal.clipped_eigenvalues==0);
+  const CovarianceTrustRegionStep exact=covariance_trust_region_subproblem(diagonal,{2.0,8.0},10.0);
+  assert(exact.lambda==0.0);check_close(exact.step[0],-1.0,1e-14);check_close(exact.step[1],-1.0,1e-14);
+
+  constexpr double ridge=0.01,dominant=1e18;
+  const std::vector<double> near_rank_one={dominant+ridge,dominant,dominant,dominant+ridge};
+  const CovarianceTrustRegionModel regularized=covariance_direct_hessian_trust_region_model(solver,near_rank_one,2);
+  assert(regularized.positive_definite&&regularized.clipped_eigenvalues==1&&regularized.spectral_floor>0.0);
+  assert(regularized.status=="MODEL_REGULARIZED_SOFT_EIGENVALUES");
+  const CovarianceTrustRegionStep step=covariance_trust_region_subproblem(regularized,{1.0,-1.0},1.0);
+  assert(std::isfinite(step.norm)&&step.norm<=1.0&&std::all_of(step.step.begin(),step.step.end(),[](double value){return std::isfinite(value);}));
+
+  CovarianceTrustRegionModel cancellation;cancellation.positive_definite=true;cancellation.eigenvalues={1.0,1.0};
+  cancellation.eigenvectors={1.0,0.0,0.0,1.0};cancellation.coordinate_transform={1.0,1.0};
+  cancellation.hessian_matrix={1e16,1e16,1e16,1e16};
+  const double cancellation_resolution=covariance_trust_region_prediction_resolution(cancellation,{0.0,0.0},{1.0,-1.0});
+  assert(cancellation_resolution>100.0);
+}
+
+void test_covariance_centered_ridge_objective_and_tau_cache()
+{
+  constexpr double epsilon=0.01,ridge=0.7;DeviceBaseline device;initialize_two_atom_covariance_baseline(device,true);
+  const Graph graph=make_two_atom_covariance_graph();const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  DeviceCovarianceSystem system(device,graph,sqrt_mass,masses);const std::vector<double> statistics={1,0,0,1,0,1};
+  std::uint64_t evaluations=0;const CovarianceBaseline baseline=build_graph_covariance_baseline(system,statistics,epsilon,evaluations);
+  const std::vector<double> scale=system.coordinate_scales(baseline.theta,epsilon);
+  CovarianceObjectiveEvaluation at_center=evaluate_covariance_fit_objective(system,baseline.theta,baseline,statistics,0.0,
+    epsilon,1.0,evaluations,true,false,true,nullptr,nullptr,&scale,ridge);
+  assert(at_center.feasible&&at_center.ridge==0.0&&std::all_of(at_center.cached_ridge_coordinates.begin(),
+    at_center.cached_ridge_coordinates.end(),[](double value){return value==0.0;}));
+  assert(std::all_of(at_center.gradient_ridge.begin(),at_center.gradient_ridge.end(),[](double value){return value==0.0;}));
+  const std::vector<double> direction=graph_laplacian_direction(graph,system.p);std::vector<double> trial=baseline.theta;
+  for(std::size_t i=0;i<trial.size();++i)trial[i]+=1e-3*scale[i]*direction[i];
+  CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(system,trial,baseline,statistics,0.0,
+    epsilon,1.0,evaluations,true,false,true,nullptr,nullptr,&scale,ridge);
+  assert(value.feasible);double z2=0.0;
+  for(std::size_t i=0;i<trial.size();++i){const double z=(trial[i]-baseline.theta[i])/scale[i];z2+=z*z;
+    check_close(value.gradient_ridge[i],ridge*(trial[i]-baseline.theta[i])/(scale[i]*scale[i]),1e-12);}
+  check_close(value.ridge,0.5*ridge*z2,1e-12);
+  const double ridge_before=value.ridge;covariance_recompose_objective_for_tau(value,trial,baseline,statistics,0.0,epsilon,0.25,scale,ridge);
+  check_close(value.ridge,ridge_before,1e-14);check_close(value.objective,value.data+value.prior+value.ridge+value.barrier,1e-13);
+  const CovarianceObjectiveEvaluation fresh=evaluate_covariance_fit_objective(system,trial,baseline,statistics,0.0,
+    epsilon,0.25,evaluations,true,false,true,nullptr,nullptr,&scale,ridge);
+  check_close(value.objective,fresh.objective,1e-12);check_close(value.ridge,fresh.ridge,1e-14);
+  for(std::size_t i=0;i<trial.size();++i)check_close(value.gradient[i],fresh.gradient[i],1e-12);
+}
+
+void test_covariance_original_residual_gates_convergence()
+{
+  constexpr double epsilon=0.01;const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  DeviceBaseline device;initialize_two_atom_covariance_baseline(device,true);DeviceCovarianceSystem system(device,graph,sqrt_mass,masses);
+  CovarianceBaseline baseline;baseline.theta.assign(6,0.0);baseline.epsilon=epsilon;baseline.mu=0.0;
+  std::vector<double> shifted_trace;assert(system.evaluate_factors(baseline.theta,epsilon,baseline.logdet,baseline.shifted_logdet,
+    &baseline.trace,&shifted_trace));
+  const std::vector<double> scale=system.coordinate_scales(baseline.theta,epsilon);std::vector<double> statistics(6);
+  for(std::size_t i=0;i<statistics.size();++i)statistics[i]=baseline.trace[i]+2.0*shifted_trace[i];
+  std::ostringstream trace;const CovarianceFitResult fit=solve_covariance_reference(system,statistics,epsilon,0.0,1,&trace,
+    false,false,false,false,{}, {},0.7,0,&baseline,&scale,&baseline.theta,1.0,true,nullptr,nullptr);
+  assert(fit.converged&&fit.status=="COVARIANCE_FIXED_TAU_CONVERGED");
+  assert(fit.original_residual_initial_pass&&fit.original_residual_final_pass);
+  assert(fit.original_residual_initial_status=="PASS"&&fit.original_residual_final_status=="PASS");
+  assert(fit.original_residual_gradient_attempts==2&&fit.full_gradient_evaluations==2);
+  assert(fit.run_trace_residual_summary.original_any_checked&&fit.run_trace_residual_summary.original_batches_checked>0);
+  assert(trace.str().find("trace_residual_original_any_checked=1")!=std::string::npos);
+
+  const std::string path="rpmd_ja_native_original_residual_state_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";RemoveTestFile cleanup{path};
+  RpmdJANativeFitOptions options;options.cutoff=5.0;options.epsilon=epsilon;options.fd_step=1e-4;options.sample_interval=1;
+  SampleHeader header{};header.temperature=300.0;header.beads=4;QrawIdentity identity{};
+  write_covariance_state(path,fit,0.0,"test.samples","test.qraw",options,header,identity,graph,2,2);
+  std::ifstream state_file(path);const auto fields=read_covariance_state_fields(state_file);
+  assert(fields.at("original_residual_initial_status")=="PASS"&&fields.at("original_residual_final_status")=="PASS");
+  assert(fields.at("original_residual_initial_pass")=="1"&&fields.at("original_residual_final_pass")=="1");
+  assert(fields.at("original_residual_gradient_attempts")=="2");
+  assert(fields.at("run_trace_residual_original_any_checked")=="1");
+
+  rpmd_ja_feasibility::Budget limited_budget;rpmd_ja_feasibility::Limits limited_limits;limited_limits.max_exact_gradients=1;
+  const double budget_start=covariance_budget_now_seconds();
+  assert(rpmd_ja_feasibility::begin(limited_budget,limited_limits,budget_start)==rpmd_ja_feasibility::BudgetResult::OK);
+  assert(rpmd_ja_feasibility::enter_phase(limited_budget,limited_limits,rpmd_ja_feasibility::Phase::A0,budget_start)==
+    rpmd_ja_feasibility::BudgetResult::OK);
+  const CovarianceFitResult budget_limited=solve_covariance_reference(system,statistics,epsilon,0.0,1,nullptr,
+    false,false,false,false,{}, {},0.7,0,&baseline,&scale,&baseline.theta,1.0,true,&limited_budget,&limited_limits);
+  assert(!budget_limited.converged&&budget_limited.status=="FEASIBILITY_BUDGET_GRADIENT_LIMIT");
+  assert(budget_limited.original_residual_initial_pass&&!budget_limited.original_residual_final_pass);
+  assert(budget_limited.original_residual_final_status=="BUDGET_LIMIT");
+  assert(budget_limited.original_residual_gradient_attempts==1&&limited_budget.exact_gradients==1);
+}
+
+void test_feasibility_same_file_path_aliases()
+{
+  const std::string path="rpmd_ja_same_file_identity_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".tmp";
+  const std::string copy=path+".copy";RemoveTestFile clean_path{path},clean_copy{copy};
+  {std::ofstream out(path,std::ios::binary);assert(out.good());out<<"same file identity";assert(out.good());}
+  {std::ifstream in(path,std::ios::binary);std::ofstream out(copy,std::ios::binary);assert(in.good()&&out.good());out<<in.rdbuf();assert(out.good());}
+  assert(feasibility_same_file_path(path,"./"+path));
+  assert(!feasibility_same_file_path(path,copy));
+  const std::string utf8_path="rpmd_ja_\xE4\xB8\xAD\xE6\x96\x87_file_identity_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".tmp";
+  RemoveTestFile clean_utf8{utf8_path};
+  {rpmd_ja_file_io::ofstream out(utf8_path,std::ios::binary);assert(out.good());out<<"UTF-8 path identity";assert(out.good());}
+  assert(feasibility_same_file_path(utf8_path,"./"+utf8_path));
+}
+
+void test_covariance_prior_calibration_ignores_m1_tail()
+{
+  const double nan=std::numeric_limits<double>::quiet_NaN();
+  const std::vector<double> statistics={1,0,0,1,0,1,-7,nan},baseline={1,0,0,1,0,1,nan,-9};
+  const std::vector<std::vector<double>> blocks={{1,0,0,1,0,1,-5,nan}};
+  const std::vector<std::uint64_t> frames={3};
+  std::ostringstream contaminated,clean;
+  write_covariance_prior_calibration(contaminated,statistics,baseline,blocks,frames,6,0.0);
+  write_covariance_prior_calibration(clean,{1,0,0,1,0,1,0,0},{1,0,0,1,0,1,0,0},{{1,0,0,1,0,1,0,0}},frames,6,0.0);
+  assert(contaminated.str()==clean.str());
+  assert(contaminated.str().find("base_parameter_count=6 total_parameter_count=8 groups=1")!=std::string::npos);
+  assert(contaminated.str().find("parameter_count=2 status=NOT_APPLICABLE")!=std::string::npos);
+
+  bool m0_block_mismatch_rejected=false;
+  try{std::ostringstream output;write_covariance_prior_calibration(output,{1,0,0,1,0,1},{1,0,0,1,0,1},{{1,0,0,1,0}},frames,6,0.0);}
+  catch(const std::invalid_argument&){m0_block_mismatch_rejected=true;}
+  assert(m0_block_mismatch_rejected);
+}
+
+void test_budget_observation_classifies_hard_clock_errors()
+{
+  using rpmd_ja_feasibility::BudgetResult;
+  covariance_require_expected_budget_observation(BudgetResult::OK,"test");
+  covariance_require_expected_budget_observation(BudgetResult::FAMILY_WALL_LIMIT,"test");
+  for(const BudgetResult result:{BudgetResult::INVALID_CLOCK,BudgetResult::CLOCK_BACKWARDS,
+      BudgetResult::NOT_STARTED,BudgetResult::INVALID_LIMITS}){
+    bool rejected=false;try{covariance_require_expected_budget_observation(result,"test");}
+    catch(const std::runtime_error&){rejected=true;}assert(rejected);
+  }
+}
+
+void test_covariance_solve_write_diagnose_replay_without_ridge()
+{
+  const std::string spool_path=write_covariance_replay_spool(".samples"),raw_path=spool_path+".qraw";
+  const std::string state_path=spool_path+".covariance_state",report_path=spool_path+".diagnostic";
+  RemoveTestFile clean_spool{spool_path},clean_raw{raw_path},clean_state{state_path},clean_report{report_path};
+  Atom atom;atom.number_of_atoms=2;atom.cpu_mass={1.0,2.0};atom.cpu_type={0,1};atom.number_of_beads=0;atom.position_per_atom.resize(6);
+  Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;Force force;
+  std::ifstream spool(spool_path,std::ios::binary);assert(spool.good());
+  const SampleHeader header=read_header(spool,0,atom,box,0.0,true,true);std::vector<double> r0(6);
+  const double interval=read_training_r0(spool,header,header.frame_count,std::numeric_limits<double>::quiet_NaN(),r0);
+  const int n=header.n,d=3*n;Graph graph=make_graph(r0,header.types,box,5.0);
+  double raw_cell[18];std::copy(box.cpu_h,box.cpu_h+18,raw_cell);const int pbc[3]={1,1,1};
+  const std::int32_t raw_types[2]={0,1};const double raw_masses[2]={1.0,2.0};
+  const char qraw_magic[8]={'G','P','J','Q','R','A','W','\0'};
+  const char layout[]="xyz_soa;derivative_input_rows_output_columns";
+  const std::uint32_t raw_version=3;const std::uint64_t model=0,config=0;const std::int32_t charge=1,kspace=1;
+  const double fd_step=1e-4,mesh=0.5,energy=0.0;std::vector<double> site_energy(n,0.0),raw_force(d,0.0),virial(9*n,0.0);
+  std::vector<double> v(static_cast<std::size_t>(d)*n,0.0),c(static_cast<std::size_t>(3)*d*d,0.0),k(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<d;++i)k[static_cast<std::size_t>(i)*d+i]=1.0;
+  double raw_stats[18]={};raw_stats[16]=fd_step;raw_stats[17]=3.0;
+  {std::ofstream raw(raw_path,std::ios::binary);assert(raw.good());raw.write(qraw_magic,sizeof(qraw_magic));
+    write(raw,raw_version);write(raw,native_endian);write(raw,std::int32_t(n));write(raw,std::int32_t(d));
+    write(raw,header.temperature);write(raw,fd_step);write(raw,model);write(raw,config);write(raw,charge);write(raw,kspace);write(raw,mesh);
+    raw.write(layout,sizeof(layout));raw.write(reinterpret_cast<const char*>(raw_cell),sizeof(raw_cell));raw.write(reinterpret_cast<const char*>(pbc),sizeof(pbc));
+    raw.write(reinterpret_cast<const char*>(raw_types),sizeof(raw_types));raw.write(reinterpret_cast<const char*>(raw_masses),sizeof(raw_masses));
+    raw.write(reinterpret_cast<const char*>(r0.data()),static_cast<std::streamsize>(r0.size()*sizeof(double)));
+    write(raw,energy);raw.write(reinterpret_cast<const char*>(site_energy.data()),static_cast<std::streamsize>(site_energy.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(raw_force.data()),static_cast<std::streamsize>(raw_force.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(virial.data()),static_cast<std::streamsize>(virial.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(v.data()),static_cast<std::streamsize>(v.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(c.data()),static_cast<std::streamsize>(c.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(k.data()),static_cast<std::streamsize>(k.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(v.data()),static_cast<std::streamsize>(v.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(c.data()),static_cast<std::streamsize>(c.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(raw_stats),sizeof(raw_stats));assert(raw.good());}
+  RpmdJANativeFitOptions options;options.temperature=header.temperature;options.cutoff=5.0;options.epsilon=0.01;
+  options.fd_step=fd_step;options.sample_interval=static_cast<int>(interval);options.covariance_ridge_lambda=0.0;
+  covariance_fit_test_allow_qraw_fixture_identity=true;
+  struct ResetFixtureIdentity{~ResetFixtureIdentity(){covariance_fit_test_allow_qraw_fixture_identity=false;}} reset_fixture_identity;
+  std::ifstream raw(raw_path,std::ios::binary);const QrawIdentity identity=validate_qraw_identity(raw,options,header,r0,box,force);
+  std::vector<double> sqrt_mass={1.0,std::sqrt(2.0),1.0,std::sqrt(2.0),1.0,std::sqrt(2.0)};
+  DeviceBaseline baseline_device;baseline_device.initialize(raw,identity.k_offset,d,n,header.masses,sqrt_mass);raw.close();
+  DeviceCovarianceSystem system(baseline_device,graph,sqrt_mass,header.masses);
+  std::vector<double> edge_statistics;const std::vector<double> statistics=collect_covariance_fit_statistics(
+    spool,header,header.frame_count,2,graph,r0,header.temperature,&edge_statistics);
+  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,options.epsilon,0.1,1,nullptr);
+  write_covariance_state(state_path,fit,0.1,spool_path,raw_path,options,header,identity,graph,header.frame_count,2);
+  {std::ifstream saved(state_path);const auto fields=read_covariance_state_fields(saved);
+    assert(fields.at("target_objective")=="COVARIANCE_SHRINKAGE"&&fields.at("ridge_coordinates")=="0");}
+  diagnose_rpmd_ja_native_covariance(state_path,report_path,options.cutoff,options.epsilon,fit.barrier_tau,
+    options.fd_step,false,atom,box,force);
+  const std::string report=read_test_file(report_path);
+  assert(report.find("state_replay_status PASS")!=std::string::npos);
+  const std::string wrong_state_path=state_path+".wrong",wrong_report_path=report_path+".wrong";
+  RemoveTestFile clean_wrong_state{wrong_state_path},clean_wrong_report{wrong_report_path};
+  std::string wrong_state=read_test_file(state_path);const std::string objective="target_objective COVARIANCE_SHRINKAGE";
+  const std::size_t objective_at=wrong_state.find(objective);assert(objective_at!=std::string::npos);
+  wrong_state.replace(objective_at,objective.size(),"target_objective FROZEN_CENTER_RIDGE");
+  {std::ofstream out(wrong_state_path);out<<wrong_state;assert(out.good());}
+  std::string mismatch_error;try{diagnose_rpmd_ja_native_covariance(wrong_state_path,wrong_report_path,options.cutoff,
+      options.epsilon,fit.barrier_tau,options.fd_step,false,atom,box,force);}
+    catch(const std::runtime_error& error){mismatch_error=error.what();}
+  assert(mismatch_error.find("target_objective disagrees with rho/ridge_lambda")!=std::string::npos);
+
+  assert(fit.converged);
+  const std::string package_path=state_path+".a0_reuse.package";RemoveTestFile clean_package{package_path};
+  const std::string manifest_bytes="RPJAFEAS9\ntraining_sha256 \""+std::string(64,'a')+"\"\n";
+  const std::map<std::string,std::string> manifest_fields={{"training_sha256",std::string(64,'a')}};
+  const std::string source_machine(64,'e'),source_job="native-a0-export-test",state_bytes=read_test_file(state_path);
+  const auto record=rpmd_ja_a0_reuse::make_export_record(manifest_bytes,manifest_fields,state_bytes,
+    source_machine,source_job,fit.optimizer_seconds,fit.optimizer_seconds,true,true,false);
+  rpmd_ja_a0_reuse::write_package_atomic(package_path,manifest_bytes,state_bytes,record);
+  const auto exported=rpmd_ja_a0_reuse::parse_package(read_test_file(package_path));
+  verify_imported_a0_parameter_map(exported.state_bytes,graph);
+  auto restore_imported=[&](const std::string& bytes){std::istringstream state(bytes);
+    return restore_covariance_fit_state(state,"native exported A0 package",statistics,
+      std::vector<std::vector<double>>{},std::vector<std::uint64_t>{},options.epsilon,0.1,0.0,"M0",spool_path,raw_path);};
+  auto imported=restore_imported(exported.state_bytes);
+  rebuild_restored_a0_baseline(imported,baseline_device,graph,sqrt_mass,header.masses,nullptr,options.epsilon,nullptr,nullptr,nullptr,true);
+  verify_imported_a0_fit(imported,baseline_device,graph,sqrt_mass,header.masses,statistics,0.1,options.epsilon,
+    nullptr,nullptr,nullptr,nullptr);
+
+  auto replace_vector_first=[](std::string bytes,const std::string& key,const double delta){
+    const std::string prefix=key+" ";const std::size_t begin=bytes.find(prefix);assert(begin!=std::string::npos);
+    const std::size_t end=bytes.find('\n',begin);assert(end!=std::string::npos);
+    std::istringstream row(bytes.substr(begin+prefix.size(),end-begin-prefix.size()));std::size_t count=0;
+    assert(static_cast<bool>(row>>count)&&count>0);std::vector<double> values(count);
+    for(double& value:values)assert(static_cast<bool>(row>>value));values[0]+=delta;
+    std::ostringstream replacement;replacement<<key<<' '<<count<<std::setprecision(17);
+    for(const double value:values)replacement<<' '<<value;
+    bytes.replace(begin,end-begin,replacement.str());return bytes;};
+  auto replace_scalar=[](std::string bytes,const std::string& key,const std::string& value){
+    const std::string prefix="\n"+key+" ";const std::size_t begin=bytes.find(prefix);assert(begin!=std::string::npos);
+    const std::size_t end=bytes.find('\n',begin+1);assert(end!=std::string::npos);
+    bytes.replace(begin+1,end-begin-1,key+" "+value);return bytes;};
+  auto reject_rewrapped=[&](const std::string& bad_state,const char* expected){
+    const auto bad_record=rpmd_ja_a0_reuse::make_export_record(manifest_bytes,manifest_fields,bad_state,source_machine,
+      source_job,fit.optimizer_seconds,fit.optimizer_seconds,true,true,false);
+    const auto bad_package=rpmd_ja_a0_reuse::parse_package(rpmd_ja_a0_reuse::serialize_package(manifest_bytes,bad_state,bad_record));
+    bool rejected=false;try{auto bad=restore_imported(bad_package.state_bytes);
+      rebuild_restored_a0_baseline(bad,baseline_device,graph,sqrt_mass,header.masses,nullptr,options.epsilon,nullptr,nullptr,nullptr,true);
+      verify_imported_a0_fit(bad,baseline_device,graph,sqrt_mass,header.masses,statistics,0.1,options.epsilon,
+        nullptr,nullptr,nullptr,nullptr);}
+    catch(const std::runtime_error& error){rejected=std::string(error.what()).find(expected)!=std::string::npos;}
+    assert(rejected);};
+  reject_rewrapped(replace_vector_first(exported.state_bytes,"coordinate_scale",0.25),"coordinate scale");
+  std::string bad_parameter=replace_vector_first(exported.state_bytes,"theta",0.25);
+  bad_parameter=replace_vector_first(std::move(bad_parameter),"last_valid_theta",0.25);
+  reject_rewrapped(bad_parameter,"do not replay");
+  reject_rewrapped(replace_scalar(exported.state_bytes,"objective_data","999"),"objective components");
+  reject_rewrapped(replace_scalar(exported.state_bytes,"target_objective","FROZEN_CENTER_RIDGE"),"target_objective");
+}
+
+void test_m1_covariance_calibration_uses_only_base_prefix_in_replay()
+{
+  const std::string spool_path=write_covariance_replay_spool(".m1.samples",true),raw_path=spool_path+".qraw";
+  const std::string state_path=spool_path+".covariance_state",report_path=spool_path+".diagnostic";
+  RemoveTestFile clean_spool{spool_path},clean_raw{raw_path},clean_state{state_path},clean_report{report_path};
+  Atom atom;atom.number_of_atoms=3;atom.cpu_mass={16.0,1.0,16.0};atom.cpu_type={0,1,0};
+  atom.cpu_atom_symbol={"O","H","O"};atom.number_of_beads=0;atom.position_per_atom.resize(9);
+  Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;
+  assert(box.pbc_x==1&&box.pbc_y==1&&box.pbc_z==1);Force force;std::ifstream spool(spool_path,std::ios::binary);assert(spool.good());
+  const SampleHeader header=read_header(spool,0,atom,box,0.0,true,true);std::vector<double> r0(9);
+  const double interval=read_training_r0(spool,header,header.frame_count,std::numeric_limits<double>::quiet_NaN(),r0);
+  const int n=header.n,d=3*n;Graph graph=make_graph(r0,header.types,box,5.2);
+  const auto& metadata=build_m1_local_basis(graph,r0,header.types,atom.cpu_atom_symbol,header.masses,box,5.2,1);
+  assert(metadata.accepted_bridge_count==1&&graph.parameter_count%6!=0&&
+    graph.base_parameter_count%6==0&&graph.base_parameter_count<graph.parameter_count);
+  double raw_cell[18];std::copy(box.cpu_h,box.cpu_h+18,raw_cell);const int pbc[3]={1,1,1};
+  std::vector<std::int32_t> raw_types(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i)raw_types[i]=header.types[i];
+  const std::vector<double> raw_masses=header.masses;const char qraw_magic[8]={'G','P','J','Q','R','A','W','\0'};
+  const char layout[]="xyz_soa;derivative_input_rows_output_columns";const std::uint32_t raw_version=3;
+  const std::uint64_t model=0,config=0;const std::int32_t charge=1,kspace=1;
+  const double fd_step=1e-4,mesh=0.5,energy=0.0;
+  std::vector<double> site_energy(static_cast<std::size_t>(n),0.0),raw_force(static_cast<std::size_t>(d),0.0);
+  std::vector<double> virial(static_cast<std::size_t>(9)*n,0.0),v(static_cast<std::size_t>(d)*n,0.0);
+  std::vector<double> c(static_cast<std::size_t>(3)*d*d,0.0),k(static_cast<std::size_t>(d)*d,0.0);
+  for(int i=0;i<d;++i)k[static_cast<std::size_t>(i)*d+i]=1.0;
+  double raw_stats[18]={};raw_stats[16]=fd_step;raw_stats[17]=3.0;
+  {std::ofstream raw(raw_path,std::ios::binary);assert(raw.good());raw.write(qraw_magic,sizeof(qraw_magic));
+    write(raw,raw_version);write(raw,native_endian);write(raw,std::int32_t(n));write(raw,std::int32_t(d));
+    write(raw,header.temperature);write(raw,fd_step);write(raw,model);write(raw,config);write(raw,charge);write(raw,kspace);write(raw,mesh);
+    raw.write(layout,sizeof(layout));raw.write(reinterpret_cast<const char*>(raw_cell),sizeof(raw_cell));raw.write(reinterpret_cast<const char*>(pbc),sizeof(pbc));
+    raw.write(reinterpret_cast<const char*>(raw_types.data()),static_cast<std::streamsize>(raw_types.size()*sizeof(raw_types[0])));
+    raw.write(reinterpret_cast<const char*>(raw_masses.data()),static_cast<std::streamsize>(raw_masses.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(r0.data()),static_cast<std::streamsize>(r0.size()*sizeof(double)));
+    write(raw,energy);raw.write(reinterpret_cast<const char*>(site_energy.data()),static_cast<std::streamsize>(site_energy.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(raw_force.data()),static_cast<std::streamsize>(raw_force.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(virial.data()),static_cast<std::streamsize>(virial.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(v.data()),static_cast<std::streamsize>(v.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(c.data()),static_cast<std::streamsize>(c.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(k.data()),static_cast<std::streamsize>(k.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(v.data()),static_cast<std::streamsize>(v.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(c.data()),static_cast<std::streamsize>(c.size()*sizeof(double)));
+    raw.write(reinterpret_cast<const char*>(raw_stats),sizeof(raw_stats));assert(raw.good());}
+  RpmdJANativeFitOptions options;options.temperature=header.temperature;options.cutoff=5.2;options.epsilon=0.01;
+  options.fd_step=fd_step;options.sample_interval=static_cast<int>(interval);options.covariance_ridge_lambda=0.3;
+  covariance_fit_test_allow_qraw_fixture_identity=true;
+  struct ResetFixtureIdentity{~ResetFixtureIdentity(){covariance_fit_test_allow_qraw_fixture_identity=false;}} reset_fixture_identity;
+  std::ifstream raw(raw_path,std::ios::binary);const QrawIdentity identity=validate_qraw_identity(raw,options,header,r0,box,force);
+  std::vector<double> sqrt_mass(static_cast<std::size_t>(d));
+  for(int axis=0;axis<3;++axis)for(int atom_index=0;atom_index<n;++atom_index)
+    sqrt_mass[static_cast<std::size_t>(axis)*n+atom_index]=std::sqrt(header.masses[atom_index]);
+  DeviceBaseline baseline_device;baseline_device.initialize(raw,identity.k_offset,d,n,header.masses,sqrt_mass);raw.close();
+  DeviceCovarianceSystem system(baseline_device,graph,sqrt_mass,header.masses);
+  std::vector<double> edge_statistics;std::vector<std::vector<double>> training_block_statistics;
+  std::vector<std::uint64_t> training_block_frames;
+  const std::vector<double> statistics=collect_covariance_fit_statistics(spool,header,header.frame_count,2,graph,r0,
+    header.temperature,&edge_statistics,&training_block_statistics,&training_block_frames);
+  std::vector<double> theta_start(static_cast<std::size_t>(graph.parameter_count),0.0);
+  for(int parameter=graph.base_parameter_count;parameter<graph.parameter_count;++parameter)
+    theta_start[parameter]=0.01*(parameter-graph.base_parameter_count+1);
+  std::ostringstream solve_trace;
+  const CovarianceFitResult fit=solve_covariance_reference(system,statistics,options.epsilon,0.0,1,&solve_trace,
+    false,false,false,false,training_block_statistics,training_block_frames,options.covariance_ridge_lambda,0,
+    nullptr,nullptr,&theta_start,1.0,true);
+  const std::string added_status="COVARIANCE_PRIOR_M1_ADDED_DIRECTIONS parameter_count="+
+    std::to_string(graph.parameter_count-graph.base_parameter_count)+" status=NOT_APPLICABLE";
+  assert(solve_trace.str().find(added_status)!=std::string::npos);
+  assert(solve_trace.str().find("selection=USER_SUPPLIED_RHO")!=std::string::npos);
+  assert(solve_trace.str().find("base_parameter_count="+std::to_string(graph.base_parameter_count)+
+    " total_parameter_count="+std::to_string(graph.parameter_count)+" groups="+
+    std::to_string(graph.base_parameter_count/6))!=std::string::npos);
+  write_covariance_state(state_path,fit,0.0,spool_path,raw_path,options,header,identity,graph,header.frame_count,2);
+  {std::ifstream saved(state_path);const auto fields=read_covariance_state_fields(saved);
+    assert(fields.at("parameter_family")=="M1"&&std::stoull(fields.at("parameter_count"))==graph.parameter_count);
+    assert(fields.at("target_objective")=="FROZEN_CENTER_RIDGE"&&std::stod(fields.at("ridge_lambda"))==options.covariance_ridge_lambda);
+    std::istringstream theta_row(fields.at("last_valid_theta"));std::size_t count=0;assert(theta_row>>count);
+    std::vector<double> saved_theta(count);for(double& value:saved_theta)assert(theta_row>>value);
+    assert(count==static_cast<std::size_t>(graph.parameter_count));
+    assert(std::any_of(saved_theta.begin()+graph.base_parameter_count,saved_theta.end(),[](double value){return value!=0.0;}));}
+  diagnose_rpmd_ja_native_covariance(state_path,report_path,options.cutoff,options.epsilon,fit.barrier_tau,
+    options.fd_step,false,atom,box,force);
+  const std::string report=read_test_file(report_path);
+  assert(report.find("state_replay_status PASS")!=std::string::npos);
+  assert(report.find(added_status)!=std::string::npos);
+  assert(report.find("base_parameter_count="+std::to_string(graph.base_parameter_count)+
+    " total_parameter_count="+std::to_string(graph.parameter_count)+" groups="+
+    std::to_string(graph.base_parameter_count/6))!=std::string::npos);
+
+  const std::string cg_witness=state_path+".cg",cg_report=state_path+".cg_report";
+  RemoveTestFile clean_cg_witness{cg_witness},clean_cg_report{cg_report};
+  CGWitness witness;witness.classification="TRUE_RESIDUAL_FAILURE";witness.probe=2;witness.iteration=3;
+  witness.true_residual_computed=true;witness.finite=true;witness.relative_residual=1.0;
+  witness.rhs_input.resize(static_cast<std::size_t>(d));witness.solution.resize(static_cast<std::size_t>(d));
+  for(int i=0;i<d;++i){witness.rhs_input[i]=0.03*(i+1);witness.solution[i]=0.02*(i+1);}
+  std::vector<double> sqrt_atom(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i)sqrt_atom[i]=std::sqrt(header.masses[i]);
+  witness.rhs=witness.rhs_input;project_translation(witness.rhs,sqrt_atom,n);
+  project_translation(witness.solution,sqrt_atom,n);
+  std::vector<double> witness_theta(static_cast<std::size_t>(graph.parameter_count),0.0);
+  witness_theta.back()=0.2;
+  RpmdJANativeFitOptions cg_options=options;cg_options.internal_mass_com=false;
+  const CGReplayContext cg_replay{cg_options,header.frame_count,identity.model,identity.config,identity.model,
+    identity.config,identity.charge,identity.kspace,identity.mesh,identity.active_mesh};
+  write_cg_witness(cg_witness,witness,witness_theta,raw_path,spool_path,cg_replay,&graph);
+  const CGWitnessSnapshot saved_witness=read_cg_witness(cg_witness,d,0);
+  assert(saved_witness.witness_format_version==2&&saved_witness.parameter_family=="M1");
+  assert(saved_witness.parameter_count==graph.parameter_count&&saved_witness.m1_minimum_support_count==1);
+  const std::string cg_sidecar=saved_witness.m1_basis_sidecar;RemoveTestFile clean_cg_sidecar{cg_sidecar};
+  replay_rpmd_ja_native_cg(cg_witness,cg_report,false,atom,box,force);
+  const std::string cg_report_text=read_test_file(cg_report);
+  assert(cg_report_text.find("parameter_family M1")!=std::string::npos);
+  assert(cg_report_text.find("M1_basis_replay_status PASS")!=std::string::npos);
+  assert(cg_report_text.find("fast_true_relative_residual ")!=std::string::npos&&
+    cg_report_text.find("compensated_true_relative_residual ")!=std::string::npos);
+  std::string basis_snapshot=read_test_file(cg_sidecar);assert(!basis_snapshot.empty());
+  basis_snapshot[0]=basis_snapshot[0]=='#'?'!':'#';
+  {std::ofstream out(cg_sidecar,std::ios::binary|std::ios::trunc);out.write(basis_snapshot.data(),basis_snapshot.size());assert(out.good());}
+  const std::string tampered_report=cg_report+".tampered";RemoveTestFile clean_tampered_report{tampered_report};
+  bool tamper_rejected=false;try{replay_rpmd_ja_native_cg(cg_witness,tampered_report,false,atom,box,force);}
+  catch(const std::runtime_error& error){tamper_rejected=std::string(error.what()).find("M1 basis snapshot")!=std::string::npos;}
+  std::ifstream tampered_output(tampered_report,std::ios::binary);
+  assert(tamper_rejected&&!tampered_output.good());
+}
+
+void test_covariance_analytic_curvature_whitened_gram()
+{
+  constexpr int n=2,d=6,r=3,p=6,probes=16;const double epsilon=0.01;
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
+  const Graph graph=make_two_atom_covariance_graph();
+  std::vector<double> householder;
+  {DeviceCovarianceSystem geometry(baseline,graph,sqrt_mass,masses);householder=geometry.householder_host;}
+  std::vector<int> compact_full;for(int full=0;full<d;++full)if(full!=0&&full!=n&&full!=2*n)compact_full.push_back(full);
+  assert(static_cast<int>(compact_full.size())==r);
+  std::vector<double> q(static_cast<std::size_t>(d)*r,0.0);
+  for(int column=0;column<r;++column){const int full=compact_full[column],axis=full/n;
+    for(int row=0;row<d;++row)q[static_cast<std::size_t>(column)*d+row]=
+      (row==full?1.0:0.0)-2.0*householder[static_cast<std::size_t>(axis)*d+row]*
+      householder[static_cast<std::size_t>(axis)*d+full];}
+
+  const std::vector<double> d0={0.015,0.002,0.0,0.002,0.04,0.005,0.0,0.005,0.08};
+  std::vector<double> full_d(static_cast<std::size_t>(d)*d,0.0);
+  for(int row=0;row<d;++row)for(int column=0;column<d;++column)for(int a=0;a<r;++a)for(int b=0;b<r;++b)
+    full_d[static_cast<std::size_t>(row)*d+column]+=q[static_cast<std::size_t>(a)*d+row]*
+      d0[static_cast<std::size_t>(a)*r+b]*q[static_cast<std::size_t>(b)*d+column];
+  assert(cudaMemcpy(baseline.k,full_d.data(),full_d.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const std::vector<double> theta(p,0.0),scale={0.7,0.8,0.9,1.1,1.2,1.3};
+  CovarianceBaseline reference;reference.theta=theta;reference.epsilon=epsilon;
+  double logdet=0.0,shifted_logdet=0.0;assert(system.evaluate_factors(theta,epsilon,logdet,shifted_logdet,&reference.trace));
+  reference.logdet=logdet;reference.shifted_logdet=shifted_logdet;
+
+  std::vector<double> omega(static_cast<std::size_t>(r)*128);
+  for(int row=0;row<r;++row)for(int column=0;column<128;++column){
+    const unsigned parity=static_cast<unsigned>(row&column);int bits=0;for(unsigned x=parity;x;x>>=1)bits+=static_cast<int>(x&1U);
+    omega[static_cast<std::size_t>(column)*r+row]=(bits&1)?-1.0:1.0;}
+  const int aa[p]={0,0,0,1,1,2},bb[p]={0,1,2,1,2,2};std::vector<std::vector<double>> a_compact(p,std::vector<double>(r*r,0.0));
+  const double signs[2]={-1.0,1.0};const int atoms[2]={0,1};
+  for(int parameter=0;parameter<p;++parameter){std::vector<double> ambient(static_cast<std::size_t>(d)*d,0.0);
+    for(int u=0;u<2;++u)for(int v=0;v<2;++v){const double coefficient=signs[u]*signs[v]/
+        (sqrt_mass[aa[parameter]*n+atoms[u]]*sqrt_mass[bb[parameter]*n+atoms[v]]);
+      const int row=aa[parameter]*n+atoms[u],column=bb[parameter]*n+atoms[v];
+      ambient[static_cast<std::size_t>(row)*d+column]+=coefficient;
+      if(aa[parameter]!=bb[parameter])ambient[static_cast<std::size_t>(column)*d+row]+=coefficient;}
+    for(int i=0;i<r;++i)for(int j=0;j<r;++j)for(int row=0;row<d;++row)for(int column=0;column<d;++column)
+      a_compact[parameter][static_cast<std::size_t>(i)*r+j]+=q[static_cast<std::size_t>(i)*d+row]*
+        ambient[static_cast<std::size_t>(row)*d+column]*q[static_cast<std::size_t>(j)*d+column];}
+  auto multiply=[](const std::vector<double>& left,const std::vector<double>& right,const int size){
+    std::vector<double> out(static_cast<std::size_t>(size)*size,0.0);
+    for(int i=0;i<size;++i)for(int j=0;j<size;++j)for(int k=0;k<size;++k)
+      out[static_cast<std::size_t>(i)*size+j]+=left[static_cast<std::size_t>(i)*size+k]*right[static_cast<std::size_t>(k)*size+j];return out;};
+  auto inverse=[](const std::vector<double>& matrix,const int size){std::vector<double> a(static_cast<std::size_t>(size)*(2*size),0.0);
+    for(int i=0;i<size;++i){for(int j=0;j<size;++j)a[static_cast<std::size_t>(i)*(2*size)+j]=matrix[static_cast<std::size_t>(i)*size+j];
+      a[static_cast<std::size_t>(i)*(2*size)+size+i]=1.0;}
+    for(int k=0;k<size;++k){const double pivot=a[static_cast<std::size_t>(k)*(2*size)+k];assert(pivot>0.0);
+      for(int j=0;j<2*size;++j)a[static_cast<std::size_t>(k)*(2*size)+j]/=pivot;
+      for(int i=0;i<size;++i)if(i!=k){const double factor=a[static_cast<std::size_t>(i)*(2*size)+k];
+        for(int j=0;j<2*size;++j)a[static_cast<std::size_t>(i)*(2*size)+j]-=factor*a[static_cast<std::size_t>(k)*(2*size)+j];}}
+    std::vector<double> out(static_cast<std::size_t>(size)*size);for(int i=0;i<size;++i)for(int j=0;j<size;++j)
+      out[static_cast<std::size_t>(i)*size+j]=a[static_cast<std::size_t>(i)*(2*size)+size+j];return out;};
+  auto gram=[](const std::vector<double>& inv,const std::vector<double>& left,const std::vector<double>& right,const int size){
+    auto product=[](const std::vector<double>& a,const std::vector<double>& b,const int m){std::vector<double> c(static_cast<std::size_t>(m)*m,0.0);
+      for(int i=0;i<m;++i)for(int j=0;j<m;++j)for(int k=0;k<m;++k)c[static_cast<std::size_t>(i)*m+j]+=a[static_cast<std::size_t>(i)*m+k]*b[static_cast<std::size_t>(k)*m+j];return c;};
+    const auto x=product(product(product(inv,left,size),inv,size),right,size);double trace=0.0;
+    for(int i=0;i<size;++i)trace+=x[static_cast<std::size_t>(i)*size+i];return trace;};
+  const std::vector<double> shifted_d={d0[0]-epsilon,d0[1],d0[2],d0[3],d0[4]-epsilon,d0[5],d0[6],d0[7],d0[8]-epsilon};
+  const auto inv_d=inverse(d0,r),inv_q=inverse(shifted_d,r);
+  const auto d_a=multiply(d0,a_compact[1],r),a_d=multiply(a_compact[1],d0,r);double commutator=0.0;
+  for(std::size_t i=0;i<d_a.size();++i)commutator=std::hypot(commutator,d_a[i]-a_d[i]);
+  assert(commutator>1e-4);
+  std::uint64_t rhs_columns=0;const CovarianceAnalyticCurvatureCache cache=covariance_build_stable_analytic_curvature_cache(
+    system,theta,epsilon,scale,probes,0.1,1.0,0.017,std::vector<double>{1,2,3,4,5,6},1.0,rhs_columns,nullptr,nullptr,&omega);
+  assert(cache.valid&&cache.probes==32&&cache.levels_built==2&&cache.stability_status=="STABLE_10_PERCENT_ENGINEERING_ONLY");
+  assert(cache.rhs_columns==rhs_columns&&rhs_columns==2ULL*(1+p)*(16+32));
+  assert(cache.relative_matrix_change<=0.1&&cache.relative_step_change<=0.1);
+  const CovarianceAnalyticCurvatureCache upgraded=covariance_build_stable_analytic_curvature_cache(
+    system,theta,epsilon,scale,64,0.1,1.0,0.017,std::vector<double>{1,2,3,4,5,6},0.5,rhs_columns,nullptr,nullptr,&omega,&cache);
+  assert(upgraded.valid&&upgraded.probes==64&&upgraded.levels_built==1);
+  assert(upgraded.stability_status=="STABLE_10_PERCENT_ENGINEERING_ONLY"&&upgraded.relative_matrix_change<=0.1&&upgraded.relative_step_change<=0.1);
+  assert(upgraded.rhs_columns==rhs_columns&&rhs_columns-cache.rhs_columns==2ULL*(1+p)*64);
+  std::vector<double> next_theta=theta;next_theta[0]=1e-4;const std::uint64_t before_inherited=rhs_columns;
+  const CovarianceAnalyticCurvatureCache inherited=covariance_build_analytic_curvature_cache(
+    system,next_theta,epsilon,scale,upgraded.probes,rhs_columns);
+  assert(inherited.valid&&inherited.probes==64&&inherited.levels_built==1);
+  assert(rhs_columns-before_inherited==2ULL*(1+p)*64);
+  constexpr double rho=0.1,tau=1.0,ridge=0.017;
+  const std::vector<double> actual=covariance_analytic_curvature_hessian(cache,p,rho,tau,ridge);
+  std::vector<double> expected(static_cast<std::size_t>(p)*p);
+  for(int i=0;i<p;++i)for(int j=0;j<p;++j){const double gd=gram(inv_d,a_compact[i],a_compact[j],r);
+    const double gq=gram(inv_q,a_compact[i],a_compact[j],r);
+    expected[static_cast<std::size_t>(i)*p+j]=scale[i]*scale[j]*(0.5*(1.0+rho)*gd+tau*gq)+(i==j?ridge:0.0);}
+  for(std::size_t i=0;i<expected.size();++i)check_close(actual[i],expected[i],2e-8);
+
+  std::uint64_t independent_rhs=0;
+  const CovarianceAnalyticCurvatureCache independent_primary=covariance_build_stable_analytic_curvature_cache(
+    system,theta,epsilon,scale,16,0.1,1.0,0.017,std::vector<double>{1,2,3,4,5,6},1.0,independent_rhs);
+  assert(independent_primary.valid);
+  const auto primary_omega=covariance_curvature_probes(r,independent_primary.probes);
+  const auto independent_omega=covariance_curvature_probes(r,independent_primary.probes,nullptr,
+    covariance_independent_curvature_seed);
+  assert(primary_omega!=independent_omega);
+  const std::vector<double> identity_hessian(static_cast<std::size_t>(p)*p,0.0);
+  std::vector<double> perturbed_hessian=identity_hessian;
+  for(int i=0;i<p;++i)perturbed_hessian[static_cast<std::size_t>(i)*p+i]=1.0;
+  perturbed_hessian[0]+=1.0;
+  const double injected_error=covariance_directional_hessian_relative_error(identity_hessian,perturbed_hessian,
+    std::vector<double>{1,0,0,0,0,0});
+  assert(injected_error>covariance_independent_directional_tolerance);
+  const CovarianceIndependentCurvatureCheck independent_check=covariance_verify_independent_curvature_batch(system,
+    independent_primary,epsilon,scale,0.1,1.0,0.017,std::vector<double>{1,2,3,4,5,6},1.0,independent_rhs);
+  assert(independent_check.valid&&independent_check.status=="PASS_INDEPENDENT_OMEGA_DIRECTIONAL");
+  assert(independent_check.probes>=independent_primary.probes&&independent_check.probes<=128);
+  assert(independent_check.directions_checked==3&&independent_check.independent_rhs_columns>0);
+  assert(independent_check.independent_batches>0&&independent_rhs>=independent_check.independent_rhs_columns);
+  assert(independent_check.max_relative_directional_error<=covariance_independent_directional_tolerance);
+  covariance_fit_test_hooks.independent_curvature_hard_failures_remaining=1;
+  bool hard_error_propagated=false;
+  try{(void)covariance_verify_independent_curvature_batch(system,independent_check.primary,
+      epsilon,scale,0.1,1.0,0.017,std::vector<double>{1,2,3,4,5,6},1.0,independent_rhs);}
+  catch(const std::runtime_error& error){hard_error_propagated=std::string(error.what()).find("CUDA_ERROR:")==0;}
+  assert(hard_error_propagated&&covariance_fit_test_hooks.independent_curvature_hard_failures_remaining==0);
+  CovarianceAnalyticCurvatureCache same_point=independent_check.independent;
+  assert(covariance_same_curvature_point(independent_check.primary,same_point));
+  const std::vector<double> at_tau_one=covariance_analytic_curvature_hessian(same_point,p,0.1,1.0,0.017);
+  const std::vector<double> at_tau_point_two=covariance_analytic_curvature_hessian(same_point,p,0.1,0.2,0.017);
+  bool changed_with_tau=false;for(std::size_t i=0;i<at_tau_one.size();++i)
+    changed_with_tau|=std::abs(at_tau_one[i]-at_tau_point_two[i])>1e-12;
+  assert(changed_with_tau);
+  const auto reused_tau=covariance_verify_independent_curvature_batch(system,independent_check.primary,
+    epsilon,scale,0.1,0.2,0.017,std::vector<double>{1,2,3,4,5,6},1.0,independent_rhs,
+    nullptr,nullptr,&independent_check.independent);
+  assert(reused_tau.independent_batches==0||reused_tau.primary.probes>independent_check.primary.probes);
+  same_point.theta[0]+=1e-4;assert(!covariance_same_curvature_point(independent_check.primary,same_point));
+  same_point=independent_check.independent;same_point.coordinate_scale[0]*=2.0;
+  assert(!covariance_same_curvature_point(independent_check.primary,same_point));
+  same_point=independent_check.independent;same_point.epsilon+=1e-4;
+  assert(!covariance_same_curvature_point(independent_check.primary,same_point));
+  same_point=independent_check.independent;++same_point.graph_assembly_generation;
+  assert(!covariance_same_curvature_point(independent_check.primary,same_point));
+}
+
+void test_covariance_fit_workspace_grows_reuses_and_releases()
+{
+  rpmd_ja_device::CovarianceFitWorkspace workspace;
+  const std::uint64_t first_growth=workspace.curvature_growth_transient_bytes(8,4,32,6,16);
+  assert(first_growth>0);
+  workspace.reserve_curvature(8,4,32,6,16);
+  assert(workspace.curvature_allocation_count==7&&workspace.curvature_capacity_bytes()>0);
+  const std::uint64_t first_peak=workspace.curvature_peak_bytes;
+  assert(workspace.curvature_growth_transient_bytes(8,4,32,6,16)==0);
+  workspace.reserve_curvature(8,4,32,6,16);
+  assert(workspace.curvature_allocation_count==7&&workspace.curvature_peak_bytes==first_peak);
+  const std::uint64_t larger_growth=workspace.curvature_growth_transient_bytes(16,8,64,12,16);
+  assert(larger_growth>0);
+  workspace.reserve_curvature(16,8,64,12,16);
+  assert(workspace.curvature_allocation_count==12&&workspace.curvature_peak_bytes>first_peak);
+  const std::uint64_t larger_peak=workspace.curvature_peak_bytes;
+  workspace.release_curvature();
+  assert(workspace.curvature_capacity_bytes()==0&&workspace.curvature_peak_bytes==larger_peak);
+  workspace.reserve_curvature(8,4,32,6,16);
+  assert(workspace.curvature_allocation_count==19&&workspace.curvature_peak_bytes==larger_peak);
+}
+
+void test_covariance_fit_workspace_is_reused_by_sequential_system_curvature_builds()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
+  const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  rpmd_ja_device::CovarianceFitWorkspace workspace;
+  const std::vector<double> theta0(6,0.0),scale(6,1.0);
+  std::vector<double> theta1=theta0;theta1[0]=1.0e-3;
+  CovarianceAnalyticCurvatureCache first,second;
+  std::uint64_t rhs_columns=0;
+  {
+    DeviceCovarianceSystem system0(baseline,graph,sqrt_mass,masses,&workspace);
+    first=covariance_build_analytic_curvature_cache(system0,theta0,0.01,scale,16,rhs_columns);
+    assert(first.valid&&workspace.curvature_allocation_count==7);
+    const std::uint64_t first_peak=workspace.curvature_peak_bytes;
+    DeviceCovarianceSystem system1(baseline,graph,sqrt_mass,masses,&workspace);
+    second=covariance_build_analytic_curvature_cache(system1,theta1,0.01,scale,16,rhs_columns);
+    assert(second.valid&&workspace.curvature_allocation_count==7&&workspace.curvature_peak_bytes==first_peak);
+    assert(!covariance_same_curvature_point(first,second));
+    double gram_difference=0.0;
+    for(std::size_t i=0;i<first.gram_d.size();++i)gram_difference+=std::abs(first.gram_d[i]-second.gram_d[i]);
+    assert(gram_difference>1.0e-10);
+  }
+  assert(workspace.curvature_capacity_bytes()>0);
+  workspace.release_curvature();
+  assert(workspace.curvature_capacity_bytes()==0);
+}
+
+void test_covariance_device_workspace_reuses_buffers_static_graph_and_same_point_factors()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
+  const Graph m0=make_two_atom_covariance_graph();Graph m1=m0;
+  m1.base_parameter_count=6;m1.parameter_count=7;m1.raw_local_parameter_count=1;
+  m1.local_base_mix.assign(6,0.0);m1.local_transform={1.0};m1.parameter_basis_norms.assign(7,1.0);
+  rpmd_ja_local_basis::EdgeInput local_edge{};local_edge.first={0,{0,0,0}};local_edge.second={1,{0,0,0}};
+  local_edge.axis={1.0,0.0,0.0};local_edge.longitudinal_parameter=0;local_edge.transverse_parameter=0;
+  m1.local_terms=rpmd_ja_local_basis::make_edge_terms(local_edge);
+  for(auto& term:m1.local_terms)term.parameter=0;
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  const std::vector<double> theta0(6,0.0),theta1(7,0.0);std::vector<double> theta_point=theta0;theta_point[0]=1.0e-3;
+  DeviceCovarianceSystemWorkspace shared;
+  auto evaluate=[&](const Graph& graph,const std::vector<double>& theta,const double epsilon,
+                    DeviceCovarianceSystemWorkspace& workspace){
+    DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses,nullptr,&workspace);
+    double logdet=0.0,shifted=0.0;
+    if(!system.evaluate_factors(theta,epsilon,logdet,shifted,nullptr))
+      throw std::runtime_error("workspace reuse regression produced a non-SPD matrix");
+    return std::array<double,2>{logdet,shifted};};
+  const std::vector<std::tuple<const Graph*,const std::vector<double>*,double>> cases={
+    {&m0,&theta0,0.01},{&m0,&theta0,0.01},{&m0,&theta0,0.02},{&m0,&theta_point,0.02},
+    {&m1,&theta1,0.02},{&m0,&theta0,0.01},{&m0,&theta0,0.01}};
+  std::vector<std::array<double,2>> shared_values;shared_values.reserve(cases.size());
+  for(std::size_t i=0;i<cases.size();++i){const auto& item=cases[i];
+    const std::uint64_t factorizations_before=shared.factorization_count;
+    const std::uint64_t uploads_before=shared.static_upload_count;
+    shared_values.push_back(evaluate(*std::get<0>(item),*std::get<1>(item),std::get<2>(item),shared));
+    if(i==1){assert(shared.factorization_count==factorizations_before&&shared.static_upload_count==uploads_before);}
+    if(i==2||i==3||i==4||i==5)assert(shared.factorization_count>factorizations_before);
+    if(i==4||i==5)assert(shared.static_upload_count==uploads_before+1);
+    if(i==6)assert(shared.factorization_count==factorizations_before&&shared.static_upload_count==uploads_before);
+  }
+  assert(shared.static_upload_count==3&&shared.allocation_count>0);
+  std::uint64_t independent_allocations=0,independent_uploads=0;
+  for(std::size_t i=0;i<cases.size();++i){DeviceCovarianceSystemWorkspace independent;
+    const auto& item=cases[i];const auto values=evaluate(*std::get<0>(item),*std::get<1>(item),std::get<2>(item),independent);
+    check_close(shared_values[i][0],values[0],1e-12);check_close(shared_values[i][1],values[1],1e-12);
+    independent_allocations+=independent.allocation_count;independent_uploads+=independent.static_upload_count;}
+  assert(shared.allocation_count<independent_allocations&&shared.static_upload_count<independent_uploads);
+
+  Graph same_address=m1;std::vector<double> local_theta(7,0.0);local_theta[6]=1.0e-4;
+  const std::uint64_t uploads_before_graph_mutation=shared.static_upload_count;
+  const std::uint64_t factors_before_graph_mutation=shared.factorization_count;
+  (void)evaluate(same_address,local_theta,0.02,shared);
+  same_address.local_transform[0]=0.75;
+  const auto changed_graph_value=evaluate(same_address,local_theta,0.02,shared);
+  assert(shared.static_upload_count==uploads_before_graph_mutation+1&&shared.factorization_count>factors_before_graph_mutation);
+  {DeviceCovarianceSystemWorkspace independent;
+    const auto expected=evaluate(same_address,local_theta,0.02,independent);
+    check_close(changed_graph_value[0],expected[0],1e-12);check_close(changed_graph_value[1],expected[1],1e-12);}
+
+  DeviceBaseline changed_baseline;initialize_two_atom_covariance_baseline(changed_baseline,true);
+  std::vector<double> changed_matrix(36,0.0);const double t[2]={1.0/std::sqrt(5.0),2.0/std::sqrt(5.0)};
+  for(int axis=0;axis<3;++axis)for(int i=0;i<2;++i)for(int j=0;j<2;++j){
+    const int row=axis*2+i,column=axis*2+j;
+    changed_matrix[static_cast<std::size_t>(row)*6+column]=(i==j?1.0:0.0)-t[i]*t[j];}
+  changed_matrix[0]+=0.05;
+  assert(cudaMemcpy(changed_baseline.k,changed_matrix.data(),changed_matrix.size()*sizeof(double),cudaMemcpyHostToDevice)==cudaSuccess);
+  auto evaluate_changed_baseline=[&](DeviceBaseline& selected,DeviceCovarianceSystemWorkspace& workspace){
+    DeviceCovarianceSystem system(selected,same_address,sqrt_mass,masses,nullptr,&workspace);
+    double logdet=0.0,shifted=0.0;if(!system.evaluate_factors(local_theta,0.02,logdet,shifted,nullptr))
+      throw std::runtime_error("baseline identity regression produced a non-SPD matrix");
+    return std::array<double,2>{logdet,shifted};};
+  const std::uint64_t uploads_before_baseline_change=shared.static_upload_count;
+  const std::uint64_t factors_before_baseline_change=shared.factorization_count;
+  const auto changed_baseline_value=evaluate_changed_baseline(changed_baseline,shared);
+  assert(shared.static_upload_count==uploads_before_baseline_change&&shared.factorization_count>factors_before_baseline_change);
+  {DeviceCovarianceSystemWorkspace independent;
+    const auto expected=evaluate_changed_baseline(changed_baseline,independent);
+    check_close(changed_baseline_value[0],expected[0],1e-12);check_close(changed_baseline_value[1],expected[1],1e-12);}
+  const std::uint64_t factors_before_baseline_hit=shared.factorization_count;
+  (void)evaluate_changed_baseline(changed_baseline,shared);
+  assert(shared.factorization_count==factors_before_baseline_hit);
+}
+
+void test_covariance_factor_identity_recovery()
+{
+  DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
+  const Graph graph=make_two_atom_covariance_graph();
+  const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};
+  DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+  const double epsilon=0.01;std::vector<double> accepted(6,0.0),candidate=accepted;
+  double logdet=0.0,shifted_logdet=0.0;
+  assert(system.evaluate_factors(accepted,epsilon,logdet,shifted_logdet));
+  assert(system.factors_valid&&system.factor_theta==accepted&&system.factor_epsilon==epsilon);
+  const std::uint64_t accepted_generation=system.factor_assembly_generation;
+
+  candidate[0]=1e-4;
+  assert(system.evaluate_factors(candidate,epsilon,logdet,shifted_logdet));
+  assert(system.factors_valid&&system.factor_theta==candidate);
+  const std::uint64_t candidate_generation=system.factor_assembly_generation;
+  const std::uint64_t after_candidate_factors=system.factorizations;
+  assert(system.ensure_factors(accepted,epsilon));
+  assert(system.factor_theta==accepted&&system.factor_assembly_generation>candidate_generation&&
+    system.factor_assembly_generation>accepted_generation);
+  assert(system.factorizations==after_candidate_factors+2);
+
+  const std::uint64_t before_tau_reuse=system.factorizations;
+  assert(system.ensure_factors(accepted,epsilon));
+  assert(system.factorizations==before_tau_reuse);
+
+  assert(!system.evaluate_factors(candidate,1.0,logdet,shifted_logdet));
+  assert(!system.factors_valid&&system.factor_theta.empty());
+  assert(system.ensure_factors(accepted,epsilon));
+  assert(system.factors_valid&&system.factor_theta==accepted&&system.factor_epsilon==epsilon);
 }
 
 void test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status()
@@ -1951,6 +3443,31 @@ void test_covariance_initialization_reports_no_improvement_at_budget()
   assert(fit.initialization_evaluations==16&&fit.start_graph_delta==0.0&&fit.theta_start==fit.theta_baseline);
   assert(trace.str().find("phase=SHRINK")!=std::string::npos&&trace.str().find("phase=EXPAND")==std::string::npos);
   assert(trace.str().find("stop_reason INITIALIZATION_EVALUATION_LIMIT")!=std::string::npos);
+}
+
+void test_covariance_directional_curvature_requires_stable_resolved_match()
+{
+  const double binade=std::ldexp(1.0,53);
+  assert(!covariance_directional_displacement_representable({binade},{1.0},{1.0},1.0));
+  assert(covariance_directional_displacement_representable({binade},{1.0},{1.0},2.0));
+  assert(!covariance_directional_displacement_representable({binade},{3000.0},{1.0},1.0e-3));
+  assert(covariance_directional_displacement_representable({binade},{3000.0},{1.0},2.0e-3));
+  const auto pass=covariance_compare_directional_curvature(2.0,2.01,2.002,1e-10,1e-10);
+  assert(pass.resolved&&pass.status=="PASS");
+  const auto unstable=covariance_compare_directional_curvature(1.5,1.0,2.0,1e-10,1e-10);
+  assert(!unstable.resolved&&unstable.status=="STEP_HALVING_UNSTABLE");
+  const auto unresolved=covariance_compare_directional_curvature(1.0,1e-12,2e-12,1e-8,1e-8);
+  assert(!unresolved.resolved&&unresolved.status=="DIFFERENCE_BELOW_RESOLUTION");
+  const auto mismatch=covariance_compare_directional_curvature(4.0,2.0,2.0,1e-10,1e-10);
+  assert(!mismatch.resolved&&mismatch.status=="GRAM_FINITE_DIFFERENCE_MISMATCH");
+  const double q=0.001/0.9,analytic=1.0/(q*q);
+  const auto log_barrier_second=[&](const double h){return -((std::log(q+h)-2.0*std::log(q))+std::log(q-h))/(h*h);};
+  const auto boundary_unstable=covariance_compare_directional_curvature(analytic,log_barrier_second(1.0e-3),
+    log_barrier_second(5.0e-4),0.0,0.0);
+  const auto boundary_stable=covariance_compare_directional_curvature(analytic,log_barrier_second(5.0e-4),
+    log_barrier_second(2.5e-4),0.0,0.0);
+  assert(boundary_unstable.status=="STEP_HALVING_UNSTABLE");
+  assert(boundary_stable.resolved&&boundary_stable.status=="PASS");
 }
 
 void test_covariance_gradient_residual_reject_retries_before_commit()
@@ -2515,6 +4032,18 @@ void test_covariance_near_boundary_fd_requires_stable_steps()
   assert(result.evaluations==evaluations-before&&result.evaluations>8&&result.evaluations<=16);
   assert(result.stable_halvings>=2&&result.status=="CONSISTENT"&&result.relative_error<=0.01&&result.one_percent_check=="PASS");
   assert(report.str().find("directional_fd_probe side=")!=std::string::npos);
+
+  std::ostringstream curvature_trace;std::string curvature_failure;std::vector<double> empty_gram(36,0.0),zero_gradient(6,0.0);
+  const std::uint64_t curvature_evaluations_before=evaluations;
+  try{(void)covariance_verify_directional_curvature(system,current,reference,statistics,0.0,epsilon,tau,scale,0.0,
+      empty_gram,zero_gradient,nullptr,evaluations,curvature_evaluations_before+8,nullptr,nullptr,&curvature_trace,"NEAR_BOUNDARY_TEST");}
+  catch(const std::runtime_error& error){curvature_failure=error.what();}
+  assert(curvature_failure.find("EVALUATION_BUDGET_EXHAUSTED")!=std::string::npos);
+  assert(evaluations-curvature_evaluations_before==8);
+  assert(curvature_trace.str().find("status=STEP_BOUNDARY")!=std::string::npos);
+  assert(curvature_trace.str().find("shrink=1")!=std::string::npos);
+  assert(curvature_trace.str().find("status=STEP_HALVING_UNSTABLE_RETRY")==std::string::npos);
+  assert(system.factors_valid&&system.factor_theta==theta&&system.factor_epsilon==epsilon);
 }
 
 void test_covariance_fixed_coordinate_fd_one_percent_is_separate_from_classification()
@@ -2682,6 +4211,16 @@ void test_covariance_edge_attribution_reconstructs_and_ranks()
   check_close(other_group.top_20_abs_fraction,1.0,1e-15);
   assert(other_group.atom_total[0]==0.0&&other_group.atom_total[1]==0.0);
 
+  std::vector<double> ridge_theta(12,0.0),ridge_center(12,0.0);ridge_theta[0]=0.8;
+  covariance_decompose_gradient(value,statistics,baseline_trace,saved_trace,shifted_trace,0.0,tau,
+    &ridge_theta,&ridge_center,&scale,0.5);
+  const CovarianceEdgeAttribution ridge_attribution=covariance_edge_gradient_attribution(
+    graph,4,edge_statistics,baseline_edge_trace,saved_edge_trace,shifted_edge_trace,scale,value,0.0,tau,true);
+  assert(ridge_attribution.status=="PASS"&&ridge_attribution.parameter_ridge_gradient.size()==12);
+  check_close(ridge_attribution.parameter_ridge_gradient[0],0.8*0.5/(3.0*3.0),1e-15);
+  check_close(ridge_attribution.edge_total[0]+ridge_attribution.edge_total[6]+ridge_attribution.parameter_ridge_gradient[0],
+    value.gradient[0],1e-13);
+
   const CovarianceEdgeAttribution invalid_residuals=covariance_edge_gradient_attribution(
     graph,4,edge_statistics,baseline_edge_trace,saved_edge_trace,shifted_edge_trace,scale,value,rho,tau,false);
   assert(invalid_residuals.status=="TRACE_RESIDUAL_FAIL"&&invalid_residuals.ranked_edges.empty());
@@ -2741,6 +4280,65 @@ void test_covariance_edge_capture_reconstructs_group_trace_and_statistics()
     check_close(sum.value(),trace[component],2e-12);}
   for(int component=0;component<6;++component){NeumaierAccumulator sum;for(std::size_t edge=0;edge<graph.edges.size();++edge)sum.add(edge_shifted_trace[6*edge+component]);
     check_close(sum.value(),shifted_trace[component],2e-12);}
+}
+
+void test_m1_statistics_compensate_projection_and_operator_mix()
+{
+  constexpr int n=9,d=3*n;Graph graph;graph.type_pairs={{0,0}};graph.base_parameter_count=6;
+  graph.raw_local_parameter_count=1;graph.parameter_count=7;graph.local_base_mix.assign(6,0.0);
+  graph.local_base_mix[1]=graph.local_base_mix[2]=graph.local_base_mix[4]=1.0;graph.local_transform={1.0};
+  graph.edges={{0,1,0,{0,0,0}},{2,3,0,{0,0,0}},{4,5,0,{0,0,0}}};
+  const std::vector<double> r0(d,0.0);std::vector<double> position(d,0.0);
+  position[1]=1.0e8;position[n+1]=5.0e7;
+  position[3]=1.0;position[2*n+3]=0.5;
+  position[n+5]=1.0e8;position[2*n+5]=-5.0e7;
+  position[6]=1.0e16;position[7]=1.0;position[8]=5.0e15;
+  const rpmd_ja_local_basis::Site sites[3]={{6,{0,0,0}},{7,{0,0,0}},{8,{0,0,0}}};
+  const rpmd_ja_local_basis::Vec3 coefficients[3]={{1.0,0.0,0.0},{1.0,0.0,0.0},{-2.0,0.0,0.0}};
+  const double shares[3]={1.0/3.0,1.0/3.0,1.0/3.0};
+  for(const double weight:{1.0e16,1.0,-1.0e16}){
+    graph.local_terms.push_back(rpmd_ja_local_basis::detail::make_term(sites,coefficients,3,0,weight,shares));}
+  std::vector<double> statistics(static_cast<std::size_t>(graph.parameter_count),0.0);
+  add_covariance_frame_statistics(graph,position,r0,n,statistics);
+  check_close(statistics[6],2.0,0.0);
+}
+
+void test_fixed_internal_probe_statistics_detect_zero_com_internal_shift()
+{
+  const int n=2;const std::vector<double> r0(6,0.0),masses={1.0,1.0},sqrt_mass(6,1.0);
+  const double inverse_sqrt_two=1.0/std::sqrt(2.0);const std::vector<double> sqrt_atom={inverse_sqrt_two,inverse_sqrt_two};
+  FixedPhysicalProbe probe;probe.source="INTERNAL_X";probe.vector={inverse_sqrt_two,-inverse_sqrt_two,0,0,0,0};
+  std::vector<FixedPhysicalProbe> probes={probe};
+  rpmd_ja_statistics_policy::TrainingChannels channels;
+  channels.names={"fixed_r0_second_moment_x","fixed_r0_second_moment_y","fixed_r0_second_moment_z","fixed_internal_projection:INTERNAL_X"};
+  channels.values.resize(channels.names.size());
+  std::vector<double> first={1.0,-1.0,0,0,0,0},second={2.0,-2.0,0,0,0,0};
+  append_fixed_r0_physical_frame(channels,first,r0,masses,sqrt_mass,probes,n);
+  append_fixed_r0_physical_frame(channels,second,r0,masses,sqrt_mass,probes,n);
+  check_close(channels.values[3][0],std::sqrt(2.0),1e-14);
+  check_close(channels.values[3][1],2.0*std::sqrt(2.0),1e-14);
+  check_close(channels.values[0][0],1.0,0.0);check_close(channels.values[0][1],4.0,0.0);
+  check_close((first[0]+first[1])/2.0,(second[0]+second[1])/2.0,0.0);
+  const auto orthonormal=make_internal_statistics_probes(probes,sqrt_atom,n);
+  assert(orthonormal.size()==1);
+  for(int axis=0;axis<3;++axis){double translation_component=0.0;
+    for(int atom=0;atom<n;++atom)translation_component+=orthonormal[0].vector[axis*n+atom]*sqrt_atom[atom];
+    assert(std::abs(translation_component)<1e-14);}
+}
+
+void test_admission_statistics_storage_peak_boundary()
+{
+  const std::uint64_t estimate=estimate_admission_statistics_storage_bytes(600000,400000,92,6,8,1000);
+  assert(estimate==943301728ULL);
+  assert(estimate>512ULL*1024*1024);
+  assert(estimate_admission_statistics_storage_bytes(std::numeric_limits<std::uint64_t>::max(),
+    400000,92,6,8,1000)==std::numeric_limits<std::uint64_t>::max());
+  constexpr std::uint64_t budget=512ULL*1024*1024;
+  const std::uint64_t channel_only=(330000ULL+340000ULL)*100ULL*sizeof(double);
+  assert(channel_only<budget);
+  assert(estimate_fixed_r0_drift_storage_bytes(330000,340000,100,100)>budget);
+  assert(estimate_fixed_r0_drift_storage_bytes(std::numeric_limits<std::uint64_t>::max(),1,100,100)==
+    std::numeric_limits<std::uint64_t>::max());
 }
 
 struct CpuCovarianceTraceReference{std::vector<double> trace,edge_trace;};
@@ -2917,6 +4515,61 @@ void test_covariance_state_parser_accepts_lf_and_crlf()
   assert(lf_fields.at("staged_barrier_enabled")=="1"&&crlf_fields.at("staged_barrier_enabled")=="1");
   const double lf_tau=std::stod(lf_fields.at("last_valid_tau")),crlf_tau=std::stod(crlf_fields.at("last_valid_tau"));
   check_close(lf_tau,crlf_tau,0.0);assert(covariance_state_tau_matches(lf_tau,crlf_tau));
+}
+
+void test_feasibility_manifest_parser_accepts_lf_and_crlf()
+{
+  const std::string stem="rpmd_ja_feasibility_manifest_line_ending_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::string lf_path=stem+"_lf.txt",crlf_path=stem+"_crlf.txt";
+  RemoveTestFile clean_lf{lf_path},clean_crlf{crlf_path};
+  {std::ofstream out(lf_path,std::ios::binary);assert(out.good());out<<"RPJAFEAS9\ntraining_source_id \"train\"\nrule \"frozen\"\n";assert(out.good());}
+  {std::ofstream out(crlf_path,std::ios::binary);assert(out.good());out<<"RPJAFEAS9\r\ntraining_source_id \"train\"\r\nrule \"frozen\"\r\n";assert(out.good());}
+  const auto lf=read_feasibility_manifest(lf_path),crlf=read_feasibility_manifest(crlf_path);
+  assert(lf==crlf&&crlf.at("training_source_id")=="train"&&crlf.at("rule")=="frozen");
+}
+
+void test_feasibility_manifest_freezes_independent_curvature_contract()
+{
+  std::map<std::string,std::string> fields={{"curvature_primary_seed","8d12e5b7c3a964f1"},
+    {"curvature_independent_seed","4f1bbcdc6762c9a5"},{"curvature_probe_cap","128"},
+    {"curvature_directional_tolerance","0.1"}};
+  const auto contract=feasibility_manifest_curvature_contract(fields);
+  assert(contract.primary_seed==covariance_primary_curvature_seed&&
+    contract.independent_seed==covariance_independent_curvature_seed&&
+    contract.probe_cap==CovarianceAnalyticCurvatureWorkspace::max_probes&&
+    contract.directional_tolerance==covariance_independent_directional_tolerance);
+  fields["curvature_probe_cap"]="64";bool rejected=false;
+  try{(void)feasibility_manifest_curvature_contract(fields);}catch(const std::runtime_error&){rejected=true;}
+  assert(rejected);
+}
+
+void test_feasibility_manifest_freezes_candidate_cost_contract()
+{
+  std::map<std::string,std::string> fields={{"candidate_cost_stop_rule","MAX_COMPLETE_OR_PARTIAL_LOWER_BOUND_SECONDS_V1"},
+    {"candidate_cost_safety_factor","1.5"}};
+  const auto contract=feasibility_manifest_candidate_cost_contract(fields);
+  assert(contract.rule=="MAX_COMPLETE_OR_PARTIAL_LOWER_BOUND_SECONDS_V1"&&contract.safety_factor==1.5);
+  fields["candidate_cost_safety_factor"]="0.9";bool rejected=false;
+  try{(void)feasibility_manifest_candidate_cost_contract(fields);}catch(const std::runtime_error&){rejected=true;}
+  assert(rejected);
+}
+
+void test_feasibility_manifest_freezes_experiment_contract()
+{
+  std::map<std::string,std::string> fields={{"lambda_factors","0.01,0.0001,0.000001"},
+    {"wall_seconds","28800"},{"max_exact_gradients","240"},{"validation_reserve_fraction","0.25"},
+    {"max_a_branch_gradients","8"},{"max_fit_family_gradients","112"},{"a_wall_fraction","0.1"},
+    {"family_wall_split_rule","EQUAL_REMAINING_FIT_TIME_V1"},
+    {"family_gradient_split_rule","EQUAL_REMAINING_EXACT_GRADIENTS_V1"},
+    {"development_max_blocks","8"},{"development_min_blocks","4"},
+    {"development_block_rule","CONTIGUOUS_EQUAL_FRAME_COUNTS_V1"}};
+  const auto contract=feasibility_manifest_experiment_contract(fields);
+  assert(contract.lambda_factors==std::vector<double>({1e-2,1e-4,1e-6}));
+  assert(contract.max_development_blocks==8&&contract.min_development_blocks==4);
+  fields["max_exact_gradients"]="241";bool rejected=false;
+  try{(void)feasibility_manifest_experiment_contract(fields);}catch(const std::runtime_error&){rejected=true;}
+  assert(rejected);
 }
 
 void test_covariance_state_tau_comparison_is_relative_for_small_values()
@@ -3362,7 +5015,7 @@ void test_padded_qr_svd_and_cut_qp(cusolverDnHandle_t solver)
 
 void test_active_set_qp_snapshot_and_rejection(cusolverDnHandle_t solver)
 {
-  std::string fixture_path="tests/data/ja_reference_resample.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const std::string fixture_path=covariance_fit_test_fixture_path("ja_reference_resample.bin.qp_state.txt");
   const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);
   assert(fixture.rows.size()==233);
   const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
@@ -3408,7 +5061,7 @@ void test_active_set_qp_snapshot_and_rejection(cusolverDnHandle_t solver)
 
 void test_active_set_preserves_svd_primal(cusolverDnHandle_t solver)
 {
-  std::string fixture_path="tests/data/ja_reference_replay_v1.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const std::string fixture_path=covariance_fit_test_fixture_path("ja_reference_replay_v1.bin.qp_state.txt");
   const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);assert(fixture.rows.size()==20);
   std::vector<double> seed(fixture.rows.size(),0.0);for(const int row:{0,1,2,3,4,5,12})seed[row]=1.0;
   const ActiveSetPolishResult polished=polish_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,seed,fixture.primal_tolerance);
@@ -3423,7 +5076,7 @@ void test_active_set_preserves_svd_primal(cusolverDnHandle_t solver)
 
 void test_active_set_refines_kkt_residual(cusolverDnHandle_t solver)
 {
-  std::string fixture_path="tests/data/ja_reference_replay_v2.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const std::string fixture_path=covariance_fit_test_fixture_path("ja_reference_replay_v2.bin.qp_state.txt");
   const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);assert(fixture.rows.size()==28);
   std::vector<double> seed(fixture.rows.size(),0.0);for(const int row:{0,1,2,3,4,5,6,20,22,25,27})seed[row]=1.0;
   const ActiveSetPolishResult polished=polish_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,seed,fixture.primal_tolerance);
@@ -3437,7 +5090,7 @@ void test_active_set_refines_kkt_residual(cusolverDnHandle_t solver)
 
 void test_active_set_rank_deficient_warm_start(cusolverDnHandle_t solver)
 {
-  std::string fixture_path="tests/data/ja_reference_replay_v4.bin.qp_state.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const std::string fixture_path=covariance_fit_test_fixture_path("ja_reference_replay_v4.bin.qp_state.txt");
   const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);assert(fixture.rows.size()==42);
   std::vector<double> seed(fixture.rows.size(),0.0);for(const int row:{0,1,2,3,5,6,20,22,24,27,28,30,35,38,39})seed[row]=1.0;
   const ActiveSetPolishResult polished=polish_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.a,fixture.b,seed,fixture.primal_tolerance);
@@ -3449,7 +5102,7 @@ void test_active_set_rank_deficient_warm_start(cusolverDnHandle_t solver)
 
 void test_outer128_stationarity_joint_polish(cusolverDnHandle_t solver)
 {
-  std::string fixture_path="tests/data/ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt";{std::ifstream probe(fixture_path);if(!probe)fixture_path="../"+fixture_path;}
+  const std::string fixture_path=covariance_fit_test_fixture_path("ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt");
   const CutQPFixture fixture=read_cut_qp_fixture(fixture_path);
   assert(fixture.svd.p==60&&fixture.rows.size()==766&&fixture.a.size()==766&&fixture.rhs.size()==766&&fixture.b.size()==766&&fixture.initial_lambda.size()==766);
   const QPSolution replay=solve_cut_qp(solver,fixture.svd,fixture.rows,fixture.rhs,fixture.primal_tolerance,fixture.initial_lambda);
@@ -3640,6 +5293,27 @@ void test_bounded_cg_replay_refinement()
   assert(exception_report.str().find("restarts NOT_AVAILABLE")!=std::string::npos);
 }
 
+void test_compensated_m1_local_action_recovers_cancellation()
+{
+  Graph graph;graph.type_pairs={{0,1}};graph.base_parameter_count=6;graph.parameter_count=7;graph.raw_local_parameter_count=2;
+  graph.local_base_mix.assign(6,0.0);graph.local_transform={1.0,1.0};
+  rpmd_ja_local_basis::EdgeInput edge{};edge.first={0,{0,0,0}};edge.second={1,{1,-2,0}};
+  edge.axis={1.0,0.0,0.0};edge.longitudinal_parameter=0;edge.transverse_parameter=1;
+  const auto terms=rpmd_ja_local_basis::make_edge_terms(edge);assert(!terms.empty());
+  auto large=terms.front(),small=terms.front(),cancel=terms.front();
+  large.parameter=0;large.weight=1.0e16;small.parameter=0;small.weight=1.0;cancel.parameter=1;cancel.weight=-1.0e16;
+  graph.local_terms={large,small,cancel};
+  const std::vector<double> q={0.0,1.0,0.0,0.0,0.0,0.0};
+  const std::vector<double> sqrt_mass(6,1.0),sqrt_atom(2,1.0),theta={0,0,0,0,0,0,1.0};
+  std::vector<double> fast(6),high(6),low(6);
+  apply_additive(graph,q,sqrt_mass,sqrt_atom,theta,2,fast);
+  apply_additive_compensated(graph,q,sqrt_mass,theta,2,high,low);
+  assert(fast[0]==0.0&&fast[1]==0.0);
+  check_close(high[0]+low[0],-1.0,1e-14);check_close(high[1]+low[1],1.0,1e-14);
+  for(int axis=1;axis<3;++axis)for(int atom=0;atom<2;++atom)
+    assert(high[axis*2+atom]==0.0&&low[axis*2+atom]==0.0);
+}
+
 void test_compensated_cg_true_residual_action()
 {
   constexpr int n=3,d=3*n;DeviceBaseline baseline;baseline.d=d;
@@ -3724,6 +5398,12 @@ void test_cg_witness_vector_line_endings()
       out.close();assert(out);bool rejected=false;try{(void)read_cg_witness(path,d,d);}catch(const std::runtime_error&){rejected=true;}assert(rejected);
     }
   }
+  {std::istringstream lines(original);std::string line;std::ofstream out(path);
+    while(std::getline(lines,line))if(line.rfind("witness_format_version ",0)!=0&&
+      line.rfind("parameter_family ",0)!=0&&line.rfind("parameter_count ",0)!=0)out<<line<<'\n';
+    out.close();assert(out);}
+  const CGWitnessSnapshot legacy=read_cg_witness(path,d,d);
+  assert(legacy.witness_format_version==1&&legacy.parameter_family=="M0"&&legacy.theta==theta);
 }
 
 void test_cg_failure_snapshot_round_trip_replay()
@@ -3869,6 +5549,45 @@ void test_lanczos_continues_across_checkpoints(cusolverDnHandle_t solver)
   for(const auto& mode:modes){assert(mode.steps_used==steps&&mode.dense_matrix_actions==expected_actions);assert(mode.actual_rayleigh>0.1&&mode.residual<1e-8);}
 }
 
+void test_lanczos_iteration_budget_interrupts_one_overrun(cusolverDnHandle_t solver)
+{
+  constexpr int n=8,d=3*n;const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0);
+  std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);
+  for(int coordinate=0;coordinate<d;++coordinate)raw[static_cast<std::size_t>(coordinate)*d+coordinate]=1.0;
+  std::stringstream raw_stream(std::ios::in|std::ios::out|std::ios::binary);
+  raw_stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));raw_stream.seekg(0);
+  DeviceBaseline baseline;baseline.initialize(raw_stream,0,d,n,masses,sqrt_mass);
+  rpmd_ja_feasibility::Limits limits;limits.wall_seconds=100.0;limits.validation_reserve_fraction=0.25;
+  limits.max_fit_family_wall_seconds=32.5;
+  rpmd_ja_feasibility::Budget budget;
+  assert(rpmd_ja_feasibility::begin(budget,limits,0.0)==rpmd_ja_feasibility::BudgetResult::OK);
+  assert(rpmd_ja_feasibility::enter_phase(budget,limits,rpmd_ja_feasibility::Phase::A1,10.0)==
+    rpmd_ja_feasibility::BudgetResult::OK);
+  assert(rpmd_ja_feasibility::enter_phase(budget,limits,rpmd_ja_feasibility::Phase::B,10.0)==
+    rpmd_ja_feasibility::BudgetResult::OK);
+  int clock_checks=0;double maximum_step_seconds=0.0;bool stopped_on_family_wall=false;
+  const std::function<void(int,double)> injected_clock=[&](const int,double step_seconds){
+    maximum_step_seconds=std::max(maximum_step_seconds,step_seconds);
+    const double now=clock_checks++==0?42.0:43.25;
+    const auto result=rpmd_ja_feasibility::observe_time(budget,limits,now);
+    if(result!=rpmd_ja_feasibility::BudgetResult::OK){
+      stopped_on_family_wall=result==rpmd_ja_feasibility::BudgetResult::FAMILY_WALL_LIMIT;
+      throw std::runtime_error("FEASIBILITY_BUDGET_FAMILY_WALL_LIMIT");}
+  };
+  bool stopped=false;
+  try{(void)lanczos_low_modes(solver,baseline,Graph{}, {},sqrt_mass,sqrt_atom,n,8,1,0.0,{},nullptr,injected_clock);}
+  catch(const std::runtime_error& error){stopped=std::string(error.what())=="FEASIBILITY_BUDGET_FAMILY_WALL_LIMIT";}
+  assert(stopped&&stopped_on_family_wall&&clock_checks==2&&maximum_step_seconds>=0.0);
+  const double overrun=budget.phase_seconds[rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::B)]-
+    limits.max_fit_family_wall_seconds;
+  assert(std::abs(overrun-0.75)<1.0e-12);
+  assert(rpmd_ja_feasibility::enter_phase(budget,limits,rpmd_ja_feasibility::Phase::C,43.25)==
+    rpmd_ja_feasibility::BudgetResult::OK);
+  const double c_available=limits.wall_seconds-budget.elapsed_seconds-
+    limits.wall_seconds*limits.validation_reserve_fraction;
+  assert(std::abs(c_available-(limits.max_fit_family_wall_seconds-overrun))<1.0e-12);
+}
+
 void test_lanczos_curvature_rounding_boundary(cusolverDnHandle_t solver)
 {
   constexpr int n=12,d=3*n,steps=3*n-3;const double epsilon=1.0,stiffness=1.0e8;const auto basis=internal_basis(n);
@@ -3941,6 +5660,52 @@ void test_probe_covariance_and_ibp(cusolverDnHandle_t solver)
   std::ifstream spool(path,std::ios::binary);assert(spool.good());
   const ResponseCheck result=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,21,1,temperature,{});
   assert(result.probes>=20);assert(result.validation_frames==validation&&result.statistical_frames==33);assert(result.observed_cov_available&&result.predicted_cov_available&&result.cg_residual_available&&result.response_ibp_available&&result.force_residual_available);assert(result.observed_cov_min>0.0&&result.observed_cov_max>=result.observed_cov_min&&result.observed_cov_condition>=1.0);assert(result.predicted_cov_min>0.0&&result.predicted_cov_max>=result.predicted_cov_min&&result.predicted_cov_condition>=1.0);assert(result.block_frames[0]+result.block_frames[1]+result.block_frames[2]+result.block_frames[3]==validation);assert(std::isfinite(result.block_variance_max_relative_delta));assert(result.cg<=1e-8);assert(result.response<=2e-8);assert(result.ibp<=2e-8);assert(result.force_residual<=2e-8);
+
+  int budget_observations=0;bool returned_after_budget_stop=false,budget_stop_observed=false;
+  const std::function<void()> stop_during_cg=[&](){
+    if(++budget_observations==3)throw std::runtime_error("injected mid-CG feasibility budget stop");};
+  std::vector<std::vector<double>> budget_probes(1,std::vector<double>(d));
+  for(int i=0;i<d;++i)budget_probes[0][i]=static_cast<double>(i+1);
+  std::vector<std::string> budget_probe_sources={"BUDGET_TEST"};
+  std::vector<ProbeOrigin> budget_probe_origins(1);
+  try{(void)validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,train,1,
+      temperature,{},0.0,nullptr,0.15,0.15,-1,{},false,nullptr,false,-1,
+      &budget_probes,&budget_probe_sources,&budget_probe_origins,stop_during_cg);
+    returned_after_budget_stop=true;
+  }catch(const std::runtime_error& error){budget_stop_observed=std::string(error.what())=="injected mid-CG feasibility budget stop";}
+  assert(budget_stop_observed&&!returned_after_budget_stop&&budget_observations==3);
+
+  const std::vector<RitzMode> common_soft_modes={modes.front()};
+  std::vector<std::string> frozen_common_sources;std::vector<ProbeOrigin> frozen_common_origins;
+  const auto frozen_common_probes=make_common_probe_set(common_soft_modes,sqrt_atom,types,n,
+    &frozen_common_sources,&frozen_common_origins,nullptr,validation-1);
+  const ResponseCheck development_common=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,
+    types,n,r0,spool,0,frames,train,1,temperature,common_soft_modes,0.0,nullptr,0.15,0.15,-1,{},false,nullptr,true,
+    validation-1,&frozen_common_probes,&frozen_common_sources,&frozen_common_origins);
+  const std::streamoff blind_frame_start=static_cast<std::streamoff>(train)*
+    static_cast<std::streamoff>(sizeof(double)+2*d*sizeof(double));
+  const ResponseCheck blind_common=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,
+    types,n,r0,spool,blind_frame_start,validation,0,1,temperature,common_soft_modes,0.0,nullptr,0.15,0.15,-1,{},false,nullptr,true,
+    validation-1,&frozen_common_probes,&frozen_common_sources,&frozen_common_origins);
+  assert(frozen_common_sources==development_common.probe_sources);
+  assert(frozen_common_sources==blind_common.probe_sources);
+  assert(frozen_common_probes.size()==static_cast<std::size_t>(development_common.probes));
+  assert(frozen_common_probes.size()==static_cast<std::size_t>(blind_common.probes));
+
+  const auto fail_first_probe=[](const int probe,const std::vector<double>&){
+    CGResult cg;cg.relative_residual=1.0;cg.witness.classification="CG_SOLVER_BUDGET_EXHAUSTED";cg.witness.probe=probe;return cg;};
+  const ResponseCheck incomplete=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,spool,0,frames,
+    train,1,temperature,common_soft_modes,0.0,nullptr,0.15,0.15,-1,fail_first_probe,true,&common_physical_probes,true,
+    validation-1,&frozen_common_probes,&frozen_common_sources,&frozen_common_origins);
+  assert(incomplete.probes==static_cast<int>(frozen_common_probes.size()));
+  assert(!incomplete.observed_cov_available&&!incomplete.predicted_cov_available&&!incomplete.response_ibp_available);
+  assert(incomplete.mean_q.empty()&&incomplete.observed_matrix.empty()&&incomplete.centered_covariance_matrix.empty());
+  for(const char* consumer:{"A0_DEVELOPMENT","BLIND"}){
+    std::ostringstream diagnostic;write_response_stats(diagnostic,incomplete);
+    assert(!write_response_consumer_statistics(diagnostic,consumer,incomplete));
+    assert(diagnostic.str().find(std::string(consumer)+"_statistics_status NOT_COMPUTED")!=std::string::npos);
+    assert(diagnostic.str().find("fixed_R0_mean_norm=NOT_COMPUTED")!=std::string::npos);
+  }
 
   const auto response_probes=make_probes({},sqrt_atom,types,n);const int m=static_cast<int>(response_probes.size());assert(m==result.probes);
   std::vector<double> reference_full(static_cast<std::size_t>(d)*d,0.0);
@@ -4022,14 +5787,224 @@ void test_probe_selection_skips_duplicate_low_modes()
   const auto selected=make_probes(candidates,sqrt_atom,types,n);assert(selected.size()==base.size()+4);
   for(std::size_t i=0;i<selected.size();++i)for(std::size_t j=0;j<i;++j)assert(std::abs(std::inner_product(selected[i].begin(),selected[i].end(),selected[j].begin(),0.0))<1e-10);
 }
+
+void test_common_low_ritz_modes_get_probe_rank_before_fixed_channels()
+{
+  constexpr int n=2,d=3*n;const std::vector<double> sqrt_atom(n,1.0);const std::vector<int> types={0,1};
+  std::vector<RitzMode> modes(3);for(int axis=0;axis<3;++axis){modes[axis].vector.assign(d,0.0);
+    modes[axis].vector[axis*n]=1.0;modes[axis].vector[axis*n+1]=-1.0;}
+  FixedPhysicalProbe fixed;fixed.source="FIXED_PHYSICAL_TEST";fixed.vector.assign(d,0.0);fixed.vector[0]=1.0;
+  const std::vector<FixedPhysicalProbe> fixed_channels={fixed};
+  std::vector<std::string> frozen_sources,development_sources,blind_sources;
+  const auto frozen=make_common_probe_set(modes,sqrt_atom,types,n,&frozen_sources,nullptr,&fixed_channels);
+  const auto development=make_common_probe_set(modes,sqrt_atom,types,n,&development_sources,nullptr,&fixed_channels);
+  const auto blind=make_common_probe_set(modes,sqrt_atom,types,n,&blind_sources,nullptr,&fixed_channels);
+  assert(frozen.size()==3&&frozen_sources.size()==3);
+  assert(std::count(frozen_sources.begin(),frozen_sources.end(),"LOW_RITZ")==3);
+  assert(frozen_sources==development_sources&&frozen_sources==blind_sources);
+  assert(frozen.size()==development.size()&&frozen.size()==blind.size());
+  for(std::size_t probe=0;probe<frozen.size();++probe){
+    assert(frozen[probe].size()==development[probe].size()&&frozen[probe].size()==blind[probe].size());
+    for(std::size_t coordinate=0;coordinate<frozen[probe].size();++coordinate){
+      assert(frozen[probe][coordinate]==development[probe][coordinate]);
+      assert(frozen[probe][coordinate]==blind[probe][coordinate]);
+    }
+  }
+  std::vector<std::string> fixed_sources;
+  (void)make_probes({},sqrt_atom,types,n,&fixed_sources,nullptr,&fixed_channels);
+  const std::size_t selected_fixed_rank=frozen.size()-3;
+  assert(fixed_sources.size()>selected_fixed_rank);
+  assert(rpmd_ja_feasibility::common_soft_probe_capacity(3,4,28)==3);
+}
+
+void test_common_probe_rank_is_capped_for_nearly_full_fixed_basis(cusolverDnHandle_t solver)
+{
+  constexpr int n=8,d=3*n,validation_frames=2048,maximum_probe_rank=20;
+  const double temperature=300.0,kbt=K_B*temperature;
+  const std::vector<double> masses(n,1.0),sqrt_atom(n,1.0),sqrt_mass(d,1.0),r0(d,0.0);
+  std::vector<int> types(n);for(int atom=0;atom<n;++atom)types[atom]=atom%4;
+  std::vector<double> raw(static_cast<std::size_t>(d)*d,0.0);
+  for(int coordinate=0;coordinate<d;++coordinate)raw[static_cast<std::size_t>(coordinate)*d+coordinate]=1.0;
+  std::stringstream raw_stream(std::ios::in|std::ios::out|std::ios::binary);
+  raw_stream.write(reinterpret_cast<const char*>(raw.data()),raw.size()*sizeof(double));raw_stream.seekg(0);
+  DeviceBaseline baseline;baseline.initialize(raw_stream,0,d,n,masses,sqrt_mass);
+  std::vector<std::string> fixed_only_sources,uncapped_sources;
+  std::vector<ProbeOrigin> fixed_only_origins,uncapped_origins;
+  const auto fixed_only=make_probes({},sqrt_atom,types,n,&fixed_only_sources,&fixed_only_origins);
+  assert(fixed_only.size()==20&&fixed_only_sources.size()==20&&fixed_only_origins.size()==20);
+  RitzMode soft;soft.vector=internal_basis(n).front();const std::vector<RitzMode> soft_modes={soft};
+  FixedPhysicalProbe physical;physical.source="FIXED_PHYSICAL_TEST";physical.vector=internal_basis(n).back();
+  const std::vector<FixedPhysicalProbe> fixed_physical={physical};
+  const auto uncapped=make_common_probe_set(soft_modes,sqrt_atom,types,n,&uncapped_sources,&uncapped_origins,
+    &fixed_physical);
+  assert(uncapped.size()==21&&uncapped_sources.size()==21&&uncapped_origins.size()==21);
+  std::vector<std::string> frozen_sources;std::vector<ProbeOrigin> frozen_origins;
+  const auto frozen=make_common_probe_set(soft_modes,sqrt_atom,types,n,&frozen_sources,&frozen_origins,&fixed_physical,
+    maximum_probe_rank);
+  assert(frozen.size()==maximum_probe_rank&&frozen_sources.size()==frozen.size()&&frozen_origins.size()==frozen.size());
+  const auto count_source=[](const std::vector<std::string>& sources,const char* value){
+    return std::count(sources.begin(),sources.end(),value);};
+  const auto count_type_origins=[](const std::vector<ProbeOrigin>& origins){
+    return std::count_if(origins.begin(),origins.end(),[](const ProbeOrigin& origin){return origin.seed_atom_index>=0;});};
+  assert(count_source(fixed_only_sources,"LOW_RITZ")==0&&count_source(uncapped_sources,"LOW_RITZ")==1&&
+    count_source(frozen_sources,"LOW_RITZ")==1);
+  assert(count_source(fixed_only_sources,"FIXED_RANDOM")==16&&
+    count_source(uncapped_sources,"FIXED_RANDOM")==16&&count_source(frozen_sources,"FIXED_RANDOM")==16);
+  assert(count_source(uncapped_sources,"FIXED_PHYSICAL_TEST")==1&&count_source(frozen_sources,"FIXED_PHYSICAL_TEST")==1);
+  assert(count_source(fixed_only_sources,"TYPE_LOCAL")==4&&count_source(uncapped_sources,"TYPE_LOCAL")==3&&
+    count_source(frozen_sources,"TYPE_LOCAL")==2);
+  assert(count_type_origins(fixed_only_origins)==4&&count_type_origins(uncapped_origins)==3&&
+    count_type_origins(frozen_origins)==2);
+  for(std::size_t index=0;index<frozen_sources.size();++index)
+    assert(probe_origin_valid(frozen_sources[index],frozen_origins[index]));
+  const std::string path="rpmd_ja_nearly_full_common_probe_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".bin";
+  struct RemoveFile{std::string path;~RemoveFile(){std::remove(path.c_str());}} cleanup{path};
+  {
+    std::ofstream out(path,std::ios::binary|std::ios::trunc);assert(out.good());
+    for(int frame=0;frame<validation_frames;++frame){
+      const double step=static_cast<double>(frame);std::vector<double> x(d,0.0),force(d,0.0);
+      for(int probe=0;probe<maximum_probe_rank;++probe){const int frequency=probe/2+1;
+        const double phase=2.0*std::acos(-1.0)*frequency*(frame%32)/32.0;
+        const double value=std::sqrt(2.0*kbt)*(probe%2?std::sin(phase):std::cos(phase));
+        for(int coordinate=0;coordinate<d;++coordinate)x[coordinate]+=value*frozen[probe][coordinate];}
+      for(int coordinate=0;coordinate<d;++coordinate)force[coordinate]=-x[coordinate];
+      out.write(reinterpret_cast<const char*>(&step),sizeof(step));
+      out.write(reinterpret_cast<const char*>(x.data()),d*sizeof(double));
+      out.write(reinterpret_cast<const char*>(force.data()),d*sizeof(double));
+    }
+    assert(out.good());
+  }
+  std::ifstream spool(path,std::ios::binary);assert(spool.good());
+  Graph graph;const std::vector<double> theta;
+  const ResponseCheck development=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,
+    spool,0,validation_frames,0,1,temperature,soft_modes,0.0,nullptr,0.15,0.15,-1,{},false,nullptr,true,
+    maximum_probe_rank,&frozen,&frozen_sources,&frozen_origins);
+  const ResponseCheck blind=validate_probes(solver,baseline,graph,theta,sqrt_mass,sqrt_atom,types,n,r0,
+    spool,0,validation_frames,0,1,temperature,soft_modes,0.0,nullptr,0.15,0.15,-1,{},false,nullptr,true,
+    maximum_probe_rank,&frozen,&frozen_sources,&frozen_origins);
+  assert(development.validation_frames==validation_frames&&blind.validation_frames==validation_frames);
+  assert(development.probes==maximum_probe_rank&&blind.probes==maximum_probe_rank);
+  assert(development.probe_sources==frozen_sources&&blind.probe_sources==frozen_sources);
+  assert(blind.probe_origins.size()==frozen_origins.size());
+  for(std::size_t index=0;index<frozen_origins.size();++index)
+    assert(encode_probe_origin(blind.probe_origins[index])==encode_probe_origin(frozen_origins[index]));
+  assert(response_consumer_statistics_ready(blind)&&blind.response_band.status=="RESPONSE_PASS");
+  const std::string snapshot_path="rpmd_ja_scored_common_probe_snapshot_test_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".txt";
+  RemoveTestFile snapshot_cleanup{snapshot_path};
+  const std::vector<double> snapshot_theta={0.0};const std::string manifest(64,'a'),candidate(64,'b'),input(64,'c');
+  const std::string snapshot_digest=write_blind_response_checkpoint(snapshot_path,blind,snapshot_theta,manifest,candidate,input,true);
+  std::vector<std::string> expected_origins;for(const ProbeOrigin& origin:frozen_origins)
+    expected_origins.push_back(encode_probe_origin(origin));
+  const BlindResponseSnapshot restored=read_blind_response_checkpoint(snapshot_path,manifest,candidate,input,
+    snapshot_digest,frozen_sources,expected_origins);
+  assert(restored.passed&&restored.response.probe_sources==frozen_sources&&
+    restored.response.mean_q==blind.mean_q&&restored.response.observed_matrix==blind.observed_matrix&&
+    restored.response.centered_covariance_matrix==blind.centered_covariance_matrix);
+}
+
+void test_frozen_qp_fixture_consumer_identity()
+{
+  const std::string path=covariance_fit_test_fixture_path(frozen_qp_fixtures[0].name);
+  const std::string bytes=read_test_file(path);
+  verify_qp_fixture_bytes(path,bytes);
+  std::string changed=bytes;assert(!changed.empty());changed[0]^=1;
+  bool rejected=false;try{verify_qp_fixture_bytes(path,changed);}catch(const std::runtime_error&){rejected=true;}assert(rejected);
+  rejected=false;try{(void)read_cut_qp_fixture(covariance_fit_test_fixture_path("missing/")+frozen_qp_fixtures[0].name);}
+  catch(const std::runtime_error&){rejected=true;}assert(rejected);
+  std::map<std::string,std::string> receipt;std::string canonical;
+  for(unsigned i=0;i<5;++i){const std::string prefix="cuda_regression_fixture_"+std::to_string(i+1);
+    receipt[prefix+"_name"]=frozen_qp_fixtures[i].name;receipt[prefix+"_sha256"]=frozen_qp_fixtures[i].sha256;
+    canonical+=frozen_qp_fixtures[i].name;canonical.push_back('\0');canonical+=frozen_qp_fixtures[i].sha256;canonical.push_back('\n');}
+  rpmd_ja_sha256::Digest sha;sha.update(reinterpret_cast<const unsigned char*>(canonical.data()),canonical.size());
+  receipt["cuda_regression_fixture_set_sha256"]=sha.finish_hex();verify_frozen_qp_fixture_receipt(receipt);
+  receipt["cuda_regression_fixture_1_sha256"]=std::string(64,'0');
+  rejected=false;try{verify_frozen_qp_fixture_receipt(receipt);}catch(const std::runtime_error&){rejected=true;}assert(rejected);
+  receipt["cuda_regression_fixture_1_sha256"]=frozen_qp_fixtures[0].sha256;
+  receipt["cuda_regression_fixture_set_sha256"]=std::string(64,'0');
+  rejected=false;try{verify_frozen_qp_fixture_receipt(receipt);}catch(const std::runtime_error&){rejected=true;}assert(rejected);
+}
+
+void test_feasibility_solver_stop_classification()
+{
+  assert(covariance_expected_candidate_stop("FEASIBILITY_BUDGET_WALL_LIMIT"));
+  assert(covariance_expected_candidate_stop("CURVATURE_UNRESOLVED_INDEPENDENT_BATCH"));
+  assert(covariance_expected_candidate_stop("CURVATURE_UNRESOLVED: DIFFERENCE_BELOW_RESOLUTION direction=FIXED_RANDOM"));
+  assert(covariance_expected_candidate_stop("BASELINE_SPD_FAIL"));
+  assert(!covariance_expected_candidate_stop("NUMERICAL_SOLVE_FAIL"));
+  assert(!covariance_expected_candidate_stop("CURVATURE_UNRESOLVED_INDEPENDENT_BATCH_ERROR"));
+  assert(!covariance_expected_candidate_stop("CURVATURE_UNRESOLVED: GRAM_FINITE_DIFFERENCE_MISMATCH direction=FIXED_RANDOM"));
+  assert(!covariance_expected_candidate_stop("CURVATURE_UNRESOLVED: NONFINITE_DIFFERENCE direction=FIXED_RANDOM"));
+  assert(!covariance_expected_candidate_stop("CUDA_ERROR"));
+  assert(!covariance_expected_candidate_stop("FEASIBILITY_BUDGET_INVALID_CLOCK"));
+  bool invalid_budget_rethrown=false;
+  try{try{throw CovarianceFeasibilityBudgetError("FEASIBILITY_BUDGET_INVALID_CLOCK");}
+    catch(const CovarianceFeasibilityBudgetError& error){(void)covariance_independent_budget_stop_or_throw(error);}}
+  catch(const CovarianceFeasibilityBudgetError& error){invalid_budget_rethrown=std::string(error.what())=="FEASIBILITY_BUDGET_INVALID_CLOCK";}
+  assert(invalid_budget_rethrown);
+  bool unknown_result_rejected=false;
+  try{(void)covariance_independent_failure_status_or_throw("NOT_STARTED");}
+  catch(const std::runtime_error& error){unknown_result_rejected=std::string(error.what()).find("IMPLEMENTATION_FAIL:")==0;}
+  assert(unknown_result_rejected);
+  assert(covariance_independent_failure_status_or_throw("CURVATURE_UNRESOLVED_INDEPENDENT_BATCH")==
+    "CURVATURE_UNRESOLVED_INDEPENDENT_BATCH");
+}
+
+void test_cgroup_host_memory_limit()
+{
+  std::istringstream maximum("100"),current("60");
+  assert(rpmd_ja_file_io::cgroup_memory_remaining_bytes(maximum,current)==40);
+  std::istringstream full_maximum("100"),full_current("120");
+  assert(rpmd_ja_file_io::cgroup_memory_remaining_bytes(full_maximum,full_current)==0);
+  std::istringstream unlimited("max"),unlimited_current("60");
+  assert(rpmd_ja_file_io::cgroup_memory_remaining_bytes(unlimited,unlimited_current)==
+    std::numeric_limits<std::uint64_t>::max());
+}
+
+void test_published_outputs_cleaned_after_readback_failure()
+{
+  const std::string suffix=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::string output="rpmd_ja_cleanup_test_"+suffix,sidecar=output+".stability";
+  const std::string output_tmp=output+".tmp",sidecar_tmp=sidecar+".tmp",pack=output+".pack";
+  auto write_file=[](const std::string& path){std::ofstream out(path,std::ios::binary);out<<"owned";out.close();
+    if(!out)throw std::runtime_error("could not create cleanup ownership fixture");};
+  bool injected=false;
+  try{
+    NativeFitScratchOwnership ownership;ownership.output=output;ownership.sidecar=sidecar;
+    ownership.output_tmp=output_tmp;ownership.sidecar_tmp=sidecar_tmp;ownership.pack=pack;
+    write_file(output);write_file(sidecar);write_file(output_tmp);write_file(sidecar_tmp);write_file(pack);
+    ownership.pack_owned=true;
+    take_published_prepare_ownership(ownership);
+    covariance_fit_test_hooks.fail_after_prepare_publication=true;
+    try{maybe_fail_after_prepare_publication_for_test();}
+    catch(const std::runtime_error& error){injected=std::string(error.what())=="TEST_PREPARE_POST_PUBLICATION_FAILURE";throw;}
+  }catch(const std::runtime_error&){}
+  if(!injected)throw std::runtime_error("post-publication prepare failure injection did not reach the cleanup handler");
+  for(const std::string& path:{output,sidecar,output_tmp,sidecar_tmp,pack}){
+    std::ifstream input(path,std::ios::binary);if(input.good())throw std::runtime_error("cleanup left an owned publication artifact");}
+}
 } // namespace
 
-int main()
+#ifndef GPUMD_RPMD_JA_NATIVE_FIT_TEST_LIBRARY
+int main(int argc,char** argv)
 {
+  if(argc!=3||std::string(argv[1])!="--fixture-dir"||argv[2][0]=='\0'){
+    std::fprintf(stderr,"usage: rpmd_ja_native_fit_cuda_test --fixture-dir <tests/data directory>\n");return 2;}
+  covariance_fit_test_fixture_directory=argv[2];
+  test_frozen_qp_fixture_consumer_identity();
+  test_feasibility_solver_stop_classification();
+  test_cgroup_host_memory_limit();
+  test_published_outputs_cleaned_after_readback_failure();
+  test_nonconverged_a0_baseline_restore_rebuilds_factors();
   test_cg_witness_vector_line_endings();
   test_fit_samples_entry_preserves_inputs();
   test_full_spd_failure_keeps_candidate_pack();
   test_response_uncomputed_values_are_explicit();
+  test_m0_only_resume_replays_only_a_missing_development_response();
+  test_frozen_response_snapshot_round_trip_and_identity_rejection();
+  test_publication_io_classification_and_two_rename_recovery();
+  test_regularization_response_delta_uses_full_predicted_matrix();
   test_probe_moments_centering_and_small_segments();
   test_ibp_diagnostic_status_is_not_a_numerical_gate();
   test_type_local_source_and_motion_diagnostics();
@@ -4055,12 +6030,15 @@ int main()
   test_response_extremes_map_to_internal_coordinates();
   test_covariance_training_statistics_include_symmetric_cross_terms();
   test_covariance_statistics_read_only_training_frames();
+  test_blind_fixed_r0_admission_reuses_training_channels_and_block_plan();
+  test_covariance_development_statistics_keep_fixed_training_center();
   test_covariance_probe_session_reuses_factors_and_rejects_stale_assembly();
   test_covariance_probe_refinement_improves_each_original_residual_and_rejects_large_error();
   test_covariance_force_residual_uses_training_frames_only();
   test_covariance_baseline_brackets_both_signs_and_zero();
   test_covariance_optimizer_updates_from_zero_baseline_and_recovers_harmonic_solution();
   test_covariance_trust_region_staged_barrier_harmonic_solve();
+  test_native_covariance_mid_a0_resume_preserves_original_start_and_stagnation_window();
   test_covariance_inverse_bfgs_spectrum_statuses();
   test_covariance_block_newton_optimizer_direction_trace();
   test_covariance_optimizer_boundary_start_preserves_prior_center_and_reports_status();
@@ -4094,11 +6072,23 @@ int main()
   test_covariance_edge_attribution_reconstructs_and_ranks();
   test_covariance_edge_attribution_reports_diffuse_top20_fractions();
   test_covariance_edge_capture_reconstructs_group_trace_and_statistics();
+  test_m1_statistics_compensate_projection_and_operator_mix();
+  test_fixed_internal_probe_statistics_detect_zero_com_internal_shift();
+  test_admission_statistics_storage_peak_boundary();
+  test_m1_gpu_chain_matches_cpu_and_dense_reference();
+  test_m1_bridge_images_share_hydrogen_anchored_branch();
+  test_fixed_physical_response_probes_are_frozen_and_ranked();
+  test_native_m1_writer_reader_cross_neighbor_images_and_transport();
   test_covariance_trace_wide_solve_matches_cpu_and_filters_failed_tail();
   test_covariance_gemm_original_residual_matches_cpu();
   test_covariance_strict_residual_failure_updates_overall_worst();
   test_covariance_saved_gradient_does_not_require_baseline_shifted_solve();
   test_covariance_state_parser_accepts_lf_and_crlf();
+  test_covariance_checkpoint_round_trip_and_corruption_rejection();
+  test_feasibility_manifest_parser_accepts_lf_and_crlf();
+  test_feasibility_manifest_freezes_independent_curvature_contract();
+  test_feasibility_manifest_freezes_candidate_cost_contract();
+  test_feasibility_manifest_freezes_experiment_contract();
   test_covariance_state_tau_comparison_is_relative_for_small_values();
   test_covariance_failed_trial_does_not_replace_last_valid_point();
   test_covariance_prior_mixing_formula();
@@ -4110,7 +6100,22 @@ int main()
   test_pap_baseline();
   test_baseline_batch_matches_gemv();
   DeviceQR qr;qr.initialize(2,3);
+  test_a0_soft_modes_use_covariance_baseline_point(qr.solver);
   test_covariance_operator_gram_includes_shared_atom_overlap(qr.solver);
+  test_covariance_direct_hessian_preconditioner(qr.solver);
+  test_covariance_centered_ridge_objective_and_tau_cache();
+  test_covariance_original_residual_gates_convergence();
+  test_feasibility_same_file_path_aliases();
+  test_covariance_solve_write_diagnose_replay_without_ridge();
+  test_covariance_prior_calibration_ignores_m1_tail();
+  test_budget_observation_classifies_hard_clock_errors();
+  test_m1_covariance_calibration_uses_only_base_prefix_in_replay();
+  test_covariance_factor_identity_recovery();
+  test_covariance_directional_curvature_requires_stable_resolved_match();
+  test_covariance_analytic_curvature_whitened_gram();
+  test_covariance_fit_workspace_grows_reuses_and_releases();
+  test_covariance_fit_workspace_is_reused_by_sequential_system_curvature_builds();
+  test_covariance_device_workspace_reuses_buffers_static_graph_and_same_point_factors();
   test_covariance_local_group_hessian_matches_tiny_objective_fd(qr.solver);
   test_covariance_block_newton_host_arithmetic();
   test_covariance_trust_region_residual_rejection_is_transactional();
@@ -4129,17 +6134,22 @@ int main()
   test_stability_cut_guard_reduces_rotating_mode_rounds(qr.solver);
   test_lanczos_staged_early_exit(qr.solver);
   test_lanczos_continues_across_checkpoints(qr.solver);
+  test_lanczos_iteration_budget_interrupts_one_overrun(qr.solver);
   test_lanczos_curvature_rounding_boundary(qr.solver);
   test_lanczos_deep_search_does_not_early_cut(qr.solver);
   test_lanczos_finite_internal_space(qr.solver);
   test_projected_cg_curvature_witness();
   test_production_true_residual_recovery();
   test_bounded_cg_replay_refinement();
+  test_compensated_m1_local_action_recovers_cancellation();
   test_compensated_cg_true_residual_action();
   test_replay_rejects_existing_report_before_reading_inputs();
   test_cg_failure_snapshot_round_trip_replay();
   test_lanczos_blindspot_cg_cut_feedback(qr.solver);
   test_lanczos_independent_seed_escapes_invariant_subspace(qr.solver);
   test_probe_selection_skips_duplicate_low_modes();
+  test_common_low_ritz_modes_get_probe_rank_before_fixed_channels();
+  test_common_probe_rank_is_capped_for_nearly_full_fixed_basis(qr.solver);
   test_probe_covariance_and_ibp(qr.solver);
 }
+#endif

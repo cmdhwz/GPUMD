@@ -40,8 +40,8 @@ assert 'FIT_STATUS ACCEPTED_REFERENCE response=PASS full_spd=PASS sample_IBP_DIA
 assert 'response_IBP_DIAGNOSTIC=' in native_fit and 'IBP_acceptance_role DIAGNOSTIC_ONLY' in native_fit
 fit_impl_start = native_fit.index("static bool fit_rpmd_ja_native_reference_impl(")
 fit_impl = native_fit[fit_impl_start:]
-assert fit_impl.index("collect_fixed_probe_statistics(in,header") < fit_impl.index("std::ofstream trace(trace_path")
-assert fit_impl.index("std::ofstream trace(trace_path") < fit_impl.index("generate_rpmd_ja_qnep_raw(")
+assert fit_impl.index("collect_fixed_probe_statistics(in,header") < fit_impl.index("rpmd_ja_file_io::ofstream trace(trace_path")
+assert fit_impl.index("rpmd_ja_file_io::ofstream trace(trace_path") < fit_impl.index("generate_rpmd_ja_qnep_raw(")
 assert "PREFLIGHT_NUMERICAL_FAILURE sample_IBP_status" in fit_impl
 assert "type-local seed vectors are translation-projected and orthogonalized" in native_fit
 assert "SOURCE_ATOM_MOTION" in native_fit and "maximum_adjacent_sampled_frame_displacement" in native_fit
@@ -52,7 +52,7 @@ assert 'if (tokens[1] == "check_samples")' in run
 assert 'check_rpmd_ja_native_fit_samples(tokens[2], tokens[3], atom, box)' in run
 assert "void check_rpmd_ja_native_fit_samples(" in native_header
 check_samples_start = native_fit.index("void check_rpmd_ja_native_fit_samples(")
-check_samples_end = native_fit.index("\n}\n\nvoid diagnose_rpmd_ja_native_covariance", check_samples_start)
+check_samples_end = native_fit.index("\n}\n", check_samples_start)
 check_samples_body = native_fit[check_samples_start:check_samples_end]
 assert "read_header(in,0,atom,box,0.0,true)" in check_samples_body
 assert "read_training_r0" in check_samples_body and "collect_fixed_probe_statistics" in check_samples_body
@@ -60,7 +60,7 @@ assert "train,r0,true,0.15,&box" in check_samples_body
 assert "collect_fixed_probe_statistics" in check_samples_body and "format_fixed_probe_report" in check_samples_body
 assert "qraw" not in check_samples_body and "make_graph" not in check_samples_body and "lanczos" not in check_samples_body
 replay_body = native_fit[native_fit.index("void replay_rpmd_ja_native_cg("):native_fit.index("#else", native_fit.index("void replay_rpmd_ja_native_cg("))]
-assert replay_body.index("std::ifstream existing_report") < replay_body.index("read_cg_witness_paths")
+assert replay_body.index("rpmd_ja_file_io::ifstream existing_report") < replay_body.index("read_cg_witness_paths")
 assert "validate_qraw_identity" in replay_body and "compute_cg_true_residual_compensated" in native_fit
 assert "fast_true_relative_residual" in replay_body and "compensated_true_relative_residual" in replay_body
 assert "NOT_ACCEPTED_REFERENCE" in replay_body and "write_text_exclusive" in replay_body
@@ -75,7 +75,7 @@ for field in ("production_recovery_attempted", "production_recovery_status", "pr
 assert "production_recovery_gate_pass" in replay_body and "replay_cg_status" in replay_body
 assert "replay_cg" in run and "replay_rpmd_ja_native_cg" in run
 parser_body = native_fit[native_fit.index("CGWitnessSnapshot read_cg_witness("):native_fit.index("bool preserve_candidate_package_on_full_spd_failure(")]
-vector_body = parser_body[parser_body.index('if(key=="theta"||'):parser_body.index('}else if(key=="status")')]
+vector_body = parser_body[parser_body.index('if(key=="theta"||'):parser_body.index('else if(key=="status")')]
 assert "vector has trailing data" in vector_body and "continue;" in vector_body
 assert "test_cg_witness_vector_line_endings();" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "cannot replace final response validation" in native_fit
@@ -93,7 +93,7 @@ assert "tail_probe_scope ALL_FQ_AND_QQ_PRODUCTS_IN_SELECTED_PROBE_SUBSPACE" in n
 assert "moments.covariance_fq()" in native_fit and "lag_autocorrelation lags=1,2,5,10" in native_fit
 assert "std::vector<std::vector<double>> history" in native_fit and "history.size()>10" in native_fit
 assert "if(collect_lags){result.lags[0].add(qp)" in native_fit
-assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance,&box)" in native_fit
+assert "collect_fixed_probe_statistics(in,header,frame_count,static_cast<std::uint64_t>(train),r0,false,options.ibp_tolerance,&box,&common_physical_probes)" in native_fit
 assert 'if(ibp_statistics_numerically_invalid(sample_statistics.ibp_band))' in native_fit
 assert "bootstrap_metric_band" in native_fit and "nonsymmetric_matrix_distance" in native_fit
 assert "std::vector<int> bootstrap_block_factors(const std::size_t block_count)" in native_fit
@@ -122,7 +122,7 @@ assert "write_response_state(response_state_path,response,theta" in native_fit
 assert "response_probe_basis_coefficients(invroot,re.vectors,m,worst_response)" in native_fit
 assert '"IBP_residual_nonsymmetric"' in native_fit and '"whitened_response_difference"' in native_fit
 assert "worst_IBP_right_singular_probe_basis_coefficients (from eigenvector of E^T E)" in native_fit
-assert 'std::fopen(path.c_str(),"wx")' in native_fit
+assert 'rpmd_ja_file_io::open_file(path,"wx")' in native_fit
 
 force_call = run.index("compute_force();", run.index("for (int step = 0; step < number_of_steps"))
 sample_call = run.index("measure.post_force(", force_call)
@@ -154,9 +154,9 @@ assert "pbc_[0] != 1 || pbc_[1] != 1 || pbc_[2] != 1" in sampler
 assert "size_stream.close();" in sampler
 assert "stream limits" in sampler
 assert "preserve_replay_inputs = fit_rpmd_ja_native_reference(options, spool_path_, frame_count_, atom, box, *force_)" in sampler
-assert "if (preserve_replay_inputs)" in sampler and "retained sample spool for CG replay" in sampler
+assert "if (preserve_replay_inputs)" in sampler and "retained sample spool and provenance for CG replay" in sampler
 assert "cg_recovery_replay_inputs_retained" in native_fit and "cg_recovery_sample_spool" in native_fit and "cg_recovery_qraw" in native_fit
-assert "saved_recovery_witness_paths.empty()&&std::remove(generated_raw_path.c_str())!=0" in native_fit
+assert "generate_raw&&saved_recovery_witness_paths.empty()?generated_raw_path:std::string{}" in native_fit
 assert "struct RpmdJANativeFitOptions" in native_header
 assert "std::uint64_t frame_count" in native_header
 assert "int max_stability_rounds = 160;" in native_header
@@ -182,15 +182,21 @@ assert "max_rounds <N>" in fit_samples_parser and "[<qraw>] [max_rounds <N>]" in
 assert 'if (tokens[1] == "fit_samples_covariance")' in run
 assert 'if (tokens[1] == "diagnose_covariance")' in run
 assert 'diagnose_rpmd_ja_native_covariance(tokens[2], tokens[3]' in run
-assert 'tokens.size() < 14 || tokens.size() > 16' in run
+assert 'tokens.size() < 14 || tokens[10] != "shrinkage" || tokens[12] != "max_iter"' in run
+assert 'for (std::size_t token = 14; token < tokens.size(); ++token)' in run
+assert 'tokens[token] == "feasibility"' in run and 'tokens[token] == "structured_basis"' in run
+assert 'tokens[token] == "blind_samples"' in run and 'tokens[token] == "blind_manifest"' in run
+assert 'blind_samples_seen!=blind_manifest_seen' in run
+assert 'feasibility requires trust_region' not in run
 assert 'tokens[token] == "trust_region"' in run and 'tokens[token] == "staged_barrier"' in run
 assert 'fit_samples_covariance step modes are mutually exclusive' in run
 assert "RpmdJANativeFitMethod::GaussianCovarianceShrinkage" in run
 assert "double covariance_shrinkage = 0.0;" in native_header and "int max_covariance_iterations = 0;" in native_header
 assert "collect_covariance_fit_statistics" in native_fit and "add_covariance_frame_statistics" in native_fit
 assert "const double components[6]={dx[0]*dx[0],2.0*dx[0]*dx[1]" in native_fit
-assert "if(edge_sums)(*edge_sums)[6*e+k]+=components[k];if(block_sums)(*block_sums)[p+k]+=components[k]" in native_fit
-assert "sums[p+k]+=components[k]" in native_fit and "block_count_frames[index]" in native_fit
+assert "if(edge_sums)(*edge_sums)[6*e+k]+=components[k];" in native_fit
+assert "if(block_sums)(*block_sums)[parameter]+=input[parameter];" in native_fit
+assert "input[p+k]+=components[k]" in native_fit and "block_count_frames[index]" in native_fit
 assert "build_graph_covariance_baseline" in native_fit and "D_b-epsilon I positive definite" in native_fit
 assert "covariance_decompose_gradient" in native_fit and "gradient_data" in native_fit and "gradient_barrier" in native_fit
 assert "covariance_gather_original_solve_residual" in native_fit and "cublasDgemm" in native_fit
@@ -214,7 +220,7 @@ assert "refinement<2" in probe_solve and "factor_residual_pre" in probe_solve an
 assert "assembly_generation" in native_fit and "later matrix assembly" in probe_solve
 assert native_fit.index('parse_double("last_valid_tau")') < native_fit.index("DeviceBaseline baseline_device", native_fit.index('void diagnose_rpmd_ja_native_covariance('))
 assert "ARMIJO_ACCEPTED" in native_fit and "STEP_COMMITTED" in native_fit and "last_valid_theta" in native_fit
-assert "state_format_version 2" in native_fit and "parameter_map_validation" in native_fit
+assert "state_format_version 4" in native_fit and "parameter_map_validation" in native_fit
 assert "negative graph-Laplacian feasibility boundary" in native_fit and "distance*=2.0" in native_fit
 left_expansion = native_fit.split("auto expand_left=[&](){", 1)[1].split("auto expand_right", 1)[0]
 right_expansion = native_fit.split("auto expand_right=[&](){", 1)[1].split("const bool left_descends", 1)[0]
@@ -224,12 +230,14 @@ assert "parameter_basis_norms" in native_fit and "coordinate_scales" in native_f
 assert "tau_min=std::nextafter(target_gap/static_cast<double>(system.r),0.0)" in native_fit
 assert "if(tau<=tau_min)" in native_fit and "raw_gradient_inf_norm" in native_fit
 assert "complete_covariance_fit_gradient_from_factors" in native_fit
-assert "complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,candidate.cached_theta,tau)" in native_fit
+assert "complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,candidate.cached_theta,tau," in native_fit
 assert "complete_covariance_fit_gradient_from_factors(system,candidate,baseline,statistics,rho,epsilon,trial_theta,tau)" not in native_fit
-assert "evaluate_covariance_fit_objective" in native_fit and "0.5*(1.0+rho)*trace[i]" in native_fit
+assert "evaluate_covariance_fit_objective" in native_fit and "value.gradient_data[i]=0.5*(statistics[i]-trace[i])" in native_fit
+assert "value.gradient_prior[i]=0.5*rho*(baseline_trace[i]-trace[i])" in native_fit
 assert "cusolverDnDpotrf" in native_fit and "cusolverDnDpotrs" in native_fit
 assert "COVARIANCE_OPTIMIZER_CONVERGED" in native_fit and "LINE_SEARCH_FAILED" in native_fit
-assert "max_initialization_evaluations=16" in native_fit and "result.theta_start=start_theta" in native_fit
+assert "max_initialization_evaluations=16" in native_fit and "resume_state?resume_state->theta_start:start_theta" in native_fit
+assert "resume_state?resume_state->theta:result.theta_start" in native_fit
 assert "result.theta_baseline=baseline.theta" in native_fit and "baseline.trace" in native_fit
 assert "evaluate_initialization(trial_theta,false)" in native_fit and "current=evaluate_initialization(result.theta,true)" in native_fit
 assert 'initialization_phase="SHRINK"' in native_fit and 'initialization_phase="EXPAND"' in native_fit and "stop_reason " in native_fit
@@ -266,7 +274,7 @@ assert "class CovarianceSolveResidualError" in native_fit
 assert "throw CovarianceSolveResidualError(diagnostic)" in native_fit
 complete_gradient = native_fit.split("void complete_covariance_fit_gradient_from_factors(", 1)[1].split("std::vector<double> covariance_scaled_gradient(", 1)[0]
 assert "catch(CovarianceSolveResidualError& error)" in complete_gradient and "error.d_trace=system.last_d_trace" in complete_gradient
-assert "covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau)" in complete_gradient
+assert "covariance_decompose_gradient(value,statistics,baseline.trace,trace,shifted_trace,rho,tau,&theta,&baseline.theta,&coordinate_scale,ridge_lambda)" in complete_gradient
 backtracking = native_fit.split("CovarianceBacktrackingResult covariance_backtrack_armijo(", 1)[1].split("CovarianceFitResult solve_covariance_reference(", 1)[0]
 assert "catch(const CovarianceSolveResidualError& error)" in backtracking and "status=GRADIENT_RESIDUAL_REJECT" in backtracking
 assert "gradient_residual_reject_trials" in backtracking and "evaluation_budget_exhausted" in backtracking
@@ -321,7 +329,7 @@ assert "covariance_backtrack_armijo" not in trust_optimizer
 assert 'shrink_source="DIRECTIONAL_SECANT"' in native_fit
 assert "std::min((joint_bfgs_directional_secant?0.5:0.9)*alpha,proposed)" in native_fit
 assert 'const bool joint_bfgs_line_search=joint_block&&(choice.method=="BFGS"||choice.method=="GROUP_BFGS")' in covariance_optimizer
-assert "joint_bfgs_line_search,joint_bfgs_line_search);" in covariance_optimizer
+assert "joint_bfgs_line_search,joint_bfgs_line_search,&baseline.theta);" in covariance_optimizer
 overshoot_backtrack = backtracking.split("if(directional_overshoot)", 1)[1].split("have_valid_candidate=true", 1)[0]
 assert "if(joint_bfgs_directional_secant||objective_only_expansion)" in overshoot_backtrack and "COVARIANCE_OVERSHOOT_BACKTRACK" in overshoot_backtrack
 assert "alpha*=0.5" not in overshoot_backtrack
@@ -397,15 +405,16 @@ assert "test_covariance_scaled_trial_round_trip_underflow" in source("tests/rpmd
 assert "barrier_center_condition_pass" in native_fit and "barrier_center_condition_status" in native_fit
 assert "write_covariance_state(covariance_state_path" in native_fit
 assert "objective_data" in native_fit and "baseline_epsilon_constraint_status" in native_fit
-assert "if(covariance_method){" in fit_impl and "else{\n  int search_depth=" in fit_impl
+assert "if(covariance_method&&options.covariance_feasibility){" in fit_impl
+assert "}else if(!covariance_method){\n  int search_depth=" in fit_impl
 assert "derived.temperature=header.temperature" in native_fit and "derived.sample_interval=static_cast<int>(std::llround(sample_interval))" in native_fit
 assert "fit_rpmd_ja_native_reference_checked(derived,spool_path,header.frame_count,atom,box,force,true)" in native_fit
 assert "validate_qraw_identity(raw,options,header,r0,box,force)" in native_fit
 assert "model!=expected_model||config!=expected_config" in native_fit
 assert "raw_types[i]==header.types[i]&&raw_masses[i]==header.masses[i]" in native_fit
 assert "raw_positions[i]-r0[i]" in native_fit
-assert "generate_raw&&saved_recovery_witness_paths.empty()&&std::remove(generated_raw_path.c_str())" in native_fit
-assert "options.raw_input_path.empty()?generated_raw_path:options.raw_input_path" in native_fit
+assert "generate_raw&&saved_recovery_witness_paths.empty()?generated_raw_path:std::string{}" in native_fit
+assert "raw_path=generate_raw?generated_raw_path:options.raw_input_path" in native_fit
 assert '#include "force/nep_charge.cuh"' in native_fit
 assert 'record_search("FIXED_INDEPENDENT"' in native_fit
 assert 'lanczos_low_modes(qr.solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,options.epsilon,initial_vector,&lanczos_workspace)' in native_fit
@@ -436,7 +445,9 @@ assert 'preserve_candidate_package_on_full_spd_failure(e.what(),own_scratch.pack
 assert 'qNEP translation-complement Hessian is not positive definite' in source("src/measure/rpmd_ja_qnep_prepare.cu")
 assert 'qNEP translation-complement Hessian is not positive definite' in native_fit
 assert 'std::sort(modes.begin(),modes.end()' in native_fit
-assert 'low_mode_probes<4' in native_fit and 'if(add(soft[i].vector,"LOW_RITZ",-1))++low_mode_probes' in native_fit
+assert 'for(std::size_t i=0;i<soft.size()&&static_cast<int>(probes.size())<rank_limit;++i)' in native_fit
+assert 'rank_limit=maximum_probe_rank<0?internal:std::min(internal,maximum_probe_rank)' in native_fit
+assert 'add(soft[i].vector,"LOW_RITZ",-1);' in native_fit
 assert 'observed_cov_status=' in native_fit and 'predicted_cov_status=' in native_fit
 assert 'response_ibp_status=' in native_fit and 'NOT_COMPUTED' in native_fit
 spectral_start = native_fit.index("std::vector<double> spectral_row(")
@@ -481,7 +492,7 @@ assert "recover_cg_true_residual_failure(" in probe_validation_body and "predict
 assert "cg_verification_method=" in native_fit and "cg_probe_recovery_" in native_fit
 assert "write_recovered_cg_witnesses(" in native_fit
 assert "test_production_true_residual_recovery" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
-assert "write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay)" in native_fit
+assert "write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay,&graph)" in native_fit
 assert "rhs_input_xyz_soa" in native_fit and "rhs_projected_xyz_soa" in native_fit and "solution_x_xyz_soa" in native_fit and "active_config_fingerprint" in native_fit
 assert 'true_residual_status "<<(w.true_residual_computed?"COMPUTED":"NOT_COMPUTED")' in native_fit
 assert 'cg_true_residual_status="<<(true_residual_computed?"COMPUTED":"NOT_COMPUTED")' in native_fit
@@ -561,7 +572,7 @@ assert "covariance_fixed_coordinate_fd(" in covariance_diagnostic and "fd_evalua
 assert "prepare_rpmd_ja" not in covariance_diagnostic
 assert "test_response_snapshot_preserves_recomputable_matrices" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_active_set_qp_snapshot_and_rejection" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
-assert "tests/data/ja_reference_resample.bin.qp_state.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert 'covariance_fit_test_fixture_path("ja_reference_resample.bin.qp_state.txt")' in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "test_outer128_stationarity_joint_polish" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert (ROOT / "tests/data/ja_reference_outer128_766cuts_stationarity_v1.qp_fixture.txt").stat().st_size > 1_000_000
@@ -647,15 +658,17 @@ pre_run_end = sampler_fit.index("void RpmdJA_Fit::post_force(", pre_run_start)
 pre_run_body = sampler_fit[pre_run_start:pre_run_end]
 assert 'lock_path_ = output_path_ + ".fit.lock";' in sampler_fit
 assert 'output_path_ + ".fit.txt.tmp"' in pre_run_body
-assert pre_run_body.index("if (file_exists(path))") < pre_run_body.index('std::fopen(lock_path_.c_str(), "wx")')
-assert pre_run_body.index('std::fopen(lock_path_.c_str(), "wx")') < pre_run_body.index("spool_.open(")
+assert pre_run_body.index("if (file_exists(path))") < pre_run_body.index('rpmd_ja_file_io::open_file(lock_path_, "a+b")')
+assert pre_run_body.index('rpmd_ja_file_io::open_file(lock_path_, "a+b")') < pre_run_body.index("rpmd_ja_process_lock::try_lock(lock_file_)")
+assert pre_run_body.index("rpmd_ja_process_lock::try_lock(lock_file_)") < pre_run_body.index("spool_.open(")
 
 release_start = sampler_fit.index("void RpmdJA_Fit::release_lock_()")
 release_end = sampler_fit.index("void RpmdJA_Fit::pre_run(", release_start)
 release_body = sampler_fit[release_start:release_end]
 assert "std::fclose(lock_file_);" in release_body
 assert "lock_file_ = nullptr;" in release_body
-assert "std::remove(lock_path_.c_str());" in release_body
+assert "rpmd_ja_process_lock::unlock(lock_file_);" in release_body
+assert "rpmd_ja_file_io::remove_file(lock_path_);" not in release_body
 assert "RpmdJA_Fit::~RpmdJA_Fit() { release_lock_(); }" in sampler_fit
 
 post_run_start = sampler_fit.index("void RpmdJA_Fit::post_run(")
@@ -672,7 +685,7 @@ assert fit_post_body.index("catch (...) {") < fit_post_body.index("release_lock_
 assert fit_post_body.rindex("release_lock_();") > 0
 assert "bool preserve_replay_inputs = false;" in post_run_body
 assert "preserve_replay_inputs = fit_rpmd_ja_native_reference(" in post_run_body
-assert "else if (std::remove(spool_path_.c_str()) != 0)" in fit_post_body
+assert "else if (rpmd_ja_file_io::remove_file(spool_path_) != 0)" in fit_post_body
 
 assert "__host__ __device__ inline bool rpmd_ja_fit_mic(" in sampling
 assert "nearbyint(sx)" in sampling and "nearbyint(sy)" in sampling and "nearbyint(sz)" in sampling
@@ -719,7 +732,7 @@ check_multicell_mic([[4.0, 0.7, -0.3], [0.0, 3.5, 0.4], [0.2, 0.0, 5.0]],
                     [0.15, 0.2, -0.3], [-3.0, 4.0, 2.0])
 
 assert "bool covariance_block_newton = false;" in native_header
-assert "fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier]." in run
+assert "fit_samples_covariance requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier] [ridge <lambda>] [analytic_curvature <16|32|64|128>] [feasibility] [structured_basis] [blind_samples <samples_file>] [blind_manifest <manifest_file>]." in run
 assert "options.max_covariance_iterations,&trace,options.covariance_block_newton,options.covariance_joint_block," in native_fit
 assert "options.covariance_trust_region,options.covariance_staged_barrier" in native_fit
 assert "COVARIANCE_DIRECTION_MODE block_newton=" in native_fit
@@ -783,13 +796,22 @@ assert "ratio<0.1" in native_fit and "ratio<0.25" in native_fit and "ratio>0.75&
 assert "full_gradient_evaluations" in native_fit and "trust_region_radius_resolves" in native_fit
 assert "covariance_barrier_stage_tolerance" in native_fit and "std::max(1e-6,1e-2*tau)" in native_fit
 assert "covariance_barrier_stage_pass(current,result.scaled_kkt_residual,tau,tau_min,staged_barrier)" in native_fit
-assert "covariance_recompose_objective_for_tau(current,result.theta,baseline,statistics,rho,epsilon,tau)" in native_fit
+assert "covariance_recompose_objective_for_tau(current,result.theta,baseline,statistics,rho,epsilon,tau,coordinate_scale,ridge_lambda)" in native_fit
 assert "value.cached_theta!=theta||value.cached_epsilon!=epsilon" in native_fit
 assert "covariance_paired_log_ratio" in native_fit and "current.cached_theta!=current_theta" in native_fit
 assert "covariance_trust_region_prediction_resolution" in native_fit and "covariance_local_difference_resolution" in native_fit
 assert "COVARIANCE_PRIOR_CALIBRATION" in native_fit and "COVARIANCE_PRIOR_BLOCK" in native_fit
 assert "COVARIANCE_PRIOR_ANCHOR prior_center=theta_baseline initialization_point=theta_start" in native_fit
-assert "selection=USER_SUPPLIED_POSITIVE_RHO block_spread_is_not_uncertainty=1" in native_fit
+assert "selection=USER_SUPPLIED_RHO block_spread_is_not_uncertainty=1" in native_fit
+assert "parameter_scope=M0_BASE_PREFIX" in native_fit and "group<base_parameter_count/6" in native_fit
+assert "COVARIANCE_PRIOR_M1_ADDED_DIRECTIONS" in native_fit and "status=NOT_APPLICABLE reason=NO_TYPEPAIR_PROXY" in native_fit
+assert "const std::size_t calibration_parameter_count=system.graph.raw_local_parameter_count>0?" in native_fit
+assert "const std::size_t calibration_parameter_count=m1_family?" in native_fit
+assert "void covariance_require_expected_budget_observation(" in native_fit
+assert 'covariance_require_expected_budget_observation(clock_status,"run_family candidate entry")' in native_fit
+assert 'covariance_require_expected_budget_observation(b_gate_accounting_status,"COMMON_PROBE_B_GATE_ACCOUNTING")' in native_fit
+assert "test_covariance_prior_calibration_ignores_m1_tail" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
+assert "test_budget_observation_classifies_hard_clock_errors" in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 assert "training_block_statistics_" in native_fit and "training_block_frames_" in native_fit
 assert 'compare_saved_vector(parse_vector(stats_key.c_str()),training_block_statistics[block],"training block statistics")' in native_fit
 assert 'optimizer_step_mode_saved ' in native_fit and 'staged_barrier_enabled_saved ' in native_fit
@@ -804,7 +826,7 @@ joint_ray_branch = covariance_optimizer.split('if(choice.method=="JOINT_BLOCK"){
 assert "covariance_joint_ray_proposal(" in joint_ray_branch
 assert 'ray_attempt.status="NOT_USED_"+choice.method' in covariance_optimizer
 assert "ray_attempt.eigen_evaluations=joint_direction_result.ray_eigen_evaluations" in covariance_optimizer
-assert "joint_bfgs_line_search,joint_bfgs_line_search);" in covariance_optimizer
+assert "joint_bfgs_line_search,joint_bfgs_line_search,&baseline.theta);" in covariance_optimizer
 assert covariance_optimizer.index('if(joint_block){ray_attempt.line_status="PROPOSAL_READY"') < covariance_optimizer.index("covariance_backtrack_armijo(")
 assert covariance_optimizer.index("result.joint_block_factorizations+=joint_factorizations") < covariance_optimizer.index("covariance_joint_ray_proposal(")
 assert covariance_optimizer.index("z=std::move(next_z)") < covariance_optimizer.index('if(joint_block){ray_attempt.line_status="STEP_COMMITTED"')
@@ -837,6 +859,9 @@ assert "group_bfgs_committed_updates" in native_fit and "COVARIANCE_GROUP_BFGS_C
 assert "group_bfgs_committed_update_status=" in covariance_optimizer
 assert "write_covariance_group_bfgs_diagnostics(fitout,covariance_fit)" in native_fit
 assert "fit.group_bfgs_update_status[group]" in native_fit
+sample_fit = (ROOT / "src/measure/rpmd_ja_fit.cu").read_text(encoding="utf-8")
+assert 'MEAN_OF_PHYSICAL_PIMD_BEAD_FORCES\\""' in sample_fit
+assert 'MASS_WEIGHTED_CUMULATIVE_CENTROID_DRIFT_REMOVAL\\""' in sample_fit
 
 
 # Independent binary64 oracle for a theta/scale reconstruction just outside the radius.

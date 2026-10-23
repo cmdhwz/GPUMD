@@ -22,6 +22,13 @@
 #include <cusolverDn.h>
 #endif
 
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+namespace rpmd_ja_qnep_prepare_test
+{
+std::function<void(const std::string&)> after_publish_before_readback;
+}
+#endif
+
 namespace
 {
 constexpr int tile_size = 128;
@@ -29,6 +36,28 @@ constexpr double raw_difference_tolerance = 5.0e-2;
 constexpr double tile_tolerance = 1.0e-8;
 constexpr char raw_magic[8] = {'G','P','J','Q','R','A','W','\0'};
 constexpr char raw_layout[] = "xyz_soa;derivative_input_rows_output_columns";
+
+std::vector<double> block_matrix_action(const RpmdJABlockMatrix& matrix,
+  const std::vector<double>& input)
+{
+  std::vector<double> output(input.size(),0.0);
+  for(const RpmdJAMatrixTile& tile:matrix.tiles){
+    if(tile.rank==0){
+      for(int row=0;row<tile.rows;++row)for(int column=0;column<tile.columns;++column)
+        output[static_cast<std::size_t>(tile.row+row)]+=
+          tile.left[static_cast<std::size_t>(row)*tile.columns+column]*input[static_cast<std::size_t>(tile.column+column)];
+    }else{
+      std::vector<double> inner(static_cast<std::size_t>(tile.rank),0.0);
+      for(int rank=0;rank<tile.rank;++rank)for(int column=0;column<tile.columns;++column)
+        inner[rank]+=tile.right[static_cast<std::size_t>(rank)*tile.columns+column]*
+          input[static_cast<std::size_t>(tile.column+column)];
+      for(int row=0;row<tile.rows;++row)for(int rank=0;rank<tile.rank;++rank)
+        output[static_cast<std::size_t>(tile.row+row)]+=
+          tile.left[static_cast<std::size_t>(row)*tile.rank+rank]*inner[rank];
+    }
+  }
+  return output;
+}
 
 template <typename T> void read_value(std::istream& in, T& value)
 {
@@ -59,7 +88,7 @@ struct Raw
 
 Raw read_raw_header(const std::string& path)
 {
-  std::ifstream in(path, std::ios::binary);
+  rpmd_ja_file_io::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("cannot open qNEP rpmd_ja raw file: " + path);
   char magic[8], layout[sizeof(raw_layout)];
   std::uint32_t version = 0, endian = 0;
@@ -157,6 +186,16 @@ void cuda_check(const cudaError_t status, const char* where)
 { if (status != cudaSuccess) throw std::runtime_error(std::string(where) + ": " + cudaGetErrorString(status)); }
 void solver_check(const cusolverStatus_t status, const char* where)
 { if (status != CUSOLVER_STATUS_SUCCESS) throw std::runtime_error(std::string(where) + " failed"); }
+struct SolverWorkspaceElements{int potrf=0,svd=0;};
+SolverWorkspaceElements query_solver_workspace_elements(cusolverDnHandle_t solver,const int r,double* query_matrix)
+{
+  SolverWorkspaceElements sizes;
+  solver_check(cusolverDnDpotrf_bufferSize(solver,CUBLAS_FILL_MODE_LOWER,r,query_matrix,r,&sizes.potrf),
+    "cusolverDnDpotrf_bufferSize");
+  solver_check(cusolverDnDgesvd_bufferSize(solver,tile_size,tile_size,&sizes.svd),"cusolverDnDgesvd_bufferSize");
+  if(sizes.potrf<=0||sizes.svd<=0)throw std::runtime_error("cuSOLVER returned a nonpositive prepare workspace size");
+  return sizes;
+}
 void blas_check(const cublasStatus_t status, const char* where)
 { if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string(where) + " failed"); }
 __global__ void compact_physical(const double* a, double* p, int d, int r, int n);
@@ -603,16 +642,42 @@ void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* inpu
 #endif
 } // namespace
 
-void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::string& output_path, const std::string& kernel_table_path,
-                                    const RpmdJAModeValidator& mode_validator, const std::string& additive_path)
+RpmdJAPrepareWorkspaceSizes query_rpmd_ja_qnep_prepare_workspace_sizes(const int atom_count)
 {
 #ifdef USE_HIP
-  (void)raw_path; (void)output_path; (void)kernel_table_path; (void)mode_validator; (void)additive_path;
+  (void)atom_count;throw std::runtime_error("qNEP rpmd_ja prepare workspace query currently requires CUDA cuSOLVER");
+#else
+  if(atom_count<2||atom_count>(std::numeric_limits<int>::max()-3)/3)
+    throw std::invalid_argument("qNEP rpmd_ja prepare workspace query has an invalid atom count");
+  cusolverDnHandle_t solver=nullptr;double* query_matrix=nullptr;
+  try{
+    solver_check(cusolverDnCreate(&solver),"create cuSOLVER for prepare workspace query");
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&query_matrix),sizeof(double)),"allocate scalar POTRF query matrix");
+    const SolverWorkspaceElements elements=query_solver_workspace_elements(solver,3*atom_count-3,query_matrix);
+    RpmdJAPrepareWorkspaceSizes sizes;
+    sizes.potrf_workspace_bytes=static_cast<std::uint64_t>(elements.potrf)*sizeof(double);
+    sizes.svd_workspace_bytes=static_cast<std::uint64_t>(elements.svd)*sizeof(double);
+    cuda_check(cudaFree(query_matrix),"free scalar POTRF query matrix");query_matrix=nullptr;
+    solver_check(cusolverDnDestroy(solver),"destroy cuSOLVER prepare workspace query");solver=nullptr;
+    return sizes;
+  }catch(...){if(query_matrix)cudaFree(query_matrix);if(solver)cusolverDnDestroy(solver);throw;}
+#endif
+}
+
+void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::string& output_path, const std::string& kernel_table_path,
+                                    const RpmdJAModeValidator& mode_validator, const std::string& additive_path,
+                                    const std::function<void(const RpmdJAAdditiveData&)>& additive_validator,
+                                    const RpmdJAPrepareResourceObserver& resource_observer,
+                                    const RpmdJAPrepareAllocationObserver& allocation_observer)
+{
+#ifdef USE_HIP
+  (void)raw_path; (void)output_path; (void)kernel_table_path; (void)mode_validator; (void)additive_path; (void)additive_validator;
+  (void)resource_observer; (void)allocation_observer;
   throw std::runtime_error("qNEP rpmd_ja reference preparation currently requires CUDA cuSOLVER");
 #else
   if (raw_path.empty() || output_path.empty() || kernel_table_path.empty()) throw std::invalid_argument("qNEP rpmd_ja prepare requires raw, output, and kernel-table paths");
   const std::string sidecar_path = output_path + ".stability", tmp_path = output_path + ".tmp", side_tmp = sidecar_path + ".tmp", failure_path = output_path + ".failure.txt";
-  std::ifstream ex1(output_path), ex2(sidecar_path), ex3(tmp_path), ex4(side_tmp), ex5(failure_path);
+  rpmd_ja_file_io::ifstream ex1(output_path), ex2(sidecar_path), ex3(tmp_path), ex4(side_tmp), ex5(failure_path);
   if (ex1.good() || ex2.good() || ex3.good() || ex4.good() || ex5.good()) throw std::runtime_error("qNEP rpmd_ja output, temporary, or failure diagnostic already exists: " + (ex5.good()?failure_path:output_path));
   Raw raw = read_raw_header(raw_path);
   RpmdJAReference& ref = raw.reference;
@@ -624,7 +689,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   const int n = ref.number_of_atoms, d = raw.dimension, r = d - 3;
   const std::size_t dd = static_cast<std::size_t>(d) * d;
   const std::size_t rr = static_cast<std::size_t>(r) * r;
-  std::ifstream raw_in(raw_path, std::ios::binary);
+  rpmd_ja_file_io::ifstream raw_in(raw_path, std::ios::binary);
   if (!raw_in) throw std::runtime_error("cannot reopen qNEP raw file");
   const std::streamoff k_start = raw.data + static_cast<std::streamoff>(1ULL*d*n + 3ULL*d*d) * sizeof(double);
   double *dk = nullptr, *a = nullptr, *physical = nullptr, *shifted = nullptr, *reconstructed_device = nullptr, *dv = nullptr, *dw = nullptr, *dm = nullptr;
@@ -647,6 +712,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         raw_gradient[coordinate] = std::accumulate(site_energy.begin(), site_energy.end(), 0.0);
       }
       additive = read_rpmd_ja_additive(additive_path, raw_path, ref, -1, raw_gradient);
+      if(additive_validator)additive_validator(additive);
       ref.mechanical_policy = std::string("native_reference_transport;") +
         (additive.internal_mass_com ? "internal_mass_com_pullback_v1;" : "") +
         "finite_temperature_additive_v1;beads=" +
@@ -667,14 +733,20 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     if(minimum_required>free_bytes)throw std::runtime_error("qNEP rpmd_ja matrix preflight exceeds free GPU memory");
     solver_check(cusolverDnCreate(&solver), "cusolverDnCreate");
     blas_check(cublasCreate(&blas),"cublasCreate");
-    int potrf_work = 0;
-    // Query POTRF before allocating either dense GPU matrix.
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&query_matrix), rr*sizeof(double)), "allocate POTRF query matrix");
-    solver_check(cusolverDnDpotrf_bufferSize(solver, CUBLAS_FILL_MODE_LOWER, r, query_matrix, r, &potrf_work), "cusolverDnDpotrf_bufferSize");
-    if(potrf_work<=0)throw std::runtime_error("cuSOLVER returned a nonpositive POTRF workspace size");
+    auto allocate_gpu=[&](void** pointer,const std::size_t bytes,const char* where){
+      if(allocation_observer)allocation_observer(where,static_cast<std::uint64_t>(bytes));
+      cuda_check(cudaMalloc(pointer,bytes),where);};
+    // cuSOLVER's workspace query reads dimensions, not the matrix payload.
+    allocate_gpu(reinterpret_cast<void**>(&query_matrix),sizeof(double),"allocate scalar POTRF query matrix");
+    const SolverWorkspaceElements workspace_elements=query_solver_workspace_elements(solver,r,query_matrix);
+    const int potrf_work=workspace_elements.potrf,lwork=workspace_elements.svd;
+    const std::size_t svd_workspace_bytes=static_cast<std::size_t>(lwork)*sizeof(double);
     cuda_check(cudaFree(query_matrix), "free POTRF query matrix");
     query_matrix=nullptr;
     const std::size_t workspace_bytes=static_cast<std::size_t>(potrf_work)*sizeof(double);
+    const std::size_t svd_live_bytes=6ULL*static_cast<std::size_t>(tile_size)*tile_size*sizeof(double)+
+      svd_workspace_bytes+static_cast<std::size_t>(tile_size)*sizeof(double)+sizeof(int)+
+      (3ULL*static_cast<std::size_t>(d)+static_cast<std::size_t>(n))*sizeof(double);
     if(workspace_bytes>std::numeric_limits<std::size_t>::max()-matrix_bytes-physical_bytes-safety_bytes)
       throw std::runtime_error("qNEP rpmd_ja Cholesky workspace size overflows");
     const std::size_t peak_base=std::numeric_limits<std::size_t>::max()-matrix_bytes-safety_bytes;
@@ -686,22 +758,38 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         throw std::runtime_error("qNEP additive certificate peak size overflows");
     }
     const std::size_t certificate_peak=use_additive?2*matrix_bytes+2*physical_bytes+safety_bytes:0;
+    if(svd_live_bytes>std::numeric_limits<std::size_t>::max()-safety_bytes)
+      throw std::runtime_error("qNEP rpmd_ja SVD peak size overflows");
+    const std::size_t svd_peak=svd_live_bytes+safety_bytes;
     if(use_additive&&(additive.k.values.size()>std::numeric_limits<std::size_t>::max()/(sizeof(std::uint64_t)+sizeof(double)) ||
        additive.k.values.size()*(sizeof(std::uint64_t)+sizeof(double))>std::numeric_limits<std::size_t>::max()-safety_bytes))
       throw std::runtime_error("sparse additive K transfer size overflows host address space");
     const std::size_t additive_sparse_bytes=use_additive ? additive.k.values.size()*(sizeof(std::uint64_t)+sizeof(double)) : 0;
     if(2*matrix_bytes>std::numeric_limits<std::size_t>::max()-additive_sparse_bytes-safety_bytes)
       throw std::runtime_error("qNEP rpmd_ja GPU preflight size overflows");
-    const std::size_t memory_required=std::max({2*matrix_bytes+additive_sparse_bytes+safety_bytes,factor_peak,certificate_peak});
+    const std::size_t memory_required=std::max({2*matrix_bytes+additive_sparse_bytes+safety_bytes,factor_peak,
+      certificate_peak,svd_peak});
+    if(resource_observer){
+      RpmdJAPrepareResourcePlan plan;
+      plan.free_gpu_bytes=static_cast<std::uint64_t>(free_bytes);
+      plan.planned_peak_gpu_bytes=static_cast<std::uint64_t>(memory_required);
+      plan.cartesian_matrix_bytes=static_cast<std::uint64_t>(matrix_bytes);
+      plan.internal_matrix_bytes=static_cast<std::uint64_t>(physical_bytes);
+      plan.potrf_workspace_bytes=static_cast<std::uint64_t>(workspace_bytes);
+      plan.svd_workspace_bytes=static_cast<std::uint64_t>(svd_workspace_bytes);
+      plan.svd_peak_bytes=static_cast<std::uint64_t>(svd_peak);
+      plan.allocator_safety_margin_bytes=static_cast<std::uint64_t>(safety_bytes);
+      resource_observer(plan);
+    }
     std::printf("    qNEP rpmd_ja prepare GPU preflight: %.3f GiB conservative peak, %.3f GiB free\n",
       static_cast<double>(memory_required)/(1024.0*1024.0*1024.0),static_cast<double>(free_bytes)/(1024.0*1024.0*1024.0));
     if (memory_required > free_bytes) throw std::runtime_error("qNEP rpmd_ja Cholesky preflight exceeds free GPU memory");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dk), dd*sizeof(double)), "allocate raw Hessian");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&a), dd*sizeof(double)), "allocate mass Hessian");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dv), static_cast<std::size_t>(d)*sizeof(double)), "allocate probe vector");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dw), 2*static_cast<std::size_t>(d)*sizeof(double)), "allocate probe result");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dinfo), sizeof(int)), "allocate solver info");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&tilebuf),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double)),"allocate D tile buffer");
+    allocate_gpu(reinterpret_cast<void**>(&dk), dd*sizeof(double), "allocate raw Hessian");
+    allocate_gpu(reinterpret_cast<void**>(&a), dd*sizeof(double), "allocate mass Hessian");
+    allocate_gpu(reinterpret_cast<void**>(&dv), static_cast<std::size_t>(d)*sizeof(double), "allocate probe vector");
+    allocate_gpu(reinterpret_cast<void**>(&dw), 2*static_cast<std::size_t>(d)*sizeof(double), "allocate probe result");
+    allocate_gpu(reinterpret_cast<void**>(&dinfo), sizeof(int), "allocate solver info");
+    allocate_gpu(reinterpret_cast<void**>(&tilebuf),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate D tile buffer");
     std::vector<double> row(d);
     for (int i = 0; i < d; ++i) {
       raw_in.seekg(k_start + static_cast<std::streamoff>(i)*d*sizeof(double));
@@ -709,7 +797,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       if (!raw_in || !std::all_of(row.begin(), row.end(), [](double x){return std::isfinite(x);})) throw std::runtime_error("qNEP raw Hessian contains invalid values");
       cuda_check(cudaMemcpy(dk + static_cast<std::size_t>(i)*d, row.data(), d*sizeof(double), cudaMemcpyHostToDevice), "upload raw Hessian row");
     }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dm), n*sizeof(double)), "allocate mass vector");
+    allocate_gpu(reinterpret_cast<void**>(&dm), n*sizeof(double), "allocate mass vector");
     cuda_check(cudaMemcpy(dm, ref.masses.data(), n*sizeof(double), cudaMemcpyHostToDevice), "upload masses");
     asymmetry_sums<<<(d+255)/256,256>>>(dk,dm,dw,d,n);cuda_check(cudaGetLastError(),"measure qNEP raw Hessian asymmetry");cuda_check(cudaDeviceSynchronize(),"measure qNEP raw Hessian asymmetry");
     std::vector<double> asym_sums(2*static_cast<std::size_t>(d));cuda_check(cudaMemcpy(asym_sums.data(),dw,asym_sums.size()*sizeof(double),cudaMemcpyDeviceToHost),"read raw Hessian asymmetry");
@@ -765,7 +853,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
           throw std::runtime_error("invalid mass-weighted sparse additive Kadd");
         weighted_values[p]=weighted;
       }
-      cuda_check(cudaMalloc(reinterpret_cast<void**>(&dk),dd*sizeof(double)), "allocate weighted additive Kadd");
+      allocate_gpu(reinterpret_cast<void**>(&dk),dd*sizeof(double), "allocate weighted additive Kadd");
       cuda_check(cudaMemset(dk,0,dd*sizeof(double)), "zero weighted additive Kadd");
       if(count){
         SpectrumBuffer<std::uint64_t> dindices(count,"allocate sparse K indices");
@@ -789,13 +877,13 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       cuda_check(cudaFree(dk), "free weighted additive Kadd"); dk=nullptr;
       std::printf("    additive K/H coefficients loaded: beads=%d, epsilon=%.9g; baseline Hessian diagnostics retained\n", additive.beads, additive.epsilon);
     }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&physical),rr*sizeof(double)),"allocate physical Hessian");
+    allocate_gpu(reinterpret_cast<void**>(&physical),rr*sizeof(double),"allocate physical Hessian");
     dim3 pgrid((r+15)/16,(r+15)/16);
     compact_physical<<<pgrid,block>>>(a,physical,d,r,n);
     cuda_check(cudaGetLastError(),"compact translation complement"); cuda_check(cudaDeviceSynchronize(),"compact translation complement");
     const double potrf_shift=use_additive?0.5*additive.epsilon:0.0;
     if (use_additive) {
-      cuda_check(cudaMalloc(reinterpret_cast<void**>(&shifted), rr*sizeof(double)), "allocate shifted D certificate reference");
+      allocate_gpu(reinterpret_cast<void**>(&shifted), rr*sizeof(double), "allocate shifted D certificate reference");
       cuda_check(cudaMemcpy(shifted, physical, rr*sizeof(double), cudaMemcpyDeviceToDevice), "save shifted D certificate reference");
       subtract_diagonal<<<(r+255)/256,256>>>(shifted,r,potrf_shift);
       subtract_diagonal<<<(r+255)/256,256>>>(physical,r,potrf_shift);
@@ -811,7 +899,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       cuda_check(cudaGetLastError(),"D probe product"); cuda_check(cudaDeviceSynchronize(),"D probe product");
       cuda_check(cudaMemcpy(products[p].data(),dw,r*sizeof(double),cudaMemcpyDeviceToHost),"read D probe product");
     }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&work),static_cast<std::size_t>(potrf_work)*sizeof(double)),"allocate Cholesky workspace");
+    allocate_gpu(reinterpret_cast<void**>(&work),static_cast<std::size_t>(potrf_work)*sizeof(double),"allocate Cholesky workspace");
     solver_check(cusolverDnDpotrf(solver,CUBLAS_FILL_MODE_LOWER,r,physical,r,work,potrf_work,dinfo),"cusolverDnDpotrf");
     cuda_check(cudaDeviceSynchronize(),"synchronize Cholesky");
     int info=0; cuda_check(cudaMemcpy(&info,dinfo,sizeof(info),cudaMemcpyDeviceToHost),"read Cholesky info");
@@ -824,7 +912,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         cuda_check(cudaMemcpy(&failed_slot,physical+static_cast<std::size_t>(j)*r+j,sizeof(double),cudaMemcpyDeviceToHost),"read failed Cholesky slot");
         bool candidate_available=false;double candidate_rho=std::numeric_limits<double>::quiet_NaN(),candidate_residual=std::numeric_limits<double>::quiet_NaN();
         const bool fd4_policy = ref.mechanical_policy == "native_reference_transport;analytic_site_gradient_fd4_v1";
-        std::ofstream report(failure_path,std::ios::out|std::ios::trunc);
+        rpmd_ja_file_io::ofstream report(failure_path,std::ios::out|std::ios::trunc);
         if(report){
           report<<std::setprecision(17)<<"qNEP rpmd_ja Cholesky failure\nraw_path: "<<raw_path<<"\nleading_minor_1based: "<<info<<"\ndimension: "<<r
             <<"\nPOTRF_operator: unshifted projected D minus diagonal shift\nPOTRF_diagonal_shift_eV_per_A2_per_amu: "<<potrf_shift
@@ -887,7 +975,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
           spectrum = low_spectrum_diagnostic(a, d, r, n, solver, blas,
             candidate_available ? candidate_rho : std::numeric_limits<double>::quiet_NaN(), modes);
           {
-            std::ofstream append(failure_path, std::ios::out | std::ios::app);
+            rpmd_ja_file_io::ofstream append(failure_path, std::ios::out | std::ios::app);
             if (append) { append << spectrum; append.flush(); if (!append) std::fprintf(stderr,"qNEP rpmd_ja: failed appending low-spectrum diagnostic %s\n",failure_path.c_str()); }
             std::printf("%s", spectrum.c_str());
           }
@@ -912,7 +1000,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
             translation_residuals.push_back(std::sqrt(overlap2));
             if (translation_residuals.back() > 1.0e-8) throw std::runtime_error("unrotated Ritz mode has excessive translation overlap");
           }
-          std::ofstream append(failure_path, std::ios::out | std::ios::app);
+          rpmd_ja_file_io::ofstream append(failure_path, std::ios::out | std::ios::app);
           if (append) {
             for (std::size_t q = 0; q < modes.size(); ++q) {
               const auto& mode = modes[q];
@@ -933,26 +1021,26 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
           if (mode_validator && !use_additive && !modes.empty()) {
             try {
               const std::string validation = mode_validator(ref, modes);
-              std::ofstream append(failure_path, std::ios::out | std::ios::app);
+              rpmd_ja_file_io::ofstream append(failure_path, std::ios::out | std::ios::app);
               if (append) { append << validation; append.flush(); }
               std::printf("%s", validation.c_str());
             } catch (const std::exception& e) {
               const std::string message = e.what();
               const std::string unavailable = std::string("\nmode_validation: unavailable (") + message + ")\nmode_validation_flags: " +
                 (message.find("INPUT_MISMATCH:") == 0 ? "INPUT_MISMATCH\n" : "NUMERICAL_OR_NONLINEAR_UNRESOLVED\n");
-              std::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
+              rpmd_ja_file_io::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
               std::printf("%s", unavailable.c_str());
             }
           } else if (!mode_validator && !use_additive) {
             const std::string unavailable = "\nmode_validation: unavailable (no qNEP evaluator supplied)\n";
-            std::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
+            rpmd_ja_file_io::ofstream append(failure_path, std::ios::out | std::ios::app); if (append) append << unavailable;
             std::printf("%s", unavailable.c_str());
           }
         } catch (const std::exception& e) {
           const std::string unavailable = spectrum.empty() ?
             std::string("\nlow_spectrum_status: unavailable (") + e.what() + ")\n" :
             std::string("\nmode_validation: unavailable (mode vector conversion/evaluator error: ") + e.what() + ")\n";
-          std::ofstream append(failure_path, std::ios::out | std::ios::app);
+          rpmd_ja_file_io::ofstream append(failure_path, std::ios::out | std::ios::app);
           if (append) { append << unavailable; append.flush(); }
           std::printf("%s", unavailable.c_str());
         }
@@ -962,14 +1050,14 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       }
       throw std::runtime_error(info>0?"qNEP translation-complement Hessian is not positive definite (POTRF leading minor "+std::to_string(info)+" of dimension "+std::to_string(r)+", raw: "+raw_path+")":"cuSOLVER Cholesky parameter failure (info="+std::to_string(info)+", invalid parameter index "+std::to_string(-info)+")");
     }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&pivot_device),r*sizeof(double)),"allocate Cholesky pivots");
+    allocate_gpu(reinterpret_cast<void**>(&pivot_device),r*sizeof(double),"allocate Cholesky pivots");
     diagonal_values<<<(r+255)/256,256>>>(physical,pivot_device,r);cuda_check(cudaGetLastError(),"read Cholesky pivots");cuda_check(cudaDeviceSynchronize(),"read Cholesky pivots");
     std::vector<double> pivots(r);cuda_check(cudaMemcpy(pivots.data(),pivot_device,r*sizeof(double),cudaMemcpyDeviceToHost),"copy Cholesky pivots");
     cuda_check(cudaFree(pivot_device),"free Cholesky pivots");pivot_device=nullptr;
     double min_pivot=std::numeric_limits<double>::infinity();for(double x:pivots){if(!(x>0.0)||!std::isfinite(x))throw std::runtime_error("invalid Cholesky pivot");min_pivot=std::min(min_pivot,x);}
     double additive_eta=0.0;
     if (use_additive) {
-      cuda_check(cudaMalloc(reinterpret_cast<void**>(&reconstructed_device),rr*sizeof(double)), "allocate full shifted reconstruction");
+      allocate_gpu(reinterpret_cast<void**>(&reconstructed_device),rr*sizeof(double), "allocate full shifted reconstruction");
       zero_upper_column_major<<<(static_cast<int>(rr)+255)/256,256>>>(physical,r);
       cuda_check(cudaGetLastError(), "clear unused Cholesky upper triangle"); cuda_check(cudaDeviceSynchronize(), "clear unused Cholesky upper triangle");
       const double one=1.0, zero=0.0;
@@ -997,7 +1085,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     // Restore the projected Cartesian operator for v3; only its complement copy was factored.
     for(int axis=2;axis>=0;--axis){cuda_check(cudaMemcpy(dv,householder[axis].data(),d*sizeof(double),cudaMemcpyHostToDevice),"restore Cartesian D basis");matvec_kernel<<<(d+255)/256,256>>>(a,dv,dw,d,d);cuda_check(cudaGetLastError(),"restore D basis matvec");cuda_check(cudaDeviceSynchronize(),"restore D basis matvec");cuda_check(cudaMemcpy(result_host.data(),dw,d*sizeof(double),cudaMemcpyDeviceToHost),"read restore D matvec");double gamma=0.0;for(int i=0;i<d;++i)gamma+=householder[axis][i]*result_host[i];householder_kernel<<<grid,block>>>(a,dv,dw,d,gamma);cuda_check(cudaGetLastError(),"restore Cartesian D basis");cuda_check(cudaDeviceSynchronize(),"restore Cartesian D basis");}
     if (use_additive) {
-      cuda_check(cudaMalloc(reinterpret_cast<void**>(&dk),dd*sizeof(double)), "allocate stored-D certificate transform");
+      allocate_gpu(reinterpret_cast<void**>(&dk),dd*sizeof(double), "allocate stored-D certificate transform");
       cuda_check(cudaMemcpy(dk,a,dd*sizeof(double),cudaMemcpyDeviceToDevice), "copy final unshifted stored D");
       for(int axis=0;axis<3;++axis){
         cuda_check(cudaMemcpy(dv,householder[axis].data(),d*sizeof(double),cudaMemcpyHostToDevice), "upload stored-D Householder vector");
@@ -1007,7 +1095,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         householder_kernel<<<grid,block>>>(dk,dv,dw,d,gamma);cuda_check(cudaGetLastError(), "stored-D Householder congruence");cuda_check(cudaDeviceSynchronize(), "stored-D Householder congruence");
       }
       project_translation_rows<<<grid,block>>>(dk,d,n);cuda_check(cudaGetLastError(), "project stored-D certificate translation");cuda_check(cudaDeviceSynchronize(), "project stored-D certificate translation");
-      cuda_check(cudaMalloc(reinterpret_cast<void**>(&shifted),rr*sizeof(double)), "allocate stored-D internal certificate");
+      allocate_gpu(reinterpret_cast<void**>(&shifted),rr*sizeof(double), "allocate stored-D internal certificate");
       compact_physical<<<pgrid,block>>>(dk,shifted,d,r,n);cuda_check(cudaGetLastError(), "compact stored-D certificate");cuda_check(cudaDeviceSynchronize(), "compact stored-D certificate");
       subtract_diagonal<<<(r+255)/256,256>>>(shifted,r,0.5*additive.epsilon);cuda_check(cudaGetLastError(), "shift stored-D certificate");cuda_check(cudaDeviceSynchronize(), "shift stored-D certificate");
       std::vector<double> stored_internal(static_cast<std::size_t>(tile_size)*tile_size), reconstructed(static_cast<std::size_t>(tile_size)*tile_size);
@@ -1048,35 +1136,51 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     ref.block_relative_residual[0]=0.0;
     for(int aidx=0;aidx<3;++aidx)ref.block_relative_residual[aidx+1]=0.0;
     ref.site_transport_relative_error[0]=ref.site_transport_relative_error[1]=ref.site_transport_relative_error[2]=0.0;
+    std::vector<std::vector<double>> stored_probes(3,std::vector<double>(d));
+    std::vector<std::vector<std::vector<double>>> expected_actions(4,
+      std::vector<std::vector<double>>(3,std::vector<double>(d,0.0)));
+    double expected_operator_norm2[4]={};
+    for(int probe=0;probe<3;++probe){double norm=0.0;
+      for(int row=0;row<d;++row){stored_probes[probe][row]=std::sin((row+1)*(0.7548776662466927+probe*0.173));
+        norm+=stored_probes[probe][row]*stored_probes[probe][row];}
+      for(double& value:stored_probes[probe])value/=std::sqrt(norm);
+      cuda_check(cudaMemcpy(dv,stored_probes[probe].data(),static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyHostToDevice),
+        "upload stored-reference D action probe");
+      matvec_kernel<<<(d+255)/256,256>>>(a,dv,dw,d,d);
+      cuda_check(cudaGetLastError(),"stored-reference D action");cuda_check(cudaDeviceSynchronize(),"stored-reference D action");
+      cuda_check(cudaMemcpy(expected_actions[0][probe].data(),dw,static_cast<std::size_t>(d)*sizeof(double),cudaMemcpyDeviceToHost),
+        "read stored-reference D action");
+    }
 
-    std::ofstream out(tmp_path,std::ios::binary|std::ios::trunc); if(!out)throw std::runtime_error("cannot create qNEP v3 temporary"); created=tmp_path;
+    rpmd_ja_file_io::ofstream out(tmp_path,std::ios::binary|std::ios::trunc); if(!out)throw std::runtime_error("cannot create qNEP v3 temporary"); created=tmp_path;
     const std::streampos diagnostics_position=write_rpmd_ja_qnep_v3_stream_prefix(out,ref);
     const std::uint64_t count=static_cast<std::uint64_t>((d+tile_size-1)/tile_size)*((d+tile_size-1)/tile_size);
     write_value(out,tile_size);write_value(out,count);
     std::vector<double> tile(static_cast<std::size_t>(tile_size)*tile_size);
-    for(int i=0;i<d;i+=tile_size)for(int j=0;j<d;j+=tile_size){const int nr=std::min(tile_size,d-i),nc=std::min(tile_size,d-j);vectorize_tile<<<dim3((nr+15)/16,(nc+15)/16),block>>>(a,tilebuf,d,i,j,nr,nc);cuda_check(cudaGetLastError(),"read D tile");cuda_check(cudaDeviceSynchronize(),"read D tile");cuda_check(cudaMemcpy(tile.data(),tilebuf,static_cast<std::size_t>(nr)*nc*sizeof(double),cudaMemcpyDeviceToHost),"copy D tile");write_tile(out,dense_tile(i,j,nr,nc,tile.data()));}
+    for(int i=0;i<d;i+=tile_size)for(int j=0;j<d;j+=tile_size){const int nr=std::min(tile_size,d-i),nc=std::min(tile_size,d-j);vectorize_tile<<<dim3((nr+15)/16,(nc+15)/16),block>>>(a,tilebuf,d,i,j,nr,nc);cuda_check(cudaGetLastError(),"read D tile");cuda_check(cudaDeviceSynchronize(),"read D tile");cuda_check(cudaMemcpy(tile.data(),tilebuf,static_cast<std::size_t>(nr)*nc*sizeof(double),cudaMemcpyDeviceToHost),"copy D tile");
+      for(int entry=0;entry<nr*nc;++entry)expected_operator_norm2[0]+=tile[entry]*tile[entry];
+      write_tile(out,dense_tile(i,j,nr,nc,tile.data()));}
 
     // Free the dense D GPU workspace before processing H tiles.
     cuda_check(cudaFree(a),"free D matrix"); a=nullptr;if(physical){cuda_check(cudaFree(physical),"free physical D");physical=nullptr;}cuda_check(cudaFree(tilebuf),"free D tile buffer");tilebuf=nullptr;
     if(!out)throw std::runtime_error("failed writing qNEP D tiles");
     // H tiles are appended in matrix order; row/column sizes stay bounded by 128.
-    std::ifstream vf(raw_path,std::ios::binary),cf(raw_path,std::ios::binary),vcf(raw_path,std::ios::binary),ccf(raw_path,std::ios::binary);
+    rpmd_ja_file_io::ifstream vf(raw_path,std::ios::binary),cf(raw_path,std::ios::binary),vcf(raw_path,std::ios::binary),ccf(raw_path,std::ios::binary);
     const std::streamoff vstart=raw.data, cstart=raw.data+static_cast<std::streamoff>(static_cast<std::uint64_t>(d)*n)*sizeof(double);
     const std::streamoff vcstart=raw.coarse_v, ccstart=raw.coarse_c;
     const std::uint64_t ddoubles=static_cast<std::uint64_t>(d)*d;
     std::vector<double> energies(n), fenergy(d), coarse_energy(n), fcoarse(d);
     for(int i=0;i<d;++i){vf.seekg(vstart+static_cast<std::streamoff>(i)*n*sizeof(double));vf.read(reinterpret_cast<char*>(energies.data()),n*sizeof(double));if(!vf)throw std::runtime_error("read fine site derivative");fenergy[i]=-std::accumulate(energies.begin(),energies.end(),0.0);vcf.seekg(vcstart+static_cast<std::streamoff>(i)*n*sizeof(double));vcf.read(reinterpret_cast<char*>(coarse_energy.data()),n*sizeof(double));if(!vcf)throw std::runtime_error("read coarse site derivative");fcoarse[i]=-std::accumulate(coarse_energy.begin(),coarse_energy.end(),0.0);}
     std::vector<double> transport_diff2(3,0.0),transport_norm2(3,0.0); std::vector<double> crows(static_cast<std::size_t>(tile_size)*d), ccrows(static_cast<std::size_t>(tile_size)*d);
-    int lwork=0, maxdim=tile_size; solver_check(cusolverDnDgesvd_bufferSize(solver,maxdim,maxdim,&lwork),"cusolverDnDgesvd_bufferSize");
-    if(lwork<=0)throw std::runtime_error("cuSOLVER returned a nonpositive SVD workspace size");
-
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&sm),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double)),"allocate SVD matrix");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&su),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double)),"allocate SVD U");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&svt),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double)),"allocate SVD VT");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&sw),static_cast<std::size_t>(lwork)*sizeof(double)),"allocate SVD workspace");cuda_check(cudaMalloc(reinterpret_cast<void**>(&sinfo),sizeof(int)),"allocate SVD info");cuda_check(cudaMalloc(reinterpret_cast<void**>(&dsingular),static_cast<std::size_t>(maxdim)*sizeof(double)),"allocate singular values");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dleft),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double)),"allocate SVD left verify buffer");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dright),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double)),"allocate SVD right verify buffer");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dproduct),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double)),"allocate SVD reconstruction buffer");
+    allocate_gpu(reinterpret_cast<void**>(&sm),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD matrix");
+    allocate_gpu(reinterpret_cast<void**>(&su),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD U");
+    allocate_gpu(reinterpret_cast<void**>(&svt),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD VT");
+    allocate_gpu(reinterpret_cast<void**>(&sw),static_cast<std::size_t>(lwork)*sizeof(double),"allocate SVD workspace");
+    allocate_gpu(reinterpret_cast<void**>(&sinfo),sizeof(int),"allocate SVD info");
+    allocate_gpu(reinterpret_cast<void**>(&dsingular),static_cast<std::size_t>(maxdim)*sizeof(double),"allocate singular values");
+    allocate_gpu(reinterpret_cast<void**>(&dleft),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD left verify buffer");
+    allocate_gpu(reinterpret_cast<void**>(&dright),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD right verify buffer");
+    allocate_gpu(reinterpret_cast<void**>(&dproduct),static_cast<std::size_t>(maxdim)*maxdim*sizeof(double),"allocate SVD reconstruction buffer");
     double tile_error[3]={};
     std::uint64_t h_v_bytes=0;
     for(int alpha=0;alpha<3;++alpha){
@@ -1107,6 +1211,10 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
             hc[static_cast<std::size_t>(x)*nc+col-j]+=increment;
           }
         }
+        for(int probe=0;probe<3;++probe)for(int x=0;x<nr;++x)for(int y=0;y<nc;++y)
+          expected_actions[alpha+1][probe][i+x]+=
+            h[static_cast<std::size_t>(x)*nc+y]*stored_probes[probe][j+y];
+        for(const double value:h)expected_operator_norm2[alpha+1]+=value*value;
         RpmdJAMatrixTile result;result.row=i;result.column=j;result.rows=nr;result.columns=nc;
         double tile_residual=0.0;
         svd_tile(solver,blas,h.data(),nr,nc,result,sw,lwork,sm,dsingular,su,svt,sinfo,dleft,dright,dproduct,tile_residual);
@@ -1124,15 +1232,38 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     const double diagnostics[21]={ref.energy_gradient_relative_error,ref.force_gradient_relative_error,ref.hessian_symmetry_relative_error,ref.energy_second_probe_relative_error,ref.force_balance_residual,ref.projection_relative_change,ref.energy_gradient_absolute_rms,ref.force_gradient_absolute_rms,ref.site_derivative_absolute_rms[0],ref.site_derivative_absolute_rms[1],ref.site_derivative_absolute_rms[2],ref.site_transport_difference_absolute_rms[0],ref.site_transport_difference_absolute_rms[1],ref.site_transport_difference_absolute_rms[2],ref.site_transport_relative_error[0],ref.site_transport_relative_error[1],ref.site_transport_relative_error[2],ref.block_relative_residual[0],ref.block_relative_residual[1],ref.block_relative_residual[2],ref.block_relative_residual[3]};
     out.seekp(diagnostics_position);out.write(reinterpret_cast<const char*>(diagnostics),sizeof(diagnostics));out.seekp(0,std::ios::end);
     write_value(out,1);out.flush();if(!out)throw std::runtime_error("failed flushing qNEP v3 output");out.close();if(!out)throw std::runtime_error("failed closing qNEP v3 output");
-    if(std::rename(tmp_path.c_str(),output_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP v3 output");created=output_path;
+    if(rpmd_ja_file_io::rename_file(tmp_path,output_path)!=0)throw std::runtime_error("cannot finalize qNEP v3 output");created=output_path;
     cuda_check(cudaFree(dv),"free probe vector");dv=nullptr;cuda_check(cudaFree(dw),"free probe result");dw=nullptr;cuda_check(cudaFree(dinfo),"free solver info");dinfo=nullptr;
-    std::ofstream side(side_tmp,std::ios::trunc);if(!side)throw std::runtime_error("cannot create qNEP stability sidecar");
+    rpmd_ja_file_io::ofstream side(side_tmp,std::ios::trunc);if(!side)throw std::runtime_error("cannot create qNEP stability sidecar");
     if(use_additive) side<<"GPUMDJA_QNEP_STABILITY 4\nfingerprint "<<std::hex<<rpmd_ja_model_fingerprint(output_path)<<"\nconfig_fingerprint "<<raw.config<<std::dec<<"\natoms "<<n<<"\nderivative_policy "<<ref.mechanical_policy<<"\ncertificate additive_shifted_frobenius_v1\nepsilon_num "<<std::setprecision(17)<<additive.epsilon<<"\nreconstruction_bound "<<additive_eta<<"\nminimum_cholesky_pivot "<<min_pivot<<"\nrelative_operator_bound 0\ntranslation_residual "<<translation_residual<<"\nreconstruction_residual "<<reconstruction<<"\nsoftmode_relative_error 0\n";
     else side<<"GPUMDJA_QNEP_STABILITY 3\nfingerprint "<<std::hex<<rpmd_ja_model_fingerprint(output_path)<<"\nconfig_fingerprint "<<raw.config<<std::dec<<"\natoms "<<n<<"\nderivative_policy "<<ref.mechanical_policy<<"\ncertificate cholesky_relative_bound\nminimum_cholesky_pivot "<<std::setprecision(17)<<min_pivot<<"\nrelative_operator_bound 0\ntranslation_residual "<<translation_residual<<"\nreconstruction_residual "<<reconstruction<<"\nsoftmode_relative_error 0\n";
-    side.flush();if(!side)throw std::runtime_error("failed writing qNEP stability sidecar");side.close();if(std::rename(side_tmp.c_str(),sidecar_path.c_str())!=0)throw std::runtime_error("cannot finalize qNEP stability sidecar");created.clear();
+    side.flush();if(!side)throw std::runtime_error("failed writing qNEP stability sidecar");side.close();if(rpmd_ja_file_io::rename_file(side_tmp,sidecar_path)!=0)throw std::runtime_error("cannot finalize qNEP stability sidecar");
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+    if(rpmd_ja_qnep_prepare_test::after_publish_before_readback)
+      rpmd_ja_qnep_prepare_test::after_publish_before_readback(output_path);
+#endif
+    const RpmdJAReference readback=read_rpmd_ja_reference(output_path);
+    const RpmdJABlockMatrix* stored_matrices[4]={&readback.block_dynamical,
+      &readback.block_site_transpose[0],&readback.block_site_transpose[1],&readback.block_site_transpose[2]};
+    for(int matrix=0;matrix<4;++matrix){
+      if(!std::isfinite(expected_operator_norm2[matrix])||expected_operator_norm2[matrix]<0.0)
+        throw std::runtime_error("stored reference operator action has a non-finite source norm");
+      const double tolerance=(matrix==0?1.0e-12:20.0*tile_tolerance)*
+        std::sqrt(std::max(expected_operator_norm2[matrix],1.0e-300));
+      for(int probe=0;probe<3;++probe){
+        const std::vector<double> actual=block_matrix_action(*stored_matrices[matrix],stored_probes[probe]);
+        double error2=0.0;for(int row=0;row<d;++row){const double difference=actual[row]-expected_actions[matrix][probe][row];
+          error2+=difference*difference;}
+        if(!std::isfinite(error2)||std::sqrt(error2)>tolerance+1.0e-12)
+          throw std::runtime_error("stored reference D/Bt action differs from the prepared operator");
+      }
+    }
+    std::printf("    qNEP stored-reference D/Bt action readback: 3 frozen probes per operator passed.\n");
+    created.clear();
   } catch (...) {
     if(dk)cudaFree(dk);if(a)cudaFree(a);if(physical)cudaFree(physical);if(shifted)cudaFree(shifted);if(reconstructed_device)cudaFree(reconstructed_device);if(dv)cudaFree(dv);if(dw)cudaFree(dw);if(dm)cudaFree(dm);if(dinfo)cudaFree(dinfo);if(work)cudaFree(work);if(query_matrix)cudaFree(query_matrix);if(pivot_device)cudaFree(pivot_device);if(tilebuf)cudaFree(tilebuf);if(sm)cudaFree(sm);if(su)cudaFree(su);if(svt)cudaFree(svt);if(sw)cudaFree(sw);if(dleft)cudaFree(dleft);if(dright)cudaFree(dright);if(dproduct)cudaFree(dproduct);if(dsingular)cudaFree(dsingular);if(sinfo)cudaFree(sinfo);if(blas)cublasDestroy(blas);if(solver)cusolverDnDestroy(solver);
-    std::remove(tmp_path.c_str());std::remove(side_tmp.c_str());if(created==output_path)std::remove(output_path.c_str());throw;
+    rpmd_ja_file_io::remove_file(tmp_path);rpmd_ja_file_io::remove_file(side_tmp);
+    if(created==output_path){rpmd_ja_file_io::remove_file(output_path);rpmd_ja_file_io::remove_file(sidecar_path);}throw;
   }
   if(blas)blas_check(cublasDestroy(blas),"cublasDestroy");
   if(solver)solver_check(cusolverDnDestroy(solver),"cusolverDnDestroy");

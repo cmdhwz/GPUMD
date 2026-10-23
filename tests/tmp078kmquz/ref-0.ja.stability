@@ -1,0 +1,8 @@
+GPUMDJA_QNEP_STABILITY 1
+fingerprint ddc572c3b9e42efe
+config_fingerprint 0000000000000013
+atoms 2
+minimum_positive_eigenvalue 1.9999999999999996
+translation_residual 5.4322313662585722e-17
+reconstruction_residual 0
+softmode_relative_error 0
