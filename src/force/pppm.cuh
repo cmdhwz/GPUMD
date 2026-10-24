@@ -332,6 +332,7 @@ private:
   double debug_mesh_after_assignment_sum_real_ = 0.0;
   gpufftHandle plan = 0;
   bool plan_initialized = false;
+  bool mesh_reported_ = false;
   bool current_force_mesh_valid_ = false;
   bool current_force_mesh_peratom_ = false;
   unsigned long long current_force_mesh_force_evaluation_id_ = 0;
@@ -376,6 +377,7 @@ private:
     const GPU_Vector<double>& position,
     const GPU_Vector<float>& D_real,
     const int pppm_call_index);
+  void print_mesh(const int N1, const int N2, const Box& box, const float* charge);
 
   bool need_peratom_virial = false;
   bool need_peratom_virial_every_batch = false;

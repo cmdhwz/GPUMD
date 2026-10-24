@@ -182,6 +182,7 @@ endif()
 # --- nep ---
 file(GLOB NEP_SOURCES
     src/main_nep/*.cu
+    src/main_nep/*/*.cu
     src/utilities/*.cu)
 add_executable(nep ${NEP_SOURCES})
 target_include_directories(nep PRIVATE src)

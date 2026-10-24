@@ -8,9 +8,9 @@ files, the run used to continue on a differently shaped model without saying any
 nep.restart rows than the file holds and reporting plausible-looking losses. Any keyword with a
 default can cause this, which is what these tests cover.
 
-nep.txt counts as an input when there is a nep.restart to resume from, or when predicting, and a
-mismatch is then an error. Without a nep.restart it is a stale output about to be overwritten, and a
-mismatch is only a warning, so that editing nep.in and retraining in place keeps working.
+nep.txt counts as an input when there is a nep.restart to resume from, when predicting, or when
+importing scalers, and a mismatch is then an error. In fresh training it is a stale output about
+to be overwritten and is not checked, so editing nep.in and retraining in place keeps working.
 
 Every mismatch is reported while nep.in is being read, before the training set is touched, so these
 runs are short. The base models cover a header with a zbl line and one without (six header lines
@@ -114,16 +114,14 @@ def test_matching_nep_in_is_accepted(tmp_path, nep_command, base_model):
 
 
 @pytest.mark.parametrize('base_model', list(BASE_MODELS))
-def test_stale_nep_txt_without_restart_only_warns(tmp_path, nep_command, base_model):
-    """Editing nep.in and retraining in place has to keep working, so a mismatch against a nep.txt
-    that this run is about to overwrite is reported but not fatal."""
+def test_stale_nep_txt_without_restart_is_ignored(tmp_path, nep_command, base_model):
+    """Fresh training ignores the nep.txt that it is about to overwrite."""
     train_once(tmp_path, nep_command, base_model)
 
     result = run_nep(tmp_path, nep_command, keywords_for(base_model, basis_size=None))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert 'basis_size_radial' in result.stdout
-    assert 'nep.in gives 6 (default), nep.txt gives 8' in result.stdout
-    assert 'nep.txt will be overwritten' in result.stdout
+    assert 'inconsistent' not in result.stdout
+    assert 'nep.txt will be overwritten' not in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -156,9 +154,9 @@ def test_zbl_added_to_a_model_without_it_is_fatal(tmp_path, nep_command):
 @pytest.mark.parametrize(
     'base_model, charge_mode, expected_text',
     [
-        ('qnep_mode2', '1', 'nep.in gives 1 (input), nep.txt gives 2'),
-        ('qnep_mode1', None, 'nep.in gives 0 (default), nep.txt gives 1'),
-        ('nep', '2', 'nep.in gives 2 (input), nep.txt gives 0'),
+        ('qnep_mode2', '1', 'model: nep.in implies nep4_zbl_charge1, nep.txt holds nep4_zbl_charge2.'),
+        ('qnep_mode1', None, 'model: nep.in implies nep4_zbl, nep.txt holds nep4_zbl_charge1.'),
+        ('nep', '2', 'model: nep.in implies nep4_zbl_charge2, nep.txt holds nep4_zbl.'),
     ],
     ids=['mode 2 model read as mode 1', 'charge model read as plain', 'plain model read as qNEP'],
 )
@@ -172,7 +170,7 @@ def test_charge_mode_mismatch_is_fatal(
 
     result = run_nep(tmp_path, nep_command, keywords_for(base_model, charge_mode=charge_mode))
     assert result.returncode != 0
-    assert 'charge_mode: ' + expected_text in result.stdout
+    assert expected_text in result.stdout
 
 
 def test_prediction_with_mismatched_nep_txt_is_fatal(tmp_path, nep_command):

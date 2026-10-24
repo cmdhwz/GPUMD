@@ -55,6 +55,66 @@ void Dump_Thermo::parse(const std::vector<std::string>& tokens)
   printf("Dump thermo every %d steps.\n", dump_interval_);
 }
 
+void write_thermo_row(
+  FILE* fid,
+  const double* thermo,
+  const bool thermo_holds_kinetic_energy,
+  const double temperature_target,
+  const int number_of_atoms_for_temperature,
+  const Box& box,
+  const double* extra_values)
+{
+  double energy_kin, temperature;
+  if (thermo_holds_kinetic_energy) {
+    energy_kin = thermo[0];
+    temperature = temperature_target;
+  } else {
+    energy_kin = 1.5 * number_of_atoms_for_temperature * K_B * thermo[0];
+    temperature = thermo[0];
+  }
+
+  // stress components are in Voigt notation: xx, yy, zz, yz, xz, xy
+  fprintf(
+    fid,
+    "%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e",
+    temperature,
+    energy_kin,
+    thermo[1],
+    thermo[2] * PRESSURE_UNIT_CONVERSION,
+    thermo[3] * PRESSURE_UNIT_CONVERSION,
+    thermo[4] * PRESSURE_UNIT_CONVERSION,
+    thermo[7] * PRESSURE_UNIT_CONVERSION,
+    thermo[6] * PRESSURE_UNIT_CONVERSION,
+    thermo[5] * PRESSURE_UNIT_CONVERSION);
+
+  fprintf(
+    fid,
+    "%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e",
+    box.cpu_h[0],
+    box.cpu_h[3],
+    box.cpu_h[6],
+    box.cpu_h[1],
+    box.cpu_h[4],
+    box.cpu_h[7],
+    box.cpu_h[2],
+    box.cpu_h[5],
+    box.cpu_h[8]);
+  if (extra_values != nullptr) {
+    fprintf(
+      fid,
+      "%25.17e%25.17e%25.17e%25.17e%25.17e%25.17e%25.17e",
+      extra_values[0],
+      extra_values[1],
+      extra_values[2],
+      extra_values[3],
+      extra_values[4],
+      extra_values[5],
+      extra_values[6]);
+  }
+  fprintf(fid, "\n");
+  fflush(fid);
+}
+
 void Dump_Thermo::pre_run(
   const int number_of_steps,
   const double time_step,
@@ -132,83 +192,41 @@ void Dump_Thermo::end_of_step(
   if ((step + 1) % dump_interval_ != 0)
     return;
 
-  int number_of_atoms_fixed =
-    (fixed_group < 0)
-      ? 0
-      : group[integrate.get_fixed_grouping_method()].cpu_size[fixed_group];
-
   double thermo[8];
   gpu_thermo.copy_to_host(thermo, 8);
-  double energy_kin, temperature;
-  if (is_pimd(integrate.get_type())) {
-    energy_kin = thermo[0];
-    temperature = temperature_target;
-  } else {
-    const int number_of_atoms_moving = atom.number_of_atoms - number_of_atoms_fixed;
-    energy_kin = 1.5 * number_of_atoms_moving * K_B * thermo[0];
-    temperature = thermo[0];
-  }
 
-  double ke_rp = 0.0;
-  double pe_rp = 0.0;
-  double e_spring = 0.0;
-  double h_rp = 0.0;
-  double w_nonham = 0.0;
-  double h_conserved = 0.0;
-  double d_h_conserved = 0.0;
+  double ring_polymer_values[7];
+  const double* extra_values = nullptr;
   if (rp_energy_) {
+    double ke_rp, e_spring, w_nonham;
     rp_ensemble_->get_ring_polymer_energy(atom.mass, ke_rp, e_spring, w_nonham);
-    pe_rp = thermo[1];
-    h_rp = ke_rp + pe_rp + e_spring;
-    h_conserved = h_rp - w_nonham;
+    const double pe_rp = thermo[1];
+    const double h_rp = ke_rp + pe_rp + e_spring;
+    const double h_conserved = h_rp - w_nonham;
     if (!conserved_reference_set_) {
       h_conserved_reference_ = h_conserved;
       conserved_reference_set_ = true;
     }
-    d_h_conserved =
+    const double d_h_conserved =
       1000.0 * (h_conserved - h_conserved_reference_) / atom.number_of_atoms;
+    ring_polymer_values[0] = ke_rp;
+    ring_polymer_values[1] = pe_rp;
+    ring_polymer_values[2] = e_spring;
+    ring_polymer_values[3] = h_rp;
+    ring_polymer_values[4] = w_nonham;
+    ring_polymer_values[5] = h_conserved;
+    ring_polymer_values[6] = d_h_conserved;
+    extra_values = ring_polymer_values;
   }
 
-  // stress components are in Voigt notation: xx, yy, zz, yz, xz, xy
-  fprintf(
+  write_thermo_row(
     fid_,
-    "%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e",
-    temperature,
-    energy_kin,
-    thermo[1],
-    thermo[2] * PRESSURE_UNIT_CONVERSION,
-    thermo[3] * PRESSURE_UNIT_CONVERSION,
-    thermo[4] * PRESSURE_UNIT_CONVERSION,
-    thermo[7] * PRESSURE_UNIT_CONVERSION,
-    thermo[6] * PRESSURE_UNIT_CONVERSION,
-    thermo[5] * PRESSURE_UNIT_CONVERSION);
-
-  fprintf(
-    fid_,
-    "%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e%20.10e",
-    box.cpu_h[0],
-    box.cpu_h[3],
-    box.cpu_h[6],
-    box.cpu_h[1],
-    box.cpu_h[4],
-    box.cpu_h[7],
-    box.cpu_h[2],
-    box.cpu_h[5],
-    box.cpu_h[8]);
-  if (rp_energy_) {
-    fprintf(
-      fid_,
-      "%25.17e%25.17e%25.17e%25.17e%25.17e%25.17e%25.17e",
-      ke_rp,
-      pe_rp,
-      e_spring,
-      h_rp,
-      w_nonham,
-      h_conserved,
-      d_h_conserved);
-  }
-  fprintf(fid_, "\n");
-  fflush(fid_);
+    thermo,
+    is_pimd(integrate.get_type()),
+    integrate.get_target_temperature_of_step(),
+    integrate.get_number_of_atoms_for_temperature(atom.number_of_atoms, group),
+    box,
+    extra_values);
 }
 
 void Dump_Thermo::post_run(

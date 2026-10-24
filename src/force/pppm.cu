@@ -2106,6 +2106,7 @@ void PPPM::initialize(
   para = {};
   mesh_spacing = mesh_spacing_input;
   current_force_mesh_valid_ = false;
+  mesh_reported_ = false;
   current_force_mesh_peratom_ = false;
   dynamic_operator_cache_valid_ = false;
   dynamic_operator_host_cache_valid_ = false;
@@ -2132,7 +2133,6 @@ void PPPM::find_para(const int N, const Box& box)
   if (number_of_points > max_mesh_points) {
     PRINT_INPUT_ERROR("PPPM mesh is too large; increase spacing or reduce the box size.");
   }
-  const bool first_mesh = !plan_initialized;
   for (int d = 0; d < 3; ++d) {
     para.K_half[d] = para.K[d] / 2;
     para.two_pi_over_K[d] = two_pi / para.K[d];
@@ -2143,14 +2143,6 @@ void PPPM::find_para(const int N, const Box& box)
     para.K0K1K2 = static_cast<int>(number_of_points);
     current_force_mesh_valid_ = false;
     allocate_memory();
-  }
-  if (first_mesh) {
-    printf(
-      "PPPM mesh: %d x %d x %d (target spacing %.17g A; actual spacing %.17g %.17g %.17g A).\n",
-      para.K[0], para.K[1], para.K[2], mesh_spacing,
-      volume / box.get_area(0) / para.K[0],
-      volume / box.get_area(1) / para.K[1],
-      volume / box.get_area(2) / para.K[2]);
   }
   para.potential_factor = K_C_SP / N;
   for (int d = 0; d < 3; ++d) {
@@ -2434,6 +2426,56 @@ bool PPPM::compute_dynamic_charge_correction(
   return valid;
 }
 
+void PPPM::print_mesh(const int N1, const int N2, const Box& box, const float* charge)
+{
+  const double volume = box.get_volume();
+  printf(
+    "PPPM mesh: %d x %d x %d (target spacing %.17g A; actual spacing %.17g %.17g %.17g A).\n",
+    para.K[0],
+    para.K[1],
+    para.K[2],
+    mesh_spacing,
+    volume / box.get_area(0) / para.K[0],
+    volume / box.get_area(1) / para.K[1],
+    volume / box.get_area(2) / para.K[2]);
+
+  // Root-mean-square force error for ik differentiation and five-point charge assignment
+  // with the optimal influence function, Eq. (38) of M. Deserno and C. Holm, JCP 109, 7694 (1998).
+  // The coefficients are a_m^(5) of Table II therein.
+  // Eq. (38) holds for a cubic box. Here it is evaluated per direction with the thickness of the
+  // cell as L, and the root mean square of the three values is reported.
+  const double coefficients[5] = {
+    1.0 / 23232.0,
+    7601.0 / 13628160.0,
+    143.0 / 69120.0,
+    517231.0 / 106536960.0,
+    106640677.0 / 11737571328.0};
+  const int number_of_charges = N2 - N1;
+  std::vector<float> q(number_of_charges);
+  CHECK(gpuMemcpy(
+    q.data(), charge + N1, sizeof(float) * number_of_charges, gpuMemcpyDeviceToHost));
+  double sum_of_squared_charges = 0.0;
+  for (const float q_i : q) {
+    sum_of_squared_charges += double(q_i) * q_i;
+  }
+  const double alpha = para.alpha;
+  double squared_error = 0.0;
+  for (int d = 0; d < 3; ++d) {
+    const double thickness = volume / box.get_area(d);
+    const double h_alpha = thickness / para.K[d] * alpha;
+    double sum = 0.0;
+    for (int m = 0; m < 5; ++m) {
+      sum += coefficients[m] * std::pow(h_alpha, 2 * m);
+    }
+    const double error =
+      K_C_SP * sum_of_squared_charges * std::pow(h_alpha, 5) *
+      std::sqrt(alpha * thickness * std::sqrt(2.0 * PI) * sum / number_of_charges) /
+      (thickness * thickness);
+    squared_error += error * error;
+  }
+  printf("PPPM force error estimate: %.3e eV/A.\n", std::sqrt(squared_error / 3.0));
+}
+
 void PPPM::find_force(
   const int N,
   const int N1,
@@ -2450,6 +2492,10 @@ void PPPM::find_force(
 {
   current_force_mesh_valid_ = false;
   find_para(N, box);
+  if (!mesh_reported_) {
+    print_mesh(N1, N2, box, charge.data());
+    mesh_reported_ = true;
+  }
   const int pppm_call_index = debug_requested_ ? debug_call_index_++ : -1;
   if (debug_requested_) {
     if (
@@ -3266,6 +3312,12 @@ void PPPM::find_force_batch(
     need_peratom_virial_every_batch || request_peratom_virial;
   last_batch_used_peratom_virial_ = calculate_peratom_virial;
   find_para(N, box);
+  if (!mesh_reported_) {
+    float* first_charge = nullptr;
+    charge.copy_to_host(&first_charge, 1);
+    print_mesh(N1, N2, box, first_charge);
+    mesh_reported_ = true;
+  }
   allocate_batch_memory(number_of_beads);
   const int mesh_grid = (para.K0K1K2 - 1) / 64 + 1;
   const dim3 mesh_grid_batch(mesh_grid, number_of_beads);

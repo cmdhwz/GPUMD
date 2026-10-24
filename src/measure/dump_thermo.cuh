@@ -21,6 +21,19 @@
 class Box;
 class Ensemble_PIMD;
 
+// Writes a row of thermo.out from the thermo values T, U and the six components of the stress.
+// A PIMD ensemble stores the kinetic energy instead of the temperature in that vector, and the
+// row then holds the target temperature.
+// Otherwise the kinetic energy is 1.5 * k_B * T times the atoms that the temperature counts.
+void write_thermo_row(
+  FILE* fid,
+  const double* thermo,
+  const bool thermo_holds_kinetic_energy,
+  const double temperature_target,
+  const int number_of_atoms_for_temperature,
+  const Box& box,
+  const double* extra_values);
+
 class Dump_Thermo : public Action
 {
 public:
