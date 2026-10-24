@@ -211,13 +211,16 @@ void Dump_Observer::end_of_step(
       }
       if (write_thermo_now) {
         // Ensemble::find_thermo stores the temperature, also under PIMD.
+        double cpu_thermo[8];
+        observer_thermo_.copy_to_host(cpu_thermo, 8);
         write_thermo_row(
           thermo_files_[potential_index],
-          observer_thermo_,
+          cpu_thermo,
           false,
           temperature_target,
           number_of_atoms_for_temperature,
-          box);
+          box,
+          nullptr);
       }
     }
   } else if (mode_.compare("average") == 0) {
@@ -237,13 +240,16 @@ void Dump_Observer::end_of_step(
         0);
     }
     if (write_thermo_now) {
+      double cpu_thermo[8];
+      thermo.copy_to_host(cpu_thermo, 8);
       write_thermo_row(
         thermo_files_[0],
-        thermo,
+        cpu_thermo,
         is_pimd(integrate.get_type()),
         temperature_target,
         number_of_atoms_for_temperature,
-        box);
+        box,
+        nullptr);
     }
   }
 }
