@@ -188,7 +188,9 @@ for key, present in (
         "fit.analytic_curvature_direction_objectives>0" in cuda_test),
     ("terminal finite differences persist as diagnostic-only fit state",
         'result.analytic_curvature_direction_status="DIAGNOSTIC_ONLY_"+check.failure_fd_status' in fit and
-        "fit.analytic_curvature_direction_status==\"DIAGNOSTIC_ONLY_DIAGNOSTIC_OBJECTIVE_LIMIT\"" in cuda_test),
+        'check.failure_fd_status="FD_ONLY_DIAGNOSTIC_OBJECTIVE_LIMIT"' in fit and
+        "fit.analytic_curvature_direction_status==\"DIAGNOSTIC_ONLY_FD_ONLY_DIAGNOSTIC_OBJECTIVE_LIMIT\"" in cuda_test and
+        "acceptance_gate=NONE" in fit),
     ("terminal diagnostic reports original gate vectors and uses post-move caches",
         "COVARIANCE_CURVATURE_GATE_DIRECTION" in fit and "role=ORIGINAL_GATE" in fit and
         "covariance_analytic_curvature_hessian(analytic_curvature_cache,system.p" in fit and
