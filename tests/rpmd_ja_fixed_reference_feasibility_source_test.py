@@ -171,12 +171,37 @@ for key, present in (
     ("independent curvature is wired and metered", "covariance_verify_directional_curvature" in fit and
         "ACTUAL_SUGGESTED_STEP" in fit and "FIXED_RANDOM" in fit and
         "analytic_curvature_direction_objectives" in fit and "model_floor_excluded 1" in fit),
+    ("terminal independent mismatch reports frozen level and component traces", "frozen_at_probes" in fit and
+        "NEGATIVE_SCALED_GRADIENT" in fit and "PROPOSED_TR_STEP" in fit and
+        "COVARIANCE_CURVATURE_NESTED_LEVEL" in fit and "primary_half_1plusrho_Gd=" in fit and
+        "primary_vTHv=" in fit and "independent_tauGq=" in fit and
+        "independent_ridge_lambda_norm2=" in fit and "denominator=" in fit and "NOT_EVALUATED" in fit),
+    ("failure finite differences are bounded and diagnostic only", "check.probes==128" in fit and
+        "std::min<std::uint64_t>(64" in fit and "&independent_hessian,true" in fit and
+        "DIAGNOSTIC_OBJECTIVE_LIMIT" in fit and "UNRESOLVED_REPRESENTABILITY" in fit and
+        "UNRESOLVED_SHIFTED_SPD_OR_DOMAIN" in fit and "diagnostic_only=1" in fit and
+        "directions_completed=" in fit and "test_covariance_independent_failure_diagnostic_never_commits" in cuda_test),
+    ("failure finite differences validate frozen directions and continue after expected unresolved probes",
+        "frozen directional curvature probe dimensions do not match" in fit and
+        "partial.completed_directions==1" in cuda_test and "UNRESOLVED_REPRESENTABILITY" in cuda_test and
+        "failure_fd_budget_errors_remaining" in cuda_test and "NOT_EVALUATED_BUDGET" in fit and
+        "fit.analytic_curvature_direction_objectives>0" in cuda_test),
+    ("terminal finite differences persist as diagnostic-only fit state",
+        'result.analytic_curvature_direction_status="DIAGNOSTIC_ONLY_"+check.failure_fd_status' in fit and
+        "fit.analytic_curvature_direction_status==\"DIAGNOSTIC_ONLY_DIAGNOSTIC_OBJECTIVE_LIMIT\"" in cuda_test),
+    ("terminal diagnostic reports original gate vectors and uses post-move caches",
+        "COVARIANCE_CURVATURE_GATE_DIRECTION" in fit and "role=ORIGINAL_GATE" in fit and
+        "covariance_analytic_curvature_hessian(analytic_curvature_cache,system.p" in fit and
+        "covariance_analytic_curvature_hessian(independent_curvature_cache,system.p" in fit),
+    ("diagnostic collection preserves the independent curvature gate result",
+        "plain_check.max_relative_directional_error==independent_check.max_relative_directional_error" in cuda_test and
+        "plain_check.independent.gram_q==independent_check.independent.gram_q" in cuda_test),
     ("directional curvature jointly bounds feasibility stability resolution and objectives", "maximum_step_halvings=24" in fit and
         "STEP_HALVING_UNSTABLE_RETRY" in fit and "DIRECTIONAL_ARITHMETIC_UNRESOLVED" in fit and
         "objective_evaluations>=max_objective_evaluations" in fit and
         "curvature_evaluations_before+8" in cuda_test and "boundary_unstable.status==\"STEP_HALVING_UNSTABLE\"" in cuda_test and
         "boundary_stable.resolved" in cuda_test and "system.ensure_factors(current.cached_theta,epsilon)" in fit),
-    ("unexpected independent-curvature budget states remain hard failures", "covariance_independent_budget_stop_or_throw(error)" in fit and
+    ("unexpected independent-curvature budget states remain hard failures", fit.count("covariance_independent_budget_stop_or_throw(error)")>=3 and
         "covariance_independent_failure_status_or_throw(check.status)" in fit and
         "invalid_budget_rethrown" in cuda_test and "unknown_result_rejected" in cuda_test),
     ("same-tau parameter updates do not repeat full directional differences", "trigger,include_reference_directions);" in fit and
@@ -415,6 +440,8 @@ assert 'verify_qp_fixture_bytes(path,bytes)' in source("tests/rpmd_ja_native_fit
 assert fit.index('reject_unexpected_stop("A0",a0)') < fit.index('reject_unexpected_stop("A1",a1,false)') < fit.index('auto run_family=')
 assert 'covariance_same_curvature_point(analytic_curvature_cache,independent_curvature_cache)' in fit
 assert 'independent_curvature_checked_tau!=tau' in fit
+assert 'failure_fd_objective_limit=64' in fit and 'failure_fd_runs' in cuda_test
+assert 'failed_independent.status=="CURVATURE_UNRESOLVED_INDEPENDENT_BATCH"' in cuda_test
 assert '"M1_basis_fingerprint_fnv64","M1_parameter_names"' in fit
 assert 'test_native_m1_writer_reader_cross_neighbor_images_and_transport' in source("tests/rpmd_ja_native_fit_cuda_test.cu")
 prepare_source = source("src/measure/rpmd_ja_qnep_prepare.cu")

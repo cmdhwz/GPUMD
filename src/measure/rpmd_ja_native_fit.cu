@@ -4574,6 +4574,12 @@ struct CovarianceFitTestHooks
   int trace_solution_failure_column=-1;
   double trace_solution_failure_delta=0.0;
   int independent_curvature_hard_failures_remaining=0;
+  int independent_curvature_bias_remaining=0;
+  double independent_curvature_diagonal_bias=0.0;
+  std::uint64_t failure_fd_objective_limit=64;
+  int failure_fd_runs=0;
+  int failure_fd_budget_errors_remaining=0;
+  std::string failure_fd_budget_error_status;
   int directional_curvature_reference_checks=0;
   int directional_curvature_step_checks=0;
   int trust_region_forced_rejections_remaining=0;
@@ -5993,6 +5999,34 @@ struct CovarianceAnalyticCurvatureCache
   int probes=0,levels_built=0;
 };
 
+struct CovarianceCurvatureComponents
+{
+  double data=std::numeric_limits<double>::quiet_NaN();
+  double barrier=std::numeric_limits<double>::quiet_NaN();
+  double ridge=std::numeric_limits<double>::quiet_NaN();
+  double total=std::numeric_limits<double>::quiet_NaN();
+};
+
+struct CovarianceCurvatureLevelDiagnostic
+{
+  int probes=0;
+  std::string primary_status="NOT_EVALUATED",independent_status="NOT_EVALUATED";
+  double primary_matrix_norm=std::numeric_limits<double>::quiet_NaN();
+  double independent_matrix_norm=std::numeric_limits<double>::quiet_NaN();
+  std::vector<CovarianceCurvatureComponents> primary,independent;
+  std::vector<std::pair<std::string,std::vector<double>>> gate_directions;
+  std::vector<CovarianceCurvatureComponents> primary_gate,independent_gate;
+};
+
+struct CovarianceIndependentCurvatureDiagnostic
+{
+  std::vector<std::pair<std::string,std::vector<double>>> directions;
+  std::vector<CovarianceCurvatureLevelDiagnostic> levels;
+  std::vector<double> theta,coordinate_scale;
+  double epsilon=std::numeric_limits<double>::quiet_NaN(),frozen_radius=std::numeric_limits<double>::quiet_NaN();
+  int frozen_at_probes=0;
+};
+
 struct CovarianceIndependentCurvatureCheck
 {
   CovarianceAnalyticCurvatureCache primary;
@@ -6002,6 +6036,9 @@ struct CovarianceIndependentCurvatureCheck
   double max_relative_directional_error=std::numeric_limits<double>::quiet_NaN(),seconds=0.0;
   std::uint64_t independent_rhs_columns=0,independent_batches=0,primary_upgrade_levels=0;
   int probes=0,directions_checked=0;
+  std::string failure_fd_status="NOT_EVALUATED";
+  std::uint64_t failure_fd_objectives=0;
+  double failure_fd_seconds=0.0;
 };
 
 double covariance_budget_now_seconds();
@@ -6196,6 +6233,43 @@ std::vector<double> covariance_analytic_curvature_hessian(const CovarianceAnalyt
   if(!std::all_of(hessian.begin(),hessian.end(),[](double value){return std::isfinite(value);}))
     throw std::runtime_error("CURVATURE_SOLVE_FAIL: analytic covariance Hessian is non-finite");
   return hessian;
+}
+
+CovarianceCurvatureComponents covariance_directional_curvature_components(
+  const CovarianceAnalyticCurvatureCache& cache,const std::vector<double>& direction,const double rho,
+  const double tau,const double ridge_lambda)
+{
+  const std::size_t p=direction.size();
+  if(!cache.valid||p==0||cache.gram_d.size()!=p*p||cache.gram_q.size()!=p*p)
+    throw std::invalid_argument("directional curvature component dimensions do not match");
+  NeumaierAccumulator d_form,q_form,norm_form;
+  for(std::size_t row=0;row<p;++row)for(std::size_t column=0;column<p;++column){
+    const std::size_t index=row+column*p;const double weight=direction[row]*direction[column];
+    d_form.add_product(weight,cache.gram_d[index]);q_form.add_product(weight,cache.gram_q[index]);}
+  for(std::size_t i=0;i<p;++i)norm_form.add_product(direction[i],direction[i]);
+  CovarianceCurvatureComponents result;result.data=0.5*(1.0+rho)*d_form.value();
+  result.barrier=tau*q_form.value();result.ridge=ridge_lambda*norm_form.value();
+  result.total=result.data+result.barrier+result.ridge;
+  if(!std::isfinite(result.data)||!std::isfinite(result.barrier)||!std::isfinite(result.ridge)||!std::isfinite(result.total))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: directional curvature component is non-finite");
+  return result;
+}
+
+double covariance_curvature_components_relative_error(const CovarianceCurvatureComponents& primary,
+  const CovarianceCurvatureComponents& independent,const double primary_matrix_norm)
+{
+  if(!std::isfinite(primary.total)||!std::isfinite(independent.total)||!std::isfinite(primary_matrix_norm))
+    throw std::runtime_error("NUMERICAL_SOLVE_FAIL: directional curvature comparison is non-finite");
+  const double denominator=std::max({std::abs(primary.total),std::abs(independent.total),
+    1.0e-12*primary_matrix_norm});
+  return std::abs(primary.total-independent.total)/denominator;
+}
+
+double covariance_curvature_matrix_norm(const CovarianceAnalyticCurvatureCache& cache,const int p,
+  const double rho,const double tau,const double ridge_lambda)
+{
+  const std::vector<double> hessian=covariance_analytic_curvature_hessian(cache,p,rho,tau,ridge_lambda);
+  double norm=0.0;for(const double value:hessian)norm=std::hypot(norm,value);return norm;
 }
 
 bool covariance_same_curvature_point(const CovarianceAnalyticCurvatureCache& left,
@@ -7116,7 +7190,23 @@ struct CovarianceDirectionalCurvatureSummary
 {
   std::string status="NOT_RUN";std::uint64_t checks=0,objectives=0;
   double seconds=0.0,max_relative_error=0.0;
+  int primary_matches=0,comparison_matches=0,comparison_checks=0,unresolved_checks=0,completed_directions=0;
+  std::vector<std::pair<std::string,std::string>> direction_statuses;
 };
+
+std::string covariance_failure_fd_status(const CovarianceDirectionalCurvatureSummary& summary,const int directions)
+{
+  if(summary.status=="DIAGNOSTIC_OBJECTIVE_LIMIT"||covariance_expected_budget_stop(summary.status))return summary.status;
+  for(const auto& direction:summary.direction_statuses)
+    if(direction.second.rfind("UNRESOLVED_",0)==0)return direction.second;
+  if(summary.completed_directions==0)return summary.status=="NOT_RUN"?"NO_COMPLETED_DIRECTIONS":summary.status;
+  std::string status;
+  if(summary.unresolved_checks>0)status="UNRESOLVED_DIFFERENCE_BELOW_RESOLUTION";
+  else if(summary.primary_matches==summary.completed_directions)
+    status=summary.comparison_matches==summary.completed_directions?"BOTH_MATCH":"PRIMARY_MATCH_INDEPENDENT_MISMATCH";
+  else status=summary.comparison_matches==summary.completed_directions?"PRIMARY_MISMATCH_INDEPENDENT_MATCH":"BOTH_MISMATCH";
+  return summary.completed_directions<directions?"PARTIAL_"+status:status;
+}
 
 bool covariance_directional_displacements(const std::vector<double>& theta,const std::vector<double>& coordinate_scale,
   const std::vector<double>& direction,const double step_size,std::vector<double>& plus,std::vector<double>& minus)
@@ -7158,12 +7248,16 @@ CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(De
   const double ridge_lambda,const std::vector<double>& raw_hessian,const std::vector<double>& scaled_gradient,
   const std::vector<double>* actual_step,std::uint64_t& objective_evaluations,const std::uint64_t max_objective_evaluations,
   rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* budget_limits=nullptr,
-  std::ostream* trace=nullptr,const char* trigger="INITIAL",const bool include_reference_directions=true)
+  std::ostream* trace=nullptr,const char* trigger="INITIAL",const bool include_reference_directions=true,
+  const std::vector<double>* comparison_hessian=nullptr,const bool diagnostic_only=false,
+  const std::vector<std::pair<std::string,std::vector<double>>>* frozen_directions=nullptr,
+  CovarianceDirectionalCurvatureSummary* partial_summary=nullptr)
 {
   CovarianceDirectionalCurvatureSummary summary;const auto started=std::chrono::steady_clock::now();
   const int p=system.p;
   if(!current.feasible||current.cached_theta.size()!=static_cast<std::size_t>(p)||coordinate_scale.size()!=static_cast<std::size_t>(p)||
      scaled_gradient.size()!=static_cast<std::size_t>(p)||raw_hessian.size()!=static_cast<std::size_t>(p)*p||
+     (comparison_hessian&&comparison_hessian->size()!=raw_hessian.size())||
      (actual_step&&actual_step->size()!=static_cast<std::size_t>(p)))
     throw std::invalid_argument("directional covariance curvature verification dimensions do not match");
   std::vector<std::pair<std::string,std::vector<double>>> directions;
@@ -7171,21 +7265,43 @@ CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(De
     const double norm=std::sqrt(std::inner_product(direction.begin(),direction.end(),direction.begin(),0.0));
     if(!std::isfinite(norm)||norm<=1e-14)return false;
     for(double& value:direction)value/=norm;directions.emplace_back(name,std::move(direction));return true;};
-  if(include_reference_directions){std::vector<double> gradient_direction=scaled_gradient;
-    for(double& value:gradient_direction)value=-value;append_direction("SCALED_GRADIENT",std::move(gradient_direction));}
-  if(actual_step)append_direction("ACTUAL_SUGGESTED_STEP",*actual_step);
-  if(include_reference_directions){std::mt19937_64 random(0x6a09e667f3bcc909ULL);std::uniform_int_distribution<int> sign(0,1);
-    std::vector<double> random_direction(static_cast<std::size_t>(p));for(double& value:random_direction)value=sign(random)?1.0:-1.0;
-    append_direction("FIXED_RANDOM",std::move(random_direction));}
+  if(frozen_directions){
+    directions=*frozen_directions;
+    for(auto& named:directions){
+      if(named.second.size()!=static_cast<std::size_t>(p))
+        throw std::invalid_argument("frozen directional curvature probe dimensions do not match");
+      double norm=0.0;for(const double value:named.second){
+        if(!std::isfinite(value))throw std::invalid_argument("frozen directional curvature probe is non-finite");
+        norm=std::hypot(norm,value);}
+      if(!(norm>1.0e-14)||!std::isfinite(norm))
+        throw std::invalid_argument("frozen directional curvature probe has no finite direction");
+      for(double& value:named.second)value/=norm;
+    }
+  }
+  else{
+    if(include_reference_directions){std::vector<double> gradient_direction=scaled_gradient;
+      for(double& value:gradient_direction)value=-value;append_direction("SCALED_GRADIENT",std::move(gradient_direction));}
+    if(actual_step)append_direction("ACTUAL_SUGGESTED_STEP",*actual_step);
+    if(include_reference_directions){std::mt19937_64 random(0x6a09e667f3bcc909ULL);std::uniform_int_distribution<int> sign(0,1);
+      std::vector<double> random_direction(static_cast<std::size_t>(p));for(double& value:random_direction)value=sign(random)?1.0:-1.0;
+      append_direction("FIXED_RANDOM",std::move(random_direction));}}
   if(directions.empty())throw std::runtime_error("CURVATURE_UNRESOLVED: no finite directional curvature probes could be formed");
   auto evaluate_objective=[&](const std::vector<double>& theta){
     if(objective_evaluations>=max_objective_evaluations){
       if(trace)*trace<<"COVARIANCE_CURVATURE_STEP status=EVALUATION_BUDGET_EXHAUSTED objective_evaluations="
         <<objective_evaluations<<" cap="<<max_objective_evaluations<<'\n';
       throw std::runtime_error("EVALUATION_BUDGET_EXHAUSTED");}
-    ++summary.objectives;
-    return evaluate_covariance_fit_objective(system,theta,baseline,statistics,rho,epsilon,tau,
-      objective_evaluations,false,false,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,budget,budget_limits);
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+    if(covariance_fit_test_hooks.failure_fd_budget_errors_remaining>0){
+      --covariance_fit_test_hooks.failure_fd_budget_errors_remaining;
+      throw CovarianceFeasibilityBudgetError(covariance_fit_test_hooks.failure_fd_budget_error_status);}
+#endif
+    const std::uint64_t before=objective_evaluations;
+    try{
+      CovarianceObjectiveEvaluation value=evaluate_covariance_fit_objective(system,theta,baseline,statistics,rho,epsilon,tau,
+        objective_evaluations,false,false,true,nullptr,nullptr,&coordinate_scale,ridge_lambda,budget,budget_limits);
+      summary.objectives+=objective_evaluations-before;return value;
+    }catch(...){summary.objectives+=objective_evaluations-before;throw;}
   };
   auto evaluate_second_at=[&](const std::vector<double>& direction,const double step_size,const char* direction_name,
       const int shrink,CovarianceObjectiveChange& second){
@@ -7234,8 +7350,16 @@ CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(De
     throw std::runtime_error(std::string("CURVATURE_UNRESOLVED: ")+last_status+
       " direction="+direction_name+" after bounded step reduction");
   };
+  auto mark_remaining_directions=[&](const std::size_t first,const char* status){
+    for(std::size_t i=first;i<directions.size();++i){summary.direction_statuses.emplace_back(directions[i].first,status);
+      if(trace)*trace<<"COVARIANCE_CURVATURE_FAILURE_FD_DIRECTION name="<<directions[i].first
+        <<" status="<<status<<'\n';}
+  };
   try{
-    for(const auto& named:directions){const std::vector<double>& direction=named.second;std::vector<double> action(static_cast<std::size_t>(p),0.0);
+    for(std::size_t direction_index=0;direction_index<directions.size();++direction_index){
+      const auto& named=directions[direction_index];const std::vector<double>& direction=named.second;
+      std::vector<double> action(static_cast<std::size_t>(p),0.0);
+      try{
       for(int row=0;row<p;++row)for(int column=0;column<p;++column)
         action[row]+=raw_hessian[static_cast<std::size_t>(row)+static_cast<std::size_t>(column)*p]*direction[column];
       const double gram_value=std::inner_product(direction.begin(),direction.end(),action.begin(),0.0);
@@ -7243,30 +7367,86 @@ CovarianceDirectionalCurvatureSummary covariance_verify_directional_curvature(De
       const double h=std::min(1.0e-3,std::max(1.0e-6,0.25*std::min(1.0,suggested_norm)));
       const DirectionalSecondPair pair=evaluate_pair(direction,h,gram_value,named.first.c_str());
       const CovarianceDirectionalCurvatureComparison& comparison=pair.comparison;
+      if(diagnostic_only&&comparison.status=="NONFINITE")
+        throw std::runtime_error("NUMERICAL_SOLVE_FAIL: primary failure finite-difference comparison is non-finite");
+      CovarianceDirectionalCurvatureComparison comparison_check;
+      if(comparison_hessian){std::vector<double> comparison_action(static_cast<std::size_t>(p),0.0);
+        for(int row=0;row<p;++row)for(int column=0;column<p;++column)
+          comparison_action[row]+=(*comparison_hessian)[static_cast<std::size_t>(row)+static_cast<std::size_t>(column)*p]*direction[column];
+        const double comparison_gram=std::inner_product(direction.begin(),direction.end(),comparison_action.begin(),0.0);
+        comparison_check=covariance_compare_directional_curvature(comparison_gram,pair.coarse.value,pair.fine.value,
+          pair.coarse.resolution,pair.fine.resolution);
+        if(comparison_check.status=="NONFINITE")
+          throw std::runtime_error("NUMERICAL_SOLVE_FAIL: independent failure finite-difference comparison is non-finite");
+        ++summary.comparison_checks;if(comparison_check.resolved)++summary.comparison_matches;
+        if(comparison_check.status=="DIFFERENCE_BELOW_RESOLUTION")++summary.unresolved_checks;
+        if(trace)*trace<<"COVARIANCE_CURVATURE_FAILURE_FD direction="<<named.first
+          <<" comparison_gram="<<comparison_gram<<" extrapolated="<<comparison_check.extrapolated
+          <<" relative_error="<<comparison_check.relative_error<<" status="<<comparison_check.status<<'\n';}
+      if(comparison.resolved)++summary.primary_matches;
+      if(comparison.status=="DIFFERENCE_BELOW_RESOLUTION")++summary.unresolved_checks;
       if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION trigger="<<trigger<<" direction="<<named.first
         <<" status="<<comparison.status<<" gram="<<gram_value<<" coarse="<<comparison.coarse
         <<" fine="<<comparison.fine<<" extrapolated="<<comparison.extrapolated
         <<" coarse_resolution="<<comparison.coarse_resolution<<" fine_resolution="<<comparison.fine_resolution
         <<" relative_error="<<comparison.relative_error<<" h="<<pair.h<<" h_half="<<0.5*pair.h<<'\n';
-      if(!comparison.resolved)throw std::runtime_error("CURVATURE_UNRESOLVED: "+comparison.status+" direction="+named.first);
+      if(!comparison.resolved&&!diagnostic_only)
+        throw std::runtime_error("CURVATURE_UNRESOLVED: "+comparison.status+" direction="+named.first);
+      ++summary.completed_directions;
+      std::string direction_status=comparison.resolved?"PRIMARY_MATCH":"PRIMARY_MISMATCH";
+      if(comparison_hessian)direction_status+=comparison_check.resolved?"_INDEPENDENT_MATCH":"_INDEPENDENT_MISMATCH";
+      summary.direction_statuses.emplace_back(named.first,direction_status);
+      }catch(const CovarianceFeasibilityBudgetError& error){
+        summary.status=covariance_independent_budget_stop_or_throw(error);
+        summary.direction_statuses.emplace_back(named.first,"FEASIBILITY_BUDGET_STOP");
+        if(trace)*trace<<"COVARIANCE_CURVATURE_FAILURE_FD_DIRECTION name="<<named.first
+          <<" status=FEASIBILITY_BUDGET_STOP reason="<<std::quoted(error.what())<<'\n';
+        mark_remaining_directions(direction_index+1,"NOT_EVALUATED_BUDGET");
+        break;
+      }catch(const std::runtime_error& error){
+        const std::string detail=error.what();
+        if(diagnostic_only&&detail=="EVALUATION_BUDGET_EXHAUSTED"){
+          summary.status="DIAGNOSTIC_OBJECTIVE_LIMIT";summary.direction_statuses.emplace_back(named.first,summary.status);
+          if(trace)*trace<<"COVARIANCE_CURVATURE_FAILURE_FD_DIRECTION name="<<named.first
+            <<" status="<<summary.status<<'\n';
+          mark_remaining_directions(direction_index+1,"NOT_EVALUATED_OBJECTIVE_LIMIT");break;}
+        if(diagnostic_only&&(detail.rfind("CURVATURE_UNRESOLVED: DIRECTIONAL_ARITHMETIC_UNRESOLVED",0)==0||
+           detail.rfind("CURVATURE_UNRESOLVED: DIRECTIONAL_STEP_BOUNDARY",0)==0||
+           detail.rfind("CURVATURE_UNRESOLVED: STEP_HALVING_UNSTABLE",0)==0)){
+          const std::string status=detail.rfind("CURVATURE_UNRESOLVED: DIRECTIONAL_ARITHMETIC_UNRESOLVED",0)==0?
+            "UNRESOLVED_REPRESENTABILITY":detail.rfind("CURVATURE_UNRESOLVED: DIRECTIONAL_STEP_BOUNDARY",0)==0?
+            "UNRESOLVED_SHIFTED_SPD_OR_DOMAIN":"UNRESOLVED_STEP_HALVING";
+          ++summary.unresolved_checks;
+          summary.direction_statuses.emplace_back(named.first,status);
+          if(trace)*trace<<"COVARIANCE_CURVATURE_FAILURE_FD_DIRECTION name="<<named.first<<" status="<<status<<'\n';
+          continue;}
+        throw;
+      }
     }
     if(!system.ensure_factors(current.cached_theta,epsilon))
       throw std::runtime_error("CURVATURE_UNRESOLVED: could not restore accepted-point covariance factors after directional checks");
-    summary.status="PASS";
+    if(summary.status=="NOT_RUN")summary.status=diagnostic_only&&summary.completed_directions==0?
+      "DIAGNOSTIC_NO_COMPLETED_DIRECTIONS":diagnostic_only?"DIAGNOSTIC_COMPLETED":"PASS";
   }catch(...){
     const std::exception_ptr original=std::current_exception();
     summary.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
     if(!system.ensure_factors(current.cached_theta,epsilon))
       throw std::runtime_error("CURVATURE_UNRESOLVED: accepted-point factors could not be restored after directional checks");
+    if(partial_summary)*partial_summary=summary;
     std::string failure="UNKNOWN";try{std::rethrow_exception(original);}catch(const std::exception& error){failure=error.what();}catch(...){}
     if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION_SUMMARY trigger="<<trigger<<" status=UNRESOLVED checks="<<summary.checks
       <<" objective_evaluations="<<summary.objectives<<" elapsed_seconds="<<summary.seconds
+      <<" primary_matches="<<summary.primary_matches<<" comparison_matches="<<summary.comparison_matches
+      <<" completed_directions="<<summary.completed_directions
       <<" reason="<<std::quoted(failure)<<" model_floor_excluded 1\n";
     std::rethrow_exception(original);
   }
   summary.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
-  if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION_SUMMARY trigger="<<trigger<<" status=PASS checks="<<summary.checks
+  if(partial_summary)*partial_summary=summary;
+  if(trace)*trace<<"COVARIANCE_CURVATURE_DIRECTION_SUMMARY trigger="<<trigger<<" status="<<summary.status<<" checks="<<summary.checks
     <<" objective_evaluations="<<summary.objectives<<" max_relative_error="<<summary.max_relative_error
+    <<" primary_matches="<<summary.primary_matches<<" comparison_matches="<<summary.comparison_matches
+    <<" completed_directions="<<summary.completed_directions
     <<" elapsed_seconds="<<summary.seconds<<" model_floor_excluded 1\n";
   return summary;
 }
@@ -7828,11 +8008,16 @@ double covariance_normalized_curvature_change(const std::vector<double>& previou
   return difference/std::max(norm,1e-300);
 }
 
+void covariance_record_primary_curvature_level(CovarianceIndependentCurvatureDiagnostic& diagnostic,
+  const CovarianceAnalyticCurvatureCache& cache,DeviceCovarianceSystem& system,const double rho,const double tau,
+  const double ridge_lambda,const std::vector<double>& gradient,const double radius);
+
 CovarianceAnalyticCurvatureCache covariance_build_stable_analytic_curvature_cache(DeviceCovarianceSystem& system,
   const std::vector<double>& theta,const double epsilon,const std::vector<double>& scale,const int minimum_probes,
   const double rho,const double tau,const double ridge_lambda,const std::vector<double>& gradient,const double radius,
   std::uint64_t& rhs_columns,rpmd_ja_feasibility::Budget* budget=nullptr,const rpmd_ja_feasibility::Limits* limits=nullptr,
-  const std::vector<double>* supplied_omega=nullptr,const CovarianceAnalyticCurvatureCache* previously_verified=nullptr)
+  const std::vector<double>* supplied_omega=nullptr,const CovarianceAnalyticCurvatureCache* previously_verified=nullptr,
+  CovarianceIndependentCurvatureDiagnostic* diagnostic=nullptr)
 {
   if((minimum_probes!=16&&minimum_probes!=32&&minimum_probes!=64&&minimum_probes!=128)||gradient.size()!=theta.size()||
      !(radius>0.0)||!std::isfinite(radius))throw std::invalid_argument("analytic covariance stability request is invalid");
@@ -7853,6 +8038,7 @@ CovarianceAnalyticCurvatureCache covariance_build_stable_analytic_curvature_cach
     if(supplied_omega){prefix.assign(supplied_omega->begin(),supplied_omega->begin()+static_cast<std::ptrdiff_t>(system.r)*probes);level_omega=&prefix;}
     current=covariance_build_analytic_curvature_cache(system,theta,epsilon,scale,probes,rhs_columns,budget,limits,level_omega);
     current.levels_built=++levels;
+    if(diagnostic)covariance_record_primary_curvature_level(*diagnostic,current,system,rho,tau,ridge_lambda,gradient,radius);
     if(previous.valid){
       const std::vector<double> previous_hessian=covariance_analytic_curvature_hessian(previous,system.p,rho,tau,ridge_lambda);
       const std::vector<double> current_hessian=covariance_analytic_curvature_hessian(current,system.p,rho,tau,ridge_lambda);
@@ -7893,12 +8079,37 @@ double covariance_directional_hessian_relative_error(const std::vector<double>& 
   return std::abs(a-b)/std::max({std::abs(a),std::abs(b),1e-12*matrix_norm});
 }
 
+std::vector<std::pair<std::string,std::vector<double>>> covariance_independent_gate_directions(
+  const CovarianceTrustRegionModel& model,const std::vector<double>& gradient,const double radius)
+{
+  std::vector<std::pair<std::string,std::vector<double>>> directions;
+  auto add_direction=[&](const char* name,std::vector<double> direction){double norm=0.0;
+    for(const double value:direction)norm=std::hypot(norm,value);
+    if(norm>0.0&&std::isfinite(norm)){for(double& value:direction)value/=norm;directions.emplace_back(name,std::move(direction));}};
+  std::vector<double> gradient_direction=gradient;for(double& value:gradient_direction)value=-value;
+  add_direction("NEGATIVE_SCALED_GRADIENT",std::move(gradient_direction));
+  const CovarianceTrustRegionStep proposed=covariance_trust_region_subproblem(model,gradient,radius);
+  add_direction("PROPOSED_TR_STEP",proposed.step);
+  std::mt19937_64 random(covariance_independent_curvature_seed^0xa0761d6478bd642fULL);
+  std::uniform_int_distribution<int> sign(0,1);std::vector<double> fixed_random(gradient.size());
+  for(double& value:fixed_random)value=sign(random)?1.0:-1.0;
+  add_direction("FIXED_RANDOM",std::move(fixed_random));
+  return directions;
+}
+
+CovarianceCurvatureLevelDiagnostic& covariance_curvature_diagnostic_level(
+  CovarianceIndependentCurvatureDiagnostic& diagnostic,const int probes);
+std::vector<std::pair<std::string,std::vector<double>>> covariance_freeze_curvature_diagnostic_directions(
+  DeviceCovarianceSystem& system,const CovarianceAnalyticCurvatureCache& primary,const double rho,const double tau,
+  const double ridge_lambda,const std::vector<double>& gradient,const double radius);
+
 CovarianceIndependentCurvatureCheck covariance_verify_independent_curvature_batch(DeviceCovarianceSystem& system,
   CovarianceAnalyticCurvatureCache primary,const double epsilon,const std::vector<double>& scale,const double rho,
   const double tau,const double ridge_lambda,const std::vector<double>& gradient,const double radius,
   std::uint64_t& rhs_columns,rpmd_ja_feasibility::Budget* budget=nullptr,
   const rpmd_ja_feasibility::Limits* limits=nullptr,
-  const CovarianceAnalyticCurvatureCache* reusable_independent=nullptr)
+  const CovarianceAnalyticCurvatureCache* reusable_independent=nullptr,
+  CovarianceIndependentCurvatureDiagnostic* diagnostic=nullptr)
 {
   CovarianceIndependentCurvatureCheck result;result.primary=std::move(primary);
   if(!result.primary.valid||gradient.size()!=static_cast<std::size_t>(system.p)||!(radius>0.0)||
@@ -7922,32 +8133,76 @@ CovarianceIndependentCurvatureCheck covariance_verify_independent_curvature_batc
           probes,rhs_columns,budget,limits,nullptr,covariance_independent_curvature_seed);
         ++result.independent_batches;
       }
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+      if(covariance_fit_test_hooks.independent_curvature_bias_remaining>0){
+        --covariance_fit_test_hooks.independent_curvature_bias_remaining;
+        for(int i=0;i<system.p;++i){const std::size_t index=static_cast<std::size_t>(i)+static_cast<std::size_t>(i)*system.p;
+          independent.gram_d[index]+=covariance_fit_test_hooks.independent_curvature_diagonal_bias;}}
+#endif
       result.independent_rhs_columns+=rhs_columns-rhs_before;result.probes=probes;
       const std::vector<double> primary_hessian=covariance_analytic_curvature_hessian(result.primary,system.p,rho,tau,ridge_lambda);
       const std::vector<double> independent_hessian=covariance_analytic_curvature_hessian(independent,system.p,rho,tau,ridge_lambda);
+      if(diagnostic){
+        if(diagnostic->directions.empty()){
+          diagnostic->directions=covariance_freeze_curvature_diagnostic_directions(system,result.primary,rho,tau,
+            ridge_lambda,gradient,radius);diagnostic->frozen_at_probes=probes;}
+        CovarianceCurvatureLevelDiagnostic& level=covariance_curvature_diagnostic_level(*diagnostic,probes);
+        if(level.primary.empty())covariance_record_primary_curvature_level(*diagnostic,result.primary,system,rho,tau,
+          ridge_lambda,gradient,radius);
+        level.independent.clear();level.independent.reserve(diagnostic->directions.size());
+        for(const auto& named:diagnostic->directions)
+          level.independent.push_back(covariance_directional_curvature_components(independent,named.second,rho,tau,ridge_lambda));
+        level.independent_matrix_norm=covariance_curvature_matrix_norm(independent,system.p,rho,tau,ridge_lambda);
+        level.independent_status="EVALUATED";
+      }
       result.independent=std::move(independent);
       const CovarianceTrustRegionModel model=covariance_direct_hessian_trust_region_model(system.solver,primary_hessian,system.p);
       if(!model.positive_definite){result.status="CURVATURE_UNRESOLVED_PRIMARY_MODEL_NOT_POSITIVE";break;}
-      const CovarianceTrustRegionStep proposed=covariance_trust_region_subproblem(model,gradient,radius);
-      std::vector<std::vector<double>> directions;
-      auto add_direction=[&](std::vector<double> direction){double norm=0.0;for(const double value:direction)norm=std::hypot(norm,value);
-        if(norm>0.0&&std::isfinite(norm)){for(double& value:direction)value/=norm;directions.push_back(std::move(direction));}};
-      std::vector<double> gradient_direction=gradient;for(double& value:gradient_direction)value=-value;
-      add_direction(std::move(gradient_direction));add_direction(proposed.step);
-      std::mt19937_64 random(covariance_independent_curvature_seed^0xa0761d6478bd642fULL);
-      std::uniform_int_distribution<int> sign(0,1);std::vector<double> fixed_random(static_cast<std::size_t>(system.p));
-      for(double& value:fixed_random)value=sign(random)?1.0:-1.0;add_direction(std::move(fixed_random));
+      const std::vector<std::pair<std::string,std::vector<double>>> directions=
+        covariance_independent_gate_directions(model,gradient,radius);
       if(directions.empty())throw std::runtime_error("independent curvature direction set is empty");
       double maximum_error=0.0;
-      for(const auto& direction:directions)
-        maximum_error=std::max(maximum_error,covariance_directional_hessian_relative_error(
-          primary_hessian,independent_hessian,direction));
+      for(std::size_t i=0;i<directions.size();++i){const auto& direction=directions[i].second;
+        const double error=covariance_directional_hessian_relative_error(primary_hessian,independent_hessian,direction);
+        maximum_error=std::max(maximum_error,error);}
       result.max_relative_directional_error=maximum_error;result.directions_checked=static_cast<int>(directions.size());
+      if(diagnostic){CovarianceCurvatureLevelDiagnostic& level=covariance_curvature_diagnostic_level(*diagnostic,probes);
+        level.gate_directions=directions;level.primary_gate.clear();level.independent_gate.clear();
+        level.primary_gate.reserve(directions.size());level.independent_gate.reserve(directions.size());
+        for(const auto& named:directions){
+          level.primary_gate.push_back(covariance_directional_curvature_components(result.primary,named.second,rho,tau,ridge_lambda));
+          level.independent_gate.push_back(covariance_directional_curvature_components(result.independent,named.second,rho,tau,ridge_lambda));}
+        level.primary_matrix_norm=covariance_curvature_matrix_norm(result.primary,system.p,rho,tau,ridge_lambda);
+        level.independent_matrix_norm=covariance_curvature_matrix_norm(result.independent,system.p,rho,tau,ridge_lambda);}
       if(maximum_error<=covariance_independent_directional_tolerance){result.valid=true;result.status="PASS_INDEPENDENT_OMEGA_DIRECTIONAL";break;}
-      if(probes>=CovarianceAnalyticCurvatureWorkspace::max_probes){result.status="CURVATURE_UNRESOLVED_INDEPENDENT_BATCH";break;}
+      if(probes>=CovarianceAnalyticCurvatureWorkspace::max_probes){result.status="CURVATURE_UNRESOLVED_INDEPENDENT_BATCH";
+        if(diagnostic){
+          bool nested_budget_stop=false;std::string nested_budget_status;
+          for(auto& level:diagnostic->levels){
+            if(level.primary_status!="EVALUATED"||level.independent_status=="EVALUATED")continue;
+            try{const std::uint64_t nested_rhs_before=rhs_columns;
+              const CovarianceAnalyticCurvatureCache nested=covariance_build_analytic_curvature_cache(system,
+                result.primary.theta,epsilon,scale,level.probes,rhs_columns,budget,limits,nullptr,
+                covariance_independent_curvature_seed);
+              result.independent_rhs_columns+=rhs_columns-nested_rhs_before;++result.independent_batches;
+              level.independent.clear();level.independent.reserve(diagnostic->directions.size());
+              for(const auto& named:diagnostic->directions)
+                level.independent.push_back(covariance_directional_curvature_components(nested,named.second,rho,tau,ridge_lambda));
+              level.independent_gate.clear();level.independent_gate.reserve(level.gate_directions.size());
+              for(const auto& named:level.gate_directions)
+                level.independent_gate.push_back(covariance_directional_curvature_components(nested,named.second,rho,tau,ridge_lambda));
+              level.independent_matrix_norm=covariance_curvature_matrix_norm(nested,system.p,rho,tau,ridge_lambda);
+              level.independent_status="EVALUATED";
+            }catch(const CovarianceFeasibilityBudgetError& error){
+              nested_budget_status=covariance_independent_budget_stop_or_throw(error);
+              level.independent_status="NOT_EVALUATED_"+nested_budget_status;nested_budget_stop=true;break;}}
+          if(nested_budget_stop)for(auto& level:diagnostic->levels)
+            if(level.independent_status=="NOT_EVALUATED")level.independent_status="NOT_EVALUATED_"+nested_budget_status;
+        }
+        break;}
       CovarianceAnalyticCurvatureCache upgraded=covariance_build_stable_analytic_curvature_cache(system,
         result.primary.theta,epsilon,scale,probes*2,rho,tau,ridge_lambda,gradient,radius,rhs_columns,budget,limits,
-        nullptr,&result.primary);
+        nullptr,&result.primary,diagnostic);
       result.primary_upgrade_levels+=static_cast<std::uint64_t>(upgraded.levels_built);
       if(!upgraded.valid){result.primary=std::move(upgraded);result.status="CURVATURE_UNRESOLVED_PRIMARY_UPGRADE";break;}
       result.primary=std::move(upgraded);
@@ -7987,6 +8242,117 @@ CovarianceDirectionChoice covariance_choose_group_bfgs_direction(const std::vect
   result.selected_slope=covariance_dot(gradient,result.direction);
   if(!std::isfinite(result.selected_slope))throw std::runtime_error("NUMERICAL_SOLVE_FAIL: covariance group BFGS slope is non-finite");
   return result;
+}
+
+std::vector<std::pair<std::string,std::vector<double>>> covariance_freeze_curvature_diagnostic_directions(
+  DeviceCovarianceSystem& system,const CovarianceAnalyticCurvatureCache& primary,const double rho,const double tau,
+  const double ridge_lambda,const std::vector<double>& gradient,const double radius)
+{
+  const int p=system.p;const std::vector<double> hessian=covariance_analytic_curvature_hessian(primary,p,rho,tau,ridge_lambda);
+  const CovarianceTrustRegionModel model=covariance_direct_hessian_trust_region_model(system.solver,hessian,p);
+  std::vector<std::pair<std::string,std::vector<double>>> directions;
+  auto append=[&](const char* name,std::vector<double> direction){double norm=0.0;
+    for(const double value:direction)norm=std::hypot(norm,value);
+    if(norm>1.0e-14&&std::isfinite(norm)){for(double& value:direction)value/=norm;directions.emplace_back(name,std::move(direction));}};
+  std::vector<double> negative_gradient=gradient;for(double& value:negative_gradient)value=-value;
+  append("NEGATIVE_SCALED_GRADIENT",std::move(negative_gradient));
+  if(model.positive_definite){const CovarianceTrustRegionStep proposed=covariance_trust_region_subproblem(model,gradient,radius);
+    append("PROPOSED_TR_STEP",proposed.step);}
+  std::mt19937_64 random(covariance_independent_curvature_seed^0xa0761d6478bd642fULL);
+  std::uniform_int_distribution<int> sign(0,1);std::vector<double> fixed_random(static_cast<std::size_t>(p));
+  for(double& value:fixed_random)value=sign(random)?1.0:-1.0;
+  append("FIXED_RANDOM",std::move(fixed_random));
+  if(directions.empty())throw std::runtime_error("CURVATURE_UNRESOLVED: no fixed diagnostic directions could be formed");
+  return directions;
+}
+
+CovarianceCurvatureLevelDiagnostic& covariance_curvature_diagnostic_level(
+  CovarianceIndependentCurvatureDiagnostic& diagnostic,const int probes)
+{
+  for(auto& level:diagnostic.levels)if(level.probes==probes)return level;
+  CovarianceCurvatureLevelDiagnostic level;level.probes=probes;
+  diagnostic.levels.push_back(std::move(level));
+  std::sort(diagnostic.levels.begin(),diagnostic.levels.end(),[](const auto& a,const auto& b){return a.probes<b.probes;});
+  for(auto& stored:diagnostic.levels)if(stored.probes==probes)return stored;
+  throw std::logic_error("nested curvature diagnostic level was not inserted");
+}
+
+void covariance_record_primary_curvature_level(CovarianceIndependentCurvatureDiagnostic& diagnostic,
+  const CovarianceAnalyticCurvatureCache& cache,DeviceCovarianceSystem& system,const double rho,const double tau,
+  const double ridge_lambda,const std::vector<double>& gradient,const double radius)
+{
+  if(diagnostic.directions.empty()){
+    diagnostic.theta=cache.theta;diagnostic.coordinate_scale=cache.coordinate_scale;diagnostic.epsilon=cache.epsilon;
+    diagnostic.frozen_radius=radius;
+    diagnostic.directions=covariance_freeze_curvature_diagnostic_directions(system,cache,rho,tau,ridge_lambda,gradient,radius);
+    diagnostic.frozen_at_probes=cache.probes;
+  }
+  CovarianceCurvatureLevelDiagnostic& level=covariance_curvature_diagnostic_level(diagnostic,cache.probes);
+  level.primary.clear();level.primary.reserve(diagnostic.directions.size());
+  for(const auto& named:diagnostic.directions)
+    level.primary.push_back(covariance_directional_curvature_components(cache,named.second,rho,tau,ridge_lambda));
+  level.primary_matrix_norm=covariance_curvature_matrix_norm(cache,system.p,rho,tau,ridge_lambda);
+  level.primary_status="EVALUATED";
+}
+
+void covariance_write_independent_curvature_diagnostic(std::ostream& out,
+  CovarianceIndependentCurvatureDiagnostic& diagnostic,const double rho,const double tau,const double ridge_lambda,
+  const char* trigger)
+{
+  const std::streamsize old_precision=out.precision();
+  out.precision(17);
+  out<<"COVARIANCE_CURVATURE_DIAGNOSTIC_POINT trigger="<<trigger<<" epsilon="<<diagnostic.epsilon
+    <<" rho="<<rho<<" tau="<<tau<<" ridge_lambda="<<ridge_lambda<<" theta=[";
+  for(std::size_t i=0;i<diagnostic.theta.size();++i){if(i)out<<',';out<<diagnostic.theta[i];}
+  out<<"] coordinate_scale=[";
+  for(std::size_t i=0;i<diagnostic.coordinate_scale.size();++i){if(i)out<<',';out<<diagnostic.coordinate_scale[i];}
+  out<<"] frozen_trust_radius="<<diagnostic.frozen_radius<<'\n';
+  for(const int probes:{16,32,64,128}){
+    CovarianceCurvatureLevelDiagnostic& level=covariance_curvature_diagnostic_level(diagnostic,probes);
+    out<<"COVARIANCE_CURVATURE_NESTED_LEVEL trigger="<<trigger<<" probes="<<probes
+      <<" frozen_at_probes="<<diagnostic.frozen_at_probes<<" rho="<<rho<<" tau="<<tau
+      <<" ridge_lambda="<<ridge_lambda<<" primary_status="<<level.primary_status
+      <<" independent_status="<<level.independent_status<<'\n';
+    for(std::size_t i=0;i<diagnostic.directions.size();++i){const auto& named=diagnostic.directions[i];
+      out<<"COVARIANCE_CURVATURE_NESTED_DIRECTION trigger="<<trigger<<" probes="<<probes
+        <<" name="<<named.first<<" vector=[";
+      for(std::size_t j=0;j<named.second.size();++j){if(j)out<<',';out<<named.second[j];}
+      out<<"] primary_status="<<level.primary_status<<" independent_status="<<level.independent_status;
+      if(i<level.primary.size()){const auto& p=level.primary[i];out<<" primary_half_1plusrho_Gd="<<p.data<<" primary_tauGq="<<p.barrier
+        <<" primary_ridge_lambda_norm2="<<p.ridge<<" primary_vTHv="<<p.total;}
+      else out<<" primary_components=NOT_EVALUATED";
+      if(i<level.independent.size()){const auto& q=level.independent[i];out<<" independent_half_1plusrho_Gd="<<q.data
+        <<" independent_tauGq="<<q.barrier<<" independent_ridge_lambda_norm2="<<q.ridge<<" independent_vTHv="<<q.total;}
+      else out<<" independent_components=NOT_EVALUATED";
+      if(i<level.primary.size()&&i<level.independent.size()){
+        const double denominator=std::max({std::abs(level.primary[i].total),std::abs(level.independent[i].total),
+          1.0e-12*level.primary_matrix_norm});
+        const double error=covariance_curvature_components_relative_error(
+          level.primary[i],level.independent[i],level.primary_matrix_norm);
+        out<<" denominator="<<denominator<<" relative_error="<<error;}
+      else out<<" denominator=NOT_EVALUATED relative_error=NOT_EVALUATED";
+      out<<'\n';}
+    for(std::size_t i=0;i<level.gate_directions.size();++i){const auto& named=level.gate_directions[i];
+      out<<"COVARIANCE_CURVATURE_GATE_DIRECTION trigger="<<trigger<<" probes="<<probes
+        <<" role=ORIGINAL_GATE name="<<named.first<<" vector=[";
+      for(std::size_t j=0;j<named.second.size();++j){if(j)out<<',';out<<named.second[j];}
+      out<<"] primary_status="<<level.primary_status<<" independent_status="<<level.independent_status;
+      if(i<level.primary_gate.size()){const auto& p=level.primary_gate[i];out<<" primary_half_1plusrho_Gd="<<p.data
+        <<" primary_tauGq="<<p.barrier<<" primary_ridge_lambda_norm2="<<p.ridge<<" primary_vTHv="<<p.total;}
+      else out<<" primary_components=NOT_EVALUATED";
+      if(i<level.independent_gate.size()){const auto& q=level.independent_gate[i];out<<" independent_half_1plusrho_Gd="<<q.data
+        <<" independent_tauGq="<<q.barrier<<" independent_ridge_lambda_norm2="<<q.ridge<<" independent_vTHv="<<q.total;}
+      else out<<" independent_components=NOT_EVALUATED";
+      if(i<level.primary_gate.size()&&i<level.independent_gate.size()){
+        const double denominator=std::max({std::abs(level.primary_gate[i].total),std::abs(level.independent_gate[i].total),
+          1.0e-12*level.primary_matrix_norm});
+        const double error=covariance_curvature_components_relative_error(
+          level.primary_gate[i],level.independent_gate[i],level.primary_matrix_norm);
+        out<<" denominator="<<denominator<<" relative_error="<<error;}
+      else out<<" denominator=NOT_EVALUATED relative_error=NOT_EVALUATED";
+      out<<'\n';}
+  }
+  out.precision(old_precision);
 }
 
 enum class CovarianceGroupBFGSUpdateStatus { Updated, Seeded, Reset, SkippedMixedStep };
@@ -8906,6 +9272,9 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     double curvature_direction_checked_tau=std::numeric_limits<double>::quiet_NaN();
     CovarianceAnalyticCurvatureCache independent_curvature_cache;
     double independent_curvature_checked_tau=std::numeric_limits<double>::quiet_NaN();
+    CovarianceIndependentCurvatureDiagnostic independent_curvature_diagnostic;
+    std::vector<double> independent_curvature_diagnostic_theta;
+    double independent_curvature_diagnostic_tau=std::numeric_limits<double>::quiet_NaN();
     auto persist_accepted_point=[&](const bool operation_in_progress=false){
       if(!checkpoint_sink)return;
       if(!checkpoint_metadata)throw std::runtime_error("checkpoint writer has no frozen branch metadata");
@@ -9022,7 +9391,7 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
     auto run_independent_curvature_check=[&](const char* trigger,const std::vector<double>& scaled_gradient){
       CovarianceIndependentCurvatureCheck check=covariance_verify_independent_curvature_batch(system,analytic_curvature_cache,
         epsilon,coordinate_scale,rho,tau,ridge_lambda,scaled_gradient,trust_radius,result.analytic_curvature_rhs_columns,
-        budget,budget_limits,&independent_curvature_cache);
+        budget,budget_limits,&independent_curvature_cache,&independent_curvature_diagnostic);
       analytic_curvature_cache=std::move(check.primary);result.analytic_curvature_independent_status=check.status;
       independent_curvature_cache=std::move(check.independent);
       result.analytic_curvature_builds+=check.independent_batches+check.primary_upgrade_levels;
@@ -9041,6 +9410,51 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
         <<" rhs_columns="<<check.independent_rhs_columns<<" max_directional_error="
         <<check.max_relative_directional_error<<" tolerance="<<covariance_independent_directional_tolerance
         <<" status="<<check.status<<'\n';flush_trace();
+      if(trace&&!check.valid)covariance_write_independent_curvature_diagnostic(*trace,independent_curvature_diagnostic,rho,tau,
+        ridge_lambda,trigger);
+      if(!check.valid&&check.status=="CURVATURE_UNRESOLVED_INDEPENDENT_BATCH"&&check.probes==128){
+        const auto fd_started=std::chrono::steady_clock::now();const std::uint64_t objective_before=result.objective_evaluations;
+        const std::vector<double> primary_hessian=covariance_analytic_curvature_hessian(analytic_curvature_cache,system.p,rho,tau,ridge_lambda);
+        const std::vector<double> independent_hessian=covariance_analytic_curvature_hessian(independent_curvature_cache,system.p,rho,tau,ridge_lambda);
+        const std::uint64_t diagnostic_ceiling=result.objective_evaluations+
+          std::min<std::uint64_t>(64,max_evaluations>result.objective_evaluations?
+            max_evaluations-result.objective_evaluations:0);
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+        ++covariance_fit_test_hooks.failure_fd_runs;
+        const std::uint64_t test_ceiling=result.objective_evaluations+covariance_fit_test_hooks.failure_fd_objective_limit;
+        const std::uint64_t bounded_diagnostic_ceiling=std::min(diagnostic_ceiling,test_ceiling);
+#else
+        const std::uint64_t bounded_diagnostic_ceiling=diagnostic_ceiling;
+#endif
+        CovarianceDirectionalCurvatureSummary fd_partial;
+        try{
+          const CovarianceDirectionalCurvatureSummary fd=covariance_verify_directional_curvature(system,current,baseline,statistics,
+            rho,epsilon,tau,coordinate_scale,ridge_lambda,primary_hessian,scaled_gradient,nullptr,result.objective_evaluations,
+            bounded_diagnostic_ceiling,budget,budget_limits,trace,trigger,true,&independent_hessian,true,
+            &independent_curvature_diagnostic.directions,&fd_partial);
+          check.failure_fd_status=covariance_failure_fd_status(fd,static_cast<int>(independent_curvature_diagnostic.directions.size()));
+        }catch(const CovarianceFeasibilityBudgetError& error){
+          check.failure_fd_status=covariance_independent_budget_stop_or_throw(error);}
+        catch(const std::runtime_error& error){const std::string detail=error.what();
+          if(detail=="EVALUATION_BUDGET_EXHAUSTED")check.failure_fd_status="DIAGNOSTIC_OBJECTIVE_LIMIT";
+          else throw;}
+        check.failure_fd_objectives=result.objective_evaluations-objective_before;
+        check.failure_fd_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-fd_started).count();
+        result.analytic_curvature_direction_checks+=fd_partial.checks;
+        result.analytic_curvature_direction_objectives+=check.failure_fd_objectives;
+        result.analytic_curvature_direction_seconds+=check.failure_fd_seconds;
+        if(fd_partial.checks>0)result.analytic_curvature_direction_max_relative_error=std::max(
+          std::isfinite(result.analytic_curvature_direction_max_relative_error)?result.analytic_curvature_direction_max_relative_error:0.0,
+          fd_partial.max_relative_error);
+        result.analytic_curvature_direction_status="DIAGNOSTIC_ONLY_"+check.failure_fd_status;
+        if(trace)*trace<<"COVARIANCE_CURVATURE_FAILURE_FD_SUMMARY trigger="<<trigger
+          <<" status="<<check.failure_fd_status<<" objective_evaluations="<<check.failure_fd_objectives
+          <<" objective_ceiling="<<(bounded_diagnostic_ceiling-objective_before)<<" elapsed_seconds="<<check.failure_fd_seconds
+          <<" checks_completed="<<fd_partial.checks<<" directions_completed="<<fd_partial.completed_directions
+          <<" primary_matches="<<fd_partial.primary_matches<<" independent_matches="<<fd_partial.comparison_matches
+          <<" unresolved_directions="<<fd_partial.unresolved_checks
+          <<" accepted_step=0 last_valid_changed=0 diagnostic_only=1\n";flush_trace();}
+      result.analytic_curvature_independent_seconds+=check.failure_fd_seconds;
       if(!check.valid){result.analytic_curvature_status="CURVATURE_UNRESOLVED";
         result.status=covariance_independent_failure_status_or_throw(check.status);
         result.reason="independent random-batch directional curvature check did not resolve";return false;}
@@ -9104,6 +9518,12 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
             analytic_curvature_cache.epsilon==epsilon&&analytic_curvature_cache.coordinate_scale==coordinate_scale&&
             analytic_curvature_cache.graph_assembly_generation==system.graph_assembly_generation&&
             analytic_curvature_cache.probes>=working_analytic_curvature_probes;
+          if(independent_curvature_diagnostic_theta!=result.theta||independent_curvature_diagnostic_tau!=tau){
+            independent_curvature_diagnostic=CovarianceIndependentCurvatureDiagnostic{};
+            independent_curvature_diagnostic_theta=result.theta;independent_curvature_diagnostic_tau=tau;}
+          if(cache_hit&&independent_curvature_diagnostic.levels.empty())
+            covariance_record_primary_curvature_level(independent_curvature_diagnostic,analytic_curvature_cache,
+              system,rho,tau,ridge_lambda,g,trust_radius);
           if(cache_hit){++result.analytic_curvature_cache_hits;result.analytic_curvature_status="CACHE_HIT";}
           else{
             try{
@@ -9114,9 +9534,12 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
                   analytic_curvature_cache.levels_built=1;
                   analytic_curvature_cache.stability_status="PREVIOUSLY_VERIFIED_PROBE_COUNT_REUSED";
                   analytic_curvature_cache.status="PROBE_COUNT_REUSED_PENDING_LOCAL_CHECK";
+                  covariance_record_primary_curvature_level(independent_curvature_diagnostic,analytic_curvature_cache,
+                    system,rho,tau,ridge_lambda,g,trust_radius);
                 }else{
                   analytic_curvature_cache=covariance_build_stable_analytic_curvature_cache(system,result.theta,epsilon,coordinate_scale,
-                    working_analytic_curvature_probes,rho,tau,ridge_lambda,g,trust_radius,result.analytic_curvature_rhs_columns,budget,budget_limits);
+                    working_analytic_curvature_probes,rho,tau,ridge_lambda,g,trust_radius,result.analytic_curvature_rhs_columns,
+                    budget,budget_limits,nullptr,nullptr,&independent_curvature_diagnostic);
                   if(analytic_curvature_cache.valid)working_analytic_curvature_probes=analytic_curvature_cache.probes;
                 }
                 result.analytic_curvature_builds+=static_cast<std::uint64_t>(analytic_curvature_cache.levels_built);
@@ -9303,7 +9726,8 @@ CovarianceFitResult solve_covariance_reference(DeviceCovarianceSystem& system,co
               const auto reverify_started=std::chrono::steady_clock::now();
               with_checkpointed_operation([&](){analytic_curvature_cache=covariance_build_stable_analytic_curvature_cache(
                 system,result.theta,epsilon,coordinate_scale,working_analytic_curvature_probes*2,rho,tau,ridge_lambda,g,
-                trust_radius,result.analytic_curvature_rhs_columns,budget,budget_limits,nullptr,&analytic_curvature_cache);});
+                trust_radius,result.analytic_curvature_rhs_columns,budget,budget_limits,nullptr,&analytic_curvature_cache,
+                &independent_curvature_diagnostic);});
               result.analytic_curvature_builds+=static_cast<std::uint64_t>(analytic_curvature_cache.levels_built);
               result.analytic_curvature_seconds+=analytic_curvature_cache.seconds;
               result.analytic_curvature_probes=analytic_curvature_cache.probes;
