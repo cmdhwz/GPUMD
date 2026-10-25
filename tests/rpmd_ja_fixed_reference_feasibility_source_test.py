@@ -908,7 +908,8 @@ assert 'const std::size_t svd_live_bytes=6ULL' in prepare_source
 assert 'certificate_peak,svd_peak' in prepare_source
 assert 'resource_observer(plan)' in prepare_source
 assert 'allocation_observer(where,static_cast<std::uint64_t>(bytes))' in prepare_source
-assert 'query_solver_workspace_elements(solver,r,query_matrix)' in prepare_source
+assert 'query_solver_workspace_elements(solver,r,query_matrix,d)' in prepare_source
+assert 'query_solver_workspace_elements(solver,3*atom_count-3,query_matrix,3*atom_count)' in prepare_source
 assert 'allocate_gpu(reinterpret_cast<void**>(&query_matrix),sizeof(double),"allocate scalar POTRF query matrix")' in prepare_source
 assert 'RpmdJAPrepareWorkspaceSizes query_rpmd_ja_qnep_prepare_workspace_sizes(int atom_count)' in prepare_header
 assert 'RpmdJAPrepareResourcePlan' in prepare_header

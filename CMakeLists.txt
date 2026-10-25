@@ -180,6 +180,8 @@ if(BUILD_TESTING)
             CUDA::cublas CUDA::cusolver CUDA::cufft Threads::Threads)
         add_test(NAME rpmd_ja_fit_prepare_integration_cuda_test
             COMMAND rpmd_ja_fit_prepare_integration_cuda_test --integration-smoke)
+        add_test(NAME rpmd_ja_qnep_prepare_svd_cuda_test
+            COMMAND rpmd_ja_fit_prepare_integration_cuda_test --prepare-svd-regression)
     endif()
 endif()
 

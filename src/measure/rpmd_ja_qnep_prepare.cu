@@ -25,6 +25,7 @@
 #ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
 namespace rpmd_ja_qnep_prepare_test
 {
+SvdFaultInjection next_svd_fault = SvdFaultInjection::None;
 std::function<void(const std::string&)> after_publish_before_readback;
 }
 #endif
@@ -208,15 +209,56 @@ Raw read_raw_header(const std::string& path)
 #ifndef USE_HIP
 void cuda_check(const cudaError_t status, const char* where)
 { if (status != cudaSuccess) throw std::runtime_error(std::string(where) + ": " + cudaGetErrorString(status)); }
+const char* solver_status_name(const cusolverStatus_t status)
+{
+  switch(status){
+    case CUSOLVER_STATUS_SUCCESS:return "CUSOLVER_STATUS_SUCCESS";
+    case CUSOLVER_STATUS_NOT_INITIALIZED:return "CUSOLVER_STATUS_NOT_INITIALIZED";
+    case CUSOLVER_STATUS_ALLOC_FAILED:return "CUSOLVER_STATUS_ALLOC_FAILED";
+    case CUSOLVER_STATUS_INVALID_VALUE:return "CUSOLVER_STATUS_INVALID_VALUE";
+    case CUSOLVER_STATUS_ARCH_MISMATCH:return "CUSOLVER_STATUS_ARCH_MISMATCH";
+    case CUSOLVER_STATUS_EXECUTION_FAILED:return "CUSOLVER_STATUS_EXECUTION_FAILED";
+    case CUSOLVER_STATUS_INTERNAL_ERROR:return "CUSOLVER_STATUS_INTERNAL_ERROR";
+    case CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED:return "CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED";
+    case CUSOLVER_STATUS_NOT_SUPPORTED:return "CUSOLVER_STATUS_NOT_SUPPORTED";
+    default:return "CUSOLVER_STATUS_UNKNOWN";
+  }
+}
+std::string cuda_status_description(const cudaError_t status)
+{
+  std::ostringstream out;
+  out<<cudaGetErrorName(status)<<" ("<<static_cast<int>(status)<<"): "<<cudaGetErrorString(status);
+  return out.str();
+}
 void solver_check(const cusolverStatus_t status, const char* where)
-{ if (status != CUSOLVER_STATUS_SUCCESS) throw std::runtime_error(std::string(where) + " failed"); }
+{ if (status != CUSOLVER_STATUS_SUCCESS) throw std::runtime_error(std::string(where) + " failed: " + solver_status_name(status) + " (" + std::to_string(static_cast<int>(status)) + ")"); }
 struct SolverWorkspaceElements{int potrf=0,svd=0;};
-SolverWorkspaceElements query_solver_workspace_elements(cusolverDnHandle_t solver,const int r,double* query_matrix)
+bool svd_status_allows_dense_fallback(const cusolverStatus_t status)
+{
+  return status==CUSOLVER_STATUS_INTERNAL_ERROR||status==CUSOLVER_STATUS_EXECUTION_FAILED||
+    status==CUSOLVER_STATUS_NOT_SUPPORTED||status==CUSOLVER_STATUS_ARCH_MISMATCH;
+}
+int query_svd_workspace_elements(cusolverDnHandle_t solver,const int m,const int n)
+{
+  if(m<n||n<=0)throw std::invalid_argument("prepare SVD workspace query requires m >= n > 0");
+  int lwork=0;
+  solver_check(cusolverDnDgesvd_bufferSize(solver,m,n,&lwork),"cusolverDnDgesvd_bufferSize");
+  if(lwork<=0)throw std::runtime_error("cuSOLVER returned a nonpositive SVD workspace size for shape "+
+    std::to_string(m)+"x"+std::to_string(n));
+  return lwork;
+}
+SolverWorkspaceElements query_solver_workspace_elements(cusolverDnHandle_t solver,const int r,double* query_matrix,const int dimension)
 {
   SolverWorkspaceElements sizes;
   solver_check(cusolverDnDpotrf_bufferSize(solver,CUBLAS_FILL_MODE_LOWER,r,query_matrix,r,&sizes.potrf),
     "cusolverDnDpotrf_bufferSize");
-  solver_check(cusolverDnDgesvd_bufferSize(solver,tile_size,tile_size,&sizes.svd),"cusolverDnDgesvd_bufferSize");
+  const int full_extent=std::min(tile_size,dimension);
+  sizes.svd=query_svd_workspace_elements(solver,full_extent,full_extent);
+  const int tail=dimension%tile_size;
+  // Wide row-major tiles are transposed before gesvd, so both rectangular edge orientations use m=tile_size,n=tail.
+  if(dimension>tile_size&&tail>0)
+    sizes.svd=std::max({sizes.svd,query_svd_workspace_elements(solver,tile_size,tail),
+      query_svd_workspace_elements(solver,tail,tail)});
   if(sizes.potrf<=0||sizes.svd<=0)throw std::runtime_error("cuSOLVER returned a nonpositive prepare workspace size");
   return sizes;
 }
@@ -609,12 +651,29 @@ RpmdJAMatrixTile dense_tile(const int row, const int col, const int rows, const 
   return tile;
 }
 
-void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* input, const int rows, const int cols, RpmdJAMatrixTile& result,
+void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const int direction, const int tile_row, const int tile_column,
+  const double* input, const int rows, const int cols, RpmdJAMatrixTile& result,
+  bool& disable_h_compression,
   double* work, const int lwork, double* matrix, double* singular, double* u, double* vt, int* info,
   double* dleft, double* dright, double* dproduct, double& relative_error)
 {
   relative_error = 0.0;
+  if(rows<=0||cols<=0)throw std::invalid_argument("invalid qNEP H SVD tile shape");
   const std::size_t elements=static_cast<std::size_t>(rows)*cols;
+  const bool transpose = rows < cols;
+  const int m = std::max(rows, cols), n = std::min(rows, cols), rankmax = n;
+  const int ld = m;
+  std::ostringstream context_stream;
+  context_stream<<"H direction "<<direction<<" tile row "<<tile_row<<" tile column "<<tile_column
+    <<" ("<<rows<<"x"<<cols<<", m="<<m<<", n="<<n<<", ld="<<ld<<", ldu="<<ld
+    <<", ldvt="<<rankmax<<", lwork="<<lwork<<")";
+  const std::string context=context_stream.str();
+  double norm2=0.0;
+  for(std::size_t i=0;i<elements;++i){
+    if(!std::isfinite(input[i]))throw std::runtime_error("qNEP H SVD input contains a non-finite value: "+context);
+    norm2+=input[i]*input[i];
+  }
+  if(!std::isfinite(norm2))throw std::runtime_error("qNEP H tile norm overflows before SVD: "+context);
   if(std::all_of(input,input+elements,[](double value){return value==0.0;})){
     if(static_cast<std::size_t>(rows)+cols<elements){
       result.rank=1;result.left.assign(static_cast<std::size_t>(rows),0.0);
@@ -622,26 +681,103 @@ void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* inpu
     }else result=dense_tile(result.row,result.column,rows,cols,input);
     return;
   }
+  if(disable_h_compression){result=dense_tile(result.row,result.column,rows,cols,input);return;}
   // Rank zero is dense in the existing tile format.
-  const bool transpose = rows < cols;
-  const int m = std::max(rows, cols), n = std::min(rows, cols), rankmax = n;
-  const int ld = m;
   std::vector<double> a(static_cast<std::size_t>(m) * n);
   if (!transpose) for(int i=0;i<m;++i)for(int j=0;j<n;++j)a[static_cast<std::size_t>(i)+static_cast<std::size_t>(j)*m]=input[static_cast<std::size_t>(i)*cols+j];
   else for (int i = 0; i < rows; ++i) for (int j = 0; j < cols; ++j) a[static_cast<std::size_t>(j) + static_cast<std::size_t>(i) * m] = input[static_cast<std::size_t>(i) * cols + j];
-  cuda_check(cudaMemcpy(matrix, a.data(), a.size() * sizeof(double), cudaMemcpyHostToDevice), "copy SVD tile");
-  solver_check(cusolverDnDgesvd(solver, 'S', 'S', m, n, matrix, ld, singular, u, ld, vt, rankmax, work, lwork, nullptr, info), "cusolverDnDgesvd");
-  cuda_check(cudaDeviceSynchronize(), "synchronize SVD");
+  cuda_check(cudaMemcpy(matrix, a.data(), a.size() * sizeof(double), cudaMemcpyHostToDevice), ("copy SVD tile: "+context).c_str());
+  const int unwritten_info=std::numeric_limits<int>::min();
+  cuda_check(cudaMemcpy(info,&unwritten_info,sizeof(unwritten_info),cudaMemcpyHostToDevice),
+    ("initialize SVD devInfo: "+context).c_str());
+  cusolverStatus_t svd_status=cusolverDnDgesvd(solver,'S','S',m,n,matrix,ld,singular,u,ld,vt,rankmax,work,lwork,nullptr,info);
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+  const rpmd_ja_qnep_prepare_test::SvdFaultInjection injected_svd_fault=
+    rpmd_ja_qnep_prepare_test::next_svd_fault;
+  rpmd_ja_qnep_prepare_test::next_svd_fault=rpmd_ja_qnep_prepare_test::SvdFaultInjection::None;
+  if(injected_svd_fault!=rpmd_ja_qnep_prepare_test::SvdFaultInjection::None){
+    cuda_check(cudaDeviceSynchronize(),("synchronize SVD before test fault injection: "+context).c_str());
+    int injected_info=unwritten_info;
+    bool write_info=false;
+    switch(injected_svd_fault){
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInvalidValueUnwrittenInfo:
+        svd_status=CUSOLVER_STATUS_INVALID_VALUE;write_info=true;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInvalidValueWrittenInfo:
+        svd_status=CUSOLVER_STATUS_INVALID_VALUE;injected_info=-7;write_info=true;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInvalidValueCudaStatusUnavailable:
+        svd_status=CUSOLVER_STATUS_INVALID_VALUE;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInternalErrorUnwrittenInfo:
+        svd_status=CUSOLVER_STATUS_INTERNAL_ERROR;write_info=true;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiExecutionFailedZeroInfo:
+        svd_status=CUSOLVER_STATUS_EXECUTION_FAILED;injected_info=0;write_info=true;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiNotSupportedUnwrittenInfo:
+        svd_status=CUSOLVER_STATUS_NOT_SUPPORTED;write_info=true;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInternalErrorNegativeInfo:
+        svd_status=CUSOLVER_STATUS_INTERNAL_ERROR;injected_info=-2;write_info=true;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInternalErrorCudaStatusUnavailable:
+        svd_status=CUSOLVER_STATUS_INTERNAL_ERROR;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::NegativeDevInfo:
+        injected_info=-2;write_info=true;break;
+      case rpmd_ja_qnep_prepare_test::SvdFaultInjection::PositiveDevInfo:
+        injected_info=1;write_info=true;break;
+      default:break;
+    }
+    if(write_info)cuda_check(cudaMemcpy(info,&injected_info,sizeof(injected_info),cudaMemcpyHostToDevice),
+      ("inject SVD devInfo for test: "+context).c_str());
+  }
+#endif
+  if(svd_status!=CUSOLVER_STATUS_SUCCESS){
+    cudaError_t cuda_status=cudaPeekAtLastError();
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+    // Exercise the unreadable-status branch without poisoning the real CUDA context.
+    if(injected_svd_fault==rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInvalidValueCudaStatusUnavailable||
+       injected_svd_fault==rpmd_ja_qnep_prepare_test::SvdFaultInjection::ApiInternalErrorCudaStatusUnavailable)
+      cuda_status=cudaErrorInvalidValue;
+#endif
+    bool info_readable=cuda_status==cudaSuccess;
+    if(info_readable){cuda_status=cudaDeviceSynchronize();info_readable=cuda_status==cudaSuccess;}
+    int host_info=unwritten_info;
+    if(info_readable){cuda_status=cudaMemcpy(&host_info,info,sizeof(host_info),cudaMemcpyDeviceToHost);info_readable=cuda_status==cudaSuccess;}
+    std::ostringstream error;
+    error<<"qNEP H SVD API failure for "<<context<<": cusolverDnDgesvd returned "<<solver_status_name(svd_status)
+      <<" ("<<static_cast<int>(svd_status)<<"); CUDA state: "<<cuda_status_description(cuda_status)<<"; devInfo: ";
+    if(!info_readable)error<<"unavailable (CUDA state is not safely readable)";
+    else if(host_info==unwritten_info)error<<"not written";
+    else error<<host_info;
+    const std::string diagnostic=error.str();
+    const bool info_allows_exact_fallback=info_readable&&(host_info==unwritten_info||host_info>=0);
+    if(svd_status_allows_dense_fallback(svd_status)&&cuda_status==cudaSuccess&&info_allows_exact_fallback){
+      std::fprintf(stderr,"qNEP H SVD exact dense fallback; H compression disabled for remaining tiles: %s\n",diagnostic.c_str());
+      disable_h_compression=true;
+      result=dense_tile(result.row,result.column,rows,cols,input);
+      return;
+    }
+    throw std::runtime_error(diagnostic);
+  }
+  cuda_check(cudaDeviceSynchronize(), ("synchronize SVD: "+context).c_str());
   int host_info = 0;
-  cuda_check(cudaMemcpy(&host_info, info, sizeof(int), cudaMemcpyDeviceToHost), "read SVD info");
-  if (host_info != 0) throw std::runtime_error("qNEP H tile SVD did not converge");
+  cuda_check(cudaMemcpy(&host_info, info, sizeof(int), cudaMemcpyDeviceToHost), ("read SVD devInfo: "+context).c_str());
+  if(host_info==unwritten_info)throw std::runtime_error("qNEP H SVD did not write devInfo: "+context);
+  if(host_info<0)throw std::runtime_error("qNEP H SVD devInfo="+std::to_string(host_info)+
+    " reports invalid parameter index "+std::to_string(-host_info)+": "+context);
+  if(host_info>0){
+    std::printf("    qNEP H SVD dense exact fallback: %s; status=%s, CUDA=%s, devInfo=%d (nonconvergence).\n",
+      context.c_str(),solver_status_name(svd_status),cuda_status_description(cudaSuccess).c_str(),host_info);
+    result=dense_tile(result.row,result.column,rows,cols,input);
+    return;
+  }
   std::vector<double> s(rankmax), hu(static_cast<std::size_t>(m) * rankmax), hvt(static_cast<std::size_t>(rankmax) * n);
   cuda_check(cudaMemcpy(s.data(), singular, s.size()*sizeof(double), cudaMemcpyDeviceToHost), "read SVD singular values");
   cuda_check(cudaMemcpy(hu.data(), u, hu.size()*sizeof(double), cudaMemcpyDeviceToHost), "read SVD U");
   cuda_check(cudaMemcpy(hvt.data(), vt, hvt.size()*sizeof(double), cudaMemcpyDeviceToHost), "read SVD VT");
-  double norm2 = 0.0;
-  for (std::size_t i = 0; i < static_cast<std::size_t>(rows) * cols; ++i) norm2 += input[i] * input[i];
-  if(!std::isfinite(norm2))throw std::runtime_error("qNEP H tile norm overflows");
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+  if(injected_svd_fault==rpmd_ja_qnep_prepare_test::SvdFaultInjection::NonFiniteFactor)
+    s.front()=std::numeric_limits<double>::quiet_NaN();
+#endif
+  if(!std::all_of(s.begin(),s.end(),[](double value){return std::isfinite(value)&&value>=0.0;})||
+     !std::all_of(hu.begin(),hu.end(),[](double value){return std::isfinite(value);})||
+     !std::all_of(hvt.begin(),hvt.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("qNEP H SVD returned non-finite or invalid factors: "+context);
   int k = rankmax;
   double discarded = 0.0;
   while (k > 0) { const double candidate = discarded + s[k - 1] * s[k - 1]; if (candidate > tile_tolerance * tile_tolerance * std::max(norm2, 1.0e-300)) break; discarded = candidate; --k; }
@@ -657,6 +793,9 @@ void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* inpu
     for (int i = 0; i < rows; ++i) for (int q = 0; q < k; ++q) result.left[static_cast<std::size_t>(i)*k+q] = hvt[static_cast<std::size_t>(q)+static_cast<std::size_t>(i)*rankmax] * std::sqrt(s[q]);
     for (int q = 0; q < k; ++q) for (int j = 0; j < cols; ++j) result.right[static_cast<std::size_t>(q)*cols+j] = std::sqrt(s[q]) * hu[static_cast<std::size_t>(j)+static_cast<std::size_t>(q)*m];
   }
+  if(!std::all_of(result.left.begin(),result.left.end(),[](double value){return std::isfinite(value);})||
+     !std::all_of(result.right.begin(),result.right.end(),[](double value){return std::isfinite(value);}))
+    throw std::runtime_error("qNEP H SVD factor conversion produced non-finite values: "+context);
   cuda_check(cudaMemcpy(dleft,result.left.data(),result.left.size()*sizeof(double),cudaMemcpyHostToDevice),"upload H left factor");
   cuda_check(cudaMemcpy(dright,result.right.data(),result.right.size()*sizeof(double),cudaMemcpyHostToDevice),"upload H right factor");
   // Row-major C=L*R is column-major C^T=R^T*L^T.
@@ -665,8 +804,16 @@ void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* inpu
   cuda_check(cudaDeviceSynchronize(),"reconstruct H tile");
   std::vector<double> reconstructed(static_cast<std::size_t>(rows)*cols);
   cuda_check(cudaMemcpy(reconstructed.data(),dproduct,reconstructed.size()*sizeof(double),cudaMemcpyDeviceToHost),"read reconstructed H tile");
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+  if(injected_svd_fault==rpmd_ja_qnep_prepare_test::SvdFaultInjection::CorruptReconstruction)
+    reconstructed.front()+=0.1;
+  else if(injected_svd_fault==rpmd_ja_qnep_prepare_test::SvdFaultInjection::NonFiniteReconstruction)
+    reconstructed.front()=std::numeric_limits<double>::quiet_NaN();
+#endif
   double err2=0.0; for(std::size_t i=0;i<reconstructed.size();++i){const double e=reconstructed[i]-input[i];err2+=e*e;}
+  if(!std::isfinite(err2))throw std::runtime_error("qNEP H SVD reconstruction produced a non-finite error: "+context);
   relative_error = std::sqrt(err2 / std::max(norm2, 1.0e-300));
+  if(!std::isfinite(relative_error))throw std::runtime_error("qNEP H SVD reconstruction residual is non-finite: "+context);
   if (!(relative_error <= tile_tolerance) || result.left.size() + result.right.size() >= static_cast<std::size_t>(rows)*cols) {
     result = dense_tile(result.row, result.column, rows, cols, input);
     relative_error = 0.0;
@@ -686,7 +833,7 @@ RpmdJAPrepareWorkspaceSizes query_rpmd_ja_qnep_prepare_workspace_sizes(const int
   try{
     solver_check(cusolverDnCreate(&solver),"create cuSOLVER for prepare workspace query");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&query_matrix),sizeof(double)),"allocate scalar POTRF query matrix");
-    const SolverWorkspaceElements elements=query_solver_workspace_elements(solver,3*atom_count-3,query_matrix);
+    const SolverWorkspaceElements elements=query_solver_workspace_elements(solver,3*atom_count-3,query_matrix,3*atom_count);
     RpmdJAPrepareWorkspaceSizes sizes;
     sizes.potrf_workspace_bytes=static_cast<std::uint64_t>(elements.potrf)*sizeof(double);
     sizes.svd_workspace_bytes=static_cast<std::uint64_t>(elements.svd)*sizeof(double);
@@ -775,7 +922,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       cuda_check(cudaMalloc(pointer,bytes),where);};
     // cuSOLVER's workspace query reads dimensions, not the matrix payload.
     allocate_gpu(reinterpret_cast<void**>(&query_matrix),sizeof(double),"allocate scalar POTRF query matrix");
-    const SolverWorkspaceElements workspace_elements=query_solver_workspace_elements(solver,r,query_matrix);
+    const SolverWorkspaceElements workspace_elements=query_solver_workspace_elements(solver,r,query_matrix,d);
     const int potrf_work=workspace_elements.potrf,lwork=workspace_elements.svd;
     const std::size_t svd_workspace_bytes=static_cast<std::size_t>(lwork)*sizeof(double);
     cuda_check(cudaFree(query_matrix), "free POTRF query matrix");
@@ -1224,6 +1371,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     allocate_gpu(reinterpret_cast<void**>(&dright),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD right verify buffer");
     allocate_gpu(reinterpret_cast<void**>(&dproduct),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD reconstruction buffer");
     double tile_error[3]={};
+    bool disable_h_compression=false;
     std::uint64_t h_v_bytes=0;
     for(int alpha=0;alpha<3;++alpha){
       write_value(out,tile_size);write_value(out,count);
@@ -1260,7 +1408,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
         for(const double value:h)expected_operator_norm2[alpha+1]+=value*value;
         RpmdJAMatrixTile result;result.row=i;result.column=j;result.rows=nr;result.columns=nc;
         double tile_residual=0.0;
-        svd_tile(solver,blas,h.data(),nr,nc,result,sw,lwork,sm,dsingular,su,svt,sinfo,dleft,dright,dproduct,tile_residual);
+        svd_tile(solver,blas,alpha,i,j,h.data(),nr,nc,result,disable_h_compression,sw,lwork,sm,dsingular,su,svt,sinfo,dleft,dright,dproduct,tile_residual);
         tile_error[alpha]=std::max(tile_error[alpha],tile_residual);
         write_tile(out,result);
       }

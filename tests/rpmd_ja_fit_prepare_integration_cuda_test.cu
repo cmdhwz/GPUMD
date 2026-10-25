@@ -795,9 +795,18 @@ void run_actual_m1_writer_prepare_readback(const std::string& base)
 int main(int argc,char** argv)
 {
   try{
-    if(argc>1&&std::string(argv[1])!="--integration-smoke")throw std::invalid_argument("usage: rpmd_ja_fit_prepare_integration_cuda_test [--integration-smoke]");
+    const std::string mode=argc>1?argv[1]:"";
+    if(!mode.empty()&&mode!="--integration-smoke"&&mode!="--prepare-svd-regression")
+      throw std::invalid_argument("usage: rpmd_ja_fit_prepare_integration_cuda_test [--integration-smoke|--prepare-svd-regression]");
     const std::string base="rpmd_ja_actual_m1_prepare_"+
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    if(mode=="--prepare-svd-regression"){
+      run_positive(base,260,4);run_dense_h_upper_bound(base);run_zero_h_tiles(base);run_ill_conditioned_h_tile_edges(base);
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+      run_svd_fault_injection_regressions(base);
+#endif
+      std::printf("RPMD_JA_PREPARE_SVD_BOUNDARY_PASS\n");return 0;
+    }
     test_feasibility_manifest_parser_accepts_lf_and_crlf();
     test_frozen_fit_input_fingerprints_reject_mutation();
     test_manifest_sha256_rejects_qraw_and_kernel_replacement_at_native_start();

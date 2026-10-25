@@ -8,6 +8,24 @@
 #ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
 namespace rpmd_ja_qnep_prepare_test
 {
+enum class SvdFaultInjection
+{
+  None,
+  ApiInvalidValueUnwrittenInfo,
+  ApiInvalidValueWrittenInfo,
+  ApiInvalidValueCudaStatusUnavailable,
+  ApiInternalErrorUnwrittenInfo,
+  ApiExecutionFailedZeroInfo,
+  ApiNotSupportedUnwrittenInfo,
+  ApiInternalErrorNegativeInfo,
+  ApiInternalErrorCudaStatusUnavailable,
+  NegativeDevInfo,
+  PositiveDevInfo,
+  NonFiniteFactor,
+  CorruptReconstruction,
+  NonFiniteReconstruction
+};
+extern SvdFaultInjection next_svd_fault;
 extern std::function<void(const std::string&)> after_publish_before_readback;
 }
 #endif
