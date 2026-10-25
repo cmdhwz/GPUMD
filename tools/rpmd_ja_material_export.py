@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import shlex
 
 import numpy as np
@@ -196,70 +197,153 @@ def _iter_xyz(path, atom_count, ordered_species, store):
             frame_index += 1
 
 
-def _read_current(path, expected_times, allow_legacy_unverified=False):
+def _read_current(path, expected_times, allow_legacy_unverified=False, *,
+                  max_correlation_work=None, max_lag_frames=None, max_memory_bytes=None):
     markers = 0
     metadata = {}
-    rows = []
+    current = None
+    row_count = 0
     in_segment = False
     segment_version = None
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            if stripped in ("# segment_metadata_version 1", "# segment_metadata_version 2"):
-                markers += 1
-                in_segment = True
-                segment_version = int(stripped.rsplit(" ", 1)[1])
-                continue
-            if stripped.startswith("# segment_metadata_version"):
-                raise ValueError("heat-current segment metadata version is unsupported")
-            if in_segment:
-                parts = stripped[1:].strip().split(maxsplit=1)
-                if len(parts) == 2:
-                    key, value = parts
-                    if key in metadata:
-                        raise ValueError(f"heat-current segment repeats {key} metadata")
-                    metadata[key] = value
-            continue
-        if not in_segment:
-            raise ValueError("heat-current data before the unique segment metadata is not accepted")
+    reference_sha256 = None
+    declared_count = None
+
+    def prepare_header(allocate):
+        nonlocal reference_sha256, declared_count, current
+        if markers != 1:
+            raise ValueError("heat-current file must contain exactly one rpmd_ja segment")
+        if segment_version == 1 and not allow_legacy_unverified:
+            raise ValueError("legacy heat-current v1 requires explicit RPJAMAT_EXPORT1 unverified mode")
+        if segment_version == 2 and allow_legacy_unverified:
+            raise ValueError("RPJAMAT_EXPORT1 only accepts a legacy v1 current segment")
+        required = {"backend": "qnep-block-v3", "current_units": _CURRENT_UNITS, "columns": _CURRENT_COLUMNS}
+        if any(metadata.get(key) != value for key, value in required.items()):
+            raise ValueError("heat-current segment backend, units, or columns do not match the v3 evaluator")
+        reference_sha256 = metadata.get("reference_package_sha256") if segment_version == 2 else None
+        if segment_version == 2 and (reference_sha256 is None or len(reference_sha256) != 64 or
+           any(character not in "0123456789abcdefABCDEF" for character in reference_sha256)):
+            raise ValueError("heat-current v2 segment has no valid reference package SHA-256")
         try:
-            row = [float(value) for value in stripped.split()]
-        except ValueError as exc:
-            raise ValueError("heat-current segment contains a malformed data row") from exc
-        if len(row) != 10 or not all(math.isfinite(value) for value in row):
-            raise ValueError("heat-current segment rows must contain ten finite columns")
-        rows.append(row)
+            declared_count = int(metadata["sample_frames"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("heat-current segment has no valid sample_frames declaration") from exc
+        if declared_count < 0 or (expected_times is not None and declared_count != len(expected_times)):
+            raise ValueError("heat-current sample count does not match the synchronized export spec")
+        if max_lag_frames is not None:
+            if max_lag_frames >= declared_count:
+                raise ValueError("max_lag_frames must be smaller than the current segment")
+            if max_correlation_work is not None and declared_count * (max_lag_frames + 1) > max_correlation_work:
+                raise ValueError("frames*max_lag_frames exceeds the bounded correlation-work limit")
+            if max_memory_bytes is not None:
+                lag_count = max_lag_frames + 1
+                estimated_bytes = (declared_count * 10 * 8 + lag_count * 9 * 8 * 18 +
+                                   4096 * 3 * 3 * 8 + (8 << 20))
+                if estimated_bytes > max_memory_bytes:
+                    raise MemoryError(f"estimated current analysis memory {estimated_bytes} bytes exceeds limit {max_memory_bytes}")
+        if allocate:
+            current = np.empty((declared_count, 10), dtype=np.float64)
+
+    with Path(path).open("r", encoding="utf-8") as stream:
+        for line in stream:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                if stripped in ("# segment_metadata_version 1", "# segment_metadata_version 2"):
+                    markers += 1
+                    in_segment = True
+                    segment_version = int(stripped.rsplit(" ", 1)[1])
+                    continue
+                if stripped.startswith("# segment_metadata_version"):
+                    raise ValueError("heat-current segment metadata version is unsupported")
+                if in_segment:
+                    parts = stripped[1:].strip().split(maxsplit=1)
+                    if len(parts) == 2:
+                        key, value = parts
+                        if key in metadata:
+                            raise ValueError(f"heat-current segment repeats {key} metadata")
+                        metadata[key] = value
+                continue
+            if not in_segment:
+                raise ValueError("heat-current data before the unique segment metadata is not accepted")
+            if current is None:
+                prepare_header(True)
+            if row_count >= declared_count:
+                raise ValueError("heat-current sample count does not match the synchronized export spec")
+            try:
+                row = [float(value) for value in stripped.split()]
+            except ValueError as exc:
+                raise ValueError("heat-current segment contains a malformed data row") from exc
+            if len(row) != 10 or not all(math.isfinite(value) for value in row):
+                raise ValueError("heat-current segment rows must contain ten finite columns")
+            current[row_count] = row
+            row_count += 1
     if markers != 1:
         raise ValueError("heat-current file must contain exactly one rpmd_ja segment")
-    if segment_version == 1 and not allow_legacy_unverified:
-        raise ValueError("legacy heat-current v1 requires explicit RPJAMAT_EXPORT1 unverified mode")
-    if segment_version == 2 and allow_legacy_unverified:
-        raise ValueError("RPJAMAT_EXPORT1 only accepts a legacy v1 current segment")
-    required = {"backend": "qnep-block-v3", "current_units": _CURRENT_UNITS, "columns": _CURRENT_COLUMNS}
-    if any(metadata.get(key) != value for key, value in required.items()):
-        raise ValueError("heat-current segment backend, units, or columns do not match the v3 evaluator")
-    reference_sha256 = metadata.get("reference_package_sha256") if segment_version == 2 else None
-    if segment_version == 2 and (reference_sha256 is None or len(reference_sha256) != 64 or
-       any(character not in "0123456789abcdefABCDEF" for character in reference_sha256)):
-        raise ValueError("heat-current v2 segment has no valid reference package SHA-256")
-    try:
-        declared_count = int(metadata["sample_frames"])
-    except (KeyError, ValueError) as exc:
-        raise ValueError("heat-current segment has no valid sample_frames declaration") from exc
-    if declared_count != len(expected_times) or len(rows) != declared_count:
+    if current is None:
+        prepare_header(False)
+        if declared_count != row_count:
+            raise ValueError("heat-current sample count does not match the synchronized export spec")
+        current = np.empty((declared_count, 10), dtype=np.float64)
+    if row_count != declared_count:
         raise ValueError("heat-current sample count does not match the synchronized export spec")
-    current = np.asarray(rows, dtype=np.float64)
     times = current[:, 0]
-    if np.any(np.diff(times) <= 0) or not np.allclose(times, expected_times, rtol=0.0, atol=1e-10):
+    if np.any(np.diff(times) <= 0) or (expected_times is not None and
+                                       not np.allclose(times, expected_times, rtol=0.0, atol=1e-10)):
         raise ValueError("heat-current time is duplicate or not synchronized to the declared dump frames")
     jcent, delta, ja = current[:, 1:4], current[:, 4:7], current[:, 7:10]
     scale = np.maximum(1.0, np.maximum(np.max(np.abs(ja), axis=1), np.max(np.abs(jcent + delta), axis=1)))
     residual = np.max(np.abs(ja - (jcent + delta)), axis=1)
     if np.any(residual > 1e-12 * scale):
         raise ValueError("heat-current segment violates JA = Jcent + DeltaJ")
-    return jcent, delta, ja, reference_sha256
+    use_class=metadata.get("reference_use_class")
+    numerical_status=metadata.get("reference_numerical_status")
+    response_status=metadata.get("reference_response_status")
+    policy=metadata.get("mechanical_policy")
+    policy_identity=None
+    if policy is not None:
+        if policy in ("native_reference_transport", "native_reference_transport;analytic_site_gradient_v1",
+                      "native_reference_transport;analytic_site_gradient_fd4_v1"):
+            policy_identity=("FORMAL", "NOT_APPLICABLE", "NOT_APPLICABLE")
+        else:
+            match=re.fullmatch(
+                r"native_reference_transport;(?:internal_mass_com_pullback_v1;)?finite_temperature_additive_v1;"
+                r"beads=[1-9][0-9]*;derivative=[1-3]"
+                r"(?:;use=DIAGNOSTIC;response=(PASS|FAIL|INCONCLUSIVE|NOT_MEASURED);numerical=PASS)?", policy)
+            if match is None:
+                raise ValueError("heat-current mechanical_policy is unknown or malformed")
+            suffix=policy.find(";use=")
+            policy_identity=("DIAGNOSTIC", "PASS", match.group(1)) if suffix >= 0 else \
+                            ("FORMAL", "NOT_APPLICABLE", "NOT_APPLICABLE")
+    identity_values=(use_class, numerical_status, response_status)
+    identity_present=any(value is not None for value in identity_values)
+    if policy_identity is not None:
+        if any(value is None for value in identity_values):
+            if policy_identity[0] == "DIAGNOSTIC" or identity_present:
+                raise ValueError("heat-current reference identity is incomplete for its mechanical_policy")
+            use_class, numerical_status, response_status=policy_identity
+        elif identity_values != policy_identity:
+            raise ValueError("heat-current reference identity conflicts with mechanical_policy")
+    elif not identity_present:
+        # Legacy ordinary segments did not carry a policy or the v7 identity triple.
+        use_class, numerical_status, response_status=("FORMAL", "NOT_APPLICABLE", "NOT_APPLICABLE")
+    elif policy is None and use_class != "FORMAL":
+        raise ValueError("heat-current non-formal identity has no bound mechanical_policy")
+    elif policy is None and (numerical_status, response_status) != ("NOT_APPLICABLE", "NOT_APPLICABLE"):
+        raise ValueError("heat-current status triple has no bound mechanical_policy")
+    if use_class not in ("FORMAL","DIAGNOSTIC") or \
+       numerical_status not in ("PASS","NOT_APPLICABLE") or \
+       response_status not in ("PASS","FAIL","INCONCLUSIVE","NOT_MEASURED","NOT_APPLICABLE") or \
+       use_class=="DIAGNOSTIC" and numerical_status!="PASS" or \
+       use_class=="FORMAL" and response_status not in ("PASS","NOT_APPLICABLE"):
+        raise ValueError("heat-current reference use or numerical/response identity is invalid")
+    return jcent, delta, ja, reference_sha256, {
+        "reference_use_class": use_class,
+        "reference_numerical_status": numerical_status,
+        "reference_response_status": response_status,
+        "times_ps": times,
+        "metadata": metadata,
+    }
 
 
 def export_trajectory(spec_path):
@@ -290,12 +374,12 @@ def export_trajectory(spec_path):
         reference_sha256 = _sha256(spec["_online_reference_package"])
         if reference_sha256.lower() != spec["online_reference_package_sha256"].lower():
             raise ValueError("declared reference package SHA-256 does not match the package bytes")
-        jc_native, delta_j_native, ja_native, native_reference_sha256 = _read_current(
+        jc_native, delta_j_native, ja_native, native_reference_sha256, current_identity = _read_current(
             spec["_current_file"], expected_times)
         if native_reference_sha256.lower() != reference_sha256.lower():
             raise ValueError("native heat-current reference package SHA-256 does not match the selected package digest")
     else:
-        jc_native, delta_j_native, ja_native, _ = _read_current(
+        jc_native, delta_j_native, ja_native, _, current_identity = _read_current(
             spec["_current_file"], expected_times, allow_legacy_unverified=True)
     dump_sha256 = _sha256(spec["_dump_xyz"])
     current_sha256 = _sha256(spec["_current_file"])
@@ -332,7 +416,10 @@ def export_trajectory(spec_path):
             online_reference_package_sha256=np.asarray(reference_sha256.lower()),
             online_current_units=np.asarray("eV*angstrom/ps"),
             online_delta_j_eV_angstrom_per_ps=delta_j_native / NATIVE_TIME_PS,
-            online_ja_eV_angstrom_per_ps=ja_native / NATIVE_TIME_PS)
+            online_ja_eV_angstrom_per_ps=ja_native / NATIVE_TIME_PS,
+            online_reference_use_class=np.asarray(current_identity["reference_use_class"]),
+            online_reference_numerical_status=np.asarray(current_identity["reference_numerical_status"]),
+            online_reference_response_status=np.asarray(current_identity["reference_response_status"]))
     np.savez_compressed(output, **arrays)
     if spec["format"] == "RPJAMAT_EXPORT1":
         return {"format": "RPJAMAT_EXPORT1_REPORT", "status": "EXPORTED_UNVERIFIED_LEGACY_CURRENT",
@@ -346,6 +433,9 @@ def export_trajectory(spec_path):
         "trajectory_id": spec["trajectory_id"], "position_stream_id": spec["position_stream_id"],
         "online_reference_id": spec["online_reference_id"],
         "online_reference_package_sha256": reference_sha256.lower(),
+        "online_reference_use_class": current_identity["reference_use_class"],
+        "online_reference_numerical_status": current_identity["reference_numerical_status"],
+        "online_reference_response_status": current_identity["reference_response_status"],
         "frame_count": frames, "atom_count": atoms, "output_npz": str(output),
         "trajectory_npz_sha256": _sha256(output), "dump_source_sha256": dump_sha256,
         "current_source_sha256": current_sha256,

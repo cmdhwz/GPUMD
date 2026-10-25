@@ -1,16 +1,19 @@
 #include "measure/rpmd_ja_qnep_prepare.cuh"
 #include "measure/rpmd_ja_reference.cuh"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -21,7 +24,7 @@ template <typename T> void array(std::ostream& out,const std::vector<T>& x){if(!
 void make_input(const std::string& raw,const std::string& kernel,const int n,const double stiffness,
                 const std::uint32_t version=1,const double stats_marker=-1.0,const double identity_abs=0.0,const int negative_axis=-1,
                 const bool multi_spectrum=false,const std::vector<double>* custom_masses=nullptr,const std::vector<int>* custom_types=nullptr,
-                const bool full_rank_h=false)
+                const bool full_rank_h=false,const bool zero_h=false,const double h_scale=1.0)
 {
   const int d=3*n;const double temperature=300.0,step=0.01;
   std::vector<double> mass(n),position(d,0.0),v(static_cast<std::size_t>(d)*n),vc(v.size()),c(static_cast<std::size_t>(3)*d*d),k(static_cast<std::size_t>(d)*d),coarse_c(c.size());
@@ -35,15 +38,18 @@ void make_input(const std::string& raw,const std::string& kernel,const int n,con
     for(int q=0;q<n-1;++q){std::vector<double> u(n,0.0);u[q]=1.0;double dot=0.0;for(int i=0;i<n;++i)dot+=u[i]*translation[i];for(int i=0;i<n;++i)u[i]-=dot*translation[i];for(const auto& vq:complement){dot=0.0;for(int i=0;i<n;++i)dot+=u[i]*vq[i];for(int i=0;i<n;++i)u[i]-=dot*vq[i];}double norm=0.0;for(double x:u)norm+=x*x;norm=std::sqrt(norm);for(double& x:u)x/=norm;complement.push_back(u);}
   }
   for(int row=0;row<d;++row)for(int col=0;col<d;++col){const int ar=row%n,ac=col%n;if(row/n==col/n){double dm=0.0;if(multi_spectrum){for(int q=0;q<n-1;++q){const double value=(row/n)*10.0+ (q==0?-1.0:static_cast<double>(q));dm+=value*complement[q][ar]*complement[q][ac];}}else{const double tr=std::sqrt(mass[ar]/mass_sum),tc=std::sqrt(mass[ac]/mass_sum);const double axis_stiffness=negative_axis<0?stiffness:(row/n==negative_axis?-1.0e-10:1.0e-10);dm=axis_stiffness*((row==col?1.0:0.0)-tr*tc);}k[static_cast<std::size_t>(col)*d+row]=dm*std::sqrt(mass[ar]*mass[ac]);}}
-  for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=0.03*std::sin((row+1)*(atom+2));vc[ix]=version>=2?v[ix]:0.97*v[ix];}
-  for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double phase=(row+1)*12.9898+(col+1)*78.233+(alpha+1)*37.719;const double noise=std::sin(phase)*43758.5453-std::floor(std::sin(phase)*43758.5453);const double target=full_rank_h?noise+(row==col?1.0:0.0):left*right;double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
+  for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom){const std::size_t ix=static_cast<std::size_t>(row)*n+atom;v[ix]=zero_h?0.0:h_scale*0.03*std::sin((row+1)*(atom+2));vc[ix]=version>=2?v[ix]:0.97*v[ix];}
+  for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n;const double left=1.0+0.01*std::sin((row+1)*(alpha+1));const double right=1.0+0.01*std::cos((col+1)*(alpha+2));const double phase=(row+1)*12.9898+(col+1)*78.233+(alpha+1)*37.719;const double noise=std::sin(phase)*43758.5453-std::floor(std::sin(phase)*43758.5453);const double target=zero_h?0.0:h_scale*(full_rank_h?noise+(row==col?1.0:0.0):left*right);double fine=target,coarse=target;if(col/n==alpha){fine+=v[static_cast<std::size_t>(row)*n+atom];coarse+=vc[static_cast<std::size_t>(row)*n+atom];if(site==atom)for(int a=0;a<n;++a){fine-=v[static_cast<std::size_t>(row)*n+a];coarse-=vc[static_cast<std::size_t>(row)*n+a];}}const std::size_t ix=static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row;c[ix]=fine;coarse_c[ix]=coarse;}
   std::ofstream out(raw,std::ios::binary);if(!out)throw std::runtime_error("cannot create raw fixture");
   const char magic[8]={'G','P','J','Q','R','A','W','\0'};const char layout[]="xyz_soa;derivative_input_rows_output_columns";
   const std::uint32_t endian=0x01020304;const int charge=1,pppm=1;const std::uint64_t model=0x12345678,config=0x87654321;const double spacing=0.5;
   out.write(magic,8);put(out,version);put(out,endian);put(out,n);put(out,d);put(out,temperature);put(out,step);put(out,model);put(out,config);put(out,charge);put(out,pppm);put(out,spacing);out.write(layout,sizeof(layout));
   double cell[18]={1,0,0,0,1,0,0,0,1,1,0,0,0,1,0,0,0,1};out.write(reinterpret_cast<char*>(cell),sizeof(cell));out.write(reinterpret_cast<const char*>(pbc.data()),sizeof(int)*3);
   array(out,types);array(out,mass);array(out,position);const double energy=0.0;std::vector<double> site_energy(n,0),force(d,0),virial(9*n,0);for(int row=0;row<d;++row)for(int atom=0;atom<n;++atom)force[row]-=v[static_cast<std::size_t>(row)*n+atom];put(out,energy);array(out,site_energy);array(out,force);array(out,virial);
-  array(out,v);array(out,c);array(out,k);array(out,vc);array(out,coarse_c);double stats[18]={};for(double value:force)stats[12]=std::max(stats[12],std::abs(value));stats[3]=identity_abs;stats[16]=step;stats[17]=stats_marker<0.0?static_cast<double>(version):stats_marker;out.write(reinterpret_cast<char*>(stats),sizeof(stats));out.close();if(!out)throw std::runtime_error("failed writing raw fixture");
+  array(out,v);array(out,c);array(out,k);double stats[24]={};for(double value:force)stats[12]=std::max(stats[12],std::abs(value));stats[3]=identity_abs;stats[16]=step;stats[17]=stats_marker<0.0?(version==4?3.0:static_cast<double>(version)):stats_marker;
+  if(version==4){for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const int site=row%n,atom=col%n,nu=col/n;double h=c[static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row];if(nu==alpha){h-=v[static_cast<std::size_t>(row)*n+atom];if(site==atom){double sum=0;for(int a=0;a<n;++a)sum+=v[static_cast<std::size_t>(row)*n+a];h+=sum;}}h/=std::sqrt(mass[site]*mass[atom]);stats[21+alpha]+=h*h;}}
+  if(version==4)array(out,std::vector<double>(stats,stats+24));else{array(out,vc);array(out,coarse_c);array(out,std::vector<double>(stats,stats+18));}
+  out.close();if(!out)throw std::runtime_error("failed writing raw fixture");
   std::ofstream kt(kernel);if(!kt)throw std::runtime_error("cannot create kernel fixture");
   kt<<"GPUMDJA_KERNEL 1\nU 100\ndegree 1\nP_rank 1\nQ_rank 1\nP_error 0\nQ_error 0\nP_S2 0\nQ_S2 0\nP_values\n1\nP_vectors\n0 1\nQ_values\n1\nQ_vectors\n0 1\nEND\n";
 }
@@ -174,7 +180,64 @@ void run_zero(const std::string& base)
     throw std::runtime_error("zero qNEP projected Hessian failure diagnostic did not report a zero candidate direction");clean(raw);clean(kernel);clean(out);
 }
 
-void patch_additive_source_geometry(const std::string& raw,const int n)
+void run_zero_h_tiles(const std::string& base)
+{
+  const std::string stem=base+"_zero_h_tiles",raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja";
+  make_input(raw,kernel,3,1.0e-10,4,-1.0,0.0,-1,false,nullptr,nullptr,false,true);
+  prepare_rpmd_ja_qnep_reference(raw,out,kernel);
+  const RpmdJAReference reference=read_rpmd_ja_reference(out);const int d=3*reference.number_of_atoms;
+  for(const auto& matrix:reference.block_site_transpose)for(const auto& tile:matrix.tiles){
+    if(tile.rank!=1||tile.left.size()!=static_cast<std::size_t>(tile.rows)||
+       tile.right.size()!=static_cast<std::size_t>(tile.columns)||
+       tile.left.size()+tile.right.size()>=static_cast<std::size_t>(tile.rows)*tile.columns)
+      throw std::runtime_error("exact zero H tile did not use the compact rank-one representation");
+    for(double value:tile.left)if(value!=0.0)throw std::runtime_error("zero H tile left factor changed");
+    for(double value:tile.right)if(value!=0.0)throw std::runtime_error("zero H tile right factor changed");
+  }
+  std::vector<double> action(static_cast<std::size_t>(d),0.0);
+  for(int row=0;row<d;++row)for(int col=0;col<d;++col)action[row]+=tile_value(reference.block_site_transpose[0],row,col)*(col+1.0);
+  for(double value:action)if(value!=0.0)throw std::runtime_error("readback action changed for compact zero H tile");
+  clean(raw);clean(kernel);clean(out);
+}
+
+void run_small_h_norm_checks(const std::string& base)
+{
+  const std::string kernel=base+"_small_h.kernel";
+  const std::string small_raw=base+"_small_h.qraw",small_out=base+"_small_h.ja";
+  make_input(small_raw,kernel,3,1.0e-10,4,-1.0,0.0,-1,false,nullptr,nullptr,false,false,1.0e-8);
+  prepare_rpmd_ja_qnep_reference(small_raw,small_out,kernel);
+  const RpmdJAReference small=read_rpmd_ja_reference(small_out);
+  for(int alpha=0;alpha<3;++alpha){const double value=tile_value(small.block_site_transpose[alpha],0,0);
+    if(!(std::isfinite(value)&&std::abs(value)>1.0e-10&&std::abs(value)<1.0e-6))
+      throw std::runtime_error("scaled small-V/C fixture did not retain its nonzero native H");}
+  clean(small_raw);clean(small_out);
+
+  const std::string bad_small_raw=base+"_small_h_bad_norm.qraw",bad_small_out=base+"_small_h_bad_norm.ja";
+  make_input(bad_small_raw,kernel,3,1.0e-10,4,-1.0,0.0,-1,false,nullptr,nullptr,false,false,1.0e-8);
+  {std::fstream file(bad_small_raw,std::ios::binary|std::ios::in|std::ios::out);if(!file)throw std::runtime_error("cannot reopen scaled compact qraw norm fixture");
+    double compact[6];file.seekg(-static_cast<std::streamoff>(sizeof(compact)),std::ios::end);file.read(reinterpret_cast<char*>(compact),sizeof(compact));
+    if(!file||!(compact[3]>0.0))throw std::runtime_error("scaled compact qraw fixture has no positive H norm");compact[3]*=1.1;
+    file.seekp(-static_cast<std::streamoff>(sizeof(compact)),std::ios::end);file.write(reinterpret_cast<char*>(compact),sizeof(compact));
+    file.close();if(!file)throw std::runtime_error("cannot close scaled compact qraw norm fixture");}
+  bool rejected_small=false;try{prepare_rpmd_ja_qnep_reference(bad_small_raw,bad_small_out,kernel);}
+  catch(const std::exception& e){rejected_small=std::string(e.what()).find("stored native-H norm")!=std::string::npos;}
+  if(!rejected_small)throw std::runtime_error("qNEP prepare accepted a same-scale small-H footer norm mismatch");
+  clean(bad_small_raw);clean(bad_small_out);
+
+  const std::string zero_raw=base+"_zero_h_bad_norm.qraw",zero_out=base+"_zero_h_bad_norm.ja";
+  make_input(zero_raw,kernel,3,1.0e-10,4,-1.0,0.0,-1,false,nullptr,nullptr,false,true);
+  {std::fstream file(zero_raw,std::ios::binary|std::ios::in|std::ios::out);if(!file)throw std::runtime_error("cannot reopen zero-H compact qraw fixture");
+    double compact[6];file.seekg(-static_cast<std::streamoff>(sizeof(compact)),std::ios::end);file.read(reinterpret_cast<char*>(compact),sizeof(compact));
+    if(!file||compact[3]!=0.0)throw std::runtime_error("zero-H compact qraw fixture norm is not zero");compact[3]=1.0e-13;
+    file.seekp(-static_cast<std::streamoff>(sizeof(compact)),std::ios::end);file.write(reinterpret_cast<char*>(compact),sizeof(compact));
+    file.close();if(!file)throw std::runtime_error("cannot close zero-H compact qraw fixture");}
+  bool rejected_zero=false;try{prepare_rpmd_ja_qnep_reference(zero_raw,zero_out,kernel);}
+  catch(const std::exception& e){rejected_zero=std::string(e.what()).find("stored native-H norm")!=std::string::npos;}
+  if(!rejected_zero)throw std::runtime_error("qNEP prepare accepted a nonzero footer norm for zero H");
+  clean(zero_raw);clean(kernel);clean(zero_out);
+}
+
+void patch_additive_source_geometry(const std::string& raw,const int n,const std::uint32_t raw_version)
 {
   const int d=3*n;const char layout[]="xyz_soa;derivative_input_rows_output_columns";
   const std::streamoff header=8+4+4+4+4+8+8+8+8+4+4+8+sizeof(layout);
@@ -191,9 +254,16 @@ void patch_additive_source_geometry(const std::string& raw,const int n)
   for(int i=0;i<n;++i){xyz[i]=0.2*i;xyz[n+i]=0.1*i*i;xyz[2*n+i]=0.05*i;}
   for(int alpha=0;alpha<3;++alpha)for(int col=0;col<d;++col)for(int row=0;row<d;++row){const double left=1.+.01*std::sin((row+1)*(alpha+1)),right=1.+.01*std::cos((col+1)*(alpha+2));c[static_cast<std::size_t>(alpha)*d*d+static_cast<std::size_t>(col)*d+row]=left*right;}
   file.seekp(cell_start);file.write(reinterpret_cast<const char*>(cell),sizeof(cell));file.seekp(positions);array(file,xyz);file.seekp(force_start);array(file,std::vector<double>(d,0.0));
-  file.seekp(vstart);array(file,zero_v);file.seekp(cstart);array(file,c);file.seekp(coarse_v);array(file,zero_v);file.seekp(coarse_c);array(file,c);
-  const std::streamoff footer=coarse_c+static_cast<std::streamoff>(3)*d*d*8;
-  double stats[18]={};stats[16]=.01;stats[17]=3.;file.seekp(footer);file.write(reinterpret_cast<char*>(stats),sizeof(stats));file.close();
+  file.seekp(vstart);array(file,zero_v);file.seekp(cstart);array(file,c);
+  if(raw_version==4){
+    const std::streamoff footer=kstart+static_cast<std::streamoff>(d)*d*8;
+    double stats[24]={};stats[16]=.01;stats[17]=3.;stats[21]=stats[22]=stats[23]=1.;file.seekp(footer);file.write(reinterpret_cast<char*>(stats),sizeof(stats));
+  }else{
+    file.seekp(coarse_v);array(file,zero_v);file.seekp(coarse_c);array(file,c);
+    const std::streamoff footer=coarse_c+static_cast<std::streamoff>(3)*d*d*8;
+    double stats[18]={};stats[16]=.01;stats[17]=3.;file.seekp(footer);file.write(reinterpret_cast<char*>(stats),sizeof(stats));
+  }
+  file.close();
   if(!file)throw std::runtime_error("failed patching additive raw fixture");
 }
 
@@ -202,13 +272,15 @@ void write_additive_package(const std::string& path,const std::string& raw,const
   std::ofstream out(path,std::ios::binary);if(!out)throw std::runtime_error("cannot create additive fixture package");
   const char magic[8]={'G','P','J','A','A','D','D','1'};const std::uint32_t endian=0x01020304;
   const int beads=8;const std::uint64_t source=rpmd_ja_model_fingerprint(raw),training=4,validation=2;
-  const double temperature=300.,epsilon=1e-8,response=0.,budget=.02;
+  const double temperature=300.,epsilon=1e-8,response=version==7?.05:0.,budget=.02;
   out.write(magic,8);put(out,version);put(out,endian);put(out,n);put(out,beads);put(out,source);
   put(out,temperature);put(out,epsilon);put(out,response);put(out,budget);put(out,training);put(out,validation);
+  if(version==7){put(out,std::uint32_t(2));put(out,std::uint32_t(1));put(out,std::uint32_t(1));}
   const int d=3*n,q=6,z=2;
   for(int i=0;i<n;++i){put(out,z);const int neighbors[2]={(i+1)%n,(i+n-1)%n};
     for(int e=0;e<2;++e){put(out,neighbors[e]);int image[3]={0,0,0};if(e==0&&i==n-1)image[0]=1;if(e==1&&i==0)image[0]=-1;array(out,std::vector<int>(image,image+3));}
     std::vector<double> ell(q,0.0);ell[0]=.1;ell[3]=-.1;array(out,ell);
+    if(version>=5)put(out,std::uint32_t(0));
     std::vector<double> b(static_cast<std::size_t>(q)*q,0.0);for(int a=0;a<q;++a)b[static_cast<std::size_t>(a)*q+a]=.02;
     b[0*q+4]=b[4*q+0]=.003;b[1*q+5]=b[5*q+1]=.002;array(out,b);
   }
@@ -228,6 +300,7 @@ void verify_additive_reference(const RpmdJAReference& r,const int n,const std::u
     for(int e=0;e<2;++e)for(int mu=0;mu<3;++mu)for(int y=0;y<q;++y){const int axis=y%3,edge=y/3,disp[2]={axis*n+neighbors[edge],axis*n+i},vel=mu*n+neighbors[e];const double signs[2]={1.,-1.};for(int a=0;a<3;++a)for(int v=0;v<2;++v)hadd[a][static_cast<std::size_t>(disp[v])*d+vel]-=xyz[e][a]*b[(3*e+mu)*q+y]*signs[v];}
   }
   const std::string expected_policy=version==1?"native_reference_transport;finite_temperature_additive_v1;beads=8;derivative=3":
+    version==7?"native_reference_transport;finite_temperature_additive_v1;beads=8;derivative=3;use=DIAGNOSTIC;response=FAIL;numerical=PASS":
     "native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1;beads=8;derivative=3";
   if(r.mechanical_policy!=expected_policy||r.additive_beads!=8||
      !r.stability_checked||r.stability_certificate!="additive_shifted_frobenius_v1"||!(r.additive_reconstruction_bound<.5*r.additive_epsilon))
@@ -241,9 +314,14 @@ void verify_additive_reference(const RpmdJAReference& r,const int n,const std::u
 void run_additive(const std::string& base,const std::uint32_t version=1)
 {
   const int n=3;const std::string stem=base+"_additive",raw=stem+".qraw",kernel=stem+".kernel",pack=stem+".gpjaadd",out=stem+".ja";
-  make_input(raw,kernel,n,1.0e-10,3);patch_additive_source_geometry(raw,n);write_additive_package(pack,raw,n,version);
-  prepare_rpmd_ja_qnep_reference(raw,out,kernel,{},pack);verify_additive_reference(read_rpmd_ja_reference(out),n,version);
-  const std::string wrong=stem+"_wrong.gpjaadd",truncated=stem+"_truncated.gpjaadd";std::ifstream in(pack,std::ios::binary);std::vector<char> bytes((std::istreambuf_iterator<char>(in)),{}),wrong_bytes=bytes;wrong_bytes[24]^=1;
+  make_input(raw,kernel,n,1.0e-10,4);patch_additive_source_geometry(raw,n,4);write_additive_package(pack,raw,n,version);
+  prepare_rpmd_ja_qnep_reference(raw,out,kernel,{},pack);const RpmdJAReference prepared=read_rpmd_ja_reference(out);
+  verify_additive_reference(prepared,n,version);
+  if(version==7&&(!rpmd_ja_reference_policy_is_diagnostic(prepared.mechanical_policy)||
+     rpmd_ja_reference_policy_response_status(prepared.mechanical_policy)!="FAIL"||
+     rpmd_ja_reference_policy_numerical_status(prepared.mechanical_policy)!="PASS"))
+    throw std::runtime_error("diagnostic additive identity did not survive native qNEP prepare/readback");
+  const std::string wrong=stem+"_wrong.gpjaadd",truncated=stem+"_truncated.gpjaadd";std::ifstream in(pack,std::ios::binary);std::vector<char> bytes((std::istreambuf_iterator<char>(in)),{}),wrong_bytes=bytes,valid_bytes=bytes;wrong_bytes[24]^=1;
   {std::ofstream f(wrong,std::ios::binary);f.write(wrong_bytes.data(),wrong_bytes.size());}
   bytes.pop_back();{std::ofstream f(truncated,std::ios::binary);f.write(bytes.data(),bytes.size());}
   for(const std::string& bad:{wrong,truncated}){const std::string failed=bad+".ja";bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,failed,kernel,{},bad);}catch(const std::exception&){rejected=true;}
@@ -251,6 +329,29 @@ void run_additive(const std::string& base,const std::uint32_t version=1)
     if(exists(failed)||exists(failed+".tmp")||exists(failed+".stability")||exists(failed+".stability.tmp"))
       throw std::runtime_error("failed additive prepare left a publishable output or temporary file");
     clean(failed);}
+  if(version==7){
+    for(const auto& mutation:std::array<std::pair<const char*,std::pair<std::size_t,std::uint32_t>>,3>{{
+        {"bad_numerical",{84,2U}},{"bad_response",{88,9U}},{"bad_pass_budget",{88,0U}}}}){
+      std::vector<char> damaged=valid_bytes;std::memcpy(damaged.data()+mutation.second.first,&mutation.second.second,sizeof(std::uint32_t));
+      const std::string bad=stem+"_"+mutation.first+".gpjaadd",failed=bad+".ja";
+      {std::ofstream f(bad,std::ios::binary);f.write(damaged.data(),static_cast<std::streamsize>(damaged.size()));}
+      bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,failed,kernel,{},bad);}catch(const std::exception&){rejected=true;}
+      if(!rejected||exists(failed)||exists(failed+".stability"))
+        throw std::runtime_error("invalid diagnostic additive status was accepted or published");
+      clean(bad);clean(failed);
+    }
+    for(const auto status:{2U,3U})for(const double response:{std::numeric_limits<double>::infinity(),-std::numeric_limits<double>::infinity()}){
+      std::vector<char> damaged=valid_bytes;std::memcpy(damaged.data()+48,&response,sizeof(response));
+      std::memcpy(damaged.data()+88,&status,sizeof(status));
+      const std::string bad=stem+"_infinite_response_"+std::to_string(status)+"_"+(response>0?"positive":"negative")+".gpjaadd";
+      const std::string failed=bad+".ja";
+      {std::ofstream f(bad,std::ios::binary);f.write(damaged.data(),static_cast<std::streamsize>(damaged.size()));}
+      bool rejected=false;try{prepare_rpmd_ja_qnep_reference(raw,failed,kernel,{},bad);}catch(const std::exception&){rejected=true;}
+      if(!rejected||exists(failed)||exists(failed+".stability"))
+        throw std::runtime_error("infinite diagnostic response was accepted or published");
+      clean(bad);clean(failed);
+    }
+  }
   clean(raw);clean(kernel);clean(pack);clean(out);clean(wrong);clean(truncated);
 }
 
@@ -269,6 +370,22 @@ void run_raw2_rejections(const std::string& base)
   rejected("_bad_marker_v1",2.0,0.0,1);
   rejected("_bad_marker_v3",2.0,0.0,3);
   rejected("_bad_identity_v3",3.0,1.1e-4,3);
+  const std::string bad_v4=base+"_bad_transport_v4.qraw",bad_v4_out=base+"_bad_transport_v4.ja";
+  make_input(bad_v4,kernel,3,1.0e-10,4);
+  {std::fstream file(bad_v4,std::ios::binary|std::ios::in|std::ios::out);file.seekp(-6*static_cast<std::streamoff>(sizeof(double)),std::ios::end);double stats[6]={1,0,0,1,1,1};file.write(reinterpret_cast<char*>(stats),sizeof(stats));}
+  bool rejected_v4=false;try{prepare_rpmd_ja_qnep_reference(bad_v4,bad_v4_out,kernel);}catch(const std::exception&){rejected_v4=true;}
+  if(!rejected_v4)throw std::runtime_error("qNEP raw v4 accepted a failed compact transport statistic");
+  clean(bad_v4);clean(kernel);clean(bad_v4_out);
+  const std::string bad_v4_norm=base+"_bad_transport_norm_v4.qraw",bad_v4_norm_out=base+"_bad_transport_norm_v4.ja";
+  make_input(bad_v4_norm,kernel,3,1.0e-10,4);
+  {std::fstream file(bad_v4_norm,std::ios::binary|std::ios::in|std::ios::out);if(!file)throw std::runtime_error("cannot reopen compact qraw norm fixture");
+    double compact[6];file.seekg(-static_cast<std::streamoff>(sizeof(compact)),std::ios::end);file.read(reinterpret_cast<char*>(compact),sizeof(compact));
+    if(!file)throw std::runtime_error("cannot read compact qraw norm fixture");compact[3]+=1.0;file.seekp(-static_cast<std::streamoff>(sizeof(compact)),std::ios::end);file.write(reinterpret_cast<char*>(compact),sizeof(compact));
+    file.close();if(!file)throw std::runtime_error("cannot close compact qraw norm fixture");}
+  bool rejected_norm=false;try{prepare_rpmd_ja_qnep_reference(bad_v4_norm,bad_v4_norm_out,kernel);}
+  catch(const std::exception& e){rejected_norm=std::string(e.what()).find("stored native-H norm")!=std::string::npos;}
+  if(!rejected_norm)throw std::runtime_error("qNEP prepare trusted a footer norm that disagrees with reconstructed H");
+  clean(bad_v4_norm);clean(kernel);clean(bad_v4_norm_out);
 }
 } // namespace
 
@@ -278,11 +395,12 @@ int main(int argc,char** argv)
   try{const bool integration_smoke=argc>1&&std::string(argv[1])=="--integration-smoke";
     const std::string base=integration_smoke?"rpmd_ja_qnep_prepare_integration_smoke_"+
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()):(argc>1?argv[1]:"rpmd_ja_qnep_prepare_cuda_test");
-    if(integration_smoke){run_additive(base,1);run_additive(base+"_internal_com",2);return 0;}
-    run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,44,1);
-    run_dense_h_upper_bound(base);
+    if(integration_smoke){run_additive(base,1);run_additive(base+"_internal_com",2);run_additive(base+"_diagnostic",7);return 0;}
+    run_positive(base,2,1);run_positive(base,3,1);run_positive(base,3,2);run_positive(base,3,3);run_positive(base,3,4);run_positive(base,44,1);
+    run_dense_h_upper_bound(base);run_zero_h_tiles(base);run_small_h_norm_checks(base);
     run_failure(base,"_negative_first",0,1,-1.0e-10);run_failure(base,"_negative_late",2,3,-1.0e-10);
-    run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);run_additive(base);return 0;}
+    run_failure(base,"_negative_lanczos",0,1,std::numeric_limits<double>::quiet_NaN(),44,true);run_zero(base);run_raw2_rejections(base);
+    run_additive(base);run_additive(base+"_diagnostic",7);return 0;}
   catch(const std::exception& e){std::fprintf(stderr,"qNEP prepare CUDA fixture failed: %s\n",e.what());return 1;}
 }
 #endif

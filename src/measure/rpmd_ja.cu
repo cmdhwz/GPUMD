@@ -211,6 +211,9 @@ void HAC::pre_run_rpmd_ja_(
 
   rpmd_ja_reference_ = read_rpmd_ja_reference(rpmd_ja_reference_path_);
   rpmd_ja_reference_file_fingerprint_ = rpmd_ja_model_fingerprint(rpmd_ja_reference_path_);
+  if(!rpmd_ja_reference_policy_use_matches(rpmd_ja_reference_.backend,
+       rpmd_ja_reference_.mechanical_policy,rpmd_ja_diagnostic_))
+    PRINT_INPUT_ERROR("rpmd_ja diagnostic references require explicit `rpmd_ja on <referencefile> diagnostic`; the selected use must match the reference identity.");
   const int N = atom.number_of_atoms;
   const size_t D = static_cast<size_t>(N) * 3;
   if (

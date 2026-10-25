@@ -300,10 +300,18 @@ def test_raw_versions_and_collect_to_fit_synthetic_chain():
         assert not list(td.glob(".*.tmp"))
         fit.collect(beadpaths,temp,samples,mean,masses)
         rawpaths=[]
-        for version in (1,2,3):
+        for version in (1,2,3,4):
             rp=td/f"raw{version}.qraw"; rawpaths.append(rp); _write_raw_fixture(rp,version,base,cell,masses,kt)
             parsed=fit.read_raw(rp); assert parsed["version"]==version
-            for arrname in ("v","c","k","coarse_v","coarse_c"): parsed[arrname]._mmap.close()
+            assert parsed["derivative_version"]==(3 if version==4 else version)
+            for arrname in ("v","c","k","coarse_v","coarse_c"):
+                if parsed[arrname] is not None: parsed[arrname]._mmap.close()
+            if version==4:
+                with rp.open("r+b") as f:
+                    f.seek(-6*8,2); compact=np.zeros(6); compact[0]=compact[3]=1.
+                    f.write(compact.astype("<f8").tobytes())
+                _raises(lambda:fit.read_raw(rp),"diagnostics")
+                _write_raw_fixture(rp,version,base,cell,masses,kt)
             if version==2:
                 with rp.open("r+b") as f:
                     f.seek(-18*8,2); stats=np.frombuffer(f.read(18*8),dtype="<f8").copy(); stats[0]=10.; stats[2]=.9; f.seek(-18*8,2); f.write(stats.astype("<f8").tobytes())
@@ -376,12 +384,31 @@ def test_raw_versions_and_collect_to_fit_synthetic_chain():
 
 def _write_raw_fixture(path,version,positions,cell,masses,k):
     n=len(masses); d=3*n; pos=positions.T.reshape(-1); zero_v=np.zeros((d,n)); zero_c=np.zeros((3,d,d)); stats=np.zeros(18); stats[16]=.01; stats[17]=version
+    if version==4: stats[17]=3.
     with path.open("wb") as f:
         f.write(fit.RAW_MAGIC); f.write(struct.pack("<IIii",version,fit.ENDIAN,n,d)); f.write(struct.pack("<ddQQ",300.,.01,11,22))
         f.write(struct.pack("<iid",1,1,1.)); f.write(fit.RAW_LAYOUT); h=np.zeros(18); h[:9]=cell.ravel(); h[9:]=np.linalg.inv(cell).ravel(); f.write(h.astype("<f8").tobytes())
         f.write(np.ones(3,dtype="<i4").tobytes()); f.write(np.arange(n,dtype="<i4").tobytes()); f.write(masses.astype("<f8").tobytes())
         f.write(pos.astype("<f8").tobytes()); f.write(struct.pack("<d",0.)); f.write(np.zeros(n,dtype="<f8").tobytes()); f.write(np.zeros(d,dtype="<f8").tobytes()); f.write(np.zeros(9*n,dtype="<f8").tobytes())
-        f.write(zero_v.astype("<f8").tobytes()); f.write(zero_c.astype("<f8").tobytes()); f.write(k.astype("<f8").tobytes()); f.write(zero_v.astype("<f8").tobytes()); f.write(zero_c.astype("<f8").tobytes()); f.write(stats.astype("<f8").tobytes())
+        f.write(zero_v.astype("<f8").tobytes()); f.write(zero_c.astype("<f8").tobytes()); f.write(k.astype("<f8").tobytes())
+        if version==4: f.write(stats.astype("<f8").tobytes()); f.write(np.zeros(6,dtype="<f8").tobytes())
+        else: f.write(zero_v.astype("<f8").tobytes()); f.write(zero_c.astype("<f8").tobytes()); f.write(stats.astype("<f8").tobytes())
+
+
+def test_compact_v4_raw_reader_preserves_fd4_and_rejects_bad_transport_stats():
+    positions=np.array([[2.,2.,2.],[3.,2.,2.]])
+    cell=np.eye(3)*10.; masses=np.array([1.,3.]); k=np.eye(6)
+    with tempfile.TemporaryDirectory() as td:
+        raw=Path(td)/"compact.qraw"
+        _write_raw_fixture(raw,4,positions,cell,masses,k)
+        parsed=fit.read_raw(raw)
+        assert parsed["version"]==4 and parsed["derivative_version"]==3
+        assert parsed["coarse_v"] is None and parsed["coarse_c"] is None
+        for key in ("v","c","k"): parsed[key]._mmap.close()
+        with raw.open("r+b") as f:
+            f.seek(-6*8,2); invalid=np.zeros(6); invalid[0]=invalid[3]=1.
+            f.write(invalid.astype("<f8").tobytes())
+        _raises(lambda:fit.read_raw(raw),"diagnostics")
 
 
 def test_fit_rejects_oversized_raw_before_reading_samples():

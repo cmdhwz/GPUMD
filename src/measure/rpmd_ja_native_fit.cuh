@@ -25,6 +25,7 @@ struct RpmdJANativeFitOptions
   std::string output_path;
   std::string kernel_table;
   std::string raw_input_path;
+  std::string baseline_state_path;
   double temperature = 0.0;
   double cutoff = 0.0;
   double epsilon = 0.0;
@@ -38,6 +39,7 @@ struct RpmdJANativeFitOptions
   double covariance_ridge_lambda = 0.0;
   int covariance_analytic_curvature_probes = 0;
   bool covariance_feasibility = false;
+  bool graph_reference = false;
   bool covariance_structured_basis = false;
   std::string covariance_blind_samples;
   std::string covariance_blind_manifest_path;

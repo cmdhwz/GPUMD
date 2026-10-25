@@ -1,5 +1,6 @@
 #include "rpmd_ja_reference.cuh"
 #include "rpmd_ja_reference_math.cuh"
+#include "rpmd_ja_qraw_v4.h"
 #include "rpmd_ja_qnep_prepare.cuh"
 #include "rpmd_ja_sha256.h"
 #include "force/force.cuh"
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -81,10 +83,18 @@ bool parse_additive_policy(const std::string& policy, int& beads, int& derivativ
     return true;
   };
   const std::string b = policy.substr(p.size(), split-p.size());
-  const std::string v = policy.substr(split+12);
+  const std::size_t derivative_start=split+12;
+  const std::size_t suffix_start=policy.find(';',derivative_start);
+  const std::string v = policy.substr(derivative_start,suffix_start==std::string::npos?std::string::npos:suffix_start-derivative_start);
   if (!parse(b, beads) || !parse(v, derivative) || beads <= 0 || derivative < 1 || derivative > 3)
     return false;
-  return std::to_string(beads) == b && std::to_string(derivative) == v;
+  if(std::to_string(beads)!=b||std::to_string(derivative)!=v)return false;
+  if(suffix_start==std::string::npos)return true;
+  const std::string suffix=policy.substr(suffix_start);
+  return suffix==";use=DIAGNOSTIC;response=PASS;numerical=PASS"||
+    suffix==";use=DIAGNOSTIC;response=FAIL;numerical=PASS"||
+    suffix==";use=DIAGNOSTIC;response=INCONCLUSIVE;numerical=PASS"||
+    suffix==";use=DIAGNOSTIC;response=NOT_MEASURED;numerical=PASS";
 }
 
 bool is_supported_qnep_policy(const std::string& policy)
@@ -1185,6 +1195,29 @@ bool rpmd_ja_reference_policy_requires_pimd_fix_com(const std::string& policy)
     rpmd_ja_reference_policy_beads(policy) > 0;
 }
 
+bool rpmd_ja_reference_policy_is_diagnostic(const std::string& policy)
+{return policy.find(";use=DIAGNOSTIC;")!=std::string::npos&&is_supported_qnep_policy(policy);}
+
+bool rpmd_ja_reference_policy_use_matches(const int backend,const std::string& policy,const bool diagnostic)
+{
+  if(backend==0||backend==1)return policy.empty()&&!diagnostic;
+  return backend==2&&is_supported_qnep_policy(policy)&&
+    rpmd_ja_reference_policy_is_diagnostic(policy)==diagnostic;
+}
+
+std::string rpmd_ja_reference_policy_response_status(const std::string& policy)
+{
+  if(!rpmd_ja_reference_policy_is_diagnostic(policy))return "NOT_APPLICABLE";
+  const std::size_t start=policy.find(";response=");
+  if(start==std::string::npos)return "INVALID";
+  const std::size_t end=policy.find(';',start+10);
+  if(end==std::string::npos)return "INVALID";
+  return policy.substr(start+10,end-start-10);
+}
+
+std::string rpmd_ja_reference_policy_numerical_status(const std::string& policy)
+{return rpmd_ja_reference_policy_is_diagnostic(policy)?"PASS":"NOT_APPLICABLE";}
+
 std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference)
 {
   // This native prepare prefix writes the fixed diagnostics array without a vector-length field.
@@ -1594,7 +1627,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     result.q_uses_pppm = uses_pppm == 1;
     read_value_checked(in, result.q_mesh_spacing, file_size);
     read_value_checked(in, policy_size, file_size);
-    if (policy_size <= 0 || policy_size > 128) throw std::runtime_error("invalid qNEP RPMD-JA mechanical policy length");
+    if (policy_size <= 0 || policy_size > 192) throw std::runtime_error("invalid qNEP RPMD-JA mechanical policy length");
     require_remaining(in, file_size, static_cast<std::size_t>(policy_size));
     result.mechanical_policy.resize(static_cast<std::size_t>(policy_size));
     in.read(&result.mechanical_policy[0], policy_size);
@@ -2299,9 +2332,10 @@ static void generate_rpmd_ja_qnep_raw_reference(
   for (double value : box.cpu_h)
     if (!std::isfinite(value)) throw std::runtime_error("qNEP rpmd_ja requires a finite cell");
 
-  const std::string temporary = path + ".tmp";
-  rpmd_ja_file_io::ifstream existing(path, std::ios::binary), existing_temporary(temporary, std::ios::binary);
-  if (existing.good() || existing_temporary.good())
+  const std::string temporary = path + ".tmp", vtranspose_temporary = path + ".vtranspose.tmp";
+  rpmd_ja_file_io::ifstream existing(path, std::ios::binary), existing_temporary(temporary, std::ios::binary),
+    existing_vtranspose(vtranspose_temporary, std::ios::binary);
+  if (existing.good() || existing_temporary.good() || existing_vtranspose.good())
     throw std::runtime_error("qNEP rpmd_ja raw output or temporary file already exists");
   const auto generation_start = std::chrono::steady_clock::now();
 
@@ -2481,7 +2515,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   if (!out) throw std::runtime_error("cannot create qNEP rpmd_ja raw file: " + temporary);
   constexpr char raw_magic[8] = {'G','P','J','Q','R','A','W','\0'};
   constexpr char raw_layout[] = "xyz_soa;derivative_input_rows_output_columns";
-  const std::uint32_t raw_version = 3, endian = kEndian;
+  const std::uint32_t raw_version = 4, endian = kEndian;
   const int charge_mode = active_qnep->get_charge_mode();
   const int uses_pppm = active_qnep->uses_pppm() ? 1 : 0;
   const double mesh_spacing = active_qnep->get_pppm_mesh_spacing();
@@ -2500,20 +2534,27 @@ static void generate_rpmd_ja_qnep_raw_reference(
 
   const std::streampos data_start = out.tellp();
   const std::uint64_t v_count = static_cast<std::uint64_t>(d) * n;
-  const std::uint64_t c_count = static_cast<std::uint64_t>(3) * d * d;
-  const std::uint64_t k_count = static_cast<std::uint64_t>(d) * d;
+  const std::uint64_t dd_count = static_cast<std::uint64_t>(d) * d;
+  const std::uint64_t c_count = static_cast<std::uint64_t>(3) * dd_count;
+  const std::uint64_t k_count = dd_count;
+  const std::uint64_t max_streamoff = static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max());
+  const std::uint64_t max_payload_elements = max_streamoff / sizeof(double);
+  if (dd_count > (max_payload_elements - 24) / 7 || v_count > max_payload_elements - 7 * dd_count - 24)
+    throw std::runtime_error("qNEP rpmd_ja raw output size overflows platform offsets");
+  const std::uint64_t temporary_payload_elements = v_count + 7 * dd_count + 24;
+  if (data_start < 0) throw std::runtime_error("qNEP rpmd_ja raw output size overflows platform offsets");
+  const std::uint64_t data_offset = static_cast<std::uint64_t>(static_cast<std::streamoff>(data_start));
+  if (temporary_payload_elements > (max_streamoff - data_offset) / sizeof(double))
+    throw std::runtime_error("qNEP rpmd_ja raw output size overflows platform offsets");
   const std::streamoff v_bytes = static_cast<std::streamoff>(v_count * sizeof(double));
   const std::streamoff c_bytes = static_cast<std::streamoff>(c_count * sizeof(double));
   const std::streamoff c_matrix_bytes = c_bytes / 3;
   const std::streamoff k_bytes = static_cast<std::streamoff>(k_count * sizeof(double));
-  const std::streamoff stats_bytes = static_cast<std::streamoff>(18 * sizeof(double));
-  if (data_start < 0 || 2 * v_bytes > std::numeric_limits<std::streamoff>::max() - 2 * c_bytes ||
-      2 * v_bytes + 2 * c_bytes > std::numeric_limits<std::streamoff>::max() - k_bytes - stats_bytes)
-    throw std::runtime_error("qNEP rpmd_ja raw output size overflows platform offsets");
-  const std::streampos coarse_v_start = data_start + v_bytes + c_bytes + k_bytes;
-  const std::streampos coarse_c_start = coarse_v_start + v_bytes;
-  const std::streampos stats_start = coarse_c_start + c_bytes;
-  out.seekp(stats_start + (stats_bytes - std::streamoff{1}));
+  const std::streamoff stats_bytes = static_cast<std::streamoff>(24 * sizeof(double));
+  const std::streampos stats_start = data_start + v_bytes + c_bytes + k_bytes;
+  const std::streampos coarse_c_start = stats_start + stats_bytes;
+  const std::streampos temporary_end = coarse_c_start + c_bytes;
+  out.seekp(temporary_end - std::streamoff{1});
   out.put('\0');
   out.flush();
   if (!out) throw std::runtime_error("cannot reserve qNEP rpmd_ja raw matrix storage");
@@ -2523,7 +2564,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
   double c_diff2[3] = {}, c_fine2[3] = {};
   double energy_gradient_diff2 = 0.0, energy_gradient_scale2 = 0.0;
   std::vector<double> plus = positions, minus = positions, plus_twice = positions, minus_twice = positions;
-  std::vector<double> v_fine(n), v_coarse(n), k_fine(d), k_coarse(d);
+  std::vector<double> v_fine(n), k_fine(d), k_coarse(d);
   std::vector<double> full_v_gradient(static_cast<std::size_t>(d), 0.0);
   std::vector<std::vector<double>> probe_directions(3, std::vector<double>(d));
   for (int coordinate = 0; coordinate < d; ++coordinate) {
@@ -2572,9 +2613,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
     const double identity_error = summed_jvp - reference_gradient[coordinate];
     jvp_identity_diff2 += identity_error * identity_error;
     jvp_identity_scale2 += reference_gradient[coordinate] * reference_gradient[coordinate];
-    v_coarse = v_fine;
     save_row(data_start, coordinate, n, v_fine);
-    save_row(coarse_v_start, coordinate, n, v_coarse);
     unit_direction[coordinate] = 0.0;
     const std::uint64_t completed = static_cast<std::uint64_t>(coordinate) + 1;
     if (next_decile <= 10 && completed * 10 >= next_decile * static_cast<std::uint64_t>(2) * d) {
@@ -2734,7 +2773,7 @@ static void generate_rpmd_ja_qnep_raw_reference(
     scalar_energy_curvature_error = std::max(scalar_energy_curvature_error,
       std::abs(energy_h - energy_h2) / std::max({std::abs(energy_h), std::abs(energy_h2), 1.0e-12}));
   }
-  double stats[18] = {};
+  double stats[24] = {};
   stats[0] = native_gradient_relative; stats[1] = native_gradient_abs;
   stats[2] = jvp_identity_relative; stats[3] = jvp_identity_abs;
   stats[4] = k_relative; stats[5] = std::sqrt(k_diff2 / (static_cast<double>(d) * d));
@@ -2745,29 +2784,67 @@ static void generate_rpmd_ja_qnep_raw_reference(
   stats[12] = max_force; stats[13] = std::sqrt(force_norm2 / d);
   stats[14] = second_consistency; stats[15] = second_convergence;
   stats[16] = fd_step; stats[17] = 3.0; // Analytic site JVP and fourth-order gradient/virial derivatives.
-  out.seekp(stats_start);
-  out.write(reinterpret_cast<const char*>(stats), sizeof(stats));
+  if(!std::all_of(stats,stats+18,[](double value){return std::isfinite(value)&&value>=0.0;}))
+    throw std::runtime_error("qNEP v4 raw generation statistics are non-finite");
   out.flush();
-  if (!out) throw std::runtime_error("failed writing qNEP rpmd_ja raw diagnostic footer");
+  if (!out) throw std::runtime_error("failed flushing qNEP rpmd_ja raw matrices before transport statistics");
   out.close();
   if (!out) throw std::runtime_error("failed closing qNEP rpmd_ja raw file");
-  if (rpmd_ja_file_io::rename_file(temporary,path) != 0)
-    throw std::runtime_error("cannot finalize qNEP rpmd_ja raw file");
-  remove_temporary.active = false;
-  std::printf("    qNEP rpmd_ja raw v3: maximum force %.3e eV/A; analytic-gradient/native-force abs RMS %.3e; site-JVP/gradient identity abs RMS %.3e; V analytic, coarse V repeats it; K uses fourth-order analytic-gradient FD; C uses fourth-order native nine-component virial FD.\n",
-    max_force, native_gradient_abs, jvp_identity_abs);
-  std::printf("    qNEP rpmd_ja raw checks: K/C stencil-step consistency D2(h)-D2(2h), normalized by D4: K %.3e; Cxyz %.3e %.3e %.3e; directional gradient D2(h)-D2(2h) %.3e; scalar energy-gradient FD %.3e and energy-curvature h/2h %.3e are diagnostic only.\n",
-    k_relative, c_relative[0], c_relative[1], c_relative[2], second_convergence, scalar_energy_gradient_error, scalar_energy_curvature_error);
-  std::printf("    qNEP rpmd_ja work: serial force evaluations %llu, gradient-only calls %llu, site JVPs %d; matrix storage %.3f GiB; tracked QEvaluator GPU buffers %.3f MiB (excludes NEP/PPPM private and host buffers).\n",
-    static_cast<unsigned long long>(4ULL * d + 4ULL * precheck_coordinates.size() + 14ULL),
-    static_cast<unsigned long long>(4ULL * d + 4ULL * precheck_coordinates.size() + 14ULL),
-    d + static_cast<int>(precheck_coordinates.size()),
-    static_cast<double>(2 * v_bytes + 2 * c_bytes + k_bytes) / (1024.0 * 1024.0 * 1024.0),
-    static_cast<double>(23ULL * n * sizeof(double) + static_cast<std::uint64_t>(n) * sizeof(int)) /
-      (1024.0 * 1024.0));
-  const double elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_start).count();
-  std::printf("    qNEP rpmd_ja raw phases: V %.3f s; K/C %.3f s\n", v_phase_seconds, kc_phase_seconds);
-  std::printf("    qNEP rpmd_ja raw generation elapsed %.3f s\n", elapsed_seconds);
+  struct RemoveVTransposeTemporary
+  {
+    explicit RemoveVTransposeTemporary(const std::string& value) : path(value) {}
+    std::string path;
+    bool active = true;
+    ~RemoveVTransposeTemporary() { if (active) rpmd_ja_file_io::remove_file(path); }
+  } remove_vtranspose(vtranspose_temporary);
+  rpmd_ja_file_io::ifstream raw_in(temporary, std::ios::binary);
+  rpmd_ja_file_io::ofstream vtranspose_out(vtranspose_temporary, std::ios::binary | std::ios::trunc);
+  if (!raw_in || !vtranspose_out) throw std::runtime_error("cannot create qNEP v4 transport-statistic scratch streams");
+  const std::uint64_t transpose_bytes = v_count * sizeof(double);
+  if (transpose_bytes == 0 || transpose_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+    throw std::runtime_error("qNEP v4 V-transpose scratch size overflows");
+  vtranspose_out.seekp(static_cast<std::streamoff>(transpose_bytes) - 1);
+  vtranspose_out.put('\0'); vtranspose_out.flush();
+  if (!vtranspose_out) throw std::runtime_error("cannot reserve qNEP v4 V-transpose scratch");
+  constexpr int transpose_tile = 128;
+  std::vector<double> vtile(static_cast<std::size_t>(transpose_tile) * transpose_tile);
+  std::vector<double> transpose_row(transpose_tile);
+  for (int r0 = 0; r0 < d; r0 += transpose_tile) {
+    const int nr = std::min(transpose_tile, d - r0);
+    for (int a0 = 0; a0 < n; a0 += transpose_tile) {
+      const int na = std::min(transpose_tile, n - a0);
+      for (int i = 0; i < nr; ++i) {
+        raw_in.clear();
+        raw_in.seekg(data_start + static_cast<std::streamoff>(r0 + i) * n * sizeof(double) + static_cast<std::streamoff>(a0) * sizeof(double));
+        raw_in.read(reinterpret_cast<char*>(vtile.data() + static_cast<std::size_t>(i) * na), static_cast<std::streamsize>(na * sizeof(double)));
+        if (!raw_in) throw std::runtime_error("truncated qNEP v4 fine V while building transport statistics");
+      }
+      for (int a = 0; a < na; ++a) {
+        for (int i = 0; i < nr; ++i) transpose_row[i] = vtile[static_cast<std::size_t>(i) * na + a];
+        vtranspose_out.seekp(static_cast<std::streamoff>(a0 + a) * d * sizeof(double) + static_cast<std::streamoff>(r0) * sizeof(double));
+        vtranspose_out.write(reinterpret_cast<const char*>(transpose_row.data()), static_cast<std::streamsize>(nr * sizeof(double)));
+        if (!vtranspose_out) throw std::runtime_error("failed writing qNEP v4 V-transpose scratch");
+      }
+    }
+  }
+  vtranspose_out.flush(); vtranspose_out.close();
+  if (!vtranspose_out) throw std::runtime_error("failed closing qNEP v4 V-transpose scratch");
+  rpmd_ja_file_io::ifstream vtranspose_in(vtranspose_temporary, std::ios::binary);
+  if(!vtranspose_in)throw std::runtime_error("cannot reopen qNEP v4 V-transpose scratch");
+  std::vector<double> fenergy(d);
+  for(int coordinate=0;coordinate<d;++coordinate)fenergy[coordinate]=-full_v_gradient[coordinate];
+  const rpmd_ja_qraw_v4::TransportStatistics transport_stats=rpmd_ja_qraw_v4::transport_statistics_from_streams(
+    n,d,atom.cpu_mass,fenergy,raw_in,vtranspose_in,static_cast<std::streamoff>(data_start)+v_bytes,
+    static_cast<std::streamoff>(coarse_c_start));
+  for(int alpha=0;alpha<3;++alpha){
+    stats[18+alpha]=transport_stats.difference_squared[alpha];
+    stats[21+alpha]=transport_stats.fine_norm_squared[alpha];
+    const double relative=std::sqrt(stats[18+alpha]/std::max(stats[21+alpha],1.0e-300));
+    if(!std::isfinite(relative)||relative>kDifferenceTolerance)
+      throw std::runtime_error("qNEP v4 transported H fine/coarse difference exceeds 5e-2");
+  }
+  vtranspose_in.close();raw_in.close();
+  if(!vtranspose_in||!raw_in)throw std::runtime_error("failed closing qNEP v4 transport-statistic input streams");
   const bool finite_diagnostics = std::isfinite(native_gradient_abs) && std::isfinite(jvp_identity_abs) &&
     std::isfinite(scalar_energy_gradient_error) && std::isfinite(scalar_energy_curvature_error) &&
     std::isfinite(k_relative) && std::isfinite(c_relative[0]) && std::isfinite(c_relative[1]) &&
@@ -2776,13 +2853,43 @@ static void generate_rpmd_ja_qnep_raw_reference(
       k_relative > kDifferenceTolerance || second_consistency > kDifferenceTolerance ||
       second_convergence > kDifferenceTolerance || c_relative[0] > kDifferenceTolerance ||
       c_relative[1] > kDifferenceTolerance || c_relative[2] > kDifferenceTolerance) {
-    std::fflush(stdout);
-    std::fprintf(stderr,
-      "qNEP rpmd_ja raw v3 stencil-step checks failed for %s at fd_step=%.9g: analytic-gradient/native-force abs RMS %.6g, site-JVP/gradient identity abs RMS %.6g (limit %.3g), K D2(h)-D2(2h) %.6g, Cxyz %.6g %.6g %.6g, gradient-curvature D4/matrix consistency %.6g, gradient-curvature D2(h)-D2(2h) %.6g (limits %.3g)\n",
-      path.c_str(), fd_step, native_gradient_abs, jvp_identity_abs, kForceTolerance, k_relative,
-      c_relative[0], c_relative[1], c_relative[2], second_consistency, second_convergence, kDifferenceTolerance);
+    std::fprintf(stderr, "qNEP rpmd_ja raw v4 stencil-step checks failed before publication for %s at fd_step=%.9g: gradient %.6g, JVP %.6g, K %.6g, Cxyz %.6g %.6g %.6g, directional %.6g, convergence %.6g\n",
+      path.c_str(), fd_step, native_gradient_abs, jvp_identity_abs, k_relative, c_relative[0], c_relative[1],
+      c_relative[2], second_consistency, second_convergence);
     throw std::runtime_error("qNEP rpmd_ja raw stencil-step finite-difference consistency check failed; inspect recorded diagnostics");
   }
+  {
+    rpmd_ja_file_io::ofstream update(temporary, std::ios::binary | std::ios::in | std::ios::out);
+    if (!update) throw std::runtime_error("cannot reopen qNEP v4 raw file to write diagnostics");
+    update.seekp(stats_start); update.write(reinterpret_cast<const char*>(stats), sizeof(stats));
+    update.flush(); if (!update) throw std::runtime_error("failed writing qNEP v4 raw diagnostic footer");
+    update.close(); if (!update) throw std::runtime_error("failed closing qNEP v4 raw diagnostic update");
+  }
+  std::error_code resize_error;
+  const std::streamoff compact_size=static_cast<std::streamoff>(stats_start)+stats_bytes;
+  if(compact_size<0)throw std::runtime_error("qNEP v4 compact size exceeds platform file offsets");
+  std::filesystem::resize_file(std::filesystem::u8path(temporary), static_cast<std::uintmax_t>(compact_size), resize_error);
+  if (resize_error) throw std::runtime_error("cannot compact qNEP v4 raw file: " + resize_error.message());
+  if(rpmd_ja_file_io::remove_file(vtranspose_temporary)!=0)
+    throw std::runtime_error("cannot remove qNEP v4 V-transpose scratch before publishing raw file");
+  remove_vtranspose.active=false;
+  if (rpmd_ja_file_io::rename_file(temporary,path) != 0)
+    throw std::runtime_error("cannot finalize qNEP rpmd_ja raw file");
+  remove_temporary.active = false;
+  std::printf("    qNEP rpmd_ja raw v4: maximum force %.3e eV/A; analytic-gradient/native-force abs RMS %.3e; site-JVP/gradient identity abs RMS %.3e; fine V/C/K retained, coarse C reduced to transported-H statistics; derivative policy remains FD4 v3.\n",
+    max_force, native_gradient_abs, jvp_identity_abs);
+  std::printf("    qNEP rpmd_ja raw checks: K/C stencil-step consistency D2(h)-D2(2h), normalized by D4: K %.3e; Cxyz %.3e %.3e %.3e; directional gradient D2(h)-D2(2h) %.3e; scalar energy-gradient FD %.3e and energy-curvature h/2h %.3e are diagnostic only.\n",
+    k_relative, c_relative[0], c_relative[1], c_relative[2], second_convergence, scalar_energy_gradient_error, scalar_energy_curvature_error);
+  std::printf("    qNEP rpmd_ja work: serial force evaluations %llu, gradient-only calls %llu, site JVPs %d; matrix storage %.3f GiB; tracked QEvaluator GPU buffers %.3f MiB (excludes NEP/PPPM private and host buffers).\n",
+    static_cast<unsigned long long>(4ULL * d + 4ULL * precheck_coordinates.size() + 14ULL),
+    static_cast<unsigned long long>(4ULL * d + 4ULL * precheck_coordinates.size() + 14ULL),
+    d + static_cast<int>(precheck_coordinates.size()),
+    static_cast<double>(v_bytes + c_bytes + k_bytes) / (1024.0 * 1024.0 * 1024.0),
+    static_cast<double>(23ULL * n * sizeof(double) + static_cast<std::uint64_t>(n) * sizeof(int)) /
+      (1024.0 * 1024.0));
+  const double elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_start).count();
+  std::printf("    qNEP rpmd_ja raw phases: V %.3f s; K/C %.3f s\n", v_phase_seconds, kc_phase_seconds);
+  std::printf("    qNEP rpmd_ja raw generation elapsed %.3f s\n", elapsed_seconds);
 }
 
 void generate_rpmd_ja_qnep_raw(

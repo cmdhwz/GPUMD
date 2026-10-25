@@ -7,6 +7,10 @@
 #include "rpmd_ja_native_fit_cuda_test.cu"
 #define GPUMD_RPMD_JA_QNEP_PREPARE_TEST_LIBRARY
 #include "rpmd_ja_qnep_prepare_cuda_test.cu"
+#include "integrate/integrate.cuh"
+#include "measure/hac.cuh"
+#include "measure/measure.cuh"
+#include "model/group.cuh"
 
 namespace
 {
@@ -15,6 +19,188 @@ struct IntegrationCleanup
   std::vector<std::string> paths;
   ~IntegrationCleanup(){for(const std::string& path:paths)clean(path);}
 };
+
+void test_measure_rpmd_ja_use_propagation_order_and_reset()
+{
+  Atom atom;Box box;Force force;Integrate integrate;std::vector<Group> groups;
+  auto add_hac=[&](Measure& measure){
+    if(!measure.parse_action({"compute_hac","1","1","1"},1,integrate,groups,atom,box,force,"nep.txt"))
+      throw std::runtime_error("compute_hac could not be registered in the configuration propagation fixture");
+    auto* hac=dynamic_cast<HAC*>(measure.get_actions().back().get());
+    if(hac==nullptr)throw std::runtime_error("compute_hac registration did not create a HAC action");
+    return hac;
+  };
+  Measure before;before.set_rpmd_ja(true,"diagnostic-reference.bin",true);HAC* before_hac=add_hac(before);
+  if(!before_hac->rpmd_ja_enabled_for_test()||!before_hac->rpmd_ja_diagnostic_for_test()||
+     before_hac->rpmd_ja_reference_path_for_test()!="diagnostic-reference.bin")
+    throw std::runtime_error("rpmd_ja setup before compute_hac creation was not copied to the new action");
+  before.set_rpmd_ja(false);
+  if(before_hac->rpmd_ja_enabled_for_test()||before_hac->rpmd_ja_diagnostic_for_test())
+    throw std::runtime_error("rpmd_ja off/reset did not clear an existing compute_hac action");
+
+  Measure after;HAC* after_hac=add_hac(after);after.set_rpmd_ja(true,"diagnostic-reference.bin",true);
+  if(!after_hac->rpmd_ja_enabled_for_test()||!after_hac->rpmd_ja_diagnostic_for_test()||
+     after_hac->rpmd_ja_reference_path_for_test()!="diagnostic-reference.bin")
+    throw std::runtime_error("rpmd_ja setup after compute_hac creation was not copied to the existing action");
+  after.set_rpmd_ja(false);
+  if(after_hac->rpmd_ja_enabled_for_test()||after_hac->rpmd_ja_diagnostic_for_test())
+    throw std::runtime_error("multi-run rpmd_ja reset left a diagnostic use flag on compute_hac");
+  HAC* next_run=add_hac(after);
+  if(next_run->rpmd_ja_enabled_for_test()||next_run->rpmd_ja_diagnostic_for_test())
+    throw std::runtime_error("compute_hac in the next run inherited stale diagnostic reference state");
+}
+
+void test_reference_use_compatibility_by_backend()
+{
+  const std::string formal_v3="native_reference_transport;finite_temperature_additive_v1;beads=4;derivative=3";
+  const std::string diagnostic_v3=formal_v3+";use=DIAGNOSTIC;response=FAIL;numerical=PASS";
+  if(!rpmd_ja_reference_policy_use_matches(0,"",false)||
+     !rpmd_ja_reference_policy_use_matches(1,"",false)||
+     rpmd_ja_reference_policy_use_matches(0,"",true)||
+     rpmd_ja_reference_policy_use_matches(1,"",true)||
+     !rpmd_ja_reference_policy_use_matches(2,"native_reference_transport",false)||
+     !rpmd_ja_reference_policy_use_matches(2,formal_v3,false)||
+     rpmd_ja_reference_policy_use_matches(2,formal_v3,true)||
+     !rpmd_ja_reference_policy_use_matches(2,diagnostic_v3,true)||
+     rpmd_ja_reference_policy_use_matches(2,diagnostic_v3,false)||
+     rpmd_ja_reference_policy_use_matches(2,"",false)||
+     rpmd_ja_reference_policy_use_matches(3,"",false))
+    throw std::runtime_error("reference use compatibility did not preserve legacy formal backends and restrict diagnostics to qNEP v3");
+}
+
+std::string write_graph_reference_samples(const std::string& path,const int frames)
+{
+  std::ofstream out(path,std::ios::binary);if(!out)throw std::runtime_error("cannot create graph-reference samples");
+  const char magic[8]={'G','P','J','A','S','M','P','1'};const std::uint32_t version=1,endian=native_endian;
+  const std::int32_t n=2,beads=4;const double temperature=300.0;
+  const double cell[9]={10,0,0,0,10,0,0,0,10},masses[2]={1.0,1.07};const std::int32_t types[2]={0,0};
+  out.write(magic,sizeof(magic));out.write(reinterpret_cast<const char*>(&version),sizeof(version));
+  out.write(reinterpret_cast<const char*>(&endian),sizeof(endian));out.write(reinterpret_cast<const char*>(&n),sizeof(n));
+  out.write(reinterpret_cast<const char*>(&beads),sizeof(beads));out.write(reinterpret_cast<const char*>(&temperature),sizeof(temperature));
+  out.write(reinterpret_cast<const char*>(cell),sizeof(cell));out.write(reinterpret_cast<const char*>(masses),sizeof(masses));
+  out.write(reinterpret_cast<const char*>(types),sizeof(types));
+  const double base[6]={2.0,4.0,2.0,4.0,2.0,4.0},amplitude[3]={0.02,0.06,0.12};
+  constexpr int training=80;
+  for(int frame=0;frame<frames;++frame){const double step=5.0+2.0*frame;
+    const double phase=2.0*3.14159265358979323846*(frame%training)/training;
+    double position[6],force[6];for(int axis=0;axis<3;++axis){const double displacement=amplitude[axis]*std::sin(phase);
+      position[2*axis]=base[2*axis]+displacement;position[2*axis+1]=base[2*axis+1]-displacement;
+      force[2*axis]=-0.2*displacement;force[2*axis+1]=0.2*displacement;}
+    out.write(reinterpret_cast<const char*>(&step),sizeof(step));
+    out.write(reinterpret_cast<const char*>(position),sizeof(position));out.write(reinterpret_cast<const char*>(force),sizeof(force));}
+  out.close();if(!out)throw std::runtime_error("failed writing graph-reference samples");return path;
+}
+
+void patch_graph_reference_raw_geometry(const std::string& raw)
+{
+  const char layout[]="xyz_soa;derivative_input_rows_output_columns";
+  const std::streamoff header=8+4+4+4+4+8+8+8+8+4+4+8+sizeof(layout);
+  const double cell[18]={10,0,0,0,10,0,0,0,10, 0.1,0,0,0,0.1,0,0,0,0.1};
+  std::fstream file(raw,std::ios::binary|std::ios::in|std::ios::out);if(!file)throw std::runtime_error("cannot patch graph-reference qraw geometry");
+  file.seekp(header);file.write(reinterpret_cast<const char*>(cell),sizeof(cell));
+  file.close();if(!file)throw std::runtime_error("failed patching graph-reference qraw cell");
+  const std::vector<double> masses={1.0,1.07},positions={2.0,4.0,2.0,4.0,2.0,4.0};
+  const std::vector<int> types={0,0};patch_m1_atom_identity(raw,types,masses,positions);
+}
+
+void test_graph_reference_samples_to_diagnostic_prepare_and_hard_failure()
+{
+  const std::string stem="rpmd_ja_graph_reference_e2e_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::string samples=write_graph_reference_samples(stem+".samples",120),raw=stem+".qraw",kernel=stem+".kernel";
+  const std::string output=stem+".ja",reuse_output=stem+".reuse.ja",bad_state_output=stem+".badstate.ja",
+    state=stem+".covariance_state.txt",bad_state=stem+".bad.covariance_state.txt",hard_output=stem+".hard.ja";
+  IntegrationCleanup cleanup{{samples,raw,kernel,output,output+".fit.txt",output+".fit_trace.txt",output+".fit.lock",
+    output+".additive.tmp",reuse_output,reuse_output+".fit.txt",reuse_output+".fit_trace.txt",reuse_output+".fit.lock",
+    reuse_output+".additive.tmp",bad_state_output,bad_state_output+".fit_trace.txt",bad_state_output+".fit.lock",
+    bad_state,state,hard_output,hard_output+".failure.txt",hard_output+".fit_trace.txt",hard_output+".fit.lock",
+    hard_output+".additive.tmp"}};
+  const std::vector<double> masses={1.0,1.07};const std::vector<int> types={0,0};
+  make_input(raw,kernel,2,0.5,3,-1.0,0.0,-1,false,&masses,&types);patch_graph_reference_raw_geometry(raw);
+  Atom atom;atom.number_of_atoms=2;atom.cpu_mass=masses;atom.cpu_type=types;atom.number_of_beads=0;atom.position_per_atom.resize(6);
+  const std::vector<double> initial={2.0,4.0,2.0,4.0,2.0,4.0};atom.position_per_atom.copy_from_host(initial.data());
+  Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;
+  box.pbc_x=box.pbc_y=box.pbc_z=1;Force force;
+  RpmdJANativeFitOptions options;options.method=RpmdJANativeFitMethod::GaussianCovarianceShrinkage;
+  options.graph_reference=true;options.output_path=output;options.kernel_table=kernel;options.raw_input_path=raw;
+  options.cutoff=4.0;options.epsilon=1.0e-3;options.response_tolerance=1.0e-6;options.fd_step=0.01;
+  covariance_fit_test_allow_qraw_fixture_identity=true;covariance_fit_test_hooks={};
+  covariance_fit_test_hooks.skip_graph_reference_mode_validator=true;
+  fit_rpmd_ja_native_reference_from_samples(options,samples,atom,box,force);
+  covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=false;
+  const RpmdJAReference prepared=read_rpmd_ja_reference(output);
+  if(!rpmd_ja_reference_policy_is_diagnostic(prepared.mechanical_policy)||
+     rpmd_ja_reference_policy_numerical_status(prepared.mechanical_policy)!="PASS")
+    throw std::runtime_error("graph-reference end-to-end fixture did not preserve its diagnostic numerical identity");
+  const std::string response=rpmd_ja_reference_policy_response_status(prepared.mechanical_policy);
+  if(response!="FAIL"&&response!="INCONCLUSIVE")
+    throw std::runtime_error("anisotropic graph-reference fixture did not produce a held-out response failure or inconclusive result");
+  if(rpmd_ja_reference_policy_use_matches(prepared.backend,prepared.mechanical_policy,false)||
+     !rpmd_ja_reference_policy_use_matches(prepared.backend,prepared.mechanical_policy,true))
+    throw std::runtime_error("ordinary rpmd_ja on use accepted a diagnostic prepared reference");
+  const std::string trace=read_test_file(output+".fit_trace.txt"),fit=read_test_file(output+".fit.txt");
+  if(trace.find("optimizer_60_parameter_run=0")==std::string::npos||
+     trace.find("numerical_status NOT_EVALUATED")==std::string::npos||
+     trace.find("GRAPH_REFERENCE_NUMERICAL_STATUS PASS certificate=FULL_CERTIFICATE_PASS readback_identity=PASS")==std::string::npos||
+     trace.find("GRAPH_REFERENCE_PREPARE_READBACK_PASS") == std::string::npos||
+     trace.find("COVARIANCE_OPTIMIZER_CONVERGED")!=std::string::npos||
+     fit.find("mechanical_policy "+prepared.mechanical_policy)==std::string::npos)
+    throw std::runtime_error("graph-reference trace or fit report is inconsistent with the prepared diagnostic readback");
+
+  double baseline_mu=0.0;std::vector<double> baseline_theta;
+  {
+    std::istringstream fit_lines(fit);std::string line;
+    while(std::getline(fit_lines,line)){
+      if(line.rfind("baseline_mu ",0)==0){std::istringstream value(line.substr(12));if(!(value>>baseline_mu))throw std::runtime_error("graph-reference fit report has no scalar baseline_mu");}
+      if(line.rfind("baseline_theta ",0)==0){std::istringstream values(line.substr(15));std::size_t count=0;if(!(values>>count))throw std::runtime_error("graph-reference fit report has malformed baseline_theta");
+        baseline_theta.resize(count);for(double& value:baseline_theta)if(!(values>>value)||!std::isfinite(value))throw std::runtime_error("graph-reference fit report has truncated baseline_theta");}
+    }
+  }
+  std::ifstream sample_input(samples,std::ios::binary);const SampleHeader saved_header=read_header(sample_input,120,atom,box,300.0,true,true);
+  std::vector<double> saved_r0(6,0.0);read_training_r0(sample_input,saved_header,120,2.0,saved_r0);
+  RpmdJANativeFitOptions state_options=options;state_options.output_path=output;state_options.temperature=300.0;state_options.sample_interval=2;
+  covariance_fit_test_allow_qraw_fixture_identity=true;
+  rpmd_ja_file_io::ifstream raw_input(raw,std::ios::binary);QrawIdentity saved_identity=validate_qraw_identity(raw_input,state_options,saved_header,saved_r0,box,force);
+  saved_identity.source_fnv64=rpmd_ja_model_fingerprint(raw);
+  covariance_fit_test_allow_qraw_fixture_identity=false;
+  Graph saved_graph=make_graph(saved_r0,saved_header.types,box,state_options.cutoff);
+  CovarianceFitResult old_fit;old_fit.status="MAX_ITERATIONS";old_fit.reason="budget exhausted; baseline candidate only";
+  old_fit.statistics.resize(static_cast<std::size_t>(saved_graph.parameter_count));old_fit.baseline_mu=baseline_mu;
+  old_fit.epsilon_constraint_status="ACTIVE";old_fit.theta_baseline=baseline_theta;old_fit.theta=baseline_theta;
+  write_covariance_state(state,old_fit,0.0,samples,raw,state_options,saved_header,saved_identity,saved_graph,120,80);
+  std::string corrupted_state=read_test_file(state);const std::string config_field="qraw_config_fingerprint ";
+  const std::size_t config_at=corrupted_state.find(config_field);
+  if(config_at==std::string::npos)throw std::runtime_error("saved baseline fixture has no qraw config identity");
+  const std::size_t config_end=corrupted_state.find('\n',config_at);
+  corrupted_state.replace(config_at,config_end-config_at,config_field+"1");
+  {std::ofstream bad_output(bad_state,std::ios::binary|std::ios::trunc);bad_output<<corrupted_state;
+    if(!bad_output)throw std::runtime_error("cannot write mismatched baseline-state fixture");}
+  options.output_path=bad_state_output;options.baseline_state_path=bad_state;covariance_fit_test_allow_qraw_fixture_identity=true;
+  bool wrong_state_rejected=false;
+  try{fit_rpmd_ja_native_reference_from_samples(options,samples,atom,box,force);}
+  catch(const std::runtime_error& error){wrong_state_rejected=std::string(error.what()).find("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL")!=std::string::npos;}
+  covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=false;
+  if(!wrong_state_rejected||exists(bad_state_output)||exists(bad_state_output+".stability")||exists(bad_state_output+".additive.tmp"))
+    throw std::runtime_error("mismatched saved graph-baseline identity was accepted or published");
+  options.output_path=reuse_output;options.baseline_state_path=state;covariance_fit_test_allow_qraw_fixture_identity=true;
+  covariance_fit_test_hooks.skip_graph_reference_mode_validator=true;
+  fit_rpmd_ja_native_reference_from_samples(options,samples,atom,box,force);
+  covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=false;
+  const std::string reuse_trace=read_test_file(reuse_output+".fit_trace.txt");
+  if(reuse_trace.find("stationarity_status SAVED_BASELINE_FREE_ROOT_VERIFIED")==std::string::npos||
+     reuse_trace.find("optimizer_60_parameter_run=0")==std::string::npos)
+    throw std::runtime_error("graph-reference baseline_state candidate was not reused after its fresh numerical check");
+
+  options.output_path=hard_output;covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=true;
+  covariance_fit_test_hooks.skip_graph_reference_mode_validator=true;
+  options.baseline_state_path.clear();
+  covariance_fit_test_hooks.fail_graph_reference_response_hard=true;
+  bool hard_error=false;try{fit_rpmd_ja_native_reference_from_samples(options,samples,atom,box,force);}
+  catch(const std::runtime_error& error){hard_error=std::string(error.what()).find("TEST_GRAPH_REFERENCE_RESPONSE_HARD_FAILURE")!=std::string::npos;}
+  covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=false;
+  if(!hard_error||exists(hard_output)||exists(hard_output+".stability")||exists(hard_output+".additive.tmp"))
+    throw std::runtime_error("hard response failure was swallowed or published a graph-reference package");
+}
 
 void test_frozen_fit_input_fingerprints_reject_mutation()
 {
@@ -495,6 +681,9 @@ int main(int argc,char** argv)
     test_frozen_fit_input_fingerprints_reject_mutation();
     test_manifest_sha256_rejects_qraw_and_kernel_replacement_at_native_start();
     test_native_additive_entry_verifier_rejects_small_scale_K_H();
+    test_measure_rpmd_ja_use_propagation_order_and_reset();
+    test_reference_use_compatibility_by_backend();
+    test_graph_reference_samples_to_diagnostic_prepare_and_hard_failure();
     run_actual_m1_writer_prepare_readback(base);run_additive(base,1);run_additive(base+"_internal_com",2);
     std::printf("ACTUAL_M1_V2_PREPARE_READBACK_PASS\n");return 0;
   }catch(const std::exception& error){

@@ -85,6 +85,7 @@ private:
   bool hac_current_qnep_full_a_ = false;
   bool rpmd_ja_option_seen_ = false;
   bool rpmd_ja_enabled_ = false;
+  bool rpmd_ja_diagnostic_ = false;
   std::string rpmd_ja_reference_path_;
   Atom atom;
   GPU_Vector<double> thermo; // some thermodynamic quantities

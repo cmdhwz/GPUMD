@@ -722,6 +722,7 @@ void Run::parse_one_keyword(
     measure.set_hac_current(false);
     rpmd_ja_option_seen_ = false;
     rpmd_ja_enabled_ = false;
+    rpmd_ja_diagnostic_ = false;
     rpmd_ja_reference_path_.clear();
     measure.set_rpmd_ja(false);
   } else if (!measure.parse_action(
@@ -734,7 +735,7 @@ void Run::parse_one_keyword(
 void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
 {
   if (tokens.size() < 2) {
-    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile>, sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, diagnose_covariance <state> <report> <cutoff> <epsilon> <tau> <fd_step>, fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier] [ridge <lambda>] [analytic_curvature <16|32|64|128>] [feasibility] [structured_basis] [blind_samples <samples_file>] [blind_manifest <manifest_file>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
+    PRINT_INPUT_ERROR("rpmd_ja expects off, on <referencefile> [diagnostic], sample <basename> <sample_interval>, check_samples <samples_file> <report_file>, replay_cg <cg_witness.txt> <report.txt>, diagnose_covariance <state> <report> <cutoff> <epsilon> <tau> <fd_step>, graph_reference <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> [baseline_state <covariance_state>], fit_samples <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> [<qraw>] [max_rounds <N>], fit_samples_covariance <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> shrinkage <rho> max_iter <N> [block_newton|joint_block|trust_region] [staged_barrier] [ridge <lambda>] [analytic_curvature <16|32|64|128>] [feasibility] [structured_basis] [blind_samples <samples_file>] [blind_manifest <manifest_file>], diagnose <fd_step> [full], diagnose_samples <samples_file> <fd_step> [full], generate <file> <T> <fd_step>, generate_sparse <file> <T> <fd_step> <kernel_table>, generate_raw <rawfile> <T> <fd_step> <kernel_table>, or prepare <rawfile> <outfile> <kernel_table> [<additive-pack>].");
   }
   if (tokens[1] == "fit") {
     if (!measure.parse_action(
@@ -872,6 +873,45 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
     }
 #ifdef USE_HIP
     PRINT_INPUT_ERROR("rpmd_ja fit_samples native reference preparation is currently unavailable in HIP builds.");
+#endif
+    fit_rpmd_ja_native_reference_from_samples(options, tokens[2], atom, box, force);
+    return;
+  }
+  if (tokens[1] == "graph_reference") {
+    if ((tokens.size() != 10 && tokens.size() != 12) || (tokens.size() == 12 && tokens[10] != "baseline_state"))
+      PRINT_INPUT_ERROR("rpmd_ja graph_reference requires <samples_file> <outfile> <cutoff> <epsilon> <response_tolerance> <fd_step> <kernel_table> <qraw> [baseline_state <covariance_state>].");
+    if (integrate.has_ensemble() || global_time != 0.0)
+      PRINT_INPUT_ERROR("rpmd_ja graph_reference must appear before any run.");
+    if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+      PRINT_INPUT_ERROR("rpmd_ja graph_reference requires exactly one qNEP potential.");
+    auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
+    if (active_qnep == nullptr || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
+        !active_qnep->uses_pppm())
+      PRINT_INPUT_ERROR("rpmd_ja graph_reference supports qNEP charge mode 1 or 2 with PPPM only.");
+    if (box.pbc_x != 1 || box.pbc_y != 1 || box.pbc_z != 1)
+      PRINT_INPUT_ERROR("rpmd_ja graph_reference requires fully periodic boundaries.");
+    RpmdJANativeFitOptions options;
+    options.method = RpmdJANativeFitMethod::GaussianCovarianceShrinkage;
+    options.graph_reference = true;
+    options.output_path = tokens[3];
+    options.raw_input_path = tokens[9];
+    if(tokens.size()==12)options.baseline_state_path=tokens[11];
+    options.kernel_table = tokens[8];
+    options.internal_mass_com = integrate.get_pimd_fix_com();
+    if (tokens[2].empty() || options.output_path.empty() || options.kernel_table.empty() || options.raw_input_path.empty() ||
+        tokens[2] == options.output_path || options.raw_input_path == options.output_path || options.raw_input_path == tokens[2] ||
+        (!options.baseline_state_path.empty()&&(options.baseline_state_path==tokens[2]||options.baseline_state_path==options.output_path||
+          options.baseline_state_path==options.raw_input_path)))
+      PRINT_INPUT_ERROR("rpmd_ja graph_reference paths must be nonempty and the output must differ from its inputs.");
+    double* values[] = {&options.cutoff, &options.epsilon, &options.response_tolerance, &options.fd_step};
+    for (int i = 0; i < 4; ++i) {
+      char* end = nullptr;
+      *values[i] = std::strtod(tokens[4 + i].c_str(), &end);
+      if (end == tokens[4 + i].c_str() || *end != '\0' || !std::isfinite(*values[i]) || *values[i] <= 0.0)
+        PRINT_INPUT_ERROR("rpmd_ja graph_reference numeric arguments must be positive finite numbers.");
+    }
+#ifdef USE_HIP
+    PRINT_INPUT_ERROR("rpmd_ja graph_reference native reference preparation is currently unavailable in HIP builds.");
 #endif
     fit_rpmd_ja_native_reference_from_samples(options, tokens[2], atom, box, force);
     return;
@@ -1106,14 +1146,18 @@ void Run::parse_rpmd_ja(const std::vector<std::string>& tokens)
   rpmd_ja_option_seen_ = true;
   if (tokens[1] == "off" && tokens.size() == 2) {
     rpmd_ja_enabled_ = false;
+    rpmd_ja_diagnostic_ = false;
     rpmd_ja_reference_path_.clear();
-  } else if (tokens[1] == "on" && tokens.size() == 3) {
+  } else if (tokens[1] == "on" && (tokens.size() == 3 || tokens.size() == 4)) {
+    if (tokens.size() == 4 && tokens[3] != "diagnostic")
+      PRINT_INPUT_ERROR("rpmd_ja on optional use must be diagnostic.");
     rpmd_ja_enabled_ = true;
     rpmd_ja_reference_path_ = tokens[2];
+    rpmd_ja_diagnostic_ = tokens.size() == 4;
   } else {
-    PRINT_INPUT_ERROR("rpmd_ja expects off or on <referencefile>.");
+    PRINT_INPUT_ERROR("rpmd_ja expects off or on <referencefile> [diagnostic].");
   }
-  measure.set_rpmd_ja(rpmd_ja_enabled_, rpmd_ja_reference_path_);
+  measure.set_rpmd_ja(rpmd_ja_enabled_, rpmd_ja_reference_path_, rpmd_ja_diagnostic_);
 }
 void Run::parse_velocity(const std::vector<std::string>& tokens)
 {

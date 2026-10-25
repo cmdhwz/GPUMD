@@ -24,6 +24,9 @@ struct RpmdJAAdditiveData
 {
   int beads = 0;
   bool internal_mass_com = false;
+  bool diagnostic = false;
+  std::string numerical_status = "PASS";
+  std::string response_status = "PASS";
   double epsilon = 0.0;
   RpmdJASparseRows k;
   RpmdJASparseRows h[3]; // Stored as H^T for the existing prepare tile orientation.
@@ -98,12 +101,27 @@ inline RpmdJAAdditiveData read_rpmd_ja_additive(
   const double budget = rpmd_ja_additive_read<double>(in);
   const auto training = rpmd_ja_additive_read<std::uint64_t>(in);
   const auto validation = rpmd_ja_additive_read<std::uint64_t>(in);
-  if (std::string(magic, sizeof(magic)) != "GPJAADD1" || (version < 1 || version > 6) || endian != 0x01020304 ||
+  if (std::string(magic, sizeof(magic)) != "GPJAADD1" || (version < 1 || version > 7) || endian != 0x01020304 ||
       n < 2 || n != ref.number_of_atoms || p < 1 || (beads > 0 && p != beads) || !(temperature > 0.0) ||
       !std::isfinite(temperature) || temperature != ref.temperature ||
-      !(epsilon > 0.0) || !std::isfinite(epsilon) || !(response >= 0.0) || !(budget >= response) ||
-      !std::isfinite(response) || !std::isfinite(budget) || !training || !validation)
+      !(epsilon > 0.0) || !std::isfinite(epsilon) || !std::isfinite(budget) || !(budget >= 0.0) || !training || !validation)
     throw std::runtime_error("GPJAADD1 dimensions, temperature, bead count, source, or metadata do not match");
+  int use_class = 0, numerical_status = 1, response_status = 0;
+  if (version >= 7) {
+    use_class = rpmd_ja_additive_read<std::uint32_t>(in);
+    numerical_status = rpmd_ja_additive_read<std::uint32_t>(in);
+    response_status = rpmd_ja_additive_read<std::uint32_t>(in);
+  }
+  if (version < 7 && (!std::isfinite(response) || response < 0.0 || budget < response))
+    throw std::runtime_error("GPJAADD1 legacy response metadata is invalid");
+  if (version >= 7 && (use_class < 2 || use_class > 3 || numerical_status != 1 || response_status < 0 || response_status > 3 ||
+      std::isinf(response) ||
+      (response_status == 0 && (!std::isfinite(response) || response < 0.0 || response > budget)) ||
+      (response_status == 1 && (!std::isfinite(response) || response < 0.0)) ||
+      ((response_status == 2 || response_status == 3) && std::isfinite(response) && response < 0.0) ||
+      (response_status == 3 && std::isfinite(response)) ||
+      ((use_class & 2) == 0 && response_status != 0)))
+    throw std::runtime_error("GPJAADD1 numerical, response, or use identity is invalid");
   if (n > std::numeric_limits<int>::max() / 3) throw std::runtime_error("GPJAADD1 dimensions overflow");
   const int d = 3 * n;
   if (raw_gradient.size() != static_cast<std::size_t>(d))
@@ -112,7 +130,14 @@ inline RpmdJAAdditiveData read_rpmd_ja_additive(
     throw std::runtime_error("GPJAADD1 source qNEP raw fingerprint does not match");
   if (static_cast<std::uint64_t>(n) > static_cast<std::uint64_t>(package_bytes - 80) / sizeof(std::int32_t))
     throw std::runtime_error("GPJAADD1 declared site count exceeds package length");
-  RpmdJAAdditiveData out; out.beads = p; out.epsilon = epsilon; out.internal_mass_com = version == 2 || version == 4 || version == 6;
+  RpmdJAAdditiveData out; out.beads = p; out.epsilon = epsilon;
+  out.internal_mass_com = version >= 7 ? (use_class & 1) != 0 : version == 2 || version == 4 || version == 6;
+  if (version >= 7) {
+    out.diagnostic = (use_class & 2) != 0;
+    out.numerical_status = "PASS";
+    out.response_status = response_status == 0 ? "PASS" : response_status == 1 ? "FAIL" :
+      response_status == 2 ? "INCONCLUSIVE" : "NOT_MEASURED";
+  }
   out.linear_gradient.assign(static_cast<std::size_t>(d), 0.0);
   std::vector<RpmdJAAdditiveEntry> k_entries;
   std::vector<RpmdJAAdditiveEntry> h_entries[3];

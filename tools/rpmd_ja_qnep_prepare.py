@@ -39,12 +39,19 @@ def read_additive(path, expected_n=None):
     with path.open("rb") as f:
         header = _exact(f, 32)
         magic, version, endian, n, beads, _source = struct.unpack("<8sIIiiQ", header)
-        if magic != b"GPJAADD1" or version not in (1, 2, 3, 4, 5, 6) or endian != ENDIAN or n < 2 or beads < 1 or \
+        if magic != b"GPJAADD1" or version not in (1, 2, 3, 4, 5, 6, 7) or endian != ENDIAN or n < 2 or beads < 1 or \
            (expected_n is not None and n != expected_n):
             raise ValueError("GPJAADD1 magic, version, dimensions, or atom count do not match")
         if n > (size-80)//4:
             raise ValueError("GPJAADD1 declared site count exceeds package length")
-        _exact(f, 48)
+        temperature, epsilon, response, response_budget = struct.unpack("<dddd", _exact(f, 32))
+        _exact(f, 16)
+        if version >= 7:
+            use_flags,numerical_status,response_status=struct.unpack("<III",_exact(f,12))
+            if use_flags not in (2,3) or numerical_status != 1 or response_status not in (0,1,2,3):
+                raise ValueError("invalid GPJAADD1 numerical, response, or use identity")
+            if math.isinf(response):
+                raise ValueError("infinite GPJAADD1 response is invalid")
         expanded_elements = 0
         for _ in range(n):
             (z,) = struct.unpack("<i", _exact(f, 4))
@@ -147,7 +154,7 @@ def _read_raw(path, additive=False):
         if _exact(f, 8) != RAW_MAGIC:
             raise ValueError("input is not a qNEP raw reference")
         ver, endian, n, d = struct.unpack("<IIii", _exact(f, 16))
-        if ver not in (1, 2, 3) or endian != ENDIAN or n < 2 or d != 3 * n:
+        if ver not in (1, 2, 3, 4) or endian != ENDIAN or n < 2 or d != 3 * n:
             raise ValueError("unsupported qNEP raw version or dimensions")
         if additive and d * d > MAX_ADDITIVE_DENSE_ELEMENTS:
             raise MemoryError(f"additive dense assembly refuses d*d={d*d} above {MAX_ADDITIVE_DENSE_ELEMENTS}")
@@ -157,7 +164,7 @@ def _read_raw(path, additive=False):
             raise ValueError("unsupported qNEP raw layout")
         vb, cb, kb = d * n * 8, 3 * d * d * 8, d * d * 8
         start = f.tell() + 18 * 8 + 12 + n * 4 + n * 8 + d * 8 + 8 + n * 8 + d * 8 + 9 * n * 8
-        expected_size = start + 2 * vb + 2 * cb + kb + 18 * 8
+        expected_size = start + (vb + cb + kb + 24 * 8 if ver == 4 else 2 * vb + 2 * cb + kb + 18 * 8)
         if path.stat().st_size != expected_size:
             raise ValueError("qNEP raw file has an invalid length")
         cell = np.frombuffer(_exact(f, 18 * 8), "<f8").copy()
@@ -170,9 +177,20 @@ def _read_raw(path, additive=False):
         force = np.frombuffer(_exact(f, d * 8), "<f8").copy()
         virial = np.frombuffer(_exact(f, 9 * n * 8), "<f8").copy()
         start = f.tell()
-    coarse_v = start + vb + cb + kb
-    coarse_c = coarse_v + vb
-    footer = coarse_c + cb
+    if ver == 4:
+        coarse_v = coarse_c = None
+        footer = start + vb + cb + kb
+        compact_stats = np.fromfile(path, dtype="<f8", count=24, offset=footer)
+        if len(compact_stats) != 24 or not np.isfinite(compact_stats).all() or np.any(compact_stats < 0):
+            raise ValueError("qNEP v4 raw footer is missing finite compact diagnostics")
+        transport_diff2, transport_norm2 = compact_stats[18:21].copy(), compact_stats[21:24].copy()
+        if np.any(np.sqrt(transport_diff2 / np.maximum(transport_norm2, 1e-300)) > 0.05):
+            raise ValueError("qNEP v4 compact native-H transport checks exceed 5e-2")
+    else:
+        coarse_v = start + vb + cb + kb
+        coarse_c = coarse_v + vb
+        footer = coarse_c + cb
+        transport_diff2 = transport_norm2 = None
     if charge not in (1, 2) or pppm != 1 or not np.isfinite([temp, step, spacing]).all() or \
        temp <= 0 or step <= 0 or spacing <= 0 or config_fp == 0:
         raise ValueError("this tool supports qNEP charge 1/2 with PPPM only")
@@ -181,7 +199,9 @@ def _read_raw(path, additive=False):
        not np.isfinite(energy0) or abs(float(site_energy.sum())-energy0) > 1e-9*max(1.0,abs(energy0)) or \
        np.any(masses <= 0) or np.any(pbc != 1):
         raise ValueError("non-finite or invalid raw geometry, mass, force, or virial")
-    return dict(path=path, raw_version=ver, n=n, d=d, temperature=temp, step=step, model_fp=model_fp,
+    return dict(path=path, raw_version=ver, derivative_version=3 if ver == 4 else ver,
+                transport_diff2=transport_diff2, transport_norm2=transport_norm2,
+                n=n, d=d, temperature=temp, step=step, model_fp=model_fp,
                 config_fp=config_fp, charge=charge, spacing=spacing, cell=cell, pbc=pbc,
                 types=types, masses=masses, positions=positions, energy0=energy0,
                 site_energy=site_energy, force=force, virial=virial, start=start,
@@ -224,11 +244,11 @@ def build_native_transport(v, c, coarse_v, coarse_c, masses, n, alpha, fine_out,
         for cidx in range(c0, c1):
             a, nu = cidx % n, cidx // n
             if nu == alpha:
-                hf[cidx - c0] -= v[:, a]
-                hc[cidx - c0] -= coarse_v[:, a]
                 selected = (np.arange(d) % n) == a
                 hf[cidx - c0, selected] -= fe[selected]
                 hc[cidx - c0, selected] -= fec[selected]
+                hf[cidx - c0] -= v[:, a]
+                hc[cidx - c0] -= coarse_v[:, a]
         fine_out[:, c0:c1] = hf.T
         coarse_out[:, c0:c1] = hc.T
     mass_coord = np.tile(masses, 3)
@@ -248,7 +268,40 @@ def build_native_transport(v, c, coarse_v, coarse_c, masses, n, alpha, fine_out,
     return math.sqrt(diff2 / (d * d)), math.sqrt(diff2 / max(norm2, 1e-300))
 
 
+def build_native_transport_fine(v, c, masses, n, alpha, fine_out):
+    """Build only H from compact v4 qraw; its h/h2 check is stored as validated stats."""
+    d = 3 * n
+    fe = np.empty(d, dtype=np.float64)
+    for r0 in range(0, d, TILE):
+        r1 = min(r0 + TILE, d)
+        # Match native std::accumulate's left-to-right site order, bounded by one row tile.
+        fe[r0:r1] = -np.add.accumulate(np.asarray(v[r0:r1]), axis=1)[:, -1]
+    for c0 in range(0, d, TILE):
+        c1 = min(c0 + TILE, d)
+        hf = np.asarray(c[c0:c1]).copy()
+        for cidx in range(c0, c1):
+            a, nu = cidx % n, cidx // n
+            if nu == alpha:
+                selected = (np.arange(d) % n) == a
+                hf[cidx - c0, selected] -= fe[selected]
+                hf[cidx - c0] -= v[:, a]
+        fine_out[:, c0:c1] = hf.T
+    mass_coord = np.tile(masses, 3)
+    norm2 = 0.0
+    for r0 in range(0, d, TILE):
+        r1 = min(r0 + TILE, d)
+        fine_out[r0:r1] /= np.sqrt(mass_coord[r0:r1, None] * mass_coord[None, :])
+        norm2 += float(np.einsum("ij,ij->", fine_out[r0:r1], fine_out[r0:r1], optimize=False))
+    if hasattr(fine_out, "flush"):
+        fine_out.flush()
+    return norm2
+
+
 def _tile_factor(a, tol, lossless, symmetric_diagonal=False):
+    if not np.any(a):
+        if a.shape[0] + a.shape[1] < a.size:
+            return 1, np.zeros(a.shape[0]), np.zeros(a.shape[1]), 0.0
+        return 0, np.asarray(a).ravel().copy(), np.empty(0), 0.0
     if lossless: return 0, np.asarray(a).ravel().copy(), np.empty(0), 0.0
     if symmetric_diagonal:
         w, q = np.linalg.eigh(0.5 * (a + a.T))
@@ -424,10 +477,15 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, a
     if step != m["step"] or np.any(stats < 0):
         raise ValueError("raw diagnostic footer step or nonnegative fields do not match the raw header")
     raw_version = m["raw_version"]
-    if stats[17] != raw_version or raw_version not in (1, 2, 3) or stats[1] > 1e-4 or \
-       (raw_version == 1 and max(stats[i] for i in (2, 4, 6, 7, 8, 14, 15)) > 0.05) or \
-       (raw_version >= 2 and (stats[3] > 1e-4 or max(stats[i] for i in (4, 6, 7, 8, 14, 15)) > 0.05)):
+    derivative_version = m["derivative_version"]
+    if stats[17] != derivative_version or derivative_version not in (1, 2, 3) or stats[1] > 1e-4 or \
+       (derivative_version == 1 and max(stats[i] for i in (2, 4, 6, 7, 8, 14, 15)) > 0.05) or \
+       (derivative_version >= 2 and (stats[3] > 1e-4 or max(stats[i] for i in (4, 6, 7, 8, 14, 15)) > 0.05)):
         raise ValueError("qNEP energy/force finite-difference checks failed")
+    if raw_version == 4:
+        transport_rel = np.sqrt(m["transport_diff2"] / np.maximum(m["transport_norm2"], 1e-300))
+        if not np.isfinite(transport_rel).all() or np.any(transport_rel > 0.05):
+            raise ValueError("qNEP v4 compact native-H transport checks exceed 5e-2")
     kernel = _kernel(kernel_path)
     additive = None
     assembled = None
@@ -500,32 +558,48 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, a
         available = _available_memory(); eig0 = _eigenvalues(dmat, translation, available)
 
         v = _read_matrix(raw_path, m["start"], (d, n))
-        vc = _read_matrix(raw_path, m["coarse_v"], (d, n))
+        vc = None if raw_version == 4 else _read_matrix(raw_path, m["coarse_v"], (d, n))
         b_fine, b_coarse, transport_abs, transport_rel = [], [], [], []
         for alpha in range(3):
             c = _read_matrix(raw_path, m["start"]+m["vb"]+alpha*d*d*8, (d,d))
-            cc = _read_matrix(raw_path, m["coarse_c"]+alpha*d*d*8, (d,d))
+            cc = None if raw_version == 4 else _read_matrix(raw_path, m["coarse_c"]+alpha*d*d*8, (d,d))
             for r0 in range(0,d,TILE):
                 r1=min(r0+TILE,d)
-                if not np.isfinite(v[r0:r1]).all() or not np.isfinite(vc[r0:r1]).all() or \
-                   not np.isfinite(c[r0:r1]).all() or not np.isfinite(cc[r0:r1]).all():
+                if not np.isfinite(v[r0:r1]).all() or (vc is not None and not np.isfinite(vc[r0:r1]).all()) or \
+                   not np.isfinite(c[r0:r1]).all() or (cc is not None and not np.isfinite(cc[r0:r1]).all()):
                     raise ValueError("raw site derivative matrices contain non-finite values")
             bf = np.memmap(work/f"Bt{alpha}.f64", dtype="<f8", mode="w+", shape=(d,d))
             work_maps.append(bf)
-            bc = np.memmap(work/f"Btc{alpha}.f64", dtype="<f8", mode="w+", shape=(d,d))
-            work_maps.append(bc)
-            ae,re = build_native_transport(v,c,vc,cc,m["masses"],n,alpha,bf,bc)
+            if raw_version == 4:
+                rebuilt_norm2 = build_native_transport_fine(v,c,m["masses"],n,alpha,bf)
+                bc = None
+                diff2, norm2 = float(m["transport_diff2"][alpha]), float(m["transport_norm2"][alpha])
+                if not math.isfinite(rebuilt_norm2) or not math.isfinite(norm2) or rebuilt_norm2 < 0.0 or norm2 < 0.0:
+                    raise ValueError(f"qNEP v4 native-H norm is non-finite on axis {alpha}")
+                norm_scale=max(abs(rebuilt_norm2),abs(norm2))
+                norm_tolerance=16*np.finfo(float).eps*d*d*norm_scale+d*d*np.nextafter(0.0,1.0)
+                if abs(rebuilt_norm2-norm2)>norm_tolerance:
+                    raise ValueError(f"qNEP v4 stored native-H norm does not match reconstructed H on axis {alpha}")
+                ae, re = math.sqrt(diff2/(d*d)), math.sqrt(diff2/max(norm2,1e-300))
+            else:
+                bc = np.memmap(work/f"Btc{alpha}.f64", dtype="<f8", mode="w+", shape=(d,d))
+                work_maps.append(bc)
+                ae,re = build_native_transport(v,c,vc,cc,m["masses"],n,alpha,bf,bc)
             if not math.isfinite(re) or re > 0.05:
                 raise ValueError(f"baseline native H h/h2 error exceeds tolerance on axis {alpha}: {re}")
             if assembled is not None:
                 htranspose = assembled["Hadd"][alpha].T
                 mass_scale = np.sqrt(np.tile(m["masses"], 3)[:, None] * np.tile(m["masses"], 3)[None, :])
                 bf[:] += htranspose / mass_scale
-                bc[:] += htranspose / mass_scale
-                if not np.isfinite(bf).all() or not np.isfinite(bc).all():
+                if bc is not None:
+                    bc[:] += htranspose / mass_scale
+                if not np.isfinite(bf).all() or (bc is not None and not np.isfinite(bc).all()):
                     raise ValueError("additive mass-weighted H contains non-finite values")
-                bf.flush(); bc.flush()
-            b_fine.append(bf); b_coarse.append(bc); transport_abs.append(ae); transport_rel.append(re)
+                bf.flush()
+                if bc is not None: bc.flush()
+            b_fine.append(bf)
+            if bc is not None: b_coarse.append(bc)
+            transport_abs.append(ae); transport_rel.append(re)
         if not np.isfinite(transport_rel).all() or max(transport_rel) > 0.05:
             raise ValueError(f"native H h/h2 error exceeds tolerance: {transport_rel}")
 
@@ -579,8 +653,10 @@ def _prepare_impl(raw_path, kernel_path, output, lossless, tile_tol, soft_tol, a
             if required>kernel["u"]*(1+32*np.finfo(float).eps):
                 raise ValueError(f"kernel U={kernel['u']:.8g} does not cover lossless block bound {required:.8g}")
 
-        policy = (f"native_reference_transport;{'internal_mass_com_pullback_v1;' if additive.get('internal_mass_com', False) else ''}finite_temperature_additive_v1;beads={additive['beads']};derivative={raw_version}"
+        policy = (f"native_reference_transport;{'internal_mass_com_pullback_v1;' if additive.get('internal_mass_com', False) else ''}finite_temperature_additive_v1;beads={additive['beads']};derivative={derivative_version}"
                   if additive is not None else "native_reference_transport")
+        if additive is not None and additive.get("diagnostic",False):
+            policy += f";use=DIAGNOSTIC;response={additive['response_status']};numerical={additive['numerical_status']}"
         tmp=work/"reference.tmp"
         with tmp.open("xb") as out:
             out.write(MAGIC);out.write(struct.pack("<IIiddQ",3,ENDIAN,n,m["temperature"],step,m["model_fp"]))

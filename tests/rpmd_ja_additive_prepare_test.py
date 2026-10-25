@@ -70,7 +70,7 @@ def _read_prepared_v3(path, n):
     return {"policy": policy, "matrices": matrices}
 
 
-def _fixture(directory):
+def _fixture(directory, *, atomic_additive_write=True):
     fitter_spec = importlib.util.spec_from_file_location("fit_additive_fixture", ROOT / "tools" / "rpmd_ja_fit_reference.py")
     fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
     n, d = 4, 12
@@ -102,7 +102,11 @@ def _fixture(directory):
         "sites": [dict(i=i, neighbors=[((i+1)%n,((0,1,0) if i==3 else (0,0,0))),((i-1)%n,((0,-1,0) if i==0 else (0,0,0)))], ell=np.array([[.2,0.,0.],[-.2,0.,0.]]), B=b.copy())
                   for i in range(n)],
     }
-    fitter.write_additive(pack_path, pack)
+    if atomic_additive_write:
+        fitter.write_additive(pack_path, pack)
+    else:
+        with pack_path.open("wb") as stream:
+            fitter._write_additive_stream(stream, pack)
     return raw, kernel, pack_path, output, pack, positions, np.diag(cell[:9].reshape(3,3))
 
 
@@ -118,7 +122,8 @@ def test_sparse_additive_v5_v6_roundtrip_and_dense_legacy_compatibility():
             with path.open("wb") as stream:
                 stream.write(fitter.ADD_MAGIC)
                 stream.write(struct.pack("<IIiiQ",version,fitter.ENDIAN,pack["n"],pack["beads"],pack["source_fingerprint"]))
-                stream.write(struct.pack("<ddddQQ",pack["temperature"],pack["epsilon"],pack["response_max"],
+                legacy_response=min(float(pack["response_max"]),float(pack["response_tolerance"]))
+                stream.write(struct.pack("<ddddQQ",pack["temperature"],pack["epsilon"],legacy_response,
                                          pack["response_tolerance"],pack["training_frames"],pack["validation_frames"]))
                 for site in pack["sites"]:
                     z=len(site["neighbors"]); stream.write(struct.pack("<i",z))
@@ -164,6 +169,17 @@ def test_sparse_additive_v5_v6_roundtrip_and_dense_legacy_compatibility():
         assert struct.unpack_from("<I",pack_path.read_bytes(),8)[0] == 6
         com=fitter.read_additive(pack_path)
         assert com["internal_mass_com"] and np.signbit(com["sites"][0]["B"][0,0])
+
+        pack["diagnostic"] = True
+        pack["response_status"] = "FAIL"
+        pack["response_max"] = 0.5
+        pack_path.unlink(); fitter.write_additive(pack_path,pack)
+        assert struct.unpack_from("<I",pack_path.read_bytes(),8)[0] == 7
+        diagnostic=fitter.read_additive(pack_path)
+        assert diagnostic["internal_mass_com"] and diagnostic["diagnostic"]
+        assert diagnostic["response_status"] == "FAIL" and diagnostic["response_max"] > diagnostic["response_tolerance"]
+        prepared_additive=qprep.read_additive(pack_path,expected_n=pack["n"])
+        assert prepared_additive["diagnostic"] and prepared_additive["response_status"] == "FAIL"
 
         for version in (1,2):
             old_path=Path(name)/f"legacy_v{version}.gpjaadd"; legacy_package(old_path,version)
@@ -214,7 +230,7 @@ def test_hand_authored_sparse_package_readers_without_hardlink_writer():
                 try: reader(path)
                 except ValueError: pass
                 else: raise AssertionError(f"hand-authored sparse {suffix} was accepted")
-        bad_version=bytearray(valid); struct.pack_into("<I",bad_version,8,7)
+        bad_version=bytearray(valid); struct.pack_into("<I",bad_version,8,8)
         invalid=Path(name)/"bad_version.gpjaadd"; invalid.write_bytes(bad_version)
         try: qprep.read_additive(invalid)
         except ValueError: pass
@@ -223,6 +239,68 @@ def test_hand_authored_sparse_package_readers_without_hardlink_writer():
         try: qprep.read_additive(truncated)
         except ValueError as exc: assert "truncated" in str(exc)
         else: raise AssertionError("truncated hand-authored sparse package was accepted")
+
+        fitter_spec = importlib.util.spec_from_file_location("fit_v7_status", ROOT / "tools" / "rpmd_ja_fit_reference.py")
+        fitter = importlib.util.module_from_spec(fitter_spec); fitter_spec.loader.exec_module(fitter)
+        with tempfile.TemporaryDirectory() as v7_dir:
+            v7_pack = {
+                "n": 2, "beads": 8, "source_fingerprint": 1234, "temperature": 300.0,
+                "epsilon": 0.01, "response_max": 0.5, "response_tolerance": 0.02,
+                "training_frames": 4, "validation_frames": 2, "diagnostic": True,
+                "response_status": "FAIL", "internal_mass_com": True,
+                "sites": [
+                    dict(i=0, neighbors=[(1, (0, 0, 0))], ell=np.zeros((1, 3)), B=np.eye(3)),
+                    dict(i=1, neighbors=[(0, (0, 0, 0))], ell=np.zeros((1, 3)), B=np.eye(3)),
+                ],
+            }
+            package_path = Path(v7_dir) / "hand_v7.gpjaadd"
+            with package_path.open("wb") as stream:
+                fitter._write_additive_stream(stream, v7_pack)
+            package = bytearray(package_path.read_bytes())
+            for suffix, offset, value in (("numerical",84,2),("response",88,9)):
+                damaged = bytearray(package); struct.pack_into("<I",damaged,offset,value)
+                bad_path = Path(v7_dir) / f"bad_{suffix}.gpjaadd"; bad_path.write_bytes(damaged)
+                for reader in (fitter.read_additive,qprep.read_additive):
+                    try: reader(bad_path)
+                    except ValueError: pass
+                    else: raise AssertionError(f"invalid v7 {suffix} status was accepted")
+            pass_above_budget = bytearray(package); struct.pack_into("<I",pass_above_budget,88,0)
+            bad_path = Path(v7_dir) / "bad_pass_budget.gpjaadd"; bad_path.write_bytes(pass_above_budget)
+            try: fitter.read_additive(bad_path)
+            except ValueError: pass
+            else: raise AssertionError("v7 response PASS above its frozen tolerance was accepted")
+            for response_code in (2,3):
+                for response_value in (float("inf"),float("-inf")):
+                    infinite_response=bytearray(package)
+                    struct.pack_into("<d",infinite_response,48,response_value)
+                    struct.pack_into("<I",infinite_response,88,response_code)
+                    bad_path=Path(v7_dir)/f"bad_infinite_response_{response_code}_{'positive' if response_value > 0 else 'negative'}.gpjaadd"
+                    bad_path.write_bytes(infinite_response)
+                    for reader in (fitter.read_additive,qprep.read_additive):
+                        try: reader(bad_path)
+                        except ValueError: pass
+                        else: raise AssertionError(f"v7 response status {response_code} accepted {response_value}")
+
+
+def test_prepare_binds_diagnostic_identity_into_v3_policy():
+    with tempfile.TemporaryDirectory() as name:
+        raw,kernel,pack_path,output,pack,_positions,_cell=_fixture(Path(name),atomic_additive_write=False)
+        fitter_spec=importlib.util.spec_from_file_location("fit_diagnostic_identity",ROOT/"tools"/"rpmd_ja_fit_reference.py")
+        fitter=importlib.util.module_from_spec(fitter_spec);fitter_spec.loader.exec_module(fitter)
+        pack["diagnostic"]=True
+        pack["response_status"]="FAIL"
+        pack["response_max"]=0.5
+        pack["response_tolerance"]=0.02
+        pack["internal_mass_com"]=True
+        pack["source_fingerprint"]=qprep._fnv64(raw)
+        with pack_path.open("wb") as stream:
+            fitter._write_additive_stream(stream,pack)
+        result=subprocess.run([sys.executable,str(ROOT/"tools/rpmd_ja_qnep_prepare.py"),str(raw),str(pack_path),
+                               "--kernel-table",str(kernel),
+                               "--output",str(output),"--lossless"],capture_output=True,text=True)
+        assert result.returncode==0,result.stderr
+        prepared=_read_prepared_v3(output,pack["n"])
+        assert ";use=DIAGNOSTIC;response=FAIL;numerical=PASS" in prepared["policy"]
 
 
 def test_additive_modes_and_expansion_limits():
@@ -653,11 +731,24 @@ def test_internal_mass_com_v6_pulls_back_nonzero_net_and_preserves_raw_transport
         assert asymmetry > 0
         old_output = Path(name) / "out_non_com.rpmdja"
         pack["internal_mass_com"] = False
-        pack_path.unlink(); fitter.write_additive(pack_path, pack)
-        with pack_path.open("r+b") as f:
-            f.seek(8); f.write(struct.pack("<I", 3))
+        legacy_path = Path(name) / "legacy_v3_non_com.gpjaadd"
+        with legacy_path.open("wb") as stream:
+            stream.write(fitter.ADD_MAGIC)
+            stream.write(struct.pack("<IIiiQ",3,fitter.ENDIAN,pack["n"],pack["beads"],pack["source_fingerprint"]))
+            stream.write(struct.pack("<ddddQQ",pack["temperature"],pack["epsilon"],pack["response_max"],
+                                     pack["response_tolerance"],pack["training_frames"],pack["validation_frames"]))
+            for site in pack["sites"]:
+                neighbors=site["neighbors"]; matrix=np.asarray(site["B"],dtype="<f8")
+                stream.write(struct.pack("<i",len(neighbors)))
+                for atom,image in neighbors: stream.write(struct.pack("<4i",atom,*image))
+                np.asarray(site["ell"],dtype="<f8").tofile(stream)
+                entries=[(row,column,float(matrix[row,column])) for row in range(matrix.shape[0])
+                         for column in range(matrix.shape[1])
+                         if matrix[row,column] != 0.0 or np.signbit(matrix[row,column])]
+                stream.write(struct.pack("<Q",len(entries)))
+                for row,column,value in entries: stream.write(struct.pack("<iid",row,column,value))
         old = subprocess.run([sys.executable, str(ROOT / "tools" / "rpmd_ja_qnep_prepare.py"),
-                              str(raw), str(pack_path), "--kernel-table", str(kernel), "--output", str(old_output)],
+                              str(raw), str(legacy_path), "--kernel-table", str(kernel), "--output", str(old_output)],
                              capture_output=True, text=True)
         assert old.returncode != 0 and "does not cancel raw reference gradient" in old.stderr
         assert not old_output.exists()
@@ -831,6 +922,7 @@ if __name__ == "__main__":
     test_additive_assembly_contract_is_available_from_prepare_module()
     test_sparse_additive_v5_v6_roundtrip_and_dense_legacy_compatibility()
     test_hand_authored_sparse_package_readers_without_hardlink_writer()
+    test_prepare_binds_diagnostic_identity_into_v3_policy()
     test_additive_modes_and_expansion_limits()
     test_additive_writer_rejects_reader_expansion_limit_before_temp_creation()
     test_additive_writer_and_readers_reject_coordination_over_reader_limit()

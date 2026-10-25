@@ -290,11 +290,21 @@ def _inspect_trajectory_npz(path, frames, atoms, memory_limit_bytes, trajectory_
             "online_delta_j_eV_angstrom_per_ps": ((frames, 3), "f", 8),
             "online_ja_eV_angstrom_per_ps": ((frames, 3), "f", 8)
         })
+    optional_online_identity = {
+        "online_reference_use_class": ((), "U", None),
+        "online_reference_numerical_status": ((), "U", None),
+        "online_reference_response_status": ((), "U", None),
+    }
     try:
         with zipfile.ZipFile(path, "r") as archive:
             members = {info.filename: info for info in archive.infolist()}
             wanted = {key + ".npy" for key in expected}
-            if set(members) != wanted:
+            member_names = set(members)
+            identity_members = {key + ".npy" for key in optional_online_identity}
+            if trajectory_format == "RPJAMAT2" and member_names == wanted | identity_members:
+                expected.update(optional_online_identity)
+                wanted |= identity_members
+            if member_names != wanted:
                 raise ValueError("trajectory NPZ must contain exactly the declared synchronized arrays")
             total_uncompressed = sum(info.file_size for info in members.values())
             if total_uncompressed > memory_limit_bytes:
@@ -449,9 +459,25 @@ def _load_reference(ref, manifest, estimate_bytes, sample):
         masses = _read_vector(stream, "<f8", n)
         positions = _read_vector(stream, "<f8", d).reshape(3, n).T.copy()
         config_fp, charge, pppm, spacing, policy_size = struct.unpack("<Qiidi", _exact(stream, 28))
-        if policy_size <= 0 or policy_size > 128:
+        if policy_size <= 0 or policy_size > 192:
             raise ValueError("qNEP v3 mechanical policy length is invalid")
         policy = _exact(stream, policy_size).decode("ascii")
+        diagnostic_policy=";use=DIAGNOSTIC;" in policy
+        expected_use="DIAGNOSTIC" if diagnostic_policy else "FORMAL"
+        diagnostic_suffix=policy[policy.find(";use="):] if ";use=" in policy else ""
+        diagnostic_statuses=("PASS","FAIL","INCONCLUSIVE","NOT_MEASURED")
+        policy_response=(policy.split(";response=",1)[1].split(";",1)[0]
+                         if diagnostic_policy and ";response=" in policy else None)
+        if diagnostic_policy and (manifest["format"] != "RPJAMAT2" or diagnostic_suffix not in tuple(
+                f";use=DIAGNOSTIC;response={status};numerical=PASS" for status in diagnostic_statuses) or
+                manifest.get("analysis_use_class") != "DIAGNOSTIC" or ref.get("use_class") != "DIAGNOSTIC" or
+                ref.get("numerical_status") != "PASS" or
+                ref.get("response_status") != policy_response):
+            raise ValueError(f"diagnostic reference {ref['id']} requires an explicit matching manifest use identity")
+        if ";use=" in policy and not diagnostic_policy:
+            raise ValueError(f"reference {ref['id']} has an unsupported use identity")
+        if not diagnostic_policy and ref.get("use_class", "FORMAL") != expected_use:
+            raise ValueError(f"reference {ref['id']} manifest use class does not match its package")
         sidecar = _validate_sidecar(header["path"], header, config_fp, policy)
         diagnostics = _read_vector(stream, "<f8", 21)
         spectral_bound, kernel_u = struct.unpack("<dd", _exact(stream, 16))
@@ -529,6 +555,9 @@ def _load_reference(ref, manifest, estimate_bytes, sample):
             raise ValueError("qNEP v3 stability flag or trailing bytes are invalid")
     return {"header": header, "positions": positions, "masses": masses, "types": types,
             "cell": cell, "delta_j_native": delta_j, "sidecar": sidecar,
+            "reference_use_class": expected_use,
+            "reference_numerical_status": "PASS" if diagnostic_policy else "NOT_APPLICABLE",
+            "reference_response_status": policy_response if diagnostic_policy else "NOT_APPLICABLE",
             "sample": sample}
 
 
@@ -574,6 +603,18 @@ def _load_trajectory(manifest, n):
     _inspect_trajectory_npz(manifest["_resolved_trajectory"], manifest["frame_count"], n,
                             manifest["memory_limit_bytes"], manifest["format"])
     with np.load(manifest["_resolved_trajectory"], allow_pickle=False) as data:
+        identity_keys = ("online_reference_use_class", "online_reference_numerical_status",
+                         "online_reference_response_status")
+        online = manifest.get("online_current", {})
+        diagnostic_selected = manifest.get("analysis_use_class") == "DIAGNOSTIC" or \
+            online.get("reference_use_class") == "DIAGNOSTIC"
+        if manifest["format"] == "RPJAMAT2" and diagnostic_selected and \
+           not all(key in data.files for key in identity_keys):
+            raise ValueError("diagnostic current is missing its bound online reference-use identity")
+        if manifest["format"] == "RPJAMAT2" and any(key in data.files for key in identity_keys):
+            if not all(key in data.files for key in identity_keys):
+                raise ValueError("trajectory NPZ has an incomplete online reference-use identity")
+            required += identity_keys
         missing = [key for key in required if key not in data.files]
         if missing:
             raise ValueError(f"trajectory NPZ is missing required synchronized fields: {', '.join(missing)}")
@@ -594,6 +635,20 @@ def _load_trajectory(manifest, n):
            str(sample["online_reference_package_sha256"].item()).lower() != online["reference_package_sha256"].lower() or \
            str(sample["online_current_units"].item()) != online["units"]:
             raise ValueError("online current reference identity, package digest, or units do not match the manifest")
+        if "online_reference_use_class" in sample:
+            current_use = str(sample["online_reference_use_class"].item())
+            current_numerical = str(sample["online_reference_numerical_status"].item())
+            current_response = str(sample["online_reference_response_status"].item())
+            if current_use not in ("FORMAL", "DIAGNOSTIC") or \
+               current_numerical not in ("PASS", "NOT_APPLICABLE") or \
+               current_response not in ("PASS", "FAIL", "INCONCLUSIVE", "NOT_MEASURED", "NOT_APPLICABLE") or \
+               current_use == "DIAGNOSTIC" and (manifest.get("analysis_use_class") != "DIAGNOSTIC" or
+                   online.get("reference_use_class") != "DIAGNOSTIC" or
+                   online.get("reference_numerical_status") != current_numerical or
+                   online.get("reference_response_status") != current_response):
+                raise ValueError("online current reference use identity does not match the explicit manifest selection")
+            if current_use == "FORMAL" and online.get("reference_use_class", "FORMAL") != "FORMAL":
+                raise ValueError("online current formal identity does not match the frozen manifest")
     if sample["wrapped_position_angstrom"].shape != (frames, n, 3) or sample["vc_angstrom_per_ps"].shape != (frames, n, 3) or \
        sample["jc_eV_angstrom_per_ps"].shape != (frames, 3):
         raise ValueError("trajectory coordinates, velocities, and centroid currents must be synchronized F-by-N arrays")
@@ -678,6 +733,19 @@ def evaluate_manifest(manifest_path):
     sample = _load_trajectory(manifest, len(manifest["ordered_atom_ids"]))
     jc = sample["jc_native"]
     loaded_references = [_load_reference(ref, manifest, estimate_bytes, sample) for ref in manifest["references"]]
+    if manifest["format"] == "RPJAMAT2":
+        online = manifest["online_current"]
+        reference_index = next(index for index, ref in enumerate(manifest["references"])
+                               if ref["id"] == online["reference_id"])
+        online_reference = loaded_references[reference_index]
+        online_identity = (online.get("reference_use_class", "FORMAL"),
+                           online.get("reference_numerical_status", "NOT_APPLICABLE"),
+                           online.get("reference_response_status", "NOT_APPLICABLE"))
+        package_identity = (online_reference["reference_use_class"],
+                            online_reference["reference_numerical_status"],
+                            online_reference["reference_response_status"])
+        if online_identity != package_identity:
+            raise ValueError("online current reference-use identity does not match the selected reference package")
     delta_series = [loaded["delta_j_native"] for loaded in loaded_references]
     online_comparison = {"status": "NOT_AVAILABLE_LEGACY_RPJAMAT1"}
     if manifest["format"] == "RPJAMAT2":
@@ -695,6 +763,9 @@ def evaluate_manifest(manifest_path):
         online_comparison = {"status": "PASS" if delta_pass and ja_pass else "FAIL",
             "reference_id": online["reference_id"],
             "reference_package_sha256": online["reference_package_sha256"].lower(),
+            "reference_use_class": online_reference["reference_use_class"],
+            "reference_numerical_status": online_reference["reference_numerical_status"],
+            "reference_response_status": online_reference["reference_response_status"],
             "units_compared": "eV*angstrom/native_time",
             "criterion": "per-frame np.allclose(rtol=1e-10, atol=1e-9)",
             "delta_j_max_abs_error": delta_error, "ja_max_abs_error": ja_error}
@@ -710,6 +781,7 @@ def evaluate_manifest(manifest_path):
     report = {
         "format": "RPJAMAT2_REPORT" if manifest["format"] == "RPJAMAT2" else "RPJAMAT1_REPORT",
         "status": "EVALUATION_ONLY",
+        "analysis_use_class": manifest.get("analysis_use_class", "FORMAL"),
         "trajectory_id": manifest["trajectory_id"],
         "frame_count": manifest["frame_count"],
         "frame_ids": manifest["frame_ids"],
@@ -734,7 +806,8 @@ def evaluate_manifest(manifest_path):
         "tolerances": manifest["tolerances"],
         "online_current_comparison": online_comparison,
         "references": [],
-        "reference_sensitivity": {"status": "INCONCLUSIVE_NO_REFERENCE_SENSITIVITY", "pairs": []}
+        "reference_sensitivity": {"status": "INCONCLUSIVE_NO_REFERENCE_SENSITIVITY", "pairs": [],
+            "scope": "DeltaJ RMS amplitude only; it does not establish thermal-conductivity equivalence"}
     }
     ps_per_native = NATIVE_TIME_PS
     dt_ps = float(manifest["time_interval_ps"])
@@ -761,6 +834,9 @@ def evaluate_manifest(manifest_path):
             "residual_3x3": decomposition_residual[lag].tolist()} for lag in range(len(decomposition_residual))]
         item = {"id": ref["id"], "package": str(loaded["header"]["path"]),
                 "package_sha256": ref["package_sha256"], "package_version": 3,
+                "reference_use_class": loaded["reference_use_class"],
+                "reference_numerical_status": loaded["reference_numerical_status"],
+                "reference_response_status": loaded["reference_response_status"],
                 "replayed_branch_identity": hashlib.sha256((manifest["branch_policy"] + "\0" +
                     manifest["trajectory_npz_sha256"].lower() + "\0" + ref["package_sha256"].lower()).encode("ascii")).hexdigest(),
                 "branch_replay": "production initialize MIC, then wrapped-step MIC accumulation and 0.45 checks passed",
@@ -788,13 +864,15 @@ def evaluate_manifest(manifest_path):
                 passed = difference <= absolute if use_absolute else ratio <= relative
                 comparisons.append({"left": manifest["references"][left]["id"],
                     "right": manifest["references"][right]["id"], "rms_difference_native": difference,
+                    "metric": "DeltaJ RMS amplitude",
                     "larger_reference_rms_native": scale,
                     "criterion": "absolute_near_zero" if use_absolute else "relative",
                     "absolute_tolerance_native": absolute,
                     "relative_tolerance": relative, "relative_difference": ratio,
                     "passed": bool(passed)})
         report["reference_sensitivity"] = {"status": "PASS" if all(x["passed"] for x in comparisons) else "FAIL",
-                                           "pairs": comparisons}
+            "pairs": comparisons,
+            "scope": "DeltaJ RMS amplitude only; it does not establish thermal-conductivity equivalence"}
     report["arrays"] = {"jc_jc": "jc_jc", "lag_ps": "lags_ps"}
     return report, arrays
 
@@ -812,7 +890,7 @@ def main(argv=None):
         report["numeric_arrays_npz"] = str(prefix) + ".npz"
         Path(str(prefix) + ".json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(f"J_A material evaluation written: {prefix}.json and {prefix}.npz; status={report['status']}; "
-              f"reference sensitivity={report['reference_sensitivity']['status']}")
+              f"reference sensitivity={report['reference_sensitivity']['status']} (DeltaJ RMS only; not kappa equivalence)")
     except (OSError, ValueError, MemoryError, np.linalg.LinAlgError) as exc:
         parser.error(str(exc))
 

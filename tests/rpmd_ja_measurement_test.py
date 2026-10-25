@@ -87,7 +87,9 @@ def demo():
     hac_header = (root / "src/measure/hac.cuh").read_text(encoding="utf-8")
     qnep_source = (root / "src/force/nep_charge.cu").read_text(encoding="utf-8")
     ja_source = (root / "src/measure/rpmd_ja.cu").read_text(encoding="utf-8")
+    reference_source = (root / "src/measure/rpmd_ja_reference.cu").read_text(encoding="utf-8")
     run_source = (root / "src/main_gpumd/run.cu").read_text(encoding="utf-8")
+    measure_source = (root / "src/measure/measure.cu").read_text(encoding="utf-8")
     ja_doc = (root / "doc/gpumd/input_parameters/rpmd_ja.rst").read_text(encoding="utf-8")
     assert "compute_rpmd_ja_current_(nd, atom, box)" in hac
     assert "gpu_find_hac_3<<<Nc, 128>>>(Nc, Nd, rpmd_ja_current_[2].data(), hac_gpu.data())" in hac
@@ -154,6 +156,19 @@ def demo():
     assert "atomicOr(error, RPMD_JA_ERROR_NUMERICAL)" in sparse
     assert "check_sparse_finite" not in sparse
     assert "step + 1 == number_of_steps && (step + 1) % sample_interval != 0" in hac
+    assert 'tokens[1] == "graph_reference"' in run_source
+    assert 'options.graph_reference = true' in run_source
+    assert 'rpmd_ja on optional use must be diagnostic' in run_source
+    assert 'rpmd_ja_reference_policy_use_matches(rpmd_ja_reference_.backend,' in ja_source
+    assert "if(backend==0||backend==1)return policy.empty()&&!diagnostic;" in reference_source
+    assert "return backend==2&&is_supported_qnep_policy(policy)&&" in reference_source
+    assert 'if (hac != nullptr) {\n        hac->set_rpmd_ja(enabled, reference_path, diagnostic);' in measure_source
+    assert 'hac->set_rpmd_ja(rpmd_ja_enabled_, rpmd_ja_reference_path_, rpmd_ja_diagnostic_);' in measure_source
+    run_reset = run_source.split('} else if (tokens[0] == "run") {', 1)[1].split('} else if (!measure.parse_action', 1)[0]
+    assert 'rpmd_ja_diagnostic_ = false;' in run_reset and 'measure.set_rpmd_ja(false);' in run_reset
+    assert '# reference_use_class %s' in hac
+    assert 'reference_response_status' in hac
+    assert 'rpmd_ja graph_reference' in ja_doc
 
 
 if __name__ == "__main__":

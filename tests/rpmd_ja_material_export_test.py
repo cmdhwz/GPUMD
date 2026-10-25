@@ -41,6 +41,7 @@ class MaterialExportTest(unittest.TestCase):
             stream.write("# segment_metadata_version 2\n")
             stream.write(f"# reference_package_sha256 {export._sha256(self.reference)}\n")
             stream.write("# backend qnep-block-v3\n")
+            stream.write("# mechanical_policy native_reference_transport\n")
             stream.write("# sample_frames 4\n")
             stream.write("# current_units eV*Angstrom/natural_time\n")
             stream.write("# columns time_ps Jcent_x Jcent_y Jcent_z DeltaJ_x DeltaJ_y DeltaJ_z JA_x JA_y JA_z\n")
@@ -148,6 +149,50 @@ class MaterialExportTest(unittest.TestCase):
         self.current.write_text("\n".join(lines) + "\n", encoding="ascii")
         with self.assertRaisesRegex(ValueError, "reference.*(SHA|digest)|digest.*reference"):
             export.export_trajectory(self._spec(reference=other_reference))
+
+    def test_diagnostic_identity_is_copied_from_current_segment_to_export(self):
+        lines = self.current.read_text(encoding="ascii").splitlines()
+        policy_index = next(index for index, line in enumerate(lines) if line.startswith("# mechanical_policy"))
+        lines[policy_index] = "# mechanical_policy native_reference_transport;finite_temperature_additive_v1;beads=1;derivative=1;use=DIAGNOSTIC;response=FAIL;numerical=PASS"
+        lines.extend(("# reference_use_class DIAGNOSTIC", "# reference_numerical_status PASS",
+                      "# reference_response_status FAIL"))
+        self.current.write_text("\n".join(lines) + "\n", encoding="ascii")
+        summary = export.export_trajectory(self._spec())
+        self.assertEqual(summary["online_reference_use_class"], "DIAGNOSTIC")
+        self.assertEqual(summary["online_reference_numerical_status"], "PASS")
+        self.assertEqual(summary["online_reference_response_status"], "FAIL")
+        with np.load(self.output, allow_pickle=False) as arrays:
+            self.assertEqual(str(arrays["online_reference_use_class"].item()), "DIAGNOSTIC")
+            self.assertEqual(str(arrays["online_reference_response_status"].item()), "FAIL")
+
+    def test_diagnostic_policy_cannot_fall_back_or_conflict(self):
+        original = self.current.read_text(encoding="ascii").splitlines()
+        diagnostic = "# mechanical_policy native_reference_transport;finite_temperature_additive_v1;beads=1;derivative=1;use=DIAGNOSTIC;response=FAIL;numerical=PASS"
+        self.current.write_text("\n".join([line for line in original if not line.startswith("# mechanical_policy")] +
+                                          [diagnostic]) + "\n", encoding="ascii")
+        with self.assertRaisesRegex(ValueError, "identity is incomplete"):
+            export._read_current(self.current, None)
+
+        conflicted = original.copy()
+        policy_line = conflicted.index("# mechanical_policy native_reference_transport")
+        conflicted[policy_line] = diagnostic
+        conflicted.extend(("# reference_use_class DIAGNOSTIC", "# reference_numerical_status PASS",
+                           "# reference_response_status PASS"))
+        self.current.write_text("\n".join(conflicted) + "\n", encoding="ascii")
+        with self.assertRaisesRegex(ValueError, "conflicts with mechanical_policy"):
+            export._read_current(self.current, None)
+
+    def test_unknown_policy_rejected_and_legacy_ordinary_still_reads(self):
+        lines = self.current.read_text(encoding="ascii").splitlines()
+        policy_line = lines.index("# mechanical_policy native_reference_transport")
+        lines[policy_line] = "# mechanical_policy future_unrecognized_policy"
+        self.current.write_text("\n".join(lines) + "\n", encoding="ascii")
+        with self.assertRaisesRegex(ValueError, "unknown or malformed"):
+            export._read_current(self.current, None)
+        old_lines = [line for line in lines if not line.startswith("# mechanical_policy")]
+        self.current.write_text("\n".join(old_lines) + "\n", encoding="ascii")
+        _jc, _delta, _ja, _sha, identity = export._read_current(self.current, None)
+        self.assertEqual(identity["reference_use_class"], "FORMAL")
 
     def test_legacy_current_requires_explicit_unverified_export_path(self):
         legacy = self.directory / "legacy-current.out"

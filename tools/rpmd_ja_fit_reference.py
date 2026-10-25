@@ -46,17 +46,18 @@ def _exact(f, size):
     return b
 
 
-def read_raw(path):
-    """Read and validate the original v1/v2/v3 qraw layout; matrices stay memmapped."""
+def read_raw(path, *, compute_source_fingerprint=True):
+    """Read v1-v4 qraw layouts; optionally omit the source FNV fingerprint for internal readers."""
     path = Path(path).resolve()
     with path.open("rb") as f:
         if _exact(f, 8) != RAW_MAGIC:
             raise ValueError("wrong qNEP raw magic")
         version, endian, n, d = struct.unpack("<IIii", _exact(f, 16))
-        if version not in (1, 2, 3) or endian != ENDIAN or n < 2 or d != 3*n:
+        if version not in (1, 2, 3, 4) or endian != ENDIAN or n < 2 or d != 3*n:
             raise ValueError("unsupported raw version or dimensions")
         start_expected = 8+16+32+16+len(RAW_LAYOUT)+18*8+12 + n*4+n*8+d*8+8+n*8+d*8+9*n*8
-        file_expected = start_expected + (2*d*n+7*d*d+18)*8
+        payload = d*n+4*d*d+24 if version == 4 else 2*d*n+7*d*d+18
+        file_expected = start_expected + payload*8
         if path.stat().st_size != file_expected:
             raise ValueError("invalid qraw length/footer before variable-size header read")
         temp, step, model_fp, config_fp = struct.unpack("<ddQQ", _exact(f, 32))
@@ -74,16 +75,28 @@ def read_raw(path):
         virial = np.frombuffer(_exact(f, 9*n*8), "<f8").copy()
         start = f.tell()
     vb, cb, kb = d*n*8, 3*d*d*8, d*d*8
-    coarse_v, coarse_c = start+vb+cb+kb, start+2*vb+cb+kb
-    footer = start+2*vb+2*cb+kb
-    if path.stat().st_size != footer+18*8:
+    if version == 4:
+        coarse_v = coarse_c = None
+        footer = start+vb+cb+kb
+        stats_count = 24
+    else:
+        coarse_v, coarse_c = start+vb+cb+kb, start+2*vb+cb+kb
+        footer = start+2*vb+2*cb+kb
+        stats_count = 18
+    if path.stat().st_size != footer+stats_count*8:
         raise ValueError("invalid qraw length/footer")
-    stats = np.memmap(path, mode="r", dtype="<f8", offset=footer, shape=(18,))
-    common_bad = (not np.isfinite(stats).all() or stats[16] != step or stats[17] != float(version)
+    stats = np.memmap(path, mode="r", dtype="<f8", offset=footer, shape=(stats_count,))
+    derivative_version = 3 if version == 4 else version
+    common_bad = (not np.isfinite(stats).all() or stats[16] != step or stats[17] != float(derivative_version)
                  or np.any(stats < 0) or stats[1] > 1e-4)
     old_bad = max(stats[2],stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]) > .05
     new_bad = stats[3] > 1e-4 or max(stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]) > .05
-    if common_bad or (version == 1 and old_bad) or (version in (2,3) and new_bad):
+    transport_bad = False
+    if version == 4:
+        transport_diff2, transport_norm2 = stats[18:21], stats[21:24]
+        transport_bad = bool(np.any(transport_norm2 < 0) or np.any(transport_diff2 < 0) or
+            np.max(np.sqrt(transport_diff2 / np.maximum(transport_norm2, 1e-300))) > .05)
+    if common_bad or transport_bad or (version == 1 and old_bad) or (version in (2,3,4) and new_bad):
         raise ValueError("qraw diagnostics fail accepted generation thresholds")
     if (not np.isfinite([temp, step, spacing, energy]).all() or temp <= 0 or step <= 0 or spacing <= 0
         or charge not in (1,2) or pppm != 1 or config_fp == 0 or not np.isfinite(cell).all()
@@ -92,29 +105,50 @@ def read_raw(path):
         or abs(float(site_energy.sum())-energy) > 1e-9*max(1.,abs(energy))):
         raise ValueError("invalid qraw source geometry or diagnostics")
     # Scan files in bounded chunks so NaNs cannot hide in memmapped derivative arrays.
-    for off, count in ((start,d*n),(start+d*n*8,d*d*3),(start+(d*n+d*d*3)*8,d*d),
-                       (coarse_v,d*n),(coarse_c,3*d*d)):
+    matrix_ranges = [(start,d*n),(start+d*n*8,d*d*3),(start+(d*n+d*d*3)*8,d*d)]
+    if version != 4:
+        matrix_ranges.extend(((coarse_v,d*n),(coarse_c,3*d*d)))
+    for off, count in matrix_ranges:
         a = np.memmap(path, mode="r", dtype="<f8", offset=off, shape=(count,))
         for i in range(0,count,1<<18):
             if not np.isfinite(a[i:i+(1<<18)]).all():
                 raise ValueError("non-finite qraw derivative matrix")
     def matrix(offset, shape):
         return np.memmap(path, mode="r", dtype="<f8", offset=offset, shape=shape)
-    return dict(path=path, version=version, n=n, d=d, temperature=temp, step=step,
+    result = dict(path=path, version=version, derivative_version=derivative_version, n=n, d=d, temperature=temp, step=step,
                 model_fingerprint=model_fp, config_fingerprint=config_fp, cell=cell[:9].reshape(3,3),
                 types=types, masses=masses, positions=positions.reshape(3,n).T, force=force.reshape(3,n).T,
                 site_energy=site_energy, energy=energy, start=start, footer=footer,
                 v=matrix(start,(d,n)), c=matrix(start+vb,(3,d,d)), k=matrix(start+vb+cb,(d,d)),
-                coarse_v=matrix(coarse_v,(d,n)), coarse_c=matrix(coarse_c,(3,d,d)), diagnostics=stats.copy(),
-                source_fingerprint=_fnv64(path))
+                diagnostics=np.asarray(stats[:18]).copy())
+    if compute_source_fingerprint:
+        result["source_fingerprint"] = _fnv64(path)
+    if version == 4:
+        result.update(coarse_v=None, coarse_c=None, transport_diff2=np.asarray(stats[18:21]).copy(),
+                      transport_norm2=np.asarray(stats[21:24]).copy())
+    else:
+        result.update(coarse_v=matrix(coarse_v,(d,n)), coarse_c=matrix(coarse_c,(3,d,d)))
+    return result
 
 
 def _validate_additive(a):
     n, p = int(a["n"]), int(a["beads"])
     if n < 2 or p < 1: raise ValueError("invalid additive dimensions")
-    vals = [a[k] for k in ("temperature","epsilon","response_max","response_tolerance")]
-    if not np.isfinite(vals).all() or vals[0] <= 0 or vals[1] <= 0 or vals[2] < 0 or vals[3] < 0 or vals[2] > vals[3]:
+    vals = [a[k] for k in ("temperature","epsilon","response_tolerance")]
+    response=float(a.get("response_max",float("nan")))
+    response_status=a.get("response_status","PASS")
+    diagnostic=bool(a.get("diagnostic",False))
+    numerical_status=a.get("numerical_status","PASS")
+    if not np.isfinite(vals).all() or vals[0] <= 0 or vals[1] <= 0 or vals[2] < 0:
         raise ValueError("invalid additive temperature, epsilon, or response budget")
+    if numerical_status != "PASS" or response_status not in ("PASS","FAIL","INCONCLUSIVE","NOT_MEASURED") or \
+       math.isinf(response) or \
+       not diagnostic and response_status != "PASS" or \
+       response_status == "PASS" and (not np.isfinite(response) or response < 0 or response > vals[2]) or \
+       response_status == "FAIL" and (not np.isfinite(response) or response < 0) or \
+       response_status in ("INCONCLUSIVE","NOT_MEASURED") and np.isfinite(response) and response < 0 or \
+       response_status == "NOT_MEASURED" and np.isfinite(response):
+        raise ValueError("invalid additive response status or response budget")
     if int(a["training_frames"]) < 1 or int(a["validation_frames"]) < 1:
         raise ValueError("frame counts must be positive")
     sites = a["sites"]
@@ -158,9 +192,15 @@ def _unique_temp_path(destination):
 
 def _write_additive_stream(f, data):
     f.write(ADD_MAGIC)
-    version = 6 if data.get("internal_mass_com", False) else 5
+    diagnostic=bool(data.get("diagnostic",False))
+    version = 7 if diagnostic else 6 if data.get("internal_mass_com", False) else 5
     f.write(struct.pack("<IIiiQ",version,ENDIAN,data["n"],data["beads"],data["source_fingerprint"]))
-    f.write(struct.pack("<ddddQQ",data["temperature"],data["epsilon"],data["response_max"],data["response_tolerance"],data["training_frames"],data["validation_frames"]))
+    response=float(data.get("response_max",float("nan")))
+    f.write(struct.pack("<ddddQQ",data["temperature"],data["epsilon"],response,data["response_tolerance"],data["training_frames"],data["validation_frames"]))
+    if diagnostic:
+        use_flags=2 | (1 if data.get("internal_mass_com",False) else 0)
+        response_code={"PASS":0,"FAIL":1,"INCONCLUSIVE":2,"NOT_MEASURED":3}[data.get("response_status","PASS")]
+        f.write(struct.pack("<III",use_flags,1,response_code))
     for s in data["sites"]:
         z=len(s["neighbors"]); f.write(struct.pack("<i",z))
         for j,img in s["neighbors"]: f.write(struct.pack("<4i",j,*img))
@@ -220,10 +260,23 @@ def read_additive(path):
         if size < 80: raise ValueError("GPJAADD1 package is shorter than its header")
         if _exact(f,8)!=ADD_MAGIC: raise ValueError("wrong GPJAADD1 magic")
         version,endian,n,p,fp=struct.unpack("<IIiiQ",_exact(f,24))
-        if version not in (1,2,3,4,5,6) or endian != ENDIAN: raise ValueError("unsupported additive package version")
+        if version not in (1,2,3,4,5,6,7) or endian != ENDIAN: raise ValueError("unsupported additive package version")
         if n < 2 or p < 1 or n > (size-80)//4:
             raise ValueError("GPJAADD1 dimensions exceed the declared package length")
         temp,eps,rmax,rtol,ntrain,nval=struct.unpack("<ddddQQ",_exact(f,48))
+        if version >= 7:
+            use_flags,numerical_code,response_code=struct.unpack("<III",_exact(f,12))
+            if use_flags not in (2,3) or numerical_code != 1 or response_code not in (0,1,2,3):
+                raise ValueError("invalid GPJAADD1 numerical, response, or use identity")
+            diagnostic=True
+            internal_mass_com=bool(use_flags & 1)
+            response_status=("PASS","FAIL","INCONCLUSIVE","NOT_MEASURED")[response_code]
+        else:
+            diagnostic=False
+            internal_mass_com=version in (2,4,6)
+            response_status="PASS"
+        if version < 7 and (not np.isfinite(rmax) or rmax < 0 or not np.isfinite(rtol) or rtol < rmax):
+            raise ValueError("invalid legacy GPJAADD1 response metadata")
         sites=[]
         expanded_elements = 0
         for i in range(n):
@@ -299,7 +352,8 @@ def read_additive(path):
             sites.append(dict(i=i,neighbors=[(x[0],tuple(x[1:])) for x in neigh],ell=ell,B=b))
         if f.read(1): raise ValueError("trailing data in additive package")
     a=dict(n=n,beads=p,source_fingerprint=fp,temperature=temp,epsilon=eps,response_max=rmax,
-           internal_mass_com=version in (2,4,6),
+           diagnostic=diagnostic,response_status=response_status,numerical_status="PASS",
+           internal_mass_com=internal_mass_com,
            response_tolerance=rtol,training_frames=ntrain,validation_frames=nval,sites=sites)
     _validate_additive(a); return a
 
@@ -378,7 +432,7 @@ def _raw_dimensions(path):
     with Path(path).open("rb") as f:
         if _exact(f,8)!=RAW_MAGIC: raise ValueError("wrong qNEP raw magic")
         version,endian,n,d=struct.unpack("<IIii",_exact(f,16))
-    if version not in (1,2,3) or endian!=ENDIAN or n<2 or d!=3*n: raise ValueError("unsupported raw version or dimensions")
+    if version not in (1,2,3,4) or endian!=ENDIAN or n<2 or d!=3*n: raise ValueError("unsupported raw version or dimensions")
     return n,d
 
 

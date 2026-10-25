@@ -77,13 +77,13 @@ template <typename T> void read_vector(std::istream& in, std::vector<T>& value, 
 struct Raw
 {
   RpmdJAReference reference;
-  int version = 0;
+  int version = 0, derivative_version = 0;
   std::uint64_t config = 0;
   int dimension = 0;
   int charge = 0;
   double spacing = 0.0;
   std::streamoff data = 0, coarse_v = 0, coarse_c = 0, footer = 0;
-  double stats[18] = {};
+  double stats[18] = {}, transport_diff2[3] = {}, transport_norm2[3] = {};
 };
 
 Raw read_raw_header(const std::string& path)
@@ -99,7 +99,7 @@ Raw read_raw_header(const std::string& path)
   read_value(in, raw.reference.fd_step); read_value(in, raw.reference.model_fingerprint);
   read_value(in, raw.config); read_value(in, raw.charge); read_value(in, uses_pppm);
   read_value(in, raw.spacing); in.read(layout, sizeof(layout));
-  if (!in || std::memcmp(magic, raw_magic, sizeof(magic)) || (version != 1 && version != 2 && version != 3) || endian != 0x01020304 ||
+  if (!in || std::memcmp(magic, raw_magic, sizeof(magic)) || (version < 1 || version > 4) || endian != 0x01020304 ||
       n <= 1 || n > std::numeric_limits<int>::max()/3 || d != 3 * n ||
       !(raw.reference.temperature > 0.0) || !std::isfinite(raw.reference.temperature) ||
       !(raw.reference.fd_step > 0.0) || !std::isfinite(raw.reference.fd_step) ||
@@ -107,12 +107,13 @@ Raw read_raw_header(const std::string& path)
       uses_pppm != 1 || !(raw.spacing > 0.0) || !std::isfinite(raw.spacing) || raw.config == 0)
     throw std::runtime_error("unsupported or invalid qNEP rpmd_ja raw header");
   raw.version = static_cast<int>(version);
+  raw.derivative_version = version == 4 ? 3 : static_cast<int>(version);
   raw.dimension = d;
   RpmdJAReference& r = raw.reference;
   r.backend = 2; r.number_of_atoms = n; r.q_charge_mode = raw.charge; r.q_uses_pppm = true;
   r.q_mesh_spacing = raw.spacing;
-  r.mechanical_policy = version == 1 ? "native_reference_transport" :
-    (version == 2 ? "native_reference_transport;analytic_site_gradient_v1" :
+  r.mechanical_policy = raw.derivative_version == 1 ? "native_reference_transport" :
+    (raw.derivative_version == 2 ? "native_reference_transport;analytic_site_gradient_v1" :
       "native_reference_transport;analytic_site_gradient_fd4_v1");
   r.mechanical_config_fingerprint = raw.config;
   double raw_cell[18];
@@ -144,23 +145,40 @@ Raw read_raw_header(const std::string& path)
   const std::uint64_t vd = static_cast<std::uint64_t>(d) * static_cast<std::uint64_t>(n);
   const std::uint64_t dd = static_cast<std::uint64_t>(d) * static_cast<std::uint64_t>(d);
   const std::uint64_t max_elements=static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()/sizeof(double));
-  if (dd > max_elements/7 || vd > (max_elements-7*dd)/2 || 2*vd+7*dd > max_elements-18)
+  std::uint64_t footer_elements=0,payload_elements=0;
+  if(version==4){
+    if(dd>(max_elements-24)/4||vd>max_elements-4*dd-24)throw std::runtime_error("qNEP raw matrix offsets overflow");
+    footer_elements=vd+4*dd;payload_elements=footer_elements+24;
+  }else{
+    if(dd>(max_elements-18)/7||vd>(max_elements-7*dd-18)/2)throw std::runtime_error("qNEP raw matrix offsets overflow");
+    footer_elements=2*vd+7*dd;payload_elements=footer_elements+18;
+  }
+  if (payload_elements > max_elements)
     throw std::runtime_error("qNEP raw matrix offsets overflow");
   const std::uint64_t max_bytes=static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max());
-  const std::uint64_t payload_bytes=(2*vd+7*dd+18)*sizeof(double);
+  const std::uint64_t payload_bytes=payload_elements*sizeof(double);
   if(raw.data<0||static_cast<std::uint64_t>(raw.data)>max_bytes-payload_bytes)
     throw std::runtime_error("qNEP raw file offset overflows platform stream offsets");
   const std::streamoff vb = static_cast<std::streamoff>(vd * sizeof(double));
   const std::streamoff cb = static_cast<std::streamoff>(3 * dd * sizeof(double));
   const std::streamoff kb = static_cast<std::streamoff>(dd * sizeof(double));
-  raw.coarse_v = raw.data + vb + cb + kb;
-  raw.coarse_c = raw.coarse_v + vb;
-  raw.footer = raw.coarse_c + cb;
+  if(version==4){
+    raw.footer=raw.data+static_cast<std::streamoff>(footer_elements*sizeof(double));
+    raw.coarse_v=-1;raw.coarse_c=-1;
+  }else{
+    raw.coarse_v = raw.data + vb + cb + kb;
+    raw.coarse_c = raw.coarse_v + vb;
+    raw.footer = raw.coarse_c + cb;
+  }
   in.seekg(0, std::ios::end);
-  if (in.tellg() != raw.footer + 18 * static_cast<std::streamoff>(sizeof(double)))
+  if (in.tellg() != raw.footer + (version==4?24:18) * static_cast<std::streamoff>(sizeof(double)))
     throw std::runtime_error("qNEP raw file size does not match its matrix layout");
   in.seekg(raw.footer);
   in.read(reinterpret_cast<char*>(raw.stats), sizeof(raw.stats));
+  if(version==4){
+    in.read(reinterpret_cast<char*>(raw.transport_diff2),sizeof(raw.transport_diff2));
+    in.read(reinterpret_cast<char*>(raw.transport_norm2),sizeof(raw.transport_norm2));
+  }
   const bool finite_stats = std::all_of(raw.stats, raw.stats + 18, [](double x) { return std::isfinite(x) && x >= 0.0; });
   const bool legacy_checks = raw.stats[17] == 1.0 && raw.stats[1] <= 1.0e-4 &&
     std::max({raw.stats[2], raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
@@ -168,7 +186,13 @@ Raw read_raw_header(const std::string& path)
     std::max({raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
   const bool analytic_fd4_checks = raw.stats[17] == 3.0 && raw.stats[1] <= 1.0e-4 && raw.stats[3] <= 1.0e-4 &&
     std::max({raw.stats[4], raw.stats[6], raw.stats[7], raw.stats[8], raw.stats[14], raw.stats[15]}) <= raw_difference_tolerance;
-  if (!in || !finite_stats || raw.stats[16] != r.fd_step ||
+  const bool transport_checks=version!=4||(
+    std::all_of(raw.transport_diff2,raw.transport_diff2+3,[](double x){return std::isfinite(x)&&x>=0.0;})&&
+    std::all_of(raw.transport_norm2,raw.transport_norm2+3,[](double x){return std::isfinite(x)&&x>=0.0;})&&
+    std::max({std::sqrt(raw.transport_diff2[0]/std::max(raw.transport_norm2[0],1.0e-300)),
+      std::sqrt(raw.transport_diff2[1]/std::max(raw.transport_norm2[1],1.0e-300)),
+      std::sqrt(raw.transport_diff2[2]/std::max(raw.transport_norm2[2],1.0e-300))})<=raw_difference_tolerance);
+  if (!in || !finite_stats || !transport_checks || raw.stats[16] != r.fd_step ||
       (version == 1 ? !legacy_checks : (version == 2 ? !analytic_checks : !analytic_fd4_checks)))
     throw std::runtime_error("qNEP raw finite-difference diagnostics fail accepted limits");
   r.energy_gradient_relative_error = raw.stats[0];
@@ -590,6 +614,15 @@ void svd_tile(cusolverDnHandle_t solver, cublasHandle_t blas, const double* inpu
   double* dleft, double* dright, double* dproduct, double& relative_error)
 {
   relative_error = 0.0;
+  const std::size_t elements=static_cast<std::size_t>(rows)*cols;
+  if(std::all_of(input,input+elements,[](double value){return value==0.0;})){
+    if(static_cast<std::size_t>(rows)+cols<elements){
+      result.rank=1;result.left.assign(static_cast<std::size_t>(rows),0.0);
+      result.right.assign(static_cast<std::size_t>(cols),0.0);
+    }else result=dense_tile(result.row,result.column,rows,cols,input);
+    return;
+  }
+  // Rank zero is dense in the existing tile format.
   const bool transpose = rows < cols;
   const int m = std::max(rows, cols), n = std::min(rows, cols), rankmax = n;
   const int ld = m;
@@ -668,11 +701,12 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
                                     const RpmdJAModeValidator& mode_validator, const std::string& additive_path,
                                     const std::function<void(const RpmdJAAdditiveData&)>& additive_validator,
                                     const RpmdJAPrepareResourceObserver& resource_observer,
-                                    const RpmdJAPrepareAllocationObserver& allocation_observer)
+                                    const RpmdJAPrepareAllocationObserver& allocation_observer,
+                                    const std::function<void(const RpmdJAReference&)>& readback_validator)
 {
 #ifdef USE_HIP
   (void)raw_path; (void)output_path; (void)kernel_table_path; (void)mode_validator; (void)additive_path; (void)additive_validator;
-  (void)resource_observer; (void)allocation_observer;
+  (void)resource_observer; (void)allocation_observer; (void)readback_validator;
   throw std::runtime_error("qNEP rpmd_ja reference preparation currently requires CUDA cuSOLVER");
 #else
   if (raw_path.empty() || output_path.empty() || kernel_table_path.empty()) throw std::invalid_argument("qNEP rpmd_ja prepare requires raw, output, and kernel-table paths");
@@ -683,7 +717,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
   RpmdJAReference& ref = raw.reference;
   std::printf("    qNEP rpmd_ja raw derivative policy: %s; fd_step %.9g A; %s\n",
     ref.mechanical_policy.c_str(), ref.fd_step,
-    raw.version == 3 ?
+    raw.derivative_version == 3 ?
       "D4 +/-h,+/-2h with D2(h)-D2(2h) checks" : "legacy stencil checks");
   load_rpmd_ja_kernel_table(kernel_table_path, ref);
   const int n = ref.number_of_atoms, d = raw.dimension, r = d - 3;
@@ -716,7 +750,10 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       ref.mechanical_policy = std::string("native_reference_transport;") +
         (additive.internal_mass_com ? "internal_mass_com_pullback_v1;" : "") +
         "finite_temperature_additive_v1;beads=" +
-        std::to_string(additive.beads) + ";derivative=" + std::to_string(raw.version);
+        std::to_string(additive.beads) + ";derivative=" + std::to_string(raw.derivative_version);
+      if(additive.diagnostic)
+        ref.mechanical_policy+=";use=DIAGNOSTIC;response="+additive.response_status+
+          ";numerical="+additive.numerical_status;
       ref.additive_beads = additive.beads;
       ref.additive_epsilon = additive.epsilon;
     }
@@ -790,12 +827,17 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     allocate_gpu(reinterpret_cast<void**>(&dw), 2*static_cast<std::size_t>(d)*sizeof(double), "allocate probe result");
     allocate_gpu(reinterpret_cast<void**>(&dinfo), sizeof(int), "allocate solver info");
     allocate_gpu(reinterpret_cast<void**>(&tilebuf),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate D tile buffer");
-    std::vector<double> row(d);
-    for (int i = 0; i < d; ++i) {
-      raw_in.seekg(k_start + static_cast<std::streamoff>(i)*d*sizeof(double));
-      raw_in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(d*sizeof(double)));
-      if (!raw_in || !std::all_of(row.begin(), row.end(), [](double x){return std::isfinite(x);})) throw std::runtime_error("qNEP raw Hessian contains invalid values");
-      cuda_check(cudaMemcpy(dk + static_cast<std::size_t>(i)*d, row.data(), d*sizeof(double), cudaMemcpyHostToDevice), "upload raw Hessian row");
+    constexpr int k_upload_rows=16;
+    std::vector<double> k_rows(static_cast<std::size_t>(k_upload_rows)*d);
+    for(int i=0;i<d;i+=k_upload_rows){
+      const int rows=std::min(k_upload_rows,d-i);const std::size_t count=static_cast<std::size_t>(rows)*d;
+      raw_in.seekg(k_start+static_cast<std::streamoff>(i)*d*sizeof(double));
+      raw_in.read(reinterpret_cast<char*>(k_rows.data()),static_cast<std::streamsize>(count*sizeof(double)));
+      if(!raw_in||!std::all_of(k_rows.begin(),k_rows.begin()+count,[](double x){return std::isfinite(x);}))
+        throw std::runtime_error("qNEP raw Hessian contains invalid values");
+      cuda_check(cudaMemcpy2D(dk+static_cast<std::size_t>(i)*d,static_cast<std::size_t>(d)*sizeof(double),
+        k_rows.data(),static_cast<std::size_t>(d)*sizeof(double),static_cast<std::size_t>(d)*sizeof(double),rows,
+        cudaMemcpyHostToDevice),"upload raw Hessian row block");
     }
     allocate_gpu(reinterpret_cast<void**>(&dm), n*sizeof(double), "allocate mass vector");
     cuda_check(cudaMemcpy(dm, ref.masses.data(), n*sizeof(double), cudaMemcpyHostToDevice), "upload masses");
@@ -1170,8 +1212,8 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     const std::streamoff vcstart=raw.coarse_v, ccstart=raw.coarse_c;
     const std::uint64_t ddoubles=static_cast<std::uint64_t>(d)*d;
     std::vector<double> energies(n), fenergy(d), coarse_energy(n), fcoarse(d);
-    for(int i=0;i<d;++i){vf.seekg(vstart+static_cast<std::streamoff>(i)*n*sizeof(double));vf.read(reinterpret_cast<char*>(energies.data()),n*sizeof(double));if(!vf)throw std::runtime_error("read fine site derivative");fenergy[i]=-std::accumulate(energies.begin(),energies.end(),0.0);vcf.seekg(vcstart+static_cast<std::streamoff>(i)*n*sizeof(double));vcf.read(reinterpret_cast<char*>(coarse_energy.data()),n*sizeof(double));if(!vcf)throw std::runtime_error("read coarse site derivative");fcoarse[i]=-std::accumulate(coarse_energy.begin(),coarse_energy.end(),0.0);}
-    std::vector<double> transport_diff2(3,0.0),transport_norm2(3,0.0); std::vector<double> crows(static_cast<std::size_t>(tile_size)*d), ccrows(static_cast<std::size_t>(tile_size)*d);
+    for(int i=0;i<d;++i){vf.seekg(vstart+static_cast<std::streamoff>(i)*n*sizeof(double));vf.read(reinterpret_cast<char*>(energies.data()),n*sizeof(double));if(!vf)throw std::runtime_error("read fine site derivative");fenergy[i]=-std::accumulate(energies.begin(),energies.end(),0.0);if(raw.version<4){vcf.seekg(vcstart+static_cast<std::streamoff>(i)*n*sizeof(double));vcf.read(reinterpret_cast<char*>(coarse_energy.data()),n*sizeof(double));if(!vcf)throw std::runtime_error("read coarse site derivative");fcoarse[i]=-std::accumulate(coarse_energy.begin(),coarse_energy.end(),0.0);}}
+    std::vector<double> transport_diff2(3,0.0),transport_norm2(3,0.0),rebuilt_fine_norm2(3,0.0); std::vector<double> crows(static_cast<std::size_t>(tile_size)*d), ccrows(raw.version<4?static_cast<std::size_t>(tile_size)*d:0);
     allocate_gpu(reinterpret_cast<void**>(&sm),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD matrix");
     allocate_gpu(reinterpret_cast<void**>(&su),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD U");
     allocate_gpu(reinterpret_cast<void**>(&svt),static_cast<std::size_t>(tile_size)*tile_size*sizeof(double),"allocate SVD VT");
@@ -1186,17 +1228,18 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     for(int alpha=0;alpha<3;++alpha){
       write_value(out,tile_size);write_value(out,count);
       for(int j=0;j<d;j+=tile_size){const int nc=std::min(tile_size,d-j);
-        for(int y=0;y<nc;++y){cf.clear();cf.seekg(cstart+static_cast<std::streamoff>(alpha*ddoubles+static_cast<std::uint64_t>(j+y)*d)*sizeof(double));cf.read(reinterpret_cast<char*>(crows.data()+static_cast<std::size_t>(y)*d),d*sizeof(double));ccf.clear();ccf.seekg(ccstart+static_cast<std::streamoff>(alpha*ddoubles+static_cast<std::uint64_t>(j+y)*d)*sizeof(double));ccf.read(reinterpret_cast<char*>(ccrows.data()+static_cast<std::size_t>(y)*d),d*sizeof(double));if(!cf||!ccf)throw std::runtime_error("read qNEP virial derivative rows");}
+        for(int y=0;y<nc;++y){cf.clear();cf.seekg(cstart+static_cast<std::streamoff>(alpha*ddoubles+static_cast<std::uint64_t>(j+y)*d)*sizeof(double));cf.read(reinterpret_cast<char*>(crows.data()+static_cast<std::size_t>(y)*d),d*sizeof(double));if(raw.version<4){ccf.clear();ccf.seekg(ccstart+static_cast<std::streamoff>(alpha*ddoubles+static_cast<std::uint64_t>(j+y)*d)*sizeof(double));ccf.read(reinterpret_cast<char*>(ccrows.data()+static_cast<std::size_t>(y)*d),d*sizeof(double));}if(!cf||(raw.version<4&&!ccf))throw std::runtime_error("read qNEP virial derivative rows");}
       const int atom_start=std::max(0,j-alpha*n),atom_end=std::min(n,j+nc-alpha*n);
       const int atom_width=std::max(0,atom_end-atom_start);
-      std::vector<double> vrows(static_cast<std::size_t>(tile_size)*atom_width), vcrows(vrows.size());
+      std::vector<double> vrows(static_cast<std::size_t>(tile_size)*atom_width), vcrows(raw.version<4?vrows.size():0);
       // Internal policy keeps raw ambient Bt/fenergy; cached E^T Bt E realizes the P pullback.
       for(int i=0;i<d;i+=tile_size){const int nr=std::min(tile_size,d-i);
-        if(atom_width>0){vf.clear();vf.seekg(vstart+static_cast<std::streamoff>(i)*n*sizeof(double)+static_cast<std::streamoff>(atom_start)*sizeof(double));for(int x=0;x<nr;++x){vf.read(reinterpret_cast<char*>(vrows.data()+static_cast<std::size_t>(x)*atom_width),static_cast<std::streamsize>(atom_width)*sizeof(double));if(!vf)throw std::runtime_error("read H fine V slice");vf.seekg(static_cast<std::streamoff>(n-atom_width)*sizeof(double),std::ios::cur);}vcf.clear();vcf.seekg(vcstart+static_cast<std::streamoff>(i)*n*sizeof(double)+static_cast<std::streamoff>(atom_start)*sizeof(double));for(int x=0;x<nr;++x){vcf.read(reinterpret_cast<char*>(vcrows.data()+static_cast<std::size_t>(x)*atom_width),static_cast<std::streamsize>(atom_width)*sizeof(double));if(!vcf)throw std::runtime_error("read H coarse V slice");vcf.seekg(static_cast<std::streamoff>(n-atom_width)*sizeof(double),std::ios::cur);}h_v_bytes+=static_cast<std::uint64_t>(2)*nr*atom_width*sizeof(double);}
+        if(atom_width>0){vf.clear();vf.seekg(vstart+static_cast<std::streamoff>(i)*n*sizeof(double)+static_cast<std::streamoff>(atom_start)*sizeof(double));for(int x=0;x<nr;++x){vf.read(reinterpret_cast<char*>(vrows.data()+static_cast<std::size_t>(x)*atom_width),static_cast<std::streamsize>(atom_width)*sizeof(double));if(!vf)throw std::runtime_error("read H fine V slice");vf.seekg(static_cast<std::streamoff>(n-atom_width)*sizeof(double),std::ios::cur);}if(raw.version<4){vcf.clear();vcf.seekg(vcstart+static_cast<std::streamoff>(i)*n*sizeof(double)+static_cast<std::streamoff>(atom_start)*sizeof(double));for(int x=0;x<nr;++x){vcf.read(reinterpret_cast<char*>(vcrows.data()+static_cast<std::size_t>(x)*atom_width),static_cast<std::streamsize>(atom_width)*sizeof(double));if(!vcf)throw std::runtime_error("read H coarse V slice");vcf.seekg(static_cast<std::streamoff>(n-atom_width)*sizeof(double),std::ios::cur);}h_v_bytes+=static_cast<std::uint64_t>(2)*nr*atom_width*sizeof(double);}else h_v_bytes+=static_cast<std::uint64_t>(nr)*atom_width*sizeof(double);}
         std::vector<double> h(static_cast<std::size_t>(nr)*nc),hc(h.size());
-        for(int x=0;x<nr;++x)for(int y=0;y<nc;++y){const int rr0=i+x,cc0=j+y,site=rr0%n,atom=cc0%n,nu=cc0/n;const double mass=std::sqrt(ref.masses[site]*ref.masses[atom]);double v=0,vc=0;if(nu==alpha){v=vrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];vc=vcrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];}double q=crows[static_cast<std::size_t>(y)*d+rr0],qc=ccrows[static_cast<std::size_t>(y)*d+rr0];if(nu==alpha&&site==atom){q-=fenergy[rr0];qc-=fcoarse[rr0];}h[static_cast<std::size_t>(x)*nc+y]=(q-v)/mass;hc[static_cast<std::size_t>(x)*nc+y]=(qc-vc)/mass;}
-        if(!std::all_of(h.begin(),h.end(),[](double x){return std::isfinite(x);})||!std::all_of(hc.begin(),hc.end(),[](double x){return std::isfinite(x);}))throw std::runtime_error("qNEP raw H tile contains non-finite values");
-        for(std::size_t k=0;k<h.size();++k){const double dx=h[k]-hc[k];transport_diff2[alpha]+=dx*dx;transport_norm2[alpha]+=h[k]*h[k];}
+        for(int x=0;x<nr;++x)for(int y=0;y<nc;++y){const int rr0=i+x,cc0=j+y,site=rr0%n,atom=cc0%n,nu=cc0/n;const double mass=std::sqrt(ref.masses[site]*ref.masses[atom]);double v=0,vc=0;if(nu==alpha){v=vrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];if(raw.version<4)vc=vcrows[static_cast<std::size_t>(x)*atom_width+atom-atom_start];}double q=crows[static_cast<std::size_t>(y)*d+rr0],qc=raw.version<4?ccrows[static_cast<std::size_t>(y)*d+rr0]:0.0;if(nu==alpha&&site==atom){q-=fenergy[rr0];if(raw.version<4)qc-=fcoarse[rr0];}h[static_cast<std::size_t>(x)*nc+y]=(q-v)/mass;if(raw.version<4)hc[static_cast<std::size_t>(x)*nc+y]=(qc-vc)/mass;}
+        if(!std::all_of(h.begin(),h.end(),[](double x){return std::isfinite(x);})||(raw.version<4&&!std::all_of(hc.begin(),hc.end(),[](double x){return std::isfinite(x); })))throw std::runtime_error("qNEP raw H tile contains non-finite values");
+        if(raw.version==4)for(const double value:h)rebuilt_fine_norm2[alpha]+=value*value;
+        if(raw.version<4)for(std::size_t k=0;k<h.size();++k){const double dx=h[k]-hc[k];transport_diff2[alpha]+=dx*dx;transport_norm2[alpha]+=h[k]*h[k];}
         if(use_additive) for(int x=0;x<nr;++x) {
           const int row=i+x;
           const auto& sparse=additive.h[alpha];
@@ -1208,7 +1251,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
             const int col=*it;
             const double increment=sparse.values[p]/std::sqrt(ref.masses[row%n]*ref.masses[col%n]);
             h[static_cast<std::size_t>(x)*nc+col-j]+=increment;
-            hc[static_cast<std::size_t>(x)*nc+col-j]+=increment;
+            if(raw.version<4)hc[static_cast<std::size_t>(x)*nc+col-j]+=increment;
           }
         }
         for(int probe=0;probe<3;++probe)for(int x=0;x<nr;++x)for(int y=0;y<nc;++y)
@@ -1223,7 +1266,17 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
       }
       }
     }
-    const std::uint64_t fenergy_v_bytes=static_cast<std::uint64_t>(2)*d*n*sizeof(double);
+    if(raw.version==4)for(int alpha=0;alpha<3;++alpha){
+      const double stored_norm=raw.transport_norm2[alpha];
+      const double norm_scale=std::max(std::abs(rebuilt_fine_norm2[alpha]),std::abs(stored_norm));
+      const double norm_tolerance=16.0*std::numeric_limits<double>::epsilon()*ddoubles*norm_scale+
+        static_cast<double>(ddoubles)*std::numeric_limits<double>::denorm_min();
+      if(!std::isfinite(rebuilt_fine_norm2[alpha])||std::abs(rebuilt_fine_norm2[alpha]-stored_norm)>norm_tolerance)
+        throw std::runtime_error("qNEP v4 stored native-H norm does not match reconstructed H");
+      transport_diff2[alpha]=raw.transport_diff2[alpha];
+      transport_norm2[alpha]=stored_norm;
+    }
+    const std::uint64_t fenergy_v_bytes=static_cast<std::uint64_t>(raw.version<4?2:1)*d*n*sizeof(double);
     printf("    qNEP H V logical reads: slices=%llu bytes, fenergy=%llu bytes, total=%llu bytes.\n",static_cast<unsigned long long>(h_v_bytes),static_cast<unsigned long long>(fenergy_v_bytes),static_cast<unsigned long long>(h_v_bytes+fenergy_v_bytes));
     cuda_check(cudaFree(sm),"free SVD matrix");sm=nullptr;cuda_check(cudaFree(su),"free SVD U");su=nullptr;cuda_check(cudaFree(svt),"free SVD VT");svt=nullptr;cuda_check(cudaFree(sw),"free SVD workspace");sw=nullptr;cuda_check(cudaFree(sinfo),"free SVD info");sinfo=nullptr;cuda_check(cudaFree(dsingular),"free singular values");dsingular=nullptr;
     cuda_check(cudaFree(dleft),"free SVD verify left");dleft=nullptr;cuda_check(cudaFree(dright),"free SVD verify right");dright=nullptr;cuda_check(cudaFree(dproduct),"free SVD verify product");dproduct=nullptr;
@@ -1258,6 +1311,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
           throw std::runtime_error("stored reference D/Bt action differs from the prepared operator");
       }
     }
+    if(readback_validator)readback_validator(readback);
     std::printf("    qNEP stored-reference D/Bt action readback: 3 frozen probes per operator passed.\n");
     created.clear();
   } catch (...) {

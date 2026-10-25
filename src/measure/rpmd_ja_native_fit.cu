@@ -137,7 +137,7 @@ SampleHeader read_header(std::istream& in, const std::uint64_t frame_count, cons
 struct QrawIdentity
 {
   std::streamoff data_offset=0,k_offset=0;
-  std::uint32_t version=0;
+  std::uint32_t version=0,derivative_version=0;
   std::uint64_t source_fnv64=0;
   std::uint64_t model=0,config=0;
   int charge=0,kspace=0;
@@ -170,7 +170,7 @@ QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptio
   const auto config=read<std::uint64_t>(raw,"qraw config fingerprint");const int charge=read<std::int32_t>(raw,"qraw charge mode");
   const int kspace=read<std::int32_t>(raw,"qraw kspace flag");const double mesh=read<double>(raw,"qraw mesh spacing");
   char layout[sizeof("xyz_soa;derivative_input_rows_output_columns")];raw.read(layout,sizeof(layout));
-  if(!raw||std::memcmp(magic,"GPJQRAW\0",8)||version!=3||endian!=native_endian||raw_n!=n||raw_d!=d||
+  if(!raw||std::memcmp(magic,"GPJQRAW\0",8)||(version<1||version>4)||endian!=native_endian||raw_n!=n||raw_d!=d||
      temperature!=options.temperature||fd_step!=options.fd_step||
      std::memcmp(layout,"xyz_soa;derivative_input_rows_output_columns",sizeof(layout)))
     throw std::runtime_error("qraw version, dimensions, temperature, fd step, or matrix layout does not match native fit assumptions");
@@ -184,8 +184,14 @@ QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptio
   if(!raw||data<0)throw std::runtime_error("qraw payload offset is invalid");
   const std::uint64_t dd=static_cast<std::uint64_t>(d)*d,vd=static_cast<std::uint64_t>(d)*n;
   const std::uint64_t max_u64=std::numeric_limits<std::uint64_t>::max();
-  if(dd>(max_u64-18)/7||vd>(max_u64-(7*dd+18))/2)throw std::runtime_error("qraw byte length overflows");
-  const std::uint64_t payload_elements=2*vd+7*dd+18;
+  std::uint64_t payload_elements=0;
+  if(version==4){
+    if(dd>(max_u64-24)/4||vd>max_u64-4*dd-24)throw std::runtime_error("qraw byte length overflows");
+    payload_elements=vd+4*dd+24;
+  }else{
+    if(dd>(max_u64-18)/7||vd>(max_u64-(7*dd+18))/2)throw std::runtime_error("qraw byte length overflows");
+    payload_elements=2*vd+7*dd+18;
+  }
   if(payload_elements>max_u64/sizeof(double))throw std::runtime_error("qraw byte length overflows");
   const std::uint64_t payload_bytes=payload_elements*sizeof(double);
   if(payload_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())-static_cast<std::uint64_t>(data))
@@ -218,16 +224,22 @@ QrawIdentity validate_qraw_identity(std::istream& raw,const RpmdJANativeFitOptio
     throw std::runtime_error("qNEP qraw model, PPPM configuration, temperature, step, atom identity, cell, or sampled training R0 does not match current fit inputs");
   raw.clear();raw.seekg(0,std::ios::end);const std::streamoff actual_end=raw.tellg();
   if(actual_end!=expected_end)throw std::runtime_error("qNEP raw file byte length is invalid");
-  raw.seekg(data+static_cast<std::streamoff>(2*vd+7*dd)*sizeof(double));double stats[18]={};
-  raw.read(reinterpret_cast<char*>(stats),sizeof(stats));
-  const bool finite_stats=raw&&std::all_of(stats,stats+18,[](double value){return std::isfinite(value)&&value>=0.0;});
+  const std::uint64_t footer_elements=version==4?vd+4*dd:2*vd+7*dd;
+  raw.seekg(data+static_cast<std::streamoff>(footer_elements)*sizeof(double));double stats[24]={};
+  raw.read(reinterpret_cast<char*>(stats),(version==4?24:18)*sizeof(double));
+  const bool finite_stats=raw&&std::all_of(stats,stats+(version==4?24:18),[](double value){return std::isfinite(value)&&value>=0.0;});
   const bool raw_v1=stats[17]==1.0&&stats[1]<=1e-4&&std::max({stats[2],stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]})<=5e-2;
   const bool raw_v2=stats[17]==2.0&&stats[1]<=1e-4&&stats[3]<=1e-4&&std::max({stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]})<=5e-2;
   const bool raw_v3=stats[17]==3.0&&stats[1]<=1e-4&&stats[3]<=1e-4&&std::max({stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]})<=5e-2;
-  if(!finite_stats||stats[16]!=options.fd_step||(version==1?!raw_v1:(version==2?!raw_v2:!raw_v3)))
+  const bool raw_v4=stats[17]==3.0&&stats[1]<=1e-4&&stats[3]<=1e-4&&
+    std::max({stats[4],stats[6],stats[7],stats[8],stats[14],stats[15]})<=5e-2&&
+    std::all_of(stats+18,stats+24,[](double value){return std::isfinite(value)&&value>=0.0;})&&
+    std::max({std::sqrt(stats[18]/std::max(stats[21],1.0e-300)),
+      std::sqrt(stats[19]/std::max(stats[22],1.0e-300)),std::sqrt(stats[20]/std::max(stats[23],1.0e-300))})<=5e-2;
+  if(!finite_stats||stats[16]!=options.fd_step||(version==1?!raw_v1:(version==2?!raw_v2:(version==3?!raw_v3:!raw_v4))))
     throw std::runtime_error("qNEP raw diagnostics fail accepted limits");
   QrawIdentity identity;
-  identity.data_offset=data;identity.k_offset=k_offset;identity.version=version;
+  identity.data_offset=data;identity.k_offset=k_offset;identity.version=version;identity.derivative_version=version==4?3:version;
   identity.model=model;identity.config=config;identity.charge=charge;identity.kspace=kspace;
   identity.mesh=mesh;identity.active_mesh=active_mesh;identity.model_sha256=active_model_sha256;
   raw.clear();return identity;
@@ -4596,6 +4608,8 @@ struct CovarianceFitTestHooks
   int checkpoint_interruptions_remaining=0;
   bool fail_after_prepare_publication=false;
   bool fail_between_reference_and_sidecar_renames=false;
+  bool fail_graph_reference_response_hard=false;
+  bool skip_graph_reference_mode_validator=false;
   std::uint64_t objective_evaluation_budget_after_baseline=0;
   std::vector<double> current_trial_theta,last_residual_rejected_theta;
 };
@@ -5994,7 +6008,19 @@ struct CovarianceBaseline
 {
   std::vector<double> theta,trace;
   double mu=0.0,logdet=0.0,shifted_logdet=0.0,boundary_mu=0.0,epsilon=0.0;
+  double phi=std::numeric_limits<double>::quiet_NaN(),phi_relative=std::numeric_limits<double>::quiet_NaN();
+  double phi_solve_residual_heuristic=std::numeric_limits<double>::quiet_NaN(),root_bracket_width=0.0,stability_bracket_width=0.0;
+  double root_relative_tolerance=std::numeric_limits<double>::quiet_NaN();
+  double minimum_shifted_cholesky_diagonal=std::numeric_limits<double>::quiet_NaN();
+  unsigned root_iterations=0;
+  std::string stationarity_status="NOT_EVALUATED";
   bool epsilon_constraint_active=false;
+};
+
+struct GraphReferenceBaselineCandidate
+{
+  double mu=0.0;
+  std::vector<double> theta;
 };
 
 struct CovarianceAnalyticCurvatureCache
@@ -6560,6 +6586,77 @@ std::vector<double> graph_laplacian_direction(const Graph& graph,const int param
   return direction;
 }
 
+GraphReferenceBaselineCandidate read_graph_reference_baseline_candidate(const std::string& path,
+  const std::string& samples_path,const std::string& raw_path,const RpmdJANativeFitOptions& options,
+  const SampleHeader& header,const QrawIdentity& qraw_identity,const Graph& graph,
+  const std::uint64_t frame_count,const int training_frames)
+{
+  rpmd_ja_file_io::ifstream input(path);
+  if(!input)throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: cannot open baseline state");
+  const std::vector<std::string> wanted={"state_format_version","fit_method","samples","qraw","cutoff_A","epsilon","fd_step",
+    "temperature_K","internal_mass_com","sample_frames","training_frames","sample_interval","beads","parameter_count",
+    "qraw_model_fingerprint","qraw_config_fingerprint","qraw_source_fnv64","samples_source_fnv64","qraw_charge_mode",
+    "qraw_kspace_flag","qraw_mesh_spacing","active_pppm_mesh_spacing","baseline_mu","baseline_epsilon_constraint_status",
+    "parameter_family","parameter_map","theta_baseline"};
+  std::map<std::string,std::string> fields;std::string line;
+  while(std::getline(input,line)){
+    std::istringstream row(line);std::string key;if(!(row>>key))continue;
+    if(std::find(wanted.begin(),wanted.end(),key)==wanted.end())continue;
+    std::string value;std::getline(row,value);const auto first=value.find_first_not_of(" \t");
+    value=first==std::string::npos?std::string():value.substr(first);
+    if(!fields.emplace(key,std::move(value)).second)
+      throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: duplicate saved baseline identity field "+key);
+  }
+  auto required=[&](const char* key)->const std::string&{const auto found=fields.find(key);
+    if(found==fields.end())throw std::runtime_error(std::string("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: missing ")+key);return found->second;};
+  auto scalar=[&](const char* key){std::istringstream row(required(key));double value=0.0;std::string extra;
+    if(!(row>>value)||!std::isfinite(value)||(row>>extra))throw std::runtime_error(std::string("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: invalid ")+key);return value;};
+  auto integer=[&](const char* key){std::istringstream row(required(key));long long value=0;std::string extra;
+    if(!(row>>value)||(row>>extra))throw std::runtime_error(std::string("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: invalid ")+key);return value;};
+  auto unsigned_integer=[&](const char* key){std::istringstream row(required(key));std::uint64_t value=0;std::string extra;
+    if(!(row>>value)||(row>>extra))throw std::runtime_error(std::string("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: invalid ")+key);return value;};
+  auto matches=[](const double a,const double b){return std::isfinite(a)&&std::isfinite(b)&&
+    std::abs(a-b)<=1e-12*std::max({1.0,std::abs(a),std::abs(b)});};
+  if(integer("state_format_version")!=4||required("fit_method")!="gaussian_covariance_shrinkage"||
+     !matches(scalar("cutoff_A"),options.cutoff)||!matches(scalar("epsilon"),options.epsilon)||
+     !matches(scalar("fd_step"),options.fd_step)||!matches(scalar("temperature_K"),header.temperature)||
+     integer("internal_mass_com")!=(options.internal_mass_com?1:0)||integer("sample_frames")!=static_cast<long long>(frame_count)||
+     integer("training_frames")!=training_frames||integer("sample_interval")!=options.sample_interval||
+     integer("beads")!=header.beads||integer("parameter_count")!=graph.parameter_count||
+     unsigned_integer("qraw_model_fingerprint")!=qraw_identity.model||
+     unsigned_integer("qraw_config_fingerprint")!=qraw_identity.config||
+     unsigned_integer("qraw_source_fnv64")!=rpmd_ja_model_fingerprint(raw_path)||
+     unsigned_integer("samples_source_fnv64")!=rpmd_ja_model_fingerprint(samples_path)||
+     integer("qraw_charge_mode")!=qraw_identity.charge||integer("qraw_kspace_flag")!=qraw_identity.kspace||
+     !matches(scalar("qraw_mesh_spacing"),qraw_identity.mesh)||
+     !matches(scalar("active_pppm_mesh_spacing"),qraw_identity.active_mesh)||required("parameter_family")!="M0")
+    throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: saved samples/qraw/configuration or graph parameters differ");
+  const std::string constraint=required("baseline_epsilon_constraint_status");
+  if(constraint!="ACTIVE"&&constraint!="INACTIVE")
+    throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: invalid saved baseline constraint status");
+  std::istringstream parameter_map(required("parameter_map"));std::size_t pair_count=0;std::string components;
+  if(!(parameter_map>>pair_count>>components)||components!="components"||pair_count!=graph.type_pairs.size())
+    throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: saved graph parameter map dimensions differ");
+  const std::array<const char*,6> component_names={{"xx","xy","xz","yy","yz","zz"}};
+  for(const char* name:component_names){std::string saved;if(!(parameter_map>>saved)||saved!=name)
+      throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: saved graph component map differs");}
+  for(const auto& pair:graph.type_pairs){int first=0,second=0;if(!(parameter_map>>first>>second)||first!=pair.first||second!=pair.second)
+      throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: saved graph type-pair map differs");}
+  parameter_map>>std::ws;if(!parameter_map.eof())throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: saved graph map has trailing values");
+  GraphReferenceBaselineCandidate candidate;candidate.mu=scalar("baseline_mu");
+  std::istringstream theta_row(required("theta_baseline"));std::size_t theta_count=0;
+  if(!(theta_row>>theta_count)||theta_count!=static_cast<std::size_t>(graph.parameter_count))
+    throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: baseline theta dimensions differ");
+  candidate.theta.resize(theta_count);for(double& value:candidate.theta)if(!(theta_row>>value)||!std::isfinite(value))
+    throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: baseline theta is non-finite or truncated");
+  theta_row>>std::ws;if(!theta_row.eof())throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: baseline theta has trailing values");
+  const std::vector<double> direction=graph_laplacian_direction(graph,graph.parameter_count);
+  for(std::size_t index=0;index<direction.size();++index)
+    if(!matches(candidate.theta[index],candidate.mu*direction[index]))
+      throw std::runtime_error("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: theta_baseline is not baseline_mu times the frozen graph direction");
+  return candidate;
+}
+
 CovarianceBaseline build_graph_covariance_baseline(DeviceCovarianceSystem& system,const std::vector<double>& statistics,
   const double epsilon,std::uint64_t& objective_evaluations,rpmd_ja_feasibility::Budget* budget=nullptr,
   const rpmd_ja_feasibility::Limits* limits=nullptr,double* objective_seconds=nullptr)
@@ -6632,6 +6729,146 @@ CovarianceBaseline build_graph_covariance_baseline(DeviceCovarianceSystem& syste
   if(!system.evaluate_factors(result.theta,epsilon,result.logdet,result.shifted_logdet,&result.trace))
     throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline did not retain strict epsilon-positive curvature");
   result.epsilon_constraint_active=result.mu-floor<=1e-4*std::max({epsilon,std::abs(result.mu),std::abs(floor),1e-12});
+  return result;
+}
+
+CovarianceBaseline build_graph_reference_baseline(DeviceCovarianceSystem& system,const std::vector<double>& statistics,
+  const double epsilon,std::uint64_t& objective_evaluations,rpmd_ja_feasibility::Budget* budget=nullptr,
+  const rpmd_ja_feasibility::Limits* limits=nullptr,double* objective_seconds=nullptr,
+  const GraphReferenceBaselineCandidate* saved_candidate=nullptr)
+{
+  if(statistics.size()!=static_cast<std::size_t>(system.p)||!(epsilon>0.0)||!std::isfinite(epsilon))
+    throw std::invalid_argument("native covariance fit baseline inputs are invalid");
+  const std::vector<double> direction=graph_laplacian_direction(system.graph,system.p);
+  const double data_slope=covariance_dot(statistics,direction);
+  if(!(data_slope>0.0)||!std::isfinite(data_slope))throw std::runtime_error("BASELINE_SPD_FAIL: training fluctuations do not bound the graph baseline objective");
+  auto parameters_at=[&](const double mu){std::vector<double> value(direction.size());for(std::size_t i=0;i<value.size();++i)value[i]=mu*direction[i];return value;};
+  constexpr double relative_root_tolerance_floor=1.0e-7;
+  if(saved_candidate){
+    CovarianceWallSeconds objective_time(objective_seconds);covariance_budget_observe_or_throw(budget,limits);++objective_evaluations;
+    CovarianceBaseline candidate;candidate.mu=saved_candidate->mu;candidate.theta=saved_candidate->theta;candidate.epsilon=epsilon;
+    candidate.root_relative_tolerance=relative_root_tolerance_floor;
+    candidate.boundary_mu=std::numeric_limits<double>::quiet_NaN();candidate.stability_bracket_width=std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> shifted_diagonal;
+    bool candidate_feasible=false;
+    try{candidate_feasible=system.evaluate_factors(candidate.theta,epsilon,candidate.logdet,candidate.shifted_logdet,
+      &candidate.trace,nullptr,false,true,nullptr,nullptr,nullptr,&shifted_diagonal);}
+    catch(const CovarianceSolveResidualError&){candidate_feasible=false;}
+    if(candidate_feasible){
+      candidate.phi=covariance_dot(candidate.trace,direction)-data_slope;
+      const double scale=std::max(std::abs(data_slope),std::abs(candidate.phi+data_slope));
+      candidate.phi_relative=std::abs(candidate.phi)/scale;
+      candidate.phi_solve_residual_heuristic=scale*std::max(1.0e-12,2.0*system.worst_solve_relative_residual);
+      if(std::isfinite(candidate.phi_relative)&&
+         system.worst_solve_relative_residual<=1.0e-7&&candidate.phi_relative<=relative_root_tolerance_floor){
+        if(shifted_diagonal.empty())throw std::runtime_error("BASELINE_SPD_FAIL: saved baseline has no shifted Cholesky diagonal");
+        candidate.minimum_shifted_cholesky_diagonal=*std::min_element(shifted_diagonal.begin(),shifted_diagonal.end());
+        candidate.stationarity_status="SAVED_BASELINE_FREE_ROOT_VERIFIED";
+        return candidate;
+      }
+    }
+  }
+  auto evaluate_mu=[&](const double mu,double& value){CovarianceWallSeconds objective_time(objective_seconds);
+    covariance_budget_observe_or_throw(budget,limits);++objective_evaluations;double logdet=0.0,shifted=0.0;
+    if(!system.evaluate_factors(parameters_at(mu),epsilon,logdet,shifted,nullptr))return false;
+    value=0.5*mu*data_slope-0.5*logdet;if(!std::isfinite(value))throw std::runtime_error("native covariance fit baseline objective is non-finite");return true;};
+  const double initial_step=std::max(epsilon,1e-8);
+  double floor=0.0,floor_bracket_width=0.0,zero_objective=0.0;const bool zero_feasible=evaluate_mu(0.0,zero_objective);
+  if(zero_feasible){
+    double feasible=0.0,infeasible=0.0,distance=initial_step;bool found=false;
+    for(int attempt=0;attempt<64;++attempt){infeasible=feasible-distance;if(!std::isfinite(infeasible))break;double ignored=0.0;
+      if(!evaluate_mu(infeasible,ignored)){found=true;break;}feasible=infeasible;distance*=2.0;if(!std::isfinite(distance))break;}
+    if(!found)throw std::runtime_error("BASELINE_SPD_FAIL: could not bracket the negative graph-Laplacian feasibility boundary");
+    double low=infeasible,high=feasible;for(int iteration=0;iteration<32;++iteration){const double middle=low+0.5*(high-low);double ignored=0.0;
+      if(evaluate_mu(middle,ignored))high=middle;else low=middle;}floor=high;floor_bracket_width=high-low;
+  }else{
+    double low=0.0,high=initial_step,high_objective=0.0;bool found=false;
+    for(int attempt=0;attempt<64;++attempt){if(evaluate_mu(high,high_objective)){found=true;break;}low=high;high*=2.0;if(!std::isfinite(high))break;}
+    if(!found)throw std::runtime_error("BASELINE_SPD_FAIL: could not find a graph-Laplacian shift with D_b-epsilon I positive definite");
+    for(int iteration=0;iteration<32;++iteration){const double middle=low+0.5*(high-low);double ignored=0.0;
+      if(evaluate_mu(middle,ignored))high=middle;else low=middle;}floor=high;floor_bracket_width=high-low;
+  }
+  auto stationarity=[&](const double mu,double& phi,double& objective,std::vector<double>* traces=nullptr,
+                        double* minimum_shifted_diagonal=nullptr){
+    if(!evaluate_mu(mu,objective))return false;
+    if(traces||minimum_shifted_diagonal){
+      double logdet=0.0,shifted=0.0;std::vector<double> diagonal;
+      covariance_budget_observe_or_throw(budget,limits);
+      if(!system.evaluate_factors(parameters_at(mu),epsilon,logdet,shifted,traces,nullptr,false,true,nullptr,nullptr,nullptr,
+          minimum_shifted_diagonal?&diagonal:nullptr))return false;
+      if(minimum_shifted_diagonal){if(diagonal.empty())throw std::runtime_error("BASELINE_SPD_FAIL: shifted Cholesky diagonal is unavailable");
+        *minimum_shifted_diagonal=*std::min_element(diagonal.begin(),diagonal.end());}
+    }else{
+      double logdet=0.0,shifted=0.0;std::vector<double> trace;
+      covariance_budget_observe_or_throw(budget,limits);
+      if(!system.evaluate_factors(parameters_at(mu),epsilon,logdet,shifted,&trace,nullptr,false,true))return false;
+      phi=covariance_dot(trace,direction)-data_slope;
+    }
+    if(traces)phi=covariance_dot(*traces,direction)-data_slope;
+    if(!std::isfinite(phi))throw std::runtime_error("BASELINE_SPD_FAIL: graph-Laplacian stationarity residual is non-finite");
+    return true;
+  };
+  constexpr unsigned maximum_root_iterations=64;
+  CovarianceBaseline result;result.boundary_mu=floor;result.epsilon=epsilon;result.stability_bracket_width=floor_bracket_width;
+  double floor_phi=0.0,floor_objective=0.0;
+  if(!stationarity(floor,floor_phi,floor_objective))
+    throw std::runtime_error("BASELINE_SPD_FAIL: stability boundary stationarity evaluation failed");
+  const double floor_trace_scale=std::max(std::abs(data_slope),std::abs(floor_phi+data_slope));
+  result.phi_solve_residual_heuristic=floor_trace_scale*std::max(1.0e-12,2.0*system.worst_solve_relative_residual);
+  result.root_relative_tolerance=relative_root_tolerance_floor;
+  double lo=floor,hi=floor,phi_lo=floor_phi,phi_hi=floor_phi,objective= floor_objective;
+  if(floor_phi/floor_trace_scale<=relative_root_tolerance_floor)
+    throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: stability-bound derivative sign is zero, negative, or inside the fixed stationarity tolerance; no KKT claim is made");
+  {
+    double distance=std::max(epsilon,1.0e-8);bool bracketed=false;
+    for(unsigned attempt=0;attempt<64;++attempt){
+      hi=floor+distance;
+      if(!std::isfinite(hi)||!stationarity(hi,phi_hi,objective))
+        throw std::runtime_error("BASELINE_SPD_FAIL: one-dimensional root bracket left the stable interval");
+      if(phi_hi<=0.0){bracketed=true;break;}
+      lo=hi;phi_lo=phi_hi;distance*=2.0;
+    }
+    if(!bracketed)throw std::runtime_error("BASELINE_ROOT_FAIL: could not bracket the free graph-Laplacian stationarity root");
+    double best_mu=std::abs(phi_lo)<std::abs(phi_hi)?lo:hi;
+    double best_phi=std::abs(phi_lo)<std::abs(phi_hi)?phi_lo:phi_hi;
+    for(unsigned iteration=0;iteration<maximum_root_iterations;++iteration){
+      const double middle=lo+0.5*(hi-lo);
+      if(middle==lo||middle==hi)break;
+      double middle_phi=0.0,middle_objective=0.0;
+      if(!stationarity(middle,middle_phi,middle_objective))
+        throw std::runtime_error("BASELINE_ROOT_FAIL: bisection candidate is not stable");
+      ++result.root_iterations;
+      if(std::abs(middle_phi)<std::abs(best_phi)){best_mu=middle;best_phi=middle_phi;objective=middle_objective;}
+      if(middle_phi>0.0){lo=middle;phi_lo=middle_phi;}else{hi=middle;phi_hi=middle_phi;}
+      const double scale=std::max(std::abs(data_slope),std::abs(middle_phi+data_slope));
+      if(scale>0.0&&std::abs(middle_phi)/scale<=relative_root_tolerance_floor)break;
+    }
+    result.mu=best_mu;result.phi=best_phi;result.root_bracket_width=hi-lo;
+    result.stationarity_status="FREE_ROOT";
+    if(std::abs(best_phi)/std::max(std::abs(data_slope),std::abs(best_phi+data_slope))>result.root_relative_tolerance)
+      throw std::runtime_error("BASELINE_ROOT_FAIL: bounded one-dimensional root did not meet its stationarity tolerance");
+  }
+  result.theta=parameters_at(result.mu);
+  covariance_budget_observe_or_throw(budget,limits);
+  CovarianceGradientBudgetReservation gradient_budget(budget,limits);
+  std::vector<double> shifted_diagonal;
+  if(!system.evaluate_factors(result.theta,epsilon,result.logdet,result.shifted_logdet,&result.trace,nullptr,false,true,
+       nullptr,nullptr,nullptr,&shifted_diagonal))
+    throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline did not retain strict epsilon-positive curvature");
+  if(shifted_diagonal.empty())throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline has no shifted Cholesky diagonal");
+  result.phi=covariance_dot(result.trace,direction)-data_slope;
+  result.phi_relative=std::abs(result.phi)/std::max(std::abs(data_slope),std::abs(result.phi+data_slope));
+  result.phi_solve_residual_heuristic=std::max(1.0e-12,2.0*system.worst_solve_relative_residual)*
+    std::max(std::abs(data_slope),std::abs(result.phi+data_slope));
+  result.root_relative_tolerance=relative_root_tolerance_floor;
+  if(!result.epsilon_constraint_active&&result.phi_relative>result.root_relative_tolerance)
+    throw std::runtime_error("BASELINE_ROOT_FAIL: final selected point exceeds the fixed relative stationarity tolerance");
+  result.minimum_shifted_cholesky_diagonal=*std::min_element(shifted_diagonal.begin(),shifted_diagonal.end());
+  if(result.epsilon_constraint_active)
+    throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: active stability-bound references are not certified by the available trace solve");
+  result.stationarity_status="FREE_ROOT";
+  if(!std::isfinite(result.minimum_shifted_cholesky_diagonal)||!(result.minimum_shifted_cholesky_diagonal>0.0))
+    throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline has no positive shifted Cholesky diagonal");
   return result;
 }
 
@@ -11782,13 +12019,19 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
     rpmd_ja_covariance_checkpoint::write_controller_journal(controller_checkpoint_path,controller_journal);
   };
-  if(covariance_method&&!rpmd_ja_covariance_prior_ridge_valid(options.covariance_shrinkage,options.covariance_ridge_lambda))
+  if(covariance_method&&!options.graph_reference&&
+     !rpmd_ja_covariance_prior_ridge_valid(options.covariance_shrinkage,options.covariance_ridge_lambda))
     throw std::invalid_argument("native covariance objective requires positive shrinkage rho or a positive ridge lambda; both must be finite and non-negative");
   if(options.output_path.empty()||options.kernel_table.empty()||spool_path.empty()||!std::isfinite(options.temperature)||options.temperature<=0.0||
      !std::isfinite(options.cutoff)||options.cutoff<=0.0||!std::isfinite(options.epsilon)||options.epsilon<=0.0||
      !std::isfinite(options.response_tolerance)||options.response_tolerance<0.0||!std::isfinite(options.ibp_tolerance)||options.ibp_tolerance<0.0||!std::isfinite(options.fd_step)||options.fd_step<=0.0||
      options.sample_interval<=0||(!covariance_method&&options.max_stability_rounds<=0)||
-     (covariance_method&&(options.max_covariance_iterations<=0||
+     (options.graph_reference&&(!covariance_method||options.covariance_feasibility||options.covariance_shrinkage!=0.0||
+       options.covariance_ridge_lambda!=0.0||options.covariance_analytic_curvature_probes!=0||
+       options.covariance_block_newton||options.covariance_joint_block||options.covariance_trust_region||
+       options.covariance_staged_barrier||options.covariance_structured_basis||
+       !options.covariance_blind_samples.empty()||!options.covariance_blind_manifest_path.empty()))||
+     (covariance_method&&((!options.graph_reference&&options.max_covariance_iterations<=0)||
        options.raw_input_path.empty()||!std::isfinite(options.covariance_ridge_lambda)||options.covariance_ridge_lambda<0.0||
        (options.covariance_analytic_curvature_probes!=0&&options.covariance_analytic_curvature_probes!=16&&
         options.covariance_analytic_curvature_probes!=32&&options.covariance_analytic_curvature_probes!=64&&
@@ -11949,6 +12192,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const int max_rounds=options.max_stability_rounds;
   if(!covariance_method){std::printf("rpmd_ja fit stability round limit=%d\n",max_rounds);
     std::printf("rpmd_ja fit stability cut epsilon=%.17g cut_guard=%.17g cut_target=%.17g\n",options.epsilon,cut_guard,cut_target);}
+  else if(options.graph_reference)std::printf("rpmd_ja graph_reference method=independent_one_parameter_graph_baseline; no rho, ridge, tau, or 60-parameter optimizer\n");
   else std::printf("rpmd_ja fit method=gaussian_covariance_shrinkage rho_effective=%.17g rho_configured=%.17g max_iter=%d direction=%s staged_barrier=%s; exact dense Cholesky is enabled\n",
     effective_covariance_rho,options.covariance_shrinkage,options.max_covariance_iterations,options.covariance_trust_region?"trust_region":
       options.covariance_joint_block?"joint_block":options.covariance_block_newton?"block_newton":"BFGS",
@@ -12133,9 +12377,10 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       throw std::runtime_error(std::string("IMPLEMENTATION_FAIL: invalid remaining-cost plan at ")+boundary);
     return prediction.status;
   };
-  trace<<std::setprecision(17)<<"evidence SAMPLED; "<<(covariance_method?"exact covariance SPD, held-out response, prepare and stored-D certificate remain required; no stability-cut feedback is used; IBP is diagnostic only":"QP_PASS is current finite cut-set only; Ritz/CG, held-out response and final stored-D Cholesky remain required; IBP is diagnostic only")
-    <<"\nfit_method "<<(covariance_method?"gaussian_covariance_shrinkage":"force_least_squares_cut_qp")
-    <<"\nreference_class finite_temperature_additive\n";
+  trace<<std::setprecision(17)<<"evidence SAMPLED; "<<(options.graph_reference?"independent one-parameter graph baseline; held-out response is diagnostic; prepare and stored-D certificate remain required; no 60-parameter optimizer is run":covariance_method?"exact covariance SPD, held-out response, prepare and stored-D certificate remain required; no stability-cut feedback is used; IBP is diagnostic only":"QP_PASS is current finite cut-set only; Ritz/CG, held-out response and final stored-D Cholesky remain required; IBP is diagnostic only")
+    <<"\nfit_method "<<(options.graph_reference?"independent_one_parameter_graph_baseline":covariance_method?"gaussian_covariance_shrinkage":"force_least_squares_cut_qp")
+    <<"\nreference_class finite_temperature_additive\n"
+    <<(options.graph_reference?"reference_use DIAGNOSTIC\nnumerical_status NOT_EVALUATED\nresponse_status NOT_MEASURED\nsample_provenance_status NOT_VERIFIABLE_GPJASMP1_HAS_NO_MODEL_OR_PPPM_FINGERPRINT\nstatistic_definition FIXED_R0_SECOND_MOMENT_NOT_CENTERED_COVARIANCE\ntraining_R0_definition FIRST_FLOOR_2F_OVER_3_CHRONOLOGICAL_FRAMES_QRAW_MATCH_REQUIRED\n":"");
   if(budget){
     (void)verify_feasibility_preflight(options.output_path);
     const char* receipt_path=std::getenv("GPUMD_RPMD_JA_PREFLIGHT_RECEIPT");
@@ -12156,8 +12401,9 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   trace<<"candidate_identity strategy native_additive_fixed_cutoff_graph output "<<std::quoted(options.output_path)<<" samples "<<std::quoted(spool_path)<<" raw "<<std::quoted(raw_path)
     <<"\ncandidate_parameters cutoff_A="<<options.cutoff<<" epsilon="<<options.epsilon<<" response_tolerance="<<options.response_tolerance
     <<" fd_step="<<options.fd_step<<" temperature_K="<<options.temperature<<" sample_interval="<<options.sample_interval;
-  if(covariance_method)trace<<(options.covariance_feasibility?" rho_A":" rho_effective")<<'='<<(options.covariance_feasibility?options.covariance_shrinkage:effective_covariance_rho)
+  if(covariance_method&&!options.graph_reference)trace<<(options.covariance_feasibility?" rho_A":" rho_effective")<<'='<<(options.covariance_feasibility?options.covariance_shrinkage:effective_covariance_rho)
     <<" max_covariance_iterations="<<options.max_covariance_iterations;
+  if(options.graph_reference)trace<<"\nscalar_baseline_method one_parameter_stationarity_root\noptimizer_60_parameter_run 0";
   if(covariance_method)trace<<"\nstability_cut_policy NONE covariance_cholesky_enforces_D_minus_epsilon_I_SPD";
   else trace<<"\nstability_cut_policy epsilon="<<options.epsilon<<" cut_guard="<<cut_guard<<" cut_target="<<cut_target<<" guard_fraction="<<stability_cut_guard_fraction;
   trace<<"\nsample_IBP_status "<<sample_statistics.ibp_band.status<<" estimate "<<sample_statistics.ibp_band.estimate<<" q99_radius "<<sample_statistics.ibp_band.radius
@@ -12246,6 +12492,8 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   if(options.internal_mass_com)qnep_size_metadata.mechanical_policy+="internal_mass_com_pullback_v1;";
   qnep_size_metadata.mechanical_policy+="finite_temperature_additive_v1;beads="+
     std::to_string(header.beads)+";derivative=3";
+  if(options.graph_reference)
+    qnep_size_metadata.mechanical_policy+=";use=DIAGNOSTIC;response=INCONCLUSIVE;numerical=PASS";
   load_rpmd_ja_kernel_table(options.kernel_table,qnep_size_metadata);
   const std::uint64_t estimated_qnep_reference_bytes=
     estimate_rpmd_ja_qnep_v3_max_serialized_bytes(qnep_size_metadata);
@@ -12254,7 +12502,8 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   const NativeAdditivePackageEstimate package_estimate_m0=estimate_native_additive_package_size(graph,n);
   const NativeAdditivePackageEstimate package_estimate_m1=options.covariance_feasibility?
     estimate_native_additive_package_size(structured_graph,n):package_estimate_m0;
-  const std::uint64_t estimated_package_bytes=std::max(package_estimate_m0.bytes,package_estimate_m1.bytes);
+  const std::uint64_t estimated_package_bytes=std::max(package_estimate_m0.bytes,package_estimate_m1.bytes)+
+    (options.graph_reference?3*sizeof(std::uint32_t):0);
   const std::size_t estimated_package_max_neighbors=std::max(package_estimate_m0.maximum_site_neighbors,
     package_estimate_m1.maximum_site_neighbors);
   covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
@@ -12273,10 +12522,40 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   if(generate_raw){if(atom.position_per_atom.size()!=static_cast<std::size_t>(d))throw std::runtime_error("native fit raw generation requires an initialized centroid position array");saved.resize(static_cast<std::size_t>(d));atom.position_per_atom.copy_to_host(saved.data());atom.position_per_atom.copy_from_host(r0.data());}
   Restore restore{atom,saved,generate_raw};
   const std::uint64_t d64=static_cast<std::uint64_t>(d),n64=static_cast<std::uint64_t>(n),dd64=d64*d64,vd64=d64*n64;
-  if(dd64>(std::numeric_limits<std::uint64_t>::max()-18)/7||vd64>(std::numeric_limits<std::uint64_t>::max()-7*dd64-18)/2)throw std::runtime_error("native fit qraw size estimate overflows");
-  const std::uint64_t raw_elements=2*vd64+7*dd64+18;if(raw_elements>std::numeric_limits<std::uint64_t>::max()/sizeof(double))throw std::runtime_error("native fit qraw byte estimate overflows");
-  const std::uint64_t raw_bytes=raw_elements*sizeof(double);
-  if(dd64>std::numeric_limits<std::size_t>::max()/sizeof(double)||raw_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))throw std::runtime_error("native fit qraw/Hessian exceeds host or file-offset limits");
+  const std::uint64_t max_raw_elements=std::numeric_limits<std::uint64_t>::max();
+  const std::uint64_t raw_header_bytes=8+16+32+16+sizeof("xyz_soa;derivative_input_rows_output_columns")+
+    18*sizeof(double)+3*sizeof(int)+n64*sizeof(std::int32_t)+n64*sizeof(double)+d64*sizeof(double)+
+    sizeof(double)+n64*sizeof(double)+d64*sizeof(double)+9*n64*sizeof(double);
+  std::uint64_t raw_bytes=0,raw_generation_peak_bytes=0,input_raw_bytes=0;
+  if(generate_raw){
+    if(dd64>(max_raw_elements-24)/4||vd64>max_raw_elements-4*dd64-24)
+      throw std::runtime_error("native fit compact qraw size estimate overflows");
+    const std::uint64_t raw_elements=vd64+4*dd64+24;
+    if(raw_elements>max_raw_elements/sizeof(double))
+      throw std::runtime_error("native fit compact qraw byte estimate overflows");
+    const std::uint64_t compact_payload_bytes=raw_elements*sizeof(double);
+    if(compact_payload_bytes>max_raw_elements-raw_header_bytes)
+      throw std::runtime_error("native fit compact qraw file size overflows");
+    raw_bytes=compact_payload_bytes+raw_header_bytes;
+    if(dd64>(max_raw_elements-24)/7||vd64>(max_raw_elements-7*dd64-24)/2)
+      throw std::runtime_error("native fit generated qraw peak estimate overflows");
+    const std::uint64_t raw_generation_peak_elements=2*vd64+7*dd64+24;
+    if(raw_generation_peak_elements>max_raw_elements/sizeof(double))
+      throw std::runtime_error("native fit generated qraw peak byte estimate overflows");
+    const std::uint64_t temporary_payload_bytes=raw_generation_peak_elements*sizeof(double);
+    if(temporary_payload_bytes>max_raw_elements-raw_header_bytes)
+      throw std::runtime_error("native fit generated qraw peak file size overflows");
+    raw_generation_peak_bytes=temporary_payload_bytes+raw_header_bytes;
+  }else{
+    rpmd_ja_file_io::ifstream raw_size(raw_path,std::ios::binary);
+    if(!raw_size)throw std::runtime_error("native fit cannot size its existing qraw input");
+    raw_size.seekg(0,std::ios::end);const std::streamoff size=raw_size.tellg();
+    raw_size.close();if(size<0||!raw_size)throw std::runtime_error("native fit cannot read the existing qraw input size");
+    input_raw_bytes=static_cast<std::uint64_t>(size);
+  }
+  if(dd64>std::numeric_limits<std::size_t>::max()/sizeof(double)||(generate_raw&&raw_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))||
+     (generate_raw&&raw_generation_peak_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())))
+    throw std::runtime_error("native fit qraw/Hessian exceeds host or file-offset limits");
   constexpr std::uint64_t qnep_sidecar_and_failure_reserve_bytes=64ULL*1024;
   const std::uint64_t qnep_tile_axis=(d64+127)/128,qnep_tile_count=qnep_tile_axis*qnep_tile_axis;
   const std::uint64_t qnep_tile_header_bytes=5*sizeof(int)+2*sizeof(std::uint64_t);
@@ -12292,7 +12571,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   std::uint64_t disk_required=disk_margin_bytes;
   auto add_disk_requirement=[&](const std::uint64_t bytes){if(disk_required>std::numeric_limits<std::uint64_t>::max()-bytes)
       throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: disk-space estimate overflows");disk_required+=bytes;};
-  if(generate_raw)add_disk_requirement(raw_bytes);
+  if(generate_raw)add_disk_requirement(raw_generation_peak_bytes);
   const std::uint64_t package_staging_peak_bytes=publication_payload_restored?0:estimated_package_bytes;
   if(estimated_qnep_reference_bytes>std::numeric_limits<std::uint64_t>::max()-qnep_sidecar_and_failure_reserve_bytes)
     throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: qNEP reference staging estimate overflows");
@@ -12308,7 +12587,10 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     <<" publication_payload_restored "<<(publication_payload_restored?1:0)
     <<" qnep_v3_max_serialized_bytes "<<estimated_qnep_reference_bytes
     <<" reference_staging_lifecycle_bytes "<<reference_staging_peak_bytes
-    <<" generated_qraw_bytes "<<(generate_raw?raw_bytes:0)
+    <<" input_qraw_bytes "<<input_raw_bytes
+    <<" generated_qraw_final_bytes "<<(generate_raw?raw_bytes:0)
+    <<" generated_qraw_peak_bytes "<<raw_generation_peak_bytes
+    <<" qraw_size_estimate_scope "<<(generate_raw?"GENERATION_TEMP_PLUS_VTRANSPOSE_AND_FINAL":"EXISTING_INPUT_FILE_SIZE_ONLY")
     <<" additive_package_staging_lifecycle_bytes "<<package_staging_peak_bytes
     <<" feasibility_controller_snapshot_checkpoint_and_A0_reuse_reserve_bytes "<<
       (options.covariance_feasibility?feasibility_controller_disk_reserve_bytes:0)
@@ -12487,7 +12769,10 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   if(acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::PEAK_EXCEEDS_CAPACITY||
      acceptance_resource_gate==rpmd_ja_feasibility::ResourceGateResult::INVALID)
     throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: known acceptance-stage resource estimate exceeds capacity or is invalid");
-  std::printf("    rpmd_ja native fit preflight: qraw %.2f GiB, GPU baseline %.2f GiB, free GPU %.2f GiB, host design+QR %.2f MiB\n",static_cast<double>(raw_bytes)/(1024.0*1024.0*1024.0),static_cast<double>(dd64*sizeof(double))/(1024.0*1024.0*1024.0),static_cast<double>(free_before)/(1024.0*1024.0*1024.0),static_cast<double>(design_bytes+qr_bytes)/(1024.0*1024.0));
+  std::printf("    rpmd_ja native fit preflight: qraw %s %.2f GiB, generated peak %.2f GiB, GPU baseline %.2f GiB, free GPU %.2f GiB, host design+QR %.2f MiB\n",
+    generate_raw?"final":"input",static_cast<double>(generate_raw?raw_bytes:input_raw_bytes)/(1024.0*1024.0*1024.0),
+    static_cast<double>(raw_generation_peak_bytes)/(1024.0*1024.0*1024.0),static_cast<double>(dd64*sizeof(double))/(1024.0*1024.0*1024.0),
+    static_cast<double>(free_before)/(1024.0*1024.0*1024.0),static_cast<double>(design_bytes+qr_bytes)/(1024.0*1024.0));
   if(dd64*sizeof(double)>free_before||free_before-dd64*sizeof(double)<256ULL*1024*1024)throw std::runtime_error("native fit baseline matrix does not fit current GPU memory with a 256 MiB safety margin");
   NativeFitScratchOwnership own_scratch{generated_raw_path,pack_path,options.output_path,options.output_path+".stability",
       options.output_path+".tmp",options.output_path+".stability.tmp",fit_path,fit_tmp,publication_stage_output_path,
@@ -12506,7 +12791,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       options.covariance_blind_samples,options.kernel_table,raw_path,qraw_identity);
   const std::streamoff data=qraw_identity.data_offset,k_offset=qraw_identity.k_offset;
   const auto raw_model=qraw_identity.model,raw_config=qraw_identity.config;
-  const std::uint32_t rawver=qraw_identity.version;const auto expected_model=raw_model,expected_config=raw_config;
+  const std::uint32_t rawver=qraw_identity.derivative_version;const auto expected_model=raw_model,expected_config=raw_config;
   const int raw_charge=qraw_identity.charge,raw_kspace=qraw_identity.kspace;
   const double raw_mesh=qraw_identity.mesh,active_mesh=qraw_identity.active_mesh;  const CGReplayContext cg_replay{options,frame_count,raw_model,raw_config,expected_model,expected_config,raw_charge,raw_kspace,raw_mesh,active_mesh};
   std::vector<double> raw_gradient(d),site(n);for(int a=0;a<d;++a){raw.clear();raw.seekg(data+static_cast<std::streamoff>(a)*n*sizeof(double));read_array(raw,site.data(),n,"raw qNEP site gradient");if(!std::all_of(site.begin(),site.end(),[](double v){return std::isfinite(v);}))throw std::runtime_error("native fit qNEP site gradient contains non-finite values");raw_gradient[a]=std::accumulate(site.begin(),site.end(),0.0);if(!std::isfinite(raw_gradient[a]))throw std::runtime_error("native fit qNEP reference gradient is non-finite");}
@@ -12556,6 +12841,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" svd_sigma_max="<<svd_sigma_max<<" design_condition="<<design_condition<<'\n';trace.flush();
     if(!trace)throw std::runtime_error("failed writing native fit unconstrained training diagnostic: "+trace_path);}
   bool fit_converged=false;ResponseCheck response;
+  std::string graph_response_status="NOT_MEASURED";
   CovarianceFitResult covariance_fit;double covariance_baseline_force_residual=std::numeric_limits<double>::quiet_NaN();
   double training_force_residual=std::numeric_limits<double>::quiet_NaN(),force_fit_cost_increase=std::numeric_limits<double>::quiet_NaN();
   if(options.covariance_feasibility){
@@ -14079,15 +14365,57 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       graph,r0,options.temperature,nullptr,&training_block_statistics,&training_block_frames);
     covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
     covariance_fit.statistics=statistics;
+    GraphReferenceBaselineCandidate saved_graph_candidate;
+    const GraphReferenceBaselineCandidate* saved_graph_candidate_ptr=nullptr;
+    if(options.graph_reference&&!options.baseline_state_path.empty()){
+      saved_graph_candidate=read_graph_reference_baseline_candidate(options.baseline_state_path,spool_path,raw_path,
+        options,header,qraw_identity,graph,frame_count,train);
+      saved_graph_candidate_ptr=&saved_graph_candidate;
+    }
     try{DeviceCovarianceSystem covariance_system(baseline,graph,sqrt_mass,atom.cpu_mass);
-      covariance_fit=solve_covariance_reference(covariance_system,statistics,options.epsilon,effective_covariance_rho,
+      if(options.graph_reference){
+        covariance_fit.statistics=statistics;
+        covariance_fit.covariance_baseline=build_graph_reference_baseline(covariance_system,statistics,options.epsilon,
+          covariance_fit.objective_evaluations,nullptr,nullptr,nullptr,saved_graph_candidate_ptr);
+        covariance_fit.theta_baseline=covariance_fit.covariance_baseline.theta;
+        covariance_fit.theta_start=covariance_fit.theta_baseline;
+        covariance_fit.theta=covariance_fit.theta_baseline;
+        covariance_fit.baseline_mu=covariance_fit.covariance_baseline.mu;
+        covariance_fit.status="GRAPH_BASELINE_PASS";
+        covariance_fit.reason="independent one-parameter fixed-R0 graph reference";
+        covariance_fit.converged=true;
+        covariance_fit.initialization_status="GRAPH_BASELINE_PASS";
+        covariance_fit.solve_rhs_columns=covariance_system.solve_rhs_columns;
+        covariance_fit.worst_solve_relative_residual=covariance_system.worst_solve_relative_residual;
+        covariance_fit.factorizations=covariance_system.factorizations;
+        covariance_fit.scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
+        trace<<"GRAPH_REFERENCE_BASELINE status NUMERICAL_PASS parameter_count "<<statistics.size()
+          <<" baseline_mu "<<covariance_fit.baseline_mu
+          <<" stationarity_status "<<covariance_fit.covariance_baseline.stationarity_status
+          <<" phi "<<covariance_fit.covariance_baseline.phi
+          <<" phi_relative "<<covariance_fit.covariance_baseline.phi_relative
+          <<" phi_solve_residual_heuristic_diagnostic_only "<<covariance_fit.covariance_baseline.phi_solve_residual_heuristic
+          <<" heuristic_used_for_acceptance 0"
+          <<" root_bracket_width "<<covariance_fit.covariance_baseline.root_bracket_width
+          <<" root_relative_tolerance "<<covariance_fit.covariance_baseline.root_relative_tolerance
+          <<" stability_bracket_width "<<covariance_fit.covariance_baseline.stability_bracket_width
+          <<" root_iterations "<<covariance_fit.covariance_baseline.root_iterations
+          <<" epsilon_num "<<options.epsilon
+          <<" minimum_shifted_cholesky_diagonal "<<covariance_fit.covariance_baseline.minimum_shifted_cholesky_diagonal
+          <<" cholesky_diagonal_is_lambda_min 0 optimizer_60_parameter_run 0\n";
+      }else covariance_fit=solve_covariance_reference(covariance_system,statistics,options.epsilon,effective_covariance_rho,
         options.max_covariance_iterations,&trace,options.covariance_block_newton,options.covariance_joint_block,
         options.covariance_trust_region,options.covariance_staged_barrier,training_block_statistics,training_block_frames,
         options.covariance_ridge_lambda,options.covariance_analytic_curvature_probes);}
     catch(const std::exception& error){if(covariance_fit.reason=="none"){covariance_fit.status="NUMERICAL_SOLVE_FAIL";covariance_fit.reason=error.what();}}
     if(covariance_fit.theta_baseline.empty())
-      trace<<"BASELINE_SPD_FAIL status "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)<<'\n';
-    trace<<"COVARIANCE_OPTIMIZER status "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)
+      trace<<(options.graph_reference?"GRAPH_REFERENCE_NUMERICAL_FAIL status ":"BASELINE_SPD_FAIL status ")
+        <<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)<<'\n';
+    if(options.graph_reference){
+      trace<<"GRAPH_REFERENCE_NUMERICAL_STATUS "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)
+        <<" objective_evaluations "<<covariance_fit.objective_evaluations<<" factorizations "<<covariance_fit.factorizations
+        <<" optimizer_60_parameter_run 0\n";
+    }else trace<<"COVARIANCE_OPTIMIZER status "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)
       <<" objective_evaluations "<<covariance_fit.objective_evaluations<<" factorizations "<<covariance_fit.factorizations
       <<" optimizer_step_mode "<<(covariance_fit.trust_region_enabled?"TRUST_REGION_OPT_IN":covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")
       <<" barrier_stage_policy "<<(covariance_fit.staged_barrier_enabled?"STAGED_BARRIER_OPT_IN":"STRICT_KKT_EACH_STAGE")
@@ -14125,17 +14453,24 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       <<" barrier_center_condition_status "<<(covariance_fit.barrier_center_condition_pass?"PASS":"NOT_VERIFIED")
       <<" barrier_gap_estimate "<<covariance_fit.barrier_gap_estimate<<'\n';trace.flush();
     if(!covariance_fit.converged){write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
-      throw std::runtime_error(covariance_fit.reason.empty()?"COVARIANCE_OPTIMIZER_FAILED: inspect covariance state":covariance_fit.reason);}
+      throw std::runtime_error(covariance_fit.reason.empty()?(options.graph_reference?"GRAPH_REFERENCE_NUMERICAL_FAIL: inspect fit trace":"COVARIANCE_OPTIMIZER_FAILED: inspect covariance state"):covariance_fit.reason);}
     theta=covariance_fit.theta;
-    trace<<"COVARIANCE_OPTIMIZER_CONVERGED scaled_kkt_residual "<<covariance_fit.scaled_kkt_residual
+    if(!options.graph_reference)trace<<"COVARIANCE_OPTIMIZER_CONVERGED scaled_kkt_residual "<<covariance_fit.scaled_kkt_residual
       <<" barrier_tau "<<covariance_fit.barrier_tau<<" barrier_center_condition_status PASS barrier_gap_estimate "<<covariance_fit.barrier_gap_estimate
       <<" objective_data "<<covariance_fit.objective_data<<" objective_prior "<<covariance_fit.objective_prior
       <<" raw_gradient_inf_norm "<<covariance_fit.raw_gradient_inf_norm<<'\n';trace.flush();
     cusolverDnHandle_t response_solver=nullptr;if(cusolverDnCreate(&response_solver)!=CUSOLVER_STATUS_SUCCESS){
-      covariance_fit.status="FIT_RESPONSE_NUMERICAL_FAIL";covariance_fit.reason="native covariance fit response cuSOLVER handle creation failed";
-      write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
-      throw std::runtime_error(covariance_fit.reason);}
-    try{const int steps=std::min(96,d-3);DeviceLanczosWorkspace response_lanczos;
+      if(options.graph_reference)throw std::runtime_error("GRAPH_REFERENCE_RESPONSE_HARD_FAILURE: cuSOLVER handle creation failed");
+      else{covariance_fit.status="FIT_RESPONSE_NUMERICAL_FAIL";covariance_fit.reason="native covariance fit response cuSOLVER handle creation failed";
+        write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
+        throw std::runtime_error(covariance_fit.reason);}}
+    if(response_solver){try{
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+      if(options.graph_reference&&covariance_fit_test_hooks.fail_graph_reference_response_hard){
+        covariance_fit_test_hooks.fail_graph_reference_response_hard=false;
+        throw std::runtime_error("TEST_GRAPH_REFERENCE_RESPONSE_HARD_FAILURE");}
+#endif
+      const int steps=std::min(96,d-3);DeviceLanczosWorkspace response_lanczos;
       response_lanczos.initialize(graph,sqrt_mass,sqrt_mass_atom,steps,psize);
       const auto modes=lanczos_low_modes(response_solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,n,steps,4,options.epsilon,{},&response_lanczos);
       response_lanczos.release();
@@ -14145,27 +14480,53 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       ResponseCheck response_progress;
       response=validate_probes(response_solver,baseline,graph,theta,sqrt_mass,sqrt_mass_atom,header.types,n,r0,in,header.frames,frame_count,train,
           options.sample_interval,options.temperature,modes,options.epsilon,&response_progress,options.response_tolerance,options.ibp_tolerance,0);
+      bool graph_probe_incomplete=false;
       if(!response.witness.classification.empty()){
         write_cg_witness(witness_path,response.witness,theta,raw_path,spool_path,cg_replay,&graph);
-        trace<<"FIT_RESPONSE_FAIL status CG_FAILURE classification "<<response.witness.classification<<'\n';trace.flush();
-        throw std::runtime_error("COVARIANCE_RESPONSE_CG_FAIL: exact covariance fit did not pass held-out probe CG; no stability feedback was applied");}
+        if(options.graph_reference){
+          if(response.witness.classification!="UNRESOLVED_SOFT_DIRECTION"&&
+             response.witness.classification!="ITERATION_LIMIT")
+            throw std::runtime_error("GRAPH_REFERENCE_RESPONSE_HARD_FAILURE: CG probe classification "+response.witness.classification);
+          graph_response_status="INCONCLUSIVE";
+          graph_probe_incomplete=true;fit_converged=true;
+          trace<<"FIT_RESPONSE_STATUS INCONCLUSIVE reason PROBE_INCOMPLETE classification "<<response.witness.classification<<'\n';trace.flush();
+        }else{
+          trace<<"FIT_RESPONSE_FAIL status CG_FAILURE classification "<<response.witness.classification<<'\n';trace.flush();
+          throw std::runtime_error("COVARIANCE_RESPONSE_CG_FAIL: exact covariance fit did not pass held-out probe CG; no stability feedback was applied");}}
+      if(!graph_probe_incomplete){
       const bool numerically_valid=std::isfinite(response.response)&&std::isfinite(response.ibp)&&response.response_band.status!="NUMERICAL_FAILURE"&&
         !ibp_statistics_numerically_invalid(response.ibp_band);
+      if(options.graph_reference&&!numerically_valid)
+        throw std::runtime_error("GRAPH_REFERENCE_RESPONSE_HARD_FAILURE: non-finite or numerically invalid held-out response computation");
       const bool response_pass=numerically_valid&&response.response<=options.response_tolerance&&response.response_band.status=="RESPONSE_PASS";
+      const bool response_fail=numerically_valid&&response.response>options.response_tolerance&&response.response_band.status=="RESPONSE_FAIL";
       trace<<"FIT_DIAGNOSTIC stage=COVARIANCE_RESPONSE_CHECK reference_class=finite_temperature_additive training_force_residual="<<training_force_residual
         <<" baseline_training_force_residual="<<covariance_baseline_force_residual<<" response_ratio_min="<<response.response_ratio_min
         <<" response_ratio_max="<<response.response_ratio_max<<'\n';
       write_response_stats(trace,response);trace<<'\n';
-      if(!response_pass){trace<<"FIT_RESPONSE_FAIL status "<<(numerically_valid?"RESPONSE_CHECK_FAIL":"NUMERICAL_FAILURE")<<'\n';trace.flush();
+      if(options.graph_reference){
+        if(graph_response_status!="INCONCLUSIVE")graph_response_status=response_pass?"PASS":response_fail?"FAIL":"INCONCLUSIVE";
+        trace<<"FIT_RESPONSE_STATUS "<<graph_response_status<<" response "<<response.response
+          <<" tolerance "<<options.response_tolerance<<"; numerical_pass is reported separately\n";trace.flush();
+        fit_converged=true;
+      }else if(!response_pass){trace<<"FIT_RESPONSE_FAIL status "<<(numerically_valid?"RESPONSE_CHECK_FAIL":"NUMERICAL_FAILURE")<<'\n';trace.flush();
         write_response_state(response_state_path,response,theta,options.temperature,options.response_tolerance,options.ibp_tolerance);
         throw std::runtime_error("COVARIANCE_RESPONSE_FAIL: Gaussian covariance fit failed existing held-out response acceptance");}
-      trace<<"FIT_RESPONSE_PASS response "<<response.response<<" tolerance "<<options.response_tolerance
+      if(!options.graph_reference){trace<<"FIT_RESPONSE_PASS response "<<response.response<<" tolerance "<<options.response_tolerance
         <<" response_ratio_min "<<response.response_ratio_min<<" response_ratio_max "<<response.response_ratio_max<<'\n';trace.flush();
-      fit_converged=true;
-    }catch(const std::exception& error){covariance_fit.status="FIT_RESPONSE_FAIL";covariance_fit.reason=error.what();
-      trace<<"FIT_RESPONSE_ABORT detail "<<std::quoted(error.what())<<'\n';trace.flush();
-      rpmd_ja_file_io::ifstream state_exists(covariance_state_path);if(!state_exists.good())write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));cusolverDnDestroy(response_solver);throw;}
-    cusolverDnDestroy(response_solver);
+        fit_converged=true;}
+      }
+    }catch(const std::exception& error){
+      if(options.graph_reference){
+        trace<<"FIT_RESPONSE_ABORT hard_failure "<<std::quoted(error.what())<<"; diagnostic package will not be published\n";trace.flush();
+        if(response_solver)cusolverDnDestroy(response_solver);
+        throw;
+      }else{
+        covariance_fit.status="FIT_RESPONSE_FAIL";covariance_fit.reason=error.what();
+        trace<<"FIT_RESPONSE_ABORT detail "<<std::quoted(error.what())<<'\n';trace.flush();
+        rpmd_ja_file_io::ifstream state_exists(covariance_state_path);if(!state_exists.good())write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
+        cusolverDnDestroy(response_solver);throw;}}
+    if(response_solver)cusolverDnDestroy(response_solver);
     if(standalone_development_candidate){
       trace<<"FEASIBILITY_ENDPOINT status DEVELOPMENT_CANDIDATE production_reference 0 reason INDEPENDENT_BLIND_GATE_REQUIRED resume_supported 0\n";trace.flush();
       write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,
@@ -14279,9 +14640,9 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   training_force_residual=compressed_training_force_residual(rmat,z,discarded2,training_force2,theta);
   force_fit_cost_increase=training_force_residual*training_force_residual-unconstrained_training_force_residual*unconstrained_training_force_residual;
   }
-  if(!std::isfinite(response.response)||!std::isfinite(response.ibp)||response.response_band.status=="NUMERICAL_FAILURE"||ibp_statistics_numerically_invalid(response.ibp_band))
+  if(!options.graph_reference&&(!std::isfinite(response.response)||!std::isfinite(response.ibp)||response.response_band.status=="NUMERICAL_FAILURE"||ibp_statistics_numerically_invalid(response.ibp_band)))
     throw std::runtime_error("NONFINITE_RESPONSE_VALIDATION: held-out response or IBP arithmetic failed numerically");
-  if(response.response>options.response_tolerance||response.response_band.status!="RESPONSE_PASS")
+  if(!options.graph_reference&&(response.response>options.response_tolerance||response.response_band.status!="RESPONSE_PASS"))
     throw std::runtime_error("native fit held-out probe response exceeds the declared tolerance");
   auto observe_prepare_budget=[&](const char* stage){
     if(!budget)return;
@@ -14337,9 +14698,18 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     FeasibilityStageTimer package_write_timer(trace,"PACKAGE_WRITE",
       stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE));
     rpmd_ja_file_io::ofstream out(pack_path,std::ios::binary|std::ios::trunc);if(!out)throw std::runtime_error("cannot create native additive package");own_scratch.pack_owned=true;
-    out.write(additive_magic,8);write(out,std::uint32_t(options.internal_mass_com?6:5));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(header.beads));write(out,raw_source_fingerprint);
-    write(out,options.temperature);write(out,options.epsilon);write(out,response.response);write(out,options.response_tolerance);write(out,std::uint64_t(train));write(out,std::uint64_t(validation));
+    out.write(additive_magic,8);write(out,std::uint32_t(options.graph_reference?7:(options.internal_mass_com?6:5)));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(header.beads));write(out,raw_source_fingerprint);
+    write(out,options.temperature);write(out,options.epsilon);
+    const double package_response=std::isfinite(response.response)?response.response:std::numeric_limits<double>::quiet_NaN();
+    write(out,package_response);write(out,options.response_tolerance);write(out,std::uint64_t(train));write(out,std::uint64_t(validation));
+    if(options.graph_reference){
+      const std::uint32_t use_flags=2U|(options.internal_mass_com?1U:0U);
+      const std::uint32_t response_code=graph_response_status=="PASS"?0U:graph_response_status=="FAIL"?1U:
+        graph_response_status=="INCONCLUSIVE"?2U:3U;
+      write(out,use_flags);write(out,std::uint32_t(1));write(out,response_code);
+    }
     estimated=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);
+    if(options.graph_reference)estimated+=3*sizeof(std::uint32_t);
     const std::streamoff actual_bytes=out.tellp();
     if(actual_bytes<0||static_cast<std::uint64_t>(actual_bytes)!=estimated)
       throw std::runtime_error("native additive package size estimate does not match bytes written");
@@ -14373,12 +14743,23 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
      rpmd_ja_feasibility::CostPlanStatus::INSUFFICIENT_REMAINING_BUDGET)
     throw std::runtime_error("DATA_INCONCLUSIVE: measured lower-bound prepare/readback cost exceeds remaining budget");
   observe_prepare_budget("before_prepare");
+  bool graph_reference_readback_verified=false;
+  std::string graph_prepared_mechanical_policy;
+  const auto same_identity_value=[](const double left,const double right){return std::isfinite(left)&&std::isfinite(right)&&
+    std::abs(left-right)<=1e-10*std::max({1.0,std::abs(left),std::abs(right)});};
   {
   FeasibilityStageTimer prepare_stage_timer(trace,"PREPARE",
     stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::PREPARE));
+  RpmdJAModeValidator prepare_mode_validator;
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+  if(!covariance_fit_test_hooks.skip_graph_reference_mode_validator)
+    prepare_mode_validator=make_rpmd_ja_qnep_mode_validator(atom,box,force);
+#else
+  prepare_mode_validator=make_rpmd_ja_qnep_mode_validator(atom,box,force);
+#endif
   try{const auto prepare=[&](){
     prepare_rpmd_ja_qnep_reference(raw_path,prepared_reference_path,options.kernel_table,
-      make_rpmd_ja_qnep_mode_validator(atom,box,force),pack_path,verify_package_entries,
+      prepare_mode_validator,pack_path,verify_package_entries,
       [&](const RpmdJAPrepareResourcePlan& plan){
         if(plan.potrf_workspace_bytes!=prepare_workspace.potrf_workspace_bytes||
            plan.svd_workspace_bytes!=prepare_workspace.svd_workspace_bytes)
@@ -14395,6 +14776,39 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       [&](const char* name,const std::uint64_t bytes){
         trace<<"RESOURCE_PREPARE_ALLOCATION_REQUEST name "<<std::quoted(name)<<" bytes "<<bytes<<" actual_request 1\n";
         trace.flush();if(!trace)throw std::runtime_error("failed writing prepare allocation request");
+      },
+      [&](const RpmdJAReference& readback){
+        if(!options.graph_reference)return;
+        std::ostringstream expected_policy;
+        expected_policy<<"native_reference_transport;"<<(options.internal_mass_com?"internal_mass_com_pullback_v1;":"")
+          <<"finite_temperature_additive_v1;beads="<<header.beads<<";derivative="<<rawver
+          <<";use=DIAGNOSTIC;response="<<graph_response_status<<";numerical=PASS";
+        bool identity_match=readback.number_of_atoms==n&&readback.types==header.types&&
+          readback.masses.size()==header.masses.size()&&readback.positions.size()==r0.size()&&
+          same_identity_value(readback.temperature,header.temperature)&&same_identity_value(readback.fd_step,options.fd_step)&&
+          readback.model_fingerprint==qraw_identity.model&&readback.mechanical_config_fingerprint==qraw_identity.config&&
+          readback.q_charge_mode==qraw_identity.charge&&readback.q_uses_pppm==(qraw_identity.kspace!=0)&&
+          same_identity_value(readback.q_mesh_spacing,qraw_identity.active_mesh)&&readback.additive_beads==header.beads&&
+          readback.mechanical_policy==expected_policy.str()&&rpmd_ja_reference_policy_is_diagnostic(readback.mechanical_policy)&&
+          rpmd_ja_reference_policy_response_status(readback.mechanical_policy)==graph_response_status&&
+          rpmd_ja_reference_policy_numerical_status(readback.mechanical_policy)=="PASS"&&
+          rpmd_ja_reference_policy_requires_pimd_fix_com(readback.mechanical_policy)==options.internal_mass_com;
+        const int expected_pbc[3]={box.pbc_x,box.pbc_y,box.pbc_z};
+        for(int index=0;index<9&&identity_match;++index)identity_match=same_identity_value(readback.cell[index],box.cpu_h[index]);
+        for(int axis=0;axis<3&&identity_match;++axis)identity_match=readback.pbc[axis]==expected_pbc[axis];
+        for(std::size_t index=0;index<header.masses.size()&&identity_match;++index)
+          identity_match=same_identity_value(readback.masses[index],header.masses[index]);
+        for(std::size_t index=0;index<r0.size()&&identity_match;++index)
+          identity_match=same_identity_value(readback.positions[index],r0[index]);
+        identity_match=identity_match&&readback.stability_checked&&!readback.stability_certificate.empty()&&
+          readback.minimum_cholesky_pivot>0.0&&std::isfinite(readback.minimum_cholesky_pivot)&&
+          same_identity_value(readback.additive_epsilon,options.epsilon)&&
+          std::isfinite(readback.additive_reconstruction_bound)&&readback.additive_reconstruction_bound>=0.0&&
+          readback.additive_reconstruction_bound<0.5*options.epsilon;
+        if(!identity_match)
+          throw std::runtime_error("GRAPH_REFERENCE_READBACK_FAIL: prepared diagnostic policy, response, COM/P/R0, qraw, or stored-D certificate identity differs");
+        graph_prepared_mechanical_policy=readback.mechanical_policy;
+        graph_reference_readback_verified=true;
       });};
     const auto after_prepare=[&](){
 #ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
@@ -14412,18 +14826,30 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   }
   prepare_stage_timer.complete();
   }
+  if(options.graph_reference&&!graph_reference_readback_verified)
+    throw std::runtime_error("GRAPH_REFERENCE_READBACK_FAIL: prepare returned without verifying the stored diagnostic identity");
   if(stage_cost_record_failure)
     throw std::runtime_error("FEASIBILITY_CHECKPOINT_FAIL: prepare measurement could not be persisted");
   observe_prepare_budget("after_prepare");
   verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
   }
-  verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
   double certificate_epsilon=0.0,certificate_eta=0.0;{rpmd_ja_file_io::ifstream stability(prepared_reference_path+".stability");std::string key;while(stability>>key){if(key=="epsilon_num")stability>>certificate_epsilon;else if(key=="reconstruction_bound")stability>>certificate_eta;else{std::string value;stability>>value;}}if(!stability.eof()||!std::isfinite(certificate_epsilon)||!std::isfinite(certificate_eta)||!(certificate_epsilon>0.0)||!(certificate_eta<0.5*certificate_epsilon))throw std::runtime_error("native fit could not read a valid stored-D Cholesky certificate");}
   trace<<"FULL_CERTIFICATE_PASS stored_D_cholesky epsilon_num "<<certificate_epsilon<<" reconstruction_bound "<<certificate_eta<<'\n'
     <<"FULL_CERTIFICATE PASS stored_D_cholesky epsilon_num "<<certificate_epsilon<<" reconstruction_bound "<<certificate_eta<<'\n';trace.flush();
+  if(options.graph_reference){
+    if(!graph_reference_readback_verified||!rpmd_ja_reference_policy_is_diagnostic(graph_prepared_mechanical_policy)||
+       rpmd_ja_reference_policy_numerical_status(graph_prepared_mechanical_policy)!="PASS"||
+       rpmd_ja_reference_policy_response_status(graph_prepared_mechanical_policy)!=graph_response_status)
+      throw std::runtime_error("GRAPH_REFERENCE_READBACK_FAIL: final prepared reference did not retain the diagnostic numerical/response identity");
+    trace<<"GRAPH_REFERENCE_NUMERICAL_STATUS PASS certificate=FULL_CERTIFICATE_PASS readback_identity=PASS optimizer_60_parameter_run=0\n"
+      <<"GRAPH_REFERENCE_PREPARE_READBACK_PASS qnep_v3_stored_D_Bt_action_probes=3_each reference_use=DIAGNOSTIC numerical_status=PASS response_status="
+      <<graph_response_status<<" COM="<<(options.internal_mass_com?"internal_mass_com":"raw_cartesian")<<" P="<<header.beads
+      <<" R0_match=1 qraw_model_PPPM_cell_pbc=1\n";trace.flush();
+    if(!trace)throw std::runtime_error("failed writing graph-reference final readback status");
+  }
   rpmd_ja_file_io::ifstream written_reference(prepared_reference_path,std::ios::binary);if(!written_reference)throw std::runtime_error("native fit prepare returned without writing the reference package");
   written_reference.seekg(0,std::ios::end);if(written_reference.tellg()<=std::streampos(0))throw std::runtime_error("native fit prepare wrote an empty reference package");
-  if(options.covariance_feasibility){
+  if(options.covariance_feasibility&&!options.graph_reference){
     rpmd_ja_feasibility::RemainingWork before_readback_work;
     before_readback_work.calls[rpmd_ja_feasibility::resource_stage_index(rpmd_ja_feasibility::ResourceStage::READBACK)]=1;
     observe_storage_lifetime("BEFORE_READBACK",disk_margin_bytes);
@@ -14483,11 +14909,30 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     <<" note includes_additive_write_independent_package_check_prepare_certificate_and_final_readback\n";
   std::printf("    rpmd_ja fit FULL_CERTIFICATE PASS: stored-D Cholesky epsilon_num=%.6g reconstruction_bound=%.6g\n",certificate_epsilon,certificate_eta);
   if(!options.covariance_feasibility||controller_journal.published_fit_sha256.empty()){
-  {rpmd_ja_file_io::ofstream fitout(fit_tmp,std::ios::out|std::ios::trunc);if(!fitout)throw std::runtime_error("cannot create native fit diagnostics");own_scratch.fit_tmp_owned=true;
+    {rpmd_ja_file_io::ofstream fitout(fit_tmp,std::ios::out|std::ios::trunc);if(!fitout)throw std::runtime_error("cannot create native fit diagnostics");own_scratch.fit_tmp_owned=true;
     fitout<<std::setprecision(17)<<"candidate_identity strategy native_additive_fixed_cutoff_graph output "<<std::quoted(options.output_path)<<" samples "<<std::quoted(spool_path)<<" raw "<<std::quoted(raw_path)
-      <<"\nreference_class finite_temperature_additive\nfit_response_status FIT_RESPONSE_PASS\nfull_certificate_status FULL_CERTIFICATE_PASS\nreference_write_status REFERENCE_WRITTEN"
+      <<"\nreference_class finite_temperature_additive\nreference_use "<<(options.graph_reference?"DIAGNOSTIC":"FORMAL")
+      <<"\nnumerical_status PASS\nresponse_status "<<(options.graph_reference?graph_response_status:"PASS")
+      <<"\nfull_certificate_status FULL_CERTIFICATE_PASS\nreference_write_status "<<(options.graph_reference?"DIAGNOSTIC_REFERENCE_WRITTEN":"REFERENCE_WRITTEN")
       <<"\nparameter_count "<<psize;
-     if(covariance_method){fitout<<"\nfit_method gaussian_covariance_shrinkage\nselected_family "<<selected_covariance_family;
+     if(options.graph_reference){
+       const CovarianceBaseline& graph_baseline=covariance_fit.covariance_baseline;
+       fitout<<"\nfit_method independent_one_parameter_graph_baseline"
+         <<"\nbaseline_mu "<<graph_baseline.mu
+         <<"\nbaseline_stationarity_status "<<graph_baseline.stationarity_status
+         <<"\nphi "<<graph_baseline.phi<<"\nphi_relative "<<graph_baseline.phi_relative
+         <<"\nphi_solve_residual_heuristic_diagnostic_only "<<graph_baseline.phi_solve_residual_heuristic
+         <<"\nheuristic_used_for_acceptance 0"
+         <<"\nroot_relative_tolerance "<<graph_baseline.root_relative_tolerance
+         <<"\nroot_bracket_width "<<graph_baseline.root_bracket_width
+         <<"\nstability_bracket_width "<<graph_baseline.stability_bracket_width
+         <<"\nroot_iterations "<<graph_baseline.root_iterations
+         <<"\nepsilon_num "<<options.epsilon
+         <<"\nminimum_shifted_cholesky_diagonal "<<graph_baseline.minimum_shifted_cholesky_diagonal
+         <<"\ncholesky_diagonal_is_lambda_min 0\noptimizer_60_parameter_run 0\nbaseline_theta "<<graph_baseline.theta.size();
+       for(const double value:graph_baseline.theta)fitout<<' '<<value;
+       fitout<<'\n';
+     }else if(covariance_method){fitout<<"\nfit_method gaussian_covariance_shrinkage\nselected_family "<<selected_covariance_family;
        if(options.covariance_feasibility)fitout<<"\nselected_candidate_branch "<<controller_journal.frozen_candidate_branch
          <<"\nselected_candidate_index "<<controller_journal.frozen_candidate_index
          <<"\nfrozen_candidate_identity_sha256 "<<controller_journal.frozen_candidate_identity_sha256;
@@ -14600,7 +15045,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       fitout<<"cg_recovery_sample_spool "<<std::quoted(spool_path)<<"\ncg_recovery_qraw "<<std::quoted(raw_path)<<'\n';
       for(const std::string& path:saved_recovery_witness_paths)fitout<<"cg_recovery_witness "<<std::quoted(path)<<'\n';
     }
-   fitout<<"family "<<(graph.parameter_count>graph.base_parameter_count?"shared_lab_frame_m1_local_basis":"shared_lab_frame_symmetric_typepair_edge_blocks")<<"\nselected_covariance_family "<<selected_covariance_family<<"\ncoordinate_convention "<<(options.internal_mass_com?"x=R-R0; raw_eval=R0+A*x; U0(x)=Taylor_raw(A*x)+Uadd(x); P=I-tt^T internal mass-COM coordinates":"raw Cartesian coordinates")<<"\ntransport_convention "<<(options.internal_mass_com?"Bt_internal=P(Bt_raw+Bt_add)P; ambient H tiles retained and interpreted by internal E^T Bt E":"raw native reference transport")<<"\nmechanical_policy "<<(options.internal_mass_com?"native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1":"native_reference_transport;finite_temperature_additive_v1")<<";beads="<<header.beads<<";derivative="<<rawver<<"\nraw_gradient_net_xyz "<<raw_net.net[0]<<' '<<raw_net.net[1]<<' '<<raw_net.net[2]<<"\nraw_gradient_net_norm "<<raw_net.net_norm<<"\ninternal_gradient_net_xyz "<<internal_net.net[0]<<' '<<internal_net.net[1]<<' '<<internal_net.net[2]<<"\ninternal_gradient_net_norm "<<internal_net.net_norm<<"\ninternal_gradient_net_limit "<<internal_net.limit<<"\ninternal_gradient_net_status "<<(internal_net.within_limit?"PASS":"FAIL")<<"\nremoved_mass_normal_norm "<<removed_normal_norm<<"\ncoordinate_scope_note finite-grid derivative errors remain; auxiliary reference definition only; pimd_fix_com removes PILE momentum and does not constrain the production Hamiltonian\nparameters "<<psize<<"\ntype_pairs "<<graph.type_pairs.size()<<"\ncutoff_A "<<options.cutoff<<"\ntraining_frames "<<train<<"\nvalidation_frames "<<validation<<"\nprobe_policy "<<(options.covariance_feasibility?"fixed_seeded_random16_type_local_up_to4_physical_oho_oxygen_salt_common":"fixed_seeded_random16_type_local_up_to4_low_ritz4")<<"\nprobe_seed 0x243f6a8885a308d3\nprobe_count "<<response.probes<<"\nprobe_subspace_only 1\nforce_residual_normalization massweighted_projected_physical_force_norm\ntraining_force_residual_relative "<<training_force_residual<<"\nheldout_force_residual_relative "<<response.force_residual<<"\nresponse_ratio_min "<<response.response_ratio_min<<"\nresponse_ratio_max "<<response.response_ratio_max<<"\nprobe_response_error "<<response.response<<"\nforce_position_ibp_error "<<response.ibp<<"\nprobe_cg_max_true_relative_residual "<<response.cg<<"\n";write_response_stats(fitout,response);write_probe_origin_table(fitout,response.probe_sources,response.probe_origins);fitout<<"\nresponse_tolerance "<<options.response_tolerance<<"\nibp_tolerance "<<options.ibp_tolerance<<"\nepsilon_fit "<<options.epsilon<<"\nspectral_cuts "<<cut_rows.size()<<"\ncertificate stored_D_additive_shifted_frobenius_SPD_bound\ncertificate_epsilon_num "<<certificate_epsilon<<"\ncertificate_reconstruction_bound "<<certificate_eta<<"\ncertificate_lambda_min_lower_bound "<<0.5*certificate_epsilon-certificate_eta<<"\ncertificate_note SPD lower bound only; not an epsilon eigenvalue floor\n";fitout.close();if(!fitout)throw std::runtime_error("failed closing native fit diagnostics");}
+   fitout<<"family "<<(graph.parameter_count>graph.base_parameter_count?"shared_lab_frame_m1_local_basis":"shared_lab_frame_symmetric_typepair_edge_blocks")<<"\nselected_covariance_family "<<selected_covariance_family<<"\ncoordinate_convention "<<(options.internal_mass_com?"x=R-R0; raw_eval=R0+A*x; U0(x)=Taylor_raw(A*x)+Uadd(x); P=I-tt^T internal mass-COM coordinates":"raw Cartesian coordinates")<<"\ntransport_convention "<<(options.internal_mass_com?"Bt_internal=P(Bt_raw+Bt_add)P; ambient H tiles retained and interpreted by internal E^T Bt E":"raw native reference transport")<<"\nmechanical_policy "<<(options.graph_reference?graph_prepared_mechanical_policy:(options.internal_mass_com?"native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1":"native_reference_transport;finite_temperature_additive_v1")+";beads="+std::to_string(header.beads)+";derivative="+std::to_string(rawver))<<"\nraw_gradient_net_xyz "<<raw_net.net[0]<<' '<<raw_net.net[1]<<' '<<raw_net.net[2]<<"\nraw_gradient_net_norm "<<raw_net.net_norm<<"\ninternal_gradient_net_xyz "<<internal_net.net[0]<<' '<<internal_net.net[1]<<' '<<internal_net.net[2]<<"\ninternal_gradient_net_norm "<<internal_net.net_norm<<"\ninternal_gradient_net_limit "<<internal_net.limit<<"\ninternal_gradient_net_status "<<(internal_net.within_limit?"PASS":"FAIL")<<"\nremoved_mass_normal_norm "<<removed_normal_norm<<"\ncoordinate_scope_note finite-grid derivative errors remain; auxiliary reference definition only; pimd_fix_com removes PILE momentum and does not constrain the production Hamiltonian\nparameters "<<psize<<"\ntype_pairs "<<graph.type_pairs.size()<<"\ncutoff_A "<<options.cutoff<<"\ntraining_frames "<<train<<"\nvalidation_frames "<<validation<<"\nprobe_policy "<<(options.covariance_feasibility?"fixed_seeded_random16_type_local_up_to4_physical_oho_oxygen_salt_common":"fixed_seeded_random16_type_local_up_to4_low_ritz4")<<"\nprobe_seed 0x243f6a8885a308d3\nprobe_count "<<response.probes<<"\nprobe_subspace_only 1\nforce_residual_normalization massweighted_projected_physical_force_norm\ntraining_force_residual_relative "<<training_force_residual<<"\nheldout_force_residual_relative "<<response.force_residual<<"\nresponse_ratio_min "<<response.response_ratio_min<<"\nresponse_ratio_max "<<response.response_ratio_max<<"\nprobe_response_error "<<response.response<<"\nforce_position_ibp_error "<<response.ibp<<"\nprobe_cg_max_true_relative_residual "<<response.cg<<"\n";write_response_stats(fitout,response);write_probe_origin_table(fitout,response.probe_sources,response.probe_origins);fitout<<"\nresponse_tolerance "<<options.response_tolerance<<"\nibp_tolerance "<<options.ibp_tolerance<<"\nepsilon_fit "<<options.epsilon<<"\nspectral_cuts "<<cut_rows.size()<<"\ncertificate stored_D_additive_shifted_frobenius_SPD_bound\ncertificate_epsilon_num "<<certificate_epsilon<<"\ncertificate_reconstruction_bound "<<certificate_eta<<"\ncertificate_lambda_min_lower_bound "<<0.5*certificate_epsilon-certificate_eta<<"\ncertificate_note SPD lower bound only; not an epsilon eigenvalue floor\n";fitout.close();if(!fitout)throw std::runtime_error("failed closing native fit diagnostics");}
   if(options.covariance_feasibility){
     controller_journal.published_fit_sha256=fit_input_content_identity(fit_tmp,true).sha256;
     persist_publication_controller_journal();own_scratch.fit_tmp_owned=false;}
@@ -14639,8 +15084,10 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
      <<" selected_lambda "<<selected_covariance_lambda<<" selected_rho "<<selected_covariance_rho
      <<" blind_response_pass 1 package_prepare_readback PASS production_reference 1 resume_supported 1 resume_scope FROZEN_SELECTION_BLIND_PUBLISH"
      <<" J_A_relation NOT_TESTED thermal_conductivity NOT_TESTED current_correlation NOT_TESTED reference_transport NOT_TESTED\n";
-  trace<<"REFERENCE_WRITTEN reference_class=finite_temperature_additive output "<<std::quoted(options.output_path)<<" stability "<<std::quoted(options.output_path+".stability")<<" fit_diagnostics "<<std::quoted(fit_path)<<'\n';
-  trace<<"FIT_STATUS ACCEPTED_REFERENCE response=PASS full_spd=PASS sample_IBP_DIAGNOSTIC="<<sample_statistics.ibp_band.status
+  trace<<(options.graph_reference?"DIAGNOSTIC_REFERENCE_WRITTEN":"REFERENCE_WRITTEN")
+    <<" reference_class=finite_temperature_additive output "<<std::quoted(options.output_path)<<" stability "<<std::quoted(options.output_path+".stability")<<" fit_diagnostics "<<std::quoted(fit_path)<<'\n';
+  trace<<(options.graph_reference?"DIAGNOSTIC_REFERENCE_STATUS":"FIT_STATUS ACCEPTED_REFERENCE")
+    <<" response="<<(options.graph_reference?graph_response_status:"PASS")<<" numerical=PASS full_spd=PASS sample_IBP_DIAGNOSTIC="<<sample_statistics.ibp_band.status
     <<" response_IBP_DIAGNOSTIC="<<response.ibp_band.status<<" recovery_witnesses="<<saved_recovery_witness_paths.size();
   if(!saved_recovery_witness_paths.empty())trace<<" replay_samples="<<std::quoted(spool_path)<<" replay_qraw="<<std::quoted(raw_path);
   trace<<'\n';for(const std::string& path:saved_recovery_witness_paths)trace<<"CG_RECOVERY_WITNESS "<<std::quoted(path)<<'\n';
@@ -14651,8 +15098,12 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
      persist_publication_controller_journal();}
    own_scratch.output_owned=false;own_scratch.sidecar_owned=false;own_scratch.output_tmp_owned=false;
    own_scratch.sidecar_tmp_owned=false;own_scratch.fit_owned=false;
-  std::printf("    rpmd_ja native reference ACCEPTED_REFERENCE; response and full SPD passed; IBP remains diagnostic (sample=%s, validation=%s); stability sidecar and fit diagnostics published.\n",
-    sample_statistics.ibp_band.status.c_str(),response.ibp_band.status.c_str());
+  if(options.graph_reference)
+    std::printf("    rpmd_ja DIAGNOSTIC reference written; numerical and stored-D certificates passed; held-out response=%s; it is not formal material acceptance.\n",
+      graph_response_status.c_str());
+  else
+    std::printf("    rpmd_ja native reference ACCEPTED_REFERENCE; response and full SPD passed; IBP remains diagnostic (sample=%s, validation=%s); stability sidecar and fit diagnostics published.\n",
+      sample_statistics.ibp_band.status.c_str(),response.ibp_band.status.c_str());
   if(!saved_recovery_witness_paths.empty())std::printf("    rpmd_ja fit retained CG replay inputs: samples=%s qraw=%s; witnesses=%zu\n",spool_path.c_str(),raw_path.c_str(),saved_recovery_witness_paths.size());
   return !saved_recovery_witness_paths.empty();
 }
@@ -14692,12 +15143,13 @@ bool fit_rpmd_ja_native_reference(const RpmdJANativeFitOptions& options,const st
 void fit_rpmd_ja_native_reference_from_samples(const RpmdJANativeFitOptions& options,const std::string& spool_path,
   Atom& atom,Box& box,Force& force)
 {
-  if(options.output_path.empty())throw std::invalid_argument("native fit_samples requires an output path");
+  const char* command_name=options.graph_reference?"graph_reference":"fit_samples";
+  if(options.output_path.empty())throw std::invalid_argument(std::string("native rpmd_ja ")+command_name+" requires an output path");
   const std::string lock_path=options.output_path+".fit.lock";
   std::FILE* lock=rpmd_ja_file_io::open_file(lock_path,"a+b");
   if(!lock||!rpmd_ja_process_lock::try_lock(lock)){
     if(lock)std::fclose(lock);
-    throw std::runtime_error("rpmd_ja fit_samples could not acquire its output lock: "+lock_path);}
+    throw std::runtime_error(std::string("rpmd_ja ")+command_name+" could not acquire its output lock: "+lock_path);}
   struct ReleaseLock{std::FILE* file;~ReleaseLock(){rpmd_ja_process_lock::unlock(file);std::fclose(file);}} release{lock};
   rpmd_ja_file_io::ifstream in(spool_path,std::ios::binary);if(!in)throw std::runtime_error("cannot open native rpmd_ja sample spool: "+spool_path);
   const SampleHeader header=read_header(in,0,atom,box,0.0,true);
@@ -14706,9 +15158,10 @@ void fit_rpmd_ja_native_reference_from_samples(const RpmdJANativeFitOptions& opt
   const double sample_interval=next_step-first_step;
   if(!std::isfinite(sample_interval)||!(sample_interval>0.0)||sample_interval>std::numeric_limits<int>::max()||
      std::abs(sample_interval-std::round(sample_interval))>1e-9)
-    throw std::runtime_error("fit_samples could not infer a positive integer sample interval from GPJASMP1");
+    throw std::runtime_error(std::string(command_name)+" could not infer a positive integer sample interval from GPJASMP1");
   RpmdJANativeFitOptions derived=options;derived.temperature=header.temperature;derived.sample_interval=static_cast<int>(std::llround(sample_interval));
-  std::printf("rpmd_ja fit_samples: frames=%llu P=%d T=%.17g K sample_interval=%d; GPJASMP1 has no potential/PPPM fingerprint, so confirm its sampling configuration is unchanged\n",
+  std::printf("rpmd_ja %s: frames=%llu P=%d T=%.17g K sample_interval=%d; GPJASMP1 has no potential/PPPM fingerprint, so confirm its sampling configuration is unchanged\n",
+    command_name,
     static_cast<unsigned long long>(header.frame_count),header.beads,header.temperature,derived.sample_interval);
   (void)fit_rpmd_ja_native_reference_checked(derived,spool_path,header.frame_count,atom,box,force,true);
 }

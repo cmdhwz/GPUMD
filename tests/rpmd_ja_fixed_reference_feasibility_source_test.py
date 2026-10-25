@@ -271,7 +271,7 @@ for key, present in (
         "sources.front()==\"LOW_RITZ\"" in cuda_test),
     ("preflight runs a separate real prepare/readback smoke", "cuda_integration_executable" in source("scripts/rpmd_ja_feasibility_preflight.py") and
         "--integration-smoke" in source("scripts/rpmd_ja_feasibility_preflight.py") and
-        "run_additive(base,1);run_additive(base+\"_internal_com\",2);return 0;" in source("tests/rpmd_ja_qnep_prepare_cuda_test.cu")),
+        "if(integration_smoke){run_additive(base,1);run_additive(base+\"_internal_com\",2);run_additive(base+\"_diagnostic\",7);return 0;}" in source("tests/rpmd_ja_qnep_prepare_cuda_test.cu")),
     ("integration smoke passes actual M1 writer output through real prepare", (ROOT / "tests/rpmd_ja_fit_prepare_integration_cuda_test.cu").is_file() and
         "GPUMD_RPMD_JA_NATIVE_FIT_TEST_REAL_PREPARE" in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
         "write_native_additive_site_blocks(out,graph,theta,edge_linear,n)" in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
@@ -524,27 +524,30 @@ assert "native_additive_package_header_bytes=sizeof(additive_magic)" in fit and 
        "native additive package size estimate does not match bytes written" in fit
 assert "static_cast<std::uint64_t>(sized.tellg())==estimated_bytes" in cuda_test
 additive_reader = source("src/measure/rpmd_ja_additive.cuh")
-assert "version < 1 || version > 6" in additive_reader
+assert "version < 1 || version > 7" in additive_reader
+assert "CovarianceBaseline build_graph_reference_baseline(" in fit
+assert "covariance_fit.covariance_baseline=build_graph_reference_baseline" in fit
+assert "GRAPH_REFERENCE_PREPARE_READBACK_PASS qnep_v3_stored_D_Bt_action_probes=3_each" in fit
 assert "version == 2 || version == 4 || version == 6" in additive_reader
 assert "rpmd_ja_additive_max_expanded_elements" in additive_reader
 assert "local matrix exceeds the per-site element limit" in additive_reader
 offline_fitter = source("tools/rpmd_ja_fit_reference.py")
 offline_prepare = source("tools/rpmd_ja_qnep_prepare.py")
-assert "version = 6 if data.get(\"internal_mass_com\", False) else 5" in offline_fitter
-assert "version not in (1,2,3,4,5,6)" in offline_fitter
+assert "version = 7 if diagnostic else 6 if data.get(\"internal_mass_com\", False) else 5" in offline_fitter
+assert "version not in (1,2,3,4,5,6,7)" in offline_fitter
 assert "internal_mass_com=version in (2,4,6)" in offline_fitter
-assert "version not in (1, 2, 3, 4, 5, 6)" in offline_prepare
+assert "version not in (1, 2, 3, 4, 5, 6, 7)" in offline_prepare
 assert 'count>q*q' in offline_prepare and 'entry_bytes>size-f.tell()' in offline_prepare
 assert "MAX_ADDITIVE_DENSE_ELEMENTS = _FITTER.MAX_ADDITIVE_DENSE_ELEMENTS" in offline_prepare
 assert "read_sparse_scalars" in additive_reader and "std::signbit(value)" in additive_reader
 assert "if(value!=0.0||std::signbit(value))" in fit
-assert "write(out,std::uint32_t(options.internal_mass_com?6:5))" in fit
+assert "std::uint32_t(options.graph_reference?7:(options.internal_mass_com?6:5))" in fit
 assert "publication_payload_restored?0:estimated_package_bytes" in fit
 assert "publication_payload_restored?0:\n    estimated_qnep_reference_bytes+qnep_sidecar_and_failure_reserve_bytes" in fit
 assert '<<" publication_payload_restored "<<(publication_payload_restored?1:0)' in fit
 assert "support_entries_upper_bound" in fit and "quadratic_bytes" not in fit[fit.index("NativeAdditivePackageEstimate estimate_native_additive_package_size("):fit.index("#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST", fit.index("NativeAdditivePackageEstimate estimate_native_additive_package_size("))]
 assert "actual additive package bytes exceed the conservative support bound" in fit
-assert "prefit_estimate.bytes>=estimated_bytes" in cuda_test
+assert "prefit_estimate.bytes+(version==7?3*sizeof(std::uint32_t):0)>=estimated_bytes" in cuda_test
 assert "write_sparse_package(3)" in source("tests/rpmd_ja_additive_sparse_test.cpp")
 assert "write_sparse_package(4)" in source("tests/rpmd_ja_additive_sparse_test.cpp")
 assert "#undef NDEBUG" in source("tests/rpmd_ja_additive_sparse_test.cpp")
@@ -670,9 +673,9 @@ native_test = source("tests/rpmd_ja_native_fit_cuda_test.cu")
 for prepare_source in (prepare_header, prepare_impl, native_test):
     assert "RpmdJAPrepareResourceObserver" in prepare_source
     assert "RpmdJAPrepareAllocationObserver" in prepare_source
-assert "const RpmdJAPrepareResourceObserver& resource_observer = {},\n  const RpmdJAPrepareAllocationObserver& allocation_observer = {});" in prepare_header
-assert "const RpmdJAPrepareResourceObserver& resource_observer,\n                                    const RpmdJAPrepareAllocationObserver& allocation_observer)" in prepare_impl
-assert "const RpmdJAPrepareResourceObserver&,\n                                    const RpmdJAPrepareAllocationObserver&) {}" in native_test
+assert "const RpmdJAPrepareResourceObserver& resource_observer = {},\n  const RpmdJAPrepareAllocationObserver& allocation_observer = {},\n  const std::function<void(const RpmdJAReference&)>& readback_validator = {});" in prepare_header
+assert "const RpmdJAPrepareResourceObserver& resource_observer,\n                                    const RpmdJAPrepareAllocationObserver& allocation_observer,\n                                    const std::function<void(const RpmdJAReference&)>& readback_validator)" in prepare_impl
+assert "const RpmdJAPrepareResourceObserver&,\n                                    const RpmdJAPrepareAllocationObserver&,\n                                    const std::function<void(const RpmdJAReference&)>&) {}" in native_test
 assert "next_cg_witness_attempt(controller_journal)" in fit
 assert fit.index("next_cg_witness_attempt(controller_journal)") < fit.index("persist_controller_journal();", fit.index("next_cg_witness_attempt(controller_journal)"))
 assert "feasibility_cg_witness_attempt=0" not in fit

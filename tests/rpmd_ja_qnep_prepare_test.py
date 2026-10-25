@@ -51,15 +51,26 @@ def test_native_transport_uses_full_virial_and_chain_force_terms():
             expected[row, coord] = c[alpha, coord, row]
             expected_coarse[row, coord] = cc[alpha, coord, row]
             if nu == alpha:
-                expected[row, coord] -= v[row, a]
-                expected_coarse[row, coord] -= vc[row, a]
                 if site == a:
                     expected[row, coord] -= -v[row].sum()
                     expected_coarse[row, coord] -= -vc[row].sum()
+                expected[row, coord] -= v[row, a]
+                expected_coarse[row, coord] -= vc[row, a]
     coord_mass = np.tile(masses, 3)
     scale = np.sqrt(coord_mass[:, None] * coord_mass[None, :])
     np.testing.assert_allclose(hf, expected / scale, rtol=1e-14, atol=1e-14)
     np.testing.assert_allclose(hc, expected_coarse / scale, rtol=1e-14, atol=1e-14)
+
+
+def test_compact_v4_fine_transport_matches_legacy_transport_operator():
+    n, d = 4, 12
+    rng = np.random.default_rng(83)
+    v = rng.normal(size=(d, n)); c = rng.normal(size=(d, d)); cc = c + 0.02*rng.normal(size=(d, d))
+    masses = np.array([1., 2., 3., 5.])
+    legacy_fine, legacy_coarse, compact_fine = np.empty((d,d)), np.empty((d,d)), np.empty((d,d))
+    qprep.build_native_transport(v,c,v,cc,masses,n,1,legacy_fine,legacy_coarse)
+    qprep.build_native_transport_fine(v,c,masses,n,1,compact_fine)
+    np.testing.assert_array_equal(compact_fine, legacy_fine)
 
 
 def test_dense_and_lowrank_tile_wire_roundtrip_and_safe_bound():
@@ -76,6 +87,22 @@ def test_dense_and_lowrank_tile_wire_roundtrip_and_safe_bound():
             np.testing.assert_allclose(roundtrip, matrix, rtol=1e-12, atol=1e-12)
             assert residual < 1e-12
             assert bound + 1e-12 >= float(np.max(np.sum(np.abs(roundtrip), axis=1)))
+
+
+def test_exact_zero_tile_uses_smaller_rank_one_wire_and_preserves_action():
+    d = qprep.TILE
+    zero = np.zeros((d, d))
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "zero.tiles"
+        qprep._write_tiles(path, zero, False, 1e-8, False)
+        dense_bytes = 12 + 36 + d * d * 8
+        assert path.stat().st_size < dense_bytes
+        recovered = _read_tiles(path, d)
+        np.testing.assert_array_equal(recovered, zero)
+        probe = np.arange(d, dtype=np.float64)
+        np.testing.assert_array_equal(recovered @ probe, np.zeros(d))
+    rank, left, right, error = qprep._tile_factor(np.zeros((1, 1)), 1e-8, False)
+    assert rank == 0 and left.tolist() == [0.0] and right.size == 0 and error == 0.0
 
 
 def test_block_compression_does_not_drop_tiles_or_symmetry():
@@ -225,14 +252,93 @@ def test_prepare_end_to_end_writes_v3_and_bound_sidecar():
         assert not Path(str(output) + ".work").exists()
 
 
+def test_compact_v4_qraw_keeps_fd4_identity_and_rejects_bad_transport_stats():
+    n, d = 4, 12
+    masses = np.array([1.0, 2.0, 3.0, 5.0])
+    lap = np.full((n, n), -1.0); np.fill_diagonal(lap, n - 1)
+    hessian = np.kron(np.eye(3), lap)
+    cell = np.zeros(18); cell[:9] = np.diag([10.0, 11.0, 12.0]).ravel()
+    cell[9:] = np.diag([0.1, 1.0/11.0, 1.0/12.0]).ravel()
+    with tempfile.TemporaryDirectory() as directory:
+        directory = Path(directory)
+        raw, kernel, output = directory / "compact.qraw", directory / "kernel.txt", directory / "compact.rpmdja"
+        with raw.open("wb") as f:
+            f.write(qprep.RAW_MAGIC); f.write(struct.pack("<IIii", 4, qprep.ENDIAN, n, d))
+            f.write(struct.pack("<ddQQ", 300.0, 0.01, 12345, 98765))
+            f.write(struct.pack("<iid", 1, 1, 1.0)); f.write(qprep.RAW_LAYOUT)
+            f.write(cell.astype("<f8").tobytes()); f.write(np.ones(3, dtype="<i4").tobytes())
+            f.write(np.zeros(n, dtype="<i4").tobytes()); f.write(masses.astype("<f8").tobytes())
+            f.write(np.zeros(d, dtype="<f8").tobytes()); f.write(struct.pack("<d", 0.0))
+            f.write(np.zeros(n, dtype="<f8").tobytes()); f.write(np.zeros(d, dtype="<f8").tobytes())
+            f.write(np.zeros(9*n, dtype="<f8").tobytes())
+            small_v = (1.0e-10 * (1.0 + np.arange(d * n).reshape(d, n) % 3)).astype("<f8")
+            small_c = (1.0e-8 * (1.0 + np.arange(3 * d * d).reshape(3, d, d) % 5)).astype("<f8")
+            f.write(small_v.tobytes())
+            f.write(small_c.tobytes())
+            f.write(hessian.T.astype("<f8").tobytes())
+            stats = np.zeros(24); stats[16] = 0.01; stats[17] = 3.0
+            for alpha in range(3):
+                stats[21 + alpha] = qprep.build_native_transport_fine(
+                    small_v, small_c[alpha], masses, n, alpha, np.empty((d, d)))
+            f.write(stats.astype("<f8").tobytes())
+        kernel.write_text("GPUMDJA_KERNEL 1\nU 100\ndegree 0\nP_rank 1\nQ_rank 1\nP_error 0\nQ_error 0\nP_S2 0\nQ_S2 0\nP_values\n1\nP_vectors\n1\nQ_values\n1\nQ_vectors\n1\nEND\n", encoding="ascii")
+        metadata = qprep._read_raw(raw)
+        assert metadata["raw_version"] == 4 and metadata["derivative_version"] == 3
+        assert metadata["coarse_v"] is None and metadata["coarse_c"] is None
+        qprep._prepare(raw, kernel, output, False, 1e-8, 1e-2)
+        assert output.exists()
+        bad = directory / "bad.qraw"
+        data = raw.read_bytes()
+        compact_footer = len(data) - 24 * 8
+        compact = np.frombuffer(data[compact_footer:], dtype="<f8").copy()
+        compact[18] = compact[21] = 1.0
+        bad.write_bytes(data[:compact_footer] + compact.astype("<f8").tobytes())
+        try:
+            qprep._read_raw(bad)
+        except ValueError as exc:
+            assert "transport" in str(exc)
+        else:
+            raise AssertionError("compact qraw accepted a failed native-H transport statistic")
+        bad_norm = directory / "bad_norm.qraw"
+        compact[18:21] = 0.0; compact[21] *= 1.1
+        bad_norm.write_bytes(data[:compact_footer] + compact.astype("<f8").tobytes())
+        try:
+            qprep._prepare(bad_norm, kernel, directory / "bad_norm.rpmdja", False, 1e-8, 1e-2)
+        except ValueError as exc:
+            assert "norm" in str(exc).lower()
+        else:
+            raise AssertionError("prepare accepted a same-scale compact qraw norm mismatch")
+        zero_data = bytearray(data)
+        metadata = qprep._read_raw(raw)
+        zero_data[metadata["start"]:metadata["start"] + metadata["vb"] + metadata["cb"]] = bytes(
+            metadata["vb"] + metadata["cb"])
+        zero_footer = np.frombuffer(zero_data[compact_footer:], dtype="<f8").copy()
+        zero_footer[18:24] = 0.0
+        zero_raw = directory / "zero_h.qraw"
+        zero_raw.write_bytes(zero_data[:compact_footer] + zero_footer.astype("<f8").tobytes())
+        qprep._prepare(zero_raw, kernel, directory / "zero_h.rpmdja", False, 1e-8, 1e-2)
+        zero_footer[21] = 1.0e-13
+        zero_bad = directory / "zero_h_bad_norm.qraw"
+        zero_bad.write_bytes(zero_data[:compact_footer] + zero_footer.astype("<f8").tobytes())
+        try:
+            qprep._prepare(zero_bad, kernel, directory / "zero_h_bad_norm.rpmdja", False, 1e-8, 1e-2)
+        except ValueError as exc:
+            assert "norm" in str(exc).lower()
+        else:
+            raise AssertionError("prepare accepted a nonzero footer norm for zero H")
+
+
 if __name__ == "__main__":
     for test in (test_native_transport_uses_full_virial_and_chain_force_terms,
+                 test_compact_v4_fine_transport_matches_legacy_transport_operator,
                  test_dense_and_lowrank_tile_wire_roundtrip_and_safe_bound,
+                 test_exact_zero_tile_uses_smaller_rank_one_wire_and_preserves_action,
                  test_block_compression_does_not_drop_tiles_or_symmetry,
                  test_kernel_coverage_uses_gpumd_internal_time_constants,
                  test_translation_complement_keeps_soft_modes_and_rejects_negative_curvature,
                  test_loewner_certificate_bounds_softmode_relative_error,
                  test_householder_anchor_permutation_handles_small_n_and_unequal_masses,
-                 test_prepare_end_to_end_writes_v3_and_bound_sidecar):
+                 test_prepare_end_to_end_writes_v3_and_bound_sidecar,
+                 test_compact_v4_qraw_keeps_fd4_identity_and_rejects_bad_transport_stats):
         test()
     print("qNEP RPMD-JA prepare tests passed")

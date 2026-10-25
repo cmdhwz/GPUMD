@@ -2076,6 +2076,10 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
   FILE* current_file = my_fopen("heat_current_rpmd_ja.out", "a");
   fprintf(current_file, "# segment_metadata_version 2\n");
   fprintf(current_file, "# reference_package_sha256 %s\n", rpmd_ja_reference_.source_file_sha256.c_str());
+  fprintf(current_file, "# reference_use_class %s\n# reference_numerical_status %s\n# reference_response_status %s\n",
+    rpmd_ja_reference_policy_is_diagnostic(rpmd_ja_reference_.mechanical_policy) ? "DIAGNOSTIC" : "FORMAL",
+    rpmd_ja_reference_policy_numerical_status(rpmd_ja_reference_.mechanical_policy).c_str(),
+    rpmd_ja_reference_policy_response_status(rpmd_ja_reference_.mechanical_policy).c_str());
   fprintf(current_file, "# backend %s\n",
     rpmd_ja_reference_.backend == 0 ? "dense-v1" :
       rpmd_ja_reference_.backend == 1 ? "sparse-v2" : "qnep-block-v3");
@@ -2151,6 +2155,10 @@ void HAC::write_rpmd_ja_outputs_(const int Nd, const int Nc, const double dt, co
 
   FILE* hac_file = my_fopen("hac_rpmd_ja.out", "a");
   fprintf(hac_file, "# segment_metadata_version 1\n");
+  fprintf(hac_file, "# reference_use_class %s\n# reference_numerical_status %s\n# reference_response_status %s\n",
+    rpmd_ja_reference_policy_is_diagnostic(rpmd_ja_reference_.mechanical_policy) ? "DIAGNOSTIC" : "FORMAL",
+    rpmd_ja_reference_policy_numerical_status(rpmd_ja_reference_.mechanical_policy).c_str(),
+    rpmd_ja_reference_policy_response_status(rpmd_ja_reference_.mechanical_policy).c_str());
   fprintf(hac_file, "# backend %s\n",
     rpmd_ja_reference_.backend == 0 ? "dense-v1" :
       rpmd_ja_reference_.backend == 1 ? "sparse-v2" : "qnep-block-v3");

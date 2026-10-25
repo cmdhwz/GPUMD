@@ -38,7 +38,8 @@ void prepare_rpmd_ja_qnep_reference(const std::string&, const std::string&, cons
                                     const RpmdJAModeValidator&, const std::string&,
                                     const std::function<void(const RpmdJAAdditiveData&)>&,
                                     const RpmdJAPrepareResourceObserver&,
-                                    const RpmdJAPrepareAllocationObserver&) {}
+                                    const RpmdJAPrepareAllocationObserver&,
+                                    const std::function<void(const RpmdJAReference&)>&) {}
 RpmdJAPrepareWorkspaceSizes query_rpmd_ja_qnep_prepare_workspace_sizes(int) { return {}; }
 RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom&, Box&, Force&) { return {}; }
 std::uint64_t rpmd_ja_model_fingerprint(const std::string&) { return 0; }
@@ -1279,21 +1280,27 @@ void test_native_m1_writer_reader_cross_neighbor_images_and_transport()
     {
       std::ofstream out(path,std::ios::binary);assert(out.good());out.write(additive_magic,8);
       write(out,version);write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(4));
-      write(out,std::uint64_t(0));write(out,300.0);write(out,0.05);write(out,0.01);write(out,0.02);
+      write(out,std::uint64_t(0));write(out,300.0);write(out,0.05);write(out,version==7?0.05:0.01);write(out,0.02);
       write(out,std::uint64_t(1));write(out,std::uint64_t(1));
-      estimated_bytes=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);assert(out.good());
+      if(version==7){write(out,std::uint32_t(3));write(out,std::uint32_t(1));write(out,std::uint32_t(1));}
+      estimated_bytes=write_native_additive_site_blocks(out,graph,theta,edge_linear,n)+(version==7?3*sizeof(std::uint32_t):0);assert(out.good());
     }
     const NativeAdditivePackageEstimate prefit_estimate=estimate_native_additive_package_size(graph,n);
-    assert(prefit_estimate.bytes>=estimated_bytes&&prefit_estimate.maximum_site_neighbors>0);
+    assert(prefit_estimate.bytes+(version==7?3*sizeof(std::uint32_t):0)>=estimated_bytes&&prefit_estimate.maximum_site_neighbors>0);
     std::ifstream sized(path,std::ios::binary|std::ios::ate);assert(sized.good());
     assert(static_cast<std::uint64_t>(sized.tellg())==estimated_bytes);sized.close();
     blocks=build_native_additive_site_blocks(graph,theta,edge_linear,n);
     const RpmdJAAdditiveData package=read_rpmd_ja_additive(path,"test-raw.qraw",reference,4,raw_gradient);
-    assert(package.internal_mass_com==(version==6));
+    assert(package.internal_mass_com==(version==6||version==7));
+    assert(package.diagnostic==(version==7));
+    if(version==7){assert(package.numerical_status=="PASS"&&package.response_status=="FAIL");}
     assert(std::remove(path.c_str())==0);return RoundTrip{package,std::move(blocks)};
   };
   const RoundTrip one_third=round_trip(third,"third",5);const RoundTrip one_half=round_trip(half,"half",5);
   const RoundTrip internal_com=round_trip(third,"internal_com",6);assert(internal_com.package.internal_mass_com);
+  const RoundTrip diagnostic_com=round_trip(third,"diagnostic_com",7);
+  assert(diagnostic_com.package.internal_mass_com&&diagnostic_com.package.diagnostic&&
+    diagnostic_com.package.numerical_status=="PASS"&&diagnostic_com.package.response_status=="FAIL");
   auto dense=[](const RpmdJASparseRows& sparse){
     const int dimension=static_cast<int>(sparse.offsets.size())-1;std::vector<double> result(static_cast<std::size_t>(dimension)*dimension,0.0);
     for(int row=0;row<dimension;++row)for(std::size_t index=sparse.offsets[row];index<sparse.offsets[row+1];++index)
@@ -2162,29 +2169,85 @@ void test_covariance_joint_large_group_bfgs_commit_and_default()
 void test_covariance_baseline_brackets_both_signs_and_zero()
 {
   const std::vector<double> masses={1.0,4.0},sqrt_mass={1.0,2.0,1.0,2.0,1.0,2.0};const Graph graph=make_two_atom_covariance_graph();
+  const auto numeric_pass=[](const CovarianceBaseline& reference,const std::uint64_t evaluations){
+    assert(std::isfinite(reference.phi)&&std::isfinite(reference.phi_relative)&&
+      std::isfinite(reference.phi_solve_residual_heuristic)&&std::isfinite(reference.root_relative_tolerance));
+    assert(reference.minimum_shifted_cholesky_diagonal>0.0&&reference.epsilon>0.0);
+    assert(evaluations<=200);
+    assert(!reference.epsilon_constraint_active);
+    assert(reference.stationarity_status=="FREE_ROOT"||reference.stationarity_status=="SAVED_BASELINE_FREE_ROOT_VERIFIED");
+    assert(reference.phi_relative<=reference.root_relative_tolerance);
+    assert(reference.root_bracket_width>=0.0&&reference.root_iterations<=64);
+  };
   {
     DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
     const std::vector<double> statistics={0.3,0.08,-0.04,0.25,0.06,0.35};std::uint64_t evaluations=0;
-    const CovarianceBaseline reference=build_graph_covariance_baseline(system,statistics,0.01,evaluations);
-    check_close(reference.mu,2.533333333333333,2e-7);assert(!reference.epsilon_constraint_active);
+    std::uint64_t optimizer_evaluations=0;
+    const CovarianceBaseline optimizer_reference=build_graph_covariance_baseline(system,statistics,0.01,optimizer_evaluations);
+    check_close(optimizer_reference.mu,2.533333333333333,2e-7);assert(!optimizer_reference.epsilon_constraint_active);
+    const CovarianceBaseline reference=build_graph_reference_baseline(system,statistics,0.01,evaluations);
+    check_close(reference.mu,2.533333333333333,2e-7);assert(!reference.epsilon_constraint_active);numeric_pass(reference,evaluations);
+    GraphReferenceBaselineCandidate saved;saved.mu=reference.mu;saved.theta=reference.theta;
+    std::uint64_t candidate_evaluations=0;
+    const CovarianceBaseline reused=build_graph_reference_baseline(system,statistics,0.01,candidate_evaluations,
+      nullptr,nullptr,nullptr,&saved);
+    check_close(reused.mu,reference.mu,1e-12);assert(candidate_evaluations==1);
+    assert(reused.stationarity_status=="SAVED_BASELINE_FREE_ROOT_VERIFIED");
+    int injected_residual=0;
+    system.before_factor=[&](){if(injected_residual++==0){CovarianceTraceDiagnostics diagnostic;
+      diagnostic.matrix_kind="D";diagnostic.status="RESIDUAL_FAIL";throw CovarianceSolveResidualError(diagnostic);}};
+    candidate_evaluations=0;
+    const CovarianceBaseline retried=build_graph_reference_baseline(system,statistics,0.01,candidate_evaluations,
+      nullptr,nullptr,nullptr,&saved);
+    system.before_factor={};
+    assert(retried.stationarity_status=="FREE_ROOT"&&candidate_evaluations>1);
+    system.before_factor=[](){throw std::runtime_error("injected graph candidate hard failure");};
+    bool hard_failure_propagated=false;
+    try{(void)build_graph_reference_baseline(system,statistics,0.01,candidate_evaluations,nullptr,nullptr,nullptr,&saved);}
+    catch(const std::runtime_error& error){hard_failure_propagated=std::string(error.what())=="injected graph candidate hard failure";}
+    system.before_factor={};assert(hard_failure_propagated);
   }
   {
     DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
     const std::vector<double> statistics={2.5,0.0,0.0,2.5,0.0,2.5};std::uint64_t evaluations=0;
-    const CovarianceBaseline reference=build_graph_covariance_baseline(system,statistics,0.01,evaluations);
-    check_close(reference.mu,-0.4,2e-7);assert(!reference.epsilon_constraint_active);
+    std::uint64_t optimizer_evaluations=0;
+    const CovarianceBaseline optimizer_reference=build_graph_covariance_baseline(system,statistics,0.01,optimizer_evaluations);
+    check_close(optimizer_reference.mu,-0.4,2e-7);assert(!optimizer_reference.epsilon_constraint_active);
+    const CovarianceBaseline reference=build_graph_reference_baseline(system,statistics,0.01,evaluations);
+    check_close(reference.mu,-0.4,2e-7);assert(!reference.epsilon_constraint_active);numeric_pass(reference,evaluations);
   }
   {
     DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
     const std::vector<double> statistics={0.3125,0.0,0.0,1.25,0.0,2.1875};std::uint64_t evaluations=0;
-    const CovarianceBaseline reference=build_graph_covariance_baseline(system,statistics,1e-6,evaluations);
-    check_close(reference.mu,0.0,2e-7);assert(!reference.epsilon_constraint_active);
+    std::uint64_t optimizer_evaluations=0;
+    const CovarianceBaseline optimizer_reference=build_graph_covariance_baseline(system,statistics,1e-6,optimizer_evaluations);
+    check_close(optimizer_reference.mu,0.0,2e-7);assert(!optimizer_reference.epsilon_constraint_active);
+    const CovarianceBaseline reference=build_graph_reference_baseline(system,statistics,1e-6,evaluations);
+    check_close(reference.mu,0.0,2e-7);assert(!reference.epsilon_constraint_active);numeric_pass(reference,evaluations);
   }
   {
     DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
     const std::vector<double> statistics={1000.0,0.0,0.0,1000.0,0.0,1000.0};std::uint64_t evaluations=0;
-    const CovarianceBaseline reference=build_graph_covariance_baseline(system,statistics,0.01,evaluations);
-    assert(reference.epsilon_constraint_active&&reference.mu>=reference.boundary_mu);
+    std::uint64_t optimizer_evaluations=0;
+    const CovarianceBaseline optimizer_reference=build_graph_covariance_baseline(system,statistics,0.01,optimizer_evaluations);
+    assert(optimizer_reference.epsilon_constraint_active&&optimizer_reference.mu>=optimizer_reference.boundary_mu);
+    bool unconfirmed=false;
+    try{(void)build_graph_reference_baseline(system,statistics,0.01,evaluations);}
+    catch(const std::runtime_error& error){unconfirmed=std::string(error.what()).find("BASELINE_NUMERICAL_UNCONFIRMED")!=std::string::npos;}
+    assert(unconfirmed);
+  }
+  {
+    constexpr double epsilon=1.0e-8,expected_mu=1.3e-8;
+    const std::vector<double> unit_masses={1.0,1.0},unit_sqrt_mass={1.0,1.0,1.0,1.0,1.0,1.0};
+    DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,false);
+    DeviceCovarianceSystem system(baseline,graph,unit_sqrt_mass,unit_masses);
+    const double slope=3.0/expected_mu;
+    const std::vector<double> statistics={slope/3.0,0.0,0.0,slope/3.0,0.0,slope/3.0};
+    std::uint64_t evaluations=0;
+    const CovarianceBaseline reference=build_graph_reference_baseline(system,statistics,epsilon,evaluations);
+    check_close(reference.mu,expected_mu,1e-7);
+    assert(reference.phi_relative<=1e-7&&reference.root_iterations<=64&&
+      reference.minimum_shifted_cholesky_diagonal>0.0&&!reference.epsilon_constraint_active);
   }
 }
 

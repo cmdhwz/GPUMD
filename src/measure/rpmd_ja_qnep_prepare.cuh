@@ -60,4 +60,5 @@ void prepare_rpmd_ja_qnep_reference(
   const std::string& additive_path = {},
   const std::function<void(const RpmdJAAdditiveData&)>& additive_validator = {},
   const RpmdJAPrepareResourceObserver& resource_observer = {},
-  const RpmdJAPrepareAllocationObserver& allocation_observer = {});
+  const RpmdJAPrepareAllocationObserver& allocation_observer = {},
+  const std::function<void(const RpmdJAReference&)>& readback_validator = {});

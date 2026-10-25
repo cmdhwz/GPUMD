@@ -231,6 +231,7 @@ class MaterialEvaluationTest(unittest.TestCase):
         self.assertEqual(report["hac_integral_units"], "eV^2*angstrom^2/ps")
         self.assertEqual(len(reference["ja_correlation_decomposition_error_by_lag_all_nine_components"]), 6)
         self.assertLess(reference["ja_correlation_decomposition_max_absolute_error"], 1.0e-12)
+        self.assertIn("amplitude only", report["reference_sensitivity"]["scope"])
         np.testing.assert_allclose(arrays["reference_0_ja_ja"], arrays["reference_0_ja_ja_decomposed"],
                                    rtol=1.0e-12, atol=1.0e-12)
         self.assertNotIn("thermal_conductivity", report)
@@ -242,6 +243,8 @@ class MaterialEvaluationTest(unittest.TestCase):
         self.assertLess(report["online_current_comparison"]["delta_j_max_abs_error"], 1.0e-10)
         self.assertLess(report["online_current_comparison"]["ja_max_abs_error"], 1.0e-10)
         self.assertEqual(report["online_current_comparison"]["reference_id"], "reference-0")
+        self.assertEqual(report["online_current_comparison"]["reference_use_class"], "FORMAL")
+        self.assertEqual(report["analysis_use_class"], "FORMAL")
         self.assertEqual(arrays["online_delta_j_eV_angstrom_per_ps"].shape, (12, 3))
 
         with self.assertRaisesRegex(ValueError, "online.*reference|reference.*online"):
@@ -249,6 +252,43 @@ class MaterialEvaluationTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "online.*DeltaJ|DeltaJ.*online"):
             evaluate.evaluate_manifest(self._v2_manifest(delta_offset=1.0e-4))
+
+    def test_diagnostic_rpjam2_requires_identity_in_current_archive(self):
+        path = self._v2_manifest()
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["analysis_use_class"] = "DIAGNOSTIC"
+        manifest["online_current"].update({
+            "reference_use_class": "DIAGNOSTIC",
+            "reference_numerical_status": "PASS",
+            "reference_response_status": "FAIL",
+        })
+        diagnostic_path = self.directory / "manifest-rpja2-diagnostic-missing-identity.json"
+        diagnostic_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "diagnostic current.*identity"):
+            evaluate.evaluate_manifest(diagnostic_path)
+
+    def test_rpjam2_current_identity_must_match_reference_package_policy(self):
+        path = self._v2_manifest()
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        with np.load(manifest["trajectory_npz"], allow_pickle=False) as source:
+            payload = {key: source[key] for key in source.files}
+        payload["online_reference_use_class"] = np.asarray("DIAGNOSTIC")
+        payload["online_reference_numerical_status"] = np.asarray("PASS")
+        payload["online_reference_response_status"] = np.asarray("FAIL")
+        trajectory = self.directory / "trajectory-rpja2-mismatched-use.npz"
+        np.savez(trajectory, **payload)
+        manifest["trajectory_npz"] = str(trajectory)
+        manifest["trajectory_npz_sha256"] = hashlib.sha256(trajectory.read_bytes()).hexdigest()
+        manifest["analysis_use_class"] = "DIAGNOSTIC"
+        manifest["online_current"].update({
+            "reference_use_class": "DIAGNOSTIC",
+            "reference_numerical_status": "PASS",
+            "reference_response_status": "FAIL",
+        })
+        mismatch_path = self.directory / "manifest-rpja2-package-use-mismatch.json"
+        mismatch_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "selected reference package"):
+            evaluate.evaluate_manifest(mismatch_path)
 
     def test_native_current_export_then_rpjam2_evaluate_fixture(self):
         with np.load(self.trajectory, allow_pickle=False) as source:

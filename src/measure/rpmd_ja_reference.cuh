@@ -90,6 +90,10 @@ struct RpmdJAReference
 RpmdJAReference read_rpmd_ja_reference(const std::string& path);
 int rpmd_ja_reference_policy_beads(const std::string& policy);
 bool rpmd_ja_reference_policy_requires_pimd_fix_com(const std::string& policy);
+bool rpmd_ja_reference_policy_is_diagnostic(const std::string& policy);
+bool rpmd_ja_reference_policy_use_matches(int backend, const std::string& policy, bool diagnostic);
+std::string rpmd_ja_reference_policy_response_status(const std::string& policy);
+std::string rpmd_ja_reference_policy_numerical_status(const std::string& policy);
 void load_rpmd_ja_kernel_table(const std::string& path, RpmdJAReference& reference);
 std::uint64_t estimate_rpmd_ja_qnep_v3_max_serialized_bytes(const RpmdJAReference& reference);
 std::streampos write_rpmd_ja_qnep_v3_stream_prefix(std::ostream& out, const RpmdJAReference& reference);

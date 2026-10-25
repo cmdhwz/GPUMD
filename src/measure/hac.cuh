@@ -33,11 +33,18 @@ public:
   ~HAC();
 
   void set_qnep_full_a(const bool enabled) { qnep_full_a_ = enabled; }
-  void set_rpmd_ja(const bool enabled, const std::string& reference_path)
+  void set_rpmd_ja(const bool enabled, const std::string& reference_path, const bool diagnostic = false)
   {
     rpmd_ja_enabled_ = enabled;
     rpmd_ja_reference_path_ = reference_path;
+    rpmd_ja_diagnostic_ = diagnostic;
   }
+
+#ifdef GPUMD_RPMD_JA_QNEP_PREPARE_FAULT_INJECTION_TEST
+  bool rpmd_ja_enabled_for_test() const { return rpmd_ja_enabled_; }
+  bool rpmd_ja_diagnostic_for_test() const { return rpmd_ja_diagnostic_; }
+  const std::string& rpmd_ja_reference_path_for_test() const { return rpmd_ja_reference_path_; }
+#endif
 
   bool centroid_force_source_is_immediate() const
   {
@@ -155,6 +162,7 @@ private:
   double deferred_hac_wall_time_ = 0.0;
   bool qnep_full_a_ = false;
   bool rpmd_ja_enabled_ = false;
+  bool rpmd_ja_diagnostic_ = false;
   std::string rpmd_ja_reference_path_;
   RpmdJAReference rpmd_ja_reference_;
   std::uint64_t rpmd_ja_reference_file_fingerprint_ = 0;

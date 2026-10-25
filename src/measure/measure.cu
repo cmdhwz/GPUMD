@@ -106,15 +106,16 @@ void Measure::set_hac_current(const bool qnep_full_a)
   }
 }
 
-void Measure::set_rpmd_ja(const bool enabled, const std::string& reference_path)
+void Measure::set_rpmd_ja(const bool enabled, const std::string& reference_path, const bool diagnostic)
 {
   rpmd_ja_enabled_ = enabled;
   rpmd_ja_reference_path_ = reference_path;
+  rpmd_ja_diagnostic_ = diagnostic;
   for (auto& action : actions_) {
     if (action->action_name == "compute_hac") {
       auto* hac = dynamic_cast<HAC*>(action.get());
       if (hac != nullptr) {
-        hac->set_rpmd_ja(enabled, reference_path);
+        hac->set_rpmd_ja(enabled, reference_path, diagnostic);
       }
     }
   }
@@ -267,7 +268,7 @@ bool Measure::parse_action(
     std::unique_ptr<Action> action;
     auto* hac = new HAC(tokens);
     hac->set_qnep_full_a(hac_current_qnep_full_a_);
-    hac->set_rpmd_ja(rpmd_ja_enabled_, rpmd_ja_reference_path_);
+    hac->set_rpmd_ja(rpmd_ja_enabled_, rpmd_ja_reference_path_, rpmd_ja_diagnostic_);
     action.reset(hac);
     actions_.emplace_back(std::move(action));
   } else if (tokens[0] == "compute_quantum_heat_moments") {
