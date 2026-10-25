@@ -99,6 +99,12 @@ int main()
   assert(block_spectrum.size() == spectrum.size());
   assert(header_contains("m3_shc_blocks.out", "statistics are per complete block only"));
   assert(header_contains("m3_shc_correlation.out", "sample_interval 1; dt_ps"));
+  for (const char* filename : {
+         "m3_plane_flux.out", "m3_shc_correlation.out", "m3_shc.out", "m3_shc_blocks.out"}) {
+    assert(header_contains(filename, "geometry_source m3_shared_geometry.json"));
+    assert(header_contains(filename, "plane_id_source sampling_planes_A"));
+    assert(header_contains(filename, "# sampling_planes_A 10.9"));
+  }
   const FixtureSampling sampling = fixture_sampling();
   const double expected_dt_ps = sampling.time_step * 10.18051 * sampling.sample_interval / 1000.0;
   for (const char* filename : {"m3_shc_correlation.out", "m3_shc_blocks.out"}) {

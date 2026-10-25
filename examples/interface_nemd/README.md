@@ -6,4 +6,6 @@ Each `model.xyz` must contain a grouping method 0 with label 0 for the hot bath,
 
 This checkout contains no trained AlAs/GaAs NEP model or matching structures, so the sample is executable after those user-specific files are supplied; it is not a self-contained physical regression. Replace `SET_TO_GPUMD_COMMIT` with the revision recorded for each run. Use distinct run folders and remove or rename output files before repeating a run; the profile and analyzer intentionally reject existing outputs.
 
+`shared_geometry.example` shows the native geometry distinction for a model with grouping method 0 source/sink labels and grouping method 1 material labels: `interfaces` records the physical z=50 Å material boundary, while `sampling_planes` selects two independent interior bulk planes. It is a schema example, not consumed by the legacy `run.in` above. The profile's `interface_crossing` labels use only the physical interface list; SHC plane IDs use the sorted sampling-plane list. The shipped Python analyzer still reads the legacy/profile schema and has not been updated for native shared-profile or SHC output.
+
 After the three profiles are written, run `python tools/interface_analysis.py examples/interface_nemd/analysis.json` from the repository root. It writes tables and an errorbar SVG into `examples/interface_nemd/analysis/`.

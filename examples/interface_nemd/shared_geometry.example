@@ -1,0 +1,6 @@
+axis z
+bin_width_A 2.0
+interfaces 1 50.0
+sampling_planes 2 25.0 75.0
+material_group 1
+bath_groups 0 0 1

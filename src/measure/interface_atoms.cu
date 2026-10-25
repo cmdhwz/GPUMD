@@ -221,6 +221,8 @@ void DumpInterfaceAtoms::pre_run(
   std::fprintf(
     output_, "# geometry_source %s_geometry.json\n",
     interface_geometry_->output_prefix().c_str());
+  std::fprintf(output_, "# reference_positions_role geometry_mapping_only; equilibrium_reference external_required\n");
+  std::fprintf(output_, "# no t=0 frame; first row is the first scheduled post-compute2 sample\n");
   std::fprintf(output_, "# bin_window_zero_based_half_open %d %d\n", bin_lo_, bin_hi_);
   std::fprintf(output_, "# sample_steps %d samples_per_block %d\n", sample_steps_, samples_per_block_);
   std::fprintf(output_, "# frame_zero_based atom_id_zero_based_global step_one_based_completed\n");

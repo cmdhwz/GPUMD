@@ -118,6 +118,9 @@ int main(int argc, char** argv)
   const char* late_file = argv[3];
   assert(contains_line(local_file, "# dump_interface_atoms version 1"));
   assert(contains_line(local_file, "# geometry_source local_geometry_geometry.json"));
+  assert(contains_line(local_file, "reference_positions_role geometry_mapping_only"));
+  assert(contains_line(local_file, "equilibrium_reference external_required"));
+  assert(contains_line(local_file, "no t=0 frame; first row is the first scheduled post-compute2 sample"));
   assert(contains_line(
     local_file,
     "# columns: frame step time_ps atom_id x_A y_A z_A xu_A yu_A zu_A vx_A_ps vy_A_ps vz_A_ps"));

@@ -35,6 +35,32 @@ int main()
   assert(interface_bin_crosses_plane(0.0, 5.0, 3.0));
   assert(interface_bin_crosses_plane(5.0, 10.0, 7.0));
   assert(!interface_bin_crosses_plane(0.0, 5.0, 5.0));
+  std::vector<double> physical_interfaces{3.0};
+  std::vector<double> sampling_planes{7.0};
+  assert(interface_normalize_plane_coordinates(physical_interfaces, 10.0, false));
+  assert(interface_normalize_plane_coordinates(sampling_planes, 10.0, false));
+  assert(interface_bin_crosses_any_plane(0.0, 5.0, physical_interfaces));
+  assert(!interface_bin_crosses_any_plane(0.0, 5.0, sampling_planes));
+  assert(!interface_bin_crosses_any_plane(5.0, 10.0, physical_interfaces));
+  assert(interface_bin_crosses_any_plane(5.0, 10.0, sampling_planes));
+
+  // Omitted sampling_planes copies the normalized physical interfaces.
+  std::vector<double> legacy_interfaces{7.0, 3.0};
+  assert(interface_normalize_plane_coordinates(legacy_interfaces, 10.0, false));
+  const std::vector<double> legacy_sampling_planes = legacy_interfaces;
+  assert(legacy_sampling_planes == std::vector<double>({3.0, 7.0}));
+
+  // Each list normalizes independently; duplicate wrapped coordinates are rejected.
+  std::vector<double> periodic_interfaces{13.0, 4.0};
+  std::vector<double> periodic_sampling{12.0, 7.0};
+  assert(interface_normalize_plane_coordinates(periodic_interfaces, 10.0, true));
+  assert(interface_normalize_plane_coordinates(periodic_sampling, 10.0, true));
+  assert(periodic_interfaces == std::vector<double>({3.0, 4.0}));
+  assert(periodic_sampling == std::vector<double>({2.0, 7.0}));
+  std::vector<double> duplicate_wrapped_sampling{0.0, 10.0};
+  assert(!interface_normalize_plane_coordinates(duplicate_wrapped_sampling, 10.0, true));
+  std::vector<double> empty_sampling;
+  assert(interface_normalize_plane_coordinates(empty_sampling, 10.0, false));
   assert(interface_vacf_origin_count(8, 0) == 8);
   assert(interface_vacf_origin_count(8, 3) == 5);
   assert(interface_vacf_origin_count(8, 8) == 0);

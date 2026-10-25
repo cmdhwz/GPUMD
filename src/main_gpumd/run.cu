@@ -297,8 +297,16 @@ void Run::perform_a_run(const int number_of_steps)
   printf("Speed of this run = %g atom*step/second.\n", run_speed);
   print_line_2();
 
+  const auto post_run_begin = std::chrono::high_resolution_clock::now();
   measure.post_run(
     atom, box, integrate, number_of_steps, time_step, integrate.get_temperature2());
+  const auto post_run_finish = std::chrono::high_resolution_clock::now();
+  const std::chrono::duration<double> post_run_time = post_run_finish - post_run_begin;
+  const std::chrono::duration<double> total_time = post_run_finish - time_begin;
+  printf("Post-run time = %g second.\n", post_run_time.count());
+  printf("Total time including post_run = %g second.\n", total_time.count());
+  printf("Total speed including post_run = %g atom*step/second.\n",
+    atom.number_of_atoms * (number_of_steps * 1.0 / total_time.count()));
 
   integrate.finalize(atom, box);
   velocity.finalize();

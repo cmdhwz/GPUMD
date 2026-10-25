@@ -8,7 +8,9 @@
 */
 
 #pragma once
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,25 @@ inline bool interface_wrap_coordinate(double& x, const double length)
   x -= std::floor(x / length) * length;
   if (x >= length) x = 0.0;
   return x >= 0.0;
+}
+
+inline bool interface_normalize_plane_coordinates(
+  std::vector<double>& coordinates, const double length, const bool periodic)
+{
+  if (!std::isfinite(length) || length <= 0.0) return false;
+  for (double& coordinate : coordinates) {
+    if (!std::isfinite(coordinate)) return false;
+    if (periodic) {
+      if (!interface_wrap_coordinate(coordinate, length)) return false;
+    } else if (coordinate < 0.0 || coordinate >= length) {
+      return false;
+    }
+  }
+  std::sort(coordinates.begin(), coordinates.end());
+  for (size_t i = 1; i < coordinates.size(); ++i) {
+    if (coordinates[i] <= coordinates[i - 1]) return false;
+  }
+  return true;
 }
 
 inline int interface_bin_index(
@@ -127,6 +148,15 @@ inline bool interface_bin_crosses_plane(
   return plane > lower && plane < upper;
 }
 
+inline bool interface_bin_crosses_any_plane(
+  const double lower, const double upper, const std::vector<double>& planes)
+{
+  for (double plane : planes) {
+    if (interface_bin_crosses_plane(lower, upper, plane)) return true;
+  }
+  return false;
+}
+
 struct InterfaceMaterialAccumulator
 {
   bool has_material = false;
@@ -188,6 +218,7 @@ public:
   double box_length_A() const { return box_length_A_; }
   double cross_section_A2() const { return cross_section_A2_; }
   const std::vector<double>& interfaces_A() const { return interfaces_A_; }
+  const std::vector<double>& sampling_planes_A() const { return sampling_planes_A_; }
   const std::vector<double>& box_matrix() const { return box_matrix_; }
   const std::vector<int>& pbc() const { return pbc_; }
   const std::vector<int>& atom_bin() const { return atom_bin_; }
@@ -207,6 +238,8 @@ private:
   int axis_ = -1;
   double bin_width_A_ = 0.0;
   std::vector<double> interfaces_A_;
+  std::vector<double> sampling_planes_A_;
+  bool sampling_planes_explicit_ = false;
   int material_method_ = -1;
   int bath_method_ = -1;
   int source_group_ = -1;

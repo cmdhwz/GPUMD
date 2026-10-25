@@ -91,6 +91,7 @@ void InterfaceGeometry::parse_config()
   bool axis_seen = false;
   bool width_seen = false;
   bool interfaces_seen = false;
+  bool sampling_planes_seen = false;
   bool material_seen = false;
   bool bath_seen = false;
   std::string line;
@@ -114,20 +115,34 @@ void InterfaceGeometry::parse_config()
       if (width_seen || fields.size() != 2 || !parse_real_token(fields[1], bin_width_A_) || bin_width_A_ <= 0.0)
         PRINT_INPUT_ERROR("Invalid or duplicate bin_width_A config key.\n");
       width_seen = true;
-    } else if (fields[0] == "interfaces") {
+    } else if (fields[0] == "interfaces" || fields[0] == "sampling_planes") {
+      const bool sampling_planes = fields[0] == "sampling_planes";
+      std::vector<double>& coordinates = sampling_planes ? sampling_planes_A_ : interfaces_A_;
+      bool& key_seen = sampling_planes ? sampling_planes_seen : interfaces_seen;
       int count = 0;
-      if (interfaces_seen || fields.size() < 2 || !parse_int_token(fields[1], count) || count < 0 ||
+      if (key_seen || fields.size() < 2 || !parse_int_token(fields[1], count) || count < 0 ||
           fields.size() != static_cast<size_t>(count) + 2) {
-        PRINT_INPUT_ERROR("Invalid or duplicate interfaces config key.\n");
+        if (sampling_planes) {
+          PRINT_INPUT_ERROR("Invalid or duplicate sampling_planes config key.\n");
+        } else {
+          PRINT_INPUT_ERROR("Invalid or duplicate interfaces config key.\n");
+        }
       }
       for (int i = 0; i < count; ++i) {
         double coordinate = 0.0;
         if (!parse_real_token(fields[i + 2], coordinate)) {
-          PRINT_INPUT_ERROR("Interface coordinates must be finite numbers.\n");
+          if (sampling_planes) {
+            PRINT_INPUT_ERROR("Sampling-plane coordinates must be finite numbers.\n");
+          } else {
+            PRINT_INPUT_ERROR("Interface coordinates must be finite numbers.\n");
+          }
         }
-        interfaces_A_.emplace_back(coordinate);
+        coordinates.emplace_back(coordinate);
       }
-      interfaces_seen = true;
+      key_seen = true;
+      if (sampling_planes) {
+        sampling_planes_explicit_ = true;
+      }
     } else if (fields[0] == "material_group") {
       if (material_seen || fields.size() != 2 || !parse_int_token(fields[1], material_method_))
         PRINT_INPUT_ERROR("Invalid or duplicate material_group config key.\n");
@@ -187,20 +202,16 @@ void InterfaceGeometry::initialize(
     PRINT_INPUT_ERROR("Interface geometry bin count or area is invalid.\n");
   }
   const int num_bins = static_cast<int>(raw_bin_count);
-  for (double& coordinate : interfaces_A_) {
-    if (pbc_[axis_]) {
-      if (!interface_wrap_coordinate(coordinate, box_length_A_)) {
-        PRINT_INPUT_ERROR("Interface coordinates cannot be wrapped into the periodic box.\n");
-      }
-    } else if (coordinate < 0.0 || coordinate >= box_length_A_) {
-      PRINT_INPUT_ERROR("Nonperiodic interface coordinates must lie in [0,L).\n");
-    }
+  if (!interface_normalize_plane_coordinates(interfaces_A_, box_length_A_, pbc_[axis_] != 0)) {
+    PRINT_INPUT_ERROR("Interface coordinates must be in range and unique after PBC normalization.\n");
   }
-  std::sort(interfaces_A_.begin(), interfaces_A_.end());
-  for (size_t i = 1; i < interfaces_A_.size(); ++i) {
-    if (interfaces_A_[i] <= interfaces_A_[i - 1]) {
-      PRINT_INPUT_ERROR("Normalized interface coordinates must be unique.\n");
+  if (sampling_planes_explicit_) {
+    if (!interface_normalize_plane_coordinates(
+          sampling_planes_A_, box_length_A_, pbc_[axis_] != 0)) {
+      PRINT_INPUT_ERROR("Sampling-plane coordinates must be in range and unique after PBC normalization.\n");
     }
+  } else {
+    sampling_planes_A_ = interfaces_A_;
   }
   const int* material_labels = group_labels(groups, material_method_, N);
   const int* bath_labels = group_labels(groups, bath_method_, N);
@@ -265,11 +276,8 @@ void InterfaceGeometry::initialize(
     if (!std::isfinite(bins_[b].volume_A3) || bins_[b].volume_A3 <= 0.0) {
       PRINT_INPUT_ERROR("Interface bin volume must be finite and positive.\n");
     }
-    for (double plane : interfaces_A_) {
-      if (interface_bin_crosses_plane(bins_[b].lower_A, bins_[b].upper_A, plane)) {
-        bins_[b].interface_crossing = 1;
-      }
-    }
+    bins_[b].interface_crossing =
+      interface_bin_crosses_any_plane(bins_[b].lower_A, bins_[b].upper_A, interfaces_A_);
   }
 
   for (int n = 0; n < N; ++n) {
@@ -342,7 +350,7 @@ void InterfaceGeometry::write_outputs() const
     PRINT_INPUT_ERROR("Interface geometry output already exists; choose a new prefix.\n");
   }
   FILE* json = my_fopen(json_name.c_str(), "w");
-  std::fprintf(json, "{\n  \"algorithm_version\": 1,\n  \"axis\": \"%c\",\n", "xyz"[axis_]);
+  std::fprintf(json, "{\n  \"algorithm_version\": 2,\n  \"axis\": \"%c\",\n", "xyz"[axis_]);
   std::fprintf(json, "  \"box_matrix_A\": [");
   for (size_t i = 0; i < box_matrix_.size(); ++i) std::fprintf(json, "%s%.17g", i ? ", " : "", box_matrix_[i]);
   std::fprintf(json, "],\n  \"pbc\": [%d, %d, %d],\n", pbc_[0], pbc_[1], pbc_[2]);
@@ -354,17 +362,22 @@ void InterfaceGeometry::write_outputs() const
   for (size_t i = 0; i < bin_edges_A_.size(); ++i) std::fprintf(json, "%s%.17g", i ? ", " : "", bin_edges_A_[i]);
   std::fprintf(json, "],\n  \"interfaces_A\": [");
   for (size_t i = 0; i < interfaces_A_.size(); ++i) std::fprintf(json, "%s%.17g", i ? ", " : "", interfaces_A_[i]);
+  std::fprintf(json, "],\n  \"sampling_planes_A\": [");
+  for (size_t i = 0; i < sampling_planes_A_.size(); ++i) {
+    std::fprintf(json, "%s%.17g", i ? ", " : "", sampling_planes_A_[i]);
+  }
   std::fprintf(
     json,
-    "],\n  \"group_methods\": {\"material\": %d, \"bath\": %d, \"bin\": %d, \"fixed\": %d, \"moving\": %d},\n",
+    "],\n  \"plane_coordinate_ordering\": \"both arrays normalized, ascending, unique\",\n  \"shc_plane_id_source\": \"zero_based_index_in_sorted_sampling_planes_A\",\n  \"group_methods\": {\"material\": %d, \"bath\": %d, \"bin\": %d, \"fixed\": %d, \"moving\": %d},\n",
     material_method_, bath_method_, has_bin_method_ ? bin_method_ : -1, fixed_method_, moving_method_);
   std::fprintf(
     json,
-    "  \"bath_group_ids\": {\"source\": %d, \"sink\": %d},\n  \"excluded_group_ids\": {\"fixed\": %d, \"moving\": %d},\n  \"atom_mapping\": \"pre_run_wrapped_reference_positions\",\n  \"options\": {\"nonperiodic_out_of_range\": \"error\", \"bin_group_labels\": \"must_equal_geometric_bin_id\"},\n  \"units\": {\"length\": \"A\", \"area\": \"A^2\", \"volume\": \"A^3\", \"mass\": \"amu\"}\n}\n",
+    "  \"bath_group_ids\": {\"source\": %d, \"sink\": %d},\n  \"excluded_group_ids\": {\"fixed\": %d, \"moving\": %d},\n  \"atom_mapping\": \"pre_run_wrapped_reference_positions\",\n  \"reference_positions_role\": \"geometry_mapping_only\",\n  \"equilibrium_reference\": \"external_required\",\n  \"options\": {\"nonperiodic_out_of_range\": \"error\", \"bin_group_labels\": \"must_equal_geometric_bin_id\"},\n  \"units\": {\"length\": \"A\", \"area\": \"A^2\", \"volume\": \"A^3\", \"mass\": \"amu\"}\n}\n",
     source_group_, sink_group_, fixed_group_id_, moving_group_id_);
   std::fclose(json);
 
   FILE* groups = my_fopen(groups_name.c_str(), "w");
+  std::fprintf(groups, "# reference_positions_role geometry_mapping_only; equilibrium_reference external_required\n");
   std::fprintf(groups, "# atom_id bin_id material_id bath_id fixed moving ref_x_A ref_y_A ref_z_A mass_amu type_id\n");
   for (size_t n = 0; n < atom_bin_.size(); ++n) {
     std::fprintf(

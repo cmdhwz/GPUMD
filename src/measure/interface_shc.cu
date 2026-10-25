@@ -43,6 +43,16 @@ bool output_exists(const std::string& path)
   return true;
 }
 
+void write_plane_id_metadata(FILE* output, const InterfaceGeometry& geometry)
+{
+  std::fprintf(output, "# plane_id_source sampling_planes_A in geometry JSON; plane_id is its zero-based sorted-coordinate index\n");
+  std::fprintf(output, "# sampling_planes_A");
+  for (double coordinate : geometry.sampling_planes_A()) {
+    std::fprintf(output, " %.17g", coordinate);
+  }
+  std::fprintf(output, "\n");
+}
+
 __global__ void gpu_store_interface_shc_sample(
   const int selected_count,
   const int plane_count,
@@ -174,8 +184,8 @@ void ComputeInterfaceSHC::pre_run(
   Force& force)
 {
   if (!interface_geometry_ || !interface_geometry_->initialized() ||
-      interface_geometry_->interfaces_A().empty()) {
-    PRINT_INPUT_ERROR("compute_interface_shc requires shared geometry with at least one interface plane.\n");
+      interface_geometry_->sampling_planes_A().empty()) {
+    PRINT_INPUT_ERROR("compute_interface_shc requires shared geometry with at least one sampling plane.\n");
   }
   const EnsembleType ensemble = integrate.get_type();
   if (ensemble != EnsembleType::NVE && ensemble != EnsembleType::HEAT_LAN &&
@@ -224,11 +234,11 @@ void ComputeInterfaceSHC::pre_run(
   }
 
   const int N = atom.number_of_atoms;
-  const std::vector<double>& interfaces = interface_geometry_->interfaces_A();
-  if (interfaces.size() > static_cast<size_t>(std::numeric_limits<int>::max() - 127)) {
-    PRINT_INPUT_ERROR("compute_interface_shc interface plane count exceeds supported indexing.\n");
+  const std::vector<double>& sampling_planes = interface_geometry_->sampling_planes_A();
+  if (sampling_planes.size() > static_cast<size_t>(std::numeric_limits<int>::max() - 127)) {
+    PRINT_INPUT_ERROR("compute_interface_shc sampling-plane count exceeds supported indexing.\n");
   }
-  const int planes = static_cast<int>(interfaces.size());
+  const int planes = static_cast<int>(sampling_planes.size());
   const std::vector<double>& reference_interleaved = interface_geometry_->reference_positions();
   std::vector<double> reference_soa(checked_product(static_cast<size_t>(N), 3));
   for (int n = 0; n < N; ++n) {
@@ -241,7 +251,7 @@ void ComputeInterfaceSHC::pre_run(
     for (int n = 0; n < N; ++n) {
       const double x = reference_soa[static_cast<size_t>(interface_geometry_->axis()) * N + n];
       if (nep_plane_atom_selected(
-            x, interfaces[p], lengths[interface_geometry_->axis()],
+            x, sampling_planes[p], lengths[interface_geometry_->axis()],
             pbc[interface_geometry_->axis()] != 0, selection_cutoff)) {
         selected_atoms_.push_back(n);
         slot_planes_.push_back(p);
@@ -310,7 +320,7 @@ void ComputeInterfaceSHC::pre_run(
   gpu_buffer_bytes = checked_sum(gpu_buffer_bytes,
     checked_product(block_flux_values, sizeof(double)));
   gpu_buffer_bytes = checked_sum(gpu_buffer_bytes,
-    checked_product(interfaces.size(), sizeof(double)));
+    checked_product(sampling_planes.size(), sizeof(double)));
   gpu_buffer_bytes = checked_sum(gpu_buffer_bytes,
     checked_product(plane_offsets_.size(), sizeof(int)));
   gpu_buffer_bytes = checked_sum(gpu_buffer_bytes, 2 * sizeof(int));
@@ -346,8 +356,8 @@ void ComputeInterfaceSHC::pre_run(
 
   gpu_reference_positions_.resize(reference_soa.size());
   gpu_reference_positions_.copy_from_host(reference_soa.data(), reference_soa.size());
-  gpu_plane_positions_.resize(interfaces.size());
-  gpu_plane_positions_.copy_from_host(interfaces.data(), interfaces.size());
+  gpu_plane_positions_.resize(sampling_planes.size());
+  gpu_plane_positions_.copy_from_host(sampling_planes.data(), sampling_planes.size());
   gpu_plane_offsets_.resize(plane_offsets_.size());
   gpu_plane_offsets_.copy_from_host(plane_offsets_.data(), plane_offsets_.size());
   gpu_candidate_offsets_.resize(candidate_offsets_.size());
@@ -403,6 +413,7 @@ void ComputeInterfaceSHC::pre_run(
   std::fprintf(fid_plane_flux_, "# compute_interface_shc_plane_flux version 1; Q=sum_j a_j dot v_j; sign follows the configured +axis crossing convention\n");
   std::fprintf(fid_plane_flux_, "# geometry_source %s_geometry.json; area_A2 %.12g; bath counters are cumulative eV with system_to_bath sign\n",
     interface_geometry_->output_prefix().c_str(), interface_geometry_->cross_section_A2());
+  write_plane_id_metadata(fid_plane_flux_, *interface_geometry_);
   std::fprintf(fid_plane_flux_, "# columns step time_ps plane_id Q_eV_ps J_W_m2 bath_source_eV bath_sink_eV\n");
   std::fprintf(fid_correlation_, "# compute_interface_shc_correlation version 1; C(+lag)=a(t) dot v(t+lag); C(-lag)=a(t+lag) dot v(t)\n");
   std::fprintf(
@@ -410,11 +421,18 @@ void ComputeInterfaceSHC::pre_run(
     "# geometry_source %s_geometry.json; area_A2 %.12g; sample_interval %d; dt_ps %.12g; Nc %d; block_samples %d\n",
     interface_geometry_->output_prefix().c_str(), interface_geometry_->cross_section_A2(),
     sample_interval_, nominal_sample_dt_ps, correlation_samples_, block_samples_);
+  write_plane_id_metadata(fid_correlation_, *interface_geometry_);
   std::fprintf(fid_correlation_, "# columns block plane_id lag time_ps correlation_W_m2 origins\n");
   std::fprintf(fid_shc_, "# compute_interface_shc_spectrum version 3; j(omega)=dt/pi*[C0+sum_lag>0(C+ + C-)cos(omega*lag*dt)]\n");
+  std::fprintf(
+    fid_shc_,
+    "# geometry_source %s_geometry.json; area_A2 %.12g; sample_interval %d; dt_ps %.12g; Nc %d; numomega %d; window rectangular\n",
+    interface_geometry_->output_prefix().c_str(), interface_geometry_->cross_section_A2(),
+    sample_interval_, nominal_sample_dt_ps, correlation_samples_, num_omega_);
   std::fprintf(fid_shc_, "# max_omega_rad_ps %.12g nominal_nyquist_rad_ps %.12g band_limited %d frequency_grid_endpoints_included 1\n",
     max_omega_rad_ps_, PI / nominal_sample_dt_ps, max_omega_rad_ps_ < PI / nominal_sample_dt_ps);
   std::fprintf(fid_shc_, "# window rectangular; analytic full-Nyquist integral equals C0; both analytic and exported-grid trapezoid integrals are reported\n");
+  write_plane_id_metadata(fid_shc_, *interface_geometry_);
   std::fprintf(fid_shc_, "# columns block block_start_ps block_end_ps block_samples accumulation_start_ps accumulation_end_ps accumulation_samples block_count plane_id omega_rad_ps C0_mean_W_m2 C0_SE_W_m2 analytic_integral_0_max_W_m2 analytic_integral_SE_W_m2 exported_grid_trapezoid_0_max_W_m2 exported_grid_trapezoid_SE_W_m2 jomega_mean_W_m2_per_rad_ps jomega_SE_W_m2_per_rad_ps\n");
   std::fprintf(fid_shc_blocks_, "# compute_interface_shc_block_spectrum version 1; statistics are per complete block only\n");
   std::fprintf(
@@ -422,6 +440,7 @@ void ComputeInterfaceSHC::pre_run(
     "# geometry_source %s_geometry.json; area_A2 %.12g; sample_interval %d; dt_ps %.12g; Nc %d; numomega %d; maxomega_rad_ps %.12g; window rectangular\n",
     interface_geometry_->output_prefix().c_str(), interface_geometry_->cross_section_A2(),
     sample_interval_, nominal_sample_dt_ps, correlation_samples_, num_omega_, max_omega_rad_ps_);
+  write_plane_id_metadata(fid_shc_blocks_, *interface_geometry_);
   std::fprintf(
     fid_shc_blocks_,
     "# columns block block_start_ps block_end_ps block_samples plane_id omega_rad_ps C0_W_m2 mean_flux_W_m2 analytic_integral_0_max_W_m2 exported_grid_trapezoid_0_max_W_m2 jomega_W_m2_per_rad_ps\n");

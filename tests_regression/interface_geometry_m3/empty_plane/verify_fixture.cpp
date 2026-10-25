@@ -53,6 +53,12 @@ int main()
   }
   assert(header_contains("empty_shc.out", "# compute_interface_shc_spectrum version 3"));
   assert(header_contains("empty_shc.out", "accumulation_start_ps accumulation_end_ps accumulation_samples"));
+  for (const char* filename : {
+         "empty_plane_flux.out", "empty_shc_correlation.out", "empty_shc.out", "empty_shc_blocks.out"}) {
+    assert(header_contains(filename, "geometry_source empty_shared_geometry.json"));
+    assert(header_contains(filename, "plane_id_source sampling_planes_A"));
+    assert(header_contains(filename, "# sampling_planes_A 15"));
+  }
   for (size_t row_index = 0; row_index < spectrum.size(); ++row_index) {
     const auto& row = spectrum[row_index];
     const auto& block_row = block_spectrum[row_index];
