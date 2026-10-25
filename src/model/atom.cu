@@ -56,12 +56,28 @@ static __global__ void gpu_update_unwrapped_position(
   }
 }
 
+void Atom::enable_position_image()
+{
+  if (number_of_atoms < 0) {
+    PRINT_INPUT_ERROR("Cannot allocate periodic image counters for a negative atom count.\n");
+  }
+  const size_t required_size = static_cast<size_t>(number_of_atoms) * 3;
+  if (required_size == 0) return;
+  if (position_image.size() == 0) {
+    position_image.resize(required_size, 0);
+  } else if (position_image.size() != required_size) {
+    PRINT_INPUT_ERROR("Periodic image counter array has an invalid size.\n");
+  }
+  // Preserve accumulated image counters when a later consumer enables unwrapped positions.
+}
+
 void Atom::enable_unwrapped_position()
 {
-  if (unwrapped_position.size() < number_of_atoms * 3) {
-    unwrapped_position.resize(number_of_atoms * 3);
+  enable_position_image();
+  const size_t required_size = static_cast<size_t>(number_of_atoms) * 3;
+  if (unwrapped_position.size() < required_size) {
+    unwrapped_position.resize(required_size);
     unwrapped_position.copy_from_device(position_per_atom.data());
-    position_image.resize(number_of_atoms * 3, 0);
   }
 }
 

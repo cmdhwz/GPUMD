@@ -25,6 +25,10 @@ Output files
      - :ref:`dump_xyz <kw_dump_xyz>`
      - Per-atom data in the extended XYZ format
      - Append
+   * - :ref:`<prefix>_atoms.out <interface_atoms_out>`
+     - :ref:`dump_interface_atoms <kw_dump_interface_atoms>`
+     - Delayed local atom snapshots from fixed reference bins
+     - Refuse existing paths
    * - :ref:`observer.xyz <observer_xyz>`
      - :ref:`dump_observer <kw_dump_observer>`
      - Atomistic quantities as evaluated with observing potentials
@@ -61,6 +65,10 @@ Output files
      - :ref:`compute_chunk <kw_compute_chunk>`
      - Time-averaged quantities in dynamic spatial bins
      - Append
+   * - :ref:`Interface geometry/profile/VACF/VDOS/SHC outputs <interface_geometry_outputs>`
+     - :ref:`interface_geometry <kw_interface_geometry>` and dependent actions
+     - Fixed reference mapping, local velocity statistics, and regular-NEP plane SHC
+     - Refuse existing paths
    * - :ref:`elastic.out <elastic_out>`
      - :ref:`compute_elastic <kw_compute_elastic>`
      - Elastic constants
@@ -201,6 +209,7 @@ Output files
    omega2_out
    restart_xyz
    dump_xyz
+   interface_atoms_out
    observer_xyz
    observer_out
    dipole_out

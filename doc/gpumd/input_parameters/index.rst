@@ -55,6 +55,9 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    run
    compute
    compute_chunk
+   interface_geometry
+   dump_interface_atoms
+   interface_modes_native_contract
    compute_adf
    compute_cohesive
    compute_dos

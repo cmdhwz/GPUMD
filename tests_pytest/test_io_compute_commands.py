@@ -67,6 +67,18 @@ def _check_elastic_format(path):
     assert data.shape == (6, 6)
 
 
+def _check_interface_temperature(path):
+    data = np.loadtxt(path, comments='#')
+    assert data.ndim == 2 and data.shape[1] == 17
+    assert np.all(np.isfinite(data[:, :11]))
+    assert np.all(data[:, 12:15] >= 0)
+    assert np.all(data[:, 13] > 0)
+    assert np.all(data[:, 14] <= data[:, 13])
+    assert np.all(np.isfinite(data[data[:, 14] > 0, 11]))
+    assert np.all(np.isnan(data[data[:, 14] == 0, 11]))
+    assert set(data[:, 7]).issubset({-1.0, 1.0, 2.0})
+
+
 COMPUTE_COMMAND_CASES = [
     CommandIOCase(
         # The sampling interval may not exceed the number of steps of the run, so it is tied to
@@ -113,6 +125,13 @@ COMPUTE_COMMAND_CASES = [
         name='compute_chunk',
         run_in_lines=[('compute_chunk', [5, 5, 'bin/1d', 'z', 'lower', 1.0, 'temperature'])],
         expected_output_files=['compute_chunk.out']),
+    CommandIOCase(
+        name='compute_chunk_interface',
+        run_in_lines=[('compute_chunk', [5, 5, 'bin/1d', 'z', 'lower', 1.0,
+                                         'interface', 1.5, 1, 2, 'yes',
+                                         'interface_temperature.out'])],
+        expected_output_files=['interface_temperature.out'],
+        parse_check=_check_interface_temperature),
     CommandIOCase(
         name='compute_cohesive', skip_base_block=True,
         run_in_lines=[('compute_cohesive', [0.99, 1.01, 6])],

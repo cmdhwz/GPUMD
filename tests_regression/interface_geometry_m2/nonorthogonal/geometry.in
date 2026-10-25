@@ -1,0 +1,6 @@
+axis z
+bin_width_A 100
+interfaces 1 100
+material_group 1
+bath_groups 0 0 1
+bin_group 2

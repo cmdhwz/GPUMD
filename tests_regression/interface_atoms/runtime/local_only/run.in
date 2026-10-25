@@ -1,0 +1,9 @@
+potential potential.txt
+time_step 0.5
+ensemble nve
+interface_geometry geometry.in local_geometry
+dump_interface_atoms 1 2 0 1 local
+run 3
+dump_xyz 1 late.xyz precision double unwrapped_position
+ensemble nve
+run 1

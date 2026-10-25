@@ -1,0 +1,6 @@
+potential potential.txt
+velocity 0 seed 24680
+time_step 0.1
+ensemble nve
+interface_geometry geometry.in geometry_only
+run 1

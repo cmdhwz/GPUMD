@@ -1,0 +1,7 @@
+potential potential.txt
+velocity 300 seed 24680
+time_step 0.1
+ensemble nve
+interface_geometry geometry.in stationary
+compute_interface_dos 1 2 4 5 30 1 2 -1 stationary
+run 4

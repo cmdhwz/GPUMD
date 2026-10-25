@@ -59,6 +59,23 @@ EnsembleType Integrate::get_type() const
   return type;
 }
 
+bool Integrate::get_heat_bath_groups(int& source_group, int& sink_group, bool& uses_region) const
+{
+  source_group = -1;
+  sink_group = -1;
+  uses_region = false;
+  if (type == EnsembleType::HEAT_LAN) {
+    const auto* ensemble_lan = static_cast<const Ensemble_LAN*>(ensemble_.get());
+    uses_region = ensemble_lan->uses_region_heat_bath();
+    if (uses_region) return true;
+  } else if (type != EnsembleType::HEAT_NHC && type != EnsembleType::HEAT_BDP) {
+    return false;
+  }
+  source_group = ensemble_->source;
+  sink_group = ensemble_->sink;
+  return true;
+}
+
 int Integrate::get_fixed_group() const
 {
   return fixed_group;

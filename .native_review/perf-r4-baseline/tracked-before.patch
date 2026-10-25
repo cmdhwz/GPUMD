@@ -1,0 +1,1526 @@
+diff --git a/doc/gpumd/input_files/run_in.rst b/doc/gpumd/input_files/run_in.rst
+index e9c41471..66b2d0b1 100644
+--- a/doc/gpumd/input_files/run_in.rst
++++ b/doc/gpumd/input_files/run_in.rst
+@@ -156,6 +156,10 @@ Actions
+      - Compute time-averaged quantities in dynamic spatial bins
+      - No
+      - No
++   * - :ref:`interface_geometry <kw_interface_geometry>`, ``compute_interface_profile``, ``compute_interface_dos``, :ref:`compute_interface_shc <kw_compute_interface_shc>`
++     - Define shared fixed reference bins, profile, local VDOS, and plane-resolved NEP SHC actions
++     - No
++     - No
+    * - :ref:`compute_adf <kw_compute_adf>`
+      - Compute the angular distribution function (:term:`ADF`)
+      - No
+diff --git a/doc/gpumd/input_parameters/compute_chunk.rst b/doc/gpumd/input_parameters/compute_chunk.rst
+index 14c8f98a..cb32f4e6 100644
+--- a/doc/gpumd/input_parameters/compute_chunk.rst
++++ b/doc/gpumd/input_parameters/compute_chunk.rst
+@@ -27,6 +27,10 @@ For 3D binning::
+ 
+   compute_chunk <sample_interval> <output_interval> bin/3d <dim1> <origin1> <delta1> <dim2> <origin2> <delta2> <dim3> <origin3> <delta3> {<quantity>}
+ 
++For a dedicated 1D interface profile::
++
++  compute_chunk <sample_interval> <output_interval> bin/1d <dim> <origin> <delta> interface <interface_coordinate> <lower_material_id> <upper_material_id> <remove_bin_drift> <output_file>
++
+ The parameters are defined as follows:
+ 
+ * :attr:`sample_interval`: Sampling interval in time steps. The quantities are sampled every this many steps.
+@@ -56,6 +60,18 @@ The allowed names for :attr:`quantity` are:
+ 
+ One can write one or more (distinct) names in any order.
+ 
++The optional :attr:`interface` form is a separate output mode for block-averaged NEMD profiles.
++It is limited to 1D binning and replaces the quantity list. Its parameters are:
++
++* :attr:`interface_coordinate`: interface coordinate in Å, within the binning range.
++* :attr:`lower_material_id`, :attr:`upper_material_id`: distinct nonnegative labels assigned to bins wholly below or above the interface. A bin crossing the interface receives material ID ``-1``.
++* :attr:`remove_bin_drift`: ``yes`` subtracts each bin's mass-weighted center-of-mass velocity before calculating temperature and removes three degrees of freedom per populated bin; ``no`` uses all three translational components.
++* :attr:`output_file`: a new output filename. Existing files are rejected to avoid mixing or overwriting runs.
++
++This mode excludes atoms in the active ``fix`` and ``move`` groups from its counts, kinetic energy, potential energy, and temperature. The remaining per-bin degrees of freedom are :math:`3N` or :math:`3N-3`, depending on :attr:`remove_bin_drift`. Potential energy uses GPUMD's per-atom site-energy allocation. For :attr:`heat_lan`, :attr:`heat_nhc`, and :attr:`heat_bdp`, the source and sink cumulative energy counters are included as system-to-bath quantities; heating makes the source counter decrease and cooling makes the sink counter increase. Other ensembles write ``nan`` in those two columns and cannot be used by the bath-power analyzer.
++
++The shared fixed-reference geometry commands ``interface_geometry`` and ``compute_interface_profile`` are documented separately in :ref:`interface_geometry <kw_interface_geometry>`. They do not change the dynamic binning or output of the legacy forms described here.
++
+ For triclinic (non-orthogonal) simulation boxes, the box length along each axis is computed as the geometric thickness :math:`L = V / A`, where :math:`V` is the box volume and :math:`A` is the cross-sectional area perpendicular to that axis. This is consistent with GPUMD's internal geometry calculations.
+ 
+ 
+@@ -101,6 +117,16 @@ A typical use case for NEMD simulations::
+ 
+ This computes the temperature and density profiles along z during a Langevin heat bath NEMD simulation.
+ 
++Example 5: interface profile with block metadata
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++::
++
++  ensemble heat_lan 300 100 50 0 1
++  compute_chunk 100 10 bin/1d z lower 20.0 interface 5000.0 1 2 yes interface_temperature.out
++  run 1000000
++
++The input ``model.xyz`` must define source and sink labels 0 and 1, plus the remaining atoms (for example label 2), in grouping method 0; the output filename must not already exist. This records one 10-sample block every 1000 MD steps. Each row includes profile timing, site-energy sum, COM-corrected temperature, degrees of freedom, total sample count, valid-temperature sample count, and the bath-counter snapshot from the last sample in that block. Per-sample bin reductions and corrected temperature accumulation run on the GPU; complete and final partial blocks are cached and written together from ``post_run``. The Python resistance analyzer has not been updated for the new version 3 shared profile; see :ref:`interface_geometry <kw_interface_geometry>` for that format.
++
+ 
+ .. _compute_chunk_out:
+ 
+@@ -142,6 +168,12 @@ produces output lines of the form::
+ Here, each line contains: chunk index, bin center along z (Å), average atom count, temperature (K), and number density (Å\ :sup:`-3`).
+ The output blocks for successive time points are written consecutively with no blank line separator; each block contains exactly :math:`N_\text{chunk}` lines.
+ 
++For the :attr:`interface` form, the selected :attr:`output_file` instead starts with metadata and a column header. Version 2 has one row per bin and these 17 columns::
++
++  step time_ps block_start_ps bin_id coordinate_min_A coordinate_max_A coordinate_center_A material_id atom_count kinetic_energy_eV potential_energy_eV temperature_K dof samples temperature_samples bath_source_eV bath_sink_eV
++
++The atom count, kinetic and potential energies, and degrees of freedom average every sample. Temperature averages only samples with positive degrees of freedom; ``temperature_samples`` records that count, and ``temperature_K`` is ``nan`` when no sample was valid. Bath energies are cumulative counters captured at each sample; the row contains the counters from the sample at ``time_ps``, including a final partial block. Other ensembles write ``nan`` for both counters. ``time_ps`` is calculated from GPUMD's internal time using its natural-time to fs conversion. Interface profiles reject non-orthogonal boxes and stop if the box matrix or PBC changes during the run. Profile rows are buffered until ``post_run``; an interruption before then can leave only the header. The legacy ``compute_chunk.out`` command, format, and temperature convention are unchanged.
++
+ 
+ Caveats
+ -------
+diff --git a/doc/gpumd/input_parameters/index.rst b/doc/gpumd/input_parameters/index.rst
+index f9b68e30..4f7c28a2 100644
+--- a/doc/gpumd/input_parameters/index.rst
++++ b/doc/gpumd/input_parameters/index.rst
+@@ -55,6 +55,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
+    run
+    compute
+    compute_chunk
++   interface_geometry
+    compute_adf
+    compute_cohesive
+    compute_dos
+diff --git a/doc/gpumd/output_files/index.rst b/doc/gpumd/output_files/index.rst
+index 70933937..d8f2a73c 100644
+--- a/doc/gpumd/output_files/index.rst
++++ b/doc/gpumd/output_files/index.rst
+@@ -61,6 +61,10 @@ Output files
+      - :ref:`compute_chunk <kw_compute_chunk>`
+      - Time-averaged quantities in dynamic spatial bins
+      - Append
++   * - :ref:`Interface geometry/profile/VACF/VDOS/SHC outputs <interface_geometry_outputs>`
++     - :ref:`interface_geometry <kw_interface_geometry>` and dependent actions
++     - Fixed reference mapping, local velocity statistics, and regular-NEP plane SHC
++     - Refuse existing paths
+    * - :ref:`elastic.out <elastic_out>`
+      - :ref:`compute_elastic <kw_compute_elastic>`
+      - Elastic constants
+diff --git a/src/force/nep.cu b/src/force/nep.cu
+index 4606208e..d5a1843b 100644
+--- a/src/force/nep.cu
++++ b/src/force/nep.cu
+@@ -31,6 +31,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
+ #include "utilities/nep_utilities.cuh"
+ #include "utilities/run_input.cuh"
+ #include <cstring>
++#include <algorithm>
+ #include <fstream>
+ #include <iostream>
+ #include <cstddef>
+@@ -540,6 +541,69 @@ static __global__ void find_descriptor(
+   }
+ }
+ 
++__device__ __forceinline__ static void record_nep_plane_flux(
++  const NEPPlaneFluxView view,
++  const int n1,
++  const int n2,
++  const float derivative[3])
++{
++  if (!view.enabled) return;
++  const int N = view.atom_count;
++  const double x1 = view.reference_positions[static_cast<size_t>(view.axis) * N + n1];
++  const double x2 = view.reference_positions[static_cast<size_t>(view.axis) * N + n2];
++  for (int p = 0; p < view.plane_count; ++p) {
++    const int direction = nep_plane_crossing_direction(
++      x1, x2, view.plane_positions[p], view.box_lengths[view.axis], view.pbc[view.axis] != 0);
++    if (direction == 0) continue;
++    const int slot = view.atom_slots[static_cast<size_t>(p) * N + n2];
++    if (slot < view.plane_offsets[p] || slot >= view.plane_offsets[p + 1]) {
++      nep_plane_flux_record_error(
++        view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_MISSING_SLOT, view.sample_step);
++      continue;
++    }
++    if (!isfinite(derivative[0]) || !isfinite(derivative[1]) || !isfinite(derivative[2])) {
++      nep_plane_flux_record_error(
++        view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_NONFINITE, view.sample_step);
++      continue;
++    }
++    const double sign = -static_cast<double>(direction);
++    for (int d = 0; d < 3; ++d) {
++      atomicAdd(&view.coefficients[3 * static_cast<size_t>(slot) + d], sign * derivative[d]);
++    }
++  }
++}
++
++static __global__ void validate_nep_plane_flux_displacement(
++  const NEPPlaneFluxView view,
++  const double* position_x,
++  const double* position_y,
++  const double* position_z)
++{
++  const int n = blockIdx.x * blockDim.x + threadIdx.x;
++  if (!view.enabled || n >= view.atom_count) return;
++  const double* current[3] = {position_x, position_y, position_z};
++  double displacement_squared = 0.0;
++  for (int d = 0; d < 3; ++d) {
++    const double position = current[d][n];
++    const double reference = view.reference_positions[static_cast<size_t>(d) * view.atom_count + n];
++    if (!isfinite(position) || !isfinite(reference)) {
++      nep_plane_flux_record_error(
++        view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_NONFINITE, view.sample_step);
++      return;
++    }
++    double delta = position - reference;
++    if (view.pbc[d]) delta -= nearbyint(delta / view.box_lengths[d]) * view.box_lengths[d];
++    displacement_squared += delta * delta;
++  }
++  if (!isfinite(displacement_squared)) {
++    nep_plane_flux_record_error(
++      view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_NONFINITE, view.sample_step);
++  } else if (sqrt(displacement_squared) > view.max_reference_displacement) {
++    nep_plane_flux_record_error(
++      view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_DISPLACEMENT, view.sample_step);
++  }
++}
++
+ static __global__ void find_force_radial(
+   NEP::ParaMB paramb,
+   NEP::ANN annmb,
+@@ -557,7 +621,8 @@ static __global__ void find_force_radial(
+   double* g_fx,
+   double* g_fy,
+   double* g_fz,
+-  double* g_virial)
++  double* g_virial,
++  NEPPlaneFluxView plane_flux_view)
+ {
+   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+   if (n1 < N2) {
+@@ -614,6 +679,7 @@ static __global__ void find_force_radial(
+           f21[d] -= tmp21 * r12[d];
+         }
+       }
++      record_nep_plane_flux(plane_flux_view, n1, n2, f12);
+       s_fx += f12[0] - f21[0];
+       s_fy += f12[1] - f21[1];
+       s_fz += f12[2] - f21[2];
+@@ -663,7 +729,8 @@ static __global__ void find_partial_force_angular(
+   const float* __restrict__ g_sum_fxyz,
+   float* g_f12x,
+   float* g_f12y,
+-  float* g_f12z)
++  float* g_f12z,
++  NEPPlaneFluxView plane_flux_view)
+ {
+   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+   if (n1 < N2) {
+@@ -731,6 +798,7 @@ static __global__ void find_partial_force_angular(
+           sum_fxyz,
+           f12);
+       }
++      record_nep_plane_flux(plane_flux_view, n1, n2, f12);
+       g_f12x[index] = f12[0];
+       g_f12y[index] = f12[1];
+       g_f12z[index] = f12[2];
+@@ -755,7 +823,8 @@ static __global__ void find_force_ZBL(
+   double* g_fy,
+   double* g_fz,
+   double* g_virial,
+-  double* g_pe)
++  double* g_pe,
++  NEPPlaneFluxView plane_flux_view)
+ {
+   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+   if (n1 < N2) {
+@@ -822,6 +891,7 @@ static __global__ void find_force_ZBL(
+       float f2 = fp * d12inv * 0.5f;
+       float f12[3] = {r12[0] * f2, r12[1] * f2, r12[2] * f2};
+       float f21[3] = {-r12[0] * f2, -r12[1] * f2, -r12[2] * f2};
++      record_nep_plane_flux(plane_flux_view, n1, n2, f12);
+       s_fx += f12[0] - f21[0];
+       s_fy += f12[1] - f21[1];
+       s_fz += f12[2] - f21[2];
+@@ -865,6 +935,15 @@ void NEP::compute_large_box(
+   const int N = type.size();
+   const int grid_size = (N2 - N1 - 1) / BLOCK_SIZE + 1;
+ 
++  if (plane_flux_view_.enabled) {
++    validate_nep_plane_flux_displacement<<<(N - 1) / BLOCK_SIZE + 1, BLOCK_SIZE>>>(
++      plane_flux_view_,
++      position_per_atom.data(),
++      position_per_atom.data() + N,
++      position_per_atom.data() + 2 * N);
++    GPU_CHECK_KERNEL
++  }
++
+   neighbor_manager.update(
+     box, 
+     type, 
+@@ -948,7 +1027,8 @@ void NEP::compute_large_box(
+     force_per_atom.data(),
+     force_per_atom.data() + N,
+     force_per_atom.data() + N * 2,
+-    virial_per_atom.data());
++    virial_per_atom.data(),
++    plane_flux_view_);
+   GPU_CHECK_KERNEL
+ 
+   find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+@@ -968,7 +1048,8 @@ void NEP::compute_large_box(
+     nep_data.sum_fxyz.data(),
+     nep_data.f12x.data(),
+     nep_data.f12y.data(),
+-    nep_data.f12z.data());
++    nep_data.f12z.data(),
++    plane_flux_view_);
+   GPU_CHECK_KERNEL
+ 
+   find_properties_many_body(
+@@ -1001,7 +1082,8 @@ void NEP::compute_large_box(
+       force_per_atom.data() + N,
+       force_per_atom.data() + N * 2,
+       virial_per_atom.data(),
+-      potential_per_atom.data());
++      potential_per_atom.data(),
++      plane_flux_view_);
+     GPU_CHECK_KERNEL
+   }
+ }
+@@ -1214,6 +1296,27 @@ static bool get_expanded_box(const double rc, const Box& box, NEP::ExpandedBox&
+   return is_small_box;
+ }
+ 
++double NEP::get_interface_plane_flux_cutoff() const
++{
++  double cutoff = paramb.rc_radial_max;
++  for (int type = 0; type < paramb.num_types; ++type) {
++    cutoff = std::max(cutoff, static_cast<double>(paramb.rc_angular[type]));
++  }
++  if (zbl.enabled) cutoff = std::max(cutoff, static_cast<double>(zbl.rc_outer));
++  return cutoff;
++}
++
++bool NEP::supports_interface_plane_flux() const
++{
++  return paramb.model_type == 0 && !has_dftd3;
++}
++
++bool NEP::uses_large_box_for_interface_flux(const Box& box) const
++{
++  ExpandedBox expanded_box;
++  return !get_expanded_box(paramb.rc_radial_max, box, expanded_box);
++}
++
+ void NEP::compute(
+   Box& box,
+   const GPU_Vector<int>& type,
+@@ -1223,6 +1326,9 @@ void NEP::compute(
+   GPU_Vector<double>& virial_per_atom)
+ {
+   const bool is_small_box = get_expanded_box(paramb.rc_radial_max, box, ebox);
++  if (plane_flux_view_.enabled && is_small_box) {
++    PRINT_INPUT_ERROR("compute_interface_shc rejects the NEP small-box expansion path.\n");
++  }
+   if (is_small_box) {
+     // update small_box_data
+     const int current_num_atoms = type.size();
+@@ -1458,7 +1564,8 @@ void NEP::compute_large_box(
+     force_per_atom.data(),
+     force_per_atom.data() + N,
+     force_per_atom.data() + N * 2,
+-    virial_per_atom.data());
++    virial_per_atom.data(),
++    NEPPlaneFluxView{});
+   GPU_CHECK_KERNEL
+ 
+   find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+@@ -1478,7 +1585,8 @@ void NEP::compute_large_box(
+     nep_data.sum_fxyz.data(),
+     nep_data.f12x.data(),
+     nep_data.f12y.data(),
+-    nep_data.f12z.data());
++    nep_data.f12z.data(),
++    NEPPlaneFluxView{});
+   GPU_CHECK_KERNEL
+ 
+   find_properties_many_body(
+@@ -1511,7 +1619,8 @@ void NEP::compute_large_box(
+       force_per_atom.data() + N,
+       force_per_atom.data() + N * 2,
+       virial_per_atom.data(),
+-      potential_per_atom.data());
++      potential_per_atom.data(),
++      NEPPlaneFluxView{});
+     GPU_CHECK_KERNEL
+   }
+ }
+diff --git a/src/force/nep.cuh b/src/force/nep.cuh
+index ad3a697b..fdef404a 100644
+--- a/src/force/nep.cuh
++++ b/src/force/nep.cuh
+@@ -16,6 +16,7 @@
+ #pragma once
+ #include "dftd3.cuh"
+ #include "neighbor.cuh"
++#include "nep_plane_flux_view.cuh"
+ #include "potential.cuh"
+ #include "utilities/common.cuh"
+ #include "utilities/gpu_vector.cuh"
+@@ -130,6 +131,12 @@ public:
+ 
+   const GPU_Vector<int>& get_NL_radial_ptr();
+ 
++  double get_interface_plane_flux_cutoff() const;
++  bool supports_interface_plane_flux() const;
++  bool uses_large_box_for_interface_flux(const Box& box) const;
++  void set_plane_flux_view(const NEPPlaneFluxView& view) { plane_flux_view_ = view; }
++  void clear_plane_flux_view() { plane_flux_view_ = NEPPlaneFluxView{}; }
++
+ private:
+   ParaMB paramb;
+   ANN annmb;
+@@ -137,6 +144,7 @@ private:
+   ExpandedBox ebox;
+   DFTD3 dftd3;
+   NeighborManager neighbor_manager;
++  NEPPlaneFluxView plane_flux_view_;
+ 
+   void update_potential(float* parameters, ANN& ann);
+ 
+diff --git a/src/integrate/ensemble_lan.cu b/src/integrate/ensemble_lan.cu
+index 57d7b3e7..0f7066e6 100644
+--- a/src/integrate/ensemble_lan.cu
++++ b/src/integrate/ensemble_lan.cu
+@@ -213,6 +213,11 @@ double Ensemble_LAN::get_temperature2() const
+   return temperature2_;
+ }
+ 
++bool Ensemble_LAN::uses_region_heat_bath() const
++{
++  return use_region;
++}
++
+ void Ensemble_LAN::initialize_run(
+   const double, Atom& atom, Box&, const std::vector<Group>& group)
+ {
+diff --git a/src/integrate/ensemble_lan.cuh b/src/integrate/ensemble_lan.cuh
+index fced6e29..b5d10967 100644
+--- a/src/integrate/ensemble_lan.cuh
++++ b/src/integrate/ensemble_lan.cuh
+@@ -32,6 +32,7 @@ public:
+ 
+   double get_temperature1() const;
+   double get_temperature2() const;
++  bool uses_region_heat_bath() const;
+ 
+   void initialize_run(
+     const double time_step, Atom& atom, Box& box, const std::vector<Group>& group) override;
+diff --git a/src/integrate/integrate.cu b/src/integrate/integrate.cu
+index 0268907f..6eef21ea 100644
+--- a/src/integrate/integrate.cu
++++ b/src/integrate/integrate.cu
+@@ -59,6 +59,23 @@ EnsembleType Integrate::get_type() const
+   return type;
+ }
+ 
++bool Integrate::get_heat_bath_groups(int& source_group, int& sink_group, bool& uses_region) const
++{
++  source_group = -1;
++  sink_group = -1;
++  uses_region = false;
++  if (type == EnsembleType::HEAT_LAN) {
++    const auto* ensemble_lan = static_cast<const Ensemble_LAN*>(ensemble_.get());
++    uses_region = ensemble_lan->uses_region_heat_bath();
++    if (uses_region) return true;
++  } else if (type != EnsembleType::HEAT_NHC && type != EnsembleType::HEAT_BDP) {
++    return false;
++  }
++  source_group = ensemble_->source;
++  sink_group = ensemble_->sink;
++  return true;
++}
++
+ int Integrate::get_fixed_group() const
+ {
+   return fixed_group;
+diff --git a/src/integrate/integrate.cuh b/src/integrate/integrate.cuh
+index 55c67b48..a64b6277 100644
+--- a/src/integrate/integrate.cuh
++++ b/src/integrate/integrate.cuh
+@@ -53,6 +53,9 @@ private:
+ public:
+   bool has_ensemble() const;
+   EnsembleType get_type() const;
++  // Returns true for heat_lan/heat_nhc/heat_bdp. Group modes fill method-0 IDs;
++  // regional heat_lan reports uses_region=true and leaves the IDs at -1.
++  bool get_heat_bath_groups(int& source, int& sink, bool& uses_region) const;
+   int get_fixed_group() const;
+   int get_move_group() const;
+   int get_fixed_grouping_method() const;
+diff --git a/src/measure/compute_chunk.cu b/src/measure/compute_chunk.cu
+index 1b12ca0b..508b8039 100644
+--- a/src/measure/compute_chunk.cu
++++ b/src/measure/compute_chunk.cu
+@@ -27,17 +27,45 @@ Output: compute_chunk.out
+ ------------------------------------------------------------------------------*/
+ 
+ #include "compute_chunk.cuh"
++#include "interface_geometry.cuh"
++#include "interface_profile_math.cuh"
++#include "integrate/integrate.cuh"
+ #include "model/atom.cuh"
++#include "model/group.cuh"
+ #include "utilities/common.cuh"
+ #include "utilities/error.cuh"
+ #include "utilities/gpu_macro.cuh"
+ #include "utilities/read_file.cuh"
+ #include <cstring>
+ #include <cmath>
++#include <limits>
+ 
+ #define DIM 3
+ #define K_B_CHUNK 8.617333262e-5
+ 
++static size_t interface_profile_checked_product(const size_t a, const size_t b)
++{
++  if (a && b > std::numeric_limits<size_t>::max() / a) {
++    PRINT_INPUT_ERROR("Interface profile allocation overflows size_t.\n");
++  }
++  return a * b;
++}
++
++static size_t interface_profile_checked_sum(const size_t a, const size_t b)
++{
++  if (b > std::numeric_limits<size_t>::max() - a) {
++    PRINT_INPUT_ERROR("Interface profile allocation overflows size_t.\n");
++  }
++  return a + b;
++}
++
++static void interface_profile_check_gpu_fill_size(const size_t elements)
++{
++  if (elements > static_cast<size_t>(std::numeric_limits<int>::max())) {
++    PRINT_INPUT_ERROR("Interface profile GPU fill buffer exceeds its supported index range.\n");
++  }
++}
++
+ // GPU kernel: assign atoms to 1D bins
+ static __global__ void gpu_assign_bins_1d(
+   int N, const double* x, const double* y, const double* z,
+@@ -105,6 +133,18 @@ static __global__ void gpu_count_per_chunk(
+   }
+ }
+ 
++static __global__ void gpu_mask_fixed_and_moving_atoms(
++  int N, int* ichunk, const int* fixed_labels, int fixed_group,
++  const int* move_labels, int move_group)
++{
++  int n = blockIdx.x * blockDim.x + threadIdx.x;
++  if (n < N &&
++      ((fixed_group >= 0 && fixed_labels[n] == fixed_group) ||
++       (move_group >= 0 && move_labels[n] == move_group))) {
++    ichunk[n] = -1;
++  }
++}
++
+ // GPU kernel: sum scalar property per chunk
+ static __global__ void gpu_sum_scalar_per_chunk(
+   int N, const int* ichunk, const double* prop,
+@@ -134,6 +174,65 @@ static __global__ void gpu_sum_ke_per_chunk(
+   }
+ }
+ 
++static __global__ void gpu_sum_mass_momentum_per_chunk(
++  int N, const int* ichunk, const double* mass,
++  const double* vx, const double* vy, const double* vz,
++  int nchunk, double* out)
++{
++  int n = blockIdx.x * blockDim.x + threadIdx.x;
++  if (n < N) {
++    int c = ichunk[n];
++    if (c >= 0 && c < nchunk) {
++      double m = mass[n];
++      atomicAdd(&out[c * 4], m);
++      atomicAdd(&out[c * 4 + 1], m * vx[n]);
++      atomicAdd(&out[c * 4 + 2], m * vy[n]);
++      atomicAdd(&out[c * 4 + 3], m * vz[n]);
++    }
++  }
++}
++
++static __global__ void gpu_accumulate_interface_profile_sample(
++  const int nchunk,
++  const int number_of_scalars,
++  const int* count,
++  const double* values,
++  const bool remove_drift,
++  const double* mass_momentum,
++  InterfaceProfileBlockAccum* block_accum,
++  int* error_info,
++  double* error_values,
++  const int step)
++{
++  const int bin = blockIdx.x * blockDim.x + threadIdx.x;
++  if (bin >= nchunk) return;
++  const double mass_sum = remove_drift ? mass_momentum[bin * 4] : 0.0;
++  const double px = remove_drift ? mass_momentum[bin * 4 + 1] : 0.0;
++  const double py = remove_drift ? mass_momentum[bin * 4 + 2] : 0.0;
++  const double pz = remove_drift ? mass_momentum[bin * 4 + 3] : 0.0;
++  const double raw_kinetic = values[bin * number_of_scalars];
++  const double potential = values[bin * number_of_scalars + 1];
++  const int error = interface_profile_accumulate_sample(
++    block_accum[bin], count[bin], remove_drift, raw_kinetic, potential,
++    mass_sum, px, py, pz, K_B);
++  if (error != INTERFACE_PROFILE_SAMPLE_OK) {
++    interface_profile_record_first_error(
++      error_info, error_values, error, step, bin, raw_kinetic,
++      mass_sum, px, py, pz, potential);
++  }
++}
++
++static __global__ void gpu_reset_interface_profile_block(
++  const int nchunk,
++  InterfaceProfileBlockAccum* block_accum,
++  int* error_info,
++  double* error_values)
++{
++  const int bin = blockIdx.x * blockDim.x + threadIdx.x;
++  if (bin < nchunk) interface_profile_reset_block_accum(block_accum[bin]);
++  if (bin == 0) interface_profile_reset_error(error_info, error_values);
++}
++
+ ComputeChunk::ComputeChunk(const std::vector<std::string>& tokens, Box& box)
+ {
+   action_name = "compute_chunk";
+@@ -144,6 +243,34 @@ ComputeChunk::ComputeChunk(const std::vector<std::string>& tokens, Box& box)
+   parse(tokens, box);
+ }
+ 
++ComputeChunk::ComputeChunk(
++  const std::vector<std::string>& tokens,
++  const std::shared_ptr<InterfaceGeometry>& interface_geometry)
++  : interface_geometry_(interface_geometry)
++{
++  action_name = "compute_interface_profile";
++  dim_ = 1;
++  ncoord_ = 1;
++  for (int i = 0; i < 3; i++) {
++    axis_[i] = 0; origin_[i] = 0.0;
++    delta_[i] = 1.0; invdelta_[i] = 1.0; nlayers_[i] = 1;
++  }
++  if (tokens.size() != 5 || !is_valid_int(tokens[1], &sample_interval_) || sample_interval_ <= 0 ||
++      !is_valid_int(tokens[2], &output_interval_) || output_interval_ <= 0) {
++    PRINT_INPUT_ERROR(
++      "compute_interface_profile syntax: <sample_steps> <samples_per_block> <yes|no> <output_file>.\n");
++  }
++  if (tokens[3] == "yes") remove_drift_ = true;
++  else if (tokens[3] != "no") PRINT_INPUT_ERROR("Drift option must be yes or no.\n");
++  if (tokens[4].empty()) PRINT_INPUT_ERROR("compute_interface_profile output file cannot be empty.\n");
++  interface_output_file_ = tokens[4];
++  interface_mode_ = true;
++  geometry_mode_ = true;
++  compute_temperature_ = 1;
++  compute_potential_ = 1;
++  number_of_scalars_ = 2;
++}
++
+ void ComputeChunk::parse(const std::vector<std::string>& tokens, Box& box)
+ {
+   printf("Compute chunk-averaged properties:\n");
+@@ -170,15 +297,51 @@ void ComputeChunk::parse(const std::vector<std::string>& tokens, Box& box)
+   }
+ 
+   // param[3]: bin style -> parse bin params, returns index of next param
+-  int next = parse_bin_params(tokens, num_param, 3, box);
++  bool interface_requested = false;
++  for (const std::string& token : tokens) {
++    if (token == "interface") interface_requested = true;
++  }
++  int next = parse_bin_params(tokens, num_param, 3, box, interface_requested);
+ 
+-  // remaining params are properties
++  // remaining params are properties, or one opt-in interface profile option
+   if (next >= num_param) {
+     PRINT_INPUT_ERROR("compute_chunk requires at least one property.\n");
+   }
+ 
+   for (int k = next; k < num_param; ++k) {
+-    if (tokens[k] == "temperature") {
++    if (tokens[k] == "interface") {
++      if (interface_mode_ || number_of_scalars_ != 0 || dim_ != 1 || k + 6 != num_param) {
++        PRINT_INPUT_ERROR(
++          "interface requires 1D binning and must be the only property option.\n");
++      }
++      if (!is_valid_real(tokens[k + 1], &interface_coordinate_) ||
++          !is_valid_int(tokens[k + 2], &material_lower_id_) ||
++          !is_valid_int(tokens[k + 3], &material_upper_id_)) {
++        PRINT_INPUT_ERROR("Invalid interface coordinate or material ID.\n");
++      }
++      if (!std::isfinite(interface_coordinate_) || !std::isfinite(delta_[0])) {
++        PRINT_INPUT_ERROR("Interface coordinate and bin width must be finite.\n");
++      }
++      if (material_lower_id_ < 0 || material_upper_id_ < 0 ||
++          material_lower_id_ == material_upper_id_) {
++        PRINT_INPUT_ERROR("Interface material IDs should be distinct nonnegative integers.\n");
++      }
++      if (tokens[k + 4] == "yes") {
++        remove_drift_ = true;
++      } else if (tokens[k + 4] != "no") {
++        PRINT_INPUT_ERROR("interface drift option should be yes or no.\n");
++      }
++      interface_output_file_ = tokens[k + 5];
++      interface_mode_ = true;
++      compute_temperature_ = 1;
++      compute_potential_ = 1;
++      number_of_scalars_ = 2;
++      printf(
++        "    interface profile at %g A, material IDs %d/%d, remove drift %s.\n",
++        interface_coordinate_, material_lower_id_, material_upper_id_,
++        remove_drift_ ? "yes" : "no");
++      break;
++    } else if (tokens[k] == "temperature") {
+       compute_temperature_ = 1;
+       number_of_scalars_++;
+       printf("    temperature\n");
+@@ -214,7 +377,8 @@ void ComputeChunk::parse(const std::vector<std::string>& tokens, Box& box)
+ 
+ static int parse_one_axis(
+   const std::vector<std::string>& tokens, int idx, int* axis, double* origin, double* delta,
+-  double* invdelta, int* nlayers, double* box_len_out, const Box& box)
++  double* invdelta, int* nlayers, double* box_len_out, const Box& box,
++  bool require_finite_width)
+ {
+   // Use geometric thickness (volume/area) which is correct for triclinic boxes
+   double vol = box.get_volume();
+@@ -241,12 +405,28 @@ static int parse_one_axis(
+   if (!is_valid_real(tokens[idx + 2], delta)) {
+     PRINT_INPUT_ERROR("delta must be a positive number.\n");
+   }
++  if (require_finite_width && !std::isfinite(*delta)) {
++    PRINT_INPUT_ERROR("Interface bin width must be finite.\n");
++  }
+   if (*delta <= 0.0) {
+     PRINT_INPUT_ERROR("delta must be positive.\n");
+   }
+   *invdelta = 1.0 / (*delta);
++  if (require_finite_width && !std::isfinite(*invdelta)) {
++    PRINT_INPUT_ERROR("Interface inverse bin width must be finite.\n");
++  }
++  // Interface mode validates before converting the possibly unbounded quotient to int.
++  if (require_finite_width && (!std::isfinite(box_len) || box_len <= 0.0)) {
++    PRINT_INPUT_ERROR("Interface box length must be finite and positive.\n");
++  }
++  const double layer_count = ceil(box_len / (*delta));
++  if (require_finite_width &&
++      (!std::isfinite(layer_count) || layer_count <= 0.0 ||
++       layer_count > std::numeric_limits<int>::max())) {
++    PRINT_INPUT_ERROR("Interface bin count is outside the supported integer range.\n");
++  }
+   // Use ceil so the last bin is not wider than delta
+-  *nlayers = static_cast<int>(ceil(box_len / (*delta)));
++  *nlayers = static_cast<int>(layer_count);
+   if (*nlayers <= 0) *nlayers = 1;
+   *box_len_out = box_len;
+ 
+@@ -254,7 +434,8 @@ static int parse_one_axis(
+ }
+ 
+ int ComputeChunk::parse_bin_params(
+-  const std::vector<std::string>& tokens, int num_param, int start, Box& box)
++  const std::vector<std::string>& tokens, int num_param, int start, Box& box,
++  bool require_finite_width)
+ {
+   if (tokens[start] == "bin/1d") {
+     dim_ = 1; ncoord_ = 1;
+@@ -263,7 +444,7 @@ int ComputeChunk::parse_bin_params(
+     }
+     int next = parse_one_axis(
+       tokens, start + 1, &axis_[0], &origin_[0], &delta_[0],
+-      &invdelta_[0], &nlayers_[0], &box_length_[0], box);
++      &invdelta_[0], &nlayers_[0], &box_length_[0], box, require_finite_width);
+     nchunk_ = nlayers_[0];
+     return next;
+   } else if (tokens[start] == "bin/2d") {
+@@ -273,10 +454,10 @@ int ComputeChunk::parse_bin_params(
+     }
+     int next = parse_one_axis(
+       tokens, start + 1, &axis_[0], &origin_[0], &delta_[0],
+-      &invdelta_[0], &nlayers_[0], &box_length_[0], box);
++      &invdelta_[0], &nlayers_[0], &box_length_[0], box, require_finite_width);
+     next = parse_one_axis(
+       tokens, next, &axis_[1], &origin_[1], &delta_[1],
+-      &invdelta_[1], &nlayers_[1], &box_length_[1], box);
++      &invdelta_[1], &nlayers_[1], &box_length_[1], box, require_finite_width);
+     if (axis_[0] == axis_[1]) {
+       PRINT_INPUT_ERROR("bin/2d requires two different axes.\n");
+     }
+@@ -289,13 +470,13 @@ int ComputeChunk::parse_bin_params(
+     }
+     int next = parse_one_axis(
+       tokens, start + 1, &axis_[0], &origin_[0], &delta_[0],
+-      &invdelta_[0], &nlayers_[0], &box_length_[0], box);
++      &invdelta_[0], &nlayers_[0], &box_length_[0], box, require_finite_width);
+     next = parse_one_axis(
+       tokens, next, &axis_[1], &origin_[1], &delta_[1],
+-      &invdelta_[1], &nlayers_[1], &box_length_[1], box);
++      &invdelta_[1], &nlayers_[1], &box_length_[1], box, require_finite_width);
+     next = parse_one_axis(
+       tokens, next, &axis_[2], &origin_[2], &delta_[2],
+-      &invdelta_[2], &nlayers_[2], &box_length_[2], box);
++      &invdelta_[2], &nlayers_[2], &box_length_[2], box, require_finite_width);
+     if (axis_[0] == axis_[1] || axis_[0] == axis_[2] || axis_[1] == axis_[2]) {
+       PRINT_INPUT_ERROR("bin/3d requires three different axes.\n");
+     }
+@@ -314,17 +495,167 @@ void ComputeChunk::pre_run(
+ {
+   if (number_of_scalars_ == 0) return;
+ 
++  if (interface_mode_ && !geometry_mode_) {
++    if (!box.is_orthogonal) {
++      PRINT_INPUT_ERROR("Interface profiles require an orthogonal box.\n");
++    }
++    const double area = box.get_area(axis_[0]);
++    const double box_length = box.get_volume() / area;
++    const double layer_count = ceil(box_length / delta_[0]);
++    if (!std::isfinite(area) || area <= 0.0 || !std::isfinite(box_length) ||
++        box_length <= 0.0 || !std::isfinite(layer_count) || layer_count <= 0.0 ||
++        layer_count > std::numeric_limits<int>::max()) {
++      PRINT_INPUT_ERROR("Interface profile box geometry is invalid.\n");
++    }
++    if (interface_coordinate_ <= origin_[0] ||
++        interface_coordinate_ >= origin_[0] + box_length) {
++      PRINT_INPUT_ERROR("Interface coordinate must lie inside the binning range.\n");
++    }
++    box_length_[0] = box_length;
++    invdelta_[0] = 1.0 / delta_[0];
++    nlayers_[0] = static_cast<int>(layer_count);
++    nchunk_ = nlayers_[0];
++  }
++  if (geometry_mode_) {
++    if (is_pimd(integrate.get_type())) {
++      PRINT_INPUT_ERROR("compute_interface_profile with shared geometry supports classical MD only.\n");
++    }
++    if (!interface_geometry_ || !interface_geometry_->initialized()) {
++      PRINT_INPUT_ERROR("Shared interface geometry must be initialized before the profile.\n");
++    }
++    if (interface_geometry_->atom_bin().size() != static_cast<size_t>(atom.number_of_atoms)) {
++      PRINT_INPUT_ERROR("Shared interface geometry atom count differs from the current model.\n");
++    }
++    axis_[0] = interface_geometry_->axis();
++    origin_[0] = 0.0;
++    delta_[0] = interface_geometry_->bin_width_A();
++    invdelta_[0] = 1.0 / delta_[0];
++    box_length_[0] = interface_geometry_->box_length_A();
++    nlayers_[0] = interface_geometry_->bin_count();
++    nchunk_ = nlayers_[0];
++  }
++
++  if (interface_mode_) {
++    if (number_of_steps < 0 || nchunk_ <= 0) {
++      PRINT_INPUT_ERROR("Interface profile requires a nonnegative run length and at least one bin.\n");
++    }
++    const size_t count_values = static_cast<size_t>(nchunk_);
++    const size_t scalar_values = interface_profile_checked_product(
++      count_values, static_cast<size_t>(number_of_scalars_));
++    const size_t auxiliary_values = remove_drift_
++      ? interface_profile_checked_product(count_values, 4) : 0;
++    interface_profile_check_gpu_fill_size(count_values);
++    interface_profile_check_gpu_fill_size(scalar_values);
++    if (remove_drift_) interface_profile_check_gpu_fill_size(auxiliary_values);
++
++    interface_expected_sample_count_ =
++      static_cast<size_t>(number_of_steps) / static_cast<size_t>(sample_interval_);
++    interface_block_cache_capacity_ = interface_profile_block_cache_capacity(
++      interface_expected_sample_count_, static_cast<size_t>(output_interval_));
++    interface_cached_block_count_ = 0;
++    const size_t cache_values = interface_profile_checked_product(
++      interface_block_cache_capacity_, count_values);
++    const size_t cpu_cache_bytes = interface_profile_checked_sum(
++      interface_profile_checked_product(cache_values, sizeof(InterfaceProfileBlockAccum)),
++      interface_profile_checked_product(
++        interface_block_cache_capacity_, sizeof(InterfaceProfileBlockMetadata)));
++    size_t gpu_cache_bytes = interface_profile_checked_product(
++      count_values, sizeof(InterfaceProfileBlockAccum));
++    gpu_cache_bytes = interface_profile_checked_sum(
++      gpu_cache_bytes, interface_profile_checked_product(count_values, sizeof(int)));
++    gpu_cache_bytes = interface_profile_checked_sum(
++      gpu_cache_bytes, interface_profile_checked_product(scalar_values, sizeof(double)));
++    gpu_cache_bytes = interface_profile_checked_sum(
++      gpu_cache_bytes, interface_profile_checked_product(auxiliary_values, sizeof(double)));
++    gpu_cache_bytes = interface_profile_checked_sum(gpu_cache_bytes, 3 * sizeof(int));
++    gpu_cache_bytes = interface_profile_checked_sum(
++      gpu_cache_bytes, INTERFACE_PROFILE_ERROR_VALUE_COUNT * sizeof(double));
++    if (cache_values > std::vector<InterfaceProfileBlockAccum>().max_size() ||
++        interface_block_cache_capacity_ >
++          std::vector<InterfaceProfileBlockMetadata>().max_size()) {
++      PRINT_INPUT_ERROR("Interface profile CPU cache exceeds vector capacity.\n");
++    }
++    printf(
++      "    interface profile buffers: CPU block cache %zu bytes, GPU reduction/accumulation %zu bytes (%zu blocks).\n",
++      cpu_cache_bytes, gpu_cache_bytes, interface_block_cache_capacity_);
++
++    cpu_interface_block_cache_.resize(cache_values);
++    cpu_interface_block_metadata_.resize(interface_block_cache_capacity_);
++    gpu_interface_block_accum_.resize(count_values);
++    gpu_interface_error_info_.resize(3);
++    gpu_interface_error_values_.resize(INTERFACE_PROFILE_ERROR_VALUE_COUNT);
++    if (remove_drift_) gpu_auxiliary_.resize(auxiliary_values);
++
++    for (int i = 0; i < 9; ++i) interface_initial_box_h_[i] = box.cpu_h[i];
++    interface_initial_pbc_[0] = box.pbc_x;
++    interface_initial_pbc_[1] = box.pbc_y;
++    interface_initial_pbc_[2] = box.pbc_z;
++    last_bath_source_eV_ = std::numeric_limits<double>::quiet_NaN();
++    last_bath_sink_eV_ = std::numeric_limits<double>::quiet_NaN();
++    FILE* existing_file = fopen(interface_output_file_.c_str(), "r");
++    if (existing_file) {
++      fclose(existing_file);
++      PRINT_INPUT_ERROR("Interface output file already exists; choose a new filename.\n");
++    }
++  } else {
++    cpu_count_sum_.resize(nchunk_, 0);
++    cpu_values_sum_.resize(nchunk_ * number_of_scalars_, 0.0);
++  }
+   ichunk_.resize(atom.number_of_atoms);
+   gpu_count_.resize(nchunk_);
+   gpu_values_.resize(nchunk_ * number_of_scalars_);
+-  cpu_count_sum_.resize(nchunk_, 0);
+-  cpu_values_sum_.resize(nchunk_ * number_of_scalars_, 0.0);
+   num_samples_ = 0;
++  if (interface_mode_) reset_interface_block();
+ 
+   calculate_chunk_volumes(box);
+   calculate_chunk_coords(box);
+ 
+-  fid_ = my_fopen("compute_chunk.out", "a");
++  if (geometry_mode_) {
++    std::vector<int> fixed_bin = interface_geometry_->atom_bin();
++    for (size_t n = 0; n < fixed_bin.size(); ++n) {
++      fixed_bin[n] = interface_profile_atom_bin(
++        fixed_bin[n], interface_geometry_->atom_fixed()[n] != 0,
++        interface_geometry_->atom_moving()[n] != 0);
++    }
++    ichunk_.copy_from_host(fixed_bin.data(), fixed_bin.size());
++  }
++
++  if (interface_mode_) {
++    fid_ = my_fopen(interface_output_file_.c_str(), "w");
++    fprintf(fid_, geometry_mode_
++      ? "# compute_interface_profile version 3\n"
++      : "# compute_chunk interface_profile version 2\n");
++    fprintf(fid_, "# axis %c\n", "xyz"[axis_[0]]);
++    fprintf(fid_, "# timestep_fs %.10e\n", time_step * TIME_UNIT_CONVERSION);
++    fprintf(fid_, "# sample_interval %d\n", sample_interval_);
++    fprintf(fid_, "# output_interval_samples %d\n", output_interval_);
++    fprintf(fid_, "# bin_width_A %.10e\n", delta_[0]);
++    fprintf(fid_, "# box_thickness_A %.10e\n", box_length_[0]);
++    fprintf(fid_, "# cross_section_A2 %.10e\n", box.get_area(axis_[0]));
++    fprintf(fid_, "# pbc %d %d %d\n", box.pbc_x, box.pbc_y, box.pbc_z);
++    fprintf(fid_, "# geometry_valid orthogonal_static_runtime_checked\n");
++    fprintf(fid_, "# bin_count %d\n", nchunk_);
++    if (geometry_mode_) {
++      fprintf(fid_, "# geometry_source %s_geometry.json\n", interface_geometry_->output_prefix().c_str());
++      fprintf(fid_, "# fixed_reference_mapping yes\n");
++      fprintf(fid_, "# interfaces_A");
++      for (double plane : interface_geometry_->interfaces_A()) fprintf(fid_, " %.10e", plane);
++      fprintf(fid_, "\n# material_id and bath_mask come from prefix_bins.dat\n");
++    } else {
++      fprintf(fid_, "# interface_coordinate_A %.10e\n", interface_coordinate_);
++      fprintf(fid_, "# material_lower_id %d\n", material_lower_id_);
++      fprintf(fid_, "# material_upper_id %d\n", material_upper_id_);
++    }
++    fprintf(fid_, "# remove_bin_drift %d\n", remove_drift_ ? 1 : 0);
++    fprintf(fid_, "# temperature_dof 3*N-3*remove_bin_drift\n");
++    fprintf(fid_, "# bath_energy_sign system_to_bath\n");
++    fprintf(fid_, geometry_mode_
++      ? "# columns step time_ps block_start_ps bin_id coordinate_min_A coordinate_max_A coordinate_center_A material_id bath_mask interface_crossing atom_count kinetic_energy_eV potential_energy_eV temperature_K dof samples temperature_samples bath_source_eV bath_sink_eV\n"
++      : "# columns step time_ps block_start_ps bin_id coordinate_min_A coordinate_max_A coordinate_center_A material_id atom_count kinetic_energy_eV potential_energy_eV temperature_K dof samples temperature_samples bath_source_eV bath_sink_eV\n");
++    fflush(fid_);
++  } else {
++    fid_ = my_fopen("compute_chunk.out", "a");
++  }
+ }
+ 
+ void ComputeChunk::end_of_step(
+@@ -335,18 +666,52 @@ void ComputeChunk::end_of_step(
+   GPU_Vector<double>& thermo, Atom& atom, Force& force)
+ {
+   if (number_of_scalars_ == 0) return;
++  if (interface_mode_ && !geometry_mode_) {
++    if (!box.is_orthogonal || box.pbc_x != interface_initial_pbc_[0] ||
++        box.pbc_y != interface_initial_pbc_[1] || box.pbc_z != interface_initial_pbc_[2]) {
++      PRINT_INPUT_ERROR("Interface profiles do not support changing box geometry or PBC.\n");
++    }
++    for (int i = 0; i < 9; ++i) {
++      if (box.cpu_h[i] != interface_initial_box_h_[i]) {
++        PRINT_INPUT_ERROR("Interface profiles do not support changing box geometry or PBC.\n");
++      }
++    }
++  }
+   if ((step + 1) % sample_interval_ != 0) return;
+ 
+-  assign_chunks(atom, box);
+-  sample(atom);
++  if (interface_mode_ && num_samples_ == 0) {
++    block_start_time_ps_ = global_time * TIME_UNIT_CONVERSION / 1000.0;
++  }
++  if (!geometry_mode_) assign_chunks(atom, box);
++  if (interface_mode_ && !geometry_mode_) mask_fixed_and_moving_atoms(group, integrate, fixed_group, move_group);
++  sample(atom, step + 1);
+   num_samples_++;
++  if (interface_mode_) {
++    last_step_ = step + 1;
++    last_time_ps_ = global_time * TIME_UNIT_CONVERSION / 1000.0;
++    const EnsembleType type = integrate.get_type();
++    if (type == EnsembleType::HEAT_LAN || type == EnsembleType::HEAT_NHC ||
++        type == EnsembleType::HEAT_BDP) {
++      const double* bath_energy = integrate.get_energy_transferred();
++      last_bath_source_eV_ = bath_energy[0];
++      last_bath_sink_eV_ = bath_energy[1];
++    } else {
++      last_bath_source_eV_ = std::numeric_limits<double>::quiet_NaN();
++      last_bath_sink_eV_ = std::numeric_limits<double>::quiet_NaN();
++    }
++  }
+ 
+   // output_interval_ means "output every N samples" (same as compute command)
+   if (num_samples_ % output_interval_ == 0) {
+-    output_results(step + 1);
+-    std::fill(cpu_count_sum_.begin(), cpu_count_sum_.end(), 0);
+-    std::fill(cpu_values_sum_.begin(), cpu_values_sum_.end(), 0.0);
+-    num_samples_ = 0;
++    if (interface_mode_) {
++      cache_interface_block();
++      reset_interface_block();
++    } else {
++      output_results(step + 1);
++      std::fill(cpu_count_sum_.begin(), cpu_count_sum_.end(), 0);
++      std::fill(cpu_values_sum_.begin(), cpu_values_sum_.end(), 0.0);
++      num_samples_ = 0;
++    }
+   }
+ }
+ 
+@@ -355,14 +720,30 @@ void ComputeChunk::post_run(
+   const int number_of_steps, const double time_step, const double temperature)
+ {
+   if (number_of_scalars_ == 0) return;
++  if (interface_mode_) {
++    if (num_samples_ > 0) {
++      cache_interface_block();
++      reset_interface_block();
++    }
++    for (std::size_t block = 0; block < interface_cached_block_count_; ++block) {
++      output_interface_results(block);
++    }
++    if (fid_) fflush(fid_);
++  }
+   if (fid_) fclose(fid_);
+   fid_ = nullptr;
+ 
+   compute_temperature_ = 0;
++  compute_potential_ = 0;
+   compute_density_number_ = 0;
+   compute_density_mass_ = 0;
+   compute_vx_ = compute_vy_ = compute_vz_ = 0;
+   compute_fx_ = compute_fy_ = compute_fz_ = 0;
++  interface_mode_ = false;
++  geometry_mode_ = false;
++  interface_geometry_.reset();
++  remove_drift_ = false;
++  interface_output_file_.clear();
+   number_of_scalars_ = 0;
+ }
+ 
+@@ -395,7 +776,28 @@ void ComputeChunk::assign_chunks(const Atom& atom, const Box& box)
+   GPU_CHECK_KERNEL
+ }
+ 
+-void ComputeChunk::sample(const Atom& atom)
++void ComputeChunk::mask_fixed_and_moving_atoms(
++  const std::vector<Group>& group, const Integrate& integrate,
++  const int fixed_group, const int move_group)
++{
++  if (fixed_group < 0 && move_group < 0) return;
++
++  const int N = ichunk_.size();
++  const int block_size = 128;
++  const int grid_size = (N - 1) / block_size + 1;
++  const int fixed_method = integrate.get_fixed_grouping_method();
++  const int move_method = integrate.get_move_grouping_method();
++  const int* fixed_labels =
++    (fixed_group >= 0) ? group[fixed_method].label.data() : nullptr;
++  const int* move_labels =
++    (move_group >= 0) ? group[move_method].label.data() : nullptr;
++
++  gpu_mask_fixed_and_moving_atoms<<<grid_size, block_size>>>(
++    N, ichunk_.data(), fixed_labels, fixed_group, move_labels, move_group);
++  GPU_CHECK_KERNEL
++}
++
++void ComputeChunk::sample(const Atom& atom, const int step)
+ {
+   const int N = atom.number_of_atoms;
+   const int block_size = 128;
+@@ -424,6 +826,13 @@ void ComputeChunk::sample(const Atom& atom)
+     GPU_CHECK_KERNEL
+     idx++;
+   }
++  if (compute_potential_) {
++    gpu_sum_scalar_per_chunk<<<grid_size, block_size>>>(
++      N, ichunk_.data(), atom.potential_per_atom.data(), nchunk_, idx,
++      number_of_scalars_, gpu_values_.data());
++    GPU_CHECK_KERNEL
++    idx++;
++  }
+   if (compute_density_number_) { idx++; } // count-based, no kernel needed
+   if (compute_density_mass_) {
+     gpu_sum_scalar_per_chunk<<<grid_size, block_size>>>(
+@@ -475,7 +884,24 @@ void ComputeChunk::sample(const Atom& atom)
+     idx++;
+   }
+ 
+-  // accumulate to CPU
++  if (interface_mode_) {
++    if (remove_drift_) {
++      gpu_auxiliary_.fill(0.0);
++      gpu_sum_mass_momentum_per_chunk<<<grid_size, block_size>>>(
++        N, ichunk_.data(), mass, vx, vy, vz, nchunk_, gpu_auxiliary_.data());
++      GPU_CHECK_KERNEL
++    }
++    gpu_accumulate_interface_profile_sample<<<
++      (nchunk_ - 1) / block_size + 1, block_size>>>(
++        nchunk_, number_of_scalars_, gpu_count_.data(), gpu_values_.data(),
++        remove_drift_, remove_drift_ ? gpu_auxiliary_.data() : nullptr,
++        gpu_interface_block_accum_.data(), gpu_interface_error_info_.data(),
++        gpu_interface_error_values_.data(), step);
++    GPU_CHECK_KERNEL
++    return;
++  }
++
++  // The non-interface compute_chunk path retains its existing per-sample host reduction.
+   std::vector<int> cpu_count(nchunk_);
+   std::vector<double> cpu_values(nchunk_ * number_of_scalars_);
+   gpu_count_.copy_to_host(cpu_count.data(), nchunk_);
+@@ -557,6 +983,142 @@ void ComputeChunk::output_results(int step)
+   fflush(fid_);
+ }
+ 
++void ComputeChunk::cache_interface_block()
++{
++  if (num_samples_ == 0) return;
++
++  const std::size_t block_index = interface_cached_block_count_;
++  const std::size_t expected_samples = interface_profile_expected_block_samples(
++    interface_expected_sample_count_, static_cast<std::size_t>(output_interval_), block_index);
++  if (expected_samples != static_cast<std::size_t>(num_samples_) ||
++      block_index >= interface_block_cache_capacity_) {
++    PRINT_INPUT_ERROR("Interface profile block cache does not match the sampled run length.\n");
++  }
++  std::size_t cache_offset = 0;
++  if (!interface_profile_block_cache_offset(
++        block_index, static_cast<std::size_t>(nchunk_),
++        interface_block_cache_capacity_, cache_offset) ||
++      cache_offset > cpu_interface_block_cache_.size() ||
++      static_cast<std::size_t>(nchunk_) > cpu_interface_block_cache_.size() - cache_offset) {
++    PRINT_INPUT_ERROR("Interface profile block cache index is outside its allocation.\n");
++  }
++
++  gpu_interface_error_info_.copy_to_host(interface_error_info_host_, 3);
++  if (interface_error_info_host_[0] != INTERFACE_PROFILE_SAMPLE_OK) {
++    gpu_interface_error_values_.copy_to_host(
++      interface_error_values_host_, INTERFACE_PROFILE_ERROR_VALUE_COUNT);
++    const char* reason = interface_error_info_host_[0] == INTERFACE_PROFILE_SAMPLE_INVALID
++      ? "invalid or non-finite per-sample data"
++      : interface_error_info_host_[0] == INTERFACE_PROFILE_SAMPLE_COUNTER_OVERFLOW
++        ? "sample counter overflow" : "non-finite accumulated block sum";
++    fprintf(
++      stderr,
++      "Interface profile rejected %s at step %d, bin %d (raw kinetic %.17g eV, "
++      "mass %.17g, momentum %.17g %.17g %.17g, potential %.17g eV).\n",
++      reason, interface_error_info_host_[1], interface_error_info_host_[2],
++      interface_error_values_host_[INTERFACE_PROFILE_ERROR_RAW_KINETIC],
++      interface_error_values_host_[INTERFACE_PROFILE_ERROR_MASS_SUM],
++      interface_error_values_host_[INTERFACE_PROFILE_ERROR_MOMENTUM_X],
++      interface_error_values_host_[INTERFACE_PROFILE_ERROR_MOMENTUM_Y],
++      interface_error_values_host_[INTERFACE_PROFILE_ERROR_MOMENTUM_Z],
++      interface_error_values_host_[INTERFACE_PROFILE_ERROR_POTENTIAL]);
++    PRINT_INPUT_ERROR("Interface profile rejected the sampled block after its GPU error flag was checked.\n");
++  }
++
++  gpu_interface_block_accum_.copy_to_host(
++    cpu_interface_block_cache_.data() + cache_offset, static_cast<size_t>(nchunk_));
++  for (int bin = 0; bin < nchunk_; ++bin) {
++    const InterfaceProfileBlockAccum& accum = cpu_interface_block_cache_[cache_offset + bin];
++    if (!std::isfinite(accum.kinetic_sum) || !std::isfinite(accum.potential_sum) ||
++        !std::isfinite(accum.temperature_sum) || !std::isfinite(accum.dof_sum) ||
++        accum.temperature_samples > static_cast<unsigned long long>(num_samples_)) {
++      PRINT_INPUT_ERROR("Interface profile rejected a non-finite or inconsistent GPU block sum.\n");
++    }
++  }
++  InterfaceProfileBlockMetadata& metadata = cpu_interface_block_metadata_[block_index];
++  metadata.step = last_step_;
++  metadata.time_ps = last_time_ps_;
++  metadata.start_time_ps = block_start_time_ps_;
++  metadata.samples = num_samples_;
++  metadata.bath_source_eV = last_bath_source_eV_;
++  metadata.bath_sink_eV = last_bath_sink_eV_;
++  ++interface_cached_block_count_;
++}
++
++void ComputeChunk::output_interface_results(const std::size_t block_index)
++{
++  if (block_index >= interface_cached_block_count_) return;
++  const InterfaceProfileBlockMetadata& metadata = cpu_interface_block_metadata_[block_index];
++  std::size_t cache_offset = 0;
++  if (!interface_profile_block_cache_offset(
++        block_index, static_cast<std::size_t>(nchunk_),
++        interface_block_cache_capacity_, cache_offset)) {
++    PRINT_INPUT_ERROR("Interface profile block cache index is invalid during output.\n");
++  }
++
++  for (int chunk = 0; chunk < nchunk_; ++chunk) {
++    const InterfaceProfileBlockAccum& accum = cpu_interface_block_cache_[cache_offset + chunk];
++    const double coordinate_min = origin_[0] + chunk * delta_[0];
++    const double remainder = box_length_[0] - (nlayers_[0] - 1) * delta_[0];
++    const double width = (chunk < nlayers_[0] - 1) ? delta_[0] : remainder;
++    const double coordinate_max = coordinate_min + width;
++    int material_id = -1;
++    int bath_mask = 0;
++    int interface_crossing = 0;
++    if (geometry_mode_) {
++      const InterfaceBinGeometry& bin = interface_geometry_->bins()[chunk];
++      material_id = bin.material_id;
++      bath_mask = bin.bath_mask;
++      interface_crossing = bin.interface_crossing;
++    } else if (coordinate_max <= interface_coordinate_) {
++      material_id = material_lower_id_;
++    } else if (coordinate_min >= interface_coordinate_) {
++      material_id = material_upper_id_;
++    }
++
++    const double inv_samples = 1.0 / metadata.samples;
++    const double temperature = accum.temperature_samples > 0
++      ? accum.temperature_sum / static_cast<double>(accum.temperature_samples)
++      : std::numeric_limits<double>::quiet_NaN();
++    fprintf(
++      fid_, "%d %.10e %.10e %d %.10e %.10e %.10e ",
++      metadata.step,
++      metadata.time_ps,
++      metadata.start_time_ps,
++      chunk,
++      coordinate_min,
++      coordinate_max,
++      chunk_coords_cpu_[chunk]);
++    if (geometry_mode_) {
++      fprintf(fid_, "%d %d %d ", material_id, bath_mask, interface_crossing);
++    } else {
++      fprintf(fid_, "%d ", material_id);
++    }
++    fprintf(
++      fid_, "%.10e %.10e %.10e %.10e %.10e %d %llu %.10e %.10e\n",
++      static_cast<double>(accum.atom_count_sum) * inv_samples,
++      accum.kinetic_sum * inv_samples,
++      accum.potential_sum * inv_samples,
++      temperature,
++      accum.dof_sum * inv_samples,
++      metadata.samples,
++      accum.temperature_samples,
++      metadata.bath_source_eV,
++      metadata.bath_sink_eV);
++  }
++}
++
++void ComputeChunk::reset_interface_block()
++{
++  const int block_size = 128;
++  const int grid_size = (nchunk_ - 1) / block_size + 1;
++  gpu_reset_interface_profile_block<<<grid_size, block_size>>>(
++    nchunk_, gpu_interface_block_accum_.data(), gpu_interface_error_info_.data(),
++    gpu_interface_error_values_.data());
++  GPU_CHECK_KERNEL
++  num_samples_ = 0;
++}
++
+ void ComputeChunk::calculate_chunk_volumes(const Box& box)
+ {
+   chunk_volume_cpu_.resize(nchunk_);
+diff --git a/src/measure/compute_chunk.cuh b/src/measure/compute_chunk.cuh
+index 9c1f445b..9b8b0bd3 100644
+--- a/src/measure/compute_chunk.cuh
++++ b/src/measure/compute_chunk.cuh
+@@ -15,15 +15,23 @@
+ 
+ #pragma once
+ #include "action.cuh"
++#include "interface_profile_math.cuh"
+ #include "model/box.cuh"
+ #include "utilities/gpu_vector.cuh"
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
++class InterfaceGeometry;
++
+ class ComputeChunk : public Action
+ {
+ public:
+   ComputeChunk(const std::vector<std::string>& tokens, Box& box);
++  ComputeChunk(
++    const std::vector<std::string>& tokens,
++    const std::shared_ptr<InterfaceGeometry>& interface_geometry);
++  bool uses_legacy_interface_guard() const { return interface_mode_ && !geometry_mode_; }
+ 
+   virtual void pre_run(
+     const int number_of_steps,
+@@ -81,6 +89,7 @@ private:
+ 
+   // Properties to compute
+   int compute_temperature_ = 0;
++  int compute_potential_ = 0;
+   int compute_density_number_ = 0;
+   int compute_density_mass_ = 0;
+   int compute_vx_ = 0;
+@@ -94,19 +103,54 @@ private:
+   // Accumulation arrays
+   GPU_Vector<int> gpu_count_;
+   GPU_Vector<double> gpu_values_;
++  GPU_Vector<double> gpu_auxiliary_;
++  GPU_Vector<InterfaceProfileBlockAccum> gpu_interface_block_accum_;
++  GPU_Vector<int> gpu_interface_error_info_;
++  GPU_Vector<double> gpu_interface_error_values_;
+   std::vector<int> cpu_count_sum_;
+   std::vector<double> cpu_values_sum_;
+   int num_samples_ = 0;
+ 
++  // Optional one-interface profile output; legacy compute_chunk remains unchanged.
++  bool interface_mode_ = false;
++  bool geometry_mode_ = false;
++  std::shared_ptr<InterfaceGeometry> interface_geometry_;
++  bool remove_drift_ = false;
++  double interface_coordinate_ = 0.0;
++  int material_lower_id_ = 1;
++  int material_upper_id_ = 2;
++  std::string interface_output_file_;
++  double block_start_time_ps_ = 0.0;
++  double last_time_ps_ = 0.0;
++  int last_step_ = 0;
++  double interface_initial_box_h_[9] = {};
++  int interface_initial_pbc_[3] = {};
++  double last_bath_source_eV_ = 0.0;
++  double last_bath_sink_eV_ = 0.0;
++  std::size_t interface_expected_sample_count_ = 0;
++  std::size_t interface_block_cache_capacity_ = 0;
++  std::size_t interface_cached_block_count_ = 0;
++  std::vector<InterfaceProfileBlockAccum> cpu_interface_block_cache_;
++  std::vector<InterfaceProfileBlockMetadata> cpu_interface_block_metadata_;
++  int interface_error_info_host_[3] = {};
++  double interface_error_values_host_[INTERFACE_PROFILE_ERROR_VALUE_COUNT] = {};
++
+   // Output
+   FILE* fid_ = nullptr;
+ 
+   void parse(const std::vector<std::string>& tokens, Box& box);
+   int parse_bin_params(
+-    const std::vector<std::string>& tokens, int num_param, int start, Box& box);
++    const std::vector<std::string>& tokens, int num_param, int start, Box& box,
++    bool require_finite_width);
+   void assign_chunks(const Atom& atom, const Box& box);
+-  void sample(const Atom& atom);
++  void mask_fixed_and_moving_atoms(
++    const std::vector<Group>& group, const Integrate& integrate,
++    const int fixed_group, const int move_group);
++  void sample(const Atom& atom, int step);
+   void output_results(int step);
++  void cache_interface_block();
++  void output_interface_results(std::size_t block_index);
++  void reset_interface_block();
+   void calculate_chunk_volumes(const Box& box);
+   void calculate_chunk_coords(const Box& box);
+ };
+diff --git a/src/measure/measure.cu b/src/measure/measure.cu
+index ce9e7220..096049a8 100644
+--- a/src/measure/measure.cu
++++ b/src/measure/measure.cu
+@@ -47,6 +47,9 @@ The driver class dealing with measurement.
+ #include "hac.cuh"
+ #include "hnemdec_kappa.cuh"
+ #include "hnemd_kappa.cuh"
++#include "interface_dos.cuh"
++#include "interface_geometry.cuh"
++#include "interface_shc.cuh"
+ #include "iron_conductivity.cuh"
+ #include "lsqt.cuh"
+ #include "modal_analysis.cuh"
+@@ -166,6 +169,32 @@ bool Measure::parse_action(
+     std::unique_ptr<Action> action;
+     action.reset(new DOS(tokens, group));
+     actions_.emplace_back(std::move(action));
++  } else if (tokens[0] == "interface_geometry") {
++    if (interface_geometry_ || tokens.size() != 3) {
++      PRINT_INPUT_ERROR("interface_geometry may be declared once as: interface_geometry <config_file> <output_prefix>.\n");
++    }
++    interface_geometry_ = std::make_shared<InterfaceGeometry>(tokens[1], tokens[2]);
++  } else if (tokens[0] == "compute_interface_profile") {
++    if (!interface_geometry_) {
++      PRINT_INPUT_ERROR("compute_interface_profile requires an earlier interface_geometry command.\n");
++    }
++    std::unique_ptr<Action> action;
++    action.reset(new ComputeChunk(tokens, interface_geometry_));
++    actions_.emplace_back(std::move(action));
++  } else if (tokens[0] == "compute_interface_dos") {
++    if (!interface_geometry_) {
++      PRINT_INPUT_ERROR("compute_interface_dos requires an earlier interface_geometry command.\n");
++    }
++    std::unique_ptr<Action> action;
++    action.reset(new ComputeInterfaceDOS(tokens, interface_geometry_, number_of_types));
++    actions_.emplace_back(std::move(action));
++  } else if (tokens[0] == "compute_interface_shc") {
++    if (!interface_geometry_) {
++      PRINT_INPUT_ERROR("compute_interface_shc requires an earlier interface_geometry command.\n");
++    }
++    std::unique_ptr<Action> action;
++    action.reset(new ComputeInterfaceSHC(tokens, interface_geometry_));
++    actions_.emplace_back(std::move(action));
+   } else if (tokens[0] == "compute_sdc") {
+     std::unique_ptr<Action> action;
+     action.reset(new SDC(tokens, group));
+@@ -300,6 +329,7 @@ void Measure::pre_run(
+   int number_of_modal_methods = 0;
+   bool has_deform = false;
+   bool has_enhanced_sampling = false;
++  int interface_shc_count = 0;
+   for (auto& action : actions_) {
+     if (action->action_name == "") {
+       printf("Dear developer:\n");
+@@ -310,7 +340,7 @@ void Measure::pre_run(
+     // to be called multiple times; others are not
+     if (
+       action->action_name != "dump_xyz" && action->action_name != "dump_netcdf" &&
+-      action->action_name != "compute_chunk" &&
++      action->action_name != "compute_chunk" && action->action_name != "compute_interface_dos" &&
+       action->action_name != "add_force" && action->action_name != "add_spring" &&
+       action->action_name != "add_efield") {
+       for (auto& action_name : action_names) {
+@@ -337,8 +367,24 @@ void Measure::pre_run(
+     if (action->action_name == "enhanced_sampling") {
+       has_enhanced_sampling = true;
+     }
++    if (action->action_name == "compute_interface_shc") ++interface_shc_count;
+     action_names.emplace_back(action->action_name);
+   }
++  if (interface_shc_count > 1) {
++    PRINT_INPUT_ERROR("compute_interface_shc may be used once per run.\n");
++  }
++  if (interface_shc_count) {
++    const char* unsupported[] = {
++      "add_force", "add_spring", "add_efield", "add_random_force", "compute_hnemd",
++      "compute_hnemdec", "compute_hnema", "plumed", "electron_stop", "enhanced_sampling", "active"};
++    for (const auto& action : actions_) {
++      for (const char* name : unsupported) {
++        if (action->action_name == name) {
++          PRINT_INPUT_ERROR("compute_interface_shc rejects external-force or driven-work actions.\n");
++        }
++      }
++    }
++  }
+   if (has_deform && has_enhanced_sampling) {
+     PRINT_INPUT_ERROR("Enhanced sampling V1A does not support box deformation.");
+   }
+@@ -350,6 +396,17 @@ void Measure::pre_run(
+     PRINT_INPUT_ERROR("Cannot have more than one HNEMD method within one run.");
+   }
+ 
++  if (interface_geometry_) {
++    for (const auto& action : actions_) {
++      const ComputeChunk* chunk = dynamic_cast<const ComputeChunk*>(action.get());
++      if (chunk && chunk->uses_legacy_interface_guard()) {
++        PRINT_INPUT_ERROR(
++          "Use compute_interface_profile with shared geometry; do not combine it with the legacy interface guard.\n");
++      }
++    }
++    interface_geometry_->initialize(atom, box, group, integrate);
++  }
++
+   for (auto& action : actions_) {
+     action->pre_run(
+       number_of_steps,
+@@ -370,6 +427,7 @@ void Measure::setup_force(
+   Box& box,
+   Force& force)
+ {
++  if (interface_geometry_) interface_geometry_->check_box(box);
+   for (auto& action : actions_) {
+     action->setup_force(time_step, integrate, group, atom, box, force);
+   }
+@@ -395,6 +453,7 @@ void Measure::post_run(
+   }
+ 
+   actions_.clear();
++  interface_geometry_.reset();
+ }
+ 
+ void Measure::end_of_step(
+@@ -451,6 +510,7 @@ void Measure::pre_force(
+   Box& box,
+   Force& force)
+ {
++  if (interface_geometry_) interface_geometry_->check_box(box);
+   for (auto& action : actions_) {
+     action->pre_force(step, time_step, integrate, group, atom, box, force);
+   }
+diff --git a/src/measure/measure.cuh b/src/measure/measure.cuh
+index f198027c..218b99bf 100644
+--- a/src/measure/measure.cuh
++++ b/src/measure/measure.cuh
+@@ -26,6 +26,7 @@ class Force;
+ class Group;
+ class Integrate;
+ class Ensemble;
++class InterfaceGeometry;
+ class Measure
+ {
+ public:
+@@ -107,4 +108,5 @@ public:
+ 
+ private:
+   std::vector<std::unique_ptr<Action>> actions_;
++  std::shared_ptr<InterfaceGeometry> interface_geometry_;
+ };
+diff --git a/tests_pytest/test_io_compute_commands.py b/tests_pytest/test_io_compute_commands.py
+index ddf0c2fd..170b2f31 100644
+--- a/tests_pytest/test_io_compute_commands.py
++++ b/tests_pytest/test_io_compute_commands.py
+@@ -67,6 +67,18 @@ def _check_elastic_format(path):
+     assert data.shape == (6, 6)
+ 
+ 
++def _check_interface_temperature(path):
++    data = np.loadtxt(path, comments='#')
++    assert data.ndim == 2 and data.shape[1] == 17
++    assert np.all(np.isfinite(data[:, :11]))
++    assert np.all(data[:, 12:15] >= 0)
++    assert np.all(data[:, 13] > 0)
++    assert np.all(data[:, 14] <= data[:, 13])
++    assert np.all(np.isfinite(data[data[:, 14] > 0, 11]))
++    assert np.all(np.isnan(data[data[:, 14] == 0, 11]))
++    assert set(data[:, 7]).issubset({-1.0, 1.0, 2.0})
++
++
+ COMPUTE_COMMAND_CASES = [
+     CommandIOCase(
+         # The sampling interval may not exceed the number of steps of the run, so it is tied to
+@@ -113,6 +125,13 @@ COMPUTE_COMMAND_CASES = [
+         name='compute_chunk',
+         run_in_lines=[('compute_chunk', [5, 5, 'bin/1d', 'z', 'lower', 1.0, 'temperature'])],
+         expected_output_files=['compute_chunk.out']),
++    CommandIOCase(
++        name='compute_chunk_interface',
++        run_in_lines=[('compute_chunk', [5, 5, 'bin/1d', 'z', 'lower', 1.0,
++                                         'interface', 1.5, 1, 2, 'yes',
++                                         'interface_temperature.out'])],
++        expected_output_files=['interface_temperature.out'],
++        parse_check=_check_interface_temperature),
+     CommandIOCase(
+         name='compute_cohesive', skip_base_block=True,
+         run_in_lines=[('compute_cohesive', [0.99, 1.01, 6])],

@@ -51,6 +51,7 @@ public:
   std::vector<GPU_Vector<double>> virial_beads;
 
   int number_of_type(std::string& symbol);
+  void enable_position_image();
   void enable_unwrapped_position();
   void update_unwrapped_position(const Box& box);
 };

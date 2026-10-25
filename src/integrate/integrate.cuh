@@ -53,6 +53,9 @@ private:
 public:
   bool has_ensemble() const;
   EnsembleType get_type() const;
+  // Returns true for heat_lan/heat_nhc/heat_bdp. Group modes fill method-0 IDs;
+  // regional heat_lan reports uses_region=true and leaves the IDs at -1.
+  bool get_heat_bath_groups(int& source, int& sink, bool& uses_region) const;
   int get_fixed_group() const;
   int get_move_group() const;
   int get_fixed_grouping_method() const;

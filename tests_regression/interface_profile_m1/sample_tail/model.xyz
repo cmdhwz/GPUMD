@@ -1,0 +1,9 @@
+7
+pbc="T T T" Lattice="10 0 0 0 10 0 0 0 200" Properties=species:S:1:pos:R:3:group:I:2
+Ar 5 5 20 0 0
+Ar 5 5 25 0 0
+Ar 5 5 175 1 0
+Ar 5 5 180 1 0
+Ar 5 5 60 2 0
+Ar 5 5 100 3 0
+Ar 5 5 140 4 0

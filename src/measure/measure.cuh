@@ -26,6 +26,7 @@ class Force;
 class Group;
 class Integrate;
 class Ensemble;
+class InterfaceGeometry;
 class Measure
 {
 public:
@@ -107,4 +108,5 @@ public:
 
 private:
   std::vector<std::unique_ptr<Action>> actions_;
+  std::shared_ptr<InterfaceGeometry> interface_geometry_;
 };

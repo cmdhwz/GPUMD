@@ -1,0 +1,10 @@
+potential potential.txt
+velocity 300 seed 24680
+time_step 0.1
+fix 2
+move 3 0.0001 0 0
+ensemble heat_lan 300 300 1 0 1
+compute 0 1 1 temperature
+compute_chunk 10 3 bin/1d z lower 40 interface 100 1 2 yes com_removed.out
+compute_chunk 10 3 bin/1d z lower 40 interface 100 1 2 no raw_temperature.out
+run 45

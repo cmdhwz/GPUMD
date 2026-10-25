@@ -16,6 +16,7 @@
 #pragma once
 #include "dftd3.cuh"
 #include "neighbor.cuh"
+#include "nep_plane_flux_view.cuh"
 #include "potential.cuh"
 #include "utilities/common.cuh"
 #include "utilities/gpu_vector.cuh"
@@ -130,6 +131,12 @@ public:
 
   const GPU_Vector<int>& get_NL_radial_ptr();
 
+  double get_interface_plane_flux_cutoff() const;
+  bool supports_interface_plane_flux() const;
+  bool uses_large_box_for_interface_flux(const Box& box) const;
+  void set_plane_flux_view(const NEPPlaneFluxView& view) { plane_flux_view_ = view; }
+  void clear_plane_flux_view() { plane_flux_view_ = NEPPlaneFluxView{}; }
+
 private:
   ParaMB paramb;
   ANN annmb;
@@ -137,6 +144,7 @@ private:
   ExpandedBox ebox;
   DFTD3 dftd3;
   NeighborManager neighbor_manager;
+  NEPPlaneFluxView plane_flux_view_;
 
   void update_potential(float* parameters, ANN& ann);
 
@@ -155,6 +163,16 @@ private:
     GPU_Vector<double>& potential,
     GPU_Vector<double>& force,
     GPU_Vector<double>& virial);
+
+  template <bool CapturePlaneFlux>
+  void compute_large_box_impl(
+    Box& box,
+    const GPU_Vector<int>& type,
+    const GPU_Vector<double>& position,
+    GPU_Vector<double>& potential,
+    GPU_Vector<double>& force,
+    GPU_Vector<double>& virial,
+    const NEPPlaneFluxView& plane_flux_view);
 
   void compute_small_box(
     const float temperature,

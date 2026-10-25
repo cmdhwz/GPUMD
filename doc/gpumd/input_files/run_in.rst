@@ -156,6 +156,10 @@ Actions
      - Compute time-averaged quantities in dynamic spatial bins
      - No
      - No
+   * - :ref:`interface_geometry <kw_interface_geometry>`, ``compute_interface_profile``, ``compute_interface_dos``, :ref:`compute_interface_shc <kw_compute_interface_shc>`
+     - Define shared fixed reference bins, profile, local VDOS, and plane-resolved NEP SHC actions
+     - No
+     - No
    * - :ref:`compute_adf <kw_compute_adf>`
      - Compute the angular distribution function (:term:`ADF`)
      - No

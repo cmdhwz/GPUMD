@@ -32,6 +32,7 @@ public:
 
   double get_temperature1() const;
   double get_temperature2() const;
+  bool uses_region_heat_bath() const;
 
   void initialize_run(
     const double time_step, Atom& atom, Box& box, const std::vector<Group>& group) override;

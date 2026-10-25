@@ -1,0 +1,5 @@
+axis x
+bin_width_A 10
+interfaces 1 25
+material_group 0
+bath_groups 1 0 1

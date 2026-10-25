@@ -1,0 +1,7 @@
+# Copy this file into an independent run directory containing model.xyz and nep.txt.
+potential nep.txt
+time_step 1.0
+velocity 300 seed 12345
+ensemble heat_lan 300 100 50 0 1
+compute_chunk 10 20 bin/1d z lower 2.0 interface 50.0 1 2 yes interface_temperature.out
+run 100000

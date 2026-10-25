@@ -1,0 +1,84 @@
+{
+  "metadata": {
+    "source_revision": "SET_TO_GPUMD_COMMIT",
+    "nep_model": "nep.txt",
+    "target_temperature_K": 300,
+    "source_group": 0,
+    "sink_group": 1,
+    "boundary_condition": "periodic_two_paths",
+    "heat_direction": "z"
+  },
+  "output_dir": "analysis",
+  "steady_state_ps": [20, 100],
+  "block_frames": 10,
+  "window_bins": 5,
+  "source_side": "lower",
+  "interface_coordinate_A": 50,
+  "max_distance_A": 40,
+  "interface_exclusion_A": 2,
+  "heterostructure_run": "hetero",
+  "runs": {
+    "hetero": {
+      "profile": "hetero/interface_temperature.out",
+      "area_A2": 400,
+      "power_fraction": 0.5,
+      "boundary_condition": "periodic_two_paths"
+    },
+    "pure_alas": {
+      "profile": "pure_alas/interface_temperature.out",
+      "area_A2": 400,
+      "power_fraction": 0.5,
+      "boundary_condition": "periodic_two_paths"
+    },
+    "pure_gaas": {
+      "profile": "pure_gaas/interface_temperature.out",
+      "area_A2": 400,
+      "power_fraction": 0.5,
+      "boundary_condition": "periodic_two_paths"
+    }
+  },
+  "interface": {
+    "left": {
+      "id": 1,
+      "name": "AlAs",
+      "region_A": [0, 50],
+      "fit_A": [20, 40]
+    },
+    "right": {
+      "id": 2,
+      "name": "GaAs",
+      "region_A": [50, 100],
+      "fit_A": [60, 80]
+    }
+  },
+  "pure_references": {
+    "left": {
+      "run": "pure_alas",
+      "material_id": 1,
+      "fit_A": [20, 40],
+      "reference_coordinate_A": 50
+    },
+    "right": {
+      "run": "pure_gaas",
+      "material_id": 2,
+      "fit_A": [60, 80],
+      "reference_coordinate_A": 50
+    }
+  },
+  "segments": [
+    {
+      "run": "hetero",
+      "side": "AlAs",
+      "material_id": 1,
+      "coordinate1_A": 21,
+      "coordinate2_A": 41
+    },
+    {
+      "run": "hetero",
+      "side": "GaAs",
+      "material_id": 2,
+      "coordinate1_A": 61,
+      "coordinate2_A": 81
+    }
+  ]
+}

@@ -1,0 +1,250 @@
+diff --git a/src/force/nep.cu b/src/force/nep.cu
+index 4606208e..d5a1843b 100644
+--- a/src/force/nep.cu
++++ b/src/force/nep.cu
+@@ -31,6 +31,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
+ #include "utilities/nep_utilities.cuh"
+ #include "utilities/run_input.cuh"
+ #include <cstring>
++#include <algorithm>
+ #include <fstream>
+ #include <iostream>
+ #include <cstddef>
+@@ -540,6 +541,69 @@ static __global__ void find_descriptor(
+   }
+ }
+ 
++__device__ __forceinline__ static void record_nep_plane_flux(
++  const NEPPlaneFluxView view,
++  const int n1,
++  const int n2,
++  const float derivative[3])
++{
++  if (!view.enabled) return;
++  const int N = view.atom_count;
++  const double x1 = view.reference_positions[static_cast<size_t>(view.axis) * N + n1];
++  const double x2 = view.reference_positions[static_cast<size_t>(view.axis) * N + n2];
++  for (int p = 0; p < view.plane_count; ++p) {
++    const int direction = nep_plane_crossing_direction(
++      x1, x2, view.plane_positions[p], view.box_lengths[view.axis], view.pbc[view.axis] != 0);
++    if (direction == 0) continue;
++    const int slot = view.atom_slots[static_cast<size_t>(p) * N + n2];
++    if (slot < view.plane_offsets[p] || slot >= view.plane_offsets[p + 1]) {
++      nep_plane_flux_record_error(
++        view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_MISSING_SLOT, view.sample_step);
++      continue;
++    }
++    if (!isfinite(derivative[0]) || !isfinite(derivative[1]) || !isfinite(derivative[2])) {
++      nep_plane_flux_record_error(
++        view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_NONFINITE, view.sample_step);
++      continue;
++    }
++    const double sign = -static_cast<double>(direction);
++    for (int d = 0; d < 3; ++d) {
++      atomicAdd(&view.coefficients[3 * static_cast<size_t>(slot) + d], sign * derivative[d]);
++    }
++  }
++}
++
++static __global__ void validate_nep_plane_flux_displacement(
++  const NEPPlaneFluxView view,
++  const double* position_x,
++  const double* position_y,
++  const double* position_z)
++{
++  const int n = blockIdx.x * blockDim.x + threadIdx.x;
++  if (!view.enabled || n >= view.atom_count) return;
++  const double* current[3] = {position_x, position_y, position_z};
++  double displacement_squared = 0.0;
++  for (int d = 0; d < 3; ++d) {
++    const double position = current[d][n];
++    const double reference = view.reference_positions[static_cast<size_t>(d) * view.atom_count + n];
++    if (!isfinite(position) || !isfinite(reference)) {
++      nep_plane_flux_record_error(
++        view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_NONFINITE, view.sample_step);
++      return;
++    }
++    double delta = position - reference;
++    if (view.pbc[d]) delta -= nearbyint(delta / view.box_lengths[d]) * view.box_lengths[d];
++    displacement_squared += delta * delta;
++  }
++  if (!isfinite(displacement_squared)) {
++    nep_plane_flux_record_error(
++      view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_NONFINITE, view.sample_step);
++  } else if (sqrt(displacement_squared) > view.max_reference_displacement) {
++    nep_plane_flux_record_error(
++      view.error_flag, view.first_error_step, NEP_PLANE_FLUX_ERROR_DISPLACEMENT, view.sample_step);
++  }
++}
++
+ static __global__ void find_force_radial(
+   NEP::ParaMB paramb,
+   NEP::ANN annmb,
+@@ -557,7 +621,8 @@ static __global__ void find_force_radial(
+   double* g_fx,
+   double* g_fy,
+   double* g_fz,
+-  double* g_virial)
++  double* g_virial,
++  NEPPlaneFluxView plane_flux_view)
+ {
+   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+   if (n1 < N2) {
+@@ -614,6 +679,7 @@ static __global__ void find_force_radial(
+           f21[d] -= tmp21 * r12[d];
+         }
+       }
++      record_nep_plane_flux(plane_flux_view, n1, n2, f12);
+       s_fx += f12[0] - f21[0];
+       s_fy += f12[1] - f21[1];
+       s_fz += f12[2] - f21[2];
+@@ -663,7 +729,8 @@ static __global__ void find_partial_force_angular(
+   const float* __restrict__ g_sum_fxyz,
+   float* g_f12x,
+   float* g_f12y,
+-  float* g_f12z)
++  float* g_f12z,
++  NEPPlaneFluxView plane_flux_view)
+ {
+   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+   if (n1 < N2) {
+@@ -731,6 +798,7 @@ static __global__ void find_partial_force_angular(
+           sum_fxyz,
+           f12);
+       }
++      record_nep_plane_flux(plane_flux_view, n1, n2, f12);
+       g_f12x[index] = f12[0];
+       g_f12y[index] = f12[1];
+       g_f12z[index] = f12[2];
+@@ -755,7 +823,8 @@ static __global__ void find_force_ZBL(
+   double* g_fy,
+   double* g_fz,
+   double* g_virial,
+-  double* g_pe)
++  double* g_pe,
++  NEPPlaneFluxView plane_flux_view)
+ {
+   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
+   if (n1 < N2) {
+@@ -822,6 +891,7 @@ static __global__ void find_force_ZBL(
+       float f2 = fp * d12inv * 0.5f;
+       float f12[3] = {r12[0] * f2, r12[1] * f2, r12[2] * f2};
+       float f21[3] = {-r12[0] * f2, -r12[1] * f2, -r12[2] * f2};
++      record_nep_plane_flux(plane_flux_view, n1, n2, f12);
+       s_fx += f12[0] - f21[0];
+       s_fy += f12[1] - f21[1];
+       s_fz += f12[2] - f21[2];
+@@ -865,6 +935,15 @@ void NEP::compute_large_box(
+   const int N = type.size();
+   const int grid_size = (N2 - N1 - 1) / BLOCK_SIZE + 1;
+ 
++  if (plane_flux_view_.enabled) {
++    validate_nep_plane_flux_displacement<<<(N - 1) / BLOCK_SIZE + 1, BLOCK_SIZE>>>(
++      plane_flux_view_,
++      position_per_atom.data(),
++      position_per_atom.data() + N,
++      position_per_atom.data() + 2 * N);
++    GPU_CHECK_KERNEL
++  }
++
+   neighbor_manager.update(
+     box, 
+     type, 
+@@ -948,7 +1027,8 @@ void NEP::compute_large_box(
+     force_per_atom.data(),
+     force_per_atom.data() + N,
+     force_per_atom.data() + N * 2,
+-    virial_per_atom.data());
++    virial_per_atom.data(),
++    plane_flux_view_);
+   GPU_CHECK_KERNEL
+ 
+   find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+@@ -968,7 +1048,8 @@ void NEP::compute_large_box(
+     nep_data.sum_fxyz.data(),
+     nep_data.f12x.data(),
+     nep_data.f12y.data(),
+-    nep_data.f12z.data());
++    nep_data.f12z.data(),
++    plane_flux_view_);
+   GPU_CHECK_KERNEL
+ 
+   find_properties_many_body(
+@@ -1001,7 +1082,8 @@ void NEP::compute_large_box(
+       force_per_atom.data() + N,
+       force_per_atom.data() + N * 2,
+       virial_per_atom.data(),
+-      potential_per_atom.data());
++      potential_per_atom.data(),
++      plane_flux_view_);
+     GPU_CHECK_KERNEL
+   }
+ }
+@@ -1214,6 +1296,27 @@ static bool get_expanded_box(const double rc, const Box& box, NEP::ExpandedBox&
+   return is_small_box;
+ }
+ 
++double NEP::get_interface_plane_flux_cutoff() const
++{
++  double cutoff = paramb.rc_radial_max;
++  for (int type = 0; type < paramb.num_types; ++type) {
++    cutoff = std::max(cutoff, static_cast<double>(paramb.rc_angular[type]));
++  }
++  if (zbl.enabled) cutoff = std::max(cutoff, static_cast<double>(zbl.rc_outer));
++  return cutoff;
++}
++
++bool NEP::supports_interface_plane_flux() const
++{
++  return paramb.model_type == 0 && !has_dftd3;
++}
++
++bool NEP::uses_large_box_for_interface_flux(const Box& box) const
++{
++  ExpandedBox expanded_box;
++  return !get_expanded_box(paramb.rc_radial_max, box, expanded_box);
++}
++
+ void NEP::compute(
+   Box& box,
+   const GPU_Vector<int>& type,
+@@ -1223,6 +1326,9 @@ void NEP::compute(
+   GPU_Vector<double>& virial_per_atom)
+ {
+   const bool is_small_box = get_expanded_box(paramb.rc_radial_max, box, ebox);
++  if (plane_flux_view_.enabled && is_small_box) {
++    PRINT_INPUT_ERROR("compute_interface_shc rejects the NEP small-box expansion path.\n");
++  }
+   if (is_small_box) {
+     // update small_box_data
+     const int current_num_atoms = type.size();
+@@ -1458,7 +1564,8 @@ void NEP::compute_large_box(
+     force_per_atom.data(),
+     force_per_atom.data() + N,
+     force_per_atom.data() + N * 2,
+-    virial_per_atom.data());
++    virial_per_atom.data(),
++    NEPPlaneFluxView{});
+   GPU_CHECK_KERNEL
+ 
+   find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+@@ -1478,7 +1585,8 @@ void NEP::compute_large_box(
+     nep_data.sum_fxyz.data(),
+     nep_data.f12x.data(),
+     nep_data.f12y.data(),
+-    nep_data.f12z.data());
++    nep_data.f12z.data(),
++    NEPPlaneFluxView{});
+   GPU_CHECK_KERNEL
+ 
+   find_properties_many_body(
+@@ -1511,7 +1619,8 @@ void NEP::compute_large_box(
+       force_per_atom.data() + N,
+       force_per_atom.data() + N * 2,
+       virial_per_atom.data(),
+-      potential_per_atom.data());
++      potential_per_atom.data(),
++      NEPPlaneFluxView{});
+     GPU_CHECK_KERNEL
+   }
+ }

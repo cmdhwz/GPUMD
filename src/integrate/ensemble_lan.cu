@@ -213,6 +213,11 @@ double Ensemble_LAN::get_temperature2() const
   return temperature2_;
 }
 
+bool Ensemble_LAN::uses_region_heat_bath() const
+{
+  return use_region;
+}
+
 void Ensemble_LAN::initialize_run(
   const double, Atom& atom, Box&, const std::vector<Group>& group)
 {

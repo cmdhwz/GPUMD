@@ -1,0 +1,7 @@
+potential ../../interface_geometry_m2/potential.txt
+velocity 300 seed 24680
+time_step 0.1
+ensemble nve
+interface_geometry geometry.in shared
+compute_interface_profile 1 2 no profile.out
+run 2

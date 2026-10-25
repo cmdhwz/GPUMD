@@ -1,0 +1,7 @@
+potential ../../../tests_pytest/fixtures/models/nep_C.txt
+velocity 0 seed 24680
+time_step 0.001
+ensemble nve
+interface_geometry geometry.in empty_shared
+compute_interface_shc 1 1 2 2 1 0.5 empty
+run 2

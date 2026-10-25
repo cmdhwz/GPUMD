@@ -47,6 +47,10 @@ The driver class dealing with measurement.
 #include "hac.cuh"
 #include "hnemdec_kappa.cuh"
 #include "hnemd_kappa.cuh"
+#include "interface_dos.cuh"
+#include "interface_geometry.cuh"
+#include "interface_atoms.cuh"
+#include "interface_shc.cuh"
 #include "iron_conductivity.cuh"
 #include "lsqt.cuh"
 #include "modal_analysis.cuh"
@@ -165,6 +169,39 @@ bool Measure::parse_action(
   } else if (tokens[0] == "compute_dos") {
     std::unique_ptr<Action> action;
     action.reset(new DOS(tokens, group));
+    actions_.emplace_back(std::move(action));
+  } else if (tokens[0] == "interface_geometry") {
+    if (interface_geometry_ || tokens.size() != 3) {
+      PRINT_INPUT_ERROR("interface_geometry may be declared once as: interface_geometry <config_file> <output_prefix>.\n");
+    }
+    interface_geometry_ = std::make_shared<InterfaceGeometry>(tokens[1], tokens[2]);
+  } else if (tokens[0] == "compute_interface_profile") {
+    if (!interface_geometry_) {
+      PRINT_INPUT_ERROR("compute_interface_profile requires an earlier interface_geometry command.\n");
+    }
+    std::unique_ptr<Action> action;
+    action.reset(new ComputeChunk(tokens, interface_geometry_));
+    actions_.emplace_back(std::move(action));
+  } else if (tokens[0] == "compute_interface_dos") {
+    if (!interface_geometry_) {
+      PRINT_INPUT_ERROR("compute_interface_dos requires an earlier interface_geometry command.\n");
+    }
+    std::unique_ptr<Action> action;
+    action.reset(new ComputeInterfaceDOS(tokens, interface_geometry_, number_of_types));
+    actions_.emplace_back(std::move(action));
+  } else if (tokens[0] == "compute_interface_shc") {
+    if (!interface_geometry_) {
+      PRINT_INPUT_ERROR("compute_interface_shc requires an earlier interface_geometry command.\n");
+    }
+    std::unique_ptr<Action> action;
+    action.reset(new ComputeInterfaceSHC(tokens, interface_geometry_));
+    actions_.emplace_back(std::move(action));
+  } else if (tokens[0] == "dump_interface_atoms") {
+    if (!interface_geometry_) {
+      PRINT_INPUT_ERROR("dump_interface_atoms requires an earlier interface_geometry command.\n");
+    }
+    std::unique_ptr<Action> action;
+    action.reset(new DumpInterfaceAtoms(tokens, interface_geometry_, atom));
     actions_.emplace_back(std::move(action));
   } else if (tokens[0] == "compute_sdc") {
     std::unique_ptr<Action> action;
@@ -300,17 +337,19 @@ void Measure::pre_run(
   int number_of_modal_methods = 0;
   bool has_deform = false;
   bool has_enhanced_sampling = false;
+  int interface_shc_count = 0;
   for (auto& action : actions_) {
     if (action->action_name == "") {
       printf("Dear developer:\n");
       printf("    Please set the action name you developed.\n");
       exit(1);
     }
-    // dump_xyz, dump_netcdf, compute_chunk, add_force, add_spring, and add_efield are allowed
-    // to be called multiple times; others are not
+    // Windowed interface consumers, dump_xyz, dump_netcdf, compute_chunk, and force additions
+    // are allowed to be called multiple times; other actions are unique within a run.
     if (
       action->action_name != "dump_xyz" && action->action_name != "dump_netcdf" &&
-      action->action_name != "compute_chunk" &&
+      action->action_name != "compute_chunk" && action->action_name != "compute_interface_dos" &&
+      action->action_name != "dump_interface_atoms" &&
       action->action_name != "add_force" && action->action_name != "add_spring" &&
       action->action_name != "add_efield") {
       for (auto& action_name : action_names) {
@@ -337,7 +376,23 @@ void Measure::pre_run(
     if (action->action_name == "enhanced_sampling") {
       has_enhanced_sampling = true;
     }
+    if (action->action_name == "compute_interface_shc") ++interface_shc_count;
     action_names.emplace_back(action->action_name);
+  }
+  if (interface_shc_count > 1) {
+    PRINT_INPUT_ERROR("compute_interface_shc may be used once per run.\n");
+  }
+  if (interface_shc_count) {
+    const char* unsupported[] = {
+      "add_force", "add_spring", "add_efield", "add_random_force", "compute_hnemd",
+      "compute_hnemdec", "compute_hnema", "plumed", "electron_stop", "enhanced_sampling", "active"};
+    for (const auto& action : actions_) {
+      for (const char* name : unsupported) {
+        if (action->action_name == name) {
+          PRINT_INPUT_ERROR("compute_interface_shc rejects external-force or driven-work actions.\n");
+        }
+      }
+    }
   }
   if (has_deform && has_enhanced_sampling) {
     PRINT_INPUT_ERROR("Enhanced sampling V1A does not support box deformation.");
@@ -348,6 +403,17 @@ void Measure::pre_run(
   }
   if (number_of_hnemd_methods > 1) {
     PRINT_INPUT_ERROR("Cannot have more than one HNEMD method within one run.");
+  }
+
+  if (interface_geometry_) {
+    for (const auto& action : actions_) {
+      const ComputeChunk* chunk = dynamic_cast<const ComputeChunk*>(action.get());
+      if (chunk && chunk->uses_legacy_interface_guard()) {
+        PRINT_INPUT_ERROR(
+          "Use compute_interface_profile with shared geometry; do not combine it with the legacy interface guard.\n");
+      }
+    }
+    interface_geometry_->initialize(atom, box, group, integrate);
   }
 
   for (auto& action : actions_) {
@@ -370,6 +436,7 @@ void Measure::setup_force(
   Box& box,
   Force& force)
 {
+  if (interface_geometry_) interface_geometry_->check_box(box);
   for (auto& action : actions_) {
     action->setup_force(time_step, integrate, group, atom, box, force);
   }
@@ -395,6 +462,7 @@ void Measure::post_run(
   }
 
   actions_.clear();
+  interface_geometry_.reset();
 }
 
 void Measure::end_of_step(
@@ -451,6 +519,7 @@ void Measure::pre_force(
   Box& box,
   Force& force)
 {
+  if (interface_geometry_) interface_geometry_->check_box(box);
   for (auto& action : actions_) {
     action->pre_force(step, time_step, integrate, group, atom, box, force);
   }

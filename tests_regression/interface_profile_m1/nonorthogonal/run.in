@@ -1,0 +1,6 @@
+potential potential.txt
+velocity 300 seed 24680
+time_step 0.1
+ensemble nve
+compute_chunk 10 3 bin/1d z lower 40 interface 100 1 2 no interface.out
+run 2

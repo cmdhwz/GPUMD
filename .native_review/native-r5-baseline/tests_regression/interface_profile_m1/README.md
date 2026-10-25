@@ -1,0 +1,3 @@
+# Native M1 profile math regression
+
+`native_profile_math_test.cpp` tests the same host/device per-sample correction and block-accumulation helpers called by the GPU profile kernel. It compares two samples with different COM momenta, variable atom count/DOF, empty and single-atom bins, valid 0 K, wide count sums, sticky error/reset behavior, partial-tail cache sizing, and invalid input handling. From this directory, build with `c++ -std=c++17 -O0 -g native_profile_math_test.cpp -o native_profile_math_test`, then run `./native_profile_math_test` (PowerShell: run the compiler and executable as separate commands).

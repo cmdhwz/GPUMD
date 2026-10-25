@@ -1,0 +1,8 @@
+potential potential.txt
+velocity 300 seed 24680
+time_step 0.1
+fix 0 3
+move 0 4 0.0001 0 0
+ensemble heat_lan 300 300 1 0 1
+interface_geometry geometry.in swapped
+run 1

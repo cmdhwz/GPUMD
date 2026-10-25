@@ -1,0 +1,7 @@
+potential potential.txt
+time_step 0.001
+ensemble nve
+interface_geometry geometry.in atoms_geometry
+dump_xyz 1 baseline.xyz precision double velocity force potential unwrapped_position
+dump_interface_atoms 1 2 0 1 local
+run 3
