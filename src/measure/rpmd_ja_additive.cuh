@@ -128,7 +128,9 @@ inline RpmdJAAdditiveData read_rpmd_ja_additive(
     throw std::runtime_error("raw qNEP gradient length does not match additive dimensions");
   if (source != rpmd_ja_model_fingerprint(raw_path))
     throw std::runtime_error("GPJAADD1 source qNEP raw fingerprint does not match");
-  if (static_cast<std::uint64_t>(n) > static_cast<std::uint64_t>(package_bytes - 80) / sizeof(std::int32_t))
+  const std::streamoff site_blocks_start=in.tellg();
+  if(site_blocks_start<0||site_blocks_start>package_bytes||
+     static_cast<std::uint64_t>(n)>static_cast<std::uint64_t>(package_bytes-site_blocks_start)/sizeof(std::int32_t))
     throw std::runtime_error("GPJAADD1 declared site count exceeds package length");
   RpmdJAAdditiveData out; out.beads = p; out.epsilon = epsilon;
   out.internal_mass_com = version >= 7 ? (use_class & 1) != 0 : version == 2 || version == 4 || version == 6;

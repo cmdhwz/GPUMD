@@ -17,6 +17,8 @@ def test_additive_package_roundtrip_and_rejects_trailing_bytes():
         path = Path(td) / "x.bin"
         old_tmp=path.with_name(path.name+".tmp"); old_tmp.write_bytes(b"keep")
         fit.write_additive(path, data)
+        encoded=path.read_bytes()
+        assert struct.unpack_from("<I",encoded,8)[0]==5 and struct.unpack_from("<i",encoded,80)[0]==len(data["sites"][0]["neighbors"])
         assert old_tmp.read_bytes()==b"keep"
         got = fit.read_additive(path)
         assert got["source_fingerprint"] == data["source_fingerprint"]
@@ -29,6 +31,40 @@ def test_additive_package_roundtrip_and_rejects_trailing_bytes():
             raise AssertionError("existing coefficient package was overwritten")
         path.write_bytes(path.read_bytes() + b"x")
         _raises(lambda: fit.read_additive(path), "trailing")
+
+
+def test_diagnostic_v7_status_roundtrip_and_exact_header_bound():
+    with tempfile.TemporaryDirectory() as td:
+        path=Path(td)/"diagnostic.bin"
+        legacy_v5=_package()
+        with path.open("wb") as output: fit._write_additive_stream(output,legacy_v5)
+        encoded=path.read_bytes()
+        assert struct.unpack_from("<I",encoded,8)[0]==5 and struct.unpack_from("<i",encoded,80)[0]==len(legacy_v5["sites"][0]["neighbors"])
+        assert fit.read_additive(path)["response_status"]=="PASS"
+        path.unlink()
+        for status,response in (("PASS",.05),("FAIL",.2),("INCONCLUSIVE",float("nan")),("NOT_MEASURED",float("nan"))):
+            data=_package();data["diagnostic"]=True;data["internal_mass_com"]=True
+            data["response_status"]=status;data["response_max"]=response;data["response_tolerance"]=.1
+            with path.open("wb") as output: fit._write_additive_stream(output,data)
+            encoded=path.read_bytes()
+            assert struct.unpack_from("<I",encoded,8)[0]==7 and struct.unpack_from("<i",encoded,92)[0]==len(data["sites"][0]["neighbors"])
+            assert fit.read_additive(path)["response_status"]==status
+            path.unlink()
+        legacy=_package();legacy["internal_mass_com"]=True
+        with path.open("wb") as output: fit._write_additive_stream(output,legacy)
+        encoded=path.read_bytes()
+        assert struct.unpack_from("<I",encoded,8)[0]==6 and struct.unpack_from("<i",encoded,80)[0]==len(legacy["sites"][0]["neighbors"])
+        path.unlink()
+        data=_package();data["diagnostic"]=True;data["response_status"]="PASS"
+        data["response_max"]=.2;data["response_tolerance"]=.1
+        with path.open("wb") as output: fit._write_additive_stream(output,data)
+        _raises(lambda:fit.read_additive(path),"response")
+        path.unlink()
+
+        header=fit.ADD_MAGIC+struct.pack("<IIiiQ",7,fit.ENDIAN,2,4,123)
+        header+=struct.pack("<ddddQQ",300.,.01,float("nan"),.1,3,1)+struct.pack("<III",3,1,2)
+        path.write_bytes(header)
+        _raises(lambda:fit.read_additive(path),"dimensions exceed")
 
 
 def test_triclinic_image_alignment_and_time_unwrap():

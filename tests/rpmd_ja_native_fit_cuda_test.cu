@@ -1273,34 +1273,47 @@ void test_native_m1_writer_reader_cross_neighbor_images_and_transport()
   reference.masses=masses;reference.positions=r0;for(int i=0;i<9;++i)reference.cell[i]=box.cpu_h[i];
   const std::vector<double> raw_gradient(d,0.0);
   struct RoundTrip{RpmdJAAdditiveData package;std::vector<NativeAdditiveSiteBlock> blocks;};
-  auto round_trip=[&](const Graph& graph,const char* suffix,const std::uint32_t version){
+  auto round_trip=[&](const Graph& graph,const char* suffix,const std::uint32_t version,const std::uint32_t response_status=1U){
     const std::string path=std::string("rpmd_ja_native_m1_writer_")+suffix+"_"+
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".bin";
     std::vector<NativeAdditiveSiteBlock> blocks;std::uint64_t estimated_bytes=0;
     {
-      std::ofstream out(path,std::ios::binary);assert(out.good());out.write(additive_magic,8);
-      write(out,version);write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(4));
-      write(out,std::uint64_t(0));write(out,300.0);write(out,0.05);write(out,version==7?0.05:0.01);write(out,0.02);
-      write(out,std::uint64_t(1));write(out,std::uint64_t(1));
-      if(version==7){write(out,std::uint32_t(3));write(out,std::uint32_t(1));write(out,std::uint32_t(1));}
-      estimated_bytes=write_native_additive_site_blocks(out,graph,theta,edge_linear,n)+(version==7?3*sizeof(std::uint32_t):0);assert(out.good());
+      std::ofstream out(path,std::ios::binary);assert(out.good());NativeAdditivePackageHeader header;
+      header.version=version;header.number_of_atoms=n;header.beads=4;header.temperature=300.0;header.epsilon=0.05;
+      header.response=version==7?(response_status==0?0.01:response_status==3?std::numeric_limits<double>::quiet_NaN():0.05):0.01;
+      header.response_tolerance=0.02;header.training_frames=1;header.validation_frames=1;
+      if(version==7){header.use_flags=3;header.response_status=response_status;}
+      const NativeAdditivePackageEstimate prefit_estimate=estimate_native_additive_package_size(graph,n,version);
+      estimated_bytes=write_native_additive_package(out,header,graph,theta,edge_linear,n,prefit_estimate.bytes);assert(out.good());
     }
-    const NativeAdditivePackageEstimate prefit_estimate=estimate_native_additive_package_size(graph,n);
-    assert(prefit_estimate.bytes+(version==7?3*sizeof(std::uint32_t):0)>=estimated_bytes&&prefit_estimate.maximum_site_neighbors>0);
+    const NativeAdditivePackageEstimate prefit_estimate=estimate_native_additive_package_size(graph,n,version);
+    assert(prefit_estimate.bytes>=estimated_bytes&&prefit_estimate.maximum_site_neighbors>0);
     std::ifstream sized(path,std::ios::binary|std::ios::ate);assert(sized.good());
     assert(static_cast<std::uint64_t>(sized.tellg())==estimated_bytes);sized.close();
     blocks=build_native_additive_site_blocks(graph,theta,edge_linear,n);
+    {
+      std::ifstream header(path,std::ios::binary);assert(header.good());char magic[8]{};header.read(magic,sizeof(magic));
+      const std::uint32_t written_version=rpmd_ja_additive_read<std::uint32_t>(header);
+      assert(written_version==version);header.seekg(static_cast<std::streamoff>(native_additive_package_header_bytes+
+        (version>=7?native_additive_graph_reference_metadata_bytes:0)));
+      const std::int32_t first_site_count=rpmd_ja_additive_read<std::int32_t>(header);
+      assert(first_site_count==static_cast<std::int32_t>(blocks.front().edges.size()));
+    }
     const RpmdJAAdditiveData package=read_rpmd_ja_additive(path,"test-raw.qraw",reference,4,raw_gradient);
     assert(package.internal_mass_com==(version==6||version==7));
     assert(package.diagnostic==(version==7));
-    if(version==7){assert(package.numerical_status=="PASS"&&package.response_status=="FAIL");}
+    if(version==7){const char* expected_status=response_status==0?"PASS":response_status==1?"FAIL":response_status==2?"INCONCLUSIVE":"NOT_MEASURED";
+      assert(package.numerical_status=="PASS"&&package.response_status==expected_status);}
     assert(std::remove(path.c_str())==0);return RoundTrip{package,std::move(blocks)};
   };
   const RoundTrip one_third=round_trip(third,"third",5);const RoundTrip one_half=round_trip(half,"half",5);
   const RoundTrip internal_com=round_trip(third,"internal_com",6);assert(internal_com.package.internal_mass_com);
-  const RoundTrip diagnostic_com=round_trip(third,"diagnostic_com",7);
+  const RoundTrip diagnostic_com=round_trip(third,"diagnostic_com",7,1);
   assert(diagnostic_com.package.internal_mass_com&&diagnostic_com.package.diagnostic&&
     diagnostic_com.package.numerical_status=="PASS"&&diagnostic_com.package.response_status=="FAIL");
+  assert(round_trip(third,"diagnostic_pass",7,0).package.response_status=="PASS");
+  assert(round_trip(third,"diagnostic_inconclusive",7,2).package.response_status=="INCONCLUSIVE");
+  assert(round_trip(third,"diagnostic_not_measured",7,3).package.response_status=="NOT_MEASURED");
   auto dense=[](const RpmdJASparseRows& sparse){
     const int dimension=static_cast<int>(sparse.offsets.size())-1;std::vector<double> result(static_cast<std::size_t>(dimension)*dimension,0.0);
     for(int row=0;row<dimension;++row)for(std::size_t index=sparse.offsets[row];index<sparse.offsets[row+1];++index)
@@ -1364,6 +1377,77 @@ void test_native_m1_writer_reader_cross_neighbor_images_and_transport()
       nonsymmetric|=std::abs(h_third[static_cast<std::size_t>(row)*d+column]-h_third[static_cast<std::size_t>(column)*d+row])>1e-10;
       gauge_h_changed|=std::abs(h_third[static_cast<std::size_t>(row)*d+column]-h_half[static_cast<std::size_t>(row)*d+column])>1e-10;}}
   assert(nonsymmetric&&gauge_h_changed);
+}
+
+std::vector<std::uint32_t> read_native_package_quadratic_modes(const std::string& path,const int n)
+{
+  std::ifstream in(path,std::ios::binary);assert(in.good());char magic[8]{};in.read(magic,sizeof(magic));
+  const auto version=rpmd_ja_additive_read<std::uint32_t>(in);(void)rpmd_ja_additive_read<std::uint32_t>(in);
+  (void)rpmd_ja_additive_read<std::int32_t>(in);(void)rpmd_ja_additive_read<std::int32_t>(in);
+  (void)rpmd_ja_additive_read<std::uint64_t>(in);for(int i=0;i<4;++i)(void)rpmd_ja_additive_read<double>(in);
+  (void)rpmd_ja_additive_read<std::uint64_t>(in);(void)rpmd_ja_additive_read<std::uint64_t>(in);
+  if(version>=7)for(int i=0;i<3;++i)(void)rpmd_ja_additive_read<std::uint32_t>(in);
+  assert(static_cast<std::uint64_t>(in.tellg())==native_additive_package_header_bytes+
+    (version>=7?native_additive_graph_reference_metadata_bytes:0));
+  std::vector<std::uint32_t> modes;for(int center=0;center<n;++center){
+    const int z=rpmd_ja_additive_read<std::int32_t>(in),q=3*z;assert(z>=0);
+    in.seekg(static_cast<std::streamoff>(16*z+sizeof(double)*q),std::ios::cur);
+    const std::uint32_t mode=rpmd_ja_additive_read<std::uint32_t>(in);modes.push_back(mode);
+    if(mode==0)in.seekg(static_cast<std::streamoff>(sizeof(double)*q*q),std::ios::cur);
+    else{const std::uint64_t count=rpmd_ja_additive_read<std::uint64_t>(in);
+      const std::uint64_t bytes_per_item=mode==1?2*sizeof(std::int32_t)+sizeof(double):2*sizeof(std::int32_t)+9*sizeof(double);
+      assert(mode==1||mode==2);in.seekg(static_cast<std::streamoff>(count*bytes_per_item),std::ios::cur);}
+    assert(in.good());}
+  return modes;
+}
+
+void test_native_additive_package_accounting_modes_and_bounds()
+{
+  const auto serialize=[&](const std::string& name,const Graph& graph,const std::vector<double>& theta,
+    const std::vector<double>& positions,const std::vector<double>& masses,const int n){
+    const std::string path="rpmd_ja_package_accounting_"+name+"_"+
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".bin";RemoveTestFile cleanup{path};
+    const std::vector<std::array<double,3>> edge_linear(graph.edges.size());NativeAdditivePackageHeader header;
+    header.version=7;header.number_of_atoms=n;header.beads=4;header.source_fingerprint=0;
+    header.temperature=300.0;header.epsilon=1e-8;header.response=0.05;header.response_tolerance=0.02;
+    header.training_frames=1;header.validation_frames=1;header.use_flags=3;header.response_status=1;
+    const NativeAdditivePackageEstimate estimate=estimate_native_additive_package_size(graph,n,header.version);
+    std::uint64_t written=0;{std::ofstream out(path,std::ios::binary);assert(out.good());
+      written=write_native_additive_package(out,header,graph,theta,edge_linear,n,estimate.bytes);out.close();assert(out.good());}
+    std::ifstream sized(path,std::ios::binary|std::ios::ate);assert(sized.good());
+    const auto actual=static_cast<std::uint64_t>(sized.tellg());assert(written==actual&&actual<=estimate.bytes);
+    RpmdJAReference reference;reference.number_of_atoms=n;reference.temperature=300.0;reference.masses=masses;reference.positions=positions;
+    reference.cell[0]=reference.cell[4]=reference.cell[8]=10.0;const std::vector<double> gradient(static_cast<std::size_t>(3*n),0.0);
+    const RpmdJAAdditiveData parsed=read_rpmd_ja_additive(path,"test-raw.qraw",reference,4,gradient);
+    assert(parsed.diagnostic&&parsed.internal_mass_com&&parsed.response_status=="FAIL");
+    return std::make_tuple(actual,read_native_package_quadratic_modes(path,n),estimate.bytes);};
+
+  Box box{};box.cpu_h[0]=box.cpu_h[4]=box.cpu_h[8]=10.0;box.cpu_h[9]=box.cpu_h[13]=box.cpu_h[17]=0.1;
+  const std::vector<double> positions2={2.0,4.0,2.0,4.0,2.0,4.0};const std::vector<int> types2={0,0};
+  const Graph dense_graph=make_graph(positions2,types2,box,4.0);std::vector<double> dense_theta(6,0.1);
+  const auto dense=serialize("dense",dense_graph,dense_theta,positions2,{1.0,1.0},2);
+  assert(std::get<0>(dense)==std::get<2>(dense)&&std::get<1>(dense)==std::vector<std::uint32_t>({0,0}));
+
+  const std::vector<double> positions3={2.0,4.0,6.0,2.0,4.0,6.0,2.0,4.0,6.0};const std::vector<int> types3={0,0,0};
+  const Graph chain=make_graph(positions3,types3,box,3.6);assert(chain.sites[1].size()==2);
+  const auto zeros=serialize("zero",chain,std::vector<double>(6,0.0),positions3,{1.0,1.0,1.0},3);
+  assert(std::get<0>(zeros)<=std::get<2>(zeros)&&std::get<1>(zeros)[1]==1);
+  const auto signed_zeros=serialize("signed_zero",chain,std::vector<double>(6,-0.0),positions3,{1.0,1.0,1.0},3);
+  assert(std::get<0>(signed_zeros)==std::get<2>(signed_zeros)&&std::get<1>(signed_zeros)[1]==2);
+  std::vector<double> sparse_theta(6,0.0);sparse_theta[0]=0.2;
+  const auto scalar=serialize("scalar",chain,sparse_theta,positions3,{1.0,1.0,1.0},3);
+  assert(std::get<0>(scalar)<=std::get<2>(scalar)&&std::get<1>(scalar)[1]==1);
+  const auto blocks=serialize("blocks",chain,std::vector<double>(6,0.1),positions3,{1.0,1.0,1.0},3);
+  assert(std::get<0>(blocks)==std::get<2>(blocks)&&std::get<1>(blocks)[1]==2);
+
+  std::ostringstream rejected;NativeAdditivePackageHeader header;header.version=7;header.number_of_atoms=2;header.beads=4;
+  header.temperature=300.0;header.epsilon=1e-8;header.response=0.05;header.response_tolerance=0.02;
+  header.training_frames=1;header.validation_frames=1;header.use_flags=3;header.response_status=1;
+  const auto exact=estimate_native_additive_package_size(dense_graph,2,7);bool bad_bound_rejected=false;
+  try{(void)write_native_additive_package(rejected,header,dense_graph,dense_theta,
+      std::vector<std::array<double,3>>(dense_graph.edges.size()),2,exact.bytes-1);}
+  catch(const std::runtime_error& error){bad_bound_rejected=std::string(error.what()).find("conservative support bound")!=std::string::npos;}
+  assert(bad_bound_rejected);
 }
 
 Graph make_two_atom_covariance_graph()
@@ -6540,6 +6624,7 @@ int main(int argc,char** argv)
   test_m1_bridge_images_share_hydrogen_anchored_branch();
   test_fixed_physical_response_probes_are_frozen_and_ranked();
   test_native_m1_writer_reader_cross_neighbor_images_and_transport();
+  test_native_additive_package_accounting_modes_and_bounds();
   test_covariance_trace_wide_solve_matches_cpu_and_filters_failed_tail();
   test_covariance_gemm_original_residual_matches_cpu();
   test_covariance_strict_residual_failure_updates_overall_worst();

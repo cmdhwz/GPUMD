@@ -4612,6 +4612,9 @@ struct CovarianceFitTestHooks
   bool fail_after_prepare_publication=false;
   bool fail_between_reference_and_sidecar_renames=false;
   bool fail_graph_reference_response_hard=false;
+  bool fail_graph_reference_package_write=false;
+  bool fail_graph_reference_prepare=false;
+  bool fail_graph_reference_readback=false;
   bool skip_graph_reference_mode_validator=false;
   std::uint64_t objective_evaluation_budget_after_baseline=0;
   std::vector<double> current_trial_theta,last_residual_rejected_theta;
@@ -6635,7 +6638,9 @@ GraphReferenceBaselineCandidate read_graph_reference_baseline_candidate(const st
     if(!(row>>value)||(row>>extra))throw std::runtime_error(std::string("GRAPH_REFERENCE_BASELINE_STATE_IDENTITY_FAIL: invalid ")+key);return value;};
   auto matches=[](const double a,const double b){return std::isfinite(a)&&std::isfinite(b)&&
     std::abs(a-b)<=1e-12*std::max({1.0,std::abs(a),std::abs(b)});};
-  if(integer("state_format_version")!=4||required("fit_method")!="gaussian_covariance_shrinkage"||
+  const std::string fit_method=required("fit_method");
+  if(integer("state_format_version")!=4||
+     (fit_method!="gaussian_covariance_shrinkage"&&fit_method!="independent_one_parameter_graph_baseline")||
      !matches(scalar("cutoff_A"),options.cutoff)||!matches(scalar("epsilon"),options.epsilon)||
      !matches(scalar("fd_step"),options.fd_step)||!matches(scalar("temperature_K"),header.temperature)||
      integer("internal_mass_com")!=(options.internal_mass_com?1:0)||integer("sample_frames")!=static_cast<long long>(frame_count)||
@@ -9168,6 +9173,28 @@ struct NativeAdditiveSiteBlock
 
 constexpr std::uint64_t native_additive_package_header_bytes=sizeof(additive_magic)+2*sizeof(std::uint32_t)+
   2*sizeof(std::int32_t)+sizeof(std::uint64_t)+4*sizeof(double)+2*sizeof(std::uint64_t);
+constexpr std::uint64_t native_additive_graph_reference_metadata_bytes=3*sizeof(std::uint32_t);
+
+struct NativeAdditivePackageHeader
+{
+  std::uint32_t version=5;
+  std::int32_t number_of_atoms=0,beads=0;
+  std::uint64_t source_fingerprint=0;
+  double temperature=0.0,epsilon=0.0,response=0.0,response_tolerance=0.0;
+  std::uint64_t training_frames=0,validation_frames=0;
+  std::uint32_t use_flags=0,response_status=0;
+};
+
+void write_native_additive_package_header(std::ostream& out,const NativeAdditivePackageHeader& header)
+{
+  if(header.version<5||header.version>7||header.number_of_atoms<=0||header.beads<=0)
+    throw std::invalid_argument("native additive package header dimensions or version are invalid");
+  out.write(additive_magic,8);write(out,header.version);write(out,native_endian);write(out,header.number_of_atoms);
+  write(out,header.beads);write(out,header.source_fingerprint);write(out,header.temperature);write(out,header.epsilon);
+  write(out,header.response);write(out,header.response_tolerance);write(out,header.training_frames);write(out,header.validation_frames);
+  if(header.version>=7){write(out,header.use_flags);write(out,std::uint32_t(1));write(out,header.response_status);}
+  if(!out)throw std::runtime_error("failed writing native additive package header");
+}
 
 template<typename Emit>
 std::uint64_t stream_native_additive_site_blocks(const Graph& graph,const std::vector<double>& theta,
@@ -9292,14 +9319,16 @@ std::uint64_t stream_native_additive_site_blocks(const Graph& graph,const std::v
 
 struct NativeAdditivePackageEstimate{std::uint64_t bytes=0;std::size_t maximum_site_neighbors=0;};
 
-NativeAdditivePackageEstimate estimate_native_additive_package_size(const Graph& graph,const int n)
+NativeAdditivePackageEstimate estimate_native_additive_package_size(const Graph& graph,const int n,const int version=5)
 {
+  if(version<5||version>7)throw std::invalid_argument("native additive package estimate version is invalid");
   const std::size_t parameter_count=static_cast<std::size_t>(has_m1_local_basis(graph)?graph.parameter_count:graph.base_parameter_count);
   std::vector<double> zero_theta(parameter_count,0.0);
   std::vector<std::array<double,3>> zero_edge_linear(graph.edges.size());
   NativeAdditivePackageEstimate estimate;
   estimate.bytes=stream_native_additive_site_blocks(graph,zero_theta,zero_edge_linear,n,
     [](const int,const NativeAdditiveSiteBlock&){},true,&estimate.maximum_site_neighbors);
+  if(version>=7)estimate.bytes+=native_additive_graph_reference_metadata_bytes;
   return estimate;
 }
 
@@ -9316,6 +9345,8 @@ std::vector<NativeAdditiveSiteBlock> build_native_additive_site_blocks(const Gra
 std::uint64_t write_native_additive_site_blocks(std::ostream& out,const Graph& graph,const std::vector<double>& theta,
   const std::vector<std::array<double,3>>& edge_linear,const int n)
 {
+  const std::streampos start=out.tellp();
+  if(start<0)throw std::runtime_error("native additive package writer could not determine its starting offset");
   const std::uint64_t upper_bound=stream_native_additive_site_blocks(graph,theta,edge_linear,n,
     [&](const int,const NativeAdditiveSiteBlock& block){
     write(out,std::int32_t(block.edges.size()));for(const SiteEdge& edge:block.edges){write(out,std::int32_t(edge.j));
@@ -9350,9 +9381,34 @@ std::uint64_t write_native_additive_site_blocks(std::ostream& out,const Graph& g
     }
   });
   const std::streampos end=out.tellp();
-  if(end<0||static_cast<std::uint64_t>(end)>upper_bound)
+  if(end<start||upper_bound<native_additive_package_header_bytes||
+     static_cast<std::uint64_t>(end-start)>upper_bound-native_additive_package_header_bytes)
     throw std::runtime_error("native additive package writer exceeded the conservative support bound");
   return static_cast<std::uint64_t>(end);
+}
+
+std::uint64_t write_native_additive_package(std::ostream& out,const NativeAdditivePackageHeader& header,
+  const Graph& graph,const std::vector<double>& theta,const std::vector<std::array<double,3>>& edge_linear,
+  const int n,const std::uint64_t conservative_upper_bound)
+{
+  const std::streampos start=out.tellp();
+  if(start!=std::streampos(0))throw std::runtime_error("native additive package must start at byte offset zero");
+  write_native_additive_package_header(out,header);
+  const std::uint64_t estimated=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);
+  const std::streampos end=out.tellp();
+  if(end<0||static_cast<std::uint64_t>(end)!=estimated){
+    std::ostringstream detail;detail<<"native additive package size estimate does not match bytes written: expected "<<estimated
+      <<" actual "<<(end<0?std::string("UNAVAILABLE"):std::to_string(static_cast<std::uint64_t>(end)))
+      <<" header_bytes "<<(native_additive_package_header_bytes+
+        (header.version>=7?native_additive_graph_reference_metadata_bytes:0))<<" header_offset 0";
+    throw std::runtime_error(detail.str());}
+  if(estimated>conservative_upper_bound){
+    std::ostringstream detail;detail<<"actual additive package bytes "<<estimated
+      <<" exceed conservative support bound "<<conservative_upper_bound<<" header_bytes "
+      <<(native_additive_package_header_bytes+
+        (header.version>=7?native_additive_graph_reference_metadata_bytes:0))<<" header_offset 0";
+    throw std::runtime_error(detail.str());}
+  return estimated;
 }
 
 std::array<double,4> verify_native_additive_package_entries(const RpmdJAAdditiveData& package,const Graph& graph,
@@ -11032,7 +11088,8 @@ std::string covariance_graph_content_sha256(const Graph& graph)
 void write_covariance_state(const std::string& path,const CovarianceFitResult& fit,const double rho,
   const std::string& samples,const std::string& raw,const RpmdJANativeFitOptions& options,const SampleHeader& header,
   const QrawIdentity& identity,const Graph& graph,const std::uint64_t frame_count,const std::uint64_t training_frames,
-  const double ridge_lambda=std::numeric_limits<double>::quiet_NaN(),const bool outer_resume_supported=false)
+  const double ridge_lambda=std::numeric_limits<double>::quiet_NaN(),const bool outer_resume_supported=false,
+  const std::string& graph_response_status="",const std::string& graph_pipeline_stage="")
 {
   auto write_vector=[](std::ostream& stream,const char* key,const std::vector<double>& values){stream<<'\n'<<key<<' '<<values.size();for(double value:values)stream<<' '<<value;};
   auto write_integer_vector=[](std::ostream& stream,const char* key,const std::vector<int>& values){stream<<'\n'<<key<<' '<<values.size();for(int value:values)stream<<' '<<value;};
@@ -11053,7 +11110,8 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
       <<'\n'<<prefix<<"_worst_original_batch_start "<<diagnostic.worst_original_batch_start
       <<'\n'<<prefix<<"_worst_original_batch_columns "<<diagnostic.worst_original_batch_columns
       <<'\n'<<prefix<<"_original_residual_checked "<<(diagnostic.original_residual_checked?1:0);};
-  std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja Gaussian covariance shrinkage state\nstate_format_version 4\nfit_method gaussian_covariance_shrinkage\nstatus "<<fit.status
+  std::ostringstream out;out<<std::setprecision(17)<<"rpmd_ja "<<(options.graph_reference?"graph-reference numerical state":"Gaussian covariance shrinkage state")
+    <<"\nstate_format_version 4\nfit_method "<<(options.graph_reference?"independent_one_parameter_graph_baseline":"gaussian_covariance_shrinkage")<<"\nstatus "<<fit.status
     <<"\nreason "<<fit.reason<<"\nsamples "<<std::quoted(samples)<<"\nqraw "<<std::quoted(raw)<<"\nshrinkage_strength "<<rho
     <<"\nfit_trace_path "<<std::quoted(options.output_path+".fit_trace.txt")
     <<"\ncutoff_A "<<options.cutoff<<"\nepsilon "<<options.epsilon<<"\nfd_step "<<options.fd_step<<"\ntemperature_K "<<header.temperature
@@ -11233,6 +11291,10 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\nfeasibility_budget_exact_gradients "<<fit.feasibility_budget_exact_gradients
     <<"\nfeasibility_budget_status "<<fit.feasibility_budget_status
     <<"\nanalytic_curvature_spectral_floor "<<fit.analytic_curvature_model_floor;
+  if(options.graph_reference)out<<"\ngraph_reference_response_status_at_snapshot "
+    <<std::quoted(graph_response_status.empty()?std::string("NOT_MEASURED"):graph_response_status)
+    <<"\ngraph_reference_pipeline_stage_at_snapshot "
+    <<std::quoted(graph_pipeline_stage.empty()?std::string("NUMERICAL_SNAPSHOT"):graph_pipeline_stage);
   if(graph.parameter_count>graph.base_parameter_count){
     out<<"\nM1_base_parameter_count "<<graph.base_parameter_count<<"\nM1_raw_local_parameter_count "<<graph.raw_local_parameter_count
       <<"\nM1_parameter_count "<<graph.parameter_count<<"\nM1_operator_map_entry_count "<<graph.m1.operator_map_entry_count
@@ -11255,6 +11317,14 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
   }
   write_trace_diagnostic(out,"failed_d_trace",fit.failed_d_trace);write_trace_diagnostic(out,"failed_shifted_trace",fit.failed_shifted_trace);out<<'\n';
   write_text_exclusive(path,out.str(),"covariance optimizer state");
+}
+
+void append_graph_reference_state_event(const std::string& path,const char* key,const std::string& value)
+{
+  rpmd_ja_file_io::ofstream out(path,std::ios::out|std::ios::app);
+  if(!out)throw std::runtime_error("cannot append graph-reference numerical state event: "+path);
+  out<<key<<' '<<std::quoted(value)<<'\n';out.close();
+  if(!out)throw std::runtime_error("failed appending graph-reference numerical state event: "+path);
 }
 
 std::map<std::string,std::string> read_feasibility_manifest(const std::string& path)
@@ -12606,11 +12676,11 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     estimate_rpmd_ja_qnep_v3_max_serialized_bytes(qnep_size_metadata);
   if(estimated_qnep_reference_bytes>static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
     throw std::runtime_error("NATIVE_FIT_RESOURCE_PREFLIGHT_FAIL: qNEP v3 maximum file size exceeds stream-offset limits");
-  const NativeAdditivePackageEstimate package_estimate_m0=estimate_native_additive_package_size(graph,n);
+  const int additive_package_version=options.graph_reference?7:(options.internal_mass_com?6:5);
+  const NativeAdditivePackageEstimate package_estimate_m0=estimate_native_additive_package_size(graph,n,additive_package_version);
   const NativeAdditivePackageEstimate package_estimate_m1=options.covariance_feasibility?
-    estimate_native_additive_package_size(structured_graph,n):package_estimate_m0;
-  const std::uint64_t estimated_package_bytes=std::max(package_estimate_m0.bytes,package_estimate_m1.bytes)+
-    (options.graph_reference?3*sizeof(std::uint32_t):0);
+    estimate_native_additive_package_size(structured_graph,n,additive_package_version):package_estimate_m0;
+  const std::uint64_t estimated_package_bytes=std::max(package_estimate_m0.bytes,package_estimate_m1.bytes);
   const std::size_t estimated_package_max_neighbors=std::max(package_estimate_m0.maximum_site_neighbors,
     package_estimate_m1.maximum_site_neighbors);
   covariance_budget_observe_or_throw(budget,budget?&feasibility_limits:nullptr);
@@ -12949,7 +13019,10 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(!trace)throw std::runtime_error("failed writing native fit unconstrained training diagnostic: "+trace_path);}
   bool fit_converged=false;ResponseCheck response;
   std::string graph_response_status="NOT_MEASURED";
+  std::string graph_reference_pipeline_stage="NUMERICAL_FIT";
+  bool graph_reference_snapshot_ready=false;
   bool graph_reference_readback_verified=false;
+  bool graph_reference_trace_closed=false;
   std::string graph_prepared_mechanical_policy;
   CovarianceFitResult covariance_fit;double covariance_baseline_force_residual=std::numeric_limits<double>::quiet_NaN();
   double training_force_residual=std::numeric_limits<double>::quiet_NaN(),force_fit_cost_increase=std::numeric_limits<double>::quiet_NaN();
@@ -14465,6 +14538,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     trace<<"FEASIBILITY_BLIND status RESTORED_BLIND_PASSED response "<<response.response
       <<" no_reselection 1 response_snapshot "<<std::quoted(options.output_path+".blind_checkpoint.txt")<<'\n';trace.flush();}
   }
+  try{
   if(covariance_method&&!options.covariance_feasibility){
     std::vector<std::vector<double>> training_block_statistics;
     std::vector<std::uint64_t> training_block_frames;
@@ -14494,6 +14568,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         covariance_fit.theta_start=covariance_fit.theta_baseline;
         covariance_fit.theta=covariance_fit.theta_baseline;
         covariance_fit.baseline_mu=covariance_fit.covariance_baseline.mu;
+        covariance_fit.epsilon_constraint_status=covariance_fit.covariance_baseline.epsilon_constraint_active?"ACTIVE":"INACTIVE";
         covariance_fit.status="GRAPH_BASELINE_PASS";
         covariance_fit.reason="independent one-parameter fixed-R0 graph reference";
         covariance_fit.converged=true;
@@ -14577,6 +14652,15 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     if(!covariance_fit.converged){write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
       throw std::runtime_error(covariance_fit.reason.empty()?(options.graph_reference?"GRAPH_REFERENCE_NUMERICAL_FAIL: inspect fit trace":"COVARIANCE_OPTIMIZER_FAILED: inspect covariance state"):covariance_fit.reason);}
     theta=covariance_fit.theta;
+    if(options.graph_reference){
+      graph_reference_pipeline_stage="RESPONSE_VALIDATION";
+      write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,
+        qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train),std::numeric_limits<double>::quiet_NaN(),false,
+        "NOT_MEASURED",graph_reference_pipeline_stage);
+      graph_reference_snapshot_ready=true;
+      trace<<"GRAPH_REFERENCE_POSTSOLVE_SNAPSHOT status NUMERICAL_PASS state "<<std::quoted(covariance_state_path)
+        <<" baseline_mu "<<covariance_fit.baseline_mu<<" parameters "<<covariance_fit.theta_baseline.size()<<'\n';trace.flush();
+    }
     if(!options.graph_reference)trace<<"COVARIANCE_OPTIMIZER_CONVERGED scaled_kkt_residual "<<covariance_fit.scaled_kkt_residual
       <<" barrier_tau "<<covariance_fit.barrier_tau<<" barrier_center_condition_status PASS barrier_gap_estimate "<<covariance_fit.barrier_gap_estimate
       <<" objective_data "<<covariance_fit.objective_data<<" objective_prior "<<covariance_fit.objective_prior
@@ -14650,6 +14734,12 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         cusolverDnDestroy(response_solver);throw;}}
     }
     if(response_solver)cusolverDnDestroy(response_solver);
+    if(options.graph_reference){
+      graph_reference_pipeline_stage="POSTSOLVE_STATE";
+      append_graph_reference_state_event(covariance_state_path,"graph_reference_response_status",graph_response_status);
+      graph_reference_pipeline_stage="POSTSOLVE_PREFLIGHT";
+      append_graph_reference_state_event(covariance_state_path,"graph_reference_pipeline_stage_after_response","POSTSOLVE_PREFLIGHT");
+    }
     if(standalone_development_candidate){
       trace<<"FEASIBILITY_ENDPOINT status DEVELOPMENT_CANDIDATE production_reference 0 reason INDEPENDENT_BLIND_GATE_REQUIRED resume_supported 0\n";trace.flush();
       write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,
@@ -14818,26 +14908,25 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   observe_prepare_budget("before_package_write");
   verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint);
   {
+    if(options.graph_reference)graph_reference_pipeline_stage="PACKAGE_WRITE";
     FeasibilityStageTimer package_write_timer(trace,"PACKAGE_WRITE",
       stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::PACKAGE_WRITE));
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+    if(options.graph_reference&&covariance_fit_test_hooks.fail_graph_reference_package_write){
+      covariance_fit_test_hooks.fail_graph_reference_package_write=false;
+      throw std::runtime_error("TEST_GRAPH_REFERENCE_PACKAGE_WRITE_FAILURE");}
+#endif
     rpmd_ja_file_io::ofstream out(pack_path,std::ios::binary|std::ios::trunc);if(!out)throw std::runtime_error("cannot create native additive package");own_scratch.pack_owned=true;
-    out.write(additive_magic,8);write(out,std::uint32_t(options.graph_reference?7:(options.internal_mass_com?6:5)));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(header.beads));write(out,raw_source_fingerprint);
-    write(out,options.temperature);write(out,options.epsilon);
     const double package_response=std::isfinite(response.response)?response.response:std::numeric_limits<double>::quiet_NaN();
-    write(out,package_response);write(out,options.response_tolerance);write(out,std::uint64_t(train));write(out,std::uint64_t(validation));
-    if(options.graph_reference){
-      const std::uint32_t use_flags=2U|(options.internal_mass_com?1U:0U);
-      const std::uint32_t response_code=graph_response_status=="PASS"?0U:graph_response_status=="FAIL"?1U:
-        graph_response_status=="INCONCLUSIVE"?2U:3U;
-      write(out,use_flags);write(out,std::uint32_t(1));write(out,response_code);
-    }
-    estimated=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);
-    if(options.graph_reference)estimated+=3*sizeof(std::uint32_t);
-    const std::streamoff actual_bytes=out.tellp();
-    if(actual_bytes<0||static_cast<std::uint64_t>(actual_bytes)!=estimated)
-      throw std::runtime_error("native additive package size estimate does not match bytes written");
-    if(estimated>estimated_package_bytes)
-      throw std::runtime_error("actual additive package bytes exceed the conservative support bound");
+    NativeAdditivePackageHeader package_header;package_header.version=static_cast<std::uint32_t>(additive_package_version);
+    package_header.number_of_atoms=n;package_header.beads=header.beads;package_header.source_fingerprint=raw_source_fingerprint;
+    package_header.temperature=options.temperature;package_header.epsilon=options.epsilon;
+    package_header.response=package_response;package_header.response_tolerance=options.response_tolerance;
+    package_header.training_frames=static_cast<std::uint64_t>(train);package_header.validation_frames=static_cast<std::uint64_t>(validation);
+    if(options.graph_reference){package_header.use_flags=2U|(options.internal_mass_com?1U:0U);
+      package_header.response_status=graph_response_status=="PASS"?0U:graph_response_status=="FAIL"?1U:
+        graph_response_status=="INCONCLUSIVE"?2U:3U;}
+    estimated=write_native_additive_package(out,package_header,graph,theta,edge_linear,n,estimated_package_bytes);
     out.close();if(!out)throw std::runtime_error("failed closing native additive package");
     package_write_timer.complete();
   }
@@ -14868,6 +14957,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   observe_prepare_budget("before_prepare");
   const auto same_identity_value=[](const double left,const double right){return std::isfinite(left)&&std::isfinite(right)&&
     std::abs(left-right)<=1e-10*std::max({1.0,std::abs(left),std::abs(right)});};
+  if(options.graph_reference)graph_reference_pipeline_stage="PREPARE";
   {
   FeasibilityStageTimer prepare_stage_timer(trace,"PREPARE",
     stage_cost_recorder(rpmd_ja_feasibility::ResourceStage::PREPARE));
@@ -14879,6 +14969,11 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   prepare_mode_validator=make_rpmd_ja_qnep_mode_validator(atom,box,force);
 #endif
   try{const auto prepare=[&](){
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+    if(options.graph_reference&&covariance_fit_test_hooks.fail_graph_reference_prepare){
+      covariance_fit_test_hooks.fail_graph_reference_prepare=false;
+      throw std::runtime_error("TEST_GRAPH_REFERENCE_PREPARE_FAILURE");}
+#endif
     prepare_rpmd_ja_qnep_reference(raw_path,prepared_reference_path,options.kernel_table,
       prepare_mode_validator,pack_path,verify_package_entries,
       [&](const RpmdJAPrepareResourcePlan& plan){
@@ -14900,6 +14995,12 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       },
       [&](const RpmdJAReference& readback){
         if(!options.graph_reference)return;
+        graph_reference_pipeline_stage="READBACK";
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+        if(covariance_fit_test_hooks.fail_graph_reference_readback){
+          covariance_fit_test_hooks.fail_graph_reference_readback=false;
+          throw std::runtime_error("TEST_GRAPH_REFERENCE_READBACK_FAILURE");}
+#endif
         std::ostringstream expected_policy;
         expected_policy<<"native_reference_transport;"<<(options.internal_mass_com?"internal_mass_com_pullback_v1;":"")
           <<"finite_temperature_additive_v1;beads="<<header.beads<<";derivative="<<rawver
@@ -14947,6 +15048,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
   }
   prepare_stage_timer.complete();
   }
+  if(options.graph_reference)graph_reference_pipeline_stage="READBACK";
   if(options.graph_reference&&!graph_reference_readback_verified)
     throw std::runtime_error("GRAPH_REFERENCE_READBACK_FAIL: prepare returned without verifying the stored diagnostic identity");
   if(stage_cost_record_failure)
@@ -15024,6 +15126,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     controller_journal.published_sidecar_sha256=controller_journal.publication_stage_sidecar_sha256;
     persist_publication_controller_journal();
   }
+  if(options.graph_reference)graph_reference_pipeline_stage="FINALIZE";
   if(budget)trace<<"MEASURED_FINALIZATION_COST prepare_package_prepare_readback_seconds "
     <<feasibility_budget.phase_seconds[rpmd_ja_feasibility::phase_index(rpmd_ja_feasibility::Phase::PREPARE)]
     <<" exact_gradients "<<feasibility_budget.exact_gradients
@@ -15217,11 +15320,14 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     <<" response_IBP_DIAGNOSTIC="<<response.ibp_band.status<<" recovery_witnesses="<<saved_recovery_witness_paths.size();
   if(!saved_recovery_witness_paths.empty())trace<<" replay_samples="<<std::quoted(spool_path)<<" replay_qraw="<<std::quoted(raw_path);
   trace<<'\n';for(const std::string& path:saved_recovery_witness_paths)trace<<"CG_RECOVERY_WITNESS "<<std::quoted(path)<<'\n';
-   trace.flush();trace.close();if(!trace)throw std::runtime_error("failed finalizing native fit trace: "+trace_path);
+   trace.flush();trace.close();graph_reference_trace_closed=true;
+   if(!trace)throw std::runtime_error("failed finalizing native fit trace: "+trace_path);
    if(options.covariance_feasibility){
      controller_journal.published_trace_sha256=fit_input_content_identity(trace_path,true).sha256;
      controller_journal.selection_state="PUBLISHED";controller_journal.operation_in_progress=false;
      persist_publication_controller_journal();}
+   if(options.graph_reference)
+     append_graph_reference_state_event(covariance_state_path,"graph_reference_pipeline_complete","PASS");
    own_scratch.output_owned=false;own_scratch.sidecar_owned=false;own_scratch.output_tmp_owned=false;
    own_scratch.sidecar_tmp_owned=false;own_scratch.fit_owned=false;
   if(options.graph_reference)
@@ -15232,6 +15338,31 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
       sample_statistics.ibp_band.status.c_str(),response.ibp_band.status.c_str());
   if(!saved_recovery_witness_paths.empty())std::printf("    rpmd_ja fit retained CG replay inputs: samples=%s qraw=%s; witnesses=%zu\n",spool_path.c_str(),raw_path.c_str(),saved_recovery_witness_paths.size());
   return !saved_recovery_witness_paths.empty();
+  }catch(const std::exception& error){
+    if(!options.graph_reference||graph_reference_pipeline_stage=="NUMERICAL_FIT")throw;
+    std::string state_error;
+    if(graph_reference_snapshot_ready)try{
+        append_graph_reference_state_event(covariance_state_path,"graph_reference_pipeline_failure_stage",graph_reference_pipeline_stage);
+        append_graph_reference_state_event(covariance_state_path,"graph_reference_pipeline_failure_reason",error.what());
+      }catch(const std::exception& save_error){state_error=save_error.what();}
+    try{
+      if(graph_reference_trace_closed){
+        rpmd_ja_file_io::ofstream failure_trace(trace_path,std::ios::out|std::ios::app);
+        if(failure_trace){failure_trace<<"GRAPH_REFERENCE_POSTSOLVE_FAIL stage "<<graph_reference_pipeline_stage
+          <<" reason "<<std::quoted(error.what());
+          if(!state_error.empty())failure_trace<<" state_snapshot_append_failure "<<std::quoted(state_error);
+          failure_trace<<'\n';failure_trace.flush();}
+      }else{
+        trace<<"GRAPH_REFERENCE_POSTSOLVE_FAIL stage "<<graph_reference_pipeline_stage
+          <<" reason "<<std::quoted(error.what());
+        if(!state_error.empty())trace<<" state_snapshot_append_failure "<<std::quoted(state_error);
+        trace<<'\n';trace.flush();
+      }
+    }catch(...){}
+    std::ostringstream detail;detail<<"GRAPH_REFERENCE_POSTSOLVE_FAIL stage="<<graph_reference_pipeline_stage
+      <<" reason="<<error.what();if(!state_error.empty())detail<<" state_snapshot_append_failure="<<state_error;
+    throw std::runtime_error(detail.str());
+  }
 }
 
 bool retryable_publication_io_failure(const std::string& detail)

@@ -261,7 +261,7 @@ def read_additive(path):
         if _exact(f,8)!=ADD_MAGIC: raise ValueError("wrong GPJAADD1 magic")
         version,endian,n,p,fp=struct.unpack("<IIiiQ",_exact(f,24))
         if version not in (1,2,3,4,5,6,7) or endian != ENDIAN: raise ValueError("unsupported additive package version")
-        if n < 2 or p < 1 or n > (size-80)//4:
+        if n < 2 or p < 1:
             raise ValueError("GPJAADD1 dimensions exceed the declared package length")
         temp,eps,rmax,rtol,ntrain,nval=struct.unpack("<ddddQQ",_exact(f,48))
         if version >= 7:
@@ -271,12 +271,21 @@ def read_additive(path):
             diagnostic=True
             internal_mass_com=bool(use_flags & 1)
             response_status=("PASS","FAIL","INCONCLUSIVE","NOT_MEASURED")[response_code]
+            if not np.isfinite(rtol) or rtol < 0 or np.isinf(rmax) or \
+               (response_code == 0 and (not np.isfinite(rmax) or rmax < 0 or rmax > rtol)) or \
+               (response_code == 1 and (not np.isfinite(rmax) or rmax < 0)) or \
+               (response_code in (2,3) and np.isfinite(rmax) and rmax < 0) or \
+               (response_code == 3 and np.isfinite(rmax)) or \
+               (not (use_flags & 2) and response_code != 0):
+                raise ValueError("invalid GPJAADD1 numerical, response, or use identity")
         else:
             diagnostic=False
             internal_mass_com=version in (2,4,6)
             response_status="PASS"
         if version < 7 and (not np.isfinite(rmax) or rmax < 0 or not np.isfinite(rtol) or rtol < rmax):
             raise ValueError("invalid legacy GPJAADD1 response metadata")
+        if n > (size-f.tell())//4:
+            raise ValueError("GPJAADD1 dimensions exceed the declared package length")
         sites=[]
         expanded_elements = 0
         for i in range(n):

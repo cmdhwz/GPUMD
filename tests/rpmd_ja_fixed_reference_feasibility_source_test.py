@@ -316,7 +316,7 @@ for key, present in (
         "if(integration_smoke){run_additive(base,1);run_additive(base+\"_internal_com\",2);run_additive(base+\"_diagnostic\",7);return 0;}" in source("tests/rpmd_ja_qnep_prepare_cuda_test.cu")),
     ("integration smoke passes actual M1 writer output through real prepare", (ROOT / "tests/rpmd_ja_fit_prepare_integration_cuda_test.cu").is_file() and
         "GPUMD_RPMD_JA_NATIVE_FIT_TEST_REAL_PREPARE" in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
-        "write_native_additive_site_blocks(out,graph,theta,edge_linear,n)" in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
+        "write_native_additive_package(out,package_header,graph,theta,edge_linear,n," in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
         "prepare_rpmd_ja_qnep_reference(raw,output_path,kernel,{},pack,[&]" in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
         "verify_native_additive_package_entries(parsed,graph,theta,positions,box,n)" in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
         "injected independent package-entry callback failure" in source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu") and
@@ -583,13 +583,18 @@ assert 'count>q*q' in offline_prepare and 'entry_bytes>size-f.tell()' in offline
 assert "MAX_ADDITIVE_DENSE_ELEMENTS = _FITTER.MAX_ADDITIVE_DENSE_ELEMENTS" in offline_prepare
 assert "read_sparse_scalars" in additive_reader and "std::signbit(value)" in additive_reader
 assert "if(value!=0.0||std::signbit(value))" in fit
-assert "std::uint32_t(options.graph_reference?7:(options.internal_mass_com?6:5))" in fit
+assert "const int additive_package_version=options.graph_reference?7:(options.internal_mass_com?6:5)" in fit
+assert "estimate_native_additive_package_size(graph,n,additive_package_version)" in fit
+assert "write_native_additive_package(out,package_header,graph,theta,edge_linear,n,estimated_package_bytes)" in fit
+assert "end-start" in fit and "native_additive_graph_reference_metadata_bytes" in fit
 assert "publication_payload_restored?0:estimated_package_bytes" in fit
 assert "publication_payload_restored?0:\n    estimated_qnep_reference_bytes+qnep_sidecar_and_failure_reserve_bytes" in fit
 assert '<<" publication_payload_restored "<<(publication_payload_restored?1:0)' in fit
 assert "support_entries_upper_bound" in fit and "quadratic_bytes" not in fit[fit.index("NativeAdditivePackageEstimate estimate_native_additive_package_size("):fit.index("#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST", fit.index("NativeAdditivePackageEstimate estimate_native_additive_package_size("))]
-assert "actual additive package bytes exceed the conservative support bound" in fit
-assert "prefit_estimate.bytes+(version==7?3*sizeof(std::uint32_t):0)>=estimated_bytes" in cuda_test
+assert "exceed conservative support bound" in fit
+assert "prefit_estimate.bytes>=estimated_bytes" in cuda_test
+assert "site_blocks_start=in.tellg()" in additive_reader
+assert "if n > (size-f.tell())//4" in offline_fitter
 assert "write_sparse_package(3)" in source("tests/rpmd_ja_additive_sparse_test.cpp")
 assert "write_sparse_package(4)" in source("tests/rpmd_ja_additive_sparse_test.cpp")
 assert "#undef NDEBUG" in source("tests/rpmd_ja_additive_sparse_test.cpp")
@@ -598,7 +603,17 @@ assert "bad_index_rejected" in source("tests/rpmd_ja_additive_sparse_test.cpp")
 assert "truncated_rejected" in source("tests/rpmd_ja_additive_sparse_test.cpp")
 assert "actual M1 version-6 package byte count differs from writer estimate" in integration_test
 assert "source_fnv64=0" in fit and "verify_frozen_fit_input_fingerprints(raw_path,options.kernel_table,raw_source_fingerprint,kernel_source_fingerprint)" in fit
-assert "write(out,raw_source_fingerprint)" in fit and "qraw_source_fnv64 \"<<identity.source_fnv64" in fit
+assert "package_header.source_fingerprint=raw_source_fingerprint" in fit and "qraw_source_fnv64 \"<<identity.source_fnv64" in fit
+graph_snapshot = fit.index('graph_reference_pipeline_stage="RESPONSE_VALIDATION";')
+graph_state_write = fit.index("write_covariance_state(covariance_state_path,covariance_fit", graph_snapshot)
+graph_snapshot_ready = fit.index("graph_reference_snapshot_ready=true;", graph_state_write)
+graph_failure_state = fit.index("if(graph_reference_snapshot_ready)try{", graph_snapshot_ready)
+assert graph_state_write < graph_snapshot_ready < graph_failure_state
+assert '<<std::quoted(graph_pipeline_stage.empty()?std::string("NUMERICAL_SNAPSHOT"):graph_pipeline_stage)' in fit
+assert "out<<key<<' '<<std::quoted(value)<<'\\n';" in fit
+assert "append_graph_reference_state_event(covariance_state_path,\"graph_reference_pipeline_complete\",\"PASS\")" in fit
+assert fit.index("append_graph_reference_state_event(covariance_state_path,\"graph_reference_pipeline_complete\"") > fit.index("trace.close();graph_reference_trace_closed=true;")
+assert "rpmd_ja_file_io::ofstream failure_trace(trace_path,std::ios::out|std::ios::app)" in fit
 assert "covariance_a0_soft_mode_theta(a0)" in fit and "test_a0_soft_modes_use_covariance_baseline_point" in cuda_test
 assert "line.back()=='\\r'" in fit and "test_feasibility_manifest_parser_accepts_lf_and_crlf" in cuda_test
 assert "offline feasibility run.in must end with its rpmd_ja fit_samples_covariance command" in source("scripts/rpmd_ja_feasibility_preflight.py")

@@ -109,11 +109,17 @@ void test_graph_reference_samples_to_diagnostic_prepare_and_hard_failure()
     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
   const std::string samples=write_graph_reference_samples(stem+".samples",120),raw=stem+".qraw",kernel=stem+".kernel";
   const std::string output=stem+".ja",reuse_output=stem+".reuse.ja",bad_state_output=stem+".badstate.ja",
-    state=stem+".covariance_state.txt",bad_state=stem+".bad.covariance_state.txt",hard_output=stem+".hard.ja";
+    state=output+".covariance_state.txt",bad_state=stem+".bad.covariance_state.txt",legacy_state=stem+".legacy.covariance_state.txt",
+    legacy_output=stem+".legacy.ja",hard_output=stem+".hard.ja";
   IntegrationCleanup cleanup{{samples,raw,kernel,output,output+".fit.txt",output+".fit_trace.txt",output+".fit.lock",
-    output+".additive.tmp",reuse_output,reuse_output+".fit.txt",reuse_output+".fit_trace.txt",reuse_output+".fit.lock",
-    reuse_output+".additive.tmp",bad_state_output,bad_state_output+".fit_trace.txt",bad_state_output+".fit.lock",
-    bad_state,state,hard_output,hard_output+".failure.txt",hard_output+".fit_trace.txt",hard_output+".fit.lock",
+    output+".additive.tmp",state,output+".failure.txt",output+".stability",reuse_output,reuse_output+".fit.txt",reuse_output+".fit_trace.txt",reuse_output+".fit.lock",
+    reuse_output+".additive.tmp",reuse_output+".covariance_state.txt",reuse_output+".failure.txt",reuse_output+".stability",
+    reuse_output+".tmp",reuse_output+".stability.tmp",bad_state_output,bad_state_output+".fit_trace.txt",bad_state_output+".fit.lock",
+    bad_state,bad_state_output+".covariance_state.txt",bad_state_output+".failure.txt",legacy_state,legacy_output,legacy_output+".fit.txt",
+    legacy_output+".fit_trace.txt",legacy_output+".fit.lock",legacy_output+".additive.tmp",legacy_output+".covariance_state.txt",
+    legacy_output+".failure.txt",legacy_output+".stability",legacy_output+".tmp",legacy_output+".stability.tmp",
+    hard_output,hard_output+".failure.txt",hard_output+".fit_trace.txt",hard_output+".fit.lock",
+    hard_output+".covariance_state.txt",hard_output+".stability",
     hard_output+".additive.tmp"}};
   const std::vector<double> masses={1.0,1.07};const std::vector<int> types={0,0};
   make_input(raw,kernel,2,0.5,3,-1.0,0.0,-1,false,&masses,&types);patch_graph_reference_raw_geometry(raw);
@@ -146,7 +152,7 @@ void test_graph_reference_samples_to_diagnostic_prepare_and_hard_failure()
      trace.find("COVARIANCE_OPTIMIZER_CONVERGED")!=std::string::npos||
      fit.find("mechanical_policy "+prepared.mechanical_policy)==std::string::npos)
     throw std::runtime_error("graph-reference trace or fit report is inconsistent with the prepared diagnostic readback");
-
+  const std::string numerical_state=read_test_file(state);
   double baseline_mu=0.0;std::vector<double> baseline_theta;
   {
     std::istringstream fit_lines(fit);std::string line;
@@ -156,18 +162,36 @@ void test_graph_reference_samples_to_diagnostic_prepare_and_hard_failure()
         baseline_theta.resize(count);for(double& value:baseline_theta)if(!(values>>value)||!std::isfinite(value))throw std::runtime_error("graph-reference fit report has truncated baseline_theta");}
     }
   }
-  std::ifstream sample_input(samples,std::ios::binary);const SampleHeader saved_header=read_header(sample_input,120,atom,box,300.0,true,true);
-  std::vector<double> saved_r0(6,0.0);read_training_r0(sample_input,saved_header,120,2.0,saved_r0);
-  RpmdJANativeFitOptions state_options=options;state_options.output_path=output;state_options.temperature=300.0;state_options.sample_interval=2;
-  covariance_fit_test_allow_qraw_fixture_identity=true;
-  rpmd_ja_file_io::ifstream raw_input(raw,std::ios::binary);QrawIdentity saved_identity=validate_qraw_identity(raw_input,state_options,saved_header,saved_r0,box,force);
-  saved_identity.source_fnv64=rpmd_ja_model_fingerprint(raw);
-  covariance_fit_test_allow_qraw_fixture_identity=false;
-  Graph saved_graph=make_graph(saved_r0,saved_header.types,box,state_options.cutoff);
-  CovarianceFitResult old_fit;old_fit.status="MAX_ITERATIONS";old_fit.reason="budget exhausted; baseline candidate only";
-  old_fit.statistics.resize(static_cast<std::size_t>(saved_graph.parameter_count));old_fit.baseline_mu=baseline_mu;
-  old_fit.epsilon_constraint_status="ACTIVE";old_fit.theta_baseline=baseline_theta;old_fit.theta=baseline_theta;
-  write_covariance_state(state,old_fit,0.0,samples,raw,state_options,saved_header,saved_identity,saved_graph,120,80);
+  if(numerical_state.find("fit_method independent_one_parameter_graph_baseline\n")==std::string::npos||
+     numerical_state.find("graph_reference_pipeline_stage_at_snapshot \"RESPONSE_VALIDATION\"")==std::string::npos||
+     numerical_state.find("graph_reference_response_status \""+response+"\"")==std::string::npos||
+     numerical_state.find("graph_reference_pipeline_complete \"PASS\"")==std::string::npos||
+     numerical_state.find("factorizations ")==std::string::npos||numerical_state.find("solve_rhs_columns ")==std::string::npos)
+    throw std::runtime_error("graph-reference numerical checkpoint omitted its response, solver counts, or snapshot stage");
+  auto state_field=[](const std::string& contents,const std::string& key){
+    const std::string prefix=key+" ";const std::size_t start=contents.find(prefix);
+    if(start==std::string::npos)throw std::runtime_error("graph-reference state is missing "+key);
+    const std::size_t end=contents.find('\n',start);return contents.substr(start+prefix.size(),end-start-prefix.size());};
+  double checkpoint_mu=0.0;{std::istringstream value(state_field(numerical_state,"baseline_mu"));
+    if(!(value>>checkpoint_mu)||!std::isfinite(checkpoint_mu))throw std::runtime_error("graph-reference checkpoint baseline_mu is not finite");}
+  {std::istringstream values(state_field(numerical_state,"theta_baseline"));std::size_t count=0;
+    if(!(values>>count)||count!=baseline_theta.size())throw std::runtime_error("graph-reference checkpoint theta dimensions differ");
+    for(std::size_t i=0;i<count;++i){double value=0.0;if(!(values>>value)||!std::isfinite(value))
+      throw std::runtime_error("graph-reference checkpoint theta is non-finite or truncated");
+      if(std::abs(value-baseline_theta[i])>1e-12*std::max({1.0,std::abs(value),std::abs(baseline_theta[i])}))
+        throw std::runtime_error("graph-reference checkpoint theta differs from the published scalar fit");}}
+  if(std::abs(checkpoint_mu-baseline_mu)>1e-12*std::max({1.0,std::abs(checkpoint_mu),std::abs(baseline_mu)}))
+    throw std::runtime_error("graph-reference checkpoint baseline_mu differs from the published scalar fit");
+  if(state_field(numerical_state,"qraw_source_fnv64")!=std::to_string(rpmd_ja_model_fingerprint(raw))||
+     state_field(numerical_state,"samples_source_fnv64")!=std::to_string(rpmd_ja_model_fingerprint(samples)))
+    throw std::runtime_error("graph-reference checkpoint source fingerprints differ from the frozen inputs");
+  auto state_count=[&](const std::string& contents,const std::string& key){
+    std::istringstream value(state_field(contents,key));std::uint64_t count=0;std::string extra;
+    if(!(value>>count)||(value>>extra))throw std::runtime_error("graph-reference state has invalid "+key);return count;};
+  const std::uint64_t baseline_factorizations=state_count(numerical_state,"factorizations");
+  const std::uint64_t baseline_rhs_columns=state_count(numerical_state,"solve_rhs_columns");
+  if(!baseline_factorizations||!baseline_rhs_columns)
+    throw std::runtime_error("graph-reference numerical checkpoint lost its completed factor/solve counters");
   std::string corrupted_state=read_test_file(state);const std::string config_field="qraw_config_fingerprint ";
   const std::size_t config_at=corrupted_state.find(config_field);
   if(config_at==std::string::npos)throw std::runtime_error("saved baseline fixture has no qraw config identity");
@@ -191,6 +215,46 @@ void test_graph_reference_samples_to_diagnostic_prepare_and_hard_failure()
      reuse_trace.find("optimizer_60_parameter_run=0")==std::string::npos)
     throw std::runtime_error("graph-reference baseline_state candidate was not reused after its fresh numerical check");
 
+  std::string legacy_state_bytes=numerical_state;
+  const std::string method_row="fit_method independent_one_parameter_graph_baseline";
+  const std::size_t method_at=legacy_state_bytes.find(method_row);
+  const std::string constraint_key="baseline_epsilon_constraint_status ";
+  if(method_at==std::string::npos)
+    throw std::runtime_error("graph-reference checkpoint cannot seed the legacy ACTIVE candidate fixture");
+  legacy_state_bytes.replace(method_at,method_row.size(),"fit_method gaussian_covariance_shrinkage");
+  const std::size_t constraint_at=legacy_state_bytes.find(constraint_key);
+  if(constraint_at==std::string::npos)
+    throw std::runtime_error("graph-reference checkpoint has no constraint status for the legacy ACTIVE fixture");
+  const std::size_t constraint_end=legacy_state_bytes.find('\n',constraint_at);
+  if(constraint_end==std::string::npos)
+    throw std::runtime_error("graph-reference checkpoint constraint status has no following row");
+  const std::size_t next_line_start=constraint_end+1;
+  const std::size_t next_line_end=legacy_state_bytes.find('\n',next_line_start);
+  const std::string following_row=legacy_state_bytes.substr(next_line_start,next_line_end-next_line_start);
+  legacy_state_bytes.replace(constraint_at,constraint_end-constraint_at,constraint_key+"ACTIVE");
+  const std::size_t legacy_constraint_at=legacy_state_bytes.find(constraint_key);
+  const std::size_t legacy_constraint_end=legacy_state_bytes.find('\n',legacy_constraint_at);
+  const std::size_t legacy_next_start=legacy_constraint_end+1;
+  const std::size_t legacy_next_end=legacy_state_bytes.find('\n',legacy_next_start);
+  if(legacy_constraint_at==std::string::npos||legacy_constraint_end==std::string::npos||
+     state_field(legacy_state_bytes,"fit_method")!="gaussian_covariance_shrinkage"||
+     state_field(legacy_state_bytes,"baseline_epsilon_constraint_status")!="ACTIVE"||
+     legacy_state_bytes.substr(legacy_next_start,legacy_next_end-legacy_next_start)!=following_row)
+    throw std::runtime_error("legacy ACTIVE fixture row conversion changed an unrelated checkpoint row");
+  for(const char* key:{"samples","qraw","qraw_model_fingerprint","qraw_config_fingerprint",
+      "qraw_source_fnv64","samples_source_fnv64","baseline_mu","theta_baseline"})
+    if(state_field(legacy_state_bytes,key)!=state_field(numerical_state,key))
+      throw std::runtime_error(std::string("legacy ACTIVE fixture changed checkpoint field ")+key);
+  {std::ofstream legacy(legacy_state,std::ios::binary|std::ios::trunc);legacy<<legacy_state_bytes;
+    if(!legacy)throw std::runtime_error("cannot write legacy ACTIVE covariance candidate fixture");}
+  options.output_path=legacy_output;options.baseline_state_path=legacy_state;covariance_fit_test_allow_qraw_fixture_identity=true;
+  covariance_fit_test_hooks.skip_graph_reference_mode_validator=true;
+  fit_rpmd_ja_native_reference_from_samples(options,samples,atom,box,force);
+  covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=false;
+  const std::string legacy_trace=read_test_file(legacy_output+".fit_trace.txt");
+  if(legacy_trace.find("stationarity_status SAVED_BASELINE_FREE_ROOT_VERIFIED")==std::string::npos)
+    throw std::runtime_error("legacy gaussian_covariance_shrinkage ACTIVE candidate was not accepted after fresh numerical verification");
+
   options.output_path=hard_output;covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=true;
   covariance_fit_test_hooks.skip_graph_reference_mode_validator=true;
   options.baseline_state_path.clear();
@@ -200,6 +264,61 @@ void test_graph_reference_samples_to_diagnostic_prepare_and_hard_failure()
   covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=false;
   if(!hard_error||exists(hard_output)||exists(hard_output+".stability")||exists(hard_output+".additive.tmp"))
     throw std::runtime_error("hard response failure was swallowed or published a graph-reference package");
+  const std::string hard_state=read_test_file(hard_output+".covariance_state.txt");
+  if(hard_state.find("graph_reference_pipeline_failure_stage \"RESPONSE_VALIDATION\"")==std::string::npos||
+     hard_state.find("TEST_GRAPH_REFERENCE_RESPONSE_HARD_FAILURE")==std::string::npos||
+     read_test_file(hard_output+".failure.txt").find("stage=RESPONSE_VALIDATION")==std::string::npos)
+    throw std::runtime_error("hard graph-response failure did not retain a staged scalar checkpoint");
+
+  const std::uint64_t raw_before=rpmd_ja_model_fingerprint(raw),samples_before=rpmd_ja_model_fingerprint(samples);
+  auto verify_postsolve_failure=[&](const std::string& suffix,const std::string& stage,const std::string& reason){
+    const std::string failed_output=stem+"."+suffix+".ja";
+    cleanup.paths.insert(cleanup.paths.end(),{failed_output,failed_output+".stability",failed_output+".fit.txt",
+      failed_output+".fit_trace.txt",failed_output+".fit.lock",failed_output+".additive.tmp",
+      failed_output+".covariance_state.txt",failed_output+".failure.txt"});
+    options.output_path=failed_output;options.baseline_state_path.clear();covariance_fit_test_hooks={};
+    covariance_fit_test_hooks.skip_graph_reference_mode_validator=true;
+    if(stage=="PACKAGE_WRITE")covariance_fit_test_hooks.fail_graph_reference_package_write=true;
+    else if(stage=="PREPARE")covariance_fit_test_hooks.fail_graph_reference_prepare=true;
+    else if(stage=="READBACK")covariance_fit_test_hooks.fail_graph_reference_readback=true;
+    covariance_fit_test_allow_qraw_fixture_identity=true;bool failed=false;
+    try{fit_rpmd_ja_native_reference_from_samples(options,samples,atom,box,force);}
+    catch(const std::runtime_error& error){const std::string detail=error.what();
+      failed=detail.find("stage="+stage)!=std::string::npos&&detail.find(reason)!=std::string::npos;}
+    covariance_fit_test_hooks={};covariance_fit_test_allow_qraw_fixture_identity=false;
+    if(!failed||exists(failed_output)||exists(failed_output+".stability")||exists(failed_output+".additive.tmp"))
+      throw std::runtime_error("injected graph-reference "+stage+" failure was swallowed or left a published/partial artifact");
+    const std::string failed_state=read_test_file(failed_output+".covariance_state.txt");
+    if(failed_state.find("graph_reference_pipeline_failure_stage \""+stage+"\"")==std::string::npos||
+       failed_state.find("graph_reference_pipeline_failure_reason \""+reason+"\"")==std::string::npos||
+       failed_state.find("qraw_source_fnv64 "+std::to_string(raw_before))==std::string::npos||
+       failed_state.find("samples_source_fnv64 "+std::to_string(samples_before))==std::string::npos||
+       failed_state.find("factorizations ")==std::string::npos||failed_state.find("solve_rhs_columns ")==std::string::npos||
+       state_count(failed_state,"factorizations")!=baseline_factorizations||
+       state_count(failed_state,"solve_rhs_columns")!=baseline_rhs_columns)
+      throw std::runtime_error("injected graph-reference failure did not retain its numerical identity and solver counts");
+    if(failed_state.find("graph_reference_pipeline_complete ")!=std::string::npos)
+      throw std::runtime_error("failed graph-reference pipeline incorrectly retained a completion event");
+    const std::string failed_trace=read_test_file(failed_output+".fit_trace.txt"),failure=read_test_file(failed_output+".failure.txt");
+    if(failed_trace.find("GRAPH_REFERENCE_POSTSOLVE_FAIL stage "+stage)==std::string::npos||
+       failed_trace.find(reason)==std::string::npos||failure.find("stage="+stage)==std::string::npos||failure.find(reason)==std::string::npos)
+      throw std::runtime_error("graph-reference fit trace and failure record disagree about the failed pipeline stage");
+    double mu=0.0;std::istringstream mu_row(state_field(failed_state,"baseline_mu"));
+    if(!(mu_row>>mu)||!std::isfinite(mu))throw std::runtime_error("failed graph-reference checkpoint lost its finite baseline_mu");
+    if(std::abs(mu-baseline_mu)>1e-12*std::max({1.0,std::abs(mu),std::abs(baseline_mu)}))
+      throw std::runtime_error("failed graph-reference checkpoint baseline_mu differs from the successful scalar fit");
+    std::istringstream theta_row(state_field(failed_state,"theta_baseline"));std::size_t count=0;
+    if(!(theta_row>>count)||count==0||count!=baseline_theta.size())throw std::runtime_error("failed graph-reference checkpoint lost its baseline theta");
+    for(std::size_t i=0;i<count;++i){double value=0.0;if(!(theta_row>>value)||!std::isfinite(value))
+      throw std::runtime_error("failed graph-reference checkpoint theta is non-finite or truncated");
+      if(std::abs(value-baseline_theta[i])>1e-12*std::max({1.0,std::abs(value),std::abs(baseline_theta[i])}))
+        throw std::runtime_error("failed graph-reference checkpoint theta differs from the successful scalar fit");}
+    if(rpmd_ja_model_fingerprint(raw)!=raw_before||rpmd_ja_model_fingerprint(samples)!=samples_before)
+      throw std::runtime_error("graph-reference pipeline failure modified its raw or sample input");
+  };
+  verify_postsolve_failure("package_write_failure","PACKAGE_WRITE","TEST_GRAPH_REFERENCE_PACKAGE_WRITE_FAILURE");
+  verify_postsolve_failure("prepare_failure","PREPARE","TEST_GRAPH_REFERENCE_PREPARE_FAILURE");
+  verify_postsolve_failure("readback_failure","READBACK","TEST_GRAPH_REFERENCE_READBACK_FAILURE");
 }
 
 void test_frozen_fit_input_fingerprints_reject_mutation()
@@ -427,10 +546,12 @@ void run_actual_m1_writer_prepare_readback(const std::string& base)
   std::uint64_t estimated_package_bytes=0;
   {
     std::ofstream out(pack,std::ios::binary);if(!out)throw std::runtime_error("cannot create actual M1 integration package");
-    out.write(additive_magic,8);write(out,std::uint32_t(6));write(out,native_endian);write(out,std::int32_t(n));write(out,std::int32_t(8));
-    write(out,rpmd_ja_model_fingerprint(raw));write(out,300.0);write(out,1.0e-8);write(out,0.0);write(out,0.02);
-    write(out,std::uint64_t(1));write(out,std::uint64_t(1));
-    estimated_package_bytes=write_native_additive_site_blocks(out,graph,theta,edge_linear,n);
+    NativeAdditivePackageHeader package_header;package_header.version=6;package_header.number_of_atoms=n;package_header.beads=8;
+    package_header.source_fingerprint=rpmd_ja_model_fingerprint(raw);package_header.temperature=300.0;
+    package_header.epsilon=1.0e-8;package_header.response=0.0;package_header.response_tolerance=0.02;
+    package_header.training_frames=1;package_header.validation_frames=1;
+    estimated_package_bytes=write_native_additive_package(out,package_header,graph,theta,edge_linear,n,
+      estimate_native_additive_package_size(graph,n,6).bytes);
     out.close();if(!out)throw std::runtime_error("failed closing actual M1 integration package");
   }
   std::ifstream sized(pack,std::ios::binary|std::ios::ate);
