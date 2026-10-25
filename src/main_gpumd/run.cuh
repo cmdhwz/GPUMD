@@ -79,6 +79,7 @@ private:
   int replicate_size_[3] = {1, 1, 1};
   std::string first_potential_filename_;
   double global_time = 0.0; // run time of entire simulation (fs)
+  unsigned run_ordinal_ = 0;
   double time_step = 1.0 / TIME_UNIT_CONVERSION;
   double max_distance_per_step = -1.0;
   bool hac_current_option_seen_ = false;

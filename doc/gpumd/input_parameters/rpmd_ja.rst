@@ -16,6 +16,7 @@ Syntax
   rpmd_ja generate_sparse <reference_file> <temperature_K> <fd_step> <kernel_table>
   rpmd_ja on <reference_file>
   rpmd_ja off
+  rpmd_ja sample <basename> <sample_interval>
 
 ``generate`` writes a dense reference from the current atom structure and the active single short-range NEP potential. ``generate_sparse`` uses a Chebyshev kernel table. For ordinary NEP, it writes sparse dynamical and site-gradient operators that must be rebound and checked with ``tools/rpmd_ja_sparse_check.py``. For qNEP charge mode 1 or 2 with PPPM, it directly writes the final v3 block reference and its stability sidecar. The table exporter supplies an analytic interpolation bound and a numerically checked arithmetic reserve; these are reported as approximation error budgets. Place either command after ``potential`` and before any ``ensemble`` or ``run`` command. Sparse runs report per-operator nonzero counts and GPU workspace bytes. They stop with an input error when that workspace does not fit; no dense fallback is attempted.
 
@@ -52,6 +53,32 @@ With an equilibrated self-describing ``restart_beads.xyz``, use this measurement
   rpmd_ja on ja_reference.bin
   compute_hac 5 1000 1 1
   run 10000
+
+WPE supports ``rpmd_ja on`` with a previously generated native NEP/qNEP
+reference when the WPE model and mechanical settings match its identity. Keep
+the actual WPE ``potential``, ``kspace``, and ``pppm_mesh_spacing`` commands in
+the measurement input. For WPE centroid HAC, GPUMD evaluates one private native
+centroid observer per sample while WPE computes physical bead forces. Reference
+generation, reference preparation, and graph fitting remain native GPUMD
+operations; WPE measurement does not replace those workflows.
+WPE qNEP measurement checks the active run-stage PPPM method and mesh spacing
+against the private observer and selected reference. A stage, atom-count, or
+bead-count identity that cannot be verified is rejected before sampling.
+
+``rpmd_ja sample`` also works with WPE in fixed-cell canonical PIMD when the
+active model is qNEP charge mode 1 or 2 with PPPM and no DFTD3 correction. The
+active WPE stage and model file are checked before sampling. It records the
+centroid structure and mean physical force across all beads after the physical
+bead-force calculation. For example::
+
+  rpmd_ja sample train 20
+
+This writes ``train.samples.tmp`` and its ``.provenance.json`` sidecar. The
+sidecar marks the WPE build backend and records the model-file SHA-256, run-input
+fingerprint, WPE stage configuration fingerprint, and the sampled force source.
+WPE ``rpmd_ja fit`` remains unavailable because it constructs a native
+reference; use the separately generated native reference with ``rpmd_ja on``
+instead.
 
 Without a bead restart, first run a separate PIMD equilibration input with ``dump_pimd_restart`` to create ``restart_beads.xyz``; then start the measurement input above. Do not begin the RPMD measurement directly from the centroid-only ``model.xyz`` state.
 
@@ -613,6 +640,17 @@ For an end-to-end qNEP JA acceptance run, provide one GPUMD executable, a relaxe
   python tests/rpmd_ja_qnep_end_to_end_test.py --gpumd /path/to/gpumd --model-xyz /path/to/model.xyz --qnep-model /path/to/nep.txt --kernel-table /path/to/ja_kernel.tbl --temperature 300
 
 The script asks GPUMD to write the final v3 reference and sidecar directly, initializes a fixed-seed bead restart with a short PIMD run, and runs the same short standard-RPMD case with ``rpmd_ja off`` and ``rpmd_ja on``. It compares centroid current/HAC, the sampled 18-column ``thermo.out`` including the total-energy drift :math:`K+U`, and final bead restart; it also checks finite three-direction J_A data, :math:`J_A=J_{cent}+\Delta J`, and reconstructs every reported JA HAC lag from all four centroid/correction and cross terms. Each production run reads a separately named copy of the seed restart and must write a fresh final restart at the requested final step. The generated short restart is for software acceptance, not equilibration or production transport. No zero-correction reference is synthesized. CUDA executables are required; this end-to-end run has not been run in this environment.
+
+Add ``--wpe-gpumd /path/to/gpumd-wpe`` to run the same reference and RPMD
+inputs through WPE as well. The extended check compares native and WPE sampled
+centroid/JA currents and HAC data, confirms that enabling JA leaves each
+backend's bead trajectory unchanged, and runs ``rpmd_ja sample`` under
+canonical PIMD to compare sampled centroid positions and mean physical bead
+forces, and to check the provenance sidecar. The sample inputs set the same
+``velocity ... seed`` before loading the bead restart; loading the restart
+replaces those temporary velocities, while the seed fixes the PIMD thermostat
+random stream initialized for that run. This requires both working CUDA
+executables and has not been run in this environment.
 
 The production CUDA fixture exercises the actual sparse workspace and v3 block GPU matvecs (dense and low-rank tiles, partial tiles, multiple vectors, and workspace reinitialization), asymmetric directional operators, signed P/Q coefficients, nonuniform masses, translation projection, zero-rank correction, multi-cell private wrapping, and non-finite error latching including sparse SpMV overflow. It does not exercise the enclosing HAC sample synchronization or the fixed-reference branch tracker. Run it where CUDA is available with::
 

@@ -91,6 +91,9 @@ Run simulation according to the inputs in the run.in file.
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
 #include "utilities/run_input.cuh"
+#ifdef GPUMD_WPE_ENABLED
+#include "wisevolve_potential_api.h"
+#endif
 #include "velocity.cuh"
 #include <algorithm>
 #include <chrono>
@@ -98,6 +101,7 @@ Run simulation according to the inputs in the run.in file.
 #include <climits>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <string>
 
 #include <cmath>
@@ -297,6 +301,7 @@ void Run::compute_force()
 
 void Run::perform_a_run(const int number_of_steps)
 {
+  const unsigned current_run_ordinal = run_ordinal_++;
 
   HAC* centroid_force_hac = nullptr;
   QuantumHeatMoments* quantum_heat_moments = nullptr;
@@ -313,6 +318,8 @@ void Run::perform_a_run(const int number_of_steps)
     }
   }
   if (rpmd_ja_fit != nullptr) {
+    rpmd_ja_fit->set_run_ordinal(current_run_ordinal);
+    const bool sample_only = rpmd_ja_fit->sample_only();
     if (rpmd_ja_enabled_) PRINT_INPUT_ERROR("rpmd_ja fit cannot run in the same segment as rpmd_ja on.");
     if (max_distance_per_step > 0.0) {
       PRINT_INPUT_ERROR("rpmd_ja fit requires a fixed integration time step; adaptive max_distance_per_step is unsupported.");
@@ -320,6 +327,34 @@ void Run::perform_a_run(const int number_of_steps)
     if (force.get_number_of_potentials() != 1) {
       PRINT_INPUT_ERROR("rpmd_ja fit requires exactly one supported qNEP potential.");
     }
+#ifdef GPUMD_WPE_ENABLED
+    if (!sample_only) {
+      PRINT_INPUT_ERROR("WPE supports rpmd_ja sample only; native fit/reference construction is unavailable.");
+    }
+    const Force::WpeStageSnapshot& stage = force.get_wpe_stage_snapshot();
+    if (!stage.valid || stage.stage_kind != WPE_STAGE_RUN ||
+        stage.number_of_atoms != atom.number_of_atoms ||
+        stage.pimd_beads != integrate.get_number_of_beads() ||
+        integrate.get_type() != EnsembleType::PIMD ||
+        (stage.facts & WPE_STAGE_PIMD_ECO_CONFIGURATION) != 0) {
+      PRINT_INPUT_ERROR("WPE rpmd_ja sample requires a verifiable canonical PIMD run stage.");
+    }
+    const double stage_pppm_spacing = stage.qnep_pppm_spacing == 0.0 ? 1.0 : stage.qnep_pppm_spacing;
+    if (stage.qnep_kspace_method != WPE_QNEP_KSPACE_PPPM ||
+        !std::isfinite(stage_pppm_spacing) || stage_pppm_spacing < 0.2 || stage_pppm_spacing > 2.0 ||
+        stage.dftd3_enabled != 0) {
+      PRINT_INPUT_ERROR("WPE rpmd_ja sample requires an identifiable qNEP PPPM stage without DFTD3.");
+    }
+    const std::string model_path = get_first_potential_filename(force.get_run_input());
+    std::ifstream model_file(model_path);
+    std::string model_type;
+    model_file >> model_type;
+    if (!model_file ||
+        (model_type != "nep4_charge1" && model_type != "nep4_zbl_charge1" &&
+         model_type != "nep4_charge2" && model_type != "nep4_zbl_charge2")) {
+      PRINT_INPUT_ERROR("WPE rpmd_ja sample requires a readable charge1 or charge2 qNEP model file.");
+    }
+#else
     auto* active_qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
     if (active_qnep == nullptr ||
         (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) ||
@@ -332,13 +367,16 @@ void Run::perform_a_run(const int number_of_steps)
       const std::string message = std::string("rpmd_ja fit cannot use the current qNEP configuration: ") + error.what();
       PRINT_INPUT_ERROR(message.c_str());
     }
+#endif
     for (const auto& action : actions) {
       if (action.get() == rpmd_ja_fit) continue;
       const std::string& name = action->action_name;
       if (action->modifies_force() || name == "compute_hnemd" || name == "compute_hnemdec" ||
           name == "compute_hnema" || name == "plumed" || name == "deform" ||
           name == "compute_es" || name == "active" || name == "dump_observer") {
-        const std::string error = "rpmd_ja fit does not support external drive/action " + name + ".";
+        const std::string operation = sample_only ? "sample" : "fit";
+        const std::string error =
+          "rpmd_ja " + operation + " does not support external drive/action " + name + ".";
         PRINT_INPUT_ERROR(error.c_str());
       }
     }

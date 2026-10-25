@@ -29,12 +29,18 @@ Calculate the heat current autocorrelation (HAC) function.
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include "utilities/run_input.cuh"
+#ifdef GPUMD_WPE_ENABLED
+#include "wisevolve_potential_api.h"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,8 +115,10 @@ void HAC::pre_run(
     centroid_direct_evaluations_ = 0;
     centroid_force_step_ = -1;
     centroid_qnep_observer_.reset();
+    rpmd_ja_nep_.reset();
 #ifdef GPUMD_WPE_ENABLED
     wpe_centroid_observer_.reset();
+    wpe_centroid_model_path_.clear();
 #endif
     int number_of_frames = number_of_steps / sample_interval;
     if (number_of_frames <= 0 || Nc > number_of_frames) {
@@ -333,36 +341,78 @@ void HAC::pre_run(
         }
       }
 #ifdef GPUMD_WPE_ENABLED
-      if (is_ring_polymer_run && !rpmd_ja_enabled_) {
+      if (is_ring_polymer_run) {
         if (split_qnep_heat_by_type_ != 0) {
           PRINT_INPUT_ERROR("WPE PIMD centroid HAC does not support split_qnep_heat_by_type.");
         }
         const std::string model_path = get_first_potential_filename(force.get_run_input());
+        wpe_centroid_model_path_ = model_path;
+        const Force::WpeStageSnapshot& stage = force.get_wpe_stage_snapshot();
+        if (!stage.valid || stage.stage_kind != WPE_STAGE_RUN ||
+            stage.number_of_atoms != atom.number_of_atoms ||
+            stage.pimd_beads != atom.number_of_beads || stage.dftd3_enabled > 1) {
+          PRINT_INPUT_ERROR("WPE centroid HAC cannot verify the active run-stage configuration.");
+        }
         std::ifstream model_file(model_path);
         std::string model_type;
         model_file >> model_type;
         if (!model_file) {
           PRINT_INPUT_ERROR("Cannot read the WPE PIMD centroid observer model file.");
         }
-        if (
+        const bool qnep_model =
           model_type == "nep4_charge1" || model_type == "nep4_zbl_charge1" ||
-          model_type == "nep4_charge2" || model_type == "nep4_zbl_charge2") {
+          model_type == "nep4_charge2" || model_type == "nep4_zbl_charge2";
+        if (!qnep_model && model_type != "nep4" && model_type != "nep4_zbl") {
+          const std::string error =
+            "WPE PIMD centroid HAC does not support potential model " + model_type + ".";
+          PRINT_INPUT_ERROR(error.c_str());
+        }
+        std::vector<std::string> observer_lines{"potential " + model_path};
+        const double pppm_spacing =
+          stage.qnep_pppm_spacing == 0.0 ? 1.0 : stage.qnep_pppm_spacing;
+        if (qnep_model) {
+          if (stage.qnep_kspace_method == WPE_QNEP_KSPACE_PPPM) {
+            if (!std::isfinite(pppm_spacing) || pppm_spacing < 0.2 || pppm_spacing > 2.0) {
+              PRINT_INPUT_ERROR("WPE qNEP centroid observer received an invalid stage PPPM spacing.");
+            }
+            std::ostringstream kspace;
+            kspace << std::setprecision(std::numeric_limits<double>::max_digits10)
+                   << "kspace pppm " << pppm_spacing;
+            observer_lines.push_back(kspace.str());
+          } else if (stage.qnep_kspace_method == WPE_QNEP_KSPACE_EWALD) {
+            observer_lines.push_back("kspace ewald");
+          } else {
+            PRINT_INPUT_ERROR("WPE qNEP centroid observer received an unsupported stage k-space method.");
+          }
+        }
+        if (stage.dftd3_enabled != 0) {
+          if (stage.dftd3_functional.empty() || !std::isfinite(stage.dftd3_rc_potential) ||
+              !std::isfinite(stage.dftd3_rc_coordination_number)) {
+            PRINT_INPUT_ERROR("WPE centroid observer could not identify active DFTD3 settings.");
+          }
+          std::ostringstream dftd3;
+          dftd3 << std::setprecision(std::numeric_limits<float>::max_digits10)
+                << "dftd3 " << stage.dftd3_functional << ' '
+                << stage.dftd3_rc_potential << ' ' << stage.dftd3_rc_coordination_number;
+          observer_lines.push_back(dftd3.str());
+        }
+        const RunInput observer_input(observer_lines);
+        if (qnep_model) {
           std::unique_ptr<NEP_Charge> observer(new NEP_Charge(
-            model_path.c_str(), atom.number_of_atoms, force.get_run_input()));
+            model_path.c_str(), atom.number_of_atoms, observer_input));
+          if (stage.qnep_kspace_method == WPE_QNEP_KSPACE_PPPM) {
+            observer->set_pppm_mesh_spacing(pppm_spacing);
+          }
           observer->N1 = 0;
           observer->N2 = atom.number_of_atoms;
           observer->configure_mechanical_observer();
           wpe_centroid_observer_ = std::move(observer);
-        } else if (model_type == "nep4" || model_type == "nep4_zbl") {
+        } else {
           std::unique_ptr<NEP> observer(
-            new NEP(model_path.c_str(), atom.number_of_atoms, force.get_run_input()));
+            new NEP(model_path.c_str(), atom.number_of_atoms, observer_input));
           observer->N1 = 0;
           observer->N2 = atom.number_of_atoms;
           wpe_centroid_observer_ = std::move(observer);
-        } else {
-          const std::string error =
-            "WPE PIMD centroid HAC does not support potential model " + model_type + ".";
-          PRINT_INPUT_ERROR(error.c_str());
         }
         centroid_position_work_.resize(static_cast<size_t>(atom.number_of_atoms) * 3);
         centroid_qnep_observer_error_.resize(1, 0);
@@ -1056,7 +1106,11 @@ void HAC::end_of_step(
       return;
     }
     ++centroid_direct_evaluations_;
-    if (rpmd_ja_enabled_ && !centroid_qnep_observer_) {
+    if (rpmd_ja_enabled_ && !centroid_qnep_observer_
+#ifdef GPUMD_WPE_ENABLED
+        && !wpe_centroid_observer_
+#endif
+    ) {
       rpmd_ja_wrap_positions(
         atom.number_of_atoms, rpmd_ja_continuous_centroid_, centroid_position_work_, box,
         rpmd_ja_branch_error_.data());

@@ -5,7 +5,12 @@
 #include "force/force.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
+#ifdef GPUMD_WPE_ENABLED
+#include "wisevolve_potential_api.h"
+#endif
+#include "utilities/compact_nep.cuh"
 #include "utilities/run_input.cuh"
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -159,6 +164,24 @@ inline std::string json_token_lines(const std::vector<RunInputLine>& lines, cons
   return output.str();
 }
 
+inline std::vector<RunInputLine> effective_thermostat_configuration_lines(
+  const std::vector<RunInputLine>& lines)
+{
+  std::vector<RunInputLine> effective;
+  for (auto line = lines.rbegin(); line != lines.rend(); ++line) {
+    if (line->tokens.empty()) continue;
+    const std::string& keyword = line->tokens[0];
+    if (keyword != "ensemble" && keyword.compare(0, 5, "pimd_") != 0) continue;
+    const bool already_seen = std::any_of(
+      effective.begin(), effective.end(), [&keyword](const RunInputLine& selected) {
+        return !selected.tokens.empty() && selected.tokens[0] == keyword;
+      });
+    if (!already_seen) effective.push_back(*line);
+  }
+  std::reverse(effective.begin(), effective.end());
+  return effective;
+}
+
 inline std::string atom_signature(const Atom& atom, const Box& box)
 {
   if (atom.cpu_type.size() != atom.cpu_mass.size()) return std::string();
@@ -183,21 +206,56 @@ inline ConfigurationSnapshot snapshot(const Force& force,const Atom& atom,const 
   const std::string canonical = canonical_token_lines(lines);
   result.run_input_sha256 = sha256_text(canonical);
   std::vector<RunInputLine> active_lines;
-  result.active_configuration_identified=active_run_configuration_lines(lines,number_of_steps,run_ordinal,active_lines);
+  const bool active_run_identified =
+    active_run_configuration_lines(lines, number_of_steps, run_ordinal, active_lines);
   result.active_run_ordinal=run_ordinal;
-  result.active_configuration_scope=result.active_configuration_identified?"PREFIX_BEFORE_ACTIVE_RUN":"ACTIVE_RUN_NOT_IDENTIFIED";
   std::ostringstream integrator_state;integrator_state.imbue(std::locale::classic());
   integrator_state<<std::setprecision(std::numeric_limits<double>::max_digits10)
     <<"time_step="<<time_step<<";temperature="<<temperature
     <<";beads="<<beads<<";internal_mass_com="<<(internal_mass_com?1:0)<<';';
-  result.physical_force_configuration_sha256 = result.active_configuration_identified?
+  result.physical_force_configuration_sha256 = active_run_identified?
     sha256_text(canonical_token_lines_for_configuration(active_lines,true)):std::string();
-  result.integrator_configuration_sha256 = result.active_configuration_identified?
+  result.integrator_configuration_sha256 = active_run_identified?
     sha256_text(canonical_token_lines_for_configuration(active_lines,false)+integrator_state.str()):std::string();
   result.model_path = force.primary_nep_model_path();
+  result.active_configuration_identified = active_run_identified;
+#ifdef GPUMD_WPE_ENABLED
+  if (result.model_path.empty()) result.model_path = get_first_potential_filename(input);
+  const Force::WpeStageSnapshot& stage = force.get_wpe_stage_snapshot();
+  if (!stage.valid || stage.stage_kind != WPE_STAGE_RUN ||
+      stage.number_of_atoms != atom.number_of_atoms ||
+      stage.pimd_beads != static_cast<std::uint32_t>(beads) ||
+      (stage.facts & WPE_STAGE_PIMD_ECO_CONFIGURATION) != 0) {
+    result.active_configuration_identified = false;
+  } else if (active_run_identified) {
+    std::ostringstream stage_configuration;
+    stage_configuration.imbue(std::locale::classic());
+    stage_configuration << std::setprecision(std::numeric_limits<double>::max_digits10)
+      << ";wpe_stage_kind=" << stage.stage_kind
+      << ";wpe_facts=" << stage.facts
+      << ";wpe_number_of_atoms=" << stage.number_of_atoms
+      << ";wpe_pimd_beads=" << stage.pimd_beads
+      << ";wpe_qnep_kspace_method=" << stage.qnep_kspace_method
+      << ";wpe_dftd3_enabled=" << stage.dftd3_enabled
+      << ";wpe_dftd3_functional=" << stage.dftd3_functional
+      << ";wpe_dftd3_rc_potential=" << stage.dftd3_rc_potential
+      << ";wpe_dftd3_rc_coordination_number=" << stage.dftd3_rc_coordination_number
+      << ";wpe_qnep_pppm_spacing=" << stage.qnep_pppm_spacing;
+    result.physical_force_configuration_sha256 = sha256_text(
+      result.physical_force_configuration_sha256 + stage_configuration.str());
+    result.integrator_configuration_sha256 = sha256_text(
+      result.integrator_configuration_sha256 + stage_configuration.str());
+  }
+#endif
   result.model_sha256 = sha256_file(result.model_path);
+#ifdef GPUMD_WPE_ENABLED
+  if (result.model_path.empty() || result.model_sha256.empty())
+    result.active_configuration_identified = false;
+#endif
+  result.active_configuration_scope=result.active_configuration_identified?"PREFIX_BEFORE_ACTIVE_RUN":"ACTIVE_RUN_NOT_IDENTIFIED";
   result.atom_signature_sha256 = atom_signature(atom, box);
-  result.thermostat_tokens_json = json_token_lines(active_lines, true);
+  result.thermostat_tokens_json = json_token_lines(
+    effective_thermostat_configuration_lines(active_lines), true);
   return result;
 }
 

@@ -1,7 +1,11 @@
 #include "force/nep.cuh"
 #include "force/nep_charge.cuh"
+#include "force/potential.cuh"
 #include "hac.cuh"
 #include "integrate/integrate.cuh"
+#ifdef GPUMD_WPE_ENABLED
+#include "wisevolve_potential_api.h"
+#endif
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
@@ -200,10 +204,32 @@ void HAC::pre_run_rpmd_ja_(
       1.0e-12 * std::max(1.0, std::fabs(target_temperature))) {
     PRINT_INPUT_ERROR("rpmd_ja requires a constant positive RPMD target temperature.");
   }
-  if (force.potentials.size() != 1 || force.primary_nep_model_path().empty())
+  if (force.potentials.size() != 1)
     PRINT_INPUT_ERROR("rpmd_ja requires exactly one supported NEP or qNEP potential.");
-  auto* active_qnep = dynamic_cast<NEP_Charge*>(force.potentials[0].get());
-  auto* active_nep = dynamic_cast<NEP*>(force.potentials[0].get());
+  Potential* active_potential = force.potentials[0].get();
+  std::string model_path = force.primary_nep_model_path();
+  bool using_wpe_observer = false;
+#ifdef GPUMD_WPE_ENABLED
+  if (wpe_centroid_observer_) {
+    active_potential = wpe_centroid_observer_.get();
+    model_path = wpe_centroid_model_path_;
+    using_wpe_observer = true;
+  }
+#endif
+  if (model_path.empty()) PRINT_INPUT_ERROR("rpmd_ja cannot identify the active NEP model file.");
+#ifdef GPUMD_WPE_ENABLED
+  const Force::WpeStageSnapshot& wpe_stage = force.get_wpe_stage_snapshot();
+  if (using_wpe_observer &&
+      (!wpe_stage.valid || wpe_stage.stage_kind != WPE_STAGE_RUN ||
+       wpe_stage.number_of_atoms != atom.number_of_atoms ||
+       wpe_stage.pimd_beads != atom.number_of_beads ||
+       (wpe_stage.facts & WPE_STAGE_PIMD_ECO_CONFIGURATION) != 0 ||
+       wpe_stage.dftd3_enabled > 1)) {
+    PRINT_INPUT_ERROR("rpmd_ja cannot verify the active WPE RPMD stage identity.");
+  }
+#endif
+  auto* active_qnep = dynamic_cast<NEP_Charge*>(active_potential);
+  auto* active_nep = dynamic_cast<NEP*>(active_potential);
   if (active_qnep == nullptr &&
       (active_nep == nullptr || !active_nep->supports_local_edge_derivatives())) {
     PRINT_INPUT_ERROR("rpmd_ja requires one short-range NEP without unsupported corrections.");
@@ -220,11 +246,23 @@ void HAC::pre_run_rpmd_ja_(
     rpmd_ja_reference_.number_of_atoms != N || rpmd_ja_reference_.types.size() != N ||
     rpmd_ja_reference_.masses.size() != N || rpmd_ja_reference_.positions.size() != D ||
     rpmd_ja_reference_.model_fingerprint !=
-      rpmd_ja_model_fingerprint(force.primary_nep_model_path())) {
+      rpmd_ja_model_fingerprint(model_path)) {
     PRINT_INPUT_ERROR("rpmd_ja reference atom metadata or NEP model does not match this run.");
   }
   if (active_qnep != nullptr) {
     const double active_mesh_spacing = active_qnep->get_pppm_mesh_spacing();
+#ifdef GPUMD_WPE_ENABLED
+    if (using_wpe_observer) {
+      const double stage_mesh_spacing =
+        wpe_stage.qnep_pppm_spacing == 0.0 ? 1.0 : wpe_stage.qnep_pppm_spacing;
+      if (wpe_stage.qnep_kspace_method != WPE_QNEP_KSPACE_PPPM ||
+          !std::isfinite(stage_mesh_spacing) || !(stage_mesh_spacing > 0.0) ||
+          std::fabs(stage_mesh_spacing - active_mesh_spacing) >
+            1.0e-12 * std::max(1.0, std::fabs(active_mesh_spacing))) {
+        PRINT_INPUT_ERROR("rpmd_ja WPE qNEP PPPM settings do not match the active stage.");
+      }
+    }
+#endif
     if (rpmd_ja_reference_.backend != 2 || !rpmd_ja_reference_.stability_checked ||
         (rpmd_ja_reference_.q_charge_mode != 1 && rpmd_ja_reference_.q_charge_mode != 2) ||
         rpmd_ja_reference_.q_charge_mode != active_qnep->get_charge_mode() ||
@@ -238,7 +276,14 @@ void HAC::pre_run_rpmd_ja_(
          rpmd_ja_reference_.mechanical_policy != "native_reference_transport;analytic_site_gradient_fd4_v1" &&
          rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) <= 0) ||
         rpmd_ja_reference_.mechanical_config_fingerprint !=
-          rpmd_ja_qnep_config_fingerprint(force) ||
+          rpmd_ja_qnep_config_fingerprint(
+            force, *active_qnep, model_path,
+#ifdef GPUMD_WPE_ENABLED
+            wpe_stage.dftd3_enabled != 0
+#else
+            force.get_run_input().contains("dftd3")
+#endif
+            ) ||
         (rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) > 0 &&
          rpmd_ja_reference_policy_beads(rpmd_ja_reference_.mechanical_policy) != atom.number_of_beads) ||
         (rpmd_ja_reference_policy_requires_pimd_fix_com(rpmd_ja_reference_.mechanical_policy) &&
@@ -327,13 +372,13 @@ void HAC::pre_run_rpmd_ja_(
     PRINT_INPUT_ERROR("rpmd_ja initial structure is non-finite or outside the reference crystal branch.");
   }
 
-  if (active_qnep == nullptr) {
-    rpmd_ja_nep_.reset(new NEP(force.primary_nep_model_path().c_str(), N, force.get_run_input()));
+  if (active_qnep == nullptr && !using_wpe_observer) {
+    rpmd_ja_nep_.reset(new NEP(model_path.c_str(), N, force.get_run_input()));
     rpmd_ja_nep_->N1 = 0;
     rpmd_ja_nep_->N2 = N;
     rpmd_ja_nep_->set_neighbor_rebuild(false);
     rpmd_ja_nep_->set_neighbor_log_enabled(false);
-  } else if (!centroid_qnep_observer_) {
+  } else if (active_qnep != nullptr && !centroid_qnep_observer_ && !using_wpe_observer) {
     PRINT_INPUT_ERROR("rpmd_ja qNEP requires the private direct-centroid mechanical observer.");
   }
   if (rpmd_ja_reference_.backend == 1 || rpmd_ja_reference_.backend == 2) {

@@ -18,6 +18,12 @@ The first parameter is the sampling interval for the heat current data.
 The second parameter is the maximum correlations steps.
 The third parameter is the output interval of the :term:`HAC` and :term:`RTC` data.
 
+For example, ``compute_hac 5 4000 1 1`` samples every 5 integration steps,
+uses 4000 sampled lag points, writes every lag point without averaging, and
+sets ``use_centroid_heat_flux`` to 1. The lag grid is separated by 5
+integration steps; the last of 4000 lag points is at 19,995 steps because the
+first point has zero lag.
+
 ``compute_hac`` requires a fixed integration time step. The adaptive
 ``time_step <dt_in_fs> <max_distance_per_step>`` form is rejected in a run
 containing ``compute_hac`` because the correlation and integration assume
@@ -36,9 +42,12 @@ bead forces or ring-polymer dynamics.
 
 For WPE PIMD/RPMD/TRPMD runs, sampled centroid HAC uses a private native GPUMD
 observer for NEP4, NEP4-ZBL, and qNEP charge1/charge2 models. It reads the same
-``kspace`` and ``dftd3`` settings, while the WPE force context evaluates
-physical beads only. Other model variants and ``split_qnep_heat_by_type`` are
-unsupported for WPE centroid HAC.
+``kspace``, ``pppm_mesh_spacing``, and ``dftd3`` settings from the active WPE
+run stage, while the WPE force context evaluates physical beads only. With
+``rpmd_ja on`` in fixed-cell RPMD,
+the same private observer supplies the centroid current once per HAC sample;
+JA adds its fixed-reference correction to that sampled current. Other model
+variants and ``split_qnep_heat_by_type`` are unsupported for WPE centroid HAC.
 
 The optional fifth parameter :attr:`split_qnep_heat_by_type` can be set to 1 to export an
 additional type-resolved heat-current file with the electrostatic and non-electrostatic

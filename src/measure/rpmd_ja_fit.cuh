@@ -23,6 +23,8 @@ class RpmdJA_Fit final : public Action
 public:
   explicit RpmdJA_Fit(const std::vector<std::string>& tokens);
   ~RpmdJA_Fit() override;
+  bool sample_only() const { return sample_only_; }
+  void set_run_ordinal(const unsigned value) { run_ordinal_ = value; }
 
   void pre_run(
     int number_of_steps,
@@ -83,7 +85,7 @@ private:
   int number_of_atoms_ = 0;
   int number_of_beads_ = 0;
   std::uint64_t frame_count_ = 0;
-  unsigned active_run_ordinal_ = 0;
+  unsigned run_ordinal_ = 0;
   int first_sample_step_ = -1;
   int last_sample_step_ = -1;
   rpmd_ja_file_io::ofstream spool_;
@@ -98,7 +100,6 @@ private:
   std::vector<double> sample_output_;
   std::vector<double> previous_centroid_;
   std::vector<double> centroid_;
-  std::vector<double> mean_force_;
   std::vector<double> frame_buffer_;
   double com_shift_[3] = {0.0, 0.0, 0.0};
   double cell_[9] = {};

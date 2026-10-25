@@ -9,6 +9,7 @@
 class Atom;
 class Box;
 class Force;
+class NEP_Charge;
 
 struct RpmdJASparseMatrix
 {
@@ -132,3 +133,5 @@ void generate_rpmd_ja_qnep_raw(
 void diagnose_rpmd_ja_qnep_reference(double fd_step, Atom& atom, Box& box, Force& force, bool full = false);
 std::uint64_t rpmd_ja_model_fingerprint(const std::string& path);
 std::uint64_t rpmd_ja_qnep_config_fingerprint(Force& force);
+std::uint64_t rpmd_ja_qnep_config_fingerprint(
+  Force& force, NEP_Charge& qnep, const std::string& model_path, bool has_dftd3);

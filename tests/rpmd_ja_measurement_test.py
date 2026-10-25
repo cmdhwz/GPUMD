@@ -115,7 +115,8 @@ def demo():
     assert 'rpmd_ja_reference_.mechanical_policy != "native_reference_transport"' in ja_source
     assert "rpmd_ja_reference_policy_requires_pimd_fix_com" in ja_source
     assert "!integrate.get_pimd_fix_com()" in ja_source
-    assert 'rpmd_ja_qnep_config_fingerprint(force)' in ja_source
+    assert 'rpmd_ja_qnep_config_fingerprint(' in ja_source
+    assert 'wpe_stage.dftd3_enabled != 0' in ja_source
     assert 'generate_rpmd_ja_qnep_reference(' in run_source
     assert 'rpmd_ja_reference_.backend == 2' in ja_source
     block_release = ja_source.split("rpmd_ja_sparse_workspace_.initialize", 1)[1].split(
@@ -126,7 +127,8 @@ def demo():
     assert 'rpmd_ja_sparse_workspace_.dynamical_block_count()' in ja_source
     assert 'rpmd_ja_sparse_workspace_.site_block_count(0)' in ja_source
     assert 'native_reference_transport' in ja_doc
-    assert 'if (rpmd_ja_enabled_ && !centroid_qnep_observer_)' in hac
+    assert 'if (rpmd_ja_enabled_ && !centroid_qnep_observer_' in hac
+    assert '&& !wpe_centroid_observer_' in hac
     assert 'rpmd_ja_enabled_ && !qnep_full_a_ && split_qnep_heat_by_type_ == 0' in hac
     assert 'block_apply_right<<<' in sparse
     assert 'block_apply_rows<<<' in sparse

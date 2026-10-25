@@ -535,7 +535,7 @@ assert 'write_cg_witness(path,witness,candidate_theta,raw_path,spool_path,cg_rep
 assert 'reconcile_controller_resume_budget(controller_journal' in fit
 assert 'OUTER_JOURNAL_RECONCILED' in fit
 provenance_header = source("src/measure/rpmd_ja_sample_provenance.h")
-assert 'active_run_configuration_lines(lines,number_of_steps,run_ordinal,active_lines)' in provenance_header
+assert 'active_run_configuration_lines(lines, number_of_steps, run_ordinal, active_lines)' in provenance_header
 assert 'canonical_token_lines_for_configuration(active_lines,true)' in provenance_header
 assert 'canonical_token_lines_for_configuration(active_lines,false)' in provenance_header
 assert 'result.active_configuration_scope=result.active_configuration_identified?"PREFIX_BEFORE_ACTIVE_RUN"' in provenance_header

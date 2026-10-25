@@ -344,9 +344,23 @@ void Force::wpe_process_command(
   const std::vector<std::string>& tokens,
   const int current_number_of_atoms)
 {
+  if (!tokens.empty() && tokens[0] == "run") wpe_stage_snapshot_ = WpeStageSnapshot();
   WpeStageInfo stage{};
-  if (wpe_stage_state_.process_command(tokens, current_number_of_atoms, stage))
+  if (wpe_stage_state_.process_command(tokens, current_number_of_atoms, stage)) {
+    wpe_stage_snapshot_.valid = true;
+    wpe_stage_snapshot_.stage_kind = stage.stage_kind;
+    wpe_stage_snapshot_.facts = stage.facts;
+    wpe_stage_snapshot_.number_of_atoms = stage.number_of_atoms;
+    wpe_stage_snapshot_.pimd_beads = stage.pimd_beads;
+    wpe_stage_snapshot_.qnep_kspace_method = stage.qnep_kspace_method;
+    wpe_stage_snapshot_.dftd3_enabled = stage.dftd3_enabled;
+    wpe_stage_snapshot_.dftd3_functional =
+      stage.dftd3_functional == nullptr ? "" : stage.dftd3_functional;
+    wpe_stage_snapshot_.dftd3_rc_potential = stage.dftd3_rc_potential;
+    wpe_stage_snapshot_.dftd3_rc_coordination_number = stage.dftd3_rc_coordination_number;
+    wpe_stage_snapshot_.qnep_pppm_spacing = stage.qnep_pppm_spacing;
     gpumd_wpe_activate_stage(potentials, stage);
+  }
 }
 #endif
 

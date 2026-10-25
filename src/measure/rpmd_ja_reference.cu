@@ -1292,12 +1292,15 @@ void print_qnep_precheck_table(const double h, const char* label,
   std::printf("    Overall: %s\n", overall_failed ? "FAIL" : "PASS");
 }
 
-std::uint64_t qnep_config_fingerprint(Force& force, NEP_Charge& qnep, const double mesh_spacing)
+std::uint64_t qnep_config_fingerprint(
+  NEP_Charge& qnep, const std::string& model_path, const double mesh_spacing,
+  const bool has_dftd3)
 {
-  if (force.get_run_input().contains("dftd3"))
+  if (has_dftd3)
     throw std::runtime_error("rpmd_ja qNEP reference does not support dftd3 corrections");
   if (!qnep.uses_pppm()) throw std::runtime_error("rpmd_ja qNEP reference currently supports kspace_method pppm only");
-  std::uint64_t hash = rpmd_ja_model_fingerprint(force.primary_nep_model_path());
+  if (model_path.empty()) throw std::runtime_error("rpmd_ja qNEP reference requires an identifiable model file");
+  std::uint64_t hash = rpmd_ja_model_fingerprint(model_path);
   const auto add_bytes = [&hash](const void* data, const std::size_t size) {
     const auto* bytes = static_cast<const unsigned char*>(data);
     for (std::size_t i = 0; i < size; ++i) hash = (hash ^ bytes[i]) * 1099511628211ULL;
@@ -1322,7 +1325,15 @@ std::uint64_t rpmd_ja_qnep_config_fingerprint(Force& force)
   auto* qnep = dynamic_cast<NEP_Charge*>(&force.get_potential(0));
   if (qnep == nullptr)
     throw std::runtime_error("rpmd_ja qNEP fingerprint does not support non-qNEP or mixed potentials");
-  return qnep_config_fingerprint(force, *qnep, qnep->get_pppm_mesh_spacing());
+  return qnep_config_fingerprint(
+    *qnep, force.primary_nep_model_path(), qnep->get_pppm_mesh_spacing(),
+    force.get_run_input().contains("dftd3"));
+}
+
+std::uint64_t rpmd_ja_qnep_config_fingerprint(
+  Force&, NEP_Charge& qnep, const std::string& model_path, const bool has_dftd3)
+{
+  return qnep_config_fingerprint(qnep, model_path, qnep.get_pppm_mesh_spacing(), has_dftd3);
 }
 
 RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom& atom, Box& active_box, Force& force)

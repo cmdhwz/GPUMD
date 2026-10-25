@@ -22,6 +22,7 @@
 #include "wpe_stage.cuh"
 #endif
 #include "utilities/common.cuh"
+#include <cstdint>
 #include <memory>
 #include <stdio.h>
 #include <string>
@@ -48,6 +49,23 @@ public:
     long long calls = 0;
     std::vector<double> worker_compute;
   };
+
+#ifdef GPUMD_WPE_ENABLED
+  struct WpeStageSnapshot
+  {
+    bool valid = false;
+    std::uint32_t stage_kind = 0;
+    std::uint64_t facts = 0;
+    std::int32_t number_of_atoms = 0;
+    std::uint32_t pimd_beads = 0;
+    std::uint32_t qnep_kspace_method = 0;
+    std::uint32_t dftd3_enabled = 0;
+    std::string dftd3_functional;
+    float dftd3_rc_potential = 0.0f;
+    float dftd3_rc_coordination_number = 0.0f;
+    double qnep_pppm_spacing = 0.0;
+  };
+#endif
 
   struct PIMD_Bead_GPU_Worker
   {
@@ -138,6 +156,7 @@ public:
   void wpe_process_command(
     const std::vector<std::string>& tokens,
     int current_number_of_atoms);
+  const WpeStageSnapshot& get_wpe_stage_snapshot() const { return wpe_stage_snapshot_; }
 #endif
 
   void finalize();
@@ -198,6 +217,7 @@ public:
 private:
 #ifdef GPUMD_WPE_ENABLED
   WpeGpumdStageState wpe_stage_state_;
+  WpeStageSnapshot wpe_stage_snapshot_;
 #endif
   std::unique_ptr<Potential> create_potential(
     const std::vector<std::string>& tokens,

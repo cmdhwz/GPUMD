@@ -5,6 +5,9 @@
 #include "rpmd_ja_native_fit.cuh"
 #include "rpmd_ja_reference.cuh"
 #include "rpmd_ja_sample_provenance.h"
+#ifdef GPUMD_WPE_ENABLED
+#include "wisevolve_potential_api.h"
+#endif
 #include "integrate/integrate.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
@@ -84,6 +87,11 @@ std::string build_provenance_json(
   const std::string& atom_signature_sha256,
   const bool configuration_stable)
 {
+#ifdef GPUMD_WPE_ENABLED
+  constexpr const char* physical_force_backend = "WPE";
+#else
+  constexpr const char* physical_force_backend = "GPUMD_NATIVE";
+#endif
   std::ostringstream output;
   output.imbue(std::locale::classic());
   output << std::setprecision(17);
@@ -110,7 +118,8 @@ std::string build_provenance_json(
     << "\",\"physical_force_configuration_sha256\":\"" << physical_force_configuration_sha256
     << "\",\"integrator_configuration_sha256\":\"" << integrator_configuration_sha256
     << "\",\"atom_signature_sha256\":\"" << atom_signature_sha256
-    << "\",\"physical_force_source\":\"MEAN_OF_PHYSICAL_PIMD_BEAD_FORCES\""
+    << "\",\"physical_force_backend\":\"" << physical_force_backend << "\""
+    << ",\"physical_force_source\":\"MEAN_OF_PHYSICAL_PIMD_BEAD_FORCES\""
     << ",\"internal_mass_com\":" << (internal_mass_com ? "true" : "false")
     << ",\"sampling_com_method\":\"MASS_WEIGHTED_CUMULATIVE_CENTROID_DRIFT_REMOVAL\""
     << ",\"sampling_com_shift_final\":[" << sampling_com_shift[0] << ',' << sampling_com_shift[1] << ','
@@ -190,6 +199,11 @@ void RpmdJA_Fit::pre_run(
   Box& box,
   Force& force)
 {
+#ifdef GPUMD_WPE_ENABLED
+  if (!sample_only_) {
+    PRINT_INPUT_ERROR("WPE supports rpmd_ja sample only; native fit/reference construction is unavailable.");
+  }
+#endif
   timestep_internal_ = time_step;
   timestep_fs_ = time_step * TIME_UNIT_CONVERSION;
   internal_mass_com_ = integrate.get_pimd_fix_com();
@@ -197,6 +211,17 @@ void RpmdJA_Fit::pre_run(
       atom.number_of_beads != integrate.get_number_of_beads()) {
     PRINT_INPUT_ERROR("rpmd_ja fit requires canonical PIMD sampling with initialized bead positions; RPMD and TRPMD do not thermostat the centroid and cannot guarantee canonical sampling.");
   }
+#ifdef GPUMD_WPE_ENABLED
+  if (sample_only_) {
+    const Force::WpeStageSnapshot& stage = force.get_wpe_stage_snapshot();
+    if (!stage.valid || stage.stage_kind != WPE_STAGE_RUN ||
+        stage.number_of_atoms != atom.number_of_atoms ||
+        stage.pimd_beads != atom.number_of_beads ||
+        (stage.facts & WPE_STAGE_PIMD_ECO_CONFIGURATION) != 0) {
+      PRINT_INPUT_ERROR("rpmd_ja sample cannot verify the active WPE canonical PIMD stage.");
+    }
+  }
+#endif
   if (integrate.get_num_target_pressure_components() != 0 ||
       integrate.get_deform_x() || integrate.get_deform_y() || integrate.get_deform_z() ||
       integrate.get_deform_xy() || integrate.get_deform_xz() || integrate.get_deform_yz()) {
@@ -254,7 +279,10 @@ void RpmdJA_Fit::pre_run(
   if (pbc_[0] != 1 || pbc_[1] != 1 || pbc_[2] != 1) {
     PRINT_INPUT_ERROR("rpmd_ja fit currently requires periodic boundaries in all three directions.");
   }
-  const unsigned current_run_ordinal=active_run_ordinal_++;
+  number_of_atoms_ = atom.number_of_atoms;
+  number_of_beads_ = atom.number_of_beads;
+  masses_ = atom.cpu_mass;
+  const unsigned current_run_ordinal = run_ordinal_;
   const rpmd_ja_sample_provenance::ConfigurationSnapshot provenance_snapshot=rpmd_ja_sample_provenance::snapshot(
     force,atom,box,number_of_steps,current_run_ordinal,time_step,temperature_,number_of_beads_,internal_mass_com_);
   if(!provenance_snapshot_initialized_){
@@ -299,13 +327,9 @@ void RpmdJA_Fit::pre_run(
     if (!(mass > 0.0) || !std::isfinite(mass)) PRINT_INPUT_ERROR("rpmd_ja fit requires positive finite masses.");
   }
 
-  number_of_atoms_ = atom.number_of_atoms;
-  number_of_beads_ = atom.number_of_beads;
-  masses_ = atom.cpu_mass;
   const std::size_t coordinates = static_cast<std::size_t>(number_of_atoms_) * 3;
   previous_centroid_.resize(coordinates);
   centroid_.resize(coordinates);
-  mean_force_.resize(coordinates);
   frame_buffer_.resize(1 + 2 * coordinates);
   bead_position_ptrs_.resize(number_of_beads_);
   bead_force_ptrs_.resize(number_of_beads_);
@@ -410,7 +434,6 @@ void RpmdJA_Fit::post_force(
 
   const std::size_t atom_count = static_cast<std::size_t>(number_of_atoms_);
   std::copy(sample_output_.begin(), sample_output_.begin() + coordinates, centroid_.begin());
-  std::copy(sample_output_.begin() + coordinates, sample_output_.begin() + 2 * coordinates, mean_force_.begin());
   double coordinate_scale = 1.0;
   for (int atom_id = 0; atom_id < number_of_atoms_; ++atom_id) {
     const unsigned int error = static_cast<unsigned int>(sample_output_[9 * atom_count + atom_id]);
@@ -475,7 +498,7 @@ void RpmdJA_Fit::post_force(
     for (int d = 0; d < 3; ++d) {
       centroid_[i + d * number_of_atoms_] -= com_shift_[d];
       if (!std::isfinite(centroid_[i + d * number_of_atoms_]) ||
-          !std::isfinite(mean_force_[i + d * number_of_atoms_])) {
+          !std::isfinite(sample_output_[coordinates + i + d * number_of_atoms_])) {
         PRINT_INPUT_ERROR("rpmd_ja fit produced a nonfinite centroid or bead-mean force.");
       }
     }
@@ -485,7 +508,8 @@ void RpmdJA_Fit::post_force(
   const double sample_step = static_cast<double>(step + 1);
   frame_buffer_[0] = sample_step;
   std::copy(centroid_.begin(), centroid_.end(), frame_buffer_.begin() + 1);
-  std::copy(mean_force_.begin(), mean_force_.end(), frame_buffer_.begin() + 1 + coordinates);
+  std::copy(sample_output_.begin() + coordinates, sample_output_.begin() + 2 * coordinates,
+    frame_buffer_.begin() + 1 + coordinates);
   write_or_throw(spool_, frame_buffer_.data(), frame_buffer_.size() * sizeof(double));
   if (frame_count_ == 0) first_sample_step_ = step + 1;
   last_sample_step_ = step + 1;
@@ -524,7 +548,7 @@ void RpmdJA_Fit::post_run(
   if(!provenance_snapshot_initialized_)PRINT_INPUT_ERROR("rpmd_ja fit has no active run configuration provenance snapshot.");
   const rpmd_ja_sample_provenance::ConfigurationSnapshot final_snapshot=
     rpmd_ja_sample_provenance::snapshot(*force_,atom,box,number_of_steps,
-      active_run_ordinal_?active_run_ordinal_-1:0,time_step,temperature_,number_of_beads_,internal_mass_com_);
+      run_ordinal_,time_step,temperature_,number_of_beads_,internal_mass_com_);
   const bool configuration_stable = configuration_stable_during_sampling_&&final_snapshot.active_configuration_identified&&
     final_snapshot.run_input_sha256 == run_input_sha256_ &&
     final_snapshot.physical_force_configuration_sha256 == physical_force_configuration_sha256_ &&

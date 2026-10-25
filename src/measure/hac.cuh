@@ -171,6 +171,7 @@ private:
   std::unique_ptr<NEP_Charge> centroid_qnep_observer_;
 #ifdef GPUMD_WPE_ENABLED
   std::unique_ptr<Potential> wpe_centroid_observer_;
+  std::string wpe_centroid_model_path_;
 #endif
   GPU_Vector<double> rpmd_ja_reference_positions_;
   GPU_Vector<double> rpmd_ja_last_wrapped_centroid_;
