@@ -4595,6 +4595,9 @@ struct CovarianceFitTestHooks
   int gradient_residual_failure_iteration=0;
   int trace_solution_failure_column=-1;
   double trace_solution_failure_delta=0.0;
+  int trace_solution_failure_skip=0;
+  int trace_solution_failure_count_remaining=-1;
+  int graph_reference_stationarity_valid_evaluations=0;
   int independent_curvature_hard_failures_remaining=0;
   int independent_curvature_bias_remaining=0;
   double independent_curvature_diagonal_bias=0.0;
@@ -5064,9 +5067,14 @@ struct DeviceCovarianceSystem
 #ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
       const int injected_column=covariance_fit_test_hooks.trace_solution_failure_column;
       if(injected_column>=source&&injected_column<source+wide_columns){double value=0.0;double* target=trace_rhs+static_cast<std::size_t>(injected_column-source)*r;
-        if(cudaMemcpy(&value,target,sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native covariance test trace solution read failed");
-        value+=covariance_fit_test_hooks.trace_solution_failure_delta;
-        if(cudaMemcpy(target,&value,sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)throw std::runtime_error("native covariance test trace solution write failed");}
+        if(covariance_fit_test_hooks.trace_solution_failure_skip>0)--covariance_fit_test_hooks.trace_solution_failure_skip;
+        else{
+          if(cudaMemcpy(&value,target,sizeof(double),cudaMemcpyDeviceToHost)!=cudaSuccess)throw std::runtime_error("native covariance test trace solution read failed");
+          value+=covariance_fit_test_hooks.trace_solution_failure_delta;
+          if(cudaMemcpy(target,&value,sizeof(double),cudaMemcpyHostToDevice)!=cudaSuccess)throw std::runtime_error("native covariance test trace solution write failed");
+          if(covariance_fit_test_hooks.trace_solution_failure_count_remaining>0&&
+             --covariance_fit_test_hooks.trace_solution_failure_count_remaining==0)
+            covariance_fit_test_hooks.trace_solution_failure_column=-1;}}
 #endif
       for(int offset=0;offset<wide_columns;offset+=trace_residual_batch){const int columns=std::min(trace_residual_batch,wide_columns-offset);
         const int batch_start=source+offset;const std::size_t values=static_cast<std::size_t>(r)*columns;
@@ -6023,6 +6031,16 @@ struct GraphReferenceBaselineCandidate
   std::vector<double> theta;
 };
 
+struct GraphReferenceSearchDiagnostics
+{
+  double mu=std::numeric_limits<double>::quiet_NaN();
+  double last_residual_mu=std::numeric_limits<double>::quiet_NaN();
+  std::string stage="NOT_RUN";
+  std::string last_residual_stage="NOT_RUN";
+  unsigned residual_failures=0;
+  CovarianceTraceDiagnostics last_residual_d_trace,last_residual_shifted_trace;
+};
+
 struct CovarianceAnalyticCurvatureCache
 {
   bool valid=false;
@@ -6735,7 +6753,7 @@ CovarianceBaseline build_graph_covariance_baseline(DeviceCovarianceSystem& syste
 CovarianceBaseline build_graph_reference_baseline(DeviceCovarianceSystem& system,const std::vector<double>& statistics,
   const double epsilon,std::uint64_t& objective_evaluations,rpmd_ja_feasibility::Budget* budget=nullptr,
   const rpmd_ja_feasibility::Limits* limits=nullptr,double* objective_seconds=nullptr,
-  const GraphReferenceBaselineCandidate* saved_candidate=nullptr)
+  const GraphReferenceBaselineCandidate* saved_candidate=nullptr,GraphReferenceSearchDiagnostics* search_diagnostics=nullptr)
 {
   if(statistics.size()!=static_cast<std::size_t>(system.p)||!(epsilon>0.0)||!std::isfinite(epsilon))
     throw std::invalid_argument("native covariance fit baseline inputs are invalid");
@@ -6743,6 +6761,13 @@ CovarianceBaseline build_graph_reference_baseline(DeviceCovarianceSystem& system
   const double data_slope=covariance_dot(statistics,direction);
   if(!(data_slope>0.0)||!std::isfinite(data_slope))throw std::runtime_error("BASELINE_SPD_FAIL: training fluctuations do not bound the graph baseline objective");
   auto parameters_at=[&](const double mu){std::vector<double> value(direction.size());for(std::size_t i=0;i<value.size();++i)value[i]=mu*direction[i];return value;};
+  auto set_search_state=[&](const char* stage,const double mu){if(search_diagnostics){search_diagnostics->stage=stage;search_diagnostics->mu=mu;}};
+  auto record_residual_failure=[&](const char* stage,const double mu,const CovarianceSolveResidualError& error){
+    if(search_diagnostics){++search_diagnostics->residual_failures;search_diagnostics->last_residual_mu=mu;
+      search_diagnostics->last_residual_stage=stage;search_diagnostics->last_residual_d_trace=error.d_trace;
+      search_diagnostics->last_residual_shifted_trace=error.shifted_trace;}};
+  if(search_diagnostics)*search_diagnostics=GraphReferenceSearchDiagnostics{};
+  set_search_state("SAVED_CANDIDATE",saved_candidate?saved_candidate->mu:std::numeric_limits<double>::quiet_NaN());
   constexpr double relative_root_tolerance_floor=1.0e-7;
   if(saved_candidate){
     CovarianceWallSeconds objective_time(objective_seconds);covariance_budget_observe_or_throw(budget,limits);++objective_evaluations;
@@ -6753,7 +6778,9 @@ CovarianceBaseline build_graph_reference_baseline(DeviceCovarianceSystem& system
     bool candidate_feasible=false;
     try{candidate_feasible=system.evaluate_factors(candidate.theta,epsilon,candidate.logdet,candidate.shifted_logdet,
       &candidate.trace,nullptr,false,true,nullptr,nullptr,nullptr,&shifted_diagonal);}
-    catch(const CovarianceSolveResidualError&){candidate_feasible=false;}
+    catch(const CovarianceSolveResidualError& error){candidate_feasible=false;
+      record_residual_failure("SAVED_CANDIDATE",candidate.mu,error);
+      system.last_d_trace=error.d_trace;system.last_shifted_trace=error.shifted_trace;}
     if(candidate_feasible){
       candidate.phi=covariance_dot(candidate.trace,direction)-data_slope;
       const double scale=std::max(std::abs(data_slope),std::abs(candidate.phi+data_slope));
@@ -6764,11 +6791,13 @@ CovarianceBaseline build_graph_reference_baseline(DeviceCovarianceSystem& system
         if(shifted_diagonal.empty())throw std::runtime_error("BASELINE_SPD_FAIL: saved baseline has no shifted Cholesky diagonal");
         candidate.minimum_shifted_cholesky_diagonal=*std::min_element(shifted_diagonal.begin(),shifted_diagonal.end());
         candidate.stationarity_status="SAVED_BASELINE_FREE_ROOT_VERIFIED";
+        set_search_state("SAVED_CANDIDATE_VERIFIED",candidate.mu);
         return candidate;
       }
     }
   }
-  auto evaluate_mu=[&](const double mu,double& value){CovarianceWallSeconds objective_time(objective_seconds);
+  auto evaluate_mu=[&](const double mu,double& value,const char* stage="FEASIBILITY_BOUNDARY"){
+    set_search_state(stage,mu);CovarianceWallSeconds objective_time(objective_seconds);
     covariance_budget_observe_or_throw(budget,limits);++objective_evaluations;double logdet=0.0,shifted=0.0;
     if(!system.evaluate_factors(parameters_at(mu),epsilon,logdet,shifted,nullptr))return false;
     value=0.5*mu*data_slope-0.5*logdet;if(!std::isfinite(value))throw std::runtime_error("native covariance fit baseline objective is non-finite");return true;};
@@ -6788,9 +6817,10 @@ CovarianceBaseline build_graph_reference_baseline(DeviceCovarianceSystem& system
     for(int iteration=0;iteration<32;++iteration){const double middle=low+0.5*(high-low);double ignored=0.0;
       if(evaluate_mu(middle,ignored))high=middle;else low=middle;}floor=high;floor_bracket_width=high-low;
   }
-  auto stationarity=[&](const double mu,double& phi,double& objective,std::vector<double>* traces=nullptr,
+  auto stationarity=[&](const double mu,double& phi,double& objective,const char* stage,
+                        std::vector<double>* traces=nullptr,
                         double* minimum_shifted_diagonal=nullptr){
-    if(!evaluate_mu(mu,objective))return false;
+    if(!evaluate_mu(mu,objective,stage))return false;
     if(traces||minimum_shifted_diagonal){
       double logdet=0.0,shifted=0.0;std::vector<double> diagonal;
       covariance_budget_observe_or_throw(budget,limits);
@@ -6810,62 +6840,111 @@ CovarianceBaseline build_graph_reference_baseline(DeviceCovarianceSystem& system
   };
   constexpr unsigned maximum_root_iterations=64;
   CovarianceBaseline result;result.boundary_mu=floor;result.epsilon=epsilon;result.stability_bracket_width=floor_bracket_width;
-  double floor_phi=0.0,floor_objective=0.0;
-  if(!stationarity(floor,floor_phi,floor_objective))
-    throw std::runtime_error("BASELINE_SPD_FAIL: stability boundary stationarity evaluation failed");
-  const double floor_trace_scale=std::max(std::abs(data_slope),std::abs(floor_phi+data_slope));
-  result.phi_solve_residual_heuristic=floor_trace_scale*std::max(1.0e-12,2.0*system.worst_solve_relative_residual);
   result.root_relative_tolerance=relative_root_tolerance_floor;
-  double lo=floor,hi=floor,phi_lo=floor_phi,phi_hi=floor_phi,objective= floor_objective;
-  if(floor_phi/floor_trace_scale<=relative_root_tolerance_floor)
-    throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: stability-bound derivative sign is zero, negative, or inside the fixed stationarity tolerance; no KKT claim is made");
-  {
-    double distance=std::max(epsilon,1.0e-8);bool bracketed=false;
-    for(unsigned attempt=0;attempt<64;++attempt){
-      hi=floor+distance;
-      if(!std::isfinite(hi)||!stationarity(hi,phi_hi,objective))
-        throw std::runtime_error("BASELINE_SPD_FAIL: one-dimensional root bracket left the stable interval");
-      if(phi_hi<=0.0){bracketed=true;break;}
-      lo=hi;phi_lo=phi_hi;distance*=2.0;
+  enum class StationarityAttempt{VALID,INFEASIBLE,RESIDUAL_FAIL};
+  auto try_stationarity=[&](const char* stage,const double mu,double& phi,double& objective){
+    set_search_state(stage,mu);
+    try{if(!stationarity(mu,phi,objective,stage))return StationarityAttempt::INFEASIBLE;
+#ifdef GPUMD_RPMD_JA_NATIVE_FIT_TEST
+      ++covariance_fit_test_hooks.graph_reference_stationarity_valid_evaluations;
+#endif
+      return StationarityAttempt::VALID;}
+    catch(const CovarianceSolveResidualError& error){record_residual_failure(stage,mu,error);
+      return StationarityAttempt::RESIDUAL_FAIL;}};
+  const double initial_distance=std::max(epsilon,1.0e-8);
+  double lo=std::numeric_limits<double>::quiet_NaN(),hi=std::numeric_limits<double>::quiet_NaN();
+  double phi_lo=std::numeric_limits<double>::quiet_NaN(),phi_hi=std::numeric_limits<double>::quiet_NaN();
+  bool positive_sign_found=false,negative_sign_found=false,any_feasible_stationarity=false,saw_residual_failure=false;
+  double distance=initial_distance;
+  for(unsigned attempt=0;attempt<maximum_root_iterations;++attempt){
+    double point=floor+distance;if(!(point>floor))point=std::nextafter(floor,std::numeric_limits<double>::infinity());
+    if(!std::isfinite(point))break;
+    double phi=0.0,point_objective=0.0;
+    const StationarityAttempt status=try_stationarity("INTERIOR_SIGN_BRACKET",point,phi,point_objective);
+    if(status==StationarityAttempt::VALID){
+      any_feasible_stationarity=true;
+      if(phi>0.0){lo=point;phi_lo=phi;positive_sign_found=true;break;}
+      double negative_point=point,negative_phi=phi,inside_distance=distance;
+      for(unsigned inner=0;inner<maximum_root_iterations;++inner){
+        inside_distance*=0.5;const double inside=floor+inside_distance;
+        if(!(inside<negative_point)||!(inside>floor))break;
+        double inside_phi=0.0,inside_objective=0.0;
+        const StationarityAttempt inside_status=try_stationarity("INTERIOR_POSITIVE_SIGN_SEARCH",inside,inside_phi,inside_objective);
+        if(inside_status==StationarityAttempt::VALID){any_feasible_stationarity=true;
+          if(inside_phi>0.0){lo=inside;phi_lo=inside_phi;hi=negative_point;phi_hi=negative_phi;
+            positive_sign_found=negative_sign_found=true;break;}
+          negative_point=inside;negative_phi=inside_phi;
+        }else if(inside_status==StationarityAttempt::RESIDUAL_FAIL)saw_residual_failure=true;
+        else break;
+      }
+      if(!positive_sign_found){set_search_state("POSITIVE_SIGN_UNCONFIRMED",negative_point);
+        throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: no residual-valid positive stationarity sign was established on the stable side of the boundary");}
+      break;
     }
-    if(!bracketed)throw std::runtime_error("BASELINE_ROOT_FAIL: could not bracket the free graph-Laplacian stationarity root");
-    double best_mu=std::abs(phi_lo)<std::abs(phi_hi)?lo:hi;
-    double best_phi=std::abs(phi_lo)<std::abs(phi_hi)?phi_lo:phi_hi;
-    for(unsigned iteration=0;iteration<maximum_root_iterations;++iteration){
-      const double middle=lo+0.5*(hi-lo);
-      if(middle==lo||middle==hi)break;
-      double middle_phi=0.0,middle_objective=0.0;
-      if(!stationarity(middle,middle_phi,middle_objective))
-        throw std::runtime_error("BASELINE_ROOT_FAIL: bisection candidate is not stable");
-      ++result.root_iterations;
-      if(std::abs(middle_phi)<std::abs(best_phi)){best_mu=middle;best_phi=middle_phi;objective=middle_objective;}
-      if(middle_phi>0.0){lo=middle;phi_lo=middle_phi;}else{hi=middle;phi_hi=middle_phi;}
-      const double scale=std::max(std::abs(data_slope),std::abs(middle_phi+data_slope));
-      if(scale>0.0&&std::abs(middle_phi)/scale<=relative_root_tolerance_floor)break;
-    }
-    result.mu=best_mu;result.phi=best_phi;result.root_bracket_width=hi-lo;
-    result.stationarity_status="FREE_ROOT";
-    if(std::abs(best_phi)/std::max(std::abs(data_slope),std::abs(best_phi+data_slope))>result.root_relative_tolerance)
-      throw std::runtime_error("BASELINE_ROOT_FAIL: bounded one-dimensional root did not meet its stationarity tolerance");
+    if(status==StationarityAttempt::RESIDUAL_FAIL)saw_residual_failure=true;
+    distance*=2.0;if(!std::isfinite(distance))break;
   }
+  if(!positive_sign_found){
+    if(saw_residual_failure){set_search_state("POSITIVE_SIGN_UNCONFIRMED",search_diagnostics?search_diagnostics->mu:floor);
+      throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: strict trace solves did not establish a positive stationarity sign near the stability boundary");}
+    if(!any_feasible_stationarity)throw std::runtime_error("BASELINE_SPD_FAIL: no strict epsilon-positive interior point was available for stationarity");
+    throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: could not establish a positive stationarity sign inside the strict SPD interval");
+  }
+  if(!negative_sign_found){
+    double outside_distance=initial_distance;bool saw_upper_residual_failure=false;
+    for(unsigned attempt=0;attempt<maximum_root_iterations;++attempt){
+      double point=lo+outside_distance;if(!(point>lo))point=std::nextafter(lo,std::numeric_limits<double>::infinity());
+      if(!std::isfinite(point))break;
+      double phi=0.0,point_objective=0.0;
+      const StationarityAttempt status=try_stationarity("INTERIOR_NEGATIVE_SIGN_SEARCH",point,phi,point_objective);
+      if(status==StationarityAttempt::VALID){any_feasible_stationarity=true;
+        if(phi<=0.0){hi=point;phi_hi=phi;negative_sign_found=true;break;}
+        lo=point;phi_lo=phi;
+      }else if(status==StationarityAttempt::RESIDUAL_FAIL){saw_residual_failure=saw_upper_residual_failure=true;}
+      else throw std::runtime_error("BASELINE_SPD_FAIL: one-dimensional root bracket left the stable interval");
+      outside_distance*=2.0;if(!std::isfinite(outside_distance))break;
+    }
+    if(!negative_sign_found){
+      if(saw_upper_residual_failure)throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: strict trace solves did not establish a negative stationarity sign for the root bracket");
+      throw std::runtime_error("BASELINE_ROOT_FAIL: could not bracket the free graph-Laplacian stationarity root");}
+  }
+  double best_mu=std::abs(phi_lo)<std::abs(phi_hi)?lo:hi;
+  double best_phi=std::abs(phi_lo)<std::abs(phi_hi)?phi_lo:phi_hi;
+  for(unsigned iteration=0;iteration<maximum_root_iterations;++iteration){
+    const double middle=lo+0.5*(hi-lo);if(middle==lo||middle==hi)break;
+    double middle_phi=0.0,middle_objective=0.0;
+    const StationarityAttempt status=try_stationarity("ROOT_BISECTION",middle,middle_phi,middle_objective);
+    if(status==StationarityAttempt::RESIDUAL_FAIL)
+      throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: strict trace solve failed inside the root bracket; no stationarity claim is made");
+    if(status==StationarityAttempt::INFEASIBLE)throw std::runtime_error("BASELINE_SPD_FAIL: root bisection candidate left the strict SPD interval");
+    ++result.root_iterations;
+    if(std::abs(middle_phi)<std::abs(best_phi)){best_mu=middle;best_phi=middle_phi;}
+    if(middle_phi>0.0){lo=middle;phi_lo=middle_phi;}else{hi=middle;phi_hi=middle_phi;}
+    const double scale=std::max(std::abs(data_slope),std::abs(middle_phi+data_slope));
+    if(scale>0.0&&std::abs(middle_phi)/scale<=relative_root_tolerance_floor)break;
+  }
+  result.mu=best_mu;result.phi=best_phi;result.root_bracket_width=hi-lo;
+  result.stationarity_status="FREE_ROOT";
+  if(std::abs(best_phi)/std::max(std::abs(data_slope),std::abs(best_phi+data_slope))>result.root_relative_tolerance)
+    throw std::runtime_error("BASELINE_ROOT_FAIL: bounded one-dimensional root did not meet its stationarity tolerance");
   result.theta=parameters_at(result.mu);
+  set_search_state("FINAL_STRICT_CERTIFICATE",result.mu);
   covariance_budget_observe_or_throw(budget,limits);
   CovarianceGradientBudgetReservation gradient_budget(budget,limits);
   std::vector<double> shifted_diagonal;
-  if(!system.evaluate_factors(result.theta,epsilon,result.logdet,result.shifted_logdet,&result.trace,nullptr,false,true,
+  try{if(!system.evaluate_factors(result.theta,epsilon,result.logdet,result.shifted_logdet,&result.trace,nullptr,false,true,
        nullptr,nullptr,nullptr,&shifted_diagonal))
-    throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline did not retain strict epsilon-positive curvature");
+      throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline did not retain strict epsilon-positive curvature");}
+  catch(const CovarianceSolveResidualError& error){record_residual_failure("FINAL_STRICT_CERTIFICATE",result.mu,error);throw;}
   if(shifted_diagonal.empty())throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline has no shifted Cholesky diagonal");
   result.phi=covariance_dot(result.trace,direction)-data_slope;
   result.phi_relative=std::abs(result.phi)/std::max(std::abs(data_slope),std::abs(result.phi+data_slope));
   result.phi_solve_residual_heuristic=std::max(1.0e-12,2.0*system.worst_solve_relative_residual)*
     std::max(std::abs(data_slope),std::abs(result.phi+data_slope));
   result.root_relative_tolerance=relative_root_tolerance_floor;
-  if(!result.epsilon_constraint_active&&result.phi_relative>result.root_relative_tolerance)
+  if(result.phi_relative>result.root_relative_tolerance)
     throw std::runtime_error("BASELINE_ROOT_FAIL: final selected point exceeds the fixed relative stationarity tolerance");
   result.minimum_shifted_cholesky_diagonal=*std::min_element(shifted_diagonal.begin(),shifted_diagonal.end());
-  if(result.epsilon_constraint_active)
-    throw std::runtime_error("BASELINE_NUMERICAL_UNCONFIRMED: active stability-bound references are not certified by the available trace solve");
   result.stationarity_status="FREE_ROOT";
   if(!std::isfinite(result.minimum_shifted_cholesky_diagonal)||!(result.minimum_shifted_cholesky_diagonal>0.0))
     throw std::runtime_error("BASELINE_SPD_FAIL: selected graph-Laplacian baseline has no positive shifted Cholesky diagonal");
@@ -6964,6 +7043,11 @@ struct CovarianceFitResult
   CovarianceJointRayProposal joint_ray_attempt,joint_ray_committed;
   CovarianceTraceDiagnostics failed_d_trace,failed_shifted_trace;
   double baseline_mu=std::numeric_limits<double>::quiet_NaN(),objective_data=std::numeric_limits<double>::quiet_NaN();
+  double graph_reference_search_mu=std::numeric_limits<double>::quiet_NaN();
+  std::string graph_reference_search_stage="NOT_RUN";
+  double graph_reference_last_residual_mu=std::numeric_limits<double>::quiet_NaN();
+  std::string graph_reference_last_residual_stage="NOT_RUN";
+  std::uint64_t graph_reference_residual_failures=0;
   double objective_prior=std::numeric_limits<double>::quiet_NaN(),objective_ridge=std::numeric_limits<double>::quiet_NaN();
   double objective_barrier=std::numeric_limits<double>::quiet_NaN();
   double objective_total=std::numeric_limits<double>::quiet_NaN(),scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
@@ -7019,6 +7103,24 @@ struct CovarianceFitResult
   double group_bfgs_direction_gamma=std::numeric_limits<double>::quiet_NaN();std::string group_bfgs_direction_source="NOT_USED";
   int iterations=0;
 };
+
+void capture_graph_reference_fit_diagnostics(CovarianceFitResult& fit,const DeviceCovarianceSystem& system,
+  const GraphReferenceSearchDiagnostics& search)
+{
+  fit.graph_reference_search_mu=search.mu;fit.graph_reference_search_stage=search.stage;
+  fit.graph_reference_last_residual_mu=search.last_residual_mu;
+  fit.graph_reference_last_residual_stage=search.last_residual_stage;
+  fit.graph_reference_residual_failures=search.residual_failures;
+  fit.factorizations=system.factorizations;fit.solve_rhs_columns=system.solve_rhs_columns;
+  fit.trace_solve_calls=system.trace_solve_calls;fit.trace_solve_batch=DeviceCovarianceSystem::trace_solve_batch;
+  fit.trace_residual_batch=DeviceCovarianceSystem::trace_residual_batch;
+  fit.factorization_seconds=system.factorization_wall_seconds;
+  fit.worst_solve_relative_residual=system.worst_solve_relative_residual;
+  fit.run_trace_residual_summary=system.run_trace_residual_summary;
+  fit.failed_d_trace=system.last_d_trace;fit.failed_shifted_trace=system.last_shifted_trace;
+  if(search.residual_failures>0){fit.failed_d_trace=search.last_residual_d_trace;
+    fit.failed_shifted_trace=search.last_residual_shifted_trace;}
+}
 
 void rebuild_restored_a0_baseline(CovarianceFitResult& fit,DeviceBaseline& device_baseline,const Graph& graph,
   const std::vector<double>& sqrt_mass,const std::vector<double>& masses,
@@ -10964,6 +11066,11 @@ void write_covariance_state(const std::string& path,const CovarianceFitResult& f
     <<"\nqraw_charge_mode "<<identity.charge<<"\nqraw_kspace_flag "<<identity.kspace<<"\nqraw_mesh_spacing "<<identity.mesh
     <<"\nactive_pppm_mesh_spacing "<<identity.active_mesh
     <<"\nbaseline_mu "<<fit.baseline_mu<<"\nbaseline_epsilon_constraint_status "<<fit.epsilon_constraint_status
+    <<"\ngraph_reference_search_stage "<<fit.graph_reference_search_stage
+    <<"\ngraph_reference_search_mu "<<fit.graph_reference_search_mu
+    <<"\ngraph_reference_last_residual_stage "<<fit.graph_reference_last_residual_stage
+    <<"\ngraph_reference_last_residual_mu "<<fit.graph_reference_last_residual_mu
+    <<"\ngraph_reference_residual_failures "<<fit.graph_reference_residual_failures
     <<"\nobjective_data "<<fit.objective_data<<"\nobjective_prior "<<fit.objective_prior
     <<"\nobjective_barrier "<<fit.objective_barrier<<"\nobjective_total "<<fit.objective_total
     <<"\noptimizer_scaled_kkt_residual "<<fit.scaled_kkt_residual<<"\noptimizer_raw_gradient_inf_norm "<<fit.raw_gradient_inf_norm<<"\nbarrier_tau "<<fit.barrier_tau
@@ -14377,8 +14484,12 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
     try{DeviceCovarianceSystem covariance_system(baseline,graph,sqrt_mass,atom.cpu_mass);
       if(options.graph_reference){
         covariance_fit.statistics=statistics;
-        covariance_fit.covariance_baseline=build_graph_reference_baseline(covariance_system,statistics,options.epsilon,
-          covariance_fit.objective_evaluations,nullptr,nullptr,nullptr,saved_graph_candidate_ptr);
+        GraphReferenceSearchDiagnostics search_diagnostics;
+        try{covariance_fit.covariance_baseline=build_graph_reference_baseline(covariance_system,statistics,options.epsilon,
+          covariance_fit.objective_evaluations,nullptr,nullptr,&covariance_fit.objective_evaluation_seconds,
+          saved_graph_candidate_ptr,&search_diagnostics);}
+        catch(...){capture_graph_reference_fit_diagnostics(covariance_fit,covariance_system,search_diagnostics);throw;}
+        capture_graph_reference_fit_diagnostics(covariance_fit,covariance_system,search_diagnostics);
         covariance_fit.theta_baseline=covariance_fit.covariance_baseline.theta;
         covariance_fit.theta_start=covariance_fit.theta_baseline;
         covariance_fit.theta=covariance_fit.theta_baseline;
@@ -14387,9 +14498,6 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         covariance_fit.reason="independent one-parameter fixed-R0 graph reference";
         covariance_fit.converged=true;
         covariance_fit.initialization_status="GRAPH_BASELINE_PASS";
-        covariance_fit.solve_rhs_columns=covariance_system.solve_rhs_columns;
-        covariance_fit.worst_solve_relative_residual=covariance_system.worst_solve_relative_residual;
-        covariance_fit.factorizations=covariance_system.factorizations;
         covariance_fit.scaled_kkt_residual=std::numeric_limits<double>::quiet_NaN();
         trace<<"GRAPH_REFERENCE_BASELINE status NUMERICAL_PASS parameter_count "<<statistics.size()
           <<" baseline_mu "<<covariance_fit.baseline_mu
@@ -14409,14 +14517,26 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         options.max_covariance_iterations,&trace,options.covariance_block_newton,options.covariance_joint_block,
         options.covariance_trust_region,options.covariance_staged_barrier,training_block_statistics,training_block_frames,
         options.covariance_ridge_lambda,options.covariance_analytic_curvature_probes);}
-    catch(const std::exception& error){if(covariance_fit.reason=="none"){covariance_fit.status="NUMERICAL_SOLVE_FAIL";covariance_fit.reason=error.what();}}
+    catch(const std::exception& error){if(covariance_fit.reason=="none"){
+      covariance_fit.reason=error.what();
+      covariance_fit.status=options.graph_reference&&covariance_fit.reason.rfind("BASELINE_NUMERICAL_UNCONFIRMED",0)==0?
+        "NUMERICAL_UNCONFIRMED":"NUMERICAL_SOLVE_FAIL";}}
     if(covariance_fit.theta_baseline.empty())
       trace<<(options.graph_reference?"GRAPH_REFERENCE_NUMERICAL_FAIL status ":"BASELINE_SPD_FAIL status ")
         <<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)<<'\n';
     if(options.graph_reference){
       trace<<"GRAPH_REFERENCE_NUMERICAL_STATUS "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)
         <<" objective_evaluations "<<covariance_fit.objective_evaluations<<" factorizations "<<covariance_fit.factorizations
+        <<" solve_rhs_columns "<<covariance_fit.solve_rhs_columns<<" trace_solve_calls "<<covariance_fit.trace_solve_calls
+        <<" worst_solve_relative_residual "<<covariance_fit.worst_solve_relative_residual
+        <<" search_stage "<<covariance_fit.graph_reference_search_stage
+        <<" search_mu "<<covariance_fit.graph_reference_search_mu
+        <<" last_residual_stage "<<covariance_fit.graph_reference_last_residual_stage
+        <<" last_residual_mu "<<covariance_fit.graph_reference_last_residual_mu
+        <<" residual_failures "<<covariance_fit.graph_reference_residual_failures
         <<" optimizer_60_parameter_run 0\n";
+      write_covariance_run_trace_residual_summary(trace,covariance_fit.run_trace_residual_summary,
+        "graph_reference_run_trace_residual",' ','=');trace<<'\n';
     }else trace<<"COVARIANCE_OPTIMIZER status "<<covariance_fit.status<<" reason "<<std::quoted(covariance_fit.reason)
       <<" objective_evaluations "<<covariance_fit.objective_evaluations<<" factorizations "<<covariance_fit.factorizations
       <<" optimizer_step_mode "<<(covariance_fit.trust_region_enabled?"TRUST_REGION_OPT_IN":covariance_fit.joint_block_enabled?"JOINT_BLOCK_OPT_IN":covariance_fit.block_newton_enabled?"BLOCK_NEWTON_OPT_IN":"BFGS_DEFAULT")
@@ -14946,6 +15066,11 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
        for(double value:covariance_fit.coordinate_scale)fitout<<' '<<value;
        fitout
       <<"\nbaseline_mu "<<covariance_fit.baseline_mu<<"\nbaseline_epsilon_constraint_status "<<covariance_fit.epsilon_constraint_status
+      <<"\ngraph_reference_search_stage "<<covariance_fit.graph_reference_search_stage
+      <<"\ngraph_reference_search_mu "<<covariance_fit.graph_reference_search_mu
+      <<"\ngraph_reference_last_residual_stage "<<covariance_fit.graph_reference_last_residual_stage
+      <<"\ngraph_reference_last_residual_mu "<<covariance_fit.graph_reference_last_residual_mu
+      <<"\ngraph_reference_residual_failures "<<covariance_fit.graph_reference_residual_failures
       <<"\ninitialization_status "<<covariance_fit.initialization_status<<"\ninitialization_evaluations "<<covariance_fit.initialization_evaluations
       <<"\ninitialization_gradient_calls "<<covariance_fit.initialization_gradient_calls
       <<"\nstart_graph_delta "<<covariance_fit.start_graph_delta<<"\nstart_objective "<<covariance_fit.start_objective

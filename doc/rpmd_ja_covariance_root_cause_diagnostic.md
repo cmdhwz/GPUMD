@@ -109,9 +109,20 @@ and the shifted epsilon barrier do not generally satisfy this formula.
 | Valid curvature predicts useful descent but BFGS steps poorly | Test one curvature/step modification with a short explicit budget. |
 | Reliable optimization passes but independent response remains wrong | Extend frozen structural/environment basis functions. |
 
-The final reference still requires optimizer convergence, held-out response,
+A production reference still requires optimizer convergence, held-out response,
 consistent additive energy/transport packaging, prepare, and the stored-matrix
 SPD certificate. Finite probes do not certify full-space material response.
+
+For `graph_reference`, rerun the original command with the same sample spool,
+qraw, kernel table, loaded model/PPPM configuration, cutoff, epsilon, response
+tolerance, and finite-difference step; change only the output name when needed.
+Do not regenerate the qraw or alter its mesh between runs. A residual-failed
+boundary trace leaves the sign unknown and may be retried at interior points.
+`NUMERICAL_UNCONFIRMED` means no strict residual-valid root bracket was proved;
+it is neither a pass nor an accepted reference. Record the response status;
+`RESPONSE_FAIL` or an inconclusive response may remain diagnostic for this
+graph-reference mode when the root, prepare, and stored-matrix SPD/readback
+checks pass. A scalar numerical pass alone does not write a reference.
 
 ## Server checks
 

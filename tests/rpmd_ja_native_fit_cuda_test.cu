@@ -2231,10 +2231,13 @@ void test_covariance_baseline_brackets_both_signs_and_zero()
     std::uint64_t optimizer_evaluations=0;
     const CovarianceBaseline optimizer_reference=build_graph_covariance_baseline(system,statistics,0.01,optimizer_evaluations);
     assert(optimizer_reference.epsilon_constraint_active&&optimizer_reference.mu>=optimizer_reference.boundary_mu);
+    GraphReferenceSearchDiagnostics search;
+    covariance_fit_test_hooks={};
     bool unconfirmed=false;
-    try{(void)build_graph_reference_baseline(system,statistics,0.01,evaluations);}
+    try{(void)build_graph_reference_baseline(system,statistics,0.01,evaluations,nullptr,nullptr,nullptr,nullptr,&search);}
     catch(const std::runtime_error& error){unconfirmed=std::string(error.what()).find("BASELINE_NUMERICAL_UNCONFIRMED")!=std::string::npos;}
-    assert(unconfirmed);
+    const int valid_evaluations=covariance_fit_test_hooks.graph_reference_stationarity_valid_evaluations;covariance_fit_test_hooks={};
+    assert(unconfirmed&&search.stage=="POSITIVE_SIGN_UNCONFIRMED"&&valid_evaluations>0);
   }
   {
     constexpr double epsilon=1.0e-8,expected_mu=1.3e-8;
@@ -2248,6 +2251,79 @@ void test_covariance_baseline_brackets_both_signs_and_zero()
     check_close(reference.mu,expected_mu,1e-7);
     assert(reference.phi_relative<=1e-7&&reference.root_iterations<=64&&
       reference.minimum_shifted_cholesky_diagonal>0.0&&!reference.epsilon_constraint_active);
+  }
+  {
+    constexpr double epsilon=1.0e-8,expected_mu=(epsilon/2.0)*(1.0+5.0e-5);
+    const std::vector<double> unit_masses={1.0,1.0},unit_sqrt_mass={1.0,1.0,1.0,1.0,1.0,1.0};
+    DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,false);
+    DeviceCovarianceSystem system(baseline,graph,unit_sqrt_mass,unit_masses);
+    const double slope=3.0/expected_mu;
+    const std::vector<double> statistics={slope/3.0,0.0,0.0,slope/3.0,0.0,slope/3.0};
+    std::uint64_t evaluations=0;
+    const CovarianceBaseline reference=build_graph_reference_baseline(system,statistics,epsilon,evaluations);
+    assert(std::abs(reference.boundary_mu-epsilon/2.0)<1e-16);
+    assert(std::abs(reference.mu-expected_mu)<=1e-15);
+    assert(reference.mu>reference.boundary_mu&&reference.mu-reference.boundary_mu<1e-12);
+    assert(!reference.epsilon_constraint_active);
+    assert(reference.phi_relative<=1e-7&&reference.minimum_shifted_cholesky_diagonal>0.0);
+  }
+  {
+    DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+    const std::vector<double> statistics={0.3,0.08,-0.04,0.25,0.06,0.35};std::uint64_t evaluations=0;
+    GraphReferenceSearchDiagnostics search;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.trace_solution_failure_column=0;
+    covariance_fit_test_hooks.trace_solution_failure_delta=1e-4;
+    covariance_fit_test_hooks.trace_solution_failure_count_remaining=20;
+    const CovarianceBaseline reference=build_graph_reference_baseline(system,statistics,0.01,evaluations,
+      nullptr,nullptr,nullptr,nullptr,&search);
+    const int injected_failures=20-covariance_fit_test_hooks.trace_solution_failure_count_remaining;
+    covariance_fit_test_hooks={};
+    numeric_pass(reference,evaluations);
+    assert(injected_failures==20&&search.residual_failures==20);
+    assert(search.last_residual_stage=="INTERIOR_SIGN_BRACKET"&&std::isfinite(search.last_residual_mu));
+    assert(search.last_residual_d_trace.matrix_kind=="D"&&search.last_residual_d_trace.status=="RESIDUAL_FAIL");
+    assert(search.last_residual_d_trace.factor_solve_relative_residual>1e-7);
+  }
+  {
+    const std::vector<double> statistics={0.3,0.08,-0.04,0.25,0.06,0.35};
+    DeviceBaseline probe_baseline;initialize_two_atom_covariance_baseline(probe_baseline,true);
+    DeviceCovarianceSystem probe_system(probe_baseline,graph,sqrt_mass,masses);std::uint64_t probe_evaluations=0;
+    (void)build_graph_reference_baseline(probe_system,statistics,0.01,probe_evaluations);
+    assert(probe_system.trace_solve_calls>0);
+    DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);
+    DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);std::uint64_t evaluations=0;
+    GraphReferenceSearchDiagnostics search;covariance_fit_test_hooks={};
+    covariance_fit_test_hooks.trace_solution_failure_column=0;covariance_fit_test_hooks.trace_solution_failure_delta=1e-4;
+    covariance_fit_test_hooks.trace_solution_failure_skip=static_cast<int>(probe_system.trace_solve_calls-1);
+    covariance_fit_test_hooks.trace_solution_failure_count_remaining=1;
+    bool final_residual_failure=false;
+    try{(void)build_graph_reference_baseline(system,statistics,0.01,evaluations,nullptr,nullptr,nullptr,nullptr,&search);}
+    catch(const CovarianceSolveResidualError&){final_residual_failure=true;}
+    covariance_fit_test_hooks={};
+    assert(final_residual_failure&&search.stage=="FINAL_STRICT_CERTIFICATE");
+    assert(search.last_residual_stage=="FINAL_STRICT_CERTIFICATE"&&search.last_residual_mu==search.mu&&
+      search.residual_failures==1);
+    assert(search.last_residual_d_trace.matrix_kind=="D"&&search.last_residual_d_trace.status=="RESIDUAL_FAIL"&&
+      search.last_residual_d_trace.factor_solve_relative_residual>1e-7);
+  }
+  {
+    DeviceBaseline baseline;initialize_two_atom_covariance_baseline(baseline,true);DeviceCovarianceSystem system(baseline,graph,sqrt_mass,masses);
+    const std::vector<double> statistics={0.3,0.08,-0.04,0.25,0.06,0.35};std::uint64_t evaluations=0;
+    GraphReferenceSearchDiagnostics search;
+    covariance_fit_test_hooks={};covariance_fit_test_hooks.trace_solution_failure_column=0;
+    covariance_fit_test_hooks.trace_solution_failure_delta=1e-4;
+    bool unconfirmed=false;
+    try{(void)build_graph_reference_baseline(system,statistics,0.01,evaluations,nullptr,nullptr,nullptr,nullptr,&search);}
+    catch(const std::runtime_error& error){unconfirmed=std::string(error.what()).find("BASELINE_NUMERICAL_UNCONFIRMED")!=std::string::npos;}
+    CovarianceFitResult failure;capture_graph_reference_fit_diagnostics(failure,system,search);
+    covariance_fit_test_hooks={};
+    assert(unconfirmed&&search.stage=="POSITIVE_SIGN_UNCONFIRMED"&&search.residual_failures==64&&evaluations<=200);
+    assert(search.last_residual_stage=="INTERIOR_SIGN_BRACKET"&&search.last_residual_mu==search.mu);
+    assert(failure.factorizations>0&&failure.solve_rhs_columns>0&&failure.trace_solve_calls>0);
+    assert(failure.failed_d_trace.matrix_kind=="D"&&failure.failed_d_trace.status=="RESIDUAL_FAIL");
+    assert(failure.failed_d_trace.factor_solve_relative_residual>1e-7);
+    assert(failure.run_trace_residual_summary.failed_logical_batches>0&&
+      failure.run_trace_residual_summary.worst_factor_matrix_kind=="D");
   }
 }
 
