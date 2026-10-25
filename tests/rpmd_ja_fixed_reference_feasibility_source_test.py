@@ -36,6 +36,23 @@ response_cleanup = fit.index("    if(response_solver)cusolverDnDestroy(response_
                             fit.index("cusolverDnDestroy(response_solver);throw;}}", response_start))
 assert scope_end(response_start) < response_cleanup
 
+# Readback results must survive the temporary package/prepare block.
+for declaration in ("bool graph_reference_readback_verified=false;",
+                    "std::string graph_prepared_mechanical_policy;"):
+    position = fit.index(declaration, implementation_start)
+    enclosing = []
+    for index in range(fit_scopes.index("{", implementation_start), position):
+        if fit_scopes[index] == "{":
+            enclosing.append(index)
+        elif fit_scopes[index] == "}":
+            enclosing.pop()
+    assert enclosing == [fit_scopes.index("{", implementation_start)], declaration
+
+assert 'std::string(options.internal_mass_com?"native_reference_transport;internal_mass_com_pullback_v1;finite_temperature_additive_v1":"native_reference_transport;finite_temperature_additive_v1")+";beads="' in fit
+reference_source = source("src/measure/rpmd_ja_reference.cu")
+assert "std::filesystem::" not in reference_source
+assert "rpmd_ja_file_io::resize_file(temporary," in reference_source
+
 policy = source("src/measure/rpmd_ja_feasibility_policy.cuh")
 cuda_test = source("tests/rpmd_ja_native_fit_cuda_test.cu")
 integration_test = source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu")

@@ -19,7 +19,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -2865,11 +2864,10 @@ static void generate_rpmd_ja_qnep_raw_reference(
     update.flush(); if (!update) throw std::runtime_error("failed writing qNEP v4 raw diagnostic footer");
     update.close(); if (!update) throw std::runtime_error("failed closing qNEP v4 raw diagnostic update");
   }
-  std::error_code resize_error;
   const std::streamoff compact_size=static_cast<std::streamoff>(stats_start)+stats_bytes;
   if(compact_size<0)throw std::runtime_error("qNEP v4 compact size exceeds platform file offsets");
-  std::filesystem::resize_file(std::filesystem::u8path(temporary), static_cast<std::uintmax_t>(compact_size), resize_error);
-  if (resize_error) throw std::runtime_error("cannot compact qNEP v4 raw file: " + resize_error.message());
+  if (rpmd_ja_file_io::resize_file(temporary, static_cast<std::uint64_t>(compact_size)) != 0)
+    throw std::runtime_error(std::string("cannot compact qNEP v4 raw file: ") + std::strerror(errno));
   if(rpmd_ja_file_io::remove_file(vtranspose_temporary)!=0)
     throw std::runtime_error("cannot remove qNEP v4 V-transpose scratch before publishing raw file");
   remove_vtranspose.active=false;

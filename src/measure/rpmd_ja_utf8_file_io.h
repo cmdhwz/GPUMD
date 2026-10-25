@@ -17,7 +17,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <io.h>
 #else
+#include <sys/types.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 #endif
@@ -88,6 +90,31 @@ inline int remove_file(const std::string& path)
 #else
   return std::remove(path.c_str());
 #endif
+}
+
+// Keep large-file truncation compatible with the C++14 Makefile and UTF-8 paths.
+inline int resize_file(const std::string& path,const std::uint64_t size)
+{
+#ifdef _WIN32
+  using FileOffset = __int64;
+#else
+  using FileOffset = off_t;
+#endif
+  if(size>static_cast<std::uint64_t>(std::numeric_limits<FileOffset>::max())){
+    errno=EFBIG;return -1;
+  }
+  std::FILE* file=open_file(path,"r+b");
+  if(!file)return -1;
+#ifdef _WIN32
+  const int result=static_cast<int>(::_chsize_s(::_fileno(file),static_cast<FileOffset>(size)));
+  if(result!=0)errno=result;
+#else
+  const int result=::ftruncate(::fileno(file),static_cast<FileOffset>(size));
+#endif
+  const int resize_errno=errno;
+  const int close_result=std::fclose(file);
+  if(result!=0){errno=resize_errno;return -1;}
+  return close_result;
 }
 
 inline int rename_file(const std::string& from,const std::string& to)

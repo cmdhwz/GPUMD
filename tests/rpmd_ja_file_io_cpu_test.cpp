@@ -201,8 +201,27 @@ void test_cgroup_file_reader_preserves_controller_text_and_empty_files()
 }
 }
 
+void test_resize_file_preserves_prefix_and_rejects_invalid_size()
+{
+  const std::string path="rpmd_ja_resize_"+
+    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+u8"_测试.tmp";
+  struct Cleanup{std::string path;~Cleanup(){rpmd_ja_file_io::remove_file(path);}} cleanup{path};
+  {rpmd_ja_file_io::ofstream out(path,std::ios::binary);out<<"abcdef";REQUIRE(out.good());}
+  REQUIRE(rpmd_ja_file_io::resize_file(path,3)==0);
+  {rpmd_ja_file_io::ifstream in(path,std::ios::binary);
+    std::string value((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+    REQUIRE(value=="abc");}
+  REQUIRE(rpmd_ja_file_io::resize_file(path,std::numeric_limits<std::uint64_t>::max())!=0);
+  {rpmd_ja_file_io::ifstream in(path,std::ios::binary|std::ios::ate);REQUIRE(in.tellg()==std::streampos(3));}
+  REQUIRE(rpmd_ja_file_io::resize_file(path,0)==0);
+  {rpmd_ja_file_io::ifstream in(path,std::ios::binary|std::ios::ate);REQUIRE(in.tellg()==std::streampos(0));}
+  REQUIRE(rpmd_ja_file_io::resize_file(path+".missing",1)!=0);
+  {rpmd_ja_file_io::ifstream in(path+".missing");REQUIRE(!in.good());}
+}
+
 int main()
 {
+  test_resize_file_preserves_prefix_and_rejects_invalid_size();
   test_cgroup_v2_nested_limit_and_tighter_ancestor();
   test_cgroup_v2_mount_root_and_escaped_mountpoint();
   test_cgroup_v2_namespace_root_keeps_delegated_mount_limit();
