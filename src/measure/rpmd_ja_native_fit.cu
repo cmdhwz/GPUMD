@@ -14526,6 +14526,7 @@ static bool fit_rpmd_ja_native_reference_impl(const RpmdJANativeFitOptions& opti
         trace<<"FIT_RESPONSE_ABORT detail "<<std::quoted(error.what())<<'\n';trace.flush();
         rpmd_ja_file_io::ifstream state_exists(covariance_state_path);if(!state_exists.good())write_covariance_state(covariance_state_path,covariance_fit,effective_covariance_rho,spool_path,raw_path,options,header,qraw_identity,graph,frame_count,static_cast<std::uint64_t>(train));
         cusolverDnDestroy(response_solver);throw;}}
+    }
     if(response_solver)cusolverDnDestroy(response_solver);
     if(standalone_development_candidate){
       trace<<"FEASIBILITY_ENDPOINT status DEVELOPMENT_CANDIDATE production_reference 0 reason INDEPENDENT_BLIND_GATE_REQUIRED resume_supported 0\n";trace.flush();

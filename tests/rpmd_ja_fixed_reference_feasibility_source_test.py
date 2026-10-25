@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +12,30 @@ def source(path):
 run = source("src/main_gpumd/run.cu")
 header = source("src/measure/rpmd_ja_native_fit.cuh")
 fit = source("src/measure/rpmd_ja_native_fit.cu")
+
+# Ignore comments and literals when checking the response/fit scope boundaries.
+fit_scopes = re.sub(
+    r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+    lambda match: " " * len(match.group()), fit)
+
+
+def scope_end(start):
+    opening = fit_scopes.index("{", start)
+    depth = 1
+    for index in range(opening + 1, len(fit_scopes)):
+        depth += (fit_scopes[index] == "{") - (fit_scopes[index] == "}")
+        if depth == 0:
+            return index
+    raise AssertionError("native fit contains an unclosed scope")
+
+
+implementation_start = fit.index("static bool fit_rpmd_ja_native_reference_impl(")
+assert scope_end(implementation_start) < fit.index("bool retryable_publication_io_failure(")
+response_start = fit.index("if(response_solver){try{", implementation_start)
+response_cleanup = fit.index("    if(response_solver)cusolverDnDestroy(response_solver);",
+                            fit.index("cusolverDnDestroy(response_solver);throw;}}", response_start))
+assert scope_end(response_start) < response_cleanup
+
 policy = source("src/measure/rpmd_ja_feasibility_policy.cuh")
 cuda_test = source("tests/rpmd_ja_native_fit_cuda_test.cu")
 integration_test = source("tests/rpmd_ja_fit_prepare_integration_cuda_test.cu")
