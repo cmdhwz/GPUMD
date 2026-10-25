@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 source = Path(__file__).parents[1] / "src/measure/rpmd_ja_reference.cu"
@@ -7,6 +8,64 @@ root = Path(__file__).parents[1]
 cli = (root / "src/main_gpumd/run.cu").read_text(encoding="utf-8")
 native = (root / "src/measure/rpmd_ja_native_fit.cu").read_text(encoding="utf-8")
 header = (root / "src/measure/rpmd_ja_reference.cuh").read_text(encoding="utf-8")
+
+
+def fingerprint_calls(source_text):
+    occurrences = []
+    pattern = re.compile(r"(?<![\w:])qnep_config_fingerprint\s*\(")
+    for match in pattern.finditer(source_text):
+        open_paren = source_text.index("(", match.start())
+        depth = 1
+        start = open_paren + 1
+        arguments = []
+        quoted = False
+        escaped = False
+        for index in range(open_paren + 1, len(source_text)):
+            character = source_text[index]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif character == chr(92):
+                    escaped = True
+                elif character == '"':
+                    quoted = False
+                continue
+            if character == '"':
+                quoted = True
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    arguments.append(source_text[start:index].strip())
+                    tail = source_text[index + 1 :].lstrip()
+                    occurrences.append((match.start(), arguments, tail.startswith("{")))
+                    break
+            elif character == "," and depth == 1:
+                arguments.append(source_text[start:index].strip())
+                start = index + 1
+        else:
+            raise AssertionError("unterminated qnep_config_fingerprint call")
+    return occurrences
+
+
+fingerprint_occurrences = fingerprint_calls(text)
+fingerprint_definitions = [item for item in fingerprint_occurrences if item[2]]
+fingerprint_callsites = [item for item in fingerprint_occurrences if not item[2]]
+assert len(fingerprint_definitions) == 1
+assert len(fingerprint_callsites) == 3
+fingerprint_parameter_count = len(fingerprint_definitions[0][1])
+assert fingerprint_parameter_count == 4
+assert all(len(arguments) == fingerprint_parameter_count for _, arguments, _ in fingerprint_callsites)
+mode_validator = text[text.index("RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(") : text.index(
+    "void diagnose_rpmd_ja_qnep_reference(")]
+prepare_fingerprint_calls = fingerprint_calls(mode_validator)
+assert len(prepare_fingerprint_calls) == 1
+prepare_arguments = [" ".join(argument.split()) for argument in prepare_fingerprint_calls[0][1]]
+assert prepare_arguments == [
+    "*active_qnep", "force.primary_nep_model_path()", "raw.q_mesh_spacing",
+    'force.get_run_input().contains("dftd3")'
+]
 
 # Keep the diagnostic entry point stable for the saved-spool caller.
 assert "void diagnose_rpmd_ja_qnep_reference(const double fd_step, Atom& atom, Box& box, Force& force, const bool full)" in text

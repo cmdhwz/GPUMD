@@ -1361,7 +1361,9 @@ RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom& atom, Box& active_box
     if (!active_qnep || (active_qnep->get_charge_mode() != 1 && active_qnep->get_charge_mode() != 2) || !active_qnep->uses_pppm())
       throw std::runtime_error("INPUT_MISMATCH: prepare requires qNEP charge mode 1 or 2 with PPPM");
     if (rpmd_ja_model_fingerprint(force.primary_nep_model_path()) != raw.model_fingerprint ||
-        qnep_config_fingerprint(force, *active_qnep, raw.q_mesh_spacing) != raw.mechanical_config_fingerprint)
+        qnep_config_fingerprint(
+          *active_qnep, force.primary_nep_model_path(), raw.q_mesh_spacing,
+          force.get_run_input().contains("dftd3")) != raw.mechanical_config_fingerprint)
       throw std::runtime_error("INPUT_MISMATCH: model or qNEP configuration fingerprint differs from raw reference");
     QEvaluator evaluator(force.primary_nep_model_path(), n, force.get_run_input(), observer_box, raw.types, raw.q_mesh_spacing);
     const auto energy = [](const QEvaluation& e) {
