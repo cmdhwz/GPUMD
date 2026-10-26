@@ -10,6 +10,7 @@
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/read_file.cuh"
+#include "utilities/run_input.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include <algorithm>
