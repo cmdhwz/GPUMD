@@ -1318,7 +1318,7 @@ void prepare_rpmd_ja_qnep_reference(const std::string& raw_path, const std::stri
     std::vector<double> bounds(d); cuda_check(cudaMemcpy(bounds.data(),dw,d*sizeof(double),cudaMemcpyDeviceToHost),"read D row bounds");
     ref.spectral_bound=*std::max_element(bounds.begin(),bounds.end());
     const double kernel_required=HBAR/(K_B*ref.temperature)*std::sqrt(ref.spectral_bound);
-    if(!std::isfinite(ref.spectral_bound)||!std::isfinite(kernel_required)||!(kernel_required<=ref.kernel_u*(1.0+32.0*std::numeric_limits<double>::epsilon())))throw std::runtime_error("qNEP kernel table does not cover lossless D row bound");
+    if(!std::isfinite(ref.spectral_bound)||!std::isfinite(kernel_required)||!(kernel_required<=ref.kernel_u*(1.0+32.0*std::numeric_limits<double>::epsilon()))){std::ostringstream error;error<<std::setprecision(17)<<"qNEP kernel table does not cover lossless D row bound spectral_bound="<<ref.spectral_bound<<" required_kernel_u="<<kernel_required<<" table_kernel_u="<<ref.kernel_u<<" temperature_K="<<ref.temperature;throw std::runtime_error(error.str());}
     ref.minimum_cholesky_pivot=min_pivot; ref.relative_operator_bound=0.0;
     ref.stability_certificate=use_additive?"additive_shifted_frobenius_v1":"cholesky_relative_bound"; ref.stability_checked=true;
     ref.additive_reconstruction_bound=additive_eta;
