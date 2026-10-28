@@ -15,6 +15,7 @@
 #include "model/box.cuh"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <vector>
 
@@ -236,8 +237,11 @@ void HAC::pre_run_rpmd_ja_(
     PRINT_INPUT_ERROR("rpmd_ja requires one short-range NEP without unsupported corrections.");
   }
 
-  rpmd_ja_reference_ = read_rpmd_ja_reference(rpmd_ja_reference_path_);
-  rpmd_ja_reference_file_fingerprint_ = rpmd_ja_model_fingerprint(rpmd_ja_reference_path_);
+  const auto reference_start = std::chrono::steady_clock::now();
+  rpmd_ja_reference_ = read_rpmd_ja_reference(
+    rpmd_ja_reference_path_, &rpmd_ja_reference_file_fingerprint_);
+  printf("rpmd_ja reference load and validation: %.3f s\n",
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - reference_start).count());
   if(!rpmd_ja_reference_policy_use_matches(rpmd_ja_reference_.backend,
        rpmd_ja_reference_.mechanical_policy,rpmd_ja_diagnostic_))
     PRINT_INPUT_ERROR("rpmd_ja diagnostic references require explicit `rpmd_ja on <referencefile> diagnostic`; the selected use must match the reference identity.");
@@ -402,7 +406,7 @@ void HAC::pre_run_rpmd_ja_(
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
     } else {
       printf(
-        "rpmd_ja qNEP fixed-reference modal cache: source D tiles=%llu, B^T tiles=(%llu,%llu,%llu), setup=%.3f s, steady bytes=%llu, peak estimate=%llu bytes (cache only); each sampled point applies two modal projections and three cached K matrices (five matrix actions; sample time not benchmarked).\n",
+        "rpmd_ja qNEP fixed-reference physical cache: source D tiles=%llu, B^T tiles=(%llu,%llu,%llu), setup=%.3f s, steady bytes=%llu, peak estimate=%llu bytes (cache only); each sampled point applies three cached physical matrices (sample time not benchmarked).\n",
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.dynamical_block_count()),
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(0)),
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(1)),

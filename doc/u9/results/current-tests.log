@@ -1,0 +1,12 @@
+test_derivatives (test_bridge.Controls.test_derivatives) ... ok
+test_full_metric_canonical_and_unstable (test_bridge.Controls.test_full_metric_canonical_and_unstable) ... ok
+test_isotope_full_metric_current_and_classical_limit (test_bridge.ReferenceControls.test_isotope_full_metric_current_and_classical_limit) ... ok
+test_legacy_and_moving_are_distinct_and_old_recovers (test_bridge.ReferenceControls.test_legacy_and_moving_are_distinct_and_old_recovers) ... ok
+test_cpp_config_and_math (test_native.NativeMathTest.test_cpp_config_and_math) ... skipped 'C++ compiler not found; native parser and math have not run'
+test_full_g_reversibility (test_rpmd.RPMDControls.test_full_g_reversibility) ... ok
+test_full_g_harmonic_spectrum_and_kubo (test_spectrum.SpectralControls.test_full_g_harmonic_spectrum_and_kubo) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.864s
+
+OK (skipped=1)

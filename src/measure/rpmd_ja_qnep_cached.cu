@@ -23,6 +23,8 @@ namespace
 {
 constexpr int threads = 256;
 constexpr int tile_size = 128;
+constexpr int tile_batch_size = 32;
+struct TileDescriptor { int row, column, rows, columns, rank, left_offset, right_offset; };
 
 void cuda_check(const cudaError_t status, const char* operation)
 {
@@ -107,37 +109,53 @@ std::size_t validate_tiles(const RpmdJABlockMatrix& matrix, const int D)
   return matrix.tiles.size();
 }
 
-static __global__ void expand_tile(
-  const int D, const int row0, const int column0, const int rows, const int columns, const int rank,
-  const double* left, const double* right, double* matrix)
+static __global__ void expand_tiles(
+  const int D, const TileDescriptor* descriptors, const double* left, const double* right, double* matrix)
 {
+  const TileDescriptor tile = descriptors[blockIdx.y];
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  const int count = rows * columns;
-  if (index >= count) return;
-  const int row = index / columns;
-  const int column = index - row * columns;
+  if (index >= tile.rows * tile.columns) return;
+  const int row = index / tile.columns;
+  const int column = index - row * tile.columns;
   double value = 0.0;
-  if (rank == 0) {
-    value = left[index];
+  if (tile.rank == 0) {
+    value = left[tile.left_offset + index];
   } else {
-    for (int k = 0; k < rank; ++k)
-      value += left[static_cast<std::size_t>(row) * rank + k] *
-        right[static_cast<std::size_t>(k) * columns + column];
+    for (int k = 0; k < tile.rank; ++k)
+      value += left[tile.left_offset + row * tile.rank + k] *
+        right[tile.right_offset + k * tile.columns + column];
   }
-  matrix[row0 + row + static_cast<std::size_t>(column0 + column) * D] = value;
+  matrix[tile.row + row + static_cast<std::size_t>(tile.column + column) * D] = value;
 }
 
 void upload_tiles(
   const RpmdJABlockMatrix& source, const int D, GPU_Vector<double>& left,
-  GPU_Vector<double>& right, double* matrix)
+  GPU_Vector<double>& right, GPU_Vector<TileDescriptor>& descriptors, double* matrix)
 {
-  for (const auto& tile : source.tiles) {
-    left.copy_from_host(tile.left.data(), tile.left.size());
-    if (!tile.right.empty()) right.copy_from_host(tile.right.data(), tile.right.size());
-    expand_tile<<<(tile.rows * tile.columns + threads - 1) / threads, threads>>>(
-      D, tile.row, tile.column, tile.rows, tile.columns, tile.rank,
-      left.data(), tile.rank ? right.data() : nullptr, matrix);
-    cuda_check(cudaGetLastError(), "launch source tile expansion");
+  std::vector<double> host_left, host_right;
+  std::vector<TileDescriptor> host_descriptors;
+  const std::size_t capacity = static_cast<std::size_t>(tile_batch_size) * tile_size * tile_size;
+  host_left.reserve(capacity);
+  host_right.reserve(capacity);
+  host_descriptors.reserve(tile_batch_size);
+  for (std::size_t start = 0; start < source.tiles.size(); start += tile_batch_size) {
+    host_left.clear(); host_right.clear(); host_descriptors.clear();
+    const std::size_t end = std::min(source.tiles.size(), start + tile_batch_size);
+    for (std::size_t i = start; i < end; ++i) {
+      const auto& tile = source.tiles[i];
+      host_descriptors.push_back({tile.row, tile.column, tile.rows, tile.columns, tile.rank,
+        static_cast<int>(host_left.size()), static_cast<int>(host_right.size())});
+      host_left.insert(host_left.end(), tile.left.begin(), tile.left.end());
+      host_right.insert(host_right.end(), tile.right.begin(), tile.right.end());
+    }
+    left.copy_from_host(host_left.data(), host_left.size());
+    if (!host_right.empty()) right.copy_from_host(host_right.data(), host_right.size());
+    descriptors.copy_from_host(host_descriptors.data(), host_descriptors.size());
+    const dim3 grid((tile_size * tile_size + threads - 1) / threads,
+      static_cast<unsigned int>(host_descriptors.size()));
+    expand_tiles<<<grid, threads>>>(
+      D, descriptors.data(), left.data(), right.data(), matrix);
+    cuda_check(cudaGetLastError(), "launch source tile batch expansion");
   }
   launch_check("expand source matrix");
 }
@@ -257,12 +275,18 @@ static __global__ void build_weighted_inputs(
   weighted[D + d] = isfinite(u) ? u : 0.0;
 }
 
-static __global__ void check_sample_values(const int r, const double* modal, const double* action, const double* result, int* error)
+static __global__ void check_sample_values(const int D, const double* action, const double* result, int* error)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < r && (!isfinite(modal[i]) || !isfinite(modal[r + i]) || !isfinite(action[i])))
+  if (i < D && !isfinite(action[i]))
     atomicOr(error, RPMD_JA_ERROR_NUMERICAL);
   if (i == 0 && !isfinite(*result)) atomicOr(error, RPMD_JA_ERROR_NUMERICAL);
+}
+
+static __global__ void check_cached_matrix(const std::size_t count, const double* matrix, int* error)
+{
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count && !isfinite(matrix[i])) atomicOr(error, 1);
 }
 
 std::vector<int> make_index_map(const int D, const int N)
@@ -348,6 +372,8 @@ void RpmdJAQNEPCached::initialize(
 #else
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
+  double upload_seconds = 0.0, eigensolve_seconds = 0.0;
+  double modal_seconds = 0.0, physical_seconds = 0.0;
   number_of_atoms_ = reference.number_of_atoms;
   dimension_ = 3 * number_of_atoms_;
   modal_dimension_ = dimension_ - 3;
@@ -389,7 +415,7 @@ void RpmdJAQNEPCached::initialize(
   const std::size_t D2 = static_cast<std::size_t>(dimension_) * dimension_;
   const std::size_t Dr = static_cast<std::size_t>(dimension_) * modal_dimension_;
   const std::size_t r2 = static_cast<std::size_t>(modal_dimension_) * modal_dimension_;
-  const std::size_t max_tile = static_cast<std::size_t>(tile_size) * tile_size;
+  const std::size_t batch_values = static_cast<std::size_t>(tile_batch_size) * tile_size * tile_size;
   std::size_t query_bytes = 0;
   add_count(query_bytes, r2, sizeof(double));
   add_count(query_bytes, static_cast<std::size_t>(modal_dimension_), sizeof(double));
@@ -397,6 +423,8 @@ void RpmdJAQNEPCached::initialize(
   require_gpu_bytes(query_bytes, "Dsyevd workspace query buffers");
   std::size_t peak_bytes = 0;
   GPU_Vector<double> eigenvalues(modal_dimension_);
+  {
+  GPU_Vector<double> eigenvectors;
   {
   GPU_Vector<double> compact(r2);
   sqrt_mass_.resize(number_of_atoms_);
@@ -410,7 +438,8 @@ void RpmdJAQNEPCached::initialize(
   std::size_t build_bytes = 0;
   add_count(build_bytes, D2, sizeof(double));
   add_count(build_bytes, static_cast<std::size_t>(2) * dimension_, sizeof(double));
-  add_count(build_bytes, static_cast<std::size_t>(2) * max_tile, sizeof(double));
+  add_count(build_bytes, static_cast<std::size_t>(2) * batch_values, sizeof(double));
+  add_count(build_bytes, tile_batch_size, sizeof(TileDescriptor));
   add_count(build_bytes, 1, sizeof(int));
   add_bytes(build_bytes, query_bytes);
   std::size_t compact_total = build_bytes;
@@ -427,23 +456,23 @@ void RpmdJAQNEPCached::initialize(
   add_count(embed_bytes, static_cast<std::size_t>(dimension_ + 2 * modal_dimension_ + number_of_atoms_), sizeof(double));
   std::size_t cache_build_bytes = 0;
   add_count(cache_build_bytes, Dr, sizeof(double));
-  add_count(cache_build_bytes, static_cast<std::size_t>(3) * r2, sizeof(double));
-  add_count(cache_build_bytes, D2, sizeof(double));
+  add_count(cache_build_bytes, static_cast<std::size_t>(3) * D2, sizeof(double));
+  add_count(cache_build_bytes, r2, sizeof(double));
   add_count(cache_build_bytes, Dr, sizeof(double));
   add_count(cache_build_bytes, static_cast<std::size_t>(p_rank_ + q_rank_) * modal_dimension_, sizeof(double));
   add_count(cache_build_bytes, static_cast<std::size_t>(degree_ + 1) * (p_rank_ + q_rank_), sizeof(double));
   add_count(cache_build_bytes, static_cast<std::size_t>(p_rank_ + q_rank_), sizeof(double));
   add_count(cache_build_bytes, static_cast<std::size_t>(modal_dimension_), sizeof(double));
   add_count(cache_build_bytes, static_cast<std::size_t>(number_of_atoms_), sizeof(double));
-  add_count(cache_build_bytes, static_cast<std::size_t>(4) * modal_dimension_ + 2 * dimension_, sizeof(double));
-  add_count(cache_build_bytes, static_cast<std::size_t>(2) * max_tile, sizeof(double));
+  add_count(cache_build_bytes, 5, sizeof(double));
+  add_count(cache_build_bytes, static_cast<std::size_t>(2) * batch_values, sizeof(double));
+  add_count(cache_build_bytes, tile_batch_size, sizeof(TileDescriptor));
   add_count(cache_build_bytes, 1, sizeof(int));
   std::size_t steady_bytes = 0;
-  add_count(steady_bytes, Dr, sizeof(double));
-  add_count(steady_bytes, static_cast<std::size_t>(3) * r2, sizeof(double));
+  add_count(steady_bytes, static_cast<std::size_t>(3) * D2, sizeof(double));
   add_count(steady_bytes, static_cast<std::size_t>(number_of_atoms_), sizeof(double));
   add_count(steady_bytes, static_cast<std::size_t>(2) * dimension_, sizeof(double));
-  add_count(steady_bytes, static_cast<std::size_t>(3) * modal_dimension_, sizeof(double));
+  add_count(steady_bytes, static_cast<std::size_t>(dimension_ + modal_dimension_), sizeof(double));
   add_count(steady_bytes, 2, sizeof(double));
   peak_bytes = std::max({build_bytes, compact_total, eigensolver_bytes,
     embed_bytes, cache_build_bytes, steady_bytes});
@@ -452,7 +481,8 @@ void RpmdJAQNEPCached::initialize(
 
   std::size_t physical_extra = 0;
   add_count(physical_extra, D2, sizeof(double));
-  add_count(physical_extra, static_cast<std::size_t>(2) * dimension_ + 2 * max_tile, sizeof(double));
+  add_count(physical_extra, static_cast<std::size_t>(2) * dimension_ + 2 * batch_values, sizeof(double));
+  add_count(physical_extra, tile_batch_size, sizeof(TileDescriptor));
   add_count(physical_extra, 1, sizeof(int));
   require_gpu_bytes(physical_extra, "D assembly and translation projection");
   const auto householder = householder_vectors(number_of_atoms_, dimension_, sqrt_mass, mass_sum);
@@ -463,9 +493,12 @@ void RpmdJAQNEPCached::initialize(
     device_map.copy_from_host(host_map.data());
     {
       GPU_Vector<double> physical(D2), h(dimension_), w(dimension_);
-      GPU_Vector<double> tile_left(max_tile), tile_right(max_tile);
+      GPU_Vector<double> tile_left(batch_values), tile_right(batch_values);
+      GPU_Vector<TileDescriptor> tile_descriptors(tile_batch_size);
       physical.fill(0.0);
-      upload_tiles(reference.block_dynamical, dimension_, tile_left, tile_right, physical.data());
+      const auto upload_start = Clock::now();
+      upload_tiles(reference.block_dynamical, dimension_, tile_left, tile_right, tile_descriptors, physical.data());
+      upload_seconds += std::chrono::duration<double>(Clock::now() - upload_start).count();
       const double one = 1.0, zero = 0.0;
       for (int axis = 0; axis < 3; ++axis) {
         h.copy_from_host(householder.data() + static_cast<std::size_t>(axis) * dimension_);
@@ -490,10 +523,12 @@ void RpmdJAQNEPCached::initialize(
     {
       GPU_Vector<double> work(lwork);
       GPU_Vector<int> info(1);
+      const auto eigensolve_start = Clock::now();
       solver_check(cusolverDnDsyevd(solver.value, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
         modal_dimension_, compact.data(), modal_dimension_, eigenvalues.data(), work.data(), lwork, info.data()),
         "solve projected dynamical spectrum");
       launch_check("Dsyevd");
+      eigensolve_seconds += std::chrono::duration<double>(Clock::now() - eigensolve_start).count();
       int solver_info = 0;
       info.copy_to_host(&solver_info, 1);
       if (solver_info != 0) {
@@ -507,10 +542,10 @@ void RpmdJAQNEPCached::initialize(
     add_count(embedding_extra, Dr, sizeof(double));
     add_count(embedding_extra, static_cast<std::size_t>(dimension_ + modal_dimension_), sizeof(double));
     require_gpu_bytes(embedding_extra, "full eigenvector embedding");
-    eigenvectors_.resize(Dr);
-    eigenvectors_.fill(0.0);
+    eigenvectors.resize(Dr);
+    eigenvectors.fill(0.0);
     embed_eigenvectors<<<(r2 + threads - 1) / threads, threads>>>(
-      modal_dimension_, dimension_, device_map.data(), compact.data(), eigenvectors_.data());
+      modal_dimension_, dimension_, device_map.data(), compact.data(), eigenvectors.data());
     launch_check("embed projected eigenvectors");
     {
       GPU_Vector<double> h(dimension_), coefficients(modal_dimension_);
@@ -518,10 +553,10 @@ void RpmdJAQNEPCached::initialize(
       for (int axis = 2; axis >= 0; --axis) {
         h.copy_from_host(householder.data() + static_cast<std::size_t>(axis) * dimension_);
         blas_check(cublasDgemv(blas, CUBLAS_OP_T, dimension_, modal_dimension_,
-          &one, eigenvectors_.data(), dimension_, h.data(), 1, &zero, coefficients.data(), 1),
+          &one, eigenvectors.data(), dimension_, h.data(), 1, &zero, coefficients.data(), 1),
           "map eigenvectors back from translation reflector");
         apply_householder_eigenvectors<<<(Dr + threads - 1) / threads, threads>>>(
-          dimension_, modal_dimension_, h.data(), coefficients.data(), eigenvectors_.data());
+          dimension_, modal_dimension_, h.data(), coefficients.data(), eigenvectors.data());
         cuda_check(cudaGetLastError(), "launch inverse Householder transform");
       }
       launch_check("restore physical eigenvectors");
@@ -529,18 +564,19 @@ void RpmdJAQNEPCached::initialize(
   }
   }
   std::size_t cache_extra = 0;
-  add_count(cache_extra, static_cast<std::size_t>(3) * r2, sizeof(double));
-  add_count(cache_extra, D2 + Dr, sizeof(double));
+  add_count(cache_extra, static_cast<std::size_t>(3) * D2, sizeof(double));
+  add_count(cache_extra, r2 + Dr, sizeof(double));
   add_count(cache_extra, static_cast<std::size_t>(p_rank_ + q_rank_) * modal_dimension_, sizeof(double));
   add_count(cache_extra, static_cast<std::size_t>(degree_ + 1) * (p_rank_ + q_rank_), sizeof(double));
   add_count(cache_extra, static_cast<std::size_t>(p_rank_ + q_rank_) + 5, sizeof(double));
-  add_count(cache_extra, static_cast<std::size_t>(2) * max_tile, sizeof(double));
+  add_count(cache_extra, static_cast<std::size_t>(2) * batch_values, sizeof(double));
+  add_count(cache_extra, tile_batch_size, sizeof(TileDescriptor));
   add_count(cache_extra, 1, sizeof(int));
   require_gpu_bytes(cache_extra, "cached B projections");
-  for (int alpha = 0; alpha < 3; ++alpha) kernel_[alpha].resize(r2);
   {
-    GPU_Vector<double> bt(D2), transform(Dr);
-    GPU_Vector<double> tile_left(max_tile), tile_right(max_tile);
+    GPU_Vector<double> modal_kernel(r2), transform(Dr);
+    GPU_Vector<double> tile_left(batch_values), tile_right(batch_values);
+    GPU_Vector<TileDescriptor> tile_descriptors(tile_batch_size);
     GPU_Vector<double> p_values(std::max(1, p_rank_)), q_values(std::max(1, q_rank_));
     GPU_Vector<double> p_vectors(std::max<std::size_t>(1, static_cast<std::size_t>(degree_ + 1) * p_rank_));
     GPU_Vector<double> q_vectors(std::max<std::size_t>(1, static_cast<std::size_t>(degree_ + 1) * q_rank_));
@@ -563,45 +599,64 @@ void RpmdJAQNEPCached::initialize(
     }
     const double one = 1.0, zero = 0.0;
     for (int alpha = 0; alpha < 3; ++alpha) {
-      upload_tiles(reference.block_site_transpose[alpha], dimension_, tile_left, tile_right, bt.data());
+      kernel_[alpha].resize(D2);
+      const auto upload_start = Clock::now();
+      upload_tiles(reference.block_site_transpose[alpha], dimension_, tile_left, tile_right, tile_descriptors, kernel_[alpha].data());
+      upload_seconds += std::chrono::duration<double>(Clock::now() - upload_start).count();
+      const auto modal_start = Clock::now();
       blas_check(cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, dimension_, modal_dimension_, dimension_,
-        &one, bt.data(), dimension_, eigenvectors_.data(), dimension_, &zero, transform.data(), dimension_),
+        &one, kernel_[alpha].data(), dimension_, eigenvectors.data(), dimension_, &zero, transform.data(), dimension_),
         "calculate B-transpose E");
       blas_check(cublasDgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, modal_dimension_, modal_dimension_, dimension_,
-        &one, eigenvectors_.data(), dimension_, transform.data(), dimension_, &zero,
-        kernel_[alpha].data(), modal_dimension_), "calculate E-transpose B-transpose E");
+        &one, eigenvectors.data(), dimension_, transform.data(), dimension_, &zero,
+        modal_kernel.data(), modal_dimension_), "calculate E-transpose B-transpose E");
       cache_error.fill(0);
       const std::size_t pair_count = r2;
       build_kernel_matrix<<<(pair_count + threads - 1) / threads, threads>>>(
         modal_dimension_, p_rank_, q_rank_, tau_, eigenvalues.data(), p_values.data(), q_values.data(),
-        modes.data(), kernel_[alpha].data(), cache_error.data());
+        modes.data(), modal_kernel.data(), cache_error.data());
       launch_check("build cached current matrix");
+      modal_seconds += std::chrono::duration<double>(Clock::now() - modal_start).count();
       int kernel_error = 0;
       cache_error.copy_to_host(&kernel_error, 1);
       if (kernel_error != 0)
         throw std::runtime_error("rpmd_ja qNEP cache contains a non-finite matrix element");
+      const auto physical_start = Clock::now();
+      blas_check(cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, dimension_, modal_dimension_, modal_dimension_,
+        &one, eigenvectors.data(), dimension_, modal_kernel.data(), modal_dimension_, &zero,
+        transform.data(), dimension_), "calculate E times cached modal matrix");
+      blas_check(cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, dimension_, dimension_, modal_dimension_,
+        &one, transform.data(), dimension_, eigenvectors.data(), dimension_, &zero,
+        kernel_[alpha].data(), dimension_), "calculate cached physical current matrix");
+      check_cached_matrix<<<(D2 + threads - 1) / threads, threads>>>(D2, kernel_[alpha].data(), cache_error.data());
+      launch_check("check cached physical current matrix");
+      physical_seconds += std::chrono::duration<double>(Clock::now() - physical_start).count();
+      cache_error.copy_to_host(&kernel_error, 1);
+      if (kernel_error != 0)
+        throw std::runtime_error("rpmd_ja qNEP cache contains a non-finite physical matrix element");
     }
+  }
   }
 
   std::size_t steady_actual = 0;
-  add_count(steady_actual, eigenvectors_.size(), sizeof(double));
   for (int alpha = 0; alpha < 3; ++alpha) add_count(steady_actual, kernel_[alpha].size(), sizeof(double));
   add_count(steady_actual, sqrt_mass_.size(), sizeof(double));
   std::size_t sample_extra = 0;
-  add_count(sample_extra, static_cast<std::size_t>(2) * dimension_ + 3 * modal_dimension_ + 2, sizeof(double));
+  add_count(sample_extra, static_cast<std::size_t>(3) * dimension_ + 2, sizeof(double));
   require_gpu_bytes(sample_extra, "steady sample buffers");
   weighted_yu_.resize(static_cast<std::size_t>(2) * dimension_);
-  modal_yu_.resize(static_cast<std::size_t>(2) * modal_dimension_);
-  scratch_.resize(modal_dimension_);
+  scratch_.resize(dimension_);
   const double one = 1.0, zero = 0.0;
   alpha_scalar_.resize(1);
   beta_scalar_.resize(1);
   alpha_scalar_.copy_from_host(&one);
   beta_scalar_.copy_from_host(&zero);
   add_count(steady_actual, 2, sizeof(double));
-  add_count(steady_actual, weighted_yu_.size() + modal_yu_.size() + scratch_.size(), sizeof(double));
+  add_count(steady_actual, weighted_yu_.size() + scratch_.size(), sizeof(double));
   allocated_bytes_ = steady_actual;
   preparation_seconds_ = std::chrono::duration<double>(Clock::now() - start).count();
+  std::printf("rpmd_ja qNEP cache stages: tile packing/upload/expansion %.3f s, eigensolve %.3f s, modal construction %.3f s, physical transform %.3f s\n",
+    upload_seconds, eigensolve_seconds, modal_seconds, physical_seconds);
   blas_check(cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_DEVICE), "set device pointer mode");
 #endif
 }
@@ -621,23 +676,19 @@ void RpmdJAQNEPCached::compute_correction(
       device_result == nullptr || device_error == nullptr)
     PRINT_INPUT_ERROR("rpmd_ja qNEP cached correction received invalid buffers.");
   cublasHandle_t blas = static_cast<cublasHandle_t>(blas_handle_);
-  const int D = dimension_, r = modal_dimension_;
+  const int D = dimension_;
   cuda_check(cudaGetLastError(), "before qNEP cached sample");
   build_weighted_inputs<<<(D + threads - 1) / threads, threads>>>(
     number_of_atoms_, D, continuous.data(), reference_positions.data(), velocity.data(),
     sqrt_mass_.data(), weighted_yu_.data(), device_error);
   cuda_check(cudaGetLastError(), "build weighted sample inputs");
-  blas_check(cublasDgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, r, 2, D,
-    alpha_scalar_.data(), eigenvectors_.data(), D, weighted_yu_.data(), D,
-    beta_scalar_.data(), modal_yu_.data(), r),
-    "project sampled positions and velocities");
   for (int alpha = 0; alpha < 3; ++alpha) {
-    blas_check(cublasDgemv(blas, CUBLAS_OP_N, r, r, alpha_scalar_.data(), kernel_[alpha].data(), r,
-      modal_yu_.data(), 1, beta_scalar_.data(), scratch_.data(), 1), "apply cached current matrix");
-    blas_check(cublasDdot(blas, r, modal_yu_.data() + r, 1, scratch_.data(), 1,
+    blas_check(cublasDgemv(blas, CUBLAS_OP_N, D, D, alpha_scalar_.data(), kernel_[alpha].data(), D,
+      weighted_yu_.data(), 1, beta_scalar_.data(), scratch_.data(), 1), "apply cached current matrix");
+    blas_check(cublasDdot(blas, D, weighted_yu_.data() + D, 1, scratch_.data(), 1,
       device_result + alpha), "contract cached current");
-    check_sample_values<<<(r + threads - 1) / threads, threads>>>(
-      r, modal_yu_.data(), scratch_.data(), device_result + alpha, device_error);
+    check_sample_values<<<(D + threads - 1) / threads, threads>>>(
+      D, scratch_.data(), device_result + alpha, device_error);
     cuda_check(cudaGetLastError(), "check cached sample values");
   }
 #endif

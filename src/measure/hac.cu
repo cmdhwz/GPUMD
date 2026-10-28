@@ -61,6 +61,32 @@ bool HAC::get_current_for_step(const int step, double current[3]) const
   return std::isfinite(current[0]) && std::isfinite(current[1]) && std::isfinite(current[2]);
 }
 
+bool HAC::u9_qnep_identity(Force& force, const Atom& atom, std::uint64_t& model, std::uint64_t& config) const
+{
+#ifdef GPUMD_WPE_ENABLED
+  const auto& stage = force.get_wpe_stage_snapshot();
+  auto* qnep = dynamic_cast<NEP_Charge*>(wpe_centroid_observer_.get());
+  const double spacing = stage.qnep_pppm_spacing == 0.0 ? 1.0 : stage.qnep_pppm_spacing;
+  if (!stage.valid || stage.stage_kind != WPE_STAGE_RUN || stage.number_of_atoms != atom.number_of_atoms ||
+      stage.pimd_beads != atom.number_of_beads || (stage.facts & WPE_STAGE_PIMD_ECO_CONFIGURATION) != 0 ||
+      stage.dftd3_enabled != 0 || stage.qnep_kspace_method != WPE_QNEP_KSPACE_PPPM ||
+      !std::isfinite(spacing) || spacing < 0.2 || spacing > 2.0 || !qnep ||
+      (qnep->get_charge_mode()!=1 && qnep->get_charge_mode()!=2) || !qnep->uses_pppm() ||
+      !std::isfinite(qnep->get_pppm_mesh_spacing()) || std::fabs(qnep->get_pppm_mesh_spacing()-spacing)>1e-12*std::max(1.0,std::fabs(spacing)) ||
+      wpe_centroid_model_path_.empty()) return false;
+  model=rpmd_ja_model_fingerprint(wpe_centroid_model_path_);
+  config=rpmd_ja_qnep_config_fingerprint(force,*qnep,wpe_centroid_model_path_,false);
+#else
+  (void)atom;
+  if(force.get_number_of_potentials()!=1 || force.primary_nep_model_path().empty() || force.get_run_input().contains("dftd3")) return false;
+  auto* qnep=dynamic_cast<NEP_Charge*>(&force.get_potential(0));
+  if(!qnep || (qnep->get_charge_mode()!=1 && qnep->get_charge_mode()!=2) || !qnep->uses_pppm() || !std::isfinite(qnep->get_pppm_mesh_spacing()) || qnep->get_pppm_mesh_spacing()<=0) return false;
+  model=rpmd_ja_model_fingerprint(force.primary_nep_model_path());
+  config=rpmd_ja_qnep_config_fingerprint(force);
+#endif
+  return true;
+}
+
 #define NUM_OF_HEAT_COMPONENTS 5
 #define NUM_OF_TYPE_HEAT_COMPONENTS 3
 #define FILE_NAME_LENGTH 200

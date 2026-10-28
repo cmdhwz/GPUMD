@@ -247,10 +247,56 @@ void check_close(const double actual, const double expected)
   assert(std::isfinite(actual));
   assert(std::fabs(actual - expected) <= 2.0e-10 * std::max({1.0, std::fabs(actual), std::fabs(expected)}));
 }
+void check_batched_cache()
+{
+  constexpr int n = 214, d = 3 * n;
+  Vector masses(n), roots(n), y(d), u(d), position(d), velocity(d), zero(d, 0.0);
+  for (int i = 0; i < n; ++i) { masses[i] = 1.0 + (i % 3); roots[i] = std::sqrt(masses[i]); }
+  double mass_sum = 0.0;
+  for (double mass : masses) mass_sum += mass;
+  Dense dynamical(d, Vector(d, 0.0)), source(d, Vector(d, 0.0));
+  for (int row = 0; row < d; ++row) {
+    position[row] = 0.01 * std::sin(row * 0.13);
+    velocity[row] = 0.02 * std::cos(row * 0.17);
+    y[row] = roots[row % n] * position[row]; u[row] = roots[row % n] * velocity[row];
+    for (int col = 0; col < d; ++col) {
+      if (row / n == col / n)
+        dynamical[row][col] = 0.6 * ((row == col ? 1.0 : 0.0) - roots[row % n] * roots[col % n] / mass_sum);
+      source[row][col] = 0.001 * std::sin(row * 0.11 + col * 0.07);
+    }
+  }
+  RpmdJAReference ref;
+  ref.backend = 2; ref.number_of_atoms = n; ref.temperature = HBAR / K_B;
+  ref.stability_checked = true; ref.spectral_bound = 1.0; ref.kernel_u = std::sqrt(2.0);
+  ref.kernel_degree = 0; ref.p_rank = 0; ref.q_rank = 1;
+  ref.q_values = {1.0}; ref.q_vectors = {1.0};
+  ref.block_dynamical = to_blocks(dynamical, 128, false, true);
+  for (int a = 0; a < 3; ++a) ref.block_site_transpose[a] = to_blocks(source, 128, true, true);
+  const Dense actual_source = dense_from_blocks(ref.block_site_transpose[0], d);
+  std::reverse(ref.block_dynamical.tiles.begin(), ref.block_dynamical.tiles.end());
+  for (auto& matrix : ref.block_site_transpose) std::reverse(matrix.tiles.begin(), matrix.tiles.end());
+  assert(ref.block_dynamical.tiles.size() > 32);
+  RpmdJASparseWorkspace workspace;
+  workspace.initialize(ref, masses);
+  GPU_Vector<double> positions(d), reference(d), velocities(d), result(3);
+  GPU_Vector<int> error(1, 0);
+  positions.copy_from_host(position.data()); reference.copy_from_host(zero.data()); velocities.copy_from_host(velocity.data());
+  workspace.compute_correction(positions, reference, velocities, result.data(), error.data());
+  int status = 0; error.copy_to_host(&status, 1); assert(status == 0);
+  Vector actual(3); result.copy_to_host(actual.data());
+  const Vector py = project(y, roots), pu = project(u, roots);
+  // K = lambda * (E^T B^T E)^T for P=0, Q=1.
+  double expected = 0.0;
+  for (int row = 0; row < d; ++row)
+    for (int col = 0; col < d; ++col)
+      expected += 0.6 * pu[row] * actual_source[col][row] * py[col];
+  for (double value : actual) check_close(value, expected);
+}
 } // namespace
 
 int main()
 {
+  check_batched_cache();
   constexpr int N = 2;
   constexpr int D = 3 * N;
   RpmdJAReference reference;

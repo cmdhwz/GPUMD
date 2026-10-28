@@ -28,11 +28,9 @@ public:
   std::size_t estimated_peak_bytes() const { return estimated_peak_bytes_; }
 
 private:
-  GPU_Vector<double> eigenvectors_;
   GPU_Vector<double> kernel_[3];
   GPU_Vector<double> sqrt_mass_;
   GPU_Vector<double> weighted_yu_;
-  GPU_Vector<double> modal_yu_;
   GPU_Vector<double> scratch_;
   GPU_Vector<double> alpha_scalar_;
   GPU_Vector<double> beta_scalar_;

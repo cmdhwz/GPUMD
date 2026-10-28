@@ -56,8 +56,38 @@ def check_hac_decomposition():
     assert np.all(np.abs(cross_forward - cross_reverse) > 1.0e-12)
 
 
+def check_cached_physical_operator():
+    masses = np.array([1.0, 4.0, 9.0])
+    sqrt_mass = np.tile(np.sqrt(masses), 3)
+    translations = np.zeros((9, 3))
+    for axis in range(3):
+        translations[axis * 3:(axis + 1) * 3, axis] = np.sqrt(masses / masses.sum())
+    basis = np.linalg.qr(translations, mode="complete")[0][:, 3:]
+    rng = np.random.default_rng(849)
+    kernels = [rng.normal(size=(6, 6)), np.zeros((6, 6)), rng.normal(size=(6, 6))]
+    physical = [(basis @ kernel) @ basis.T for kernel in kernels]
+    shift = sqrt_mass * np.repeat([1.1, -0.4, 2.0], 3)
+    scratch = np.empty(9)
+    for _ in range(5):
+        y = sqrt_mass * rng.normal(size=9)
+        u = sqrt_mass * rng.normal(size=9)
+        for kernel, matrix in zip(kernels, physical):
+            old = (basis.T @ u) @ kernel @ (basis.T @ y)
+            np.matmul(matrix, y, out=scratch)
+            new = u @ scratch
+            assert np.isclose(new, old, rtol=1e-13, atol=1e-13)
+            if np.any(kernel):
+                assert not np.isclose(new, u @ matrix.T @ y)
+            else:
+                assert new == 0.0 and np.all(scratch == 0.0)
+            assert np.isclose(u @ matrix @ (y + shift), old, rtol=1e-13, atol=1e-13)
+            assert np.isclose((u + shift) @ matrix @ y, old, rtol=1e-13, atol=1e-13)
+
+
+
 def demo():
     check_hac_decomposition()
+    check_cached_physical_operator()
     # A non-symmetric matrix catches accidental transposition of DeltaH.
     matrix = [[0.0, 2.0], [-3.0, 1.0]]
     x, velocity = [2.0, -1.0], [4.0, 5.0]

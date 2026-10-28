@@ -1,0 +1,69 @@
+
+Algorithm : SHA256
+Hash      : 8C847B8B4EA4F6672F9BB287A9CFC7127486CE1407208DA93E3CB272E915C9D8
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\src\measure\u9_oho.cu
+
+Algorithm : SHA256
+Hash      : 56E2BB106C765273C061A6FBD82A82F481C3C7D846A17D4C0602375842D10511
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\src\measure\u9_oho.cuh
+
+Algorithm : SHA256
+Hash      : 70F0C0FAE9FDF1498633FBDD13FA320FB2AC941FA7C90D0DE7B82B7D80BCDB8D
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\src\measure\u9_oho_math.cuh
+
+Algorithm : SHA256
+Hash      : AD195BA107E859EE26D89E6785CB617374EB0F39877CDAAAB788C0E4D3EB6F32
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\src\measure\hac.cu
+
+Algorithm : SHA256
+Hash      : 6242DD885982B2C309F1D4B460E3E053FE161FCED4A5735F5C1933DCED06CB00
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\src\measure\hac.cuh
+
+Algorithm : SHA256
+Hash      : FA728F80C4117E388EF515F526C139048A2E4155F1981851495ED8D47F6F9550
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\src\measure\measure.cu
+
+Algorithm : SHA256
+Hash      : D8B18E343495FB42D9919A7EDED953B06DDDE3261FD508A13E78D8C89270834B
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\src\main_gpumd\run.cu
+
+Algorithm : SHA256
+Hash      : FD874D47B55A5B42F39630914DC3DB3A2B85CE644CA194DC71E1B751B8279990
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tools\u9_oho\bridge.py
+
+Algorithm : SHA256
+Hash      : 5DB30FFD94709BC878E1048486F01370215A4FC54419B8D4BCC274E2A160D857
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tools\u9_oho\run_controls.py
+
+Algorithm : SHA256
+Hash      : F7F1D91B50669B75FACDFABF6D3D464D0635CD8861CEA9967701B0C5A7099075
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tools\u9_oho\spectrum.py
+
+Algorithm : SHA256
+Hash      : F1D3380039C09DF41A0E0B40FD4C0B05929947BC39D91F5A79415D9DFE915410
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tools\u9_oho\u9_rpmd.py
+
+Algorithm : SHA256
+Hash      : A3B66A844B4BB7045091EB7D3D6D29E55781E3EF53355EF95D8BD1717A9C2A31
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tests\u9_oho\synthetic.cfg
+
+Algorithm : SHA256
+Hash      : CB78FFF9D2DC7712223F40502AE6F04A57D78945524136AEF12C67990D628FF3
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tests\u9_oho\test_bridge.py
+
+Algorithm : SHA256
+Hash      : B45D3A445CF1434F057E9BC6711797FCC7CC2AFBE181DB3A98C66CC7BDF71FA3
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tests\u9_oho\test_native_math.cpp
+
+Algorithm : SHA256
+Hash      : D6A20481159DD31EE0C9B9F7D501AC8B185456E1652BA96BF0CA5F21018019AD
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tests\u9_oho\test_native.py
+
+Algorithm : SHA256
+Hash      : 68F723C743A2BAEA8BED2062932F464363210D85238E05D1A04A499571BB0F3D
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tests\u9_oho\test_rpmd.py
+
+Algorithm : SHA256
+Hash      : 5574438E11498AEA0BDD1B9DFB6E0FF145AE2D65C82AA154ED1582E1877371A8
+Path      : D:\计算文件\各种软件\GPUMD-4.7\GPUMD-5.3\GPUMD-branch_new_wpe-worktree\tests\u9_oho\test_spectrum.py
+

@@ -1,0 +1,15 @@
+test_canonical_and_atomic_kinetics (__main__.OHOTests.test_canonical_and_atomic_kinetics) ... ok
+test_coupled_local_reference_full_map_and_transport (__main__.OHOTests.test_coupled_local_reference_full_map_and_transport) ... ok
+test_current_independent_atomic_rates (__main__.OHOTests.test_current_independent_atomic_rates) ... ok
+test_direct_projection_and_commutator_boundary (__main__.OHOTests.test_direct_projection_and_commutator_boundary) ... ok
+test_harmonic_full_map_against_independent_spectrum (__main__.OHOTests.test_harmonic_full_map_against_independent_spectrum) ... ok
+test_mirror_reference_and_time_reversal (__main__.OHOTests.test_mirror_reference_and_time_reversal) ... ok
+test_path_gradient_rotation_and_gaussian_insertion (__main__.OHOTests.test_path_gradient_rotation_and_gaussian_insertion) ... ok
+test_potential_force_minima_and_taylor (__main__.OHOTests.test_potential_force_minima_and_taylor) ... ok
+test_rpmd_force_reversibility_and_second_order (__main__.OHOTests.test_rpmd_force_reversibility_and_second_order) ... ok
+test_static_support_and_spd (__main__.OHOTests.test_static_support_and_spd) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 1.812s
+
+OK

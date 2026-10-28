@@ -57,6 +57,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/extrapolation.cuh"
 #include "measure/hac.cuh"
 #include "measure/quantum_heat_moments.cuh"
+#include "measure/u9_oho.cuh"
 #include "measure/hnemd_kappa.cuh"
 #include "measure/hnemdec_kappa.cuh"
 #include "measure/lsqt.cuh"
@@ -305,6 +306,8 @@ void Run::perform_a_run(const int number_of_steps)
 
   HAC* centroid_force_hac = nullptr;
   QuantumHeatMoments* quantum_heat_moments = nullptr;
+  U9OHO* u9_oho = nullptr;
+  int u9_hac_count = 0;
   Centroid_Force_Diagnostic* centroid_force_diagnostic = nullptr;
 #ifdef USE_NETCDF
   Centroid_DeltaF_O* centroid_deltaF_O = nullptr;
@@ -402,11 +405,35 @@ void Run::perform_a_run(const int number_of_steps)
     }
   }
   for (const auto& action : actions) {
-    if (action->action_name == "compute_hac" && centroid_force_hac == nullptr) {
-      centroid_force_hac = dynamic_cast<HAC*>(action.get());
+    if (action->action_name == "compute_hac") {
+      ++u9_hac_count;
+      if (centroid_force_hac == nullptr) centroid_force_hac = dynamic_cast<HAC*>(action.get());
+    } else if (action->action_name == "compute_u9_oho") {
+      if (u9_oho != nullptr) PRINT_INPUT_ERROR("compute_u9_oho may appear only once per run.");
+      u9_oho = dynamic_cast<U9OHO*>(action.get());
     } else if (action->action_name == "compute_quantum_heat_moments") {
       quantum_heat_moments = dynamic_cast<QuantumHeatMoments*>(action.get());
     }
+  }
+  if (u9_oho != nullptr) {
+    if (u9_hac_count != 1 || centroid_force_hac == nullptr)
+      PRINT_INPUT_ERROR("compute_u9_oho requires exactly one compute_hac action.");
+    if (max_distance_per_step > 0.0 || integrate.get_fixed_group() != -1 || integrate.get_move_group() != -1)
+      PRINT_INPUT_ERROR("compute_u9_oho requires a fixed time step and no fixed or moving groups.");
+    for (const auto& action : actions) {
+      const std::string& name = action->action_name;
+      if (action->modifies_force() || name == "compute_hnemd" || name == "compute_hnemdec" ||
+          name == "compute_hnema" || name == "plumed" || name == "deform" ||
+          name == "compute_es" || name == "active" || name == "dump_observer")
+        PRINT_INPUT_ERROR("compute_u9_oho does not support driven or force-changing actions.");
+    }
+    u9_oho->set_hac(centroid_force_hac);
+    u9_oho->set_run_ordinal(current_run_ordinal);
+    auto observer = std::find_if(actions.begin(), actions.end(),
+      [u9_oho](const std::unique_ptr<Action>& action) { return action.get() == u9_oho; });
+    auto hac = std::find_if(actions.begin(), actions.end(),
+      [centroid_force_hac](const std::unique_ptr<Action>& action) { return action.get() == centroid_force_hac; });
+    if (observer < hac) std::rotate(observer, observer + 1, hac + 1);
   }
   if (rpmd_ja_enabled_ && centroid_force_hac == nullptr) {
     PRINT_INPUT_ERROR("rpmd_ja on requires compute_hac in the same run.");

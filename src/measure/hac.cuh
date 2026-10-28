@@ -51,6 +51,14 @@ public:
     return compute != 0 && use_centroid_heat_flux_ != 0 && !deferred_centroid_enabled_;
   }
 
+  bool u9_qnep_identity(Force& force, const Atom& atom, std::uint64_t& model, std::uint64_t& config) const;
+
+  bool u9_compatible() const
+  {
+    return centroid_force_source_is_immediate() && !qnep_full_a_ &&
+      split_qnep_heat_by_type_ == 0 && deferred_centroid_qnep_ == 0;
+  }
+
   bool centroid_force_ready(const int step) const
   {
     return centroid_force_source_is_immediate() && centroid_force_step_ == step;

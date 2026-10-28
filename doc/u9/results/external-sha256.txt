@@ -1,0 +1,17 @@
+
+Algorithm : SHA256
+Hash      : AC26D47668518A91244ECF22238A3A3F44F3E19158086B1F2CCD83013A23E964
+Path      : D:\文件\我的周报\数据\rpmd热流函数推导\RPMD_heat_current_theory_2026\RPMD_heat_current_theory_2026_v2_expanded\quantum_material_hamiltonian_v1\src\local_model.py
+
+Algorithm : SHA256
+Hash      : 124FAFAC1F567629F83A5386926BD963D71FA8064178C731273C2402355E68DB
+Path      : D:\文件\我的周报\数据\rpmd热流函数推导\RPMD_heat_current_theory_2026\RPMD_heat_current_theory_2026_v2_expanded\quantum_material_hamiltonian_v1\src\constrained_embedding.py
+
+Algorithm : SHA256
+Hash      : 3481FD205B264468B8ED9FA2F5F17FC4C8555D334FFB3F0A0DC7501596EC6F38
+Path      : D:\文件\我的周报\数据\rpmd热流函数推导\RPMD_heat_current_theory_2026\RPMD_heat_current_theory_2026_v2_expanded\quantum_material_hamiltonian_v1\src\quantum_adapter.py
+
+Algorithm : SHA256
+Hash      : 93C420CF6E1361C0256311233A1F390D15BF47C9240B5ABFB6D200F56F551B0F
+Path      : D:\文件\我的周报\数据\rpmd热流函数推导\RPMD_heat_current_theory_2026\RPMD_heat_current_theory_2026_v2_expanded\quantum_benchmark_OHO\src\oho.py
+

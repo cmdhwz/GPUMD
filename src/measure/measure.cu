@@ -59,6 +59,7 @@ The driver class dealing with measurement.
 #include "proton_tunneling.cuh"
 #include "rpmd_ja_fit.cuh"
 #include "quantum_heat_moments.cuh"
+#include "u9_oho.cuh"
 #include "qnep_projection.cuh"
 #include "rdf.cuh"
 #include "sdc.cuh"
@@ -271,6 +272,8 @@ bool Measure::parse_action(
     hac->set_rpmd_ja(rpmd_ja_enabled_, rpmd_ja_reference_path_, rpmd_ja_diagnostic_);
     action.reset(hac);
     actions_.emplace_back(std::move(action));
+  } else if (tokens[0] == "compute_u9_oho") {
+    actions_.emplace_back(new U9OHO(tokens));
   } else if (tokens[0] == "compute_quantum_heat_moments") {
     actions_.emplace_back(new QuantumHeatMoments(params.data(), params.size()));
   } else if (tokens[0] == "compute_qnep_projection") {

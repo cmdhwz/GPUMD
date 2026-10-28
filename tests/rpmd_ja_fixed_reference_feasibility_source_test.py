@@ -945,7 +945,8 @@ reference_header = source('src/measure/rpmd_ja_reference.cuh')
 reference_reader = source('src/measure/rpmd_ja_reference.cu')
 assert 'source_file_sha256' in reference_header
 assert 'rpmd_ja_sha256::Digest digest' in reference_reader
-assert 'result.source_file_sha256 = digest.finish_hex()' in reference_reader
+assert 'actual_sha256 = digest.finish_hex()' in reference_reader
+assert 'result.source_file_sha256 = actual_sha256' in reference_reader
 assert 'test_covariance_fit_workspace_is_reused_by_sequential_system_curvature_builds' in cuda_test
 
 a0_write = a0_reuse[a0_reuse.index('inline void write_package_atomic'):]

@@ -89,6 +89,7 @@ struct RpmdJAReference
 };
 
 RpmdJAReference read_rpmd_ja_reference(const std::string& path);
+RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* file_fingerprint);
 int rpmd_ja_reference_policy_beads(const std::string& policy);
 bool rpmd_ja_reference_policy_requires_pimd_fix_com(const std::string& policy);
 bool rpmd_ja_reference_policy_is_diagnostic(const std::string& policy);

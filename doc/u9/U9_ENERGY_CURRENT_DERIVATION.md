@@ -1,0 +1,12 @@
+# Energy polarization and current
+
+For fixed affine embedding r=r0+A z, G=A^T M A, C=G^-1, P=M A C p, site kinetic energy T_i=P_i^2/(2m_i), and the chosen constrained_v1 split U=sum u_i, sum T_i=p^T C p/2. Define h_i=T_i+u_i and PE=sum_i r_i h_i. The finite classical current J={PE,H} equals sum_i [(A C p)_i h_i+r_i((P_i/m_i)(-M A C grad U)_i+grad u_i dot C p)]. Existing `constrained_embedding` constructs the same polynomial and separates terms by momentum degree into J1 and J3; `evaluate_point` offers a separately expanded rate check. For the quantum finite model PE is Weyl/Hermitian and J=i[H,PE]/hbar. For this fixed affine, constant-metric finite model the Weyl Poisson current equals the exact infinite-space commutator symbol. A finite projected matrix commutator can differ due to representation and truncation. The current commutator residual in the spectral control records this difference and truncation; it is not ignored. J is finite-model scalar and no periodic Cartesian material mapping follows automatically.
+
+## Site convention and operator ordering
+
+With V(q)=sum c_r q^r and f(q)=lambda0+lambda1 q+lambda2 q², constrained_v1 uses u_L=u_R=K Q²/4+f(q)Q/4 and u_H=V(q)+f(q)Q/2. It closes exactly to U. The Cartesian atomic momentum in the fixed slice is P=M A C p and h_i=P_i²/(2m_i)+u_i. The Weyl polynomial J1/J3 is built by the existing bracket implementation. Independently, the Hermitian operator is PE=1/2 sum {r_i,h_i}, with J=i[H,PE]/hbar. Finite-basis commutator truncation must be measured separately, not reassigned into the primary J1 block. None of these scalar finite-model quantities defines the full periodic qNEP+PPPM Cartesian material current.
+
+
+## Exact instantaneous-current identity
+
+For constant G, H=T(p)+U(z) has a quadratic momentum kinetic term and no mixed z/p derivatives. With affine r, PE=sum r_i[T_i(p)+u_i(z)] is at most quadratic in p. In every odd Moyal term of order three or above, a derivative of U would require at least three p derivatives of PE, which vanish; derivatives of T of order at least three vanish, and mixed derivatives of H vanish. Therefore the infinite-space Weyl symbol of i[H,PE]/hbar is exactly {PE,H}=J1+J3. The site anticommutator gives the same Weyl PE for affine r and quadratic p dependence. The hbar² Moyal source appears when evolving J3 through [J,H], not as an instantaneous-current correction. Any discrepancy between projected J1+J3 and the commutator of finite projected H and PE is a basis/grid representation or truncation defect, not a physical redefinition of J1.

@@ -1,0 +1,12 @@
+{
+  "c": [1.0, 0.12, -2.0, 0.05, 1.0],
+  "K": 4.0,
+  "lambda": [-0.2, 0.1, 0.2],
+  "reference_masses": {"ML": 16.0, "m": 1.0, "MR": 17.0},
+  "isotope_masses": [16.0, 2.0, 17.0],
+  "d0": 4.0,
+  "beta": 2.0,
+  "hbar": 0.8,
+  "units": "synthetic m0,l0,E0; no material calibration",
+  "source": "synthetic_general_u9_example"
+}

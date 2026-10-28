@@ -1536,8 +1536,31 @@ RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom& atom, Box& active_box
   };
 }
 
-RpmdJAReference read_rpmd_ja_reference(const std::string& path)
+RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* file_fingerprint)
 {
+  std::uint64_t actual_fingerprint = 0;
+  std::string actual_sha256;
+  bool fingerprint_computed = false;
+  const auto get_fingerprint = [&]() {
+    if (!fingerprint_computed) {
+      rpmd_ja_file_io::ifstream identity(path, std::ios::binary);
+      if (!identity) throw std::runtime_error("cannot open RPMD-JA reference file for identity: " + path);
+      rpmd_ja_sha256::Digest digest;
+      std::uint64_t hash = 14695981039346656037ULL;
+      char bytes[8192];
+      while (identity.read(bytes, sizeof(bytes)) || identity.gcount() != 0) {
+        const std::streamsize count = identity.gcount();
+        digest.update(reinterpret_cast<const unsigned char*>(bytes), static_cast<std::size_t>(count));
+        for (std::streamsize i = 0; i < count; ++i)
+          hash = (hash ^ static_cast<unsigned char>(bytes[i])) * 1099511628211ULL;
+      }
+      if (!identity.eof()) throw std::runtime_error("failed reading RPMD-JA reference file for identity");
+      actual_fingerprint = hash;
+      actual_sha256 = digest.finish_hex();
+      fingerprint_computed = true;
+    }
+    return actual_fingerprint;
+  };
   rpmd_ja_file_io::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("cannot open RPMD-JA reference file: " + path);
   char magic[sizeof(kMagic)], units[sizeof(kUnits)];
@@ -1742,7 +1765,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     if (!stability || stability >> trailing || atom_count != result.number_of_atoms || !(minimum_pivot > 0.0) ||
         !std::isfinite(minimum_pivot) || !(reconstruction_residual >= 0.0) ||
         !std::isfinite(reconstruction_residual) || reconstruction_residual > 1.0e-8 ||
-        fingerprint != rpmd_ja_model_fingerprint(path))
+        fingerprint != get_fingerprint())
       throw std::runtime_error("RPMD-JA stability sidecar does not validate this reference file");
     result.stability_checked = true;
   } else {
@@ -1839,7 +1862,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
         !std::isfinite(reconstruction_residual) || reconstruction_residual > 1.0e-8 ||
         !(softmode_error >= 0.0) || softmode_error > 1.0e-2 || !std::isfinite(softmode_error) ||
         config_fingerprint != result.mechanical_config_fingerprint ||
-        file_fingerprint != rpmd_ja_model_fingerprint(path))
+        file_fingerprint != get_fingerprint())
       throw std::runtime_error("qNEP RPMD-JA stability sidecar does not validate this reference file");
     if (stability_version >= 2 && stability_version < 4 &&
         (!(operator_bound >= 0.0) || operator_bound > 1.0e-2 || !std::isfinite(operator_bound)))
@@ -1857,16 +1880,15 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path)
     result.relative_operator_bound = operator_bound;
     result.stability_checked = true;
   }
-  in.clear();
-  in.seekg(0, std::ios::beg);
-  if (!in) throw std::runtime_error("cannot rewind RPMD-JA reference file for SHA-256 identity");
-  rpmd_ja_sha256::Digest digest;
-  char digest_buffer[8192];
-  while (in.read(digest_buffer, sizeof(digest_buffer)) || in.gcount() != 0)
-    digest.update(reinterpret_cast<const unsigned char*>(digest_buffer), static_cast<std::size_t>(in.gcount()));
-  if (!in.eof()) throw std::runtime_error("failed reading RPMD-JA reference file for SHA-256 identity");
-  result.source_file_sha256 = digest.finish_hex();
+  const std::uint64_t identity_fingerprint = get_fingerprint();
+  result.source_file_sha256 = actual_sha256;
+  if (file_fingerprint) *file_fingerprint = identity_fingerprint;
   return result;
+}
+
+RpmdJAReference read_rpmd_ja_reference(const std::string& path)
+{
+  return read_rpmd_ja_reference(path, nullptr);
 }
 
 void generate_rpmd_ja_reference(
