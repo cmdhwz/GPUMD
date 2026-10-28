@@ -1,5 +1,4 @@
 #include "measure/rpmd_ja.cuh"
-#include "measure/rpmd_ja_store_current.cuh"
 #include "model/box.cuh"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
@@ -248,97 +247,10 @@ void check_close(const double actual, const double expected)
   assert(std::isfinite(actual));
   assert(std::fabs(actual - expected) <= 2.0e-10 * std::max({1.0, std::fabs(actual), std::fabs(expected)}));
 }
-void check_store_current_batches()
-{
-  for (int count : {1, 7, 8, 9, 17}) {
-    Vector heat(5 * count), delta(3 * count);
-    for (int component = 0; component < 5; ++component)
-      for (int frame = 0; frame < count; ++frame)
-        heat[component * count + frame] = 1.7 * component + 0.23 * frame;
-    for (int frame = 0; frame < count; ++frame)
-      for (int d = 0; d < 3; ++d) delta[3 * frame + d] = 0.11 * frame - 0.37 * d;
-    GPU_Vector<double> device_heat(heat.size()), device_delta(3 * RPMD_JA_SAMPLE_BATCH_SIZE);
-    GPU_Vector<double> cent(3 * count), corr(3 * count), ja(3 * count);
-    GPU_Vector<int> error(1, 0);
-    device_heat.copy_from_host(heat.data());
-    for (int start = 0; start < count; start += RPMD_JA_SAMPLE_BATCH_SIZE) {
-      const int size = std::min(RPMD_JA_SAMPLE_BATCH_SIZE, count - start);
-      device_delta.copy_from_host(delta.data() + 3 * start, 3 * size);
-      store_current<<<1, 128>>>(count, start, size, device_heat.data(), device_delta.data(),
-        cent.data(), corr.data(), ja.data(), error.data());
-    }
-    Vector c(3 * count), d(3 * count), j(3 * count);
-    cent.copy_to_host(c.data()); corr.copy_to_host(d.data()); ja.copy_to_host(j.data());
-    int status = 0; error.copy_to_host(&status, 1); assert(status == 0);
-    for (int frame = 0; frame < count; ++frame) for (int axis = 0; axis < 3; ++axis) {
-      const int index = axis * count + frame;
-      const double expected = axis == 0 ? heat[frame] + heat[count + frame] :
-        axis == 1 ? heat[2 * count + frame] + heat[3 * count + frame] : heat[4 * count + frame];
-      check_close(c[index], expected);
-      check_close(d[index], delta[3 * frame + axis]);
-      check_close(j[index], expected + delta[3 * frame + axis]);
-    }
-    delta[0] = std::numeric_limits<double>::quiet_NaN();
-    device_delta.copy_from_host(delta.data(), 3);
-    error.fill(RPMD_JA_ERROR_BRANCH);
-    store_current<<<1, 128>>>(count, 0, 1, device_heat.data(), device_delta.data(),
-      cent.data(), corr.data(), ja.data(), error.data());
-    error.copy_to_host(&status, 1);
-    assert((status & RPMD_JA_ERROR_BRANCH) && (status & RPMD_JA_ERROR_NUMERICAL));
-  }
-}
-
-void check_batched_cache()
-{
-  constexpr int n = 214, d = 3 * n;
-  Vector masses(n), roots(n), y(d), u(d), position(d), velocity(d), zero(d, 0.0);
-  for (int i = 0; i < n; ++i) { masses[i] = 1.0 + (i % 3); roots[i] = std::sqrt(masses[i]); }
-  double mass_sum = 0.0;
-  for (double mass : masses) mass_sum += mass;
-  Dense dynamical(d, Vector(d, 0.0)), source(d, Vector(d, 0.0));
-  for (int row = 0; row < d; ++row) {
-    position[row] = 0.01 * std::sin(row * 0.13);
-    velocity[row] = 0.02 * std::cos(row * 0.17);
-    y[row] = roots[row % n] * position[row]; u[row] = roots[row % n] * velocity[row];
-    for (int col = 0; col < d; ++col) {
-      if (row / n == col / n)
-        dynamical[row][col] = 0.6 * ((row == col ? 1.0 : 0.0) - roots[row % n] * roots[col % n] / mass_sum);
-      source[row][col] = 0.001 * std::sin(row * 0.11 + col * 0.07);
-    }
-  }
-  RpmdJAReference ref;
-  ref.backend = 2; ref.number_of_atoms = n; ref.temperature = HBAR / K_B;
-  ref.stability_checked = true; ref.spectral_bound = 1.0; ref.kernel_u = std::sqrt(2.0);
-  ref.kernel_degree = 0; ref.p_rank = 0; ref.q_rank = 1;
-  ref.q_values = {1.0}; ref.q_vectors = {1.0};
-  ref.block_dynamical = to_blocks(dynamical, 128, false, true);
-  for (int a = 0; a < 3; ++a) ref.block_site_transpose[a] = to_blocks(source, 128, true, true);
-  const Dense actual_source = dense_from_blocks(ref.block_site_transpose[0], d);
-  std::reverse(ref.block_dynamical.tiles.begin(), ref.block_dynamical.tiles.end());
-  for (auto& matrix : ref.block_site_transpose) std::reverse(matrix.tiles.begin(), matrix.tiles.end());
-  assert(ref.block_dynamical.tiles.size() > 32);
-  RpmdJASparseWorkspace workspace;
-  workspace.initialize(ref, masses);
-  GPU_Vector<double> positions(d), reference(d), velocities(d), result(3);
-  GPU_Vector<int> error(1, 0);
-  positions.copy_from_host(position.data()); reference.copy_from_host(zero.data()); velocities.copy_from_host(velocity.data());
-  workspace.compute_correction(positions, reference, velocities, result.data(), error.data());
-  int status = 0; error.copy_to_host(&status, 1); assert(status == 0);
-  Vector actual(3); result.copy_to_host(actual.data());
-  const Vector py = project(y, roots), pu = project(u, roots);
-  // K = lambda * (E^T B^T E)^T for P=0, Q=1.
-  double expected = 0.0;
-  for (int row = 0; row < d; ++row)
-    for (int col = 0; col < d; ++col)
-      expected += 0.6 * pu[row] * actual_source[col][row] * py[col];
-  for (double value : actual) check_close(value, expected);
-}
 } // namespace
 
 int main()
 {
-  check_store_current_batches();
-  check_batched_cache();
   constexpr int N = 2;
   constexpr int D = 3 * N;
   RpmdJAReference reference;
@@ -431,52 +343,6 @@ int main()
     check_close(actual[alpha], expected);
   }
   check_close(actual[1], 0.0); // Zero B direction.
-
-  // Compare frozen batched frames against the existing single-frame path, including partial tails.
-  for (int frame_count : {1, 7, 8, 9, 17}) {
-    GPU_Vector<double> batched_result(3 * RPMD_JA_SAMPLE_BATCH_SIZE);
-    std::vector<Vector> expected_frames;
-    error.fill(0);
-    for (int frame = 0; frame < frame_count; ++frame) {
-      Vector frame_position = position, frame_velocity = velocity;
-      for (int i = 0; i < D; ++i) {
-        frame_position[i] += 0.013 * frame * (i + 1);
-        frame_velocity[i] -= 0.007 * frame * (i + 2);
-      }
-      positions.copy_from_host(frame_position.data()); velocities.copy_from_host(frame_velocity.data());
-      block_workspace.compute_correction(positions, ref_positions, velocities, result.data(), error.data());
-      Vector expected_frame(3); result.copy_to_host(expected_frame.data());
-      expected_frames.push_back(expected_frame);
-    }
-    for (int frame = 0; frame < frame_count; ++frame) {
-      Vector frame_position = position, frame_velocity = velocity;
-      for (int i = 0; i < D; ++i) {
-        frame_position[i] += 0.013 * frame * (i + 1);
-        frame_velocity[i] -= 0.007 * frame * (i + 2);
-      }
-      positions.copy_from_host(frame_position.data()); velocities.copy_from_host(frame_velocity.data());
-      const int slot = frame % RPMD_JA_SAMPLE_BATCH_SIZE;
-      block_workspace.capture_cached_sample(positions, ref_positions, velocities, slot, error.data());
-      if (slot == RPMD_JA_SAMPLE_BATCH_SIZE - 1 || frame + 1 == frame_count) {
-        block_workspace.compute_cached_batch(slot + 1, batched_result.data(), error.data());
-        Vector values(3 * (slot + 1)); batched_result.copy_to_host(values.data(), values.size());
-        for (int i = 0; i <= slot; ++i)
-          for (int a = 0; a < 3; ++a)
-            check_close(values[3 * i + a], expected_frames[frame - slot + i][a]);
-      }
-    }
-    error.copy_to_host(&device_error, 1); assert(device_error == 0);
-  }
-  positions.copy_from_host(position.data()); velocities.copy_from_host(velocity.data());
-  Vector invalid_batch_position = position;
-  invalid_batch_position[0] = std::numeric_limits<double>::quiet_NaN();
-  positions.copy_from_host(invalid_batch_position.data());
-  error.fill(RPMD_JA_ERROR_BRANCH);
-  block_workspace.capture_cached_sample(positions, ref_positions, velocities, 0, error.data());
-  error.copy_to_host(&device_error, 1);
-  assert((device_error & RPMD_JA_ERROR_BRANCH) && (device_error & RPMD_JA_ERROR_NUMERICAL));
-  positions.copy_from_host(position.data());
-  error.fill(0);
 
   RpmdJAReference zero_rank_block_reference = block_reference;
   zero_rank_block_reference.p_rank = zero_rank_block_reference.q_rank = 0;

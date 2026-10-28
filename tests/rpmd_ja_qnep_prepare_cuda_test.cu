@@ -1,6 +1,5 @@
 #include "measure/rpmd_ja_qnep_prepare.cuh"
 #include "measure/rpmd_ja_reference.cuh"
-#include "measure/rpmd_ja_sample_provenance.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -108,25 +107,7 @@ std::vector<char> read_file_bytes(const std::string& path)
 void run_positive(const std::string& base,const int n,const std::uint32_t version)
 {
   const std::string stem=base+"_N"+std::to_string(n),raw=stem+".qraw",kernel=stem+".kernel",out=stem+".ja";
-  make_input(raw,kernel,n,1.0e-10,version);prepare_rpmd_ja_qnep_reference(raw,out,kernel);
-  std::uint64_t fingerprint=0;const RpmdJAReference r=read_rpmd_ja_reference(out,&fingerprint);
-  if(fingerprint!=rpmd_ja_model_fingerprint(out))throw std::runtime_error("reference fingerprint mismatch");
-  const std::string expected_sha=rpmd_ja_sample_provenance::sha256_file(out);
-  if(r.source_file_sha256!=expected_sha||read_rpmd_ja_reference(out).source_file_sha256!=expected_sha)
-    throw std::runtime_error("reference SHA-256 mismatch");
-  const std::string sidecar=out+".stability";
-  const auto sidecar_bytes=read_file_bytes(sidecar);
-  std::string altered(sidecar_bytes.begin(),sidecar_bytes.end());
-  const auto fingerprint_start=altered.find("fingerprint ");
-  if(fingerprint_start==std::string::npos)throw std::runtime_error("sidecar fingerprint missing");
-  const auto digit=fingerprint_start+std::string("fingerprint ").size();
-  altered[digit]=altered[digit]=='0'?'1':'0';
-  { std::ofstream broken(sidecar,std::ios::binary|std::ios::trunc);broken<<altered; }
-  bool rejected=false;try{read_rpmd_ja_reference(out,&fingerprint);}catch(const std::exception&){rejected=true;}
-  { std::ofstream restore(sidecar,std::ios::binary|std::ios::trunc);restore.write(sidecar_bytes.data(),sidecar_bytes.size()); }
-  if(!rejected)throw std::runtime_error("tampered sidecar fingerprint accepted");
-  read_rpmd_ja_reference(out,&fingerprint);
-  if(fingerprint!=rpmd_ja_model_fingerprint(out))throw std::runtime_error("restored fingerprint mismatch");
+  make_input(raw,kernel,n,1.0e-10,version);prepare_rpmd_ja_qnep_reference(raw,out,kernel);const RpmdJAReference r=read_rpmd_ja_reference(out);
   if(r.backend!=2||r.number_of_atoms!=n||r.block_dynamical.tiles.empty()||r.block_site_transpose[0].tiles.empty()||!r.stability_checked||!has_compressed_h(r)||!(r.force_balance_residual>1.0e-4))throw std::runtime_error("prepared qNEP v3 fixture failed nonzero-force readback or H compression");
   const std::string expected_policy=version==1?"native_reference_transport":
     (version==2?"native_reference_transport;analytic_site_gradient_v1":"native_reference_transport;analytic_site_gradient_fd4_v1");

@@ -5,8 +5,6 @@
 #include <cstddef>
 #include <vector>
 
-constexpr int RPMD_JA_SAMPLE_BATCH_SIZE = 8;
-
 class RpmdJAQNEPCached
 {
 public:
@@ -23,10 +21,6 @@ public:
     double* device_result,
     int* device_error);
 
-  void capture_sample(const GPU_Vector<double>& continuous, const GPU_Vector<double>& reference_positions,
-    const GPU_Vector<double>& velocity, int slot, int* device_error);
-  void compute_batch(int count, double* device_result, int* device_error);
-
   std::size_t allocated_bytes() const { return allocated_bytes_; }
   std::size_t dynamical_tile_count() const { return dynamical_tile_count_; }
   std::size_t site_tile_count(const int alpha) const { return site_tile_count_[alpha]; }
@@ -34,9 +28,11 @@ public:
   std::size_t estimated_peak_bytes() const { return estimated_peak_bytes_; }
 
 private:
+  GPU_Vector<double> eigenvectors_;
   GPU_Vector<double> kernel_[3];
   GPU_Vector<double> sqrt_mass_;
   GPU_Vector<double> weighted_yu_;
+  GPU_Vector<double> modal_yu_;
   GPU_Vector<double> scratch_;
   GPU_Vector<double> alpha_scalar_;
   GPU_Vector<double> beta_scalar_;

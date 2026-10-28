@@ -3,8 +3,6 @@
 #include "rpmd_ja_qraw_v4.h"
 #include "rpmd_ja_qnep_prepare.cuh"
 #include "rpmd_ja_sha256.h"
-#include "rpmd_ja_identity_stream.cuh"
-#include <chrono>
 #include "force/force.cuh"
 #include "force/nep.cuh"
 #include "force/nep_charge.cuh"
@@ -1538,17 +1536,10 @@ RpmdJAModeValidator make_rpmd_ja_qnep_mode_validator(Atom& atom, Box& active_box
   };
 }
 
-RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* file_fingerprint)
+RpmdJAReference read_rpmd_ja_reference(const std::string& path)
 {
-  const auto read_start = std::chrono::steady_clock::now();
-  rpmd_ja_file_io::ifstream source(path, std::ios::binary);
-  if (!source) throw std::runtime_error("cannot open RPMD-JA reference file: " + path);
-  source.seekg(0, std::ios::end);
-  const std::streamoff file_size = source.tellg();
-  source.seekg(0, std::ios::beg);
-  if (file_size < 0 || !source) throw std::runtime_error("invalid RPMD-JA reference file size");
-  RpmdJAIdentityStreambuf identity(source.rdbuf());
-  std::istream in(&identity);
+  rpmd_ja_file_io::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open RPMD-JA reference file: " + path);
   char magic[sizeof(kMagic)], units[sizeof(kUnits)];
   in.read(magic, sizeof(magic));
   std::uint32_t version, endian;
@@ -1574,7 +1565,10 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* f
     throw std::runtime_error("invalid RPMD-JA reference temperature or finite-difference step");
   const int dimension = reference_dimension(result.number_of_atoms);
   const std::streampos data_position = in.tellg();
-  if (data_position < 0) throw std::runtime_error("invalid RPMD-JA reference file position");
+  in.seekg(0, std::ios::end);
+  const std::streamoff file_size = in.tellg();
+  in.seekg(data_position);
+  if (file_size < 0 || data_position < 0) throw std::runtime_error("invalid RPMD-JA reference file size");
   const std::size_t n = static_cast<std::size_t>(result.number_of_atoms);
   if (result.backend == 0) {
     const std::size_t matrix = matrix_size(result.number_of_atoms);
@@ -1707,11 +1701,6 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* f
       throw std::runtime_error("qNEP RPMD-JA kernel table does not cover the stored spectrum");
   }
   if (in.peek() != std::char_traits<char>::eof()) throw std::runtime_error("trailing data in RPMD-JA reference file");
-  if (source.bad() || identity.pubseekoff(0, std::ios::cur, std::ios::in) != file_size)
-    throw std::runtime_error("failed reading RPMD-JA reference identity");
-  const std::uint64_t identity_fingerprint = identity.fingerprint();
-  const std::string identity_sha256 = identity.sha256();
-  const auto validation_start = std::chrono::steady_clock::now();
   require_finite(result.masses, "masses");
   require_finite(result.positions, "reference positions");
   for (double mass : result.masses) if (!(mass > 0.0)) throw std::runtime_error("nonpositive RPMD-JA mass");
@@ -1753,7 +1742,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* f
     if (!stability || stability >> trailing || atom_count != result.number_of_atoms || !(minimum_pivot > 0.0) ||
         !std::isfinite(minimum_pivot) || !(reconstruction_residual >= 0.0) ||
         !std::isfinite(reconstruction_residual) || reconstruction_residual > 1.0e-8 ||
-        fingerprint != identity_fingerprint)
+        fingerprint != rpmd_ja_model_fingerprint(path))
       throw std::runtime_error("RPMD-JA stability sidecar does not validate this reference file");
     result.stability_checked = true;
   } else {
@@ -1850,7 +1839,7 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* f
         !std::isfinite(reconstruction_residual) || reconstruction_residual > 1.0e-8 ||
         !(softmode_error >= 0.0) || softmode_error > 1.0e-2 || !std::isfinite(softmode_error) ||
         config_fingerprint != result.mechanical_config_fingerprint ||
-        file_fingerprint != identity_fingerprint)
+        file_fingerprint != rpmd_ja_model_fingerprint(path))
       throw std::runtime_error("qNEP RPMD-JA stability sidecar does not validate this reference file");
     if (stability_version >= 2 && stability_version < 4 &&
         (!(operator_bound >= 0.0) || operator_bound > 1.0e-2 || !std::isfinite(operator_bound)))
@@ -1868,17 +1857,16 @@ RpmdJAReference read_rpmd_ja_reference(const std::string& path, std::uint64_t* f
     result.relative_operator_bound = operator_bound;
     result.stability_checked = true;
   }
-  result.source_file_sha256 = identity_sha256;
-  std::printf("rpmd_ja reference parse+identity %.3f s, validation %.3f s\n",
-    std::chrono::duration<double>(validation_start - read_start).count(),
-    std::chrono::duration<double>(std::chrono::steady_clock::now() - validation_start).count());
-  if (file_fingerprint) *file_fingerprint = identity_fingerprint;
+  in.clear();
+  in.seekg(0, std::ios::beg);
+  if (!in) throw std::runtime_error("cannot rewind RPMD-JA reference file for SHA-256 identity");
+  rpmd_ja_sha256::Digest digest;
+  char digest_buffer[8192];
+  while (in.read(digest_buffer, sizeof(digest_buffer)) || in.gcount() != 0)
+    digest.update(reinterpret_cast<const unsigned char*>(digest_buffer), static_cast<std::size_t>(in.gcount()));
+  if (!in.eof()) throw std::runtime_error("failed reading RPMD-JA reference file for SHA-256 identity");
+  result.source_file_sha256 = digest.finish_hex();
   return result;
-}
-
-RpmdJAReference read_rpmd_ja_reference(const std::string& path)
-{
-  return read_rpmd_ja_reference(path, nullptr);
 }
 
 void generate_rpmd_ja_reference(
