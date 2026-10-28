@@ -263,7 +263,7 @@ static __global__ void build_kernel_matrix(
 
 static __global__ void build_weighted_inputs(
   const int N, const int D, const double* continuous, const double* reference,
-  const double* velocity, const double* sqrt_mass, double* weighted, int* error)
+  const double* velocity, const double* sqrt_mass, double* y_out, double* u_out, int* error)
 {
   const int d = blockIdx.x * blockDim.x + threadIdx.x;
   if (d >= D) return;
@@ -271,8 +271,8 @@ static __global__ void build_weighted_inputs(
   const double y = sqrt_mass[atom] * (continuous[d] - reference[d]);
   const double u = sqrt_mass[atom] * velocity[d];
   if (!isfinite(y) || !isfinite(u)) atomicOr(error, RPMD_JA_ERROR_NUMERICAL);
-  weighted[d] = isfinite(y) ? y : 0.0;
-  weighted[D + d] = isfinite(u) ? u : 0.0;
+  y_out[d] = isfinite(y) ? y : 0.0;
+  u_out[d] = isfinite(u) ? u : 0.0;
 }
 
 static __global__ void check_sample_values(const int D, const double* action, const double* result, int* error)
@@ -471,8 +471,7 @@ void RpmdJAQNEPCached::initialize(
   std::size_t steady_bytes = 0;
   add_count(steady_bytes, static_cast<std::size_t>(3) * D2, sizeof(double));
   add_count(steady_bytes, static_cast<std::size_t>(number_of_atoms_), sizeof(double));
-  add_count(steady_bytes, static_cast<std::size_t>(2) * dimension_, sizeof(double));
-  add_count(steady_bytes, static_cast<std::size_t>(dimension_ + modal_dimension_), sizeof(double));
+  add_count(steady_bytes, static_cast<std::size_t>(3) * RPMD_JA_SAMPLE_BATCH_SIZE * dimension_ + modal_dimension_, sizeof(double));
   add_count(steady_bytes, 2, sizeof(double));
   peak_bytes = std::max({build_bytes, compact_total, eigensolver_bytes,
     embed_bytes, cache_build_bytes, steady_bytes});
@@ -642,10 +641,10 @@ void RpmdJAQNEPCached::initialize(
   for (int alpha = 0; alpha < 3; ++alpha) add_count(steady_actual, kernel_[alpha].size(), sizeof(double));
   add_count(steady_actual, sqrt_mass_.size(), sizeof(double));
   std::size_t sample_extra = 0;
-  add_count(sample_extra, static_cast<std::size_t>(3) * dimension_ + 2, sizeof(double));
+  add_count(sample_extra, static_cast<std::size_t>(3) * RPMD_JA_SAMPLE_BATCH_SIZE * dimension_ + 2, sizeof(double));
   require_gpu_bytes(sample_extra, "steady sample buffers");
-  weighted_yu_.resize(static_cast<std::size_t>(2) * dimension_);
-  scratch_.resize(dimension_);
+  weighted_yu_.resize(static_cast<std::size_t>(2) * RPMD_JA_SAMPLE_BATCH_SIZE * dimension_);
+  scratch_.resize(static_cast<std::size_t>(RPMD_JA_SAMPLE_BATCH_SIZE) * dimension_);
   const double one = 1.0, zero = 0.0;
   alpha_scalar_.resize(1);
   beta_scalar_.resize(1);
@@ -661,35 +660,56 @@ void RpmdJAQNEPCached::initialize(
 #endif
 }
 
-void RpmdJAQNEPCached::compute_correction(
-  const GPU_Vector<double>& continuous,
-  const GPU_Vector<double>& reference_positions,
-  const GPU_Vector<double>& velocity,
-  double* device_result,
-  int* device_error)
+void RpmdJAQNEPCached::capture_sample(
+  const GPU_Vector<double>& continuous, const GPU_Vector<double>& reference_positions,
+  const GPU_Vector<double>& velocity, int slot, int* device_error)
 {
 #ifdef USE_HIP
-  (void)continuous; (void)reference_positions; (void)velocity; (void)device_result; (void)device_error;
+  (void)continuous; (void)reference_positions; (void)velocity; (void)slot; (void)device_error;
   PRINT_INPUT_ERROR("rpmd_ja qNEP v3 cached evaluation is CUDA-only.");
 #else
-  if (!blas_handle_ || number_of_atoms_ <= 0 || modal_dimension_ <= 0 ||
-      device_result == nullptr || device_error == nullptr)
-    PRINT_INPUT_ERROR("rpmd_ja qNEP cached correction received invalid buffers.");
+  if (!blas_handle_ || slot < 0 || slot >= RPMD_JA_SAMPLE_BATCH_SIZE || !device_error)
+    PRINT_INPUT_ERROR("rpmd_ja qNEP cached sample received invalid buffers.");
+  const int D = dimension_;
+  build_weighted_inputs<<<(D + threads - 1) / threads, threads>>>(
+    number_of_atoms_, D, continuous.data(), reference_positions.data(), velocity.data(), sqrt_mass_.data(),
+    weighted_yu_.data() + static_cast<std::size_t>(slot) * D,
+    weighted_yu_.data() + static_cast<std::size_t>(RPMD_JA_SAMPLE_BATCH_SIZE + slot) * D, device_error);
+  cuda_check(cudaGetLastError(), "build weighted sample inputs");
+#endif
+}
+
+void RpmdJAQNEPCached::compute_batch(int count, double* device_result, int* device_error)
+{
+#ifdef USE_HIP
+  (void)count; (void)device_result; (void)device_error;
+  PRINT_INPUT_ERROR("rpmd_ja qNEP v3 cached evaluation is CUDA-only.");
+#else
+  if (!blas_handle_ || count < 1 || count > RPMD_JA_SAMPLE_BATCH_SIZE || !device_result || !device_error)
+    PRINT_INPUT_ERROR("rpmd_ja qNEP cached batch received invalid buffers.");
   cublasHandle_t blas = static_cast<cublasHandle_t>(blas_handle_);
   const int D = dimension_;
-  cuda_check(cudaGetLastError(), "before qNEP cached sample");
-  build_weighted_inputs<<<(D + threads - 1) / threads, threads>>>(
-    number_of_atoms_, D, continuous.data(), reference_positions.data(), velocity.data(),
-    sqrt_mass_.data(), weighted_yu_.data(), device_error);
-  cuda_check(cudaGetLastError(), "build weighted sample inputs");
   for (int alpha = 0; alpha < 3; ++alpha) {
-    blas_check(cublasDgemv(blas, CUBLAS_OP_N, D, D, alpha_scalar_.data(), kernel_[alpha].data(), D,
-      weighted_yu_.data(), 1, beta_scalar_.data(), scratch_.data(), 1), "apply cached current matrix");
-    blas_check(cublasDdot(blas, D, weighted_yu_.data() + D, 1, scratch_.data(), 1,
-      device_result + alpha), "contract cached current");
-    check_sample_values<<<(D + threads - 1) / threads, threads>>>(
-      D, scratch_.data(), device_result + alpha, device_error);
-    cuda_check(cudaGetLastError(), "check cached sample values");
+    blas_check(cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, D, count, D,
+      alpha_scalar_.data(), kernel_[alpha].data(), D, weighted_yu_.data(), D,
+      beta_scalar_.data(), scratch_.data(), D), "apply cached current matrix batch");
+    for (int slot = 0; slot < count; ++slot) {
+      const std::size_t offset = static_cast<std::size_t>(slot) * D;
+      double* result = device_result + 3 * slot + alpha;
+      blas_check(cublasDdot(blas, D, weighted_yu_.data() + static_cast<std::size_t>(RPMD_JA_SAMPLE_BATCH_SIZE) * D + offset,
+        1, scratch_.data() + offset, 1, result), "contract cached current");
+      check_sample_values<<<(D + threads - 1) / threads, threads>>>(
+        D, scratch_.data() + offset, result, device_error);
+      cuda_check(cudaGetLastError(), "check cached sample values");
+    }
   }
 #endif
+}
+
+void RpmdJAQNEPCached::compute_correction(
+  const GPU_Vector<double>& continuous, const GPU_Vector<double>& reference_positions,
+  const GPU_Vector<double>& velocity, double* device_result, int* device_error)
+{
+  capture_sample(continuous, reference_positions, velocity, 0, device_error);
+  compute_batch(1, device_result, device_error);
 }

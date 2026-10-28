@@ -61,6 +61,11 @@ public:
     const GPU_Vector<double>& velocity,
     double* device_result,
     int* device_error);
+  void capture_cached_sample(const GPU_Vector<double>& continuous, const GPU_Vector<double>& reference_positions,
+    const GPU_Vector<double>& velocity, int slot, int* device_error)
+  { qnep_cached_.capture_sample(continuous, reference_positions, velocity, slot, device_error); }
+  void compute_cached_batch(int count, double* device_result, int* device_error)
+  { qnep_cached_.compute_batch(count, device_result, device_error); }
   std::size_t allocated_bytes() const { return allocated_bytes_; }
   double preparation_seconds() const { return qnep_cached_.preparation_seconds(); }
   std::size_t estimated_peak_bytes() const { return qnep_cached_.estimated_peak_bytes(); }

@@ -2,6 +2,7 @@
 #include "force/nep_charge.cuh"
 #include "force/potential.cuh"
 #include "hac.cuh"
+#include "rpmd_ja_store_current.cuh"
 #include "integrate/integrate.cuh"
 #ifdef GPUMD_WPE_ENABLED
 #include "wisevolve_potential_api.h"
@@ -142,29 +143,6 @@ static __global__ void delta_current(
     __syncthreads();
   }
   if (tid == 0) result[alpha] = sums[0];
-}
-
-static __global__ void store_current(
-  const int Nd,
-  const int frame,
-  const double* centroid_heat,
-  const double* delta,
-  double* jcent_history,
-  double* delta_history,
-  double* ja_history,
-  int* error)
-{
-  const int d = threadIdx.x;
-  if (d >= 3) return;
-  const double jcent = d == 0 ? centroid_heat[frame + Nd * 0] + centroid_heat[frame + Nd * 1]
-                    : d == 1 ? centroid_heat[frame + Nd * 2] + centroid_heat[frame + Nd * 3]
-                             : centroid_heat[frame + Nd * 4];
-  if (!isfinite(jcent) || !isfinite(delta[d]) || !isfinite(jcent + delta[d]))
-    atomicOr(error, RPMD_JA_ERROR_NUMERICAL);
-  const size_t index = static_cast<size_t>(frame) + static_cast<size_t>(Nd) * d;
-  jcent_history[index] = jcent;
-  delta_history[index] = delta[d];
-  ja_history[index] = jcent + delta[d];
 }
 
 } // namespace
@@ -362,7 +340,7 @@ void HAC::pre_run_rpmd_ja_(
   centroid_position_work_.resize(D);
   rpmd_ja_last_wrapped_centroid_.resize(D);
   rpmd_ja_continuous_centroid_.resize(D);
-  rpmd_ja_delta_current_.resize(3);
+  rpmd_ja_delta_current_.resize(rpmd_ja_reference_.backend == 2 ? 3 * RPMD_JA_SAMPLE_BATCH_SIZE : 3);
   for (auto& history : rpmd_ja_current_) history.resize(static_cast<size_t>(3) * number_of_frames);
   rpmd_ja_number_of_frames_ = number_of_frames;
   rpmd_ja_branch_error_.resize(1, 0);
@@ -406,14 +384,18 @@ void HAC::pre_run_rpmd_ja_(
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()));
     } else {
       printf(
-        "rpmd_ja qNEP fixed-reference physical cache: source D tiles=%llu, B^T tiles=(%llu,%llu,%llu), setup=%.3f s, steady bytes=%llu, peak estimate=%llu bytes (cache only); each sampled point applies three cached physical matrices (sample time not benchmarked).\n",
+        "rpmd_ja qNEP fixed-reference physical cache: source D tiles=%llu, B^T tiles=(%llu,%llu,%llu), setup=%.3f s, steady bytes=%llu, peak estimate=%llu bytes (cache only); samples are evaluated in batches of up to %d using three cached physical matrices (sample time not benchmarked).\n",
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.dynamical_block_count()),
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(0)),
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(1)),
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.site_block_count(2)),
         rpmd_ja_sparse_workspace_.preparation_seconds(),
         static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.allocated_bytes()),
-        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.estimated_peak_bytes()));
+        static_cast<unsigned long long>(rpmd_ja_sparse_workspace_.estimated_peak_bytes()),
+        RPMD_JA_SAMPLE_BATCH_SIZE);
+      printf("rpmd_ja qNEP measurement: %d frames, %d batches of up to %d.\n",
+        number_of_frames, (number_of_frames + RPMD_JA_SAMPLE_BATCH_SIZE - 1) / RPMD_JA_SAMPLE_BATCH_SIZE,
+        RPMD_JA_SAMPLE_BATCH_SIZE);
     }
   }
   rpmd_ja_tracker_initialized_ = true;
@@ -438,22 +420,36 @@ void HAC::update_rpmd_ja_centroid_(const int step, const bool check_error, Atom&
 
 void HAC::compute_rpmd_ja_current_(const int frame, Atom& atom, Box&)
 {
-  if (rpmd_ja_reference_.backend == 0) {
-    const int D = atom.number_of_atoms * 3;
-    delta_current<<<3, 128>>>(
-      D, rpmd_ja_continuous_centroid_.data(), rpmd_ja_reference_positions_.data(),
-      atom.velocity_per_atom.data(), rpmd_ja_delta_h_[0].data(), rpmd_ja_delta_h_[1].data(),
-      rpmd_ja_delta_h_[2].data(), rpmd_ja_delta_current_.data());
-  } else {
-    rpmd_ja_sparse_workspace_.compute_correction(
+  if (rpmd_ja_reference_.backend == 2) {
+    const int slot = frame % RPMD_JA_SAMPLE_BATCH_SIZE;
+    rpmd_ja_sparse_workspace_.capture_cached_sample(
       rpmd_ja_continuous_centroid_, rpmd_ja_reference_positions_, atom.velocity_per_atom,
-      rpmd_ja_delta_current_.data(), rpmd_ja_branch_error_.data());
+      slot, rpmd_ja_branch_error_.data());
+    if (slot == RPMD_JA_SAMPLE_BATCH_SIZE - 1 || frame + 1 == rpmd_ja_number_of_frames_) {
+      const int count = slot + 1;
+      rpmd_ja_sparse_workspace_.compute_cached_batch(count, rpmd_ja_delta_current_.data(), rpmd_ja_branch_error_.data());
+      store_current<<<1, 128>>>(
+        rpmd_ja_number_of_frames_, frame - slot, count, heat_all.data(), rpmd_ja_delta_current_.data(),
+        rpmd_ja_current_[0].data(), rpmd_ja_current_[1].data(), rpmd_ja_current_[2].data(),
+        rpmd_ja_branch_error_.data());
+    }
+  } else {
+    if (rpmd_ja_reference_.backend == 0) {
+      const int D = atom.number_of_atoms * 3;
+      delta_current<<<3, 128>>>(
+        D, rpmd_ja_continuous_centroid_.data(), rpmd_ja_reference_positions_.data(),
+        atom.velocity_per_atom.data(), rpmd_ja_delta_h_[0].data(), rpmd_ja_delta_h_[1].data(),
+        rpmd_ja_delta_h_[2].data(), rpmd_ja_delta_current_.data());
+    } else {
+      rpmd_ja_sparse_workspace_.compute_correction(
+        rpmd_ja_continuous_centroid_, rpmd_ja_reference_positions_, atom.velocity_per_atom,
+        rpmd_ja_delta_current_.data(), rpmd_ja_branch_error_.data());
+    }
+    store_current<<<1, 128>>>(
+      rpmd_ja_number_of_frames_, frame, 1, heat_all.data(), rpmd_ja_delta_current_.data(),
+      rpmd_ja_current_[0].data(), rpmd_ja_current_[1].data(), rpmd_ja_current_[2].data(),
+      rpmd_ja_branch_error_.data());
   }
-  GPU_CHECK_KERNEL
-  store_current<<<1, 128>>>(
-    rpmd_ja_number_of_frames_, frame, heat_all.data(), rpmd_ja_delta_current_.data(),
-    rpmd_ja_current_[0].data(), rpmd_ja_current_[1].data(), rpmd_ja_current_[2].data(),
-    rpmd_ja_branch_error_.data());
   GPU_CHECK_KERNEL
   int sample_error = 0;
   rpmd_ja_branch_error_.copy_to_host(&sample_error, 1);
