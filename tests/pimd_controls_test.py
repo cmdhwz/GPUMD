@@ -146,7 +146,9 @@ def test_source_call_order_and_kernel_contracts():
     half_kick = compute1.index("gpu_half_kick<<<")
     com_fix = compute1.index("remove_center_of_mass_velocity_(atom);")
     thermo_update = compute1.index("update_thermo_(box, atom, thermo);")
-    pressure_update = compute1.index("apply_barostat_(box, atom, thermo);")
+    pressure_update = compute1.index(
+        "apply_barostat_(step, number_of_steps, box, atom, thermo);"
+    )
     box_refresh = compute1.index("box.set_is_orthogonal();")
     free_step = compute1.index("gpu_nve_forward<<<")
     assert half_kick < com_fix < thermo_update < pressure_update < box_refresh < free_step
@@ -224,8 +226,49 @@ def test_source_call_order_and_kernel_contracts():
     assert "correct_velocity does not update ring-polymer bead velocities." in perform_a_run
 
 
+def test_pimd_pressure_ramp_contract():
+    constructor = function_body(
+        SOURCE,
+        "Ensemble_PIMD::Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& box)",
+    )
+    eco_parse = constructor.index('tokens[num_param - 2] == "eco"')
+    count_validation = constructor.index("if (use_scr_barostat)")
+    assert eco_parse < count_validation
+    assert "pimd_num_param = num_param - 2;" in constructor
+    assert "pimd_num_param != 10" in constructor
+    assert "pimd_num_param != 16" in constructor
+    assert "pressure_ramp_ = pimd_num_param == 10 || pimd_num_param == 16;" in constructor
+    assert "pimd_num_param == 13 || pimd_num_param == 16" in constructor
+    assert "pimd_num_param == 9 || pimd_num_param == 10" in constructor
+    assert "tokens[6 + i]" in constructor
+    assert "tokens[6 + num_target_pressure_components + i]" in constructor
+    assert "6 + num_target_pressure_components * (pressure_ramp_ ? 2 : 1)" in constructor
+
+    apply_barostat = function_body(SOURCE, "void Ensemble_PIMD::apply_barostat_(")
+    assert "static_cast<double>(step) / number_of_steps" in apply_barostat
+    assert (
+        "target_pressure[i] + (target_pressure_stop_[i] - target_pressure[i]) * progress"
+        in apply_barostat
+    )
+
+    # This three-axis input exercises the start, stop, modulus, and coupling indices.
+    tokens = "ensemble pimd 32 300 300 100 38 38 38 50 50 50 140 140 140 1000".split()
+    assert tokens[6:9] == ["38", "38", "38"]
+    assert tokens[9:12] == ["50", "50", "50"]
+    assert tokens[12:15] == ["140", "140", "140"]
+    assert tokens[15] == "1000"
+
+    def ramp_target(step, number_of_steps, start, stop):
+        return start + (stop - start) * step / number_of_steps
+
+    assert ramp_target(0, 100000, 38.0, 50.0) == 38.0
+    assert np.isclose(ramp_target(99999, 100000, 38.0, 50.0), 49.99988)
+    assert ramp_target(0, 1, 38.0, 50.0) == 38.0
+
+
 if __name__ == "__main__":
     test_global_com_projection()
     test_global_com_projection_bead_counts()
     test_centroid_only_cell_transforms()
     test_source_call_order_and_kernel_contracts()
+    test_pimd_pressure_ramp_contract()

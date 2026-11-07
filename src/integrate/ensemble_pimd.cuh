@@ -99,12 +99,14 @@ protected:
   double omega_n;
   bool use_eco_pimd = false;
   bool use_scr_barostat = false;
+  bool pressure_ramp_ = false;
   bool eco_frequencies_reported = false;
   double eco_omega_max_cm1 = 0.0;
   double eco_last_temperature = -1.0;
   double temperature1_ = 0.0;
   double temperature2_ = 0.0;
   double elastic_modulus_[6] = {0.0};
+  double target_pressure_stop_[6] = {0.0};
   double tau_p_ = 0.0;
   GPU_Vector<gpurandState> curand_states;
   GPU_Vector<double*> position_beads;
@@ -138,5 +140,10 @@ protected:
 private:
   void remove_center_of_mass_velocity_(Atom& atom);
   void update_thermo_(Box& box, Atom& atom, GPU_Vector<double>& thermo);
-  void apply_barostat_(Box& box, Atom& atom, GPU_Vector<double>& thermo);
+  void apply_barostat_(
+    const int step,
+    const int number_of_steps,
+    Box& box,
+    Atom& atom,
+    GPU_Vector<double>& thermo);
 };

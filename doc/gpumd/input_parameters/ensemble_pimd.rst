@@ -27,7 +27,7 @@ It can be used in the following ways::
 In both cases, :attr:`num_beads` is the number of beads in the ring polymer, which should be a positive even integer no larger than 128.
 The first case is similar to the NVT ensemble with :attr:`nvt_lan` as the Langevin thermostat is used for both the internal and the centroid modes [Ceriotti2010]_. 
 The second case is similar to the NPT ensemble with :attr:`npt_ber`, where a Berendsen barostat is added compared to the first case.
-The pressure target is fixed during a run.
+The pressure target is fixed during a run unless a pressure-ramp form below is used.
 Note that :attr:`pimd` or :attr:`pimd_scr` (that is, not :attr:`rpmd` or :attr:`trpmd` described below) must be the first run that requires to set :attr:`num_beads`. By default one cannot change :attr:`num_beads` from run to run. A continuous PIMD sequence may explicitly discard the old internal modes and rebuild a new ring polymer from its current centroid with :attr:`pimd_reseed_from_centroid`; this exception is not available for RPMD or TRPMD.
 
 One-time centroid reseeding
@@ -59,6 +59,27 @@ It can be used in the following ways::
 
 The pressure-control parameters have the same meaning and support the same isotropic, orthogonal, and triclinic forms as in the pressure-controlled :attr:`pimd` case.
 The difference is that :attr:`pimd` uses the Berendsen barostat, whereas :attr:`pimd_scr` uses stochastic cell rescaling.
+
+Pressure ramp
+-------------
+
+For either :attr:`pimd` or :attr:`pimd_scr`, the target pressure can be ramped linearly during the current run for isotropic or orthogonal-cell control::
+
+    ensemble pimd <num_beads> <T_1> <T_2> <T_coup> <P_start> <P_stop> <C> <tau_p>
+    ensemble pimd <num_beads> <T_1> <T_2> <T_coup> <Pxx_start> <Pyy_start> <Pzz_start> <Pxx_stop> <Pyy_stop> <Pzz_stop> <Cxx> <Cyy> <Czz> <tau_p>
+
+The :attr:`pimd_scr` keyword can be substituted for :attr:`pimd` in these forms. The first form controls isotropic pressure; the second controls the three orthogonal cell directions independently and requires an orthogonal box. The pressure and elastic-modulus values are in GPa. The target pressure interpolates from ``*_start`` to ``*_stop`` over the progress of the current :attr:`run`, using ``step / number_of_steps`` with zero-based ``step``. Thus the first barostat update uses the start pressure; for :math:`N` steps, the last update uses :math:`P_\mathrm{start} + (P_\mathrm{stop} - P_\mathrm{start})(N-1)/N`, and ``run 1`` uses only the start pressure. The stop pressure is the run-end boundary value. A newly declared ramp in the next run starts from that declaration's start pressure. Existing fixed-pressure forms remain available. Triclinic pressure ramps are not supported.
+
+For example, the following ramps isotropic pressure from 0 to 50 GPa over 100000 steps::
+
+    ensemble pimd 32 300 300 100 0 50 100 1000
+    run 100000
+
+This form ramps the three orthogonal pressure components independently::
+
+    ensemble pimd 32 300 300 100 38 38 38 50 50 50 140 140 140 1000
+
+PIMD runs through the GPUMD-WPE backend use the same pressure-ramp inputs and integrator. WPE supplies the bead forces and virials; the shared PIMD integrator evaluates pressure and applies the cell update.
 
 For both pressure-controlled forms, the barostat transforms the centroid
 position with the updated cell and translates every bead by the same centroid

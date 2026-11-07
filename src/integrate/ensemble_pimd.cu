@@ -152,17 +152,19 @@ Ensemble_PIMD::Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& 
       }
     }
     if (use_scr_barostat) {
-      if (pimd_num_param != 9 && pimd_num_param != 13 && pimd_num_param != 19) {
+      if (
+        pimd_num_param != 9 && pimd_num_param != 10 && pimd_num_param != 13 &&
+        pimd_num_param != 16 && pimd_num_param != 19) {
         PRINT_INPUT_ERROR(
-          "ensemble pimd_scr should have 7, 11, or 17 parameters, optionally followed by "
+          "ensemble pimd_scr should have 7, 8, 11, 14, or 17 parameters, optionally followed by "
           "eco omega_max_cm1.");
       }
     } else {
       if (
-        pimd_num_param != 6 && pimd_num_param != 9 && pimd_num_param != 13 &&
-        pimd_num_param != 19) {
+        pimd_num_param != 6 && pimd_num_param != 9 && pimd_num_param != 10 &&
+        pimd_num_param != 13 && pimd_num_param != 16 && pimd_num_param != 19) {
         PRINT_INPUT_ERROR(
-          "ensemble pimd should have 4, 7, 11, or 17 parameters, optionally followed by "
+          "ensemble pimd should have 4, 7, 8, 11, 14, or 17 parameters, optionally followed by "
           "eco omega_max_cm1.");
       }
     }
@@ -209,37 +211,50 @@ Ensemble_PIMD::Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& 
     }
 
     if (pimd_num_param >= 9) {
-      if (pimd_num_param == 13) {
-        for (int i = 0; i < 3; i++) {
-          if (!is_valid_real(tokens[6 + i], &target_pressure[i])) {
-            PRINT_INPUT_ERROR("Pressure should be a number.");
-          }
-        }
-        for (int i = 0; i < 3; i++) {
-          if (!is_valid_real(tokens[9 + i], &elastic_modulus_[i])) {
-            PRINT_INPUT_ERROR("elastic modulus should be a number.");
-          }
-          if (elastic_modulus_[i] <= 0) {
-            PRINT_INPUT_ERROR("elastic modulus should > 0.");
-          }
-        }
+      pressure_ramp_ = pimd_num_param == 10 || pimd_num_param == 16;
+      if (pimd_num_param == 13 || pimd_num_param == 16) {
         num_target_pressure_components = 3;
+      } else if (pimd_num_param == 9 || pimd_num_param == 10) {
+        num_target_pressure_components = 1;
+      } else {
+        num_target_pressure_components = 6;
+      }
+
+      for (int i = 0; i < num_target_pressure_components; i++) {
+        if (!is_valid_real(tokens[6 + i], &target_pressure[i]) ||
+            (pressure_ramp_ && !std::isfinite(target_pressure[i]))) {
+          PRINT_INPUT_ERROR("Pressure should be a number.");
+        }
+      }
+      if (pressure_ramp_) {
+        for (int i = 0; i < num_target_pressure_components; i++) {
+          if (
+            !is_valid_real(
+              tokens[6 + num_target_pressure_components + i], &target_pressure_stop_[i]) ||
+              !std::isfinite(target_pressure_stop_[i])) {
+            PRINT_INPUT_ERROR("Final pressure should be a finite number.");
+          }
+        }
+      }
+      const int index_elastic_modulus =
+        6 + num_target_pressure_components * (pressure_ramp_ ? 2 : 1);
+      for (int i = 0; i < num_target_pressure_components; i++) {
+        if (!is_valid_real(tokens[index_elastic_modulus + i], &elastic_modulus_[i]) ||
+            (pressure_ramp_ && !std::isfinite(elastic_modulus_[i]))) {
+          PRINT_INPUT_ERROR("elastic modulus should be a finite number.");
+        }
+        if (elastic_modulus_[i] <= 0) {
+          PRINT_INPUT_ERROR("elastic modulus should > 0.");
+        }
+      }
+
+      if (num_target_pressure_components == 3) {
         if (
           box.cpu_h[1] != 0 || box.cpu_h[2] != 0 || box.cpu_h[3] != 0 || box.cpu_h[5] != 0 ||
           box.cpu_h[6] != 0 || box.cpu_h[7] != 0) {
           PRINT_INPUT_ERROR("Cannot use triclinic box with only 3 target pressure components.");
         }
-      } else if (pimd_num_param == 9) {
-        if (!is_valid_real(tokens[6], &target_pressure[0])) {
-          PRINT_INPUT_ERROR("Pressure should be a number.");
-        }
-        if (!is_valid_real(tokens[7], &elastic_modulus_[0])) {
-          PRINT_INPUT_ERROR("elastic modulus should be a number.");
-        }
-        if (elastic_modulus_[0] <= 0) {
-          PRINT_INPUT_ERROR("elastic modulus should > 0.");
-        }
-        num_target_pressure_components = 1;
+      } else if (num_target_pressure_components == 1) {
         if (
           box.cpu_h[1] != 0 || box.cpu_h[2] != 0 || box.cpu_h[3] != 0 || box.cpu_h[5] != 0 ||
           box.cpu_h[6] != 0 || box.cpu_h[7] != 0) {
@@ -250,28 +265,15 @@ Ensemble_PIMD::Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& 
             "Cannot use isotropic pressure with non-periodic boundary in any direction.");
         }
       } else {
-        for (int i = 0; i < 6; i++) {
-          if (!is_valid_real(tokens[6 + i], &target_pressure[i])) {
-            PRINT_INPUT_ERROR("Pressure should be a number.");
-          }
-        }
-        for (int i = 0; i < 6; i++) {
-          if (!is_valid_real(tokens[12 + i], &elastic_modulus_[i])) {
-            PRINT_INPUT_ERROR("elastic modulus should be a number.");
-          }
-          if (elastic_modulus_[i] <= 0) {
-            PRINT_INPUT_ERROR("elastic modulus should > 0.");
-          }
-        }
-        num_target_pressure_components = 6;
         if (box.pbc_x == 0 || box.pbc_y == 0 || box.pbc_z == 0) {
           PRINT_INPUT_ERROR(
             "Cannot use 6 pressure components with non-periodic boundary in any direction.");
         }
       }
 
-      int index_pressure_coupling = num_target_pressure_components * 2 + 6;
-      if (!is_valid_real(tokens[index_pressure_coupling], &tau_p_)) {
+      const int index_pressure_coupling = index_elastic_modulus + num_target_pressure_components;
+      if (!is_valid_real(tokens[index_pressure_coupling], &tau_p_) ||
+          (pressure_ramp_ && !std::isfinite(tau_p_))) {
         PRINT_INPUT_ERROR("Pressure coupling should be a number.");
       }
       if (tau_p_ < 1) {
@@ -308,12 +310,25 @@ Ensemble_PIMD::Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& 
     printf("    tau_T is %g time_step.\n", temperature_coupling);
     if (pimd_num_param >= 9) {
       if (num_target_pressure_components == 1) {
-        printf("    isotropic pressure is %g GPa.\n", target_pressure[0]);
+        if (pressure_ramp_) {
+          printf(
+            "    isotropic pressure ramps from %g to %g GPa.\n",
+            target_pressure[0], target_pressure_stop_[0]);
+        } else {
+          printf("    isotropic pressure is %g GPa.\n", target_pressure[0]);
+        }
         printf("    bulk modulus is %g GPa.\n", elastic_modulus_[0]);
       } else if (num_target_pressure_components == 3) {
-        printf("    pressure_xx is %g GPa.\n", target_pressure[0]);
-        printf("    pressure_yy is %g GPa.\n", target_pressure[1]);
-        printf("    pressure_zz is %g GPa.\n", target_pressure[2]);
+        const char* component_names[] = {"xx", "yy", "zz"};
+        for (int i = 0; i < 3; i++) {
+          if (pressure_ramp_) {
+            printf(
+              "    pressure_%s ramps from %g to %g GPa.\n",
+              component_names[i], target_pressure[i], target_pressure_stop_[i]);
+          } else {
+            printf("    pressure_%s is %g GPa.\n", component_names[i], target_pressure[i]);
+          }
+        }
         printf("    modulus_xx is %g GPa.\n", elastic_modulus_[0]);
         printf("    modulus_yy is %g GPa.\n", elastic_modulus_[1]);
         printf("    modulus_zz is %g GPa.\n", elastic_modulus_[2]);
@@ -335,6 +350,7 @@ Ensemble_PIMD::Ensemble_PIMD(const std::vector<std::string>& tokens, const Box& 
 
       for (int i = 0; i < num_target_pressure_components; i++) {
         target_pressure[i] /= PRESSURE_UNIT_CONVERSION;
+        target_pressure_stop_[i] /= PRESSURE_UNIT_CONVERSION;
         pressure_coupling[i] *= PRESSURE_UNIT_CONVERSION;
       }
     }
@@ -1426,8 +1442,24 @@ void Ensemble_PIMD::update_thermo_(Box& box, Atom& atom, GPU_Vector<double>& the
   GPU_CHECK_KERNEL
 }
 
-void Ensemble_PIMD::apply_barostat_(Box& box, Atom& atom, GPU_Vector<double>& thermo)
+void Ensemble_PIMD::apply_barostat_(
+  const int step,
+  const int number_of_steps,
+  Box& box,
+  Atom& atom,
+  GPU_Vector<double>& thermo)
 {
+  double pressure_target_ramped[6];
+  double* pressure_target = target_pressure;
+  if (pressure_ramp_) {
+    const double progress = static_cast<double>(step) / number_of_steps;
+    for (int i = 0; i < num_target_pressure_components; i++) {
+      pressure_target_ramped[i] =
+        target_pressure[i] + (target_pressure_stop_[i] - target_pressure[i]) * progress;
+    }
+    pressure_target = pressure_target_ramped;
+  }
+
   if (num_target_pressure_components == 1) {
     double scale_factor;
     cpu_pressure_isotropic(
@@ -1435,7 +1467,7 @@ void Ensemble_PIMD::apply_barostat_(Box& box, Atom& atom, GPU_Vector<double>& th
       use_scr_barostat,
       box,
       temperature,
-      target_pressure,
+      pressure_target,
       pressure_coupling,
       thermo.data(),
       scale_factor);
@@ -1453,7 +1485,7 @@ void Ensemble_PIMD::apply_barostat_(Box& box, Atom& atom, GPU_Vector<double>& th
       use_scr_barostat,
       box,
       temperature,
-      target_pressure,
+      pressure_target,
       pressure_coupling,
       thermo.data(),
       scale_factor);
@@ -1473,7 +1505,7 @@ void Ensemble_PIMD::apply_barostat_(Box& box, Atom& atom, GPU_Vector<double>& th
       use_scr_barostat,
       box,
       temperature,
-      target_pressure,
+      pressure_target,
       pressure_coupling,
       thermo.data(),
       mu);
@@ -1552,7 +1584,7 @@ void Ensemble_PIMD::compute1(
   // Consume the old force before rescaling; the regular force call then refreshes it.
   if (num_target_pressure_components > 0) {
     update_thermo_(box, atom, thermo);
-    apply_barostat_(box, atom, thermo);
+    apply_barostat_(step, number_of_steps, box, atom, thermo);
     box.set_is_orthogonal();
   }
 
