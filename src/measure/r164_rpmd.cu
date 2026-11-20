@@ -33,11 +33,17 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
   if (observer_requested_) ++next;
   checkpoint_stride_=0;
   if (next<t.size()) {
-    if (t[next]!="checkpoint" || next+2!=t.size() || !is_valid_int(t[next+1], &checkpoint_stride_) || checkpoint_stride_<=0)
+    if (t[next]!="checkpoint" || next+2!=t.size() || t[next+1].empty())
       PRINT_INPUT_ERROR("r164_rpmd expects optional observer followed by checkpoint and a positive stride.");
-    next+=2;
+    int value=0;
+    for (char c : t[next+1]) {
+      if (c<'0' || c>'9' || value>(std::numeric_limits<int>::max()-(c-'0'))/10)
+        PRINT_INPUT_ERROR("r164_rpmd checkpoint stride must be a positive decimal int.");
+      value=value*10+(c-'0');
+    }
+    if (value==0) PRINT_INPUT_ERROR("r164_rpmd checkpoint stride must be positive.");
+    checkpoint_stride_=value;
   }
-  if (next!=t.size()) PRINT_INPUT_ERROR("r164_rpmd invalid options.");
   directory_ = t[1]; enabled_ = true;
 }
 void R164_RPMD::read_positions(Atom& atom, std::vector<double>& q) {
@@ -77,6 +83,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
        << "P " << p_ << "\nN " << n_ << "\ntemperature_K " << temperature_ << "\ndt_fs " << dt*TIME_UNIT_CONVERSION << "\n"
        << "time_convention step_times_fixed_dt_start_zero\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
+  if (checkpoint_stride_) meta << "checkpoint_stride " << checkpoint_stride_ << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
   meta.close(); if (!meta || rpmd_ja_file_io::atomic_commit_new_file(directory_+"/metadata.txt.tmp", directory_+"/metadata.txt") != 0) PRINT_INPUT_ERROR("r164_rpmd failed committing metadata.");
   offset_.resize(n_*3);

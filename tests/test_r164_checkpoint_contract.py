@@ -9,7 +9,7 @@ class CheckpointContract(unittest.TestCase):
     def test_parser_accepts_only_ordered_positive_checkpoint(self):
         parse = SOURCE.split("void R164_RPMD::parse(", 1)[1].split("void R164_RPMD::read_positions", 1)[0]
         self.assertLess(parse.index('t[next]=="observer"'), parse.index('t[next]!="checkpoint"'))
-        for guard in ('next+2!=t.size()', '!is_valid_int(t[next+1], &checkpoint_stride_)', 'checkpoint_stride_<=0'):
+        for guard in ('next+2!=t.size()', "c<'0' || c>'9'", 'std::numeric_limits<int>::max()', 'value==0'):
             self.assertIn(guard, parse)
 
     def test_commit_order_and_opt_in_cadence(self):
