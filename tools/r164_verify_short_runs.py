@@ -36,7 +36,7 @@ def r164_options(tokens):
         if len(rest)<2 or not rest[1].isascii() or not rest[1].isdigit() or not 0<int(rest[1])<=2147483647: raise ValueError('invalid checkpoint option')
         checkpoint=int(rest[1]); rest=rest[2:]
     if rest:
-        if len(rest)!=4 or rest[0]!='pppm_trace' or any(not x.isascii() or not x.isdigit() or int(x)>2147483647 for x in rest[1:]): raise ValueError('invalid PPPM trace option')
+        if len(rest)!=4 or rest[0]!='pppm_trace' or any(not x.isascii() or not x.isdigit() or int(x)>2147483647 for x in rest[1:3]) or not (rest[3]=='all' or (rest[3].isascii() and rest[3].isdigit() and int(rest[3])<=2147483647)): raise ValueError('invalid PPPM trace option')
     return observer,checkpoint
 
 
