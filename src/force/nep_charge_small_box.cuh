@@ -121,7 +121,7 @@ static __global__ void find_neighbor_list_small_box(
             if (distance_square < rc_radial * rc_radial) {
               if (n1==trace_atom && count_radial<trace_capacity) {
                 R164_Neighbor_Edge& edge=radial[count_radial];
-                edge.slot=count_radial; edge.atom=n2;
+                edge.slot=count_radial; edge.atom=n2; edge.native_atom=-1;
                 edge.image[0]=ia+ebox.num_cells[0]*shift[0]; edge.image[1]=ib+ebox.num_cells[1]*shift[1]; edge.image[2]=ic+ebox.num_cells[2]*shift[2];
                 edge.dx=x12; edge.dy=y12; edge.dz=z12;
               }
@@ -134,7 +134,7 @@ static __global__ void find_neighbor_list_small_box(
             if (distance_square < rc_angular * rc_angular) {
               if (n1==trace_atom && count_angular<trace_capacity) {
                 R164_Neighbor_Edge& edge=angular[count_angular];
-                edge.slot=count_angular; edge.atom=n2;
+                edge.slot=count_angular; edge.atom=n2; edge.native_atom=-1;
                 edge.image[0]=ia+ebox.num_cells[0]*shift[0]; edge.image[1]=ib+ebox.num_cells[1]*shift[1]; edge.image[2]=ic+ebox.num_cells[2]*shift[2];
                 edge.dx=x12; edge.dy=y12; edge.dz=z12;
               }
@@ -672,7 +672,7 @@ static __device__ void find_force_radial_small_box_impl(
   double* g_fy,
   double* g_fz,
   double* g_virial,
-  const int n1)
+  const int n1, const int trace_atom = -1, R164_Neighbor_Edge* trace_edges = nullptr, int trace_capacity = 0)
 {
   if (n1 < N2) {
     int t1 = g_type[n1];
@@ -704,6 +704,7 @@ static __device__ void find_force_radial_small_box_impl(
           f12[d] += tmp12 * r12[d];
         }
       }
+      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
       double s_sxx = 0.0;
       double s_sxy = 0.0;
       double s_sxz = 0.0;
@@ -764,7 +765,7 @@ static __global__ void find_force_radial_small_box(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial, const int trace_atom, R164_Neighbor_Edge* trace_edges, int trace_capacity)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   find_force_radial_small_box_impl(
@@ -786,7 +787,7 @@ static __global__ void find_force_radial_small_box(
     g_fy,
     g_fz,
     g_virial,
-    n1);
+    n1, trace_atom, trace_edges, trace_capacity);
 }
 
 static __global__ void find_force_radial_small_box_pimd_batch(
@@ -859,7 +860,7 @@ static __device__ void find_force_angular_small_box_impl(
   double* g_fy,
   double* g_fz,
   double* g_virial,
-  const int n1)
+  const int n1, const int trace_atom = -1, R164_Neighbor_Edge* trace_edges = nullptr, int trace_capacity = 0)
 {
   if (n1 < N2) {
 
@@ -921,6 +922,7 @@ static __device__ void find_force_angular_small_box_impl(
           sum_fxyz,
           f12);
       }
+      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
       double s_sxx = 0.0;
       double s_sxy = 0.0;
       double s_sxz = 0.0;
@@ -982,7 +984,7 @@ static __global__ void find_force_angular_small_box(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial, const int trace_atom, R164_Neighbor_Edge* trace_edges, int trace_capacity)
 {
   const int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   find_force_angular_small_box_impl(
@@ -1005,7 +1007,7 @@ static __global__ void find_force_angular_small_box(
     g_fy,
     g_fz,
     g_virial,
-    n1);
+    n1, trace_atom, trace_edges, trace_capacity);
 }
 
 static __global__ void find_force_angular_small_box_pimd_batch(

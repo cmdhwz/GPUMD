@@ -82,7 +82,15 @@ struct QNEPReferenceTangentDiagnostics {
 struct R164_Neighbor_Edge {
   int slot, atom, image[3];
   float dx, dy, dz;
+  int native_atom;
+  float native_r[3], B[3], energy_gradient[3], charge_gradient[3];
 };
+
+inline __device__ void r164_record_native(R164_Neighbor_Edge* edges, int slot, int atom, const float* r, const float* f)
+{
+  R164_Neighbor_Edge& edge=edges[slot]; edge.native_atom=atom;
+  for (int d=0;d<3;++d) { edge.native_r[d]=r[d]; edge.B[d]=f[d]; }
+}
 
 class NEP_Charge : public Potential
 {
@@ -547,6 +555,7 @@ private:
   const void* charge_heat_channel_cache_velocity_ = nullptr;
   GPU_Vector<R164_Neighbor_Edge> r164_radial_edges_, r164_angular_edges_;
   void write_r164_neighbors(int N, bool small_box_path, unsigned long long before, unsigned long long after);
+  void write_r164_derivatives(int N, bool small_box_path, const GPU_Vector<int>& type);
   std::string r164_trace_prefix_;
   int r164_trace_step_ = -1, r164_trace_atom_ = -1, r164_trace_bead_ = -1;
   void write_r164_pre_electro_trace(int N, const GPU_Vector<double>& potential);

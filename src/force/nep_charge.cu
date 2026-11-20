@@ -780,7 +780,7 @@ static __global__ void find_descriptor(
       int image[3];
       apply_mic(box, x12, y12, z12, (n1==trace_atom) ? image : nullptr);
       if (n1==trace_atom && i1<radial_capacity) {
-        R164_Neighbor_Edge& edge=radial[i1]; edge.slot=i1; edge.atom=n2;
+        R164_Neighbor_Edge& edge=radial[i1]; edge.slot=i1; edge.atom=n2; edge.native_atom=-1;
         edge.image[0]=image[0]; edge.image[1]=image[1]; edge.image[2]=image[2];
         edge.dx=x12; edge.dy=y12; edge.dz=z12;
       }
@@ -815,7 +815,7 @@ static __global__ void find_descriptor(
         int image[3];
         apply_mic(box, x12, y12, z12, (n1==trace_atom && n==0) ? image : nullptr);
         if (n1==trace_atom && n==0 && i1<angular_capacity) {
-          R164_Neighbor_Edge& edge=angular[i1]; edge.slot=i1; edge.atom=n2;
+          R164_Neighbor_Edge& edge=angular[i1]; edge.slot=i1; edge.atom=n2; edge.native_atom=-1;
           edge.image[0]=image[0]; edge.image[1]=image[1]; edge.image[2]=image[2];
           edge.dx=x12; edge.dy=y12; edge.dz=z12;
         }
@@ -1439,7 +1439,7 @@ static __global__ void find_force_radial(
   double* g_fx,
   double* g_fy,
   double* g_fz,
-  double* g_virial)
+  double* g_virial, const int trace_atom, R164_Neighbor_Edge* trace_edges, int trace_capacity)
 {
   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
@@ -1498,6 +1498,7 @@ static __global__ void find_force_radial(
           f21[d] -= tmp21 * r12[d];
         }
       }
+      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
       s_fx += f12[0] - f21[0];
       s_fy += f12[1] - f21[1];
       s_fz += f12[2] - f21[2];
@@ -1677,7 +1678,7 @@ static __global__ void find_partial_force_angular(
   const float* __restrict__ g_sum_fxyz,
   float* g_f12x,
   float* g_f12y,
-  float* g_f12z)
+  float* g_f12z, const int trace_atom, R164_Neighbor_Edge* trace_edges, int trace_capacity)
 {
   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
@@ -1747,6 +1748,7 @@ static __global__ void find_partial_force_angular(
           sum_fxyz,
           f12);
       }
+      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
       g_f12x[index] = f12[0];
       g_f12y[index] = f12[1];
       g_f12z[index] = f12[2];
@@ -2638,7 +2640,8 @@ void NEP_Charge::compute_large_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(), trace_neighbors ? r164_trace_atom_ : -1,
+    trace_neighbors ? r164_radial_edges_.data() : nullptr, paramb.MN_radial);
   GPU_CHECK_KERNEL
 
   find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
@@ -2660,7 +2663,8 @@ void NEP_Charge::compute_large_box(
     nep_data.sum_fxyz.data(),
     nep_data.f12x.data(),
     nep_data.f12y.data(),
-    nep_data.f12z.data());
+    nep_data.f12z.data(), trace_neighbors ? r164_trace_atom_ : -1,
+    trace_neighbors ? r164_angular_edges_.data() : nullptr, paramb.MN_angular);
   GPU_CHECK_KERNEL
 
   find_properties_many_body(
@@ -2938,7 +2942,8 @@ void NEP_Charge::compute_small_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(), trace_neighbors ? r164_trace_atom_ : -1,
+    trace_neighbors ? r164_radial_edges_.data() : nullptr, big_neighbor_size);
   GPU_CHECK_KERNEL
 
   find_force_angular_small_box<<<grid_size, BLOCK_SIZE>>>(
@@ -2960,7 +2965,8 @@ void NEP_Charge::compute_small_box(
     force_per_atom.data(),
     force_per_atom.data() + N,
     force_per_atom.data() + N * 2,
-    virial_per_atom.data());
+    virial_per_atom.data(), trace_neighbors ? r164_trace_atom_ : -1,
+    trace_neighbors ? r164_angular_edges_.data() : nullptr, big_neighbor_size);
   GPU_CHECK_KERNEL
 
   if (zbl.enabled) {
@@ -3118,7 +3124,6 @@ void NEP_Charge::write_r164_pre_electro_trace(int N, const GPU_Vector<double>& p
   }
   out.close();
   if (!out) PRINT_INPUT_ERROR("r164_rpmd failed closing pre-electro trace.");
-  r164_trace_step_=-1;
 }
 
 void NEP_Charge::compute(
@@ -3167,6 +3172,10 @@ void NEP_Charge::compute(
       virial_per_atom,
       true,
       md_qnep_bec_enabled_);
+  }
+  if (r164_trace_step_>=0) {
+    write_r164_derivatives(type.size(),is_small_box,type);
+    r164_trace_step_=-1;
   }
   pppm.finish_debug_force_evaluation();
   if (has_dftd3) {
@@ -3265,6 +3274,73 @@ static __device__ __forceinline__ void find_charge_gradient_angular_pair(
       sum_fxyz,
       f12);
   }
+}
+
+static __global__ void r164_independent_gradients(
+  NEP_Charge::ParaMB paramb, const float* c_type_pair, int N, int center, const int* type,
+  const float* Fp, const float* charge_derivative, const float* sums,
+  R164_Neighbor_Edge* edges, int count, bool angular)
+{
+  int slot=blockIdx.x*blockDim.x+threadIdx.x;
+  if (slot>=count) return;
+  R164_Neighbor_Edge& edge=edges[slot];
+  float r[3]={edge.dx,edge.dy,edge.dz}, e[3]={}, g[3]={};
+  if (angular) {
+    float energy_fp[MAX_DIM_ANGULAR]={}, charge_fp[MAX_DIM_ANGULAR]={};
+    float angular_sum[NUM_OF_ABC*MAX_NUM_N]={};
+    for (int d=0;d<paramb.dim_angular;++d) {
+      int k=(paramb.n_max_radial+1+d)*N+center;
+      energy_fp[d]=Fp[k]; charge_fp[d]=charge_derivative[k];
+    }
+    const int count_abc=(paramb.L_max+1)*(paramb.L_max+1)-1;
+    for (int n=0;n<=paramb.n_max_angular;++n) for (int a=0;a<count_abc;++a)
+      angular_sum[n*NUM_OF_ABC+a]=sums[(n*count_abc+a)*N+center];
+    find_charge_gradient_angular_pair(paramb,c_type_pair,center,edge.atom,type,r,energy_fp,angular_sum,e);
+    find_charge_gradient_angular_pair(paramb,c_type_pair,center,edge.atom,type,r,charge_fp,angular_sum,g);
+  } else {
+    find_charge_gradient_radial_pair(paramb,c_type_pair,N,center,edge.atom,type,r,Fp,e);
+    find_charge_gradient_radial_pair(paramb,c_type_pair,N,center,edge.atom,type,r,charge_derivative,g);
+  }
+  for (int d=0;d<3;++d) { edge.energy_gradient[d]=e[d]; edge.charge_gradient[d]=g[d]; }
+}
+
+void NEP_Charge::write_r164_derivatives(int N, bool small_box_path, const GPU_Vector<int>& type)
+{
+  int counts[2]={};
+  const auto& nr=small_box_path ? small_box_data.NN_radial : nep_data.NN_radial;
+  const auto& na=small_box_path ? small_box_data.NN_angular : nep_data.NN_angular;
+  nr.copy_to_host(&counts[0],1,r164_trace_atom_); na.copy_to_host(&counts[1],1,r164_trace_atom_);
+  if (counts[0]<0 || counts[1]<0 || static_cast<size_t>(counts[0])>r164_radial_edges_.size() || static_cast<size_t>(counts[1])>r164_angular_edges_.size())
+    PRINT_INPUT_ERROR("r164_rpmd derivative trace exceeds allocated capacity.");
+  for (int kind=0;kind<2;++kind) if (counts[kind]) {
+    auto& edges=kind ? r164_angular_edges_ : r164_radial_edges_;
+    r164_independent_gradients<<<(counts[kind]+63)/64,64>>>(paramb,annmb.c_type_pair,N,r164_trace_atom_,type.data(),
+      nep_data.Fp.data(),nep_data.charge_derivative.data(),nep_data.sum_fxyz.data(),edges.data(),counts[kind],kind!=0);
+    GPU_CHECK_KERNEL
+  }
+  float G=0; nep_data.D_real.copy_to_host(&G,1,r164_trace_atom_);
+  if (!std::isfinite(G)) PRINT_INPUT_ERROR("r164_rpmd nonfinite projected D.");
+  rpmd_ja_file_io::ofstream out(r164_trace_prefix_+"_local_edge_derivatives.out");
+  out << std::setprecision(17) << "# schema r164_local_edge_derivatives_v1\n# step " << r164_trace_step_
+      << "\n# bead " << r164_trace_bead_ << "\n# atom " << r164_trace_atom_ << "\n# force_evaluation_id " << force_evaluation_id_
+      << "\n# projected_G_eV_per_e " << G << "\n# scope ANN_only_ZBL_excluded\n# radial_count " << counts[0] << "\n# angular_count " << counts[1]
+      << "\n# columns kind slot atom image_x image_y image_z rx ry rz Bx By Bz ex ey ez gx gy gz; r=angstrom B,e=eV_per_angstrom g=e_per_angstrom\n";
+  for (int kind=0;kind<2;++kind) {
+    std::vector<R164_Neighbor_Edge> host(counts[kind]);
+    if (counts[kind]) (kind ? r164_angular_edges_ : r164_radial_edges_).copy_to_host(host.data(),counts[kind]);
+    for (int i=0;i<counts[kind];++i) {
+      const auto& edge=host[i];
+      if (edge.slot!=i || edge.atom<0 || edge.atom>=N || !std::isfinite(edge.dx) || !std::isfinite(edge.dy) || !std::isfinite(edge.dz) || edge.atom!=edge.native_atom || edge.dx!=edge.native_r[0] || edge.dy!=edge.native_r[1] || edge.dz!=edge.native_r[2])
+        PRINT_INPUT_ERROR("r164_rpmd descriptor/native edge mismatch.");
+      out << (kind ? "angular" : "radial") << ' ' << i << ' ' << edge.atom << ' ' << edge.image[0] << ' ' << edge.image[1] << ' ' << edge.image[2]
+          << ' ' << edge.dx << ' ' << edge.dy << ' ' << edge.dz;
+      for (int d=0;d<3;++d) { if (!std::isfinite(edge.B[d])) PRINT_INPUT_ERROR("r164_rpmd nonfinite edge B."); out << ' ' << edge.B[d]; }
+      for (int d=0;d<3;++d) { if (!std::isfinite(edge.energy_gradient[d])) PRINT_INPUT_ERROR("r164_rpmd nonfinite edge e."); out << ' ' << edge.energy_gradient[d]; }
+      for (int d=0;d<3;++d) { if (!std::isfinite(edge.charge_gradient[d])) PRINT_INPUT_ERROR("r164_rpmd nonfinite edge g."); out << ' ' << edge.charge_gradient[d]; }
+      out << '\n';
+    }
+  }
+  out.close(); if (!out) PRINT_INPUT_ERROR("r164_rpmd failed closing derivative trace.");
 }
 
 static __global__ void compute_reference_local_tangent(
