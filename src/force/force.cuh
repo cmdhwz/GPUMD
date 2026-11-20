@@ -36,6 +36,13 @@ enum class PIMD_DP_Source_Count_Mode
 };
 class RunInput;
 
+struct R164_PPPM_Trace {
+  std::string prefix;
+  int step;
+  int bead;
+  int atom;
+};
+
 class Force
 {
 public:
@@ -124,7 +131,9 @@ public:
     std::vector<GPU_Vector<double>>& force_beads,
     std::vector<GPU_Vector<double>>& virial_beads,
     std::vector<GPU_Vector<double>>& velocity_beads,
-    GPU_Vector<double>& mass_per_atom);
+    GPU_Vector<double>& mass_per_atom,
+    const R164_PPPM_Trace* trace = nullptr);
+  void validate_r164_pppm_trace() const;
   void compute_pimd_bead_range_on_device(
     int device_id,
     Box& box,

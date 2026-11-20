@@ -41,7 +41,7 @@ public:
 private:
   void execute_run_in(const RunInput& run_input);
   void perform_a_run(const int number_of_steps);
-  void compute_force();
+  void compute_force(int step = -1);
   void parse_one_keyword(
     const std::vector<std::string>& tokens, const RunInput& run_input);
 

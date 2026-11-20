@@ -319,6 +319,7 @@ public:
       charge_diagnostics_force_evaluation_id_ == force_evaluation_id_;
   }
   int get_charge_mode() const { return paramb.charge_mode; }
+  bool r164_trace_compatible() const { return use_pppm && paramb.charge_mode == 2 && !has_dftd3; }
   const char* get_dynamic_q_formula_version() const { return PPPM::dynamic_q_formula_version(); }
   bool uses_pppm() const { return use_pppm; }
   bool pppm_dynamic_q_diag_files_are_compatible(const bool check_debug_files) const

@@ -275,8 +275,10 @@ void Run::execute_run_in(const RunInput& run_input)
 
 }
 
-void Run::compute_force()
+void Run::compute_force(int step)
 {
+  R164_PPPM_Trace trace;
+  const bool trace_here = r164_rpmd.enabled() && r164_rpmd.trace_for_step(step, trace);
   if (is_pimd(integrate.get_type())) {
     force.compute_pimd_beads(
       box,
@@ -287,7 +289,7 @@ void Run::compute_force()
       atom.force_beads,
       atom.virial_beads,
       atom.velocity_beads,
-      atom.mass);
+      atom.mass, trace_here ? &trace : nullptr);
   } else {
     force.compute(
       box,
@@ -543,6 +545,7 @@ void Run::perform_a_run(const int number_of_steps)
       if (action->action_name != "dump_thermo") PRINT_INPUT_ERROR("r164_rpmd only supports dump_thermo as an additional action.");
     for (const auto& property : measure.properties)
       if (property->property_name != "dump_pimd_restart") PRINT_INPUT_ERROR("r164_rpmd only supports dump_pimd_restart as an additional property.");
+    r164_rpmd.validate_trace(force, number_of_steps, atom);
     r164_rpmd.begin(atom, box, integrate.get_temperature(), time_step, global_time);
     r164_rpmd.configure_observer(force, atom, r164_model_xyz_sha256_, r164_restart_sha256_);
   }
@@ -555,7 +558,7 @@ void Run::perform_a_run(const int number_of_steps)
   force.set_pimd_qnep_batch_bec_required(!classical_md && requires_bec);
 
   // setup force for the first integrate step
-  compute_force();
+  compute_force(0);
   if (r164_rpmd.enabled()) r164_rpmd.check_force_positions(atom);
   if (r164_rpmd.enabled()) r164_rpmd.output(0, number_of_steps, atom);
   atom.update_unwrapped_position(box);
@@ -606,7 +609,7 @@ void Run::perform_a_run(const int number_of_steps)
     force.advance_temperature();
 
     measure.pre_force(step, time_step, integrate, group, atom, box, force);
-    compute_force();
+    compute_force(step+1);
     if (r164_rpmd.enabled()) r164_rpmd.check_force_positions(atom);
 
     atom.update_unwrapped_position(box);

@@ -31,20 +31,40 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
   size_t next=3;
   observer_requested_ = next<t.size() && t[next]=="observer";
   if (observer_requested_) ++next;
-  checkpoint_stride_=0;
-  if (next<t.size()) {
-    if (t[next]!="checkpoint" || next+2!=t.size() || t[next+1].empty())
-      PRINT_INPUT_ERROR("r164_rpmd expects optional observer followed by checkpoint and a positive stride.");
-    int value=0;
-    for (char c : t[next+1]) {
-      if (c<'0' || c>'9' || value>(std::numeric_limits<int>::max()-(c-'0'))/10)
-        PRINT_INPUT_ERROR("r164_rpmd checkpoint stride must be a positive decimal int.");
+  checkpoint_stride_=0; trace_step_=-1;
+  auto decimal = [](const std::string& text, int& value) {
+    if (text.empty()) return false;
+    value=0;
+    for (char c : text) {
+      if (c<'0' || c>'9' || value>(std::numeric_limits<int>::max()-(c-'0'))/10) return false;
       value=value*10+(c-'0');
     }
-    if (value==0) PRINT_INPUT_ERROR("r164_rpmd checkpoint stride must be positive.");
-    checkpoint_stride_=value;
+    return true;
+  };
+  if (next<t.size() && t[next]=="checkpoint") {
+    if (next+1>=t.size() || !decimal(t[next+1],checkpoint_stride_) || checkpoint_stride_<=0)
+      PRINT_INPUT_ERROR("r164_rpmd checkpoint requires a positive decimal int stride.");
+    next+=2;
   }
+  if (next<t.size() && t[next]=="pppm_trace") {
+    if (next+4!=t.size() || !decimal(t[next+1],trace_step_) || !decimal(t[next+2],trace_bead_) || !decimal(t[next+3],trace_atom_))
+      PRINT_INPUT_ERROR("r164_rpmd pppm_trace requires step bead atom as nonnegative decimal ints.");
+    next+=4;
+  }
+  if (next!=t.size()) PRINT_INPUT_ERROR("r164_rpmd invalid options; use observer, checkpoint, pppm_trace in order.");
   directory_ = t[1]; enabled_ = true;
+}
+void R164_RPMD::validate_trace(const Force& force, int total, const Atom& atom) const {
+  if (trace_step_<0) return;
+  if (trace_step_>=total || trace_bead_>=atom.number_of_beads || trace_atom_>=atom.number_of_atoms)
+    PRINT_INPUT_ERROR("r164_rpmd pppm_trace step, bead or atom is outside the run.");
+  force.validate_r164_pppm_trace();
+}
+bool R164_RPMD::trace_for_step(int step, R164_PPPM_Trace& trace) const {
+  if (trace_step_<0 || (step!=trace_step_ && step!=trace_step_+1)) return false;
+  trace.prefix=directory_+"/pppm_trace_step_"+std::to_string(step)+"_bead_"+std::to_string(trace_bead_);
+  trace.step=step; trace.bead=trace_bead_; trace.atom=trace_atom_;
+  return true;
 }
 void R164_RPMD::read_positions(Atom& atom, std::vector<double>& q) {
   q.resize(p_ * n_ * 3);
@@ -349,7 +369,9 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     }
   }
   const bool checkpoint = checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0);
-  if (step==0 || step==total || (stride_ && step%stride_==0) || checkpoint) {
+  R164_PPPM_Trace trace;
+  const bool trace_here=trace_for_step(step,trace);
+  if (step==0 || step==total || (stride_ && step%stride_==0) || checkpoint || trace_here) {
     const std::string frame_path=directory_+"/frame_"+std::to_string(step)+".txt";
     rpmd_ja_file_io::ofstream frame(frame_path+".tmp"); frame << std::setprecision(17);
     for (int s=0; s<p_; ++s) { double energy=0; for (int i=0;i<n_;++i) energy+=u[s*n_+i]; frame << "bead " << s << ' ' << energy << '\n';
@@ -452,6 +474,25 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     receipt.close();
     if (!receipt || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
       PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.");
+  }
+  if (trace_here) {
+    const std::string suffix=std::to_string(step)+".txt";
+    const std::string files[]={directory_+"/source_identity.txt",directory_+"/frame_"+suffix,directory_+"/force_images_"+suffix,
+      trace.prefix+"_mesh.out",trace.prefix+"_kspace.out",trace.prefix+"_atom.out",trace.prefix+"_assignment_atom.out",
+      trace.prefix+"_assignment_stencil_atom"+std::to_string(trace_atom_)+".out"};
+    const char* names[]={"source_identity","frame","force_images","mesh","kspace","atom","assignment_atom","assignment_stencil"};
+    const std::string path=directory_+"/pppm_trace_step_"+std::to_string(step)+"_receipt.txt";
+    rpmd_ja_file_io::ofstream receipt(path+".tmp");
+    receipt << "schema r164_pppm_trace_v1\nstep " << step << "\nbead " << trace_bead_ << "\natom " << trace_atom_ << "\nneighbor_history unavailable\nphysical_event unavailable\n";
+    for (int i=0;i<8;++i) {
+      const auto hash=rpmd_ja_sample_provenance::sha256_file(files[i]);
+      if (hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing PPPM trace.");
+      receipt << names[i] << "_sha256 " << hash << "\n";
+    }
+    receipt << "scalar_line_sha256 " << rpmd_ja_sample_provenance::sha256_text(scalar_line) << "\n";
+    receipt.close();
+    if (!receipt || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
+      PRINT_INPUT_ERROR("r164_rpmd failed committing PPPM trace receipt.");
   }
   if (step == total) {
     const std::string marker=directory_+"/COMPLETE";

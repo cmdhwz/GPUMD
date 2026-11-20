@@ -1237,6 +1237,19 @@ void Force::refresh_pimd_bead_gpu_workers_()
   CHECK(gpuSetDevice(0));
 }
 
+void Force::validate_r164_pppm_trace() const
+{
+#ifdef GPUMD_WPE_ENABLED
+  PRINT_INPUT_ERROR("r164_rpmd pppm_trace is unavailable with WPE.");
+#else
+  if (pimd_bead_gpu_parallel_devices_ != 1 || pimd_bead_batch_enabled_ || potentials.size() != 1 || !potentials[0])
+    PRINT_INPUT_ERROR("r164_rpmd pppm_trace requires a single native serial unbatched potential.");
+  const auto* model=dynamic_cast<const NEP_Charge*>(potentials[0].get());
+  if (!model || !model->r164_trace_compatible())
+    PRINT_INPUT_ERROR("r164_rpmd pppm_trace requires native charge2 PPPM without DFTD3.");
+#endif
+}
+
 void Force::compute_pimd_beads(
   Box& box,
   GPU_Vector<int>& type,
@@ -1246,7 +1259,8 @@ void Force::compute_pimd_beads(
   std::vector<GPU_Vector<double>>& force_beads,
   std::vector<GPU_Vector<double>>& virial_beads,
   std::vector<GPU_Vector<double>>& velocity_beads,
-  GPU_Vector<double>& mass_per_atom)
+  GPU_Vector<double>& mass_per_atom,
+  const R164_PPPM_Trace* trace)
 {
   ++pimd_force_call_count_;
   pimd_centroid_probe_ready_ = false;
@@ -1304,6 +1318,10 @@ void Force::compute_pimd_beads(
       }
     }
     for (int k = 0; k < position_beads.size(); ++k) {
+      if (trace && k == trace->bead) {
+        auto* model=dynamic_cast<NEP_Charge*>(potentials[0].get());
+        model->request_pppm_debug_for_next_force(trace->prefix.c_str(),trace->step,trace->atom);
+      }
       compute(
         box,
         position_beads[k],
