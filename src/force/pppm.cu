@@ -18,6 +18,7 @@ The k-space part of the PPPM method.
 ------------------------------------------------------------------------------*/
 
 #include "pppm.cuh"
+#include "measure/rpmd_ja_utf8_file_io.h"
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
@@ -417,7 +418,8 @@ __global__ void find_mesh(
   const double* g_z,
   gpufftComplex* g_mesh,
   PPPMAssignmentAtomDebug* g_debug_atoms,
-  PPPMAssignmentStencilDebug* g_debug_stencil)
+  PPPMAssignmentStencilDebug* g_debug_stencil,
+  const int debug_atom)
 {
   const int n = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n < N2) {
@@ -443,7 +445,7 @@ __global__ void find_mesh(
       Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy + W_coeff[d][1]) * dy + W_coeff[d][0];
       Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz + W_coeff[d][1]) * dz + W_coeff[d][0];
     }
-    const int debug_slot = n - N1;
+    const int debug_slot = debug_atom >= 0 ? (n == debug_atom ? 0 : 8) : n - N1;
     if (g_debug_atoms != nullptr && debug_slot < 8) {
       PPPMAssignmentAtomDebug& d = g_debug_atoms[debug_slot];
       d.atom_id = n;
@@ -475,7 +477,7 @@ __global__ void find_mesh(
           const int neighbor012 = neighbor0 + para.K[0] * (neighbor1 + para.K[1] * neighbor2);
           const float W = Wx[n0 + 2] * Wy[n1 + 2] * Wz[n2 + 2];
           const float qW = q * W;
-          if (g_debug_stencil != nullptr && n == 0) {
+          if (g_debug_stencil != nullptr && n == (debug_atom >= 0 ? debug_atom : 0)) {
             const int debug_index = (n0 + 2) * 25 + (n1 + 2) * 5 + (n2 + 2);
             PPPMAssignmentStencilDebug& d = g_debug_stencil[debug_index];
             d.n0 = n0;
@@ -1882,7 +1884,8 @@ void PPPM::write_debug(
   const GPU_Vector<float>& charge,
   const GPU_Vector<double>& position,
   const GPU_Vector<float>& D_real,
-  const int pppm_call_index)
+  const int pppm_call_index, const unsigned long long force_evaluation_id,
+  const bool calculate_peratom_virial)
 {
   const int M = para.K0K1K2;
   std::vector<gpufftComplex> h_mesh_charge(M), h_mesh(M), h_mesh_fourier(M), h_mesh_G(M);
@@ -1910,12 +1913,13 @@ void PPPM::write_debug(
     sum_charge_N1_N2 += static_cast<double>(h_charge[n]);
   }
 
-  std::ofstream mesh_file(debug_prefix_ + "_mesh.out", std::ios::app);
-  std::ofstream kspace_file(debug_prefix_ + "_kspace.out", std::ios::app);
-  std::ofstream atom_file(debug_prefix_ + "_atom.out", std::ios::app);
-  std::ofstream assignment_atom_file(debug_prefix_ + "_assignment_atom.out", std::ios::app);
-  std::ofstream assignment_stencil_file(
-    debug_prefix_ + "_assignment_stencil_atom0.out", std::ios::app);
+  rpmd_ja_file_io::ofstream mesh_file(debug_prefix_ + "_mesh.out", std::ios::app);
+  rpmd_ja_file_io::ofstream kspace_file(debug_prefix_ + "_kspace.out", std::ios::app);
+  rpmd_ja_file_io::ofstream atom_file(debug_prefix_ + "_atom.out", std::ios::app);
+  rpmd_ja_file_io::ofstream assignment_atom_file(debug_prefix_ + "_assignment_atom.out", std::ios::app);
+  const int target_atom = debug_atom_ >= 0 ? debug_atom_ : 0;
+  rpmd_ja_file_io::ofstream assignment_stencil_file(
+    debug_prefix_ + "_assignment_stencil_atom" + std::to_string(target_atom) + ".out", std::ios::app);
   if (!mesh_file || !kspace_file || !atom_file || !assignment_atom_file || !assignment_stencil_file) {
     std::cerr << "Cannot open PPPM debug output files with prefix " << debug_prefix_ << ".\n";
     exit(1);
@@ -1928,6 +1932,8 @@ void PPPM::write_debug(
 
   auto write_header = [&](std::ofstream& file) {
     file << "# pppm_frame " << debug_frame_ << "\n";
+    file << "# force_evaluation_id " << force_evaluation_id << "\n";
+    file << "# reciprocal_energy_branch " << (calculate_peratom_virial ? "per_atom" : "global_uniform") << "\n";
     file << "# source_signature " << PPPM_DEBUG_SOURCE_SIGNATURE << "\n";
     file << "# pppm_N " << N << "\n";
     file << "# pppm_N1 " << N1 << "\n";
@@ -2005,7 +2011,7 @@ void PPPM::write_debug(
   write_header(assignment_atom_file);
   assignment_atom_file << "# columns atom_id q x y z sx sy sz ix iy iz dx dy dz"
                           " Wx0 Wx1 Wx2 Wx3 Wx4 Wy0 Wy1 Wy2 Wy3 Wy4 Wz0 Wz1 Wz2 Wz3 Wz4\n";
-  const int debug_atom_count = N2 - N1 < 8 ? N2 - N1 : 8;
+  const int debug_atom_count = debug_atom_ >= 0 ? 1 : (N2 - N1 < 8 ? N2 - N1 : 8);
   for (int i = 0; i < debug_atom_count; ++i) {
     const PPPMAssignmentAtomDebug& d = h_assignment_atoms[i];
     assignment_atom_file << d.atom_id << " " << d.q << " " << d.x << " " << d.y << " " << d.z
@@ -2018,15 +2024,19 @@ void PPPM::write_debug(
   }
 
   write_header(assignment_stencil_file);
-  assignment_stencil_file << "# pppm_stencil_atom 0\n";
+  assignment_stencil_file << "# pppm_stencil_atom " << target_atom << "\n";
   assignment_stencil_file << "# columns n0 n1 n2 neighbor0 neighbor1 neighbor2 neighbor012 W qW\n";
-  if (N1 <= 0 && 0 < N2) {
+  if (N1 <= target_atom && target_atom < N2) {
     for (int i = 0; i < 125; ++i) {
       const PPPMAssignmentStencilDebug& d = h_assignment_stencil[i];
       assignment_stencil_file << d.n0 << " " << d.n1 << " " << d.n2 << " " << d.neighbor0
                               << " " << d.neighbor1 << " " << d.neighbor2 << " " << d.neighbor012
                               << " " << d.W << " " << d.qW << "\n";
     }
+  }
+  mesh_file.close(); kspace_file.close(); atom_file.close(); assignment_atom_file.close(); assignment_stencil_file.close();
+  if (!mesh_file || !kspace_file || !atom_file || !assignment_atom_file || !assignment_stencil_file) {
+    std::cerr << "Failed closing PPPM debug output files.\n"; exit(1);
   }
 }
 
@@ -2664,7 +2674,8 @@ void PPPM::find_force(
     position_per_atom.data() + N * 2,
     mesh.data(),
     debug_requested_ ? debug_assignment_atoms_.data() : nullptr,
-    debug_requested_ ? debug_assignment_stencil_.data() : nullptr);
+    debug_requested_ ? debug_assignment_stencil_.data() : nullptr,
+    debug_atom_);
   GPU_CHECK_KERNEL
   if (debug_requested_) {
     debug_mesh_charge_.copy_from_device(mesh.data());
@@ -2809,7 +2820,7 @@ void PPPM::find_force(
     GPU_CHECK_KERNEL
   }
   if (debug_requested_) {
-    write_debug(N, N1, N2, box, charge, position_per_atom, D_real, pppm_call_index);
+    write_debug(N, N1, N2, box, charge, position_per_atom, D_real, pppm_call_index, force_evaluation_id, calculate_peratom_virial);
   }
   if (force_evaluation_id != 0) {
     current_force_mesh_valid_ = true;

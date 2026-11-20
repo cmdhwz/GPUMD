@@ -147,8 +147,9 @@ public:
   }
   double get_mesh_spacing() const { return mesh_spacing; }
   const int* get_mesh() const { return para.K; }
-  void request_debug_for_next_force(const char* prefix, const int frame)
+  void request_debug_for_next_force(const char* prefix, const int frame, const int atom = -1)
   {
+    debug_atom_ = atom;
     debug_requested_ = true;
     debug_call_index_ = 0;
     debug_prefix_ = prefix;
@@ -281,6 +282,7 @@ private:
   GPU_Vector<double> reference_delta_Q_;
   GPU_Vector<gpufftComplex> reference_delta_phi_;
   bool debug_requested_ = false;
+  int debug_atom_ = -1;
   int debug_call_index_ = 0;
   std::string debug_prefix_;
   int debug_frame_ = 0;
@@ -381,7 +383,8 @@ private:
     const GPU_Vector<float>& charge,
     const GPU_Vector<double>& position,
     const GPU_Vector<float>& D_real,
-    const int pppm_call_index);
+    const int pppm_call_index, const unsigned long long force_evaluation_id,
+    const bool calculate_peratom_virial);
   void print_mesh(const int N1, const int N2, const Box& box, const float* charge);
 
   bool need_peratom_virial = false;

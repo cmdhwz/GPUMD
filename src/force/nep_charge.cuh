@@ -234,9 +234,9 @@ public:
     }
   }
   void invalidate_current_force_caches();
-  void request_pppm_debug_for_next_force(const char* prefix, const int frame)
+  void request_pppm_debug_for_next_force(const char* prefix, const int frame, const int atom = -1)
   {
-    pppm.request_debug_for_next_force(prefix, frame);
+    pppm.request_debug_for_next_force(prefix, frame, atom);
   }
   void reset_dynamic_charge_cache();
   void request_dynamic_charge_debug(const int step) { pppm.request_dynamic_charge_debug(step); }
