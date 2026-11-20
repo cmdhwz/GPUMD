@@ -23,6 +23,15 @@
 #include <cstdint>
 #include <new>
 #include <utility>
+#ifdef GPUMD_R164_ZSTD
+#include <zstd.h>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#endif
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -36,7 +45,7 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
   if (observer_requested_) ++next;
   drift_charge_requested_ = observer_requested_ && next<t.size() && t[next]=="drift_charge";
   if (drift_charge_requested_) ++next;
-  buffered_=false; sample_stride_=0; series_.clear();
+  buffered_=false; compressed_=false; sample_stride_=0; series_.clear();
   checkpoint_stride_=0; trace_step_=-1;
   auto decimal = [](const std::string& text, int& value) {
     if (text.empty()) return false;
@@ -52,6 +61,14 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
         !decimal(t[next+1],sample_stride_) || sample_stride_<=0)
       PRINT_INPUT_ERROR("r164_rpmd buffered requires observer and a positive decimal sample stride.");
     buffered_=true; next+=2;
+    if (next<t.size() && t[next]=="compressed") {
+#ifndef GPUMD_R164_ZSTD
+      PRINT_INPUT_ERROR("r164_rpmd compressed requires a Zstd-enabled build.");
+#else
+      if (stride_<=0) PRINT_INPUT_ERROR("r164_rpmd compressed requires a positive frame stride.");
+      compressed_=true; ++next;
+#endif
+    }
   }
   if (buffered_ && next<t.size())
     PRINT_INPUT_ERROR("r164_rpmd buffered cannot be combined with checkpoint, drift_charge or pppm_trace; use legacy diagnostic mode.");
@@ -117,7 +134,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   if (created != 0) PRINT_INPUT_ERROR("r164_rpmd output directory must not already exist and its parent must exist.");
   std::ostringstream meta;
   meta << std::setprecision(17) << "schema r164_diagnostic_v1\nstorage "
-       << (buffered_ ? "binary64_series_text_and_binary_snapshots_v1" : "binary64_text_17_digits")
+       << (buffered_ ? (compressed_ ? "binary64_series_text_and_zstd_snapshots_v2" : "binary64_series_text_and_binary_snapshots_v1") : "binary64_text_17_digits")
        << "; force_backend_precision not_certified\n"
        << "layout q_p_F: bead,atom,xyz; U: bead\nreference_id R27_fixed_2OH_R157\nreference_source_sha256 1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa\nreference_atom_identity_and_environment UNVERIFIED\nunits q=angstrom p=eV_fs_per_angstrom F=eV_per_angstrom U=eV time=fs\n"
        << "flow_b UNVERIFIED_OR_UNAVAILABLE\nd2 R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT\nJ2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\n"
@@ -126,7 +143,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
        << "time_convention step_times_fixed_dt_start_zero\n"
        << "number_increment " << (buffered_ ? "UNAVAILABLE_buffered_mode" : "lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment") << "\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
-  if (buffered_) meta << "buffered_sample_stride " << sample_stride_ << "\nbuffered_frame_stride " << stride_ << "\nbuffered_snapshot_format binary_v1\n";
+  if (buffered_) meta << "buffered_sample_stride " << sample_stride_ << "\nbuffered_frame_stride " << stride_ << "\nbuffered_snapshot_format " << (compressed_ ? "zstd_shuffle_v2" : "binary_v1") << "\n";
   if (drift_charge_requested_) meta << "drift_charge observer_frame_natural_units\n";
   if (checkpoint_stride_) meta << "checkpoint_stride " << checkpoint_stride_ << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
@@ -264,7 +281,102 @@ void R164_RPMD::write_snapshot(int step, const std::vector<double>& q, const std
     PRINT_INPUT_ERROR("r164_rpmd failed committing force images.");
 }
 
-void R164_RPMD::prepare_buffered(int total) {
+#ifdef GPUMD_R164_ZSTD
+struct R164_RPMD::CompressionWorker {
+  struct Frame { uint32_t step, width; uint64_t raw_size; std::vector<unsigned char> data; };
+  std::vector<double> mass;
+  int P, N;
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::deque<Snapshot> pending;
+  std::vector<Frame> frames;
+  std::exception_ptr failure;
+  bool stopping=false;
+  uint64_t raw_bytes=0, compressed_bytes=0, retained_capacity_bytes=0;
+  double compression_seconds=0, wait_seconds=0;
+  std::thread thread;
+
+  CompressionWorker(const std::vector<double>& input_mass, int p, int n)
+    : mass(input_mass), P(p), N(n), thread(&CompressionWorker::run,this) {}
+  ~CompressionWorker() {
+    { std::lock_guard<std::mutex> lock(mutex); stopping=true; }
+    changed.notify_all();
+    if (thread.joinable()) thread.join();
+  }
+  void submit(Snapshot&& snapshot) {
+    const auto start=std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(mutex);
+    changed.wait(lock,[&]{ return pending.size()<2 || failure || stopping; });
+    wait_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    if (failure) std::rethrow_exception(failure);
+    if (stopping) throw std::runtime_error("compression worker stopped");
+    pending.push_back(std::move(snapshot));
+    lock.unlock(); changed.notify_all();
+  }
+  void finish() {
+    { std::lock_guard<std::mutex> lock(mutex); stopping=true; }
+    changed.notify_all();
+    if (thread.joinable()) thread.join();
+    if (failure) std::rethrow_exception(failure);
+  }
+  void run() noexcept {
+    ZSTD_CCtx* context=nullptr;
+    try {
+      context=ZSTD_createCCtx();
+      if (!context) throw std::runtime_error("cannot allocate Zstd context");
+      for (const auto setting : {std::make_pair(ZSTD_c_compressionLevel,1),std::make_pair(ZSTD_c_checksumFlag,1)}) {
+        const size_t result=ZSTD_CCtx_setParameter(context,setting.first,setting.second);
+        if (ZSTD_isError(result)) throw std::runtime_error(ZSTD_getErrorName(result));
+      }
+      std::vector<unsigned char> raw, compressed_scratch;
+      for (;;) {
+        Snapshot snapshot;
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          changed.wait(lock,[&]{ return !pending.empty() || stopping; });
+          if (pending.empty()) break;
+          snapshot=std::move(pending.front()); pending.pop_front();
+        }
+        changed.notify_all();
+        const auto start=std::chrono::steady_clock::now();
+        for (int bead=0;bead<P;++bead) for (int d=0;d<3;++d) for (int i=0;i<N;++i) {
+          const int j=bead*3*N+d*N+i;
+          snapshot.v[j]=mass[i]*TIME_UNIT_CONVERSION*snapshot.v[j];
+        }
+        const size_t doubles=snapshot.energy.size()+snapshot.q.size()+snapshot.v.size()+snapshot.f.size();
+        if (doubles>(std::numeric_limits<size_t>::max()-snapshot.images.size())/sizeof(double))
+          throw std::runtime_error("snapshot size overflow");
+        raw.resize(doubles*sizeof(double)+snapshot.images.size());
+        size_t out=0;
+        for (size_t byte=0;byte<sizeof(double);++byte) {
+          for (const auto* values : {&snapshot.energy,&snapshot.q,&snapshot.v,&snapshot.f})
+            for (const double& value:*values) raw[out++]=reinterpret_cast<const unsigned char*>(&value)[byte];
+        }
+        std::copy(snapshot.images.begin(),snapshot.images.end(),raw.begin()+out);
+        const size_t bound=ZSTD_compressBound(raw.size());
+        if (ZSTD_isError(bound)) throw std::runtime_error(ZSTD_getErrorName(bound));
+        Frame frame; frame.step=static_cast<uint32_t>(snapshot.step); frame.width=static_cast<uint32_t>(snapshot.image_width); frame.raw_size=raw.size();
+        compressed_scratch.resize(bound);
+        const size_t bytes=ZSTD_compress2(context,compressed_scratch.data(),compressed_scratch.size(),raw.data(),raw.size());
+        if (ZSTD_isError(bytes)) throw std::runtime_error(ZSTD_getErrorName(bytes));
+        frame.data=std::vector<unsigned char>(compressed_scratch.begin(),compressed_scratch.begin()+bytes);
+        if (raw_bytes>std::numeric_limits<uint64_t>::max()-raw.size() || compressed_bytes>std::numeric_limits<uint64_t>::max()-bytes ||
+            retained_capacity_bytes>std::numeric_limits<uint64_t>::max()-frame.data.capacity())
+          throw std::runtime_error("compression byte count overflow");
+        raw_bytes+=raw.size(); compressed_bytes+=bytes; retained_capacity_bytes+=frame.data.capacity();
+        frames.push_back(std::move(frame));
+        compression_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex); failure=std::current_exception(); stopping=true;
+    }
+    if (context) ZSTD_freeCCtx(context);
+    changed.notify_all();
+  }
+};
+#endif
+
+void R164_RPMD::prepare_buffered(int total, const Atom& atom) {
   if (!buffered_) return;
   buffered_total_=total;
   if (stride_>0) {
@@ -278,24 +390,63 @@ void R164_RPMD::prepare_buffered(int total) {
   const double base=static_cast<double>(frame_count)*static_cast<double>(p_)*n_;
   const double extra=static_cast<double>(frame_count)*p_*sizeof(double)+static_cast<double>(sample_count)*sizeof(SeriesRow);
   const double unit=1024.0*1024.0*1024.0;
-  if (stride_>0) printf("r164_rpmd buffered output estimates %.3f GiB (int8 images) to %.3f GiB (int64 images) host memory for %zu snapshots and %zu samples; choose sparse frames for large runs.\n",(base*(9*sizeof(double)+3)+extra)/unit,(base*(9*sizeof(double)+3*sizeof(long long))+extra)/unit,frame_count,sample_count);
-  try { series_.reserve(sample_count); snapshots_.reserve(frame_count); }
+  if (stride_>0) printf("r164_rpmd uncompressed output reference %.3f GiB (int8 images) to %.3f GiB (int64 images) for %zu snapshots and %zu samples%s.\n",(base*(9*sizeof(double)+3)+extra)/unit,(base*(9*sizeof(double)+3*sizeof(long long))+extra)/unit,frame_count,sample_count,compressed_ ? "; compression peak also includes queue and worker buffers" : "; choose sparse frames for large runs");
+  try {
+    series_.reserve(sample_count);
+#ifdef GPUMD_R164_ZSTD
+    if (compressed_) compression_=std::make_shared<CompressionWorker>(atom.cpu_mass,p_,n_);
+    else
+#endif
+      snapshots_.reserve(frame_count);
+  }
   catch (const std::bad_alloc&) { PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered output; reduce frame or sample frequency."); }
+  catch (const std::exception& e) { fprintf(stderr,"r164_rpmd cannot start compression: %s\n",e.what()); PRINT_INPUT_ERROR("r164_rpmd cannot start snapshot worker."); }
 }
 
 void R164_RPMD::finish_buffered(Atom& atom) {
   if (!buffered_) return;
   if (next_output_step_!=static_cast<long long>(buffered_total_)+1 || drift_pending_)
     PRINT_INPUT_ERROR("r164_rpmd cannot finish incomplete buffered output.");
+#ifdef GPUMD_R164_ZSTD
+  if (compressed_) {
+    try { compression_->finish(); }
+    catch (const std::exception& e) { fprintf(stderr,"r164_rpmd compression failed: %s\n",e.what()); PRINT_INPUT_ERROR("r164_rpmd snapshot compression failed."); }
+  }
+#endif
   write_text("metadata.txt",metadata_text_);
   write_text("source_identity.txt",identity_text_);
   write_text("observer.txt",observer_text_);
-  if (!snapshots_.empty()) {
+  if (!snapshots_.empty() || compressed_) {
     const std::string binary_path=directory_+"/snapshots.bin";
     rpmd_ja_file_io::ofstream binary(binary_path+".tmp",std::ios::binary);
     const char magic[8]={'R','1','6','4','S','N','A','P'};
-    const uint32_t header[4]={1,static_cast<uint32_t>(p_),static_cast<uint32_t>(n_),static_cast<uint32_t>(snapshots_.size())};
+    uint32_t count=static_cast<uint32_t>(snapshots_.size());
+#ifdef GPUMD_R164_ZSTD
+    if (compressed_) count=static_cast<uint32_t>(compression_->frames.size());
+#endif
+    const uint32_t header[4]={compressed_ ? 2u : 1u,static_cast<uint32_t>(p_),static_cast<uint32_t>(n_),count};
     binary.write(magic,sizeof(magic)); binary.write(reinterpret_cast<const char*>(header),sizeof(header));
+#ifdef GPUMD_R164_ZSTD
+    if (compressed_) {
+      uint64_t offset=24+static_cast<uint64_t>(count)*8;
+      for (const auto& frame:compression_->frames) {
+        binary.write(reinterpret_cast<const char*>(&offset),sizeof(offset));
+        if (frame.data.size()>std::numeric_limits<uint64_t>::max()-offset-24)
+          PRINT_INPUT_ERROR("r164_rpmd compressed archive exceeds supported size.");
+        offset+=24+frame.data.size();
+      }
+      for (const auto& frame:compression_->frames) {
+        const uint32_t record[2]={frame.step,frame.width};
+        const uint64_t sizes[2]={frame.raw_size,static_cast<uint64_t>(frame.data.size())};
+        binary.write(reinterpret_cast<const char*>(record),sizeof(record));
+        binary.write(reinterpret_cast<const char*>(sizes),sizeof(sizes));
+        binary.write(reinterpret_cast<const char*>(frame.data.data()),frame.data.size());
+      }
+      printf("r164_rpmd compressed %llu raw bytes to %llu bytes (retained capacity %llu); CPU compression %.3f s, queue wait %.3f s.\n",
+        static_cast<unsigned long long>(compression_->raw_bytes),static_cast<unsigned long long>(compression_->compressed_bytes),
+        static_cast<unsigned long long>(compression_->retained_capacity_bytes),compression_->compression_seconds,compression_->wait_seconds);
+    } else
+#endif
     for (auto& snapshot:snapshots_) {
       const uint32_t record[2]={static_cast<uint32_t>(snapshot.step),static_cast<uint32_t>(snapshot.image_width)};
       binary.write(reinterpret_cast<const char*>(record),sizeof(record));
@@ -333,7 +484,7 @@ void R164_RPMD::finish_buffered(Atom& atom) {
   if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
     PRINT_INPUT_ERROR("r164_rpmd failed committing buffered series.");
   series_.clear(); series_.shrink_to_fit();
-  snapshots_.clear(); snapshots_.shrink_to_fit();
+  snapshots_.clear(); snapshots_.shrink_to_fit(); compression_.reset();
   write_complete(buffered_total_);
 }
 
@@ -559,11 +710,20 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
           const uint64_t bits=static_cast<uint64_t>(force_images_[i]);
           for (int j=0;j<frame.image_width;++j) frame.images[i*frame.image_width+j]=static_cast<unsigned char>(bits>>(8*j));
         }
-        frame.v=std::move(v); frame.f=std::move(f); snapshots_.push_back(std::move(frame));
+        frame.v=std::move(v); frame.f=std::move(f);
+#ifdef GPUMD_R164_ZSTD
+        if (compressed_) compression_->submit(std::move(frame));
+        else
+#endif
+          snapshots_.push_back(std::move(frame));
       } else write_snapshot(step,q_,v,f,energy,force_images_,atom);
     } catch (const std::bad_alloc&) {
       if (!buffered_) throw;
       PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered snapshot; reduce frame frequency.");
+    } catch (const std::exception& e) {
+      if (!buffered_) throw;
+      fprintf(stderr,"r164_rpmd snapshot worker failed: %s\n",e.what());
+      PRINT_INPUT_ERROR("r164_rpmd snapshot compression failed.");
     }
   }
   if (buffered_) {

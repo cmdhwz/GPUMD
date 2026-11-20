@@ -30,6 +30,14 @@ file(GLOB GPUMD_SOURCES
 add_executable(gpumd ${GPUMD_SOURCES})
 target_include_directories(gpumd PRIVATE src)
 target_link_libraries(gpumd PRIVATE CUDA::cublas CUDA::cusolver CUDA::cufft)
+option(GPUMD_R164_ZSTD "Enable buffered R164 Zstd snapshot compression" OFF)
+if(GPUMD_R164_ZSTD)
+    find_path(GPUMD_R164_ZSTD_INCLUDE_DIR zstd.h REQUIRED)
+    find_library(GPUMD_R164_ZSTD_LIBRARY NAMES zstd libzstd REQUIRED)
+    target_include_directories(gpumd PRIVATE ${GPUMD_R164_ZSTD_INCLUDE_DIR})
+    target_compile_definitions(gpumd PRIVATE GPUMD_R164_ZSTD=1)
+    target_link_libraries(gpumd PRIVATE ${GPUMD_R164_ZSTD_LIBRARY} Threads::Threads)
+endif()
 execute_process(
     COMMAND git rev-parse --short HEAD
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

@@ -44,6 +44,13 @@ LDFLAGS =
 LIBS = -lcublas -lcusolver -lcufft
 NEP_LIBS =
 GNEP_LIBS =
+GPUMD_R164_ZSTD ?= 0
+GPUMD_R164_ZSTD_CFLAGS ?=
+GPUMD_R164_ZSTD_LDFLAGS ?=
+ifeq ($(GPUMD_R164_ZSTD),1)
+CFLAGS += -DGPUMD_R164_ZSTD=1 $(GPUMD_R164_ZSTD_CFLAGS)
+GPUMD_ZSTD_LIBS = $(GPUMD_R164_ZSTD_LDFLAGS) -lzstd
+endif
 ifndef OS
 LIBS += -lpthread
 NEP_LIBS += -ldl
@@ -157,7 +164,7 @@ gpumd_replica:
 	$(MAKE) -C main_replica CC="$(CC)" CUDA_ARCH="$(CUDA_ARCH)"
 
 gpumd: $(OBJ_GPUMD)
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(GPUMD_ZSTD_LIBS)
 	@echo =================================================
 	@echo The gpumd executable is successfully compiled!
 	@echo =================================================

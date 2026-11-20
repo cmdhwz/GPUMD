@@ -14,6 +14,7 @@ public:
   bool enabled() const { return enabled_; }
   void parse(const std::vector<std::string>& tokens);
   void reset() {
+    compression_.reset(); compressed_ = false;
     enabled_ = false; observer_requested_ = false; drift_charge_requested_ = false; buffered_ = false;
     sample_stride_ = 0; checkpoint_stride_ = 0; trace_step_ = -1;
     series_.clear(); series_.shrink_to_fit(); snapshots_.clear(); snapshots_.shrink_to_fit();
@@ -26,7 +27,7 @@ public:
   void capture_drift(Atom&);
   void check_force_positions(Atom&);
   void output(int step, int total, Atom&);
-  void prepare_buffered(int total);
+  void prepare_buffered(int total, const Atom&);
   void finish_buffered(Atom&);
 private:
   bool enabled_ = false;
@@ -34,7 +35,7 @@ private:
   int trace_step_ = -1, trace_bead_ = -1, trace_atom_ = -1;
   double temperature_ = 0, dt_ = 0, lengths_[3] = {};
   std::string directory_;
-  bool observer_requested_ = false, drift_charge_requested_ = false, buffered_ = false;
+  bool observer_requested_ = false, drift_charge_requested_ = false, buffered_ = false, compressed_ = false;
   int sample_stride_ = 0;
   struct SeriesRow {
     int step;
@@ -49,6 +50,8 @@ private:
     int image_width;
     std::vector<unsigned char> images;
   };
+  struct CompressionWorker;
+  std::shared_ptr<CompressionWorker> compression_;
   std::vector<Snapshot> snapshots_;
   std::string metadata_text_, identity_text_, observer_text_;
   int buffered_total_ = 0;

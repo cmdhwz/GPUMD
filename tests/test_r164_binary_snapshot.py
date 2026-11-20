@@ -8,6 +8,11 @@ import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 from r164_frame_to_npz import read_binary_frame, binary_lineage, main
 
+try:
+    import zstandard as zstd
+except ImportError:
+    zstd=None
+
 class BinarySnapshotTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.root=Path(self.tmp.name)
@@ -49,6 +54,61 @@ class BinarySnapshotTest(unittest.TestCase):
             self.assertEqual(int(phase['step']),1)
             self.assertAlmostEqual(float(phase['time_fs']),.1)
             np.testing.assert_array_equal(phase['force_images'],np.zeros((1,2,3),dtype=np.int64))
+
+    @unittest.skipIf(zstd is None,'optional Python zstandard unavailable')
+    def test_compressed_random_access_and_corruption(self):
+        self.fields['buffered_snapshot_format']=['zstd_shuffle_v2']
+        widths=[1,2,4]; values=[[-3,4,0,1,-1,0],[-129,128,0,1,-1,0],[-32769,32768,0,1,-1,0]]
+        records=[]
+        for step,(width,images) in enumerate(zip(widths,values)):
+            code={1:'b',2:'h',4:'i'}[width]
+            floats=np.r_[np.array([step+1.]),np.array(images,dtype=float)*10,np.arange(6.),np.arange(6.)+10].astype('<f8')
+            shuffled=np.frombuffer(floats.tobytes(),dtype=np.uint8).reshape(-1,8).T.copy().tobytes()
+            raw=shuffled+struct.pack('<6'+code,*images)
+            payload=zstd.ZstdCompressor(level=1,write_checksum=True).compress(raw)
+            records.append(struct.pack('<IIQQ',step,width,len(raw),len(payload))+payload)
+        offsets=[]; cursor=24+8*len(records)
+        for record in records:
+            offsets.append(cursor); cursor+=len(record)
+        path=self.root/'snapshots.bin'
+        original=struct.pack('<8sIIII',b'R164SNAP',2,1,2,3)+struct.pack('<3Q',*offsets)+b''.join(records)
+        path.write_bytes(original)
+        result=read_binary_frame(self.root,1,1,2,self.fields)
+        np.testing.assert_array_equal(result[4].transpose(0,2,1).ravel(),values[1])
+        self.assertEqual(result[3][0],2.)
+        for broken in (original[:-1], original[:24]+struct.pack('<Q',0)+original[32:]):
+            path.write_bytes(broken)
+            with self.assertRaises(ValueError): read_binary_frame(self.root,1,1,2,self.fields)
+        broken=bytearray(original); broken[offsets[1]+24+len(records[1])-25]^=1
+        path.write_bytes(broken)
+        with self.assertRaises(ValueError): read_binary_frame(self.root,1,1,2,self.fields)
+
+    @unittest.skipIf(zstd is None,'optional Python zstandard unavailable')
+    def test_compressed_index_skips_unrelated_headers(self):
+        self.fields['buffered_snapshot_format']=['zstd_shuffle_v2']
+        (self.root/'COMPLETE').write_text('r164_diagnostic_v1 final_step 6\n')
+        floats=np.zeros(19,dtype='<f8')
+        shuffled=np.frombuffer(floats.tobytes(),dtype=np.uint8).reshape(-1,8).T.copy().tobytes()
+        raw=shuffled+bytes(6)
+        payload=zstd.ZstdCompressor(write_checksum=True).compress(raw)
+        records=[struct.pack('<IIQQ',i,1,len(raw),len(payload))+payload for i in range(7)]
+        offsets=[]; cursor=24+8*len(records)
+        for record in records:
+            offsets.append(cursor); cursor+=len(record)
+        path=self.root/'snapshots.bin'
+        path.write_bytes(struct.pack('<8sIIII',b'R164SNAP',2,1,2,7)+struct.pack('<7Q',*offsets)+b''.join(records))
+        seeks=[]; original=Path.open
+        class Logged:
+            def __init__(self,wrapped): self.wrapped=wrapped
+            def __enter__(self): return self
+            def __exit__(self,*args): self.wrapped.close()
+            def read(self,*args): return self.wrapped.read(*args)
+            def seek(self,*args): seeks.append(args[0]); return self.wrapped.seek(*args)
+        def opening(path,*args,**kwargs):
+            result=original(path,*args,**kwargs)
+            return Logged(result) if path.name=='snapshots.bin' else result
+        with patch.object(Path,'open',opening): read_binary_frame(self.root,3,1,2,self.fields)
+        for i in (1,2,4,5): self.assertNotIn(offsets[i],seeks)
 
     def test_canonical_edge_tolerance(self):
         path=self.make_file(1,[0]*6)

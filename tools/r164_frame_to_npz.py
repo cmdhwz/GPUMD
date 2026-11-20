@@ -24,7 +24,7 @@ def read_frame(path, P, N):
     return q,p,f,u
 
 def read_binary_frame(directory, step, P, N, fields):
-    if step < 0 or fields.get('buffered_snapshot_format') != ['binary_v1']:
+    if step < 0 or fields.get('buffered_snapshot_format') not in (['binary_v1'],['zstd_shuffle_v2']):
         raise ValueError('invalid binary snapshot metadata')
     dt = float(fields['dt_fs'][0])
     stride = int(fields['buffered_frame_stride'][0])
@@ -43,27 +43,79 @@ def read_binary_frame(directory, step, P, N, fields):
         if len(header)!=24:
             raise ValueError('truncated binary snapshot header')
         magic,version,beads,atoms,records=struct.unpack('<8sIIII',header)
-        if (magic!=b'R164SNAP' or version!=1 or beads!=P or atoms!=N or
+        expected_version=1 if fields['buffered_snapshot_format']==['binary_v1'] else 2
+        if (magic!=b'R164SNAP' or version!=expected_version or beads!=P or atoms!=N or
                 P<1 or N<1 or records!=count):
             raise ValueError('binary snapshot header mismatch')
-        for i in range(records):
-            pos=source.tell(); record=source.read(8)
-            if len(record)!=8: raise ValueError('truncated snapshot record header')
-            current,width=struct.unpack('<II',record)
-            expected=final if i==records-1 else i*stride
-            if current!=expected or width not in (1,2,4,8):
-                raise ValueError('binary snapshot step or image width mismatch')
-            length=8*P+3*(3*P*N)*8+(3*P*N)*width
-            if source.tell()+length>size: raise ValueError('truncated snapshot record')
-            entry=(pos,current,width,length)
-            if i==0: first=entry
-            if current==step: selected=entry
-            source.seek(length,1)
-        if source.tell()!=size: raise ValueError('trailing binary snapshot data')
+        if version==2:
+            if 8*records>size-24: raise ValueError('truncated binary snapshot index')
+            index_bytes=source.read(8*records)
+            if len(index_bytes)!=8*records: raise ValueError('truncated binary snapshot index')
+            offsets=np.frombuffer(index_bytes,dtype='<u8')
+            index_end=24+8*records
+            if (int(offsets[0])!=index_end or np.any(offsets>size-24)
+                    or np.any(offsets[1:]<=offsets[:-1])
+                    or np.any(offsets[1:]-offsets[:-1]<24)):
+                raise ValueError('invalid binary snapshot offset index')
+            if step%stride==0:
+                selected_index=step//stride
+            elif step==final:
+                selected_index=records-1
+            else:
+                raise ValueError('requested step is not a stored snapshot')
+            for i in sorted({0,selected_index,records-1}):
+                pos=int(offsets[i]); source.seek(pos); record=source.read(24)
+                if len(record)!=24: raise ValueError('truncated snapshot record header')
+                current,width,stored_raw,length=struct.unpack('<IIQQ',record)
+                expected=final if i==records-1 else i*stride
+                if current!=expected or width not in (1,2,4,8):
+                    raise ValueError('binary snapshot step or image width mismatch')
+                raw_length=8*P+3*(3*P*N)*8+(3*P*N)*width
+                bound=raw_length+(raw_length>>8)+(((128<<10)-raw_length)>>11 if raw_length<(128<<10) else 0)
+                if stored_raw!=raw_length or length<1 or length>bound:
+                    raise ValueError('invalid compressed snapshot lengths')
+                end=int(offsets[i+1]) if i+1<records else size
+                if pos+24+length!=end: raise ValueError('compressed snapshot boundary mismatch')
+                entry=(pos,current,width,length,24)
+                if i==0: first=entry
+                if i==selected_index: selected=entry
+        else:
+            cursor=24
+            for i in range(records):
+                source.seek(cursor); record=source.read(8)
+                if len(record)!=8: raise ValueError('truncated snapshot record header')
+                current,width=struct.unpack('<II',record)
+                expected=final if i==records-1 else i*stride
+                if current!=expected or width not in (1,2,4,8):
+                    raise ValueError('binary snapshot step or image width mismatch')
+                length=8*P+3*(3*P*N)*8+(3*P*N)*width
+                if cursor+8+length>size: raise ValueError('truncated snapshot record')
+                entry=(cursor,current,width,length,8)
+                if i==0: first=entry
+                if current==step: selected=entry
+                cursor+=8+length
+            if cursor!=size: raise ValueError('trailing binary snapshot data')
         if selected is None: raise ValueError('requested step is not a stored snapshot')
-        pos,_,width,length=selected
-        source.seek(pos+8)
+        pos,_,width,length,record_header=selected
+        source.seek(pos+record_header)
         data=source.read(length)
+        if len(data)!=length: raise ValueError('truncated snapshot payload')
+    if version==2:
+        try:
+            import zstandard as zstd
+        except ImportError as e:
+            raise ValueError('compressed snapshots require Python zstandard') from e
+        raw_length=8*P+3*(3*P*N)*8+(3*P*N)*width
+        try:
+            if zstd.frame_content_size(data)!=raw_length:
+                raise ValueError('compressed frame content size mismatch')
+            decoded=zstd.ZstdDecompressor().decompress(data,max_output_size=raw_length,allow_extra_data=False)
+        except zstd.ZstdError as e:
+            raise ValueError('invalid compressed snapshot or checksum') from e
+        if len(decoded)!=raw_length: raise ValueError('compressed snapshot size mismatch')
+        double_bytes=8*(P+9*P*N)
+        shuffled=np.frombuffer(decoded[:double_bytes],dtype=np.uint8).reshape(8,-1)
+        data=shuffled.T.copy().tobytes()+decoded[double_bytes:]
     offset=0
     def take(dtype, count):
         nonlocal offset
@@ -98,7 +150,7 @@ def binary_lineage(directory, header, first):
             for block in iter(lambda:source.read(1024*1024),b''): identity.update(block)
     identity.update(b'\0snapshots.bin:first_record\0'+header)
     with (directory/'snapshots.bin').open('rb') as source:
-        source.seek(first[0]); remaining=8+first[3]
+        source.seek(first[0]); remaining=first[4]+first[3]
         while remaining:
             block=source.read(min(1024*1024,remaining))
             if not block: raise ValueError('truncated first snapshot during identity')
@@ -120,7 +172,7 @@ def main():
     if len(atoms) != N or [int(x[0]) for x in atoms] != list(range(N)):
         raise ValueError('atom metadata ordering mismatch')
     binary=(a.directory/'snapshots.bin').is_file()
-    if not binary and fields.get('buffered_snapshot_format')==['binary_v1']:
+    if not binary and fields.get('buffered_snapshot_format') in (['binary_v1'],['zstd_shuffle_v2']):
         raise ValueError('buffered capture has no binary snapshots')
     extra={}
     if binary:

@@ -18,7 +18,7 @@ class BufferedContract(unittest.TestCase):
         self.assertIn('unavailable values nan',body)
         self.assertIn('sample_stride_',body)
         self.assertLess(body.index('atomic_commit_new_file(binary_path+".tmp",binary_path)'),body.index('write_complete(buffered_total_)'))
-        self.assertIn('if (!snapshots_.empty())',body)
+        self.assertIn('if (!snapshots_.empty() || compressed_)',body)
         run=(ROOT/'src/main_gpumd/run.cu').read_text(encoding='utf8')
         self.assertLess(run.index('const auto time_finish'),run.index('r164_rpmd.finish_buffered(atom)'))
         self.assertLess(run.index('r164_rpmd.finish_buffered(atom)'),run.index('measure.post_run('))
