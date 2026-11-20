@@ -548,6 +548,7 @@ void Run::perform_a_run(const int number_of_steps)
     r164_rpmd.validate_trace(force, number_of_steps, atom);
     r164_rpmd.begin(atom, box, integrate.get_temperature(), time_step, global_time);
     r164_rpmd.configure_observer(force, atom, r164_model_xyz_sha256_, r164_restart_sha256_);
+    r164_rpmd.prepare_buffered(number_of_steps);
   }
   integrate.initialize(time_step, atom, box, group);
   measure.pre_run(number_of_steps, time_step, integrate, group, atom, box, force);
@@ -684,6 +685,7 @@ void Run::perform_a_run(const int number_of_steps)
   }
   print_line_2();
 
+  if (r164_rpmd.enabled()) r164_rpmd.finish_buffered(atom);
   measure.post_run(
     atom, box, integrate, number_of_steps, time_step, integrate.get_temperature2());
 

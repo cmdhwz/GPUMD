@@ -17,11 +17,13 @@ class CheckpointContract(unittest.TestCase):
         for text in ('checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0)',
                      'snapshot || (!buffered_ && (step==0 || step==total || checkpoint || trace_here))'):
             self.assertIn(text, output)
-        points = [output.index(x) for x in ('atomic_commit_new_file(frame_path', 'atomic_commit_new_file(image_path',
+        points = [output.index(x) for x in ('write_snapshot(step,q_,v,f,energy,force_images_,atom)',
                   'crossings.close()', 'scalar_file.close()', 'sha256_text(scalar_line)',
                   'PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.")', 'if (step == total) write_complete(step)')]
         self.assertEqual(points, sorted(points))
         self.assertIn('if (checkpoint) {', output)
+        writer=SOURCE.split('void R164_RPMD::write_snapshot(',1)[1].split('void R164_RPMD::prepare_buffered(',1)[0]
+        self.assertLess(writer.index('atomic_commit_new_file(frame_path'),writer.index('atomic_commit_new_file(image_path'))
         complete=SOURCE.split('void R164_RPMD::write_complete(',1)[1].split('void R164_RPMD::output(',1)[0]
         self.assertIn('atomic_commit_new_file(marker+".tmp",marker)',complete)
 

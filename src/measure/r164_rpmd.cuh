@@ -13,7 +13,12 @@ class R164_RPMD {
 public:
   bool enabled() const { return enabled_; }
   void parse(const std::vector<std::string>& tokens);
-  void reset() { enabled_ = false; observer_requested_ = false; drift_charge_requested_ = false; buffered_ = false; sample_stride_ = 0; series_.clear(); series_.shrink_to_fit(); checkpoint_stride_ = 0; trace_step_ = -1; observer_.reset(); }
+  void reset() {
+    enabled_ = false; observer_requested_ = false; drift_charge_requested_ = false; buffered_ = false;
+    sample_stride_ = 0; checkpoint_stride_ = 0; trace_step_ = -1;
+    series_.clear(); series_.shrink_to_fit(); snapshots_.clear(); snapshots_.shrink_to_fit();
+    metadata_text_.clear(); identity_text_.clear(); observer_text_.clear(); observer_.reset();
+  }
   void begin(Atom&, const Box&, double temperature, double dt, double start_time);
   void configure_observer(Force&, Atom&, const std::string& model_xyz_sha256, const std::string& restart_sha256);
   void validate_trace(const Force&, int total, const Atom&) const;
@@ -21,6 +26,8 @@ public:
   void capture_drift(Atom&);
   void check_force_positions(Atom&);
   void output(int step, int total, Atom&);
+  void prepare_buffered(int total);
+  void finish_buffered(Atom&);
 private:
   bool enabled_ = false;
   int stride_ = 0, checkpoint_stride_ = 0, n_ = 0, p_ = 0;
@@ -36,7 +43,17 @@ private:
     double b[3], d2[3], j2[3];
   };
   std::vector<SeriesRow> series_;
-  void finish_buffered(int step, int total);
+  struct Snapshot {
+    int step;
+    std::vector<double> q, v, f, energy;
+    std::vector<long long> images;
+  };
+  std::vector<Snapshot> snapshots_;
+  std::string metadata_text_, identity_text_, observer_text_;
+  int buffered_total_ = 0;
+  void write_text(const std::string&, const std::string&);
+  void write_snapshot(int, const std::vector<double>&, const std::vector<double>&,
+      const std::vector<double>&, const std::vector<double>&, const std::vector<long long>&, const Atom&);
   void write_complete(int step);
   rpmd_ja_sha256::Digest scalar_prefix_digest_;
   std::unique_ptr<NEP_Charge> observer_;

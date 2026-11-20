@@ -14,9 +14,17 @@ class BufferedContract(unittest.TestCase):
     def test_finish_orders_series_before_complete(self):
         text=(ROOT/'src/measure/r164_rpmd.cu').read_text(encoding='utf8')
         body=text.split('void R164_RPMD::finish_buffered(',1)[1].split('void R164_RPMD::write_complete(',1)[0]
-        self.assertLess(body.index('atomic_commit_new_file(path+".tmp",path)'),body.index('write_complete(step)'))
+        self.assertLess(body.index('atomic_commit_new_file(path+".tmp",path)'),body.index('write_complete(buffered_total_)'))
         self.assertIn('unavailable values nan',body)
         self.assertIn('sample_stride_',body)
+        self.assertIn('for (const auto& snapshot:snapshots_) write_snapshot',body)
+        run=(ROOT/'src/main_gpumd/run.cu').read_text(encoding='utf8')
+        self.assertLess(run.index('const auto time_finish'),run.index('r164_rpmd.finish_buffered(atom)'))
+        self.assertLess(run.index('r164_rpmd.finish_buffered(atom)'),run.index('measure.post_run('))
+        output=text.split('void R164_RPMD::output(',1)[1]
+        self.assertIn('} else write_snapshot(step,q_,v,f,energy,force_images_,atom)',output)
+        self.assertNotIn('finish_buffered(',output)
+        self.assertIn('frame.v=std::move(v); frame.f=std::move(f)',output)
     def test_option_excludes_other_diagnostics(self):
         text=(ROOT/'src/measure/r164_rpmd.cu').read_text(encoding='utf8')
         self.assertIn('buffered_ && next<t.size()',text)

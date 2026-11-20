@@ -20,6 +20,8 @@
 #include <iomanip>
 #include <sstream>
 #include <limits>
+#include <new>
+#include <utility>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -112,7 +114,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   int created = mkdir(directory_.c_str(), 0777);
 #endif
   if (created != 0) PRINT_INPUT_ERROR("r164_rpmd output directory must not already exist and its parent must exist.");
-  rpmd_ja_file_io::ofstream meta(directory_+"/metadata.txt.tmp");
+  std::ostringstream meta;
   meta << std::setprecision(17) << "schema r164_diagnostic_v1\nstorage binary64_text_17_digits; force_backend_precision not_certified\n"
        << "layout q_p_F: bead,atom,xyz; U: bead\nreference_id R27_fixed_2OH_R157\nreference_source_sha256 1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa\nreference_atom_identity_and_environment UNVERIFIED\nunits q=angstrom p=eV_fs_per_angstrom F=eV_per_angstrom U=eV time=fs\n"
        << "flow_b UNVERIFIED_OR_UNAVAILABLE\nd2 R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT\nJ2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\n"
@@ -125,7 +127,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   if (drift_charge_requested_) meta << "drift_charge observer_frame_natural_units\n";
   if (checkpoint_stride_) meta << "checkpoint_stride " << checkpoint_stride_ << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
-  meta.close(); if (!meta || rpmd_ja_file_io::atomic_commit_new_file(directory_+"/metadata.txt.tmp", directory_+"/metadata.txt") != 0) PRINT_INPUT_ERROR("r164_rpmd failed committing metadata.");
+  if (buffered_) metadata_text_=meta.str(); else write_text("metadata.txt",meta.str());
   offset_.resize(n_*3);
 }
 void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& model_xyz_sha256, const std::string& restart_sha256) {
@@ -133,7 +135,7 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
   const std::string source_model=get_first_potential_filename(force.get_run_input());
   const std::string source_hash=rpmd_ja_sample_provenance::sha256_file(source_model);
   const std::string input_hash=rpmd_ja_sample_provenance::sha256_file("run.in");
-  rpmd_ja_file_io::ofstream identity(directory_+"/source_identity.txt.tmp");
+  std::ostringstream identity;
 #ifdef GPUMD_WPE_ENABLED
   identity << "bead_force_backend WPE\n";
 #else
@@ -155,9 +157,7 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
            << "\ninput_hash_scope after_successful_read_unverified_against_concurrent_changes\n";
   identity << "model_sha256 " << (source_hash.empty()?"UNAVAILABLE":source_hash)
            << "\nrun_in_sha256 " << (input_hash.empty()?"UNAVAILABLE":input_hash) << "\n";
-  identity.close();
-  if (!identity || rpmd_ja_file_io::atomic_commit_new_file(directory_+"/source_identity.txt.tmp",directory_+"/source_identity.txt") != 0)
-    PRINT_INPUT_ERROR("r164_rpmd failed committing source identity.");
+  if (buffered_) identity_text_=identity.str(); else write_text("source_identity.txt",identity.str());
   if (!observer_requested_) return;
   std::string model; double spacing=0;
 #ifdef GPUMD_WPE_ENABLED
@@ -195,14 +195,13 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
   observer_q_.resize(3*n_); observer_u_.resize(n_); observer_f_.resize(3*n_); observer_virial_.resize(9*n_); observer_v_.resize(3*n_);
   if (drift_charge_requested_) observer_drift_v_.resize(3*n_);
   const std::string model_hash=rpmd_ja_sample_provenance::sha256_file(model);
-  rpmd_ja_file_io::ofstream meta(directory_+"/observer.txt.tmp");
+  std::ostringstream meta;
   meta << std::setprecision(17) << "native_private_qnep_pppm_observer\nmodel " << model
        << "\nmodel_sha256 " << (model_hash.empty()?"UNAVAILABLE":model_hash)
        << "\nrun_in_sha256 " << (input_hash.empty()?"UNAVAILABLE":input_hash)
-       << "\npppm_spacing " << spacing << "\nframe_call_identity step; observer_force_call ordinal step_plus_one\n";
-  meta.close();
-  if (!meta || rpmd_ja_file_io::atomic_commit_new_file(directory_+"/observer.txt.tmp", directory_+"/observer.txt") != 0)
-    PRINT_INPUT_ERROR("r164_rpmd failed committing observer identity.");
+       << "\npppm_spacing " << spacing << "\nframe_call_identity "
+       << (buffered_ ? "sampled_step; observer_force_call ordinal step_div_sample_stride_plus_one" : "step; observer_force_call ordinal step_plus_one") << "\n";
+  if (buffered_) observer_text_=meta.str(); else write_text("observer.txt",meta.str());
 }
 void R164_RPMD::capture_drift(Atom& atom) {
   read_positions(atom,position_scratch_); const auto& current=position_scratch_;
@@ -234,8 +233,54 @@ void R164_RPMD::check_force_positions(Atom& atom) {
     force_images_[j]=static_cast<long long>(image);
   }
 }
-void R164_RPMD::finish_buffered(int step, int total) {
-  if (step!=total) return;
+void R164_RPMD::write_text(const std::string& name, const std::string& text) {
+  const std::string path=directory_+"/"+name;
+  rpmd_ja_file_io::ofstream out(path+".tmp"); out << text; out.close();
+  if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
+    PRINT_INPUT_ERROR("r164_rpmd failed committing output metadata.");
+}
+
+void R164_RPMD::write_snapshot(int step, const std::vector<double>& q, const std::vector<double>& v,
+  const std::vector<double>& f, const std::vector<double>& energy,
+  const std::vector<long long>& force_images, const Atom& atom) {
+  const std::string frame_path=directory_+"/frame_"+std::to_string(step)+".txt";
+  rpmd_ja_file_io::ofstream frame(frame_path+".tmp"); frame << std::setprecision(17);
+  for (int s=0;s<p_;++s) { frame << "bead " << s << ' ' << energy[s] << '\n';
+    for (int i=0;i<n_;++i) { frame << i; for (int d=0;d<3;++d) frame << ' ' << q[s*n_*3+d*n_+i];
+      for (int d=0;d<3;++d) frame << ' ' << atom.cpu_mass[i]*TIME_UNIT_CONVERSION*v[s*n_*3+d*n_+i];
+      for (int d=0;d<3;++d) frame << ' ' << f[s*n_*3+d*n_+i]; frame << '\n'; }
+  }
+  frame.close(); if (!frame || rpmd_ja_file_io::atomic_commit_new_file(frame_path+".tmp",frame_path)!=0)
+    PRINT_INPUT_ERROR("r164_rpmd failed committing frame.");
+  const std::string image_path=directory_+"/force_images_"+std::to_string(step)+".txt";
+  rpmd_ja_file_io::ofstream images(image_path+".tmp");
+  images << "# bead atom image_x image_y image_z; q_lift=q_force+cell*image\n";
+  for (int bead=0;bead<p_;++bead) for (int i=0;i<n_;++i)
+    images << bead << ' ' << i << ' ' << force_images[bead*3*n_+i] << ' ' << force_images[bead*3*n_+n_+i] << ' ' << force_images[bead*3*n_+2*n_+i] << '\n';
+  images.close(); if (!images || rpmd_ja_file_io::atomic_commit_new_file(image_path+".tmp",image_path)!=0)
+    PRINT_INPUT_ERROR("r164_rpmd failed committing force images.");
+}
+
+void R164_RPMD::prepare_buffered(int total) {
+  if (!buffered_) return;
+  buffered_total_=total;
+  const size_t sample_count=static_cast<size_t>(total)/sample_stride_+1;
+  const size_t frame_count=stride_>0 ? 1+static_cast<size_t>(total)/stride_+(total%stride_!=0 ? 1 : 0) : 0;
+  const double bytes=static_cast<double>(frame_count)*(static_cast<double>(p_)*n_*(9*sizeof(double)+3*sizeof(long long))+static_cast<double>(p_)*sizeof(double))
+      +static_cast<double>(sample_count)*sizeof(SeriesRow);
+  if (stride_>0) printf("r164_rpmd buffered output estimates %.3f GiB host memory for %zu snapshots and %zu samples; choose sparse frames for large runs.\n",bytes/(1024.0*1024.0*1024.0),frame_count,sample_count);
+  try { series_.reserve(sample_count); snapshots_.reserve(frame_count); }
+  catch (const std::bad_alloc&) { PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered output; reduce frame or sample frequency."); }
+}
+
+void R164_RPMD::finish_buffered(Atom& atom) {
+  if (!buffered_) return;
+  if (next_output_step_!=static_cast<long long>(buffered_total_)+1 || drift_pending_)
+    PRINT_INPUT_ERROR("r164_rpmd cannot finish incomplete buffered output.");
+  write_text("metadata.txt",metadata_text_);
+  write_text("source_identity.txt",identity_text_);
+  write_text("observer.txt",observer_text_);
+  for (const auto& snapshot:snapshots_) write_snapshot(snapshot.step,snapshot.q,snapshot.v,snapshot.f,snapshot.energy,snapshot.images,atom);
   const std::string path=directory_+"/series.txt";
   rpmd_ja_file_io::ofstream out(path+".tmp"); out << std::setprecision(17);
   out << "# schema r164_buffered_series_v1\n# sample_stride " << sample_stride_
@@ -256,7 +301,8 @@ void R164_RPMD::finish_buffered(int step, int total) {
   if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
     PRINT_INPUT_ERROR("r164_rpmd failed committing buffered series.");
   series_.clear(); series_.shrink_to_fit();
-  write_complete(step);
+  snapshots_.clear(); snapshots_.shrink_to_fit();
+  write_complete(buffered_total_);
 }
 
 void R164_RPMD::write_complete(int step) {
@@ -273,7 +319,6 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   const double time_fs=step*dt_*TIME_UNIT_CONVERSION;
   const bool sample=!buffered_ || step%sample_stride_==0;
   const bool snapshot=stride_>0 && (step==0 || step==total || step%stride_==0);
-  if (buffered_ && step==0) series_.reserve(static_cast<size_t>(total)/sample_stride_+1);
   // The next drift starts after the integrator maps every bead relative to bead zero.
   read_positions(atom,position_scratch_); const auto& current=position_scratch_;
   for (int i=0;i<n_;++i) for (int d=0;d<3;++d) {
@@ -292,11 +337,15 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   }
   if (buffered_ && !sample && !snapshot) {
     drift_pending_=false; ++next_output_step_;
-    finish_buffered(step,total);
     return;
   }
   const bool need_force=!buffered_ || snapshot;
-  std::vector<double> v(p_*n_*3), f(need_force ? p_*n_*3 : 0), u(p_*n_);
+  std::vector<double> v, f, u;
+  try { v.resize(p_*n_*3); if (need_force) f.resize(p_*n_*3); u.resize(p_*n_); }
+  catch (const std::bad_alloc&) {
+    if (!buffered_) throw;
+    PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered frame workspace; reduce frame or sample frequency.");
+  }
   for (int s=0; s<p_; ++s) {
     atom.velocity_beads[s].copy_to_host(v.data()+s*n_*3);
     if (need_force) atom.force_beads[s].copy_to_host(f.data()+s*n_*3);
@@ -462,22 +511,19 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   const bool checkpoint = checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0);
   R164_PPPM_Trace trace;
   const bool trace_here=trace_for_step(step,trace);
-  if (snapshot || (!buffered_ && (step==0 || step==total || checkpoint || trace_here))) {
-    const std::string frame_path=directory_+"/frame_"+std::to_string(step)+".txt";
-    rpmd_ja_file_io::ofstream frame(frame_path+".tmp"); frame << std::setprecision(17);
-    for (int s=0; s<p_; ++s) { double energy=0; for (int i=0;i<n_;++i) energy+=u[s*n_+i]; frame << "bead " << s << ' ' << energy << '\n';
-      for (int i=0; i<n_; ++i) { frame << i; for (int d=0;d<3;++d) frame << ' ' << q_[s*n_*3+d*n_+i];
-        for (int d=0;d<3;++d) frame << ' ' << atom.cpu_mass[i]*TIME_UNIT_CONVERSION*v[s*n_*3+d*n_+i];
-        for (int d=0;d<3;++d) frame << ' ' << f[s*n_*3+d*n_+i]; frame << '\n'; }
+  const bool save_snapshot=snapshot || (!buffered_ && (step==0 || step==total || checkpoint || trace_here));
+  if (save_snapshot) {
+    try {
+      std::vector<double> energy(p_,0.0);
+      for (int bead=0;bead<p_;++bead) for (int i=0;i<n_;++i) energy[bead]+=u[bead*n_+i];
+      if (buffered_) {
+        Snapshot frame; frame.step=step; frame.q=q_; frame.images=force_images_; frame.energy=std::move(energy);
+        frame.v=std::move(v); frame.f=std::move(f); snapshots_.push_back(std::move(frame));
+      } else write_snapshot(step,q_,v,f,energy,force_images_,atom);
+    } catch (const std::bad_alloc&) {
+      if (!buffered_) throw;
+      PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered snapshot; reduce frame frequency.");
     }
-    frame.close(); if (!frame || rpmd_ja_file_io::atomic_commit_new_file(frame_path+".tmp", frame_path) != 0) PRINT_INPUT_ERROR("r164_rpmd failed committing frame.");
-    const std::string image_path=directory_+"/force_images_"+std::to_string(step)+".txt";
-    rpmd_ja_file_io::ofstream images(image_path+".tmp");
-    images << "# bead atom image_x image_y image_z; q_lift=q_force+cell*image\n";
-    for (int bead=0;bead<p_;++bead) for (int i=0;i<n_;++i)
-      images << bead << ' ' << i << ' ' << force_images_[bead*3*n_+i] << ' ' << force_images_[bead*3*n_+n_+i] << ' ' << force_images_[bead*3*n_+2*n_+i] << '\n';
-    images.close(); if (!images || rpmd_ja_file_io::atomic_commit_new_file(image_path+".tmp",image_path)!=0)
-      PRINT_INPUT_ERROR("r164_rpmd failed committing force images.");
   }
   if (buffered_) {
     if (sample) {
@@ -501,7 +547,6 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       series_.push_back(row);
     }
     drift_pending_=false; ++next_output_step_;
-    finish_buffered(step,total);
     return;
   }
   if (!previous_force_images_.empty()) {
