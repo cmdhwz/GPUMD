@@ -1932,8 +1932,10 @@ void PPPM::write_debug(
 
   auto write_header = [&](std::ofstream& file) {
     file << "# pppm_frame " << debug_frame_ << "\n";
-    file << "# force_evaluation_id " << force_evaluation_id << "\n";
-    file << "# reciprocal_energy_branch " << (calculate_peratom_virial ? "per_atom" : "global_uniform") << "\n";
+    if (debug_atom_ >= 0) {
+      file << "# force_evaluation_id " << force_evaluation_id << "\n";
+      file << "# reciprocal_energy_branch " << (calculate_peratom_virial ? "per_atom" : "global_uniform") << "\n";
+    }
     file << "# source_signature " << PPPM_DEBUG_SOURCE_SIGNATURE << "\n";
     file << "# pppm_N " << N << "\n";
     file << "# pppm_N1 " << N1 << "\n";

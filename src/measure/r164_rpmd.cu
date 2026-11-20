@@ -477,14 +477,25 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   }
   if (trace_here) {
     const std::string suffix=std::to_string(step)+".txt";
-    const std::string files[]={directory_+"/source_identity.txt",directory_+"/frame_"+suffix,directory_+"/force_images_"+suffix,
+    const std::string files[]={directory_+"/metadata.txt",directory_+"/source_identity.txt",directory_+"/frame_"+suffix,directory_+"/force_images_"+suffix,
       trace.prefix+"_mesh.out",trace.prefix+"_kspace.out",trace.prefix+"_atom.out",trace.prefix+"_assignment_atom.out",
       trace.prefix+"_assignment_stencil_atom"+std::to_string(trace_atom_)+".out",trace.prefix+"_pre_electro.out"};
-    const char* names[]={"source_identity","frame","force_images","mesh","kspace","atom","assignment_atom","assignment_stencil","pre_electro"};
+    const char* names[]={"metadata","source_identity","frame","force_images","mesh","kspace","atom","assignment_atom","assignment_stencil","pre_electro"};
     const std::string path=directory_+"/pppm_trace_step_"+std::to_string(step)+"_receipt.txt";
+    rpmd_ja_file_io::ifstream debug_atom_file(trace.prefix+"_atom.out");
+    std::string line; unsigned long long evaluation_id=0; bool found=false;
+    while (std::getline(debug_atom_file,line)) {
+      const std::string key="# force_evaluation_id ";
+      if (line.compare(0,key.size(),key)==0) {
+        std::istringstream value(line.substr(key.size()));
+        if (found || !(value >> evaluation_id) || evaluation_id==0) PRINT_INPUT_ERROR("r164_rpmd invalid trace force evaluation id.");
+        found=true;
+      }
+    }
+    if (!debug_atom_file.eof() || !found) PRINT_INPUT_ERROR("r164_rpmd missing trace force evaluation id.");
     rpmd_ja_file_io::ofstream receipt(path+".tmp");
-    receipt << "schema r164_pppm_trace_v1\nstep " << step << "\nbead " << trace_bead_ << "\natom " << trace_atom_ << "\nneighbor_history unavailable\nphysical_event unavailable\n";
-    for (int i=0;i<9;++i) {
+    receipt << "schema r164_pppm_trace_v1\nstep " << step << "\nbead " << trace_bead_ << "\natom " << trace_atom_ << "\nforce_evaluation_id " << evaluation_id << "\nneighbor_history unavailable\nphysical_event unavailable\n";
+    for (int i=0;i<10;++i) {
       const auto hash=rpmd_ja_sample_provenance::sha256_file(files[i]);
       if (hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing PPPM trace.");
       receipt << names[i] << "_sha256 " << hash << "\n";
