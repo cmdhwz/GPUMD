@@ -117,8 +117,15 @@ def integral(c, dt):
     return out
 
 
-def eh_diagnostic(traces, dt, window):
+def eh_diagnostic(traces, dt, window, number_intervals=None):
     bins=[(trace[:-1]+trace[1:])*0.5 for trace in traces]
+    if number_intervals is not None:
+        if len(number_intervals) != len(bins):
+            raise ValueError('number interval trace count mismatch')
+        for values, interval in zip(bins, number_intervals):
+            if interval.shape != (len(values),12) or not np.isfinite(interval).all():
+                raise ValueError('invalid lifted number intervals')
+            values[:,6:] = interval/dt
     total_bins=sum(len(x) for x in bins)
     mean=sum((x.sum(axis=0) for x in bins),np.zeros(18))/total_bins
     origin_count=sum(max(0,len(x)-window+1) for x in bins)
@@ -152,12 +159,59 @@ def eh_diagnostic(traces, dt, window):
                   finite_sample_residual=(eh-triangular).tolist())
     return result
 
-def analyze(directories, max_lag):
+def read_lift_intervals(directory, expected_hash, expected_metadata_hash, expected_rows):
+    path = Path(directory)/'scalar.txt'
+    meta_path = Path(directory)/'metadata.txt'
+    if digest(meta_path) != expected_metadata_hash:
+        raise ValueError('metadata changed before interval read')
+    metadata = fields(meta_path)
+    if metadata.get('number_increment') != 'lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment':
+        raise ValueError('missing lifted number increment metadata')
+    if digest(path) != expected_hash:
+        raise ValueError('scalar changed before interval read')
+    rows = []
+    with path.open(encoding='utf8', newline='') as source:
+        for line in source:
+            if line.startswith('#'):
+                continue
+            if not line.endswith('\n'):
+                raise ValueError('partial scalar line')
+            tokens = line.split()
+            step = len(rows)
+            if not tokens or int(tokens[0]) != step:
+                raise ValueError('noncontiguous interval step')
+            initial = tokens.count('NUMBER_INCREMENT_INITIAL_BOUNDARY')
+            lift = tokens.count('NUMBER_INCREMENT_LIFT_A')
+            if step == 0:
+                if initial != 1 or lift != 0 or tokens[-1] != 'NUMBER_INCREMENT_INITIAL_BOUNDARY':
+                    raise ValueError('invalid initial number increment boundary')
+                rows.append(None)
+            else:
+                if initial != 0 or lift != 1 or len(tokens) < 13 or tokens[-13] != 'NUMBER_INCREMENT_LIFT_A':
+                    raise ValueError('invalid lifted number increment suffix')
+                values = np.asarray(tokens[-12:], dtype=float)
+                if values.shape != (12,) or not np.isfinite(values).all():
+                    raise ValueError('invalid lifted number increment values')
+                rows.append(values)
+    if len(rows) != expected_rows or digest(path) != expected_hash or digest(meta_path) != expected_metadata_hash:
+        raise ValueError('number interval domain or scalar SHA mismatch')
+    return np.asarray(rows[1:], dtype=float).reshape((-1,12))
+
+
+def analyze(directories, max_lag, number_intervals='trapezoid'):
+    if number_intervals not in ('trapezoid','lift'):
+        raise ValueError('unsupported number interval mode')
     if max_lag <= 0:
         raise ValueError('max lag must be positive')
     if len({Path(d).resolve() for d in directories}) != len(directories):
         raise ValueError('duplicate input directory')
+    initial_hashes = None
+    if number_intervals == 'lift':
+        initial_hashes = [{name:digest(Path(d)/name) for name in ('metadata.txt','scalar.txt')} for d in directories]
     loaded = [load_trace(d) for d in directories]
+    if initial_hashes is not None and any(any(before[name] != entry[2][name] for name in before)
+                                          for before,entry in zip(initial_hashes,loaded)):
+        raise ValueError('source changed during correlation calculation')
     scalar_hashes=[item[2]['scalar.txt'] for item in loaded]
     if len(set(scalar_hashes)) != len(scalar_hashes):
         raise ValueError('identical scalar inputs would be double counted')
@@ -166,6 +220,10 @@ def analyze(directories, max_lag):
     traces = [item[0] for item in loaded]
     if any(len(x) <= max_lag for x in traces):
         raise ValueError('max lag must be shorter than every trace')
+    intervals = None
+    if number_intervals == 'lift':
+        intervals = [read_lift_intervals(d, entry[2]['scalar.txt'], entry[2]['metadata.txt'], len(entry[0]))
+                     for d,entry in zip(directories,loaded)]
     mean = sum((x.sum(axis=0) for x in traces), np.zeros(18))/sum(map(len, traces))
     c, counts = correlations(traces, mean, max_lag)
     bb, bd, db, dd = c[:, :3, :3], c[:, :3, 3:6], c[:, 3:6, :3], c[:, 3:6, 3:6]
@@ -193,7 +251,9 @@ def analyze(directories, max_lag):
         'axes': 'C[lag,i,j] uses time-zero i and later-time j; vector order b_xyz,d2_xyz,N_O_xyz,N_H_xyz,N_Na_xyz,N_Cl_xyz',
         'units': {'b_d2':'eV angstrom/fs','species':'angstrom/fs','correlation':'outer product of vector units',
                   'integral':'correlation units multiplied by fs; no volume or temperature normalization'},
-        'eh_regular_only':eh_diagnostic(traces,loaded[0][3],max_lag),
+        'eh_regular_only':eh_diagnostic(traces,loaded[0][3],max_lag,intervals),
+        'number_interval_mode':number_intervals,
+        'number_interval_scope':'GK remains pointwise; EH species bins are lifted displacement/dt' if intervals is not None else 'GK pointwise; EH species bins use endpoint trapezoids',
         'dt_fs': loaded[0][3], 'temperature_K': loaded[0][4], 'cell_angstrom': loaded[0][5].tolist(),
         'max_lag': max_lag, 'sample_counts': counts, 'mean_shared_all_samples': mean.tolist(),
         'C_full_18x18': c.tolist(), 'C_bb':bb.tolist(), 'C_bd':bd.tolist(), 'C_db':db.tolist(), 'C_dd':dd.tolist(),
@@ -210,9 +270,10 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directories', nargs='+', type=Path)
     parser.add_argument('--max-lag',type=int,required=True)
+    parser.add_argument('--number-intervals', choices=('trapezoid','lift'), default='trapezoid')
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
-    result=analyze(args.directories,args.max_lag)
+    result=analyze(args.directories,args.max_lag,args.number_intervals)
     with args.output.open('x',encoding='utf8') as output:
         json.dump(result,output,indent=2,allow_nan=False); output.write('\n')
 

@@ -45,6 +45,38 @@ class CorrelationTests(unittest.TestCase):
         self.assertLess(np.max(np.abs(result['finite_sample_residual'])),1e-12)
         self.assertIsNone(corr.eh_diagnostic([x[:2]],0.2,1)['eh_covariance_over_2t'])
 
+    def test_lift_intervals_and_invalid_suffixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d=Path(tmp); self.fixture(d)
+            meta=d/'metadata.txt'
+            meta.write_text(meta.read_text(encoding='utf8')+'number_increment lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment\n',encoding='utf8')
+            scalar=d/'scalar.txt'; source=scalar.read_text(encoding='utf8').splitlines()
+            lines=[source[0],source[1]+' NUMBER_INCREMENT_INITIAL_BOUNDARY']
+            increments=[]
+            for step,line in enumerate(source[2:],1):
+                values=np.arange(12,dtype=float)*step*step*.01
+                increments.append(values)
+                lines.append(line+' NUMBER_INCREMENT_LIFT_A '+' '.join(map(str,values)))
+            original='\n'.join(lines)+'\n'; scalar.write_text(original,encoding='utf8')
+            lifted=corr.analyze([d],2,'lift'); regular=corr.analyze([d],2)
+            np.testing.assert_array_equal(lifted['C_full_18x18'],regular['C_full_18x18'])
+            x,_,_,dt,_,_=corr.load_trace(d)
+            bins=(x[:-1]+x[1:])*.5
+            bins[:,6:]=np.asarray(increments)/dt
+            expected=(bins-bins.mean(axis=0)).T@(bins-bins.mean(axis=0))/len(bins)*dt*.5
+            one=corr.analyze([d],1,'lift')['eh_regular_only']
+            np.testing.assert_allclose(one['triangular_correlation_integral'],expected,rtol=1e-12,atol=1e-12)
+            self.assertFalse(np.allclose(lifted['eh_regular_only']['eh_covariance_over_2t'],regular['eh_regular_only']['eh_covariance_over_2t']))
+            bad=[original.replace('NUMBER_INCREMENT_INITIAL_BOUNDARY','NUMBER_INCREMENT_LIFT_A',1),
+                 original.replace('NUMBER_INCREMENT_LIFT_A','NUMBER_INCREMENT_INITIAL_BOUNDARY',1),
+                 original.replace('NUMBER_INCREMENT_LIFT_A','NUMBER_INCREMENT_LIFT_A NUMBER_INCREMENT_LIFT_A',1),
+                 original.replace('NUMBER_INCREMENT_LIFT_A','NUMBER_INCREMENT_MISSING',1),
+                 original.replace('NUMBER_INCREMENT_LIFT_A 0.0','NUMBER_INCREMENT_LIFT_A nan',1),
+                 original.replace('NUMBER_INCREMENT_LIFT_A 0.0','NUMBER_INCREMENT_LIFT_A',1)]
+            for text in bad:
+                scalar.write_text(text,encoding='utf8')
+                with self.assertRaises(ValueError): corr.analyze([d],2,'lift')
+
     def test_reject_missing_hole_and_bad_j(self):
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp); self.fixture(d); scalar=d/'scalar.txt'; original=scalar.read_text(encoding='utf8')

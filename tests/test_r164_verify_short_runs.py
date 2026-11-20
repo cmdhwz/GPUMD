@@ -26,6 +26,19 @@ class ShortRunTests(unittest.TestCase):
             with self.assertRaises(ValueError): v.read_scalars(path,.1,2)
             lines[1]=lines[1].replace('0.1 ','0.15 ',1); path.write_text(''.join(lines))
             with self.assertRaises(ValueError): v.read_scalars(path,.1,2)
+    def test_number_increment_suffix_keeps_monitor_and_checkpoint_rows(self):
+        import r164_checkpoint_chain as chain
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'scalar.txt'
+            base=lambda step:' '.join(map(str,[step,step*.1]+[0]*19))
+            lines=[base(0)+' NUMBER_INCREMENT_INITIAL_BOUNDARY\n',
+                   base(1)+' NUMBER_INCREMENT_LIFT_A '+' '.join(map(str,range(12)))+'\n']
+            path.write_text(''.join(lines),encoding='utf8')
+            self.assertEqual(len(v.read_scalars(path,.1,1)),2)
+            rows=chain.scalar_prefix(path,1,.1)
+            self.assertEqual(len(rows),2)
+            self.assertTrue(rows[1][0].endswith(b'10 11\n'))
+
     def test_actual_image_rows_and_component_comparison(self):
         with tempfile.TemporaryDirectory() as t:
             path=Path(t)/'images.txt'; path.write_text('# images\n0 0 1 0 -1\n',encoding='utf8')

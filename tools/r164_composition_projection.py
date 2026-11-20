@@ -135,12 +135,12 @@ def matrix_diagnostic(raw, a, rcond, null_rtol):
     return result
 
 
-def run(directories, max_lag, rcond, null_rtol):
+def run(directories, max_lag, rcond, null_rtol, number_intervals='trapezoid'):
     if not np.isfinite(rcond) or not 0 < rcond < 0.1 or not np.isfinite(null_rtol) or not 0 <= null_rtol <= 1:
         raise ValueError('invalid support rcond or null-cross tolerance')
     names = ('metadata.txt','source_identity.txt','observer.txt','scalar.txt','COMPLETE')
     initial_hashes = [{name:digest(Path(d)/name) for name in names} for d in directories]
-    raw = analyze(directories, max_lag)
+    raw = analyze(directories, max_lag, number_intervals)
     if any(before != item['sha256'] for before,item in zip(initial_hashes,raw['inputs'])):
         raise ValueError('source changed during correlation calculation')
     checked = [composition(d, item['sha256']) for d,item in zip(directories,raw['inputs'])]
@@ -172,9 +172,10 @@ def main():
     parser.add_argument('--max-lag',required=True,type=int)
     parser.add_argument('--support-rcond',required=True,type=float)
     parser.add_argument('--null-cross-rtol',required=True,type=float)
+    parser.add_argument('--number-intervals',choices=('trapezoid','lift'),default='trapezoid')
     parser.add_argument('--output',required=True,type=Path)
     args = parser.parse_args()
-    report = run(args.directories,args.max_lag,args.support_rcond,args.null_cross_rtol)
+    report = run(args.directories,args.max_lag,args.support_rcond,args.null_cross_rtol,args.number_intervals)
     encoded = json.dumps(report,indent=2,allow_nan=False)+'\n'
     with args.output.open('x',encoding='utf8',newline='\n') as output:
         output.write(encoded)

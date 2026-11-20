@@ -177,3 +177,16 @@ The values shown are diagnostic examples, not acceptance thresholds. The tool ch
 An independent all-bead lift comparison (`native-composition-projection-independent-43a6/number-flow-increments.json`) found maximum per-step differences between direct species centroid displacement and trapezoidal scalar number-flow integration of 5.17759e-5 Å at 0.1 fs and 4.05425e-4 Å at 0.2 fs; maximum accumulated differences at 1 fs were 3.11210e-4 and 1.24575e-3 Å. After the recorded two-kick correction, the residual was at most 8.24e-12 Å, with per-atom centroid drift residual at most 2.47e-14 Å. The present GK/EH calculations retain the existing point-value and trapezoidal-bin domains; this comparison does not substitute displacement integrals into those windows.
 
 On the recorded fine-on capture with diagnostic parameters `support_rcond=1e-8` and `null_cross_rtol=1e-5`, GK windows of 1 and 3 steps had support rank 3. At 6 steps GK was unresolved due to negative spectrum and null-space coupling, EH had rank 3, and the triangular matrix was unresolved due to negative spectrum. At 10 steps GK was unresolved and EH and triangular matrices lacked sufficient contiguous origins. These are short-window arithmetic diagnostics, not production support. The independent comparison is `native-composition-projection-independent-43a6/cli-independent-verification.json`.
+
+### Lifted species-number intervals
+
+Each new R164 scalar row appends the exact full-bead continuous-lift displacement sum for O/H/Na/Cl in xyz order, in Å, on the right-closed interval ending at that step. Step zero is `NUMBER_INCREMENT_INITIAL_BOUNDARY`, with no numeric increment; every later completed step has `NUMBER_INCREMENT_LIFT_A` followed by 12 values. Checkpoint receipts cover the appended scalar bytes. A fresh-cache continuation has its own step-zero boundary; the checkpoint chain retains the parent boundary once and appends child rows from local step 1.
+
+The correlation and composition tools retain pointwise GK and the existing trapezoidal interval default. Add `--number-intervals lift` to use recorded displacement/dt for the 12 species channels of regular-only EH and triangular windows; b and d2 still use endpoint trapezoids. This mode rejects legacy captures without the increment fields. For example:
+
+```text
+python tools/r164_provisional_correlations.py CAPTURE --max-lag 3 --number-intervals lift --output correlations.json
+python tools/r164_composition_projection.py CAPTURE --max-lag 3 --number-intervals lift --support-rcond 1e-8 --null-cross-rtol 1e-5 --output projection.json
+```
+
+The increments are geometric number-flow integrals; they do not supply unknown P11 physical-event increments, and P14 production release remains unpassed.

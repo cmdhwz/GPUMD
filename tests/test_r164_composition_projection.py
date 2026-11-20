@@ -50,6 +50,28 @@ class ProjectionTests(unittest.TestCase):
         np.testing.assert_allclose(reconstructed, flows, rtol=1e-13, atol=1e-13)
         self.assertGreater(total, 0)
 
+    def test_lift_mode_forwards_to_composition(self):
+        from test_r164_provisional_correlations import CorrelationTests
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); CorrelationTests().fixture(root)
+            meta=root/'metadata.txt'
+            text=meta.read_text(encoding='utf8').replace('N 5896','N 4')
+            text+='number_increment lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment\n'
+            text+=''.join(f'atom {i} {symbol} {i+1}\n' for i,symbol in enumerate(projection.SPECIES))
+            meta.write_text(text,encoding='utf8')
+            scalar=root/'scalar.txt'; lines=scalar.read_text(encoding='utf8').splitlines(); rewritten=[lines[0]]
+            for step,line in enumerate(lines[1:]):
+                tokens=line.split(); n=np.asarray(tokens[9:21],dtype=float).reshape(4,3)
+                tokens[6:9]=map(str,np.arange(1,5)@n*projection.MASS_FACTOR)
+                suffix=['NUMBER_INCREMENT_INITIAL_BOUNDARY'] if step==0 else ['NUMBER_INCREMENT_LIFT_A']+list(map(str,np.arange(12)*step*step*.01))
+                rewritten.append(' '.join(tokens+suffix))
+            scalar.write_text('\n'.join(rewritten)+'\n',encoding='utf8')
+            normal=projection.run([root],2,1e-8,1e-5)
+            lifted=projection.run([root],2,1e-8,1e-5,'lift')
+            self.assertEqual(lifted['raw_report']['number_interval_mode'],'lift')
+            np.testing.assert_array_equal(lifted['matrices']['GK']['ordered'],normal['matrices']['GK']['ordered'])
+            self.assertFalse(np.allclose(lifted['matrices']['EH']['ordered'],normal['matrices']['EH']['ordered']))
+
     def test_mass_flow_and_bad_momentum(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
