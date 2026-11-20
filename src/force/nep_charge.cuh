@@ -237,6 +237,7 @@ public:
   void request_pppm_debug_for_next_force(const char* prefix, const int frame, const int atom = -1)
   {
     pppm.request_debug_for_next_force(prefix, frame, atom);
+    if (atom >= 0) { r164_trace_prefix_=prefix; r164_trace_step_=frame; r164_trace_atom_=atom; }
   }
   void reset_dynamic_charge_cache();
   void request_dynamic_charge_debug(const int step) { pppm.request_dynamic_charge_debug(step); }
@@ -539,6 +540,9 @@ private:
   unsigned long long charge_heat_channel_cache_force_evaluation_id_ = 0;
   const void* charge_heat_channel_cache_position_ = nullptr;
   const void* charge_heat_channel_cache_velocity_ = nullptr;
+  std::string r164_trace_prefix_;
+  int r164_trace_step_ = -1, r164_trace_atom_ = -1;
+  void write_r164_pre_electro_trace(int N, const GPU_Vector<double>& potential);
   unsigned long long force_evaluation_id_ = 0;
   unsigned long long charge_rate_generation_ = 0;
   bool charge_rate_cache_set_ = false;

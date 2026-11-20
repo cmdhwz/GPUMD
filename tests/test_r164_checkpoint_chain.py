@@ -10,7 +10,7 @@ import r164_checkpoint_chain as chain
 
 class OptionTests(unittest.TestCase):
     def test_legacy_and_extended(self):
-        for args,expected in [(['r164_rpmd','r164_output','1'],(False,None)),(['r164_rpmd','r164_output','1','observer'],(True,None)),(['r164_rpmd','r164_output','1','observer','checkpoint','2'],(True,2)),(['r164_rpmd','r164_output','1','checkpoint','2'],(False,2))]:
+        for args,expected in [(['r164_rpmd','r164_output','1'],(False,None)),(['r164_rpmd','r164_output','1','observer'],(True,None)),(['r164_rpmd','r164_output','1','observer','checkpoint','2'],(True,2)),(['r164_rpmd','r164_output','1','checkpoint','2'],(False,2)),(['r164_rpmd','r164_output','1','observer','checkpoint','2','pppm_trace','0','0','5609'],(True,2)),(['r164_rpmd','r164_output','1','pppm_trace','0','0','1'],(False,None))]:
             self.assertEqual(chain.r164_options(args),expected)
         for rest in (['checkpoint','0'],['checkpoint','4294967297'],['checkpoint','2','observer'],['checkpoint','+2']):
             with self.assertRaises(ValueError): chain.r164_options(['r164_rpmd','r164_output','1']+rest)

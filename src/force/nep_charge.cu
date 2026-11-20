@@ -22,6 +22,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 
 #include "neighbor.cuh"
 #include "nep_charge.cuh"
+#include "measure/rpmd_ja_utf8_file_io.h"
 #include "nep_charge_small_box.cuh"
 #include "utilities/common.cuh"
 #include "utilities/compact_nep.cuh"
@@ -36,6 +37,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -2473,6 +2475,7 @@ void NEP_Charge::compute_large_box(
   if (capture_charge_diagnostics) {
     nep_data.charge_raw.copy_from_device(nep_data.charge.data());
   }
+  write_r164_pre_electro_trace(N, potential_per_atom);
 
   if (include_electro) {
     zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
@@ -2769,6 +2772,7 @@ void NEP_Charge::compute_small_box(
   if (capture_charge_diagnostics) {
     nep_data.charge_raw.copy_from_device(nep_data.charge.data());
   }
+  write_r164_pre_electro_trace(N, potential_per_atom);
 
   if (include_electro) {
     zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
@@ -3039,6 +3043,27 @@ void NEP_Charge::begin_force_evaluation_()
 void NEP_Charge::invalidate_current_force_caches()
 {
   invalidate_current_force_caches_();
+}
+
+void NEP_Charge::write_r164_pre_electro_trace(int N, const GPU_Vector<double>& potential)
+{
+  if (r164_trace_step_ < 0) return;
+  std::vector<float> raw(N);
+  std::vector<double> local(N);
+  nep_data.charge.copy_to_host(raw.data(), N);
+  potential.copy_to_host(local.data(), N);
+  rpmd_ja_file_io::ofstream out(r164_trace_prefix_+"_pre_electro.out");
+  out << std::setprecision(17) << "# schema r164_pre_electro_v1\n# step " << r164_trace_step_
+      << "\n# atom " << r164_trace_atom_ << "\n# force_evaluation_id " << force_evaluation_id_
+      << "\n# N " << N << "\n# columns atom raw_charge potential_before_electro_eV\n";
+  for (int i=0;i<N;++i) {
+    if (!std::isfinite(raw[i]) || !std::isfinite(local[i]))
+      PRINT_INPUT_ERROR("r164_rpmd nonfinite pre-electro trace.");
+    out << i << ' ' << raw[i] << ' ' << local[i] << '\n';
+  }
+  out.close();
+  if (!out) PRINT_INPUT_ERROR("r164_rpmd failed closing pre-electro trace.");
+  r164_trace_step_=-1;
 }
 
 void NEP_Charge::compute(

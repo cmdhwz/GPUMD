@@ -47,6 +47,7 @@ def config(capture,meta,source):
     b={x[0]:x for x in lines}; r=b['r164_rpmd']
     if (len(b['potential'])!=2 or len(b['read_pimd_restart'])!=2 or len(b['kspace'])!=3 or b['kspace'][1]!='pppm' or float(b['kspace'][2])<=0 or len(b['time_step'])!=2 or not math.isclose(float(b['time_step'][1]),float(meta['dt_fs']),rel_tol=4.5e-16,abs_tol=0.0) or len(b['ensemble'])!=4 or b['ensemble'][1]!='rpmd' or int(b['ensemble'][2])!=int(meta['P']) or float(b['ensemble'][3])!=float(meta['temperature_K']) or b['pimd_propagator']!=['pimd_propagator','exact'] or b['pimd_fix_com']!=['pimd_fix_com','off'] or len(b['run'])!=2 or not 0<int(b['run'][1])<=2147483647): raise ValueError('unsupported run configuration')
     observer,checkpoint=r164_options(r)
+    if 'pppm_trace' in r: raise ValueError('checkpoint chain does not support trace schedule')
     if r[1]!='r164_output' or (root/r[1]).resolve()!=capture.resolve() or checkpoint is None or checkpoint!=int(meta['checkpoint_stride']): raise ValueError('checkpoint card mismatch')
     for name,field in ((simple(b['potential'][1]),'model_sha256'),('model.xyz','model_xyz_sha256'),(simple(b['read_pimd_restart'][1]),'restart_input_sha256')):
         if not HEX.fullmatch(source.get(field,'')) or sha(root/name)!=source[field]: raise ValueError('input identity mismatch: '+field)
