@@ -47,6 +47,26 @@ class ShortRunTests(unittest.TestCase):
         self.assertEqual(item['observer_components_max_abs']['relay'],1.); self.assertIsNone(item['d2_max_abs'])
         self.assertEqual(item['energy_momentum_scalar_difference'],[-1.]*7)
 
+    def test_frame_scalar_ledger_and_observer_contradictions(self):
+        q=np.zeros((2,2,3)); q[1,:,0]=[1.,2.]
+        p=np.zeros_like(q); p[0,0,0]=2.; p[1,0,0]=4.; p[0,1,1]=4.; p[1,1,1]=8.
+        mass=np.array([2.,4.]); species=np.array(['O','H']); U=np.array([1.,2.]); T=300.
+        omega=2*8.617343e-5*T/(6.465412e-2*10.18051)
+        # Hand sums: K=5+10, spring=(2+16)*omega^2, centroid p=(3,6,0), species v=(1.5,0,0)/(0,1.5,0).
+        kinetic=15.; spring=18.*omega**2
+        base=np.array([3.,kinetic,spring,(3.+kinetic+spring)/4.,3.,6.,0.,1.5,0,0,0,1.5,0,0,0,0,0,0,0])
+        record={'base':base,'components':{k:None for k in ('conv','local','mechanical','relay','projection')}}
+        result=v.validate_frame_scalars(q,p,U,mass,species,T,record)
+        self.assertLess(max(map(abs,result['residual'])),1e-12)
+        bad=dict(record,base=base.copy()); bad['base'][1]+=0.01
+        with self.assertRaises(ValueError): v.validate_frame_scalars(q,p,U,mass,species,T,bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            d=Path(tmp); v.check_observer_mode(d,[record],False)
+            (d/'observer.txt').write_text('unexpected',encoding='utf8')
+            with self.assertRaises(ValueError): v.check_observer_mode(d,[record],False)
+            (d/'observer.txt').unlink(); bad_components=dict(record,components=dict(record['components'],relay=np.ones(3)))
+            with self.assertRaises(ValueError): v.check_observer_mode(d,[bad_components],False)
+
     def test_cpu_initial_energy_force_delta_and_phase_gate(self):
         with tempfile.TemporaryDirectory() as t:
             d=Path(t); N=5896; P=32; shape=(P,N,3); q=np.zeros(shape); p=np.zeros(shape); force=np.zeros(shape); U=np.arange(P,dtype=float)

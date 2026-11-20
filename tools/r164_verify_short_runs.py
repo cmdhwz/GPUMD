@@ -74,6 +74,36 @@ def read_scalars(path,dt,steps):
     return records
 
 
+def validate_frame_scalars(q,p,U,mass,species,temperature,record):
+    beads,atoms,_=q.shape
+    if p.shape!=q.shape or U.shape!=(beads,) or mass.shape!=(atoms,) or species.shape!=(atoms,):
+        raise ValueError('phase and scalar dimensions differ')
+    omega=beads*8.617343e-5*temperature/(6.465412e-2*10.18051)
+    kinetic=p*p/(2*mass[None,:,None])
+    delta=np.roll(q,-1,axis=0)-q
+    spring=0.5*mass[None,:,None]*omega**2*delta*delta
+    v=p/mass[None,:,None]
+    totalU=U.sum(); totalK=kinetic.sum(); totalS=spring.sum()
+    momentum=p.sum(axis=(0,1))/beads
+    flows=np.concatenate([v[:,species==symbol,:].sum(axis=(0,1))/beads for symbol in ('O','H','Na','Cl')])
+    calculated=np.concatenate(([totalU,totalK,totalS,(totalU+totalK+totalS)/(beads*atoms)],momentum,flows))
+    absU=np.abs(U).sum(); absK=np.abs(kinetic).sum(); absS=np.abs(spring).sum()
+    momentum_abs=np.abs(p).sum(axis=(0,1))/beads
+    flow_abs=np.concatenate([np.abs(v[:,species==symbol,:]).sum(axis=(0,1))/beads for symbol in ('O','H','Na','Cl')])
+    contributions=np.concatenate(([absU,absK,absS,(absU+absK+absS)/(beads*atoms)],momentum_abs,flow_abs))
+    tolerance=1e-10+1e-10*contributions
+    residual=record['base']-calculated
+    if not np.isfinite(residual).all() or np.any(np.abs(residual)>tolerance):
+        raise ValueError('frame/scalar serialization arithmetic mismatch')
+    return {'residual':residual.tolist(),'absolute_contribution_sum':contributions.tolist(),
+            'arithmetic_tolerance':tolerance.tolist()}
+
+
+def check_observer_mode(directory,records,observer):
+    if not observer and ((Path(directory)/'observer.txt').exists() or
+                         any(any(value is not None for value in row['components'].values()) for row in records)):
+        raise ValueError('observer-off run contains observer output')
+
 def load_run(directory,run_in,dt,steps,observer):
     directory=Path(directory); meta=keyfile(directory/'metadata.txt'); src=keyfile(directory/'source_identity.txt')
     marker=(directory/'COMPLETE').read_text(encoding='utf8').split()
@@ -96,15 +126,18 @@ def load_run(directory,run_in,dt,steps,observer):
     if (cell.shape!=(3,) or not np.allclose(cell,29.3104,atol=1e-8,rtol=0) or not np.isfinite(mass).all() or np.any(mass<=0) or
         set(species)!={'O','H','Na','Cl'} or np.count_nonzero(species=='Na')!=26 or np.count_nonzero(species=='Cl')!=26): raise ValueError('invalid cell/mass')
     records=read_scalars(directory/'scalar.txt',dt,steps)
+    check_observer_mode(directory,records,observer)
     frames=[directory/f'frame_{i}.txt' for i in range(steps+1)]
     images=[directory/f'force_images_{i}.txt' for i in range(steps+1)]
-    for frame_path,image_path in zip(frames,images):
-        q,_,_,_=read_frame(frame_path,32,5896)
+    scalar_frame_checks=[]
+    for frame_path,image_path,record in zip(frames,images,records):
+        q,p,_,U=read_frame(frame_path,32,5896)
         read_images(image_path,q,cell)
+        scalar_frame_checks.append(validate_frame_scalars(q,p,U,mass,species,300,record))
     return {'directory':str(directory),'source':src,'config':cfg,'meta':meta,'species':species,'mass':mass,'cell':cell,'records':records,'frames':frames,'images':images,'dt':dt,'observer_requested':observer,
             'inputs':{p.name:sha(p) for p in (directory/'metadata.txt',directory/'source_identity.txt',directory/'scalar.txt',directory/'COMPLETE',Path(run_in))},
             'frame_sha256':[sha(p) for p in frames], 'image_sha256':[sha(p) for p in images],
-            'observer_sha256':sha(directory/'observer.txt') if observer else None}
+            'observer_sha256':sha(directory/'observer.txt') if observer else None, 'scalar_frame_checks':scalar_frame_checks}
 
 
 def read_images(path,q,cell):
@@ -192,10 +225,13 @@ def main():
     result={'normalized_propagation_config':[list(x) for x in runs[0]['config']], 'build_identity':'PARTIAL_OR_UNAVAILABLE' if len(known)==0 or any(x[0] in ('UNAVAILABLE','unknown','') or x[1] in ('UNAVAILABLE','unknown','') for x in builds) else 'METADATA_MATCH_UNVERIFIED_BINARY', 'schema':'r164_short_run_verification_v1','status':'STRUCTURE_CHECKED_NO_PHYSICAL_GATE_PASS','thresholds':'NOT_FROZEN',
             'scope':'finite short-run comparisons; no event, production or conductivity acceptance',
             'runs':{name:{'directory':r['directory'],'source':r['source'],'files':r['inputs'],'frame_sha256':r['frame_sha256'],'image_sha256':r['image_sha256'],'observer_sha256':r['observer_sha256'],
-                    'observer_component_available_steps':{k:sum(x['components'][k] is not None for x in r['records']) for k in ('conv','local','mechanical','relay','projection')}}
+                    'observer_component_available_steps':{k:sum(x['components'][k] is not None for x in r['records']) for k in ('conv','local','mechanical','relay','projection')},
+                    'frame_scalar_arithmetic':r['scalar_frame_checks']}
                     for name,r in zip(('coarse_on','fine_on','fine_off'),runs)},
             'units':{'q':'angstrom','p':'eV fs/angstrom','F':'eV/angstrom','U':'eV/bead','H_per_PN':'eV','b_d2_J2':'eV angstrom/fs','N':'angstrom/fs'},
             'gpu_and_runtime':'UNVERIFIED_FROM_CAPTURE',
+            'frame_scalar_arithmetic_scope':'serialization and summation only; fixed absolute tolerance 1e-10 plus 1e-10 times absolute contribution sum; not a physical threshold',
+            'frame_scalar_order':['U','K','spring','H_per_PN','Px','Py','Pz','NOx','NOy','NOz','NHx','NHy','NHz','NNax','NNay','NNaz','NClx','NCly','NClz'],
             'observer_candidate_coverage':('COMPLETE_UNVERIFIED' if all(all(c is not None for c in row['components'].values()) for run in runs[:2] for row in run['records']) else 'INCOMPLETE_UNAVAILABLE'), 'energy_full_window':[energy(r) for r in runs],
             'coarse_fine_common_times':compare(runs[0],runs[1],[(i,2*i) for i in range(6)]),
             'observer_on_off_same_step':compare(runs[1],runs[2],[(i,i) for i in range(11)]),
