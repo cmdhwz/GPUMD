@@ -3107,7 +3107,7 @@ void NEP_Charge::compute(
 
 static __device__ __forceinline__ void find_charge_gradient_radial_pair(
   const NEP_Charge::ParaMB paramb,
-  const NEP_Charge::ANN annmb,
+  const float* c_type_pair,
   const int N,
   const int n1,
   const int n2,
@@ -3128,7 +3128,7 @@ static __device__ __forceinline__ void find_charge_gradient_radial_pair(
     for (int k = 0; k <= paramb.basis_size_radial; ++k) {
       const int c_index = get_c_index(
         t1 * paramb.num_types + t2, n, k, paramb.n_max_radial, paramb.basis_size_radial);
-      gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
+      gnp12 += fnp12[k] * c_type_pair[c_index];
     }
     const float tmp12 = g_charge_derivative[n1 + n * N] * gnp12 / d12;
     for (int d = 0; d < 3; ++d) f12[d] += tmp12 * r12[d];
@@ -3137,7 +3137,7 @@ static __device__ __forceinline__ void find_charge_gradient_radial_pair(
 
 static __device__ __forceinline__ void find_charge_gradient_angular_pair(
   const NEP_Charge::ParaMB paramb,
-  const NEP_Charge::ANN annmb,
+  const float* c_type_pair,
   const int n1,
   const int n2,
   const int* g_type,
@@ -3163,8 +3163,8 @@ static __device__ __forceinline__ void find_charge_gradient_angular_pair(
         paramb.n_max_angular,
         paramb.basis_size_angular,
         paramb.num_c_radial);
-      gn12 += fn12[k] * annmb.c_type_pair[c_index];
-      gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
+      gn12 += fn12[k] * c_type_pair[c_index];
+      gnp12 += fnp12[k] * c_type_pair[c_index];
     }
     accumulate_f12(
       paramb.L_max,
@@ -3189,7 +3189,7 @@ static __device__ __forceinline__ void find_charge_gradient_angular_pair(
 
 static __global__ void compute_reference_local_tangent(
   const NEP_Charge::ParaMB paramb,
-  const NEP_Charge::ANN annmb,
+  const float* c_type_pair,
   const NEP_Charge::ZBL zbl,
   const int N,
   const Box box,
@@ -3258,11 +3258,11 @@ static __global__ void compute_reference_local_tangent(
       float energy_gradient[3] = {0.0f, 0.0f, 0.0f};
       float charge_gradient[3] = {0.0f, 0.0f, 0.0f};
       if (angular) {
-        find_charge_gradient_angular_pair(paramb, annmb, i, j, type, r, energy_fp, angular_sum, energy_gradient);
-        find_charge_gradient_angular_pair(paramb, annmb, i, j, type, r, charge_fp, angular_sum, charge_gradient);
+        find_charge_gradient_angular_pair(paramb, c_type_pair, i, j, type, r, energy_fp, angular_sum, energy_gradient);
+        find_charge_gradient_angular_pair(paramb, c_type_pair, i, j, type, r, charge_fp, angular_sum, charge_gradient);
       } else {
-        find_charge_gradient_radial_pair(paramb, annmb, N, i, j, type, r, Fp, energy_gradient);
-        find_charge_gradient_radial_pair(paramb, annmb, N, i, j, type, r, charge_derivative, charge_gradient);
+        find_charge_gradient_radial_pair(paramb, c_type_pair, N, i, j, type, r, Fp, energy_gradient);
+        find_charge_gradient_radial_pair(paramb, c_type_pair, N, i, j, type, r, charge_derivative, charge_gradient);
       }
       if (local_current) {
         const double contraction=(energy_gradient[0]+D_projected[i]*charge_gradient[0])*direction[j] +
@@ -3499,7 +3499,7 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
       diagnostics->pppm_site_tangent.resize(size_n);
     }
     compute_reference_local_tangent<<<(N - 1) / 64 + 1, 64>>>(
-      paramb, annmb, zbl, N, box, small_box, NN_radial, NL_radial, NN_angular, NL_angular,
+      paramb, annmb.c_type_pair, zbl, N, box, small_box, NN_radial, NL_radial, NN_angular, NL_angular,
       type.data(), position.data(), direction->data(), x12_radial, y12_radial, z12_radial,
       x12_angular, y12_angular, z12_angular, nep_data.Fp.data(), nep_data.charge_derivative.data(),
       nep_data.sum_fxyz.data(), reference_charge_direction_raw_.data(), reference_short_site_derivative_.data(),
@@ -3645,7 +3645,7 @@ static __global__ void find_charge_rate_radial(
       float(g_x[n2] - g_x[n1]), float(g_y[n2] - g_y[n1]), float(g_z[n2] - g_z[n1])};
     apply_mic(box, r12[0], r12[1], r12[2]);
     float f12[3] = {0.0f, 0.0f, 0.0f};
-    find_charge_gradient_radial_pair(paramb, annmb, N, n1, n2, g_type, r12, g_charge_derivative, f12);
+    find_charge_gradient_radial_pair(paramb, annmb.c_type_pair, N, n1, n2, g_type, r12, g_charge_derivative, f12);
     if (g_charge_rate != nullptr) {
       g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
                             f12[1] * (g_vy[n2] - g_vy[n1]) +
@@ -3694,7 +3694,7 @@ static __global__ void find_charge_rate_angular(
       float(g_x[n2] - g_x[n1]), float(g_y[n2] - g_y[n1]), float(g_z[n2] - g_z[n1])};
     apply_mic(box, r12[0], r12[1], r12[2]);
     float f12[3] = {0.0f, 0.0f, 0.0f};
-    find_charge_gradient_angular_pair(paramb, annmb, n1, n2, g_type, r12, Fp, sum_fxyz, f12);
+    find_charge_gradient_angular_pair(paramb, annmb.c_type_pair, n1, n2, g_type, r12, Fp, sum_fxyz, f12);
     if (g_charge_rate != nullptr) {
       g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
                             f12[1] * (g_vy[n2] - g_vy[n1]) +
@@ -3732,7 +3732,7 @@ static __global__ void find_charge_rate_radial_small_box(
     const int n2 = g_NL[index];
     const float r12[3] = {g_x12[index], g_y12[index], g_z12[index]};
     float f12[3] = {0.0f, 0.0f, 0.0f};
-    find_charge_gradient_radial_pair(paramb, annmb, N, n1, n2, g_type, r12, g_charge_derivative, f12);
+    find_charge_gradient_radial_pair(paramb, annmb.c_type_pair, N, n1, n2, g_type, r12, g_charge_derivative, f12);
     if (g_charge_rate != nullptr) {
       g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
                             f12[1] * (g_vy[n2] - g_vy[n1]) +
@@ -3779,7 +3779,7 @@ static __global__ void find_charge_rate_angular_small_box(
     const int n2 = g_NL[index];
     const float r12[3] = {g_x12[index], g_y12[index], g_z12[index]};
     float f12[3] = {0.0f, 0.0f, 0.0f};
-    find_charge_gradient_angular_pair(paramb, annmb, n1, n2, g_type, r12, Fp, sum_fxyz, f12);
+    find_charge_gradient_angular_pair(paramb, annmb.c_type_pair, n1, n2, g_type, r12, Fp, sum_fxyz, f12);
     if (g_charge_rate != nullptr) {
       g_charge_rate[n1] += f12[0] * (g_vx[n2] - g_vx[n1]) +
                             f12[1] * (g_vy[n2] - g_vy[n1]) +
