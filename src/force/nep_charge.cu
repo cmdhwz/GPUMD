@@ -759,7 +759,9 @@ static __global__ void find_descriptor(
   float* g_charge,
   float* g_charge_derivative,
   double* g_virial,
-  float* g_sum_fxyz)
+  float* g_sum_fxyz,
+  const int trace_atom, R164_Neighbor_Edge* radial, R164_Neighbor_Edge* angular,
+  const int radial_capacity, const int angular_capacity)
 {
   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
@@ -775,7 +777,13 @@ static __global__ void find_descriptor(
       float x12 = g_x[n2] - x1;
       float y12 = g_y[n2] - y1;
       float z12 = g_z[n2] - z1;
-      apply_mic(box, x12, y12, z12);
+      int image[3];
+      apply_mic(box, x12, y12, z12, (n1==trace_atom) ? image : nullptr);
+      if (n1==trace_atom && i1<radial_capacity) {
+        R164_Neighbor_Edge& edge=radial[i1]; edge.slot=i1; edge.atom=n2;
+        edge.image[0]=image[0]; edge.image[1]=image[1]; edge.image[2]=image[2];
+        edge.dx=x12; edge.dy=y12; edge.dz=z12;
+      }
       float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
       float fc12;
       int t2 = g_type[n2];
@@ -804,7 +812,13 @@ static __global__ void find_descriptor(
         float x12 = g_x[n2] - x1;
         float y12 = g_y[n2] - y1;
         float z12 = g_z[n2] - z1;
-        apply_mic(box, x12, y12, z12);
+        int image[3];
+        apply_mic(box, x12, y12, z12, (n1==trace_atom && n==0) ? image : nullptr);
+        if (n1==trace_atom && n==0 && i1<angular_capacity) {
+          R164_Neighbor_Edge& edge=angular[i1]; edge.slot=i1; edge.atom=n2;
+          edge.image[0]=image[0]; edge.image[1]=image[1]; edge.image[2]=image[2];
+          edge.dx=x12; edge.dy=y12; edge.dz=z12;
+        }
         float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
         float fc12;
         int t2 = g_type[n2];
@@ -2404,6 +2418,9 @@ void NEP_Charge::compute_large_box(
   const int grid_size = (N2 - N1 - 1) / BLOCK_SIZE + 1;
   const bool capture_charge_diagnostics = charge_diagnostics_requested_;
 
+  const bool trace_neighbors=r164_trace_step_>=0;
+  const auto generation_before=neighbor_manager.get_generation();
+  if (trace_neighbors) { r164_radial_edges_.resize(paramb.MN_radial); r164_angular_edges_.resize(paramb.MN_angular); }
   neighbor_manager.update(
     box, 
     type, 
@@ -2469,8 +2486,11 @@ void NEP_Charge::compute_large_box(
     nep_data.charge.data(),
     nep_data.charge_derivative.data(),
     virial_per_atom.data(),
-    nep_data.sum_fxyz.data());
+    nep_data.sum_fxyz.data(),
+    trace_neighbors ? r164_trace_atom_ : -1, trace_neighbors ? r164_radial_edges_.data() : nullptr,
+    trace_neighbors ? r164_angular_edges_.data() : nullptr, paramb.MN_radial, paramb.MN_angular);
   GPU_CHECK_KERNEL
+  if (trace_neighbors) write_r164_neighbors(N, false, generation_before, neighbor_manager.get_generation());
 
   if (capture_charge_diagnostics) {
     nep_data.charge_raw.copy_from_device(nep_data.charge.data());
@@ -2696,6 +2716,8 @@ void NEP_Charge::compute_small_box(
 
   const int big_neighbor_size = 2000;
   const int size_x12 = type.size() * big_neighbor_size;
+  const bool trace_neighbors=r164_trace_step_>=0;
+  if (trace_neighbors) { r164_radial_edges_.resize(big_neighbor_size); r164_angular_edges_.resize(big_neighbor_size); }
 
   find_neighbor_list_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
@@ -2717,8 +2739,11 @@ void NEP_Charge::compute_small_box(
     small_box_data.r12.data() + size_x12 * 2,
     small_box_data.r12.data() + size_x12 * 3,
     small_box_data.r12.data() + size_x12 * 4,
-    small_box_data.r12.data() + size_x12 * 5);
+    small_box_data.r12.data() + size_x12 * 5,
+    trace_neighbors ? r164_trace_atom_ : -1, trace_neighbors ? r164_radial_edges_.data() : nullptr,
+    trace_neighbors ? r164_angular_edges_.data() : nullptr, big_neighbor_size);
   GPU_CHECK_KERNEL
+  if (trace_neighbors) write_r164_neighbors(N, true, 0, 0);
 
   long long& num_calls = neighbor_small_box_calls_;
   if (neighbor_diagnostics_enabled_ && num_calls++ % 1000 == 0) {
@@ -3043,6 +3068,36 @@ void NEP_Charge::begin_force_evaluation_()
 void NEP_Charge::invalidate_current_force_caches()
 {
   invalidate_current_force_caches_();
+}
+
+void NEP_Charge::write_r164_neighbors(int N, bool small, unsigned long long before, unsigned long long after)
+{
+  int counts[2]={};
+  const auto& nn_radial=small ? small_box_data.NN_radial : nep_data.NN_radial;
+  const auto& nn_angular=small ? small_box_data.NN_angular : nep_data.NN_angular;
+  nn_radial.copy_to_host(&counts[0],1,r164_trace_atom_);
+  nn_angular.copy_to_host(&counts[1],1,r164_trace_atom_);
+  if (counts[0]<0 || counts[1]<0 || static_cast<size_t>(counts[0])>r164_radial_edges_.size() || static_cast<size_t>(counts[1])>r164_angular_edges_.size())
+    PRINT_INPUT_ERROR("r164_rpmd neighbor trace exceeds allocated capacity.");
+  std::vector<R164_Neighbor_Edge> radial(counts[0]), angular(counts[1]);
+  if (counts[0]) r164_radial_edges_.copy_to_host(radial.data(),counts[0]);
+  if (counts[1]) r164_angular_edges_.copy_to_host(angular.data(),counts[1]);
+  rpmd_ja_file_io::ofstream out(r164_trace_prefix_+"_descriptor_neighbors.out");
+  out << std::setprecision(17) << "# schema r164_descriptor_neighbors_v1\n# step " << r164_trace_step_
+      << "\n# bead " << r164_trace_bead_ << "\n# atom " << r164_trace_atom_
+      << "\n# force_evaluation_id " << force_evaluation_id_ << "\n# N " << N
+      << "\n# path " << (small ? "small_rebuild_each_call" : "large_descriptor_mic") << "\n";
+  if (small) out << "# global_generation unavailable\n";
+  else out << "# global_generation_before " << before << "\n# global_generation_after " << after << "\n";
+  out << "# r_ij = q_force[j]-q_force[i]+h*image; displacement float angstrom\n"
+      << "# radial_count " << counts[0] << "\n# angular_count " << counts[1]
+      << "\n# columns kind slot atom image_x image_y image_z dx dy dz\n";
+  for (int kind=0;kind<2;++kind) {
+    const auto& edges=kind ? angular : radial;
+    for (const auto& e:edges) out << (kind ? "angular" : "radial") << ' ' << e.slot << ' ' << e.atom
+      << ' ' << e.image[0] << ' ' << e.image[1] << ' ' << e.image[2] << ' ' << e.dx << ' ' << e.dy << ' ' << e.dz << '\n';
+  }
+  out.close(); if (!out) PRINT_INPUT_ERROR("r164_rpmd failed closing descriptor neighbor trace.");
 }
 
 void NEP_Charge::write_r164_pre_electro_trace(int N, const GPU_Vector<double>& potential)

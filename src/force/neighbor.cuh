@@ -183,6 +183,7 @@ public:
   void initialize(const double rc, const int num_atoms, const int num_neighbors);
   void set_always_rebuild(const bool value) { always_rebuild = value; }
   void invalidate_reference_positions() { reference_positions_valid = false; }
+  unsigned long long get_generation() const { return generation_; }
   double get_skin() const;
   int get_capacity() const;
   void find_neighbor_global(
@@ -284,6 +285,7 @@ private:
   double skin = 1.0;              // skin distance
   bool always_rebuild = false;
   bool reference_positions_valid = false;
+  unsigned long long generation_ = 0;
   GPU_Vector<int> cell_count;     // for cell list
   GPU_Vector<int> cell_count_sum; // for cell list
   GPU_Vector<int> cell_contents;  // for cell list
@@ -308,6 +310,7 @@ public:
     Box& box,
     const GPU_Vector<int>& type,
     const GPU_Vector<double>& position_per_atom);
+  unsigned long long get_generation() const { return neighbor.get_generation(); }
   const GPU_Vector<int>& get_candidate_NN() const;
   const GPU_Vector<int>& get_candidate_NL() const;
   void set_candidate_capacity(const int capacity);

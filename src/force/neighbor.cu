@@ -1131,6 +1131,7 @@ void Neighbor::find_neighbor_global(
       z0.data());
     GPU_CHECK_KERNEL
     reference_positions_valid = true;
+    ++generation_;
   }
 }
 
@@ -1659,6 +1660,7 @@ void Neighbor::find_local_neighbor_from_global_batch(
 
 void Neighbor::initialize(const double rc, const int num_atoms, const int num_neighbors)
 {
+  generation_ = 0;
   reference_positions_valid = false;
   const double rc_plus_skin = rc + skin;
   const int MN = num_neighbors * rc_plus_skin * rc_plus_skin * rc_plus_skin / (rc * rc * rc);

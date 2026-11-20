@@ -1320,7 +1320,7 @@ void Force::compute_pimd_beads(
     for (int k = 0; k < position_beads.size(); ++k) {
       if (trace && k == trace->bead) {
         auto* model=dynamic_cast<NEP_Charge*>(potentials[0].get());
-        model->request_pppm_debug_for_next_force(trace->prefix.c_str(),trace->step,trace->atom);
+        model->request_pppm_debug_for_next_force(trace->prefix.c_str(),trace->step,trace->atom,trace->bead);
       }
       compute(
         box,

@@ -479,8 +479,8 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     const std::string suffix=std::to_string(step)+".txt";
     const std::string files[]={directory_+"/metadata.txt",directory_+"/source_identity.txt",directory_+"/frame_"+suffix,directory_+"/force_images_"+suffix,
       trace.prefix+"_mesh.out",trace.prefix+"_kspace.out",trace.prefix+"_atom.out",trace.prefix+"_assignment_atom.out",
-      trace.prefix+"_assignment_stencil_atom"+std::to_string(trace_atom_)+".out",trace.prefix+"_pre_electro.out"};
-    const char* names[]={"metadata","source_identity","frame","force_images","mesh","kspace","atom","assignment_atom","assignment_stencil","pre_electro"};
+      trace.prefix+"_assignment_stencil_atom"+std::to_string(trace_atom_)+".out",trace.prefix+"_pre_electro.out",trace.prefix+"_descriptor_neighbors.out"};
+    const char* names[]={"metadata","source_identity","frame","force_images","mesh","kspace","atom","assignment_atom","assignment_stencil","pre_electro","descriptor_neighbors"};
     const std::string path=directory_+"/pppm_trace_step_"+std::to_string(step)+"_receipt.txt";
     rpmd_ja_file_io::ifstream debug_atom_file(trace.prefix+"_atom.out");
     std::string line; unsigned long long evaluation_id=0; bool found=false;
@@ -493,9 +493,21 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       }
     }
     if (!debug_atom_file.eof() || !found) PRINT_INPUT_ERROR("r164_rpmd missing trace force evaluation id.");
+    rpmd_ja_file_io::ifstream neighbors(trace.prefix+"_descriptor_neighbors.out");
+    bool neighbor_id_found=false;
+    while (std::getline(neighbors,line)) {
+      const std::string key="# force_evaluation_id ";
+      if (line.compare(0,key.size(),key)==0) {
+        unsigned long long neighbor_id=0; std::istringstream value(line.substr(key.size()));
+        if (neighbor_id_found || !(value >> neighbor_id) || neighbor_id!=evaluation_id)
+          PRINT_INPUT_ERROR("r164_rpmd descriptor neighbor force id mismatch.");
+        neighbor_id_found=true;
+      }
+    }
+    if (!neighbors.eof() || !neighbor_id_found) PRINT_INPUT_ERROR("r164_rpmd missing descriptor neighbor force id.");
     rpmd_ja_file_io::ofstream receipt(path+".tmp");
-    receipt << "schema r164_pppm_trace_v1\nstep " << step << "\nbead " << trace_bead_ << "\natom " << trace_atom_ << "\nforce_evaluation_id " << evaluation_id << "\nneighbor_history unavailable\nphysical_event unavailable\n";
-    for (int i=0;i<10;++i) {
+    receipt << "schema r164_pppm_trace_v2\nstep " << step << "\nbead " << trace_bead_ << "\natom " << trace_atom_ << "\nforce_evaluation_id " << evaluation_id << "\nneighbor_history partial_target_descriptor_only\nphysical_event unavailable\n";
+    for (int i=0;i<11;++i) {
       const auto hash=rpmd_ja_sample_provenance::sha256_file(files[i]);
       if (hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing PPPM trace.");
       receipt << names[i] << "_sha256 " << hash << "\n";

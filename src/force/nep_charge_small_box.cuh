@@ -37,17 +37,27 @@ static __device__ __inline__ double atomicAdd(double* address, double val)
 #endif
 
 static __device__ void apply_mic_small_box(
-  const Box& box, const NEP_Charge::ExpandedBox& ebox, float& x12, float& y12, float& z12)
+  const Box& box, const NEP_Charge::ExpandedBox& ebox, float& x12, float& y12, float& z12, int* image = nullptr)
 {
+  if (image) image[0]=image[1]=image[2]=0;
   float sx12 = ebox.h[9] * x12 + ebox.h[10] * y12 + ebox.h[11] * z12;
   float sy12 = ebox.h[12] * x12 + ebox.h[13] * y12 + ebox.h[14] * z12;
   float sz12 = ebox.h[15] * x12 + ebox.h[16] * y12 + ebox.h[17] * z12;
-  if (box.pbc_x == 1)
-    sx12 -= nearbyint(sx12);
-  if (box.pbc_y == 1)
-    sy12 -= nearbyint(sy12);
-  if (box.pbc_z == 1)
-    sz12 -= nearbyint(sz12);
+  if (box.pbc_x == 1) {
+    const double shift=nearbyint(sx12);
+    sx12 -= shift;
+    if (image) image[0]=-static_cast<int>(shift);
+  }
+  if (box.pbc_y == 1) {
+    const double shift=nearbyint(sy12);
+    sy12 -= shift;
+    if (image) image[1]=-static_cast<int>(shift);
+  }
+  if (box.pbc_z == 1) {
+    const double shift=nearbyint(sz12);
+    sz12 -= shift;
+    if (image) image[2]=-static_cast<int>(shift);
+  }
   x12 = ebox.h[0] * sx12 + ebox.h[1] * sy12 + ebox.h[2] * sz12;
   y12 = ebox.h[3] * sx12 + ebox.h[4] * sy12 + ebox.h[5] * sz12;
   z12 = ebox.h[6] * sx12 + ebox.h[7] * sy12 + ebox.h[8] * sz12;
@@ -73,7 +83,8 @@ static __global__ void find_neighbor_list_small_box(
   float* g_z12_radial,
   float* g_x12_angular,
   float* g_y12_angular,
-  float* g_z12_angular)
+  float* g_z12_angular,
+  const int trace_atom, R164_Neighbor_Edge* radial, R164_Neighbor_Edge* angular, const int trace_capacity)
 {
   int n1 = blockIdx.x * blockDim.x + threadIdx.x + N1;
   if (n1 < N2) {
@@ -99,7 +110,8 @@ static __global__ void find_neighbor_list_small_box(
             float y12 = g_y[n2] + delta[1] - y1;
             float z12 = g_z[n2] + delta[2] - z1;
 
-            apply_mic_small_box(box, ebox, x12, y12, z12);
+            int shift[3];
+            apply_mic_small_box(box, ebox, x12, y12, z12, n1==trace_atom ? shift : nullptr);
 
             float distance_square = float(x12 * x12 + y12 * y12 + z12 * z12);
 
@@ -107,6 +119,12 @@ static __global__ void find_neighbor_list_small_box(
             float rc_angular = paramb.rc_angular;
 
             if (distance_square < rc_radial * rc_radial) {
+              if (n1==trace_atom && count_radial<trace_capacity) {
+                R164_Neighbor_Edge& edge=radial[count_radial];
+                edge.slot=count_radial; edge.atom=n2;
+                edge.image[0]=ia+ebox.num_cells[0]*shift[0]; edge.image[1]=ib+ebox.num_cells[1]*shift[1]; edge.image[2]=ic+ebox.num_cells[2]*shift[2];
+                edge.dx=x12; edge.dy=y12; edge.dz=z12;
+              }
               g_NL_radial[count_radial * N + n1] = n2;
               g_x12_radial[count_radial * N + n1] = x12;
               g_y12_radial[count_radial * N + n1] = y12;
@@ -114,6 +132,12 @@ static __global__ void find_neighbor_list_small_box(
               count_radial++;
             }
             if (distance_square < rc_angular * rc_angular) {
+              if (n1==trace_atom && count_angular<trace_capacity) {
+                R164_Neighbor_Edge& edge=angular[count_angular];
+                edge.slot=count_angular; edge.atom=n2;
+                edge.image[0]=ia+ebox.num_cells[0]*shift[0]; edge.image[1]=ib+ebox.num_cells[1]*shift[1]; edge.image[2]=ic+ebox.num_cells[2]*shift[2];
+                edge.dx=x12; edge.dy=y12; edge.dz=z12;
+              }
               g_NL_angular[count_angular * N + n1] = n2;
               g_x12_angular[count_angular * N + n1] = x12;
               g_y12_angular[count_angular * N + n1] = y12;
