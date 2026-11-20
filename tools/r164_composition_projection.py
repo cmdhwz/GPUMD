@@ -102,7 +102,7 @@ def matrix_diagnostic(raw, a, rcond, null_rtol):
     j_unprojected = direct_map @ sym[:6,:6] @ direct_map.T
     result = {'ordered':ordered.tolist(), 'symmetric':sym.tolist(), 'antisymmetric':anti.tolist(),
               'eigenvalues_YY':eig.tolist(), 'eigenvalue_scale':scale,
-              'threshold_units':'eigenvalues of mixed-unit Y block in declared coordinates; no conductivity normalization', 'threshold_scan':scan,
+              'threshold_units':'angstrom^2/fs; no conductivity normalization', 'threshold_scan':scan,
               'unprojected_6x6':sym[:6,:6].tolist(),
               'unprojected':{'b':sym[:3,:3].tolist(), 'J2':j_unprojected.tolist(),
                              'J2_minus_b':(j_unprojected-sym[:3,:3]).tolist()}}
@@ -117,19 +117,19 @@ def matrix_diagnostic(raw, a, rcond, null_rtol):
         result.update(status='UNRESOLVED', reasons=reasons, projected=None)
         return result
     supported = eig > rcond*scale
-    w = (vec[:,supported] / eig[supported]) @ vec[:,supported].T
-    projected = sym[:6,:6] - xy @ w @ xy.T
-    j_projected = direct_map @ sym[:6,:6] @ direct_map.T - (direct_map@xy) @ w @ (direct_map@xy).T
+    z = (xy @ vec[:,supported]) / np.sqrt(eig[supported])
+    projected = sym[:6,:6] - z @ z.T
+    z_j = direct_map @ z
+    j_projected = direct_map @ sym[:6,:6] @ direct_map.T - z_j @ z_j.T
     blocks = {'bb':projected[:3,:3], 'bd':projected[:3,3:], 'db':projected[3:,:3], 'dd':projected[3:,3:]}
     block_sum = sum(blocks.values(), np.zeros((3,3)))
     result.update(status='FINITE_SAMPLE_SUPPORTED_ONLY', reasons=[],
                   projected={'Lperp_6x6':projected.tolist(), 'blocks':{k:v.tolist() for k,v in blocks.items()},
-                             'b_unprojected':sym[:3,:3].tolist(), 'b_projected':blocks['bb'].tolist(),
-                             'J2_unprojected':j_unprojected.tolist(), 'J2_projected_direct':j_projected.tolist(),
+                             'b_projected':blocks['bb'].tolist(),
+                             'J2_projected_direct':j_projected.tolist(),
                              'J2_projected_block_sum':block_sum.tolist(),
                              'block_identity_max_abs':float(np.max(np.abs(block_sum-j_projected))),
                              'J2_minus_b_block_identity_max_abs':float(np.max(np.abs((j_projected-blocks['bb'])-(blocks['bd']+blocks['db']+blocks['dd'])))),
-                             'J2_minus_b_unprojected':(j_unprojected-sym[:3,:3]).tolist(),
                              'J2_minus_b_projected':(j_projected-blocks['bb']).tolist(),
                              'projection_change_in_J2_minus_b':((j_projected-blocks['bb'])-(j_unprojected-sym[:3,:3])).tolist()})
     return result
