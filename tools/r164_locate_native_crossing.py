@@ -11,6 +11,7 @@ from r164_verify_short_runs import card, keyfile, read_scalars, read_images, sha
 C=10.18051
 KB=8.617343e-5
 HBAR=6.465412e-2
+PI=3.14159265358979
 
 
 def normal_matrix(P):
@@ -18,9 +19,9 @@ def normal_matrix(P):
     for j in range(1,P+1):
         for k in range(P):
             if k==0: T[j-1,k]=np.sqrt(1/P)
-            elif k<P//2: T[j-1,k]=np.sqrt(2/P)*np.cos(2*np.pi*j*k/P)
+            elif k<P//2: T[j-1,k]=np.sqrt(2/P)*np.cos(2*PI*j*k/P)
             elif k==P//2: T[j-1,k]=np.sqrt(1/P)*((-1)**j)
-            else: T[j-1,k]=np.sqrt(2/P)*np.sin(2*np.pi*j*k/P)
+            else: T[j-1,k]=np.sqrt(2/P)*np.sin(2*PI*j*k/P)
     return T
 
 
@@ -58,7 +59,7 @@ def mode_state(Q,V,omega,t):
 def build_modes(q,p,F,mass,dt,T,temperature):
     P=q.shape[0]; velocity=(p+dt*F/2)/mass[None,:,None]
     Q=np.einsum('sk,sia->kia',T,q); V=np.einsum('sk,sia->kia',T,velocity)
-    omega=2*P*KB*temperature/(HBAR*C)*np.sin(np.arange(P)*np.pi/P); omega[0]=0
+    omega=2*P*KB*temperature/(HBAR*C)*np.sin(np.arange(P)*PI/P); omega[0]=0
     return Q,V,omega
 
 
@@ -87,14 +88,17 @@ def validate_inputs(source,run_directory,lines):
         if not re.fullmatch('[0-9a-fA-F]{64}',source.get(field,'')) or sha(path).lower()!=source[field].lower():
             raise ValueError('source input SHA mismatch: '+field)
 
-def locate_one(Q,V,omega,T,bead,atom,axis,dt,L,K,image0,image1):
+def locate_one(Q,V,omega,T,bead,atom,axis,dt,L,K,image0,image1,actual0,actual1):
     weight=T[bead]; qk=Q[:,atom,axis]; vk=V[:,atom,axis]
     def state(t):
         wt=omega*t; co=np.cos(wt); si=np.sin(wt)
         factor=np.empty_like(omega); factor[0]=t; factor[1:]=si[1:]/omega[1:]
         return float(np.dot(weight,co*qk+factor*vk)),float(np.dot(weight,-omega*si*qk+co*vk))
     q0,v0=state(0); q1,_=state(dt)
-    label0=lifted_label(q0,image0,L,K); label1=lifted_label(q1,image1,L,K)
+    if image0!=image1: raise ValueError("selected coordinate chart wrap unsupported")
+    label0=lifted_label(actual0,image0,L,K); label1=lifted_label(actual1,image1,L,K)
+    if (lifted_label(q0,image0,L,K),lifted_label(q1,image1,L,K)) != (label0,label1):
+        raise ValueError("recorded and replay endpoint centers differ")
     if abs(label1-label0)!=1: raise ValueError('endpoint centers do not differ by exactly one')
     bound=float(np.sum(np.abs(weight)*(np.abs(qk)*omega**2+np.abs(vk)*omega)))
     if abs(v0)<=bound*dt: raise ValueError('monotonicity cannot be proved on this interval')
@@ -127,15 +131,20 @@ def locate_one(Q,V,omega,T,bead,atom,axis,dt,L,K,image0,image1):
             'root_from_step_fs':root,'side_delta_fs':side,'samples':samples}
 
 
-def stdout_mesh(path,dt):
+def stdout_mesh(path,dt,final):
     text=path.read_text(encoding='utf8',errors='strict')
     matches=re.findall(r'PPPM mesh:\s*(\d+)\s*x\s*(\d+)\s*x\s*(\d+)\s*\(target spacing\s+([0-9.eE+-]+)\s+A;',text)
     parsed={(int(a),int(b),int(c),float(spacing)) for a,b,c,spacing in matches}
     if len(parsed)!=1: raise ValueError('missing or inconsistent stdout PPPM mesh')
     a,b,c,spacing=next(iter(parsed))
-    if spacing!=0.5 or 'Number of atoms is 5896.' not in text or 'number of beads is 32.' not in text or f'Time step for this run is {dt:g} fs.' not in text or 'Finished running GPUMD.' not in text:
+    if (a,b,c,spacing)!=(60,60,60,0.5) or f'Run {final} steps.' not in text or 'Number of atoms is 5896.' not in text or 'number of beads is 32.' not in text or f'Time step for this run is {dt:g} fs.' not in text or 'Finished running GPUMD.' not in text:
         raise ValueError('stdout does not match required run facts')
     return [int(a),int(b),int(c)]
+
+
+def validate_capture_path(lines,run_directory,directory):
+    if (run_directory/by_filename(lines,'r164_rpmd')).resolve()!=directory.resolve():
+        raise ValueError('run card capture path mismatch')
 
 
 def main():
@@ -155,7 +164,8 @@ def main():
     observer=any(x[0]=='r164_rpmd' and len(x)==4 and x[3]=='observer' for x in lines)
     card(runin,source,dt,final,observer); records=read_scalars(directory/'scalar.txt',dt,final)
     check_observer_mode(directory,records,observer)
-    mesh=stdout_mesh(stdout,dt)
+    validate_capture_path(lines,runin.parent,directory)
+    mesh=stdout_mesh(stdout,dt,final)
     if any(x<=0 for x in mesh): raise ValueError('invalid mesh dimensions')
     validate_inputs(source,runin.parent,lines)
     atom_rows=[line.split()[1:] for line in (directory/'metadata.txt').read_text(encoding='utf8').splitlines() if line.startswith('atom ')]
@@ -171,12 +181,13 @@ def main():
         if np.any(np.abs(q-q[0:1])>=cell[None,None,:]/2-1e-9): raise ValueError('ambiguous first-bead lift branch')
     T=normal_matrix(P); Q,V,omega,qhat,phat=reconstruct(q0,p0,F0,F1,mass,dt,T,temperature)
     qerr,perr=validate_endpoint(qhat,phat,q1,p1)
-    d='xyz'.index(a.axis); info=locate_one(Q,V,omega,T,a.bead,a.atom,d,dt,cell[d],mesh[d],int(img0[a.bead,a.atom,d]),int(img1[a.bead,a.atom,d]))
+    d='xyz'.index(a.axis); info=locate_one(Q,V,omega,T,a.bead,a.atom,d,dt,cell[d],mesh[d],int(img0[a.bead,a.atom,d]),int(img1[a.bead,a.atom,d]),float(q0[a.bead,a.atom,d]),float(q1[a.bead,a.atom,d]))
     info.update(schema='r164_native_assignment_crossing_v1',scope='recorded trajectory numerical assignment-center crossing; no P11 physical event, impulse, energy transfer, heat current or winding',
         stdout_binding='same run directory and matching printed facts; stdout not cryptographically bound to capture',step=a.step,bead=a.bead,atom=a.atom,axis=a.axis,mesh=mesh,dt_fs=dt,
         full_q_endpoint_max_A=qerr,full_p_endpoint_max_eV_fs_per_A=perr,endpoint_tolerance=1e-8,
         absolute_root_time_fs=a.step*dt+info['root_from_step_fs'],
         monotonicity_scope='selected coordinate only; other coordinates not certified',
+        root_bracket_scope='floating-point bisection of reconstructed drift only; not an error bound on actual device substep time',
         momentum_scope='post-first-kick free-ring substep momentum; no impulse inserted',
         input_sha256={str(p):sha(p) for p in [runin,stdout,directory/'metadata.txt',directory/'source_identity.txt',directory/'COMPLETE',directory/'scalar.txt',*files,*images,runin.parent/by_filename(lines,'potential'),runin.parent/'model.xyz',runin.parent/by_filename(lines,'read_pimd_restart')]})
     arrays={}
