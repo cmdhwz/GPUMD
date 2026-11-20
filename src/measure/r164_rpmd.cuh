@@ -33,6 +33,10 @@ private:
   Box box_for_observer_;
   GPU_Vector<double> observer_q_, observer_u_, observer_f_, observer_virial_, observer_v_, observer_site_rate_, observer_gradient_, observer_local_, observer_local_image_;
   std::vector<double> q_, offset_;
+  std::vector<int> species_;
+  double number_increment_[4][3] = {};
+  int next_output_step_ = 0;
+  bool drift_pending_ = false;
   std::vector<long long> force_images_, previous_force_images_;
   void read_positions(Atom&, std::vector<double>&);
   void check_branch(const std::vector<double>&) const;

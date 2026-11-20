@@ -86,9 +86,14 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   if (checkpoint_stride_) scalar_prefix_digest_=rpmd_ja_sha256::Digest();
   if (n_ <= 0 || p_ < 2) PRINT_INPUT_ERROR("r164_rpmd requires loaded bead arrays.");
   for (int d=0; d<3; ++d) { lengths_[d]=box.cpu_h[d*4]; if (!std::isfinite(lengths_[d]) || !(lengths_[d]>0)) PRINT_INPUT_ERROR("r164_rpmd invalid box."); }
-  for (const auto& species : atom.cpu_atom_symbol)
-    if (species != "O" && species != "H" && species != "Na" && species != "Cl")
+  species_.resize(n_);
+  for (int i=0; i<n_; ++i) {
+    const auto& symbol=atom.cpu_atom_symbol[i];
+    if (symbol != "O" && symbol != "H" && symbol != "Na" && symbol != "Cl")
       PRINT_INPUT_ERROR("r164_rpmd supports only O, H, Na and Cl.");
+    species_[i]=symbol=="O"?0:symbol=="H"?1:symbol=="Na"?2:3;
+  }
+  next_output_step_=0; drift_pending_=false;
   read_positions(atom, q_); check_branch(q_);
 #ifdef _WIN32
   int created = _wmkdir(rpmd_ja_file_io::utf8_to_wide_path(directory_).c_str());
@@ -103,6 +108,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
        << "checkpoint " << (checkpoint_stride_ ? "FRESH_REBUILD_ONLY" : "BLOCKED") << "\n"
        << "P " << p_ << "\nN " << n_ << "\ntemperature_K " << temperature_ << "\ndt_fs " << dt*TIME_UNIT_CONVERSION << "\n"
        << "time_convention step_times_fixed_dt_start_zero\n"
+       << "number_increment lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
   if (checkpoint_stride_) meta << "checkpoint_stride " << checkpoint_stride_ << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
@@ -182,8 +188,20 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
 }
 void R164_RPMD::capture_drift(Atom& atom) {
   std::vector<double> current; read_positions(atom,current);
-  for (int s=0; s<p_; ++s) for (int j=0; j<n_*3; ++j) q_[s*n_*3+j]=current[s*n_*3+j]+offset_[j];
+  if (next_output_step_<=0 || drift_pending_) PRINT_INPUT_ERROR("r164_rpmd invalid drift capture sequence.");
+  for (auto& species : number_increment_) for (double& value : species) value=0;
+  for (int s=0; s<p_; ++s) for (int d=0; d<3; ++d) for (int i=0; i<n_; ++i) {
+    const int j=s*n_*3+d*n_+i;
+    const double next=current[j]+offset_[d*n_+i];
+    const double delta=next-q_[j];
+    if (!std::isfinite(next) || !std::isfinite(delta)) PRINT_INPUT_ERROR("r164_rpmd non-finite drift increment.");
+    number_increment_[species_[i]][d]+=delta/p_;
+    q_[j]=next;
+  }
+  for (const auto& species : number_increment_) for (double value : species)
+    if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite number increment.");
   check_branch(q_);
+  drift_pending_=true;
 }
 void R164_RPMD::check_force_positions(Atom& atom) {
   std::vector<double> current; read_positions(atom,current);
@@ -199,6 +217,8 @@ void R164_RPMD::check_force_positions(Atom& atom) {
   }
 }
 void R164_RPMD::output(int step, int total, Atom& atom) {
+  if (step!=next_output_step_ || (step==0 ? drift_pending_ : !drift_pending_))
+    PRINT_INPUT_ERROR("r164_rpmd invalid completed-step output sequence.");
   const double time_fs=step*dt_*TIME_UNIT_CONVERSION;
   std::vector<double> v(p_*n_*3), f(p_*n_*3), u(p_*n_), current;
   for (int s=0; s<p_; ++s) {
@@ -357,7 +377,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   const double omega=p_*K_B*temperature_/HBAR;
   for (int s=0; s<p_; ++s) for (int i=0; i<n_; ++i) {
     const double mass=atom.cpu_mass[i]; potential+=u[s*n_+i];
-    int sp=atom.cpu_atom_symbol[i]=="O"?0:atom.cpu_atom_symbol[i]=="H"?1:atom.cpu_atom_symbol[i]=="Na"?2:3;
+    int sp=species_[i];
     for (int d=0; d<3; ++d) {
       int j=s*n_*3+d*n_+i, next=((s+1)%p_)*n_*3+d*n_+i;
       double velocity=v[j], delta=q_[next]-q_[j];
@@ -400,7 +420,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
 
   const std::string scalar_path=directory_+"/scalar.txt";
   rpmd_ja_file_io::ofstream scalar_file(scalar_path, std::ios::app);
-  if (step == 0) scalar_file << "# step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz observer_status [conv_xyz local_status local_xyz local_image_status local_image_xyz mechanical_image_status mechanical_image_xyz relay_image_status relay_image_xyz projection_image_status projection_image_xyz mechanical_status mechanical_xyz relay_status relay_xyz projection_status projection_xyz tangent_status site_rate_sum gradient_power native_power max_force_residual] b_status b_xyz J2_status J2_xyz R27_status [Q0 Q1 Pi0 Pi1 d2x d2y d2z]\n";
+  if (step == 0) scalar_file << "# step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz observer_status [conv_xyz local_status local_xyz local_image_status local_image_xyz mechanical_image_status mechanical_image_xyz relay_image_status relay_image_xyz projection_image_status projection_image_xyz mechanical_status mechanical_xyz relay_status relay_xyz projection_status projection_xyz tangent_status site_rate_sum gradient_power native_power max_force_residual] b_status b_xyz J2_status J2_xyz R27_status [Q0 Q1 Pi0 Pi1 d2x d2y d2z] number_increment_status [O_H_Na_Cl_xyz_angstrom]\n";
   std::ostringstream scalar;
   scalar << std::setprecision(17) << step << ' ' << time_fs << ' ' << potential << ' ' << kinetic << ' ' << spring << ' ' << (potential+kinetic+spring)/(p_*n_);
   for (double x:momentum) scalar << ' ' << x;
@@ -449,10 +469,16 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   } else scalar << " B_UNAVAILABLE J2_UNAVAILABLE";
   if (r27_candidate) scalar << " R27_UNVERIFIED " << Q[0] << ' ' << Q[1] << ' ' << Pi[0] << ' ' << Pi[1] << ' ' << d2[0] << ' ' << d2[1] << ' ' << d2[2];
   else scalar << " R27_NOT_APPLICABLE";
+  if (step==0) scalar << " NUMBER_INCREMENT_INITIAL_BOUNDARY";
+  else {
+    scalar << " NUMBER_INCREMENT_LIFT_A";
+    for (const auto& species : number_increment_) for (double value : species) scalar << ' ' << value;
+  }
   scalar << '\n';
   const std::string scalar_line=scalar.str();
   scalar_file << scalar_line;
   scalar_file.close(); if (!scalar_file) PRINT_INPUT_ERROR("r164_rpmd failed closing scalar output.");
+  drift_pending_=false; ++next_output_step_;
   if (checkpoint_stride_) scalar_prefix_digest_.update(reinterpret_cast<const unsigned char*>(scalar_line.data()),scalar_line.size());
   if (checkpoint) {
     const std::string suffix=std::to_string(step)+".txt";
