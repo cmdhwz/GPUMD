@@ -2827,7 +2827,9 @@ static void generate_rpmd_ja_qnep_raw_reference(
       const int na = std::min(transpose_tile, n - a0);
       for (int i = 0; i < nr; ++i) {
         raw_in.clear();
-        raw_in.seekg(data_start + static_cast<std::streamoff>(r0 + i) * n * sizeof(double) + static_cast<std::streamoff>(a0) * sizeof(double));
+        const std::streamoff byte_offset =
+          (static_cast<std::streamoff>(r0 + i) * n + a0) * static_cast<std::streamoff>(sizeof(double));
+        raw_in.seekg(data_start + byte_offset);
         raw_in.read(reinterpret_cast<char*>(vtile.data() + static_cast<std::size_t>(i) * na), static_cast<std::streamsize>(na * sizeof(double)));
         if (!raw_in) throw std::runtime_error("truncated qNEP v4 fine V while building transport statistics");
       }
