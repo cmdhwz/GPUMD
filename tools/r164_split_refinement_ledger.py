@@ -136,7 +136,7 @@ def modes(state,T,mass):
     return np.stack((np.einsum('sk,sia->kia',T,q*root),np.einsum('sk,sia->kia',T,p/root))),np.einsum('sk,sia->kia',T,F/root)
 
 
-def execution_evidence(path, coarse, fine, binary_override):
+def execution_evidence(path, coarse, fine, binary_override, verified_inputs):
     if path is None:
         if binary_override is not None: raise ValueError('binary verification requires execution sidecar')
         return {'status':'UNAVAILABLE_NOT_BOUND_TO_BINARY'}
@@ -144,10 +144,17 @@ def execution_evidence(path, coarse, fine, binary_override):
     if coarse.parent.parent!=fine.parent.parent or path.parent!=coarse.parent.parent:
         raise ValueError('execution sidecar and runs must share campaign directory')
     evidence=json.loads(path.read_text(encoding='utf8'))
-    names={x.get('case') for x in evidence.get('cases',[]) if x.get('returncode')==0 and x.get('marker_written') is True}
+    cases=evidence.get('cases',[])
     digest=evidence.get('sha256','')
-    if coarse.parent.name not in names or fine.parent.name not in names or not re.fullmatch('[0-9a-fA-F]{64}',digest):
-        raise ValueError('execution sidecar does not name both completed runs and a binary SHA')
+    if not re.fullmatch('[0-9a-fA-F]{64}',digest):
+        raise ValueError('execution sidecar missing binary SHA')
+    for capture,verified in zip((coarse,fine),verified_inputs):
+        matching=[x for x in cases if x.get('case')==capture.parent.name]
+        if len(matching)!=1 or matching[0].get('returncode')!=0 or matching[0].get('marker_written') is not True:
+            raise ValueError('execution sidecar does not uniquely name completed runs')
+        for field in ('run_in_sha256','stdout_sha256'):
+            if field in matching[0] and matching[0][field]!=verified[field]:
+                raise ValueError('execution sidecar input SHA mismatch: '+field)
     declared=Path(evidence['binary'])
     binary=Path(binary_override).resolve() if binary_override is not None else declared
     if binary_override is not None and not binary.is_file(): raise ValueError('binary verification path missing')
@@ -158,9 +165,28 @@ def execution_evidence(path, coarse, fine, binary_override):
             'binary_sha256_declared':digest.lower(),'binary_sha256_current':actual}
 
 
+def short_card_pair(coarse_runin, fine_runin):
+    def values(path):
+        lines=[line.split('#',1)[0].split() for line in Path(path).read_text(encoding='utf8').splitlines()]
+        dt=[x for x in lines if x and x[0]=='time_step']
+        steps=[x for x in lines if x and x[0]=='run']
+        if len(dt)!=1 or len(steps)!=1 or len(dt[0])!=2 or len(steps[0])!=2:
+            raise ValueError('requires unique time_step and run commands')
+        try:
+            return float(dt[0][1]),int(steps[0][1])
+        except ValueError as error:
+            raise ValueError('invalid short-card time_step or run') from error
+    pair=(values(coarse_runin),values(fine_runin))
+    if pair not in (((0.2,5),(0.1,10)),((0.1,10),(0.05,20))):
+        raise ValueError('unsupported frozen short-card pair')
+    return pair
+
+
 def ledger(coarse, coarse_runin, fine, fine_runin, execution=None, binary=None):
     coarse=Path(coarse).resolve(); fine=Path(fine).resolve()
-    c=load_verified(coarse,coarse_runin,0.2,5); f=load_verified(fine,fine_runin,0.1,10)
+    (coarse_dt,coarse_steps),(fine_dt,fine_steps)=short_card_pair(coarse_runin,fine_runin)
+    c=load_verified(coarse,coarse_runin,coarse_dt,coarse_steps)
+    f=load_verified(fine,fine_runin,fine_dt,fine_steps)
     for key in ('bead_force_backend','model_sha256','model_xyz_sha256','restart_input_sha256','build_git_commit','build_git_dirty'):
         if c['source'].get(key)!=f['source'].get(key): raise ValueError('source identity differs: '+key)
     if (c['config']!=f['config'] or not np.array_equal(c['species'],f['species'])
@@ -177,7 +203,8 @@ def ledger(coarse, coarse_runin, fine, fine_runin, execution=None, binary=None):
     initial=cz-fz
     cumulative={name:np.zeros_like(initial) for name in ('endpoint_force_difference','curvature','coupling','slope','closure')}
     propagated_initial=initial.copy(); steps=[]; coarse_records=[cr]; fine_records=[fr]
-    for i in range(5):
+    common_times=[{'coarse_step':0,'fine_step':0,'time_fs':0.0,**physical_summary(initial,T,c['mass'])}]
+    for i in range(coarse_steps):
         cm,cmrec=load_frame(c,i+1); fm,fmrec=load_frame(f,2*i+1); fe,ferec=load_frame(f,2*i+2)
         c1,cf1=modes(cm,T,c['mass']); fmid,ffmid=modes(fm,T,c['mass']); f1,ff1=modes(fe,T,c['mass'])
         actual=c1-f1
@@ -205,13 +232,18 @@ def ledger(coarse, coarse_runin, fine, fine_runin, execution=None, binary=None):
                       'cumulative_reconstruction_residual':summary(actual-assembled),
                       'cumulative_terms':{name:summary(value) for name,value in cumulative.items()}})
         cz,cf,fz,ff=c1,cf1,f1,ff1
+        common_times.append({'coarse_step':i+1,'fine_step':2*(i+1),'time_fs':(i+1)*h,**physical_summary(actual,T,c['mass'])})
         coarse_records.append(cmrec); fine_records.extend((fmrec,ferec))
     return {'schema':'r164_split_refinement_ledger_v1',
             'scope':'observed finite paired trajectories only; no exact-solution bound, event attribution or P11 acceptance',
             'endpoint_force_difference_scope':'endpoint force differences include trajectory response and native force variation; not independently separated',
             'units':{'Q':'sqrt(eV) fs','P':'sqrt(eV)','time':'fs','mode_force':'sqrt(eV)/fs'},
+            'step_pair':{'coarse':{'dt_fs':coarse_dt,'steps':coarse_steps},
+                         'fine':{'dt_fs':fine_dt,'steps':fine_steps}},
+            'common_time_physical_difference':common_times,
             'source_identity':c['source'],'normalized_config':[list(x) for x in c['config']],
-            'binary_evidence':execution_evidence(execution,coarse,fine,binary),
+            'binary_evidence':execution_evidence(execution,coarse,fine,binary,
+                [{'run_in_sha256':r['source']['run_in_sha256'],'stdout_sha256':r['stdout_sha256']} for r in (c,f)]),
             'capture_source':{'coarse':c['inputs'],'fine':f['inputs']},
             'observer_sha256':{'coarse':c['observer_sha256'],'fine':f['observer_sha256']},
             'stdout_sha256':{'coarse':c['stdout_sha256'],'fine':f['stdout_sha256']},
@@ -219,7 +251,7 @@ def ledger(coarse, coarse_runin, fine, fine_runin, execution=None, binary=None):
             'frame_identity':{'coarse':coarse_records,'fine':fine_records},
             'initial_q_lift_max_A':initial_q,'initial_p_max_eV_fs_per_A':initial_p,
             'initial_mass_weighted_difference':summary(initial),'steps':steps,
-            'final_physical_difference':physical_summary(actual,T,c['mass']),
+            'final_physical_difference':{key:value for key,value in common_times[-1].items() if key not in ('coarse_step','fine_step','time_fs')},
             'cumulative_physical_terms':{name:physical_summary(value,T,c['mass']) for name,value in cumulative.items()},
             'single_step_arithmetic_tolerance':'1e-8 angstrom and 1e-8 eV fs/angstrom; not a physical threshold',
             'cumulative_initial':summary(propagated_initial),

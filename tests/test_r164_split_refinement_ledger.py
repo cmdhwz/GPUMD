@@ -1,5 +1,6 @@
 import sys
 import unittest
+import json
 import tempfile
 from unittest.mock import patch
 from pathlib import Path
@@ -13,6 +14,37 @@ class SplitLedgerTests(unittest.TestCase):
     def setUp(self):
         self.omega=np.array([0.,2.]); self.h=.2
         self.ones=np.ones((2,1,1)); self.zeros=np.zeros_like(self.ones)
+    def test_frozen_short_card_pairs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c=Path(temp)/'coarse.in'; f=Path(temp)/'fine.in'
+            def card(path,dt,n): path.write_text(f'time_step {dt}\nrun {n}\n',encoding='utf8')
+            card(c,.2,5); card(f,.1,10)
+            self.assertEqual(ledger.short_card_pair(c,f),((.2,5),(.1,10)))
+            card(c,.1,10); card(f,.05,20)
+            self.assertEqual(ledger.short_card_pair(c,f),((.1,10),(.05,20)))
+            card(f,.025,40)
+            with self.assertRaisesRegex(ValueError,'unsupported frozen'): ledger.short_card_pair(c,f)
+            card(f,.05,20); f.write_text(f.read_text()+'run 20\n')
+            with self.assertRaisesRegex(ValueError,'unique'): ledger.short_card_pair(c,f)
+
+    def test_execution_case_hashes_optional_but_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); cases=[]
+            for name in ('coarse','fine'):
+                folder=root/name; folder.mkdir(); (folder/'r164_output').mkdir()
+                (folder/'run.in').write_text(name); (folder/'stdout.log').write_text('log'+name)
+                cases.append({'case':name,'returncode':0,'marker_written':True})
+            path=root/'execution.json'
+            def write(): path.write_text(json.dumps({'binary':'missing','sha256':'a'*64,'cases':cases}))
+            verified=[{'run_in_sha256':ledger.sha(root/name/'run.in'),'stdout_sha256':ledger.sha(root/name/'stdout.log')} for name in ('coarse','fine')]
+            write(); args=(path,root/'coarse/r164_output',root/'fine/r164_output',None,verified)
+            self.assertEqual(ledger.execution_evidence(*args)['status'],'SIDECAR_NOT_FRAME_RECEIPT')
+            cases[1]['run_in_sha256']=ledger.sha(root/'fine/run.in')
+            cases[1]['stdout_sha256']=ledger.sha(root/'fine/stdout.log'); write()
+            ledger.execution_evidence(*args)
+            cases[1]['stdout_sha256']='0'*64; write()
+            with self.assertRaisesRegex(ValueError,'input SHA mismatch'): ledger.execution_evidence(*args)
+
     def test_three_sources_and_zero_mode(self):
         curvature,coupling,slope,direct=source_terms(self.zeros,self.ones,self.zeros,self.omega,self.h)
         np.testing.assert_allclose(coupling,0,atol=1e-15); np.testing.assert_allclose(slope,0,atol=1e-15)
