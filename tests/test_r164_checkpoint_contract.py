@@ -1,0 +1,35 @@
+"""Source-level contracts pending native GPU checkpoint execution."""
+import hashlib
+from pathlib import Path
+import unittest
+
+SOURCE = (Path(__file__).resolve().parents[1] / "src/measure/r164_rpmd.cu").read_text(encoding="utf8")
+
+class CheckpointContract(unittest.TestCase):
+    def test_parser_accepts_only_ordered_positive_checkpoint(self):
+        parse = SOURCE.split("void R164_RPMD::parse(", 1)[1].split("void R164_RPMD::read_positions", 1)[0]
+        self.assertLess(parse.index('t[next]=="observer"'), parse.index('t[next]!="checkpoint"'))
+        for guard in ('next+2!=t.size()', '!is_valid_int(t[next+1], &checkpoint_stride_)', 'checkpoint_stride_<=0'):
+            self.assertIn(guard, parse)
+
+    def test_commit_order_and_opt_in_cadence(self):
+        output = SOURCE.split('void R164_RPMD::output(', 1)[1]
+        for text in ('checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0)',
+                     '(stride_ && step%stride_==0) || checkpoint'):
+            self.assertIn(text, output)
+        points = [output.index(x) for x in ('atomic_commit_new_file(frame_path', 'atomic_commit_new_file(image_path',
+                  'crossings.close()', 'scalar_file.close()', 'sha256_text(scalar_line)',
+                  'PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.")', 'atomic_commit_new_file(marker+".tmp", marker)')]
+        self.assertEqual(points, sorted(points))
+        self.assertIn('if (checkpoint) {', output)
+
+    def test_canonical_line_hash_and_required_fields(self):
+        lf = b'12 1.2 3.4\n'
+        self.assertEqual(hashlib.sha256(lf).digest(), hashlib.sha256(b'12 1.2 3.4\r\n'.rstrip(b'\r\n') + b'\n').digest())
+        for field in ('metadata_sha256', 'source_identity_sha256', 'frame_sha256', 'force_images_sha256',
+                      'scalar_line_sha256', 'cache_policy fresh_rebuild_only', 'physical_event_history unavailable'):
+            self.assertIn(field, SOURCE)
+        self.assertIn('metadata_hash.size()!=64', SOURCE)
+        self.assertIn('scalar_hash.size()!=64', SOURCE)
+
+if __name__ == '__main__': unittest.main()

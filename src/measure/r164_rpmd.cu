@@ -26,10 +26,18 @@
 #endif
 
 void R164_RPMD::parse(const std::vector<std::string>& t) {
-  if (enabled_ || (t.size() != 3 && t.size() != 4) || !is_valid_int(t[2], &stride_) || stride_ < 0 || t[1].empty())
+  if (enabled_ || t.size() < 3 || !is_valid_int(t[2], &stride_) || stride_ < 0 || t[1].empty())
     PRINT_INPUT_ERROR("r164_rpmd requires a fresh output directory and nonnegative debug stride.");
-  if (t.size() == 4 && t[3] != "observer") PRINT_INPUT_ERROR("r164_rpmd fourth argument must be observer.");
-  observer_requested_ = t.size() == 4;
+  size_t next=3;
+  observer_requested_ = next<t.size() && t[next]=="observer";
+  if (observer_requested_) ++next;
+  checkpoint_stride_=0;
+  if (next<t.size()) {
+    if (t[next]!="checkpoint" || next+2!=t.size() || !is_valid_int(t[next+1], &checkpoint_stride_) || checkpoint_stride_<=0)
+      PRINT_INPUT_ERROR("r164_rpmd expects optional observer followed by checkpoint and a positive stride.");
+    next+=2;
+  }
+  if (next!=t.size()) PRINT_INPUT_ERROR("r164_rpmd invalid options.");
   directory_ = t[1]; enabled_ = true;
 }
 void R164_RPMD::read_positions(Atom& atom, std::vector<double>& q) {
@@ -64,7 +72,8 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   rpmd_ja_file_io::ofstream meta(directory_+"/metadata.txt.tmp");
   meta << std::setprecision(17) << "schema r164_diagnostic_v1\nstorage binary64_text_17_digits; force_backend_precision not_certified\n"
        << "layout q_p_F: bead,atom,xyz; U: bead\nreference_id R27_fixed_2OH_R157\nreference_source_sha256 1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa\nreference_atom_identity_and_environment UNVERIFIED\nunits q=angstrom p=eV_fs_per_angstrom F=eV_per_angstrom U=eV time=fs\n"
-       << "flow_b UNVERIFIED_OR_UNAVAILABLE\nd2 R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT\nJ2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\ncheckpoint BLOCKED\n"
+       << "flow_b UNVERIFIED_OR_UNAVAILABLE\nd2 R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT\nJ2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\n"
+       << "checkpoint " << (checkpoint_stride_ ? "FRESH_REBUILD_ONLY" : "BLOCKED") << "\n"
        << "P " << p_ << "\nN " << n_ << "\ntemperature_K " << temperature_ << "\ndt_fs " << dt*TIME_UNIT_CONVERSION << "\n"
        << "time_convention step_times_fixed_dt_start_zero\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
@@ -331,7 +340,8 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       flows[sp][d]+=velocity/TIME_UNIT_CONVERSION/p_;
     }
   }
-  if (step==0 || step==total || (stride_ && step%stride_==0)) {
+  const bool checkpoint = checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0);
+  if (step==0 || step==total || (stride_ && step%stride_==0) || checkpoint) {
     const std::string frame_path=directory_+"/frame_"+std::to_string(step)+".txt";
     rpmd_ja_file_io::ofstream frame(frame_path+".tmp"); frame << std::setprecision(17);
     for (int s=0; s<p_; ++s) { double energy=0; for (int i=0;i<n_;++i) energy+=u[s*n_+i]; frame << "bead " << s << ' ' << energy << '\n';
@@ -359,8 +369,9 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   previous_force_images_=force_images_;
 
   const std::string scalar_path=directory_+"/scalar.txt";
-  rpmd_ja_file_io::ofstream scalar(scalar_path, std::ios::app);
-  if (step == 0) scalar << "# step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz observer_status [conv_xyz local_status local_xyz local_image_status local_image_xyz mechanical_image_status mechanical_image_xyz relay_image_status relay_image_xyz projection_image_status projection_image_xyz mechanical_status mechanical_xyz relay_status relay_xyz projection_status projection_xyz tangent_status site_rate_sum gradient_power native_power max_force_residual] b_status b_xyz J2_status J2_xyz R27_status [Q0 Q1 Pi0 Pi1 d2x d2y d2z]\n";
+  rpmd_ja_file_io::ofstream scalar_file(scalar_path, std::ios::app);
+  if (step == 0) scalar_file << "# step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz observer_status [conv_xyz local_status local_xyz local_image_status local_image_xyz mechanical_image_status mechanical_image_xyz relay_image_status relay_image_xyz projection_image_status projection_image_xyz mechanical_status mechanical_xyz relay_status relay_xyz projection_status projection_xyz tangent_status site_rate_sum gradient_power native_power max_force_residual] b_status b_xyz J2_status J2_xyz R27_status [Q0 Q1 Pi0 Pi1 d2x d2y d2z]\n";
+  std::ostringstream scalar;
   scalar << std::setprecision(17) << step << ' ' << time_fs << ' ' << potential << ' ' << kinetic << ' ' << spring << ' ' << (potential+kinetic+spring)/(p_*n_);
   for (double x:momentum) scalar << ' ' << x;
   for (auto& species:flows) for (double x:species) scalar << ' ' << x;
@@ -408,7 +419,29 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   } else scalar << " B_UNAVAILABLE J2_UNAVAILABLE";
   if (r27_candidate) scalar << " R27_UNVERIFIED " << Q[0] << ' ' << Q[1] << ' ' << Pi[0] << ' ' << Pi[1] << ' ' << d2[0] << ' ' << d2[1] << ' ' << d2[2];
   else scalar << " R27_NOT_APPLICABLE";
-  scalar << '\n'; scalar.close(); if (!scalar) PRINT_INPUT_ERROR("r164_rpmd failed closing scalar output.");
+  scalar << '\n';
+  const std::string scalar_line=scalar.str();
+  scalar_file << scalar_line;
+  scalar_file.close(); if (!scalar_file) PRINT_INPUT_ERROR("r164_rpmd failed closing scalar output.");
+  if (checkpoint) {
+    const std::string suffix=std::to_string(step)+".txt";
+    const std::string metadata_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/metadata.txt");
+    const std::string identity_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/source_identity.txt");
+    const std::string frame_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/frame_"+suffix);
+    const std::string image_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/force_images_"+suffix);
+    const std::string scalar_hash=rpmd_ja_sample_provenance::sha256_text(scalar_line);
+    if (metadata_hash.size()!=64 || identity_hash.size()!=64 || frame_hash.size()!=64 || image_hash.size()!=64 || scalar_hash.size()!=64)
+      PRINT_INPUT_ERROR("r164_rpmd failed hashing checkpoint inputs.");
+    const std::string path=directory_+"/checkpoint_"+suffix;
+    rpmd_ja_file_io::ofstream receipt(path+".tmp");
+    receipt << std::setprecision(17) << "schema r164_checkpoint_v1\nstep " << step << "\ntime_fs " << time_fs
+            << "\nmetadata_sha256 " << metadata_hash << "\nsource_identity_sha256 " << identity_hash
+            << "\nframe_sha256 " << frame_hash << "\nforce_images_sha256 " << image_hash
+            << "\nscalar_line_sha256 " << scalar_hash << "\ncache_policy fresh_rebuild_only\nphysical_event_history unavailable\n";
+    receipt.close();
+    if (!receipt || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
+      PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.");
+  }
   if (step == total) {
     const std::string marker=directory_+"/COMPLETE";
     rpmd_ja_file_io::ofstream done(marker+".tmp");
