@@ -505,7 +505,8 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       }
     }
     if (!neighbors.eof() || !neighbor_id_found) PRINT_INPUT_ERROR("r164_rpmd missing descriptor neighbor force id.");
-    rpmd_ja_file_io::ifstream derivatives(trace.prefix+(trace_atom_==-2?"_all_meta.out":"_local_edge_derivatives.out"));
+    if (trace_atom_!=-2) {
+    rpmd_ja_file_io::ifstream derivatives(trace.prefix+"_local_edge_derivatives.out");
     bool derivative_id_found=false;
     while (std::getline(derivatives,line)) {
       const std::string key="# force_evaluation_id ";
@@ -517,12 +518,14 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       }
     }
     if (!derivatives.eof() || !derivative_id_found) PRINT_INPUT_ERROR("r164_rpmd missing derivative force id.");
+    }
     rpmd_ja_file_io::ofstream receipt(path+".tmp");
-    receipt << (trace_atom_==-2?"schema r164_pppm_trace_all_v1\nstep ":"schema r164_pppm_trace_v3\nstep ") << step << "\nbead " << trace_bead_ << "\natom " << (trace_atom_==-2?"all":std::to_string(trace_atom_)) << "\nforce_evaluation_id " << evaluation_id << "\nneighbor_history partial_target_descriptor_only\nphysical_event unavailable\n";
+    receipt << (trace_atom_==-2?"schema r164_pppm_trace_all_v1\nstep ":"schema r164_pppm_trace_v3\nstep ") << step << "\nbead " << trace_bead_ << "\natom " << (trace_atom_==-2?"all":std::to_string(trace_atom_)) << "\nforce_evaluation_id " << evaluation_id << "\nneighbor_history " << (trace_atom_==-2?"all_centers_selected_bead_endpoint":"partial_target_descriptor_only") << "\nphysical_event unavailable\n";
     for (int i=0;i<12;++i) {
       const auto hash=rpmd_ja_sample_provenance::sha256_file(files[i]);
       if (hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing PPPM trace.");
-      receipt << names[i] << "_sha256 " << hash << "\n";
+      const char* name=trace_atom_==-2 && i==10 ? "all_meta" : trace_atom_==-2 && i==11 ? "all_edges" : names[i];
+      receipt << name << "_sha256 " << hash << "\n";
     }
     receipt << "scalar_line_sha256 " << rpmd_ja_sample_provenance::sha256_text(scalar_line) << "\n";
     receipt.close();

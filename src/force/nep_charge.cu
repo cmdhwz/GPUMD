@@ -2722,9 +2722,9 @@ void NEP_Charge::compute_small_box(
   const bool capture_charge_diagnostics = charge_diagnostics_requested_;
 
   const int big_neighbor_size = 2000;
-  const int size_x12 = type.size() * big_neighbor_size;
   const bool trace_neighbors=r164_trace_step_>=0;
-  if (trace_neighbors && r164_trace_atom_==-2 && static_cast<size_t>(N)*big_neighbor_size>static_cast<size_t>(std::numeric_limits<int>::max())) PRINT_INPUT_ERROR("r164_rpmd all-edge capacity overflow.");
+  if (trace_neighbors && r164_trace_atom_==-2 && static_cast<size_t>(N)*big_neighbor_size>static_cast<size_t>(std::numeric_limits<int>::max())/6) PRINT_INPUT_ERROR("r164_rpmd all-edge capacity overflow.");
+  const int size_x12 = type.size() * big_neighbor_size;
   if (trace_neighbors) { r164_radial_edges_.resize(static_cast<size_t>(big_neighbor_size)*(r164_trace_atom_==-2?N:1)); r164_angular_edges_.resize(static_cast<size_t>(big_neighbor_size)*(r164_trace_atom_==-2?N:1)); }
 
   find_neighbor_list_small_box<<<grid_size, BLOCK_SIZE>>>(
@@ -3149,6 +3149,7 @@ void NEP_Charge::compute(
     const int current_num_atoms = type.size();
     if (small_box_data.NN_radial.size() != current_num_atoms) {
       const int big_neighbor_size = 2000;
+      if (r164_trace_atom_==-2 && r164_trace_step_>=0 && static_cast<size_t>(current_num_atoms)*big_neighbor_size>static_cast<size_t>(std::numeric_limits<int>::max())/6) PRINT_INPUT_ERROR("r164_rpmd all-edge capacity overflow.");
       const int size_x12 = current_num_atoms * big_neighbor_size;
 
       small_box_data.NN_radial.resize(current_num_atoms);
@@ -3364,7 +3365,7 @@ void NEP_Charge::write_r164_derivatives(int N, bool small_box_path, const GPU_Ve
     meta.close(); if (!meta) PRINT_INPUT_ERROR("r164_rpmd failed closing all-edge metadata.");
     rpmd_ja_file_io::ofstream out(r164_trace_prefix_+"_all_edges.bin",std::ios::binary);
     static_assert(sizeof(float)==4 && std::numeric_limits<float>::is_iec559, "all-edge output requires IEEE binary32");
-    auto write32=[&](uint32_t value) { char bytes[4]; for (int b=0;b<4;++b) bytes[b]=static_cast<char>((value>>(8*b))&255); out.write(bytes,4); };
+
     for (int kind=0;kind<2;++kind) {
       int max_count=0; for (int count:counts[kind]) max_count=std::max(max_count,count);
       auto& dev=kind?r164_angular_edges_:r164_radial_edges_;
@@ -3376,9 +3377,12 @@ void NEP_Charge::write_r164_derivatives(int N, bool small_box_path, const GPU_Ve
           if (edge.slot!=slot || edge.atom<0 || edge.atom>=N || edge.atom!=edge.native_atom || edge.dx!=edge.native_r[0] || edge.dy!=edge.native_r[1] || edge.dz!=edge.native_r[2])
             PRINT_INPUT_ERROR("r164_rpmd all-edge descriptor/native mismatch.");
           const int32_t ints[7]={kind,center,slot,edge.atom,edge.image[0],edge.image[1],edge.image[2]};
-          for (int32_t v:ints) write32(static_cast<uint32_t>(v));
+          char record[76]; int offset=0;
+          auto pack32=[&](uint32_t value) { for (int b=0;b<4;++b) record[offset++]=static_cast<char>((value>>(8*b))&255); };
+          for (int32_t v:ints) pack32(static_cast<uint32_t>(v));
           const float floats[12]={edge.dx,edge.dy,edge.dz,edge.B[0],edge.B[1],edge.B[2],edge.energy_gradient[0],edge.energy_gradient[1],edge.energy_gradient[2],edge.charge_gradient[0],edge.charge_gradient[1],edge.charge_gradient[2]};
-          for (float value:floats) { if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite all-edge value."); uint32_t bits; std::memcpy(&bits,&value,4); write32(bits); }
+          for (float value:floats) { if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite all-edge value."); uint32_t bits; std::memcpy(&bits,&value,4); pack32(bits); }
+          out.write(record,sizeof(record));
         }
       }
     }
