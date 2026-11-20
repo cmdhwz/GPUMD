@@ -42,12 +42,14 @@ def audit(directory,step):
         parts=line.split()
         if len(parts)!=2 or parts[0] in rec: raise ValueError('malformed receipt')
         rec[parts[0]]=parts[1]
-    if rec.get('schema')!='r164_pppm_trace_all_v1' or rec.get('atom')!='all' or int(rec['step'])!=step or rec.get('physical_event')!='unavailable': raise ValueError('not an all-center trace receipt')
+    if rec.get('schema')!='r164_pppm_trace_all_v1' or rec.get('atom')!='all' or int(rec['step'])!=step or rec.get('physical_event')!='unavailable' or rec.get('neighbor_history')!='all_centers_selected_bead_endpoint': raise ValueError('not an all-center trace receipt')
     bead=int(rec['bead']); fid=int(rec['force_evaluation_id']); prefix=f'pppm_trace_step_{step}_bead_{bead}'
     files={'metadata':d/'metadata.txt','source_identity':d/'source_identity.txt','frame':d/f'frame_{step}.txt','force_images':d/f'force_images_{step}.txt'}
     for name,suffix in [('mesh','mesh.out'),('kspace','kspace.out'),('atom','atom.out'),('assignment_atom','assignment_atom.out'),('assignment_stencil','assignment_stencil_atom0.out'),('pre_electro','pre_electro.out'),('all_meta','all_meta.out'),('all_edges','all_edges.bin')]: files[name]=d/f'{prefix}_{suffix}'
+    hashes={}
     for name,path in files.items():
-        if sha(path)!=rec.get(name+'_sha256'): raise ValueError('receipt hash mismatch: '+name)
+        hashes[name]=sha(path)
+        if hashes[name]!=rec.get(name+'_sha256'): raise ValueError('receipt hash mismatch: '+name)
     meta=keyfile(files['metadata']); src=keyfile(files['source_identity'])
     if src.get('bead_force_backend')!='native_GPUMD' or meta.get('schema')!='r164_diagnostic_v1': raise ValueError('requires native R164 capture')
     run=d.parent/'run.in'; model=d.parent/'model.xyz'
@@ -69,6 +71,7 @@ def audit(directory,step):
             if int(line.split()[0])==step: rows.append(line.rstrip(b'\r\n')+b'\n')
     if len(rows)!=1 or hashlib.sha256(rows[0]).hexdigest()!=rec['scalar_line_sha256']: raise ValueError('scalar row mismatch')
     N=int(meta['N']); P=int(meta['P']); cell=np.array(meta['cell_angstrom'].split(),float); T=float(meta['temperature_K'])
+    if fid!=step*P+bead+1: raise ValueError('unexpected native force call identity')
     if not 0<=bead<P or N<1 or cell.shape!=(3,) or not np.isfinite(cell).all() or np.any(cell<=0): raise ValueError('invalid capture dimensions')
     atoms=[line.split() for line in files['metadata'].read_text(encoding='utf8').splitlines() if line.startswith('atom ')]
     if len(atoms)!=N or [int(x[1]) for x in atoms]!=list(range(N)): raise ValueError('invalid atom order')
@@ -79,18 +82,22 @@ def audit(directory,step):
         h=headers(files[name])
         if int(h.get('force_evaluation_id','0'))!=fid: raise ValueError('force ID mismatch: '+name)
     ah=headers(files['all_meta'])
-    if ah.get('schema')!='r164_all_edges_v1' or int(ah.get('step','-1'))!=step or int(ah.get('bead','-1'))!=bead or 'record_bytes 76 order kind_slot_center' not in ah.get('binary','') or 'ANN_only_ZBL_excluded' not in ah.get('units',''): raise ValueError('all-edge schema mismatch')
+    if ah.get('schema')!='r164_all_edges_v1' or int(ah.get('step','-1'))!=step or int(ah.get('bead','-1'))!=bead or ah.get('binary')!='little_endian record_bytes 76 order kind_slot_center' or 'ANN_only_ZBL_excluded' not in ah.get('units',''): raise ValueError('all-edge schema mismatch')
     ph=headers(files['pre_electro'])
     if int(ph.get('step','-1'))!=step or ph.get('atom')!='all': raise ValueError('pre-electro source mismatch')
-    h=headers(files['assignment_atom']); H=np.array(h['box_h'].split(),float).reshape(3,3)
+    h=headers(files['assignment_atom']); branch=h.get('reciprocal_energy_branch')
+    if branch not in ('global_uniform','per_atom') or any(headers(files[name]).get('reciprocal_energy_branch')!=branch for name in ('mesh','kspace','atom','assignment_stencil')): raise ValueError('inconsistent reciprocal energy branch')
+    H=np.array(h['box_h'].split(),float).reshape(3,3)
     if not np.allclose(H,np.diag(cell),atol=1e-10,rtol=0): raise ValueError('requires orthogonal fixed cell')
     K=np.array(h['pppm_mesh_size'].split(),int); M=int(np.prod(K)); kc=float(h['K_C_SP'].split()[0]); shape=tuple(K[::-1]);
-    if np.any(K<5) or not np.isfinite(kc) or int(h['pppm_N'])!=N or int(h['pppm_N1'])!=0 or int(h['pppm_N2'])!=N: raise ValueError('invalid mesh or atom range')
+    if K.shape!=(3,) or np.any(K<5) or not np.isfinite(kc) or int(h['pppm_N'])!=N or int(h['pppm_N1'])!=0 or int(h['pppm_N2'])!=N: raise ValueError('invalid mesh or atom range')
     A=loadtxt(files['assignment_atom'],29); atom=loadtxt(files['atom'],7); m=loadtxt(files['mesh'],7); k=loadtxt(files['kspace'],14); md=loadtxt(files['all_meta'],4)
     if A.shape[0]!=N or atom.shape[0]!=N or md.shape[0]!=N or m.shape[0]!=M or k.shape[0]!=M or not np.array_equal(A[:,0],np.arange(N)) or not np.array_equal(atom[:,0],np.arange(N)) or not np.array_equal(md[:,0],np.arange(N)): raise ValueError('row order/dimensions mismatch')
     grid=np.indices(shape).reshape(3,-1).T[:,::-1]
     if not np.array_equal(m[:,:3],grid) or not np.array_equal(k[:,:3],grid): raise ValueError('mesh ordering mismatch')
-    if not np.array_equal(A[:,1],atom[:,4]) or not np.allclose(A[:,2:5],q[bead]-images[bead]*cell,atol=1e-8,rtol=0): raise ValueError('assignment/source mismatch')
+    if not np.array_equal(A[:,1],atom[:,4]) or not np.array_equal(A[:,2:5],atom[:,1:4]) or not np.allclose(A[:,2:5],q[bead]-images[bead]*cell,atol=1e-8,rtol=0): raise ValueError('assignment/source mismatch')
+    expected_projection=(atom[:,5].astype(np.float32)-np.float32(np.mean(atom[:,5].astype(np.float32),dtype=np.float64))).astype(np.float32)
+    if not np.array_equal(expected_projection,md[:,3].astype(np.float32)): raise ValueError('projected D mismatch')
     counts=md[:,1:3].astype(int)
     if np.any(counts<0) or not np.array_equal(counts,md[:,1:3]): raise ValueError('invalid counts')
     edge=read_edges(files['all_edges'],counts); n=len(edge)
@@ -103,6 +110,9 @@ def audit(directory,step):
         for typ in range(2):
             z=edge[edge['kind']==typ]; idx=np.lexsort((z['slot'],z['center'])); z=z[idx]
             if not np.array_equal(z['slot'],np.arange(len(z))-np.repeat(np.cumsum(np.r_[0,counts[:-1,typ]]),counts[:,typ])): raise ValueError('edge slots mismatch')
+    if n:
+        geometric=A[edge['atom'],2:5]-A[edge['center'],2:5]+edge['image']*cell
+        if np.any(np.abs(geometric-edge['r'])>2e-5*(1+np.abs(geometric))): raise ValueError('edge image/displacement mismatch')
     centers=A[:,8:11].astype(int); delta=A[:,11:14]; weights=A[:,14:].reshape(N,3,5); charge=A[:,1]; gn=md[:,3];
     if not np.array_equal(centers,A[:,8:11]) or np.any(np.abs(delta)>.500001) or not np.isfinite(weights).all(): raise ValueError('invalid assignment')
     stencil=loadtxt(files['assignment_stencil'],9)
@@ -111,37 +121,27 @@ def audit(directory,step):
     if pre.shape!=(N,3) or not np.array_equal(pre[:,0],np.arange(N)): raise ValueError('invalid raw source rows')
     offsets=np.indices((5,5,5)).reshape(3,-1).T-2
     if not np.array_equal(stencil[:,:3],offsets) or not np.array_equal(stencil[:,3:6],(centers[0]+offsets)%K): raise ValueError('assignment stencil identity mismatch')
-    Q=np.zeros(shape); phi=m[:,5].reshape(shape); S=(k[:,9]+1j*k[:,10]).reshape(shape); G=k[:,11].reshape(shape)
-    if int(ah.get('N','-1'))!=N: raise ValueError('all-edge N mismatch')
-    field=[np.fft.ifftn(-1j*k[:,6+a].reshape(shape)*S*G).real*M for a in range(3)]
-    derivatives=np.empty((N,3,5));
+    linear=(((centers[:,2,None]+offsets[None,:,2])%K[2])*K[1]+(centers[:,1,None]+offsets[None,:,1])%K[1])*K[0]+(centers[:,0,None]+offsets[None,:,0])%K[0]
+    wf=weights.astype(np.float32); w0=wf[:,0,offsets[:,0]+2]; w1=wf[:,1,offsets[:,1]+2]; w2=wf[:,2,offsets[:,2]+2]
+    W32=((w0*w1).astype(np.float32)*w2).astype(np.float32)
+    if not np.array_equal(stencil[:,6].astype(int),linear[0]) or not np.array_equal(stencil[:,7].astype(np.float32),W32[0]) or not np.array_equal(stencil[:,8].astype(np.float32),(np.float32(charge[0])*W32[0]).astype(np.float32)): raise ValueError('captured stencil weight mismatch')
+    derivatives=np.empty((N,3,5))
     for z in range(5): derivatives[:,:,z]=COEFF[z,1]+2*COEFF[z,2]*delta+3*COEFF[z,3]*delta**2+4*COEFF[z,4]*delta**3
-    ik=np.zeros((N,3)); fw=np.zeros((N,3)); D=np.zeros(N)
-    def traverse(phi_input,scatter=False):
-        fw0=np.zeros((N,3)); D0=np.zeros(N)
-        for a in range(5):
-          ix=(centers[:,0]+a-2)%K[0]
-          for b in range(5):
-           iy=(centers[:,1]+b-2)%K[1]
-           for c in range(5):
-            iz=(centers[:,2]+c-2)%K[2]; w=weights[:,0,a]*weights[:,1,b]*weights[:,2,c]; index=(iz,iy,ix)
-            if scatter: np.add.at(Q,index,charge*w)
-            else:
-             v=phi_input[index]; D0+=2*kc*w*v
-             for axis in range(3):
-              dw=derivatives[:,axis,(a,b,c)[axis]]*K[axis]/cell[axis]
-              for j,z in enumerate((a,b,c)):
-               if j!=axis: dw*=weights[:,j,z]
-              fw0[:,axis]-=2*kc*charge*dw*v
-        return fw0,D0
-    traverse(phi,True); phi64=np.fft.ifftn(np.fft.fftn(Q)*G).real*M; fw,D=traverse(phi); fw64,D64=traverse(phi64); G64=D64-D64.mean()
-    for a in range(5):
-      ix=(centers[:,0]+a-2)%K[0]
-      for b in range(5):
-       iy=(centers[:,1]+b-2)%K[1]
-       for c in range(5):
-        iz=(centers[:,2]+c-2)%K[2]; w=weights[:,0,a]*weights[:,1,b]*weights[:,2,c]
-        for axis in range(3): ik[:,axis]+=2*kc*charge*w*field[axis][iz,iy,ix]
+    dw=np.empty((N,125,3)); factors=(w0.astype(float),w1.astype(float),w2.astype(float))
+    for axis in range(3):
+        others=[j for j in range(3) if j!=axis]
+        dw[:,:,axis]=derivatives[:,axis,offsets[:,axis]+2]*(K[axis]/cell[axis])*factors[others[0]]*factors[others[1]]
+    Q=np.zeros(M); np.add.at(Q,linear.ravel(),(charge[:,None]*W32).ravel()); Q=Q.reshape(shape)
+    phi=m[:,5].reshape(shape); S=(k[:,9]+1j*k[:,10]).reshape(shape); G=k[:,11].reshape(shape)
+    inverse=np.ix_(*[(-np.arange(n))%n for n in shape])
+    if G.flat[0]!=0 or np.any(G<0) or not np.allclose(G,G[inverse],rtol=1e-7,atol=1e-15): raise ValueError('mesh kernel is not even, nonnegative and zero-mode-free')
+    field=np.stack([np.fft.ifftn(-1j*k[:,6+a].reshape(shape)*S*G).real*M for a in range(3)])
+    native_phi=phi.ravel()[linear]; phi64=np.fft.ifftn(np.fft.fftn(Q)*G).real*M
+    ik=2*kc*charge[:,None]*np.stack([(W32*field[a].ravel()[linear]).sum(axis=1) for a in range(3)],axis=1)
+    fw=-2*kc*charge[:,None]*np.sum(dw*native_phi[:,:,None],axis=1)
+    potential64=phi64.ravel()[linear]
+    fw64=-2*kc*charge[:,None]*np.sum(dw*potential64[:,:,None],axis=1)
+    D64=2*kc*np.sum(W32*potential64,axis=1); G64=D64-D64.mean()
     local=[]
     for v in (edge['B'],edge['e']+gn[edge['center'],None]*edge['g'],edge['e']+G64[edge['center'],None]*edge['g']):
         f=np.zeros((N,3)); np.add.at(f,edge['center'],v); np.add.at(f,edge['atom'],-v); local.append(f)
@@ -151,22 +151,16 @@ def audit(directory,step):
     force_q=A[:,2:5]
     def shifted_Q(selection,axis,shift):
         indices=np.arange(N) if selection is None else np.array([selection])
-        Qdiff=np.zeros(shape); ds=shift*K[axis]/cell[axis]
-        d0=delta[indices,axis]; w0=weights[indices,axis,:]
+        ds=shift*K[axis]/cell[axis]; d0=delta[indices,axis]
         def poly(x):
             return np.stack([sum(COEFF[z,p]*x**p for p in range(5)) for z in range(5)],axis=1)
-        replacement=w0+poly(d0+ds)-poly(d0)
-        for a in range(5):
-          ix=(centers[indices,0]+a-2)%K[0]
-          for b in range(5):
-           iy=(centers[indices,1]+b-2)%K[1]
-           for c in range(5):
-            iz=(centers[indices,2]+c-2)%K[2]; z=(a,b,c)
-            dw=replacement[:,z[axis]]-w0[:,z[axis]]
-            for j in range(3):
-             if j!=axis: dw=dw*weights[indices,j,z[j]]
-            np.add.at(Qdiff,(iz,iy,ix),charge[indices]*dw)
-        return Qdiff
+        replacement=weights[indices,axis,:]+poly(d0+ds)-poly(d0)
+        z=offsets[:,axis]+2
+        dw_axis=replacement[:,z]-weights[indices,axis,:][:,z]
+        others=[j for j in range(3) if j!=axis]
+        change=charge[indices,None]*dw_axis*factors[others[0]][indices]*factors[others[1]][indices]
+        Qdiff=np.zeros(M); np.add.at(Qdiff,linear[indices].ravel(),change.ravel())
+        return Qdiff.reshape(shape)
     def finite_difference(selection,axis):
         ids=np.arange(N) if selection is None else np.array([selection])
         chart=np.minimum(.5-delta[ids,axis],.5+delta[ids,axis])*cell[axis]/K[axis]
@@ -174,7 +168,7 @@ def audit(directory,step):
         limit=float(min(np.min(chart),np.min(face)))
         if limit<=1e-12: return {'status':'UNAVAILABLE','reason':'no symmetric fixed-chart interval','margin_A':limit}
         base=min(0.004,limit/4); entries=[]
-        for h in (base,base/2,base/4):
+        for h in (base,base/2,base/4,base/8):
             changes=[]
             for sign in (1,-1):
                 dq=shifted_Q(selection,axis,sign*h)
@@ -188,7 +182,7 @@ def audit(directory,step):
     maxcoord=np.unravel_index(np.argmax(np.abs(fw64-ik)),fw64.shape)
     fd_coordinate=finite_difference(int(maxcoord[0]),int(maxcoord[1]))
     fd_translation={axis:finite_difference(None,i) for i,axis in enumerate('xyz')}
-    return {'schema':'r164_force_split_audit_v1','scope':'fixed_descriptor_edges_assignment_branch_ANN_only_native_no_event_or_transport_claim','capture':str(d),'step':step,'bead':bead,'force_evaluation_id':fid,'N':N,'P':P,'temperature_K':T,'source_identity':src,'input_sha256':{**{x:sha(y) for x,y in files.items()},'run.in':sha(run),'model.xyz':sha(model),'potential':sha(potential)},'units':{'force':'eV/angstrom','power':'eV/fs'},'force_stages':{name:metrics(value,velocity) for name,value in zip(('native','local_B_ik','local_e_Gnative_ik','local_e_G64_ik','local_e_G64_FW64'),stages)},'force_differences':differences,'mesh_charge_FP64_minus_native_max':float(np.max(np.abs(Q-m[:,3].reshape(shape)))),'branch_finite_difference':{'atom':int(maxcoord[0]),'axis':'xyz'[maxcoord[1]],'result':fd_coordinate},'translation_finite_difference':fd_translation}
+    return {'schema':'r164_force_split_audit_v1','scope':'fixed_descriptor_edges_assignment_branch_ANN_only_native_no_event_or_transport_claim','capture':str(d),'receipt_sha256':sha(d/f'pppm_trace_step_{step}_receipt.txt'),'scalar_line_sha256':rec['scalar_line_sha256'],'step':step,'bead':bead,'force_evaluation_id':fid,'N':N,'P':P,'temperature_K':T,'reciprocal_energy_branch':branch,'energy_scope':'global_uniform is total-bead energy; no site-energy allocation claimed','source_identity':src,'input_sha256':{**hashes,'run.in':src['run_in_sha256'],'model.xyz':src['model_xyz_sha256'],'potential':src['model_sha256']},'units':{'force':'eV/angstrom','power':'eV/fs'},'force_stages':{name:metrics(value,velocity) for name,value in zip(('native','local_B_ik','local_e_Gnative_ik','local_e_G64_ik','local_e_G64_FW64'),stages)},'force_differences':differences,'mesh_charge_FP64_minus_native_max':float(np.max(np.abs(Q-m[:,3].reshape(shape)))),'branch_finite_difference':{'atom':int(maxcoord[0]),'axis':'xyz'[maxcoord[1]],'result':fd_coordinate},'translation_finite_difference':fd_translation,'total_F_regular_minus_native':metrics(stages[-1]-stages[0],velocity),'chain_closure':metrics((stages[0]-stages[-1])-sum((stages[i]-stages[i+1] for i in range(4)),np.zeros_like(stages[0])),velocity)}
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('capture',type=Path); ap.add_argument('step',type=int); ap.add_argument('--output',type=Path); a=ap.parse_args()

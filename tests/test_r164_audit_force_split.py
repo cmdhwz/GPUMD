@@ -16,7 +16,7 @@ class ForceAuditTests(unittest.TestCase):
     def test_bad_receipt_hash_rejected(self):
         with tempfile.TemporaryDirectory() as t:
             p=Path(t); (p/'metadata.txt').write_text('bad')
-            (p/'pppm_trace_step_0_receipt.txt').write_text('schema r164_pppm_trace_all_v1\nstep 0\nbead 0\natom all\nforce_evaluation_id 1\nphysical_event unavailable\nmetadata_sha256 '+ '0'*64 +'\n')
+            (p/'pppm_trace_step_0_receipt.txt').write_text('schema r164_pppm_trace_all_v1\nstep 0\nbead 0\natom all\nforce_evaluation_id 1\nneighbor_history all_centers_selected_bead_endpoint\nphysical_event unavailable\nmetadata_sha256 '+ '0'*64 +'\n')
             with self.assertRaisesRegex(ValueError,'receipt hash mismatch'): audit.audit(p,0)
     def test_signed_max_and_power(self):
         result=audit.metrics(np.array([[1.,-3.,2.],[0.,0.,0.]]),np.ones((2,3)))
