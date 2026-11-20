@@ -3387,6 +3387,7 @@ void NEP_Charge::write_r164_derivatives(int N, bool small_box_path, const GPU_Ve
       }
     }
     out.close(); if (!out) PRINT_INPUT_ERROR("r164_rpmd failed closing all-edge binary.");
+    r164_radial_edges_.resize(0); r164_angular_edges_.resize(0);
     return;
   }
   int counts[2]={};

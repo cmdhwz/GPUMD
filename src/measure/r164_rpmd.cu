@@ -48,7 +48,7 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
   }
   if (next<t.size() && t[next]=="pppm_trace") {
     if (next+4!=t.size() || !decimal(t[next+1],trace_step_) || !decimal(t[next+2],trace_bead_) || !(t[next+3]=="all" ? (trace_atom_=-2,true) : decimal(t[next+3],trace_atom_)))
-      PRINT_INPUT_ERROR("r164_rpmd pppm_trace requires step bead atom as nonnegative decimal ints.");
+      PRINT_INPUT_ERROR("r164_rpmd pppm_trace requires nonnegative decimal step and bead, and a nonnegative decimal atom or all.");
     next+=4;
   }
   if (next!=t.size()) PRINT_INPUT_ERROR("r164_rpmd invalid options; use observer, checkpoint, pppm_trace in order.");
