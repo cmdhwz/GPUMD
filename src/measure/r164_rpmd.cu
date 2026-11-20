@@ -280,9 +280,14 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   for (double value : u) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite potential before observer.");
   for (double mass : atom.cpu_mass) if (!std::isfinite(mass) || mass <= 0) PRINT_INPUT_ERROR("r164_rpmd invalid mass.");
   double observer_conv[3]={}, local_current[3]={}, local_image[3]={}, mechanical[3]={}, mechanical_image[3]={}, relay[3]={}, relay_image[3]={}, projection[3]={}, projection_image[3]={}, chart[3]={}, site_rate_sum=0, gradient_power=0, native_power=0, force_difference_max=0;
+  const bool projection_frame=step==0 || step==total || (stride_ && step%stride_==0);
   bool tangent_valid=false, mechanical_valid=false, relay_valid=false, projection_valid=false;
+  std::vector<double> centroid;
+  std::vector<float> raw_D, raw_rate;
+  const char* projection_status="charge_diagnostics_unavailable";
+  int projection_guard_axis=-1, projection_guard_index=-1;
   if (observer_) {
-    std::vector<double> centroid(3*n_), cv(3*n_);
+    centroid.resize(3*n_); std::vector<double> cv(3*n_);
     for (int bead=0; bead<p_; ++bead) for (int j=0; j<3*n_; ++j) {
       centroid[j]+=q_[bead*3*n_+j]/p_; cv[j]+=v[bead*3*n_+j]/p_;
     }
@@ -327,12 +332,12 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       observer_->compute_charge_rate_for_current_force_frame(box_for_observer_,atom.type,observer_q_,observer_v_);
       relay_valid=observer_->compute_reference_relay_current(box_for_observer_,observer_q_,observer_v_,relay,relay_image);
       if (relay_valid) for (int d=0;d<3;++d) { relay[d]/=TIME_UNIT_CONVERSION; relay_image[d]/=TIME_UNIT_CONVERSION; if (!std::isfinite(relay[d]) || !std::isfinite(relay_image[d])) relay_valid=false; }
-      std::vector<float> raw_D(n_), raw_rate(n_);
+      raw_D.resize(n_); raw_rate.resize(n_);
       observer_->get_raw_D_reference().copy_to_host(raw_D.data());
       observer_->get_raw_charge_rate_reference().copy_to_host(raw_rate.data());
       double mean_D=0, mean_rate=0;
-      projection_valid=true;
-      for (int i=0;i<n_;++i) { if (!std::isfinite(raw_D[i]) || !std::isfinite(raw_rate[i])) projection_valid=false; mean_D+=raw_D[i]/n_; mean_rate+=raw_rate[i]/n_; }
+      projection_valid=true; projection_status="valid";
+      for (int i=0;i<n_;++i) { if (!std::isfinite(raw_D[i]) || !std::isfinite(raw_rate[i])) { projection_valid=false; projection_status="nonfinite"; } mean_D+=raw_D[i]/n_; mean_rate+=raw_rate[i]/n_; }
       for (int d=0;d<3 && projection_valid;++d) {
         std::vector<double> ordered(n_); double mean_x=0, L=lengths_[d];
         for (int i=0;i<n_;++i) { ordered[i]=centroid[d*n_+i]; mean_x+=ordered[i]/n_; }
@@ -344,7 +349,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
           auto left_near=std::lower_bound(ordered.begin(),ordered.end(),left-1e-9);
           auto right_near=std::lower_bound(ordered.begin(),ordered.end(),right-1e-9);
           if ((left_near!=ordered.end() && *left_near<=left+1e-9) ||
-              (right_near!=ordered.end() && *right_near<=right+1e-9)) { projection_valid=false; break; }
+              (right_near!=ordered.end() && *right_near<=right+1e-9)) { projection_valid=false; projection_status="half_box_guard"; projection_guard_axis=d; projection_guard_index=i; break; }
           double left_count=li-ordered.begin(), right_count=ordered.end()-ri;
           double eta=x-mean_x+L*(right_count-left_count)/n_;
           double c=mean_D*raw_rate[i]-raw_D[i]*mean_rate;
@@ -352,9 +357,9 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
           projection_image[d]+=L*(right_count-left_count)/n_*c/TIME_UNIT_CONVERSION;
         }
       }
-      for (double x:projection) if (!std::isfinite(x)) projection_valid=false;
+      for (double x:projection) if (!std::isfinite(x)) { projection_valid=false; projection_status="nonfinite"; projection_guard_axis=-1; projection_guard_index=-1; }
     }
-    if (step==0 || step==total || (stride_ && step%stride_==0)) {
+    if (projection_frame) {
       const std::string path=directory_+"/observer_frame_"+std::to_string(step)+".txt";
       rpmd_ja_file_io::ofstream out(path+".tmp"); out << std::setprecision(17);
       const int* mesh=observer_->get_pppm_mesh();
@@ -480,6 +485,35 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   scalar_file.close(); if (!scalar_file) PRINT_INPUT_ERROR("r164_rpmd failed closing scalar output.");
   drift_pending_=false; ++next_output_step_;
   if (checkpoint_stride_) scalar_prefix_digest_.update(reinterpret_cast<const unsigned char*>(scalar_line.data()),scalar_line.size());
+  if (observer_ && projection_frame) {
+    const std::string suffix=std::to_string(step)+".txt";
+    const std::string files[]={directory_+"/metadata.txt", directory_+"/source_identity.txt", directory_+"/observer.txt",
+                               directory_+"/frame_"+suffix, directory_+"/observer_frame_"+suffix};
+    const char* names[]={"metadata", "source_identity", "observer", "frame", "observer_frame"};
+    std::string hashes[5];
+    for (int k=0;k<5;++k) {
+      hashes[k]=rpmd_ja_sample_provenance::sha256_file(files[k]);
+      if (hashes[k].size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing observer projection inputs.");
+    }
+    const std::string scalar_hash=rpmd_ja_sample_provenance::sha256_text(scalar_line);
+    if (scalar_hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing observer projection scalar.");
+    const bool have_rows=raw_D.size()==static_cast<size_t>(n_) && raw_rate.size()==static_cast<size_t>(n_);
+    const std::string path=directory_+"/observer_projection_"+suffix;
+    rpmd_ja_file_io::ofstream out(path+".tmp"); out << std::setprecision(17);
+    out << "# schema r164_observer_projection_v1\n# step " << step << "\n# time_fs " << time_fs
+        << "\n# observer_force_call " << step+1 << "\n# N " << n_ << "\n# status " << projection_status
+        << "\n# guard_axis " << projection_guard_axis << "\n# guard_index " << projection_guard_index
+        << "\n# rows " << (have_rows?n_:0) << "\n# time_unit_conversion " << TIME_UNIT_CONVERSION
+        << "\n# half_box_guard_A 1e-9\n# columns atom centroid_canonical_xyz_A raw_D_fp32_eV_per_e raw_rate_fp32_e_per_natural_time\n";
+    for (int k=0;k<5;++k) out << "# " << names[k] << "_sha256 " << hashes[k] << '\n';
+    out << "# scalar_line_sha256 " << scalar_hash << '\n';
+    if (have_rows) for (int i=0;i<n_;++i) {
+      out << i; for (int d=0;d<3;++d) out << ' ' << centroid[d*n_+i];
+      out << ' ' << raw_D[i] << ' ' << raw_rate[i] << '\n';
+    }
+    out.close(); if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
+      PRINT_INPUT_ERROR("r164_rpmd failed committing observer projection.");
+  }
   if (checkpoint) {
     const std::string suffix=std::to_string(step)+".txt";
     const std::string metadata_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/metadata.txt");
