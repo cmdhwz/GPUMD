@@ -232,6 +232,10 @@ public:
     const bool write_debug,
     // The reciprocal correction is returned in eV*Angstrom/natural_time.
     double* delta_j_q_pppm = nullptr);
+  bool compute_mechanical_current(
+    int N, const Box& box, const GPU_Vector<float>& charge,
+    const GPU_Vector<double>& position, const GPU_Vector<double>& direction,
+    double* current, unsigned long long force_evaluation_id, double* image = nullptr);
   bool compute_dynamic_charge_correction(
     const int N,
     const int N1,
@@ -242,7 +246,8 @@ public:
     const GPU_Vector<double>& position,
     // The reciprocal correction is returned in eV*Angstrom/natural_time.
     double* delta_j_q_pppm = nullptr,
-    const unsigned long long force_evaluation_id = 0);
+    const unsigned long long force_evaluation_id = 0,
+    double* image = nullptr);
   void finalize_dynamic_charge_diagnostic(
     const double* delta_j_q_real,
     const double* delta_j_q_total,

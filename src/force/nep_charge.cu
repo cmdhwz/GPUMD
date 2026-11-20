@@ -3211,7 +3211,10 @@ static __global__ void compute_reference_local_tangent(
   const float* charge_derivative,
   const float* sum_fxyz,
   double* charge_direction_raw,
-  double* short_site_derivative)
+  double* short_site_derivative,
+  const float* D_projected,
+  double* local_current,
+  double* local_image)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= N) return;
@@ -3228,6 +3231,7 @@ static __global__ void compute_reference_local_tangent(
         sum_fxyz[(n * ((paramb.L_max + 1) * (paramb.L_max + 1) - 1) + abc) * N + i];
 
   double local = 0.0;
+  double current[3] = {}, image_current[3] = {};
   double charge_tangent = 0.0;
   const double ux = direction[i], uy = direction[i + N], uz = direction[i + 2 * N];
   for (int pass = 0; pass < 2; ++pass) {
@@ -3250,7 +3254,7 @@ static __global__ void compute_reference_local_tangent(
         apply_mic(box, r[0], r[1], r[2]);
       }
       const double dux = direction[j] - ux, duy = direction[j + N] - uy, duz = direction[j + 2 * N] - uz;
-      if (dux == 0.0 && duy == 0.0 && duz == 0.0) continue;
+      if (!local_current && dux == 0.0 && duy == 0.0 && duz == 0.0) continue;
       float energy_gradient[3] = {0.0f, 0.0f, 0.0f};
       float charge_gradient[3] = {0.0f, 0.0f, 0.0f};
       if (angular) {
@@ -3259,6 +3263,19 @@ static __global__ void compute_reference_local_tangent(
       } else {
         find_charge_gradient_radial_pair(paramb, annmb, N, i, j, type, r, Fp, energy_gradient);
         find_charge_gradient_radial_pair(paramb, annmb, N, i, j, type, r, charge_derivative, charge_gradient);
+      }
+      if (local_current) {
+        const double contraction=(energy_gradient[0]+D_projected[i]*charge_gradient[0])*direction[j] +
+          (energy_gradient[1]+D_projected[i]*charge_gradient[1])*direction[j+N] +
+          (energy_gradient[2]+D_projected[i]*charge_gradient[2])*direction[j+2*N];
+        for (int d=0;d<3;++d) {
+          current[d]-=r[d]*contraction;
+          if (local_image) {
+            double raw=position[j+d*N]-position[i+d*N];
+            double image=nearbyint((static_cast<double>(r[d])-raw)/box.cpu_h[4*d]);
+            image_current[d]-=box.cpu_h[4*d]*image*contraction;
+          }
+        }
       }
       local += energy_gradient[0] * dux + energy_gradient[1] * duy + energy_gradient[2] * duz;
       charge_tangent += charge_gradient[0] * dux + charge_gradient[1] * duy + charge_gradient[2] * duz;
@@ -3291,6 +3308,8 @@ static __global__ void compute_reference_local_tangent(
   }
   charge_direction_raw[i] = charge_tangent;
   short_site_derivative[i] = local;
+  if (local_current) for (int d=0;d<3;++d) local_current[d*N+i]=current[d];
+  if (local_image) for (int d=0;d<3;++d) local_image[d*N+i]=image_current[d];
 }
 
 static __global__ void project_reference_charge_direction(
@@ -3425,9 +3444,13 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
   const GPU_Vector<double>* direction,
   GPU_Vector<double>* site_derivative,
   GPU_Vector<double>& total_energy_gradient,
-  QNEPReferenceTangentDiagnostics* diagnostics)
+  QNEPReferenceTangentDiagnostics* diagnostics,
+  GPU_Vector<double>* local_current,
+  GPU_Vector<double>* local_image)
 {
   const int N = type.size();
+  if (local_image && (!local_current || !box.is_orthogonal)) return false;
+  if (local_current && (!direction || zbl.enabled || !has_charge_diagnostics_for_current_force_frame())) return false;
   if (diagnostics != nullptr) *diagnostics = {};
   if (diagnostics != nullptr && direction == nullptr) return false;
   if (!reference_force_frame_valid_ || reference_force_frame_id_ != force_evaluation_id_ ||
@@ -3444,6 +3467,8 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
   for (int i = 0; i < 18; ++i)
     if (reference_force_frame_box_[i] != box.cpu_h[i]) return false;
 
+  if (local_current && local_current->size()!=static_cast<size_t>(3*N)) local_current->resize(3*N);
+  if (local_image && local_image->size()!=static_cast<size_t>(3*N)) local_image->resize(3*N);
   const bool small_box = reference_force_frame_small_box_;
   const int* NN_radial = small_box ? small_box_data.NN_radial.data() : nep_data.NN_radial.data();
   const int* NL_radial = small_box ? small_box_data.NL_radial.data() : nep_data.NL_radial.data();
@@ -3477,7 +3502,9 @@ bool NEP_Charge::compute_reference_site_energy_derivative(
       paramb, annmb, zbl, N, box, small_box, NN_radial, NL_radial, NN_angular, NL_angular,
       type.data(), position.data(), direction->data(), x12_radial, y12_radial, z12_radial,
       x12_angular, y12_angular, z12_angular, nep_data.Fp.data(), nep_data.charge_derivative.data(),
-      nep_data.sum_fxyz.data(), reference_charge_direction_raw_.data(), reference_short_site_derivative_.data());
+      nep_data.sum_fxyz.data(), reference_charge_direction_raw_.data(), reference_short_site_derivative_.data(),
+      local_current ? nep_data.D_projected.data() : nullptr, local_current ? local_current->data() : nullptr,
+      local_image ? local_image->data() : nullptr);
     GPU_CHECK_KERNEL
     project_reference_charge_direction<<<1, 1024>>>(
       N, reference_charge_direction_raw_.data(), reference_charge_direction_.data());
@@ -5652,6 +5679,26 @@ bool NEP_Charge::compute_dynamic_charge_correction_impl(
     for (int d = 0; d < 3; ++d) delta_j_q_total[d] = total_result[d];
   }
   return true;
+}
+
+bool NEP_Charge::compute_reference_mechanical_current(
+  const Box& box, const GPU_Vector<double>& position, const GPU_Vector<double>& direction, double* current, double* image)
+{
+  if (!reference_force_frame_valid_ || reference_force_frame_id_ != force_evaluation_id_ ||
+      reference_force_frame_position_ != position.data() || !use_pppm || paramb.charge_mode != 2 || has_dftd3)
+    return false;
+  return pppm.compute_mechanical_current(reference_force_frame_N_,box,nep_data.charge,position,direction,current,force_evaluation_id_,image);
+}
+
+bool NEP_Charge::compute_reference_relay_current(const Box& box, const GPU_Vector<double>& position,
+  const GPU_Vector<double>& direction, double* current, double* image)
+{
+  if (!reference_force_frame_valid_ || reference_force_frame_id_ != force_evaluation_id_ ||
+      reference_force_frame_position_ != position.data() || !use_pppm || paramb.charge_mode != 2 ||
+      has_dftd3 || !charge_rate_cache_set_ || charge_rate_cache_force_evaluation_id_ != force_evaluation_id_ ||
+      charge_rate_cache_position_ != position.data() || charge_rate_cache_velocity_ != direction.data()) return false;
+  int N=reference_force_frame_N_;
+  return pppm.compute_dynamic_charge_correction(N,0,N,box,nep_data.charge,nep_data.charge_rate,position,current,force_evaluation_id_,image);
 }
 
 bool NEP_Charge::compute_dynamic_charge_correction(

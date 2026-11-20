@@ -184,7 +184,9 @@ public:
     const GPU_Vector<double>* direction,
     GPU_Vector<double>* site_derivative,
     GPU_Vector<double>& total_energy_gradient,
-    QNEPReferenceTangentDiagnostics* diagnostics = nullptr);
+    QNEPReferenceTangentDiagnostics* diagnostics = nullptr,
+    GPU_Vector<double>* local_current = nullptr,
+    GPU_Vector<double>* local_image = nullptr);
   bool diagnose_reference_translation_energy(
     const Box& box,
     const GPU_Vector<int>& type,
@@ -253,6 +255,10 @@ public:
     const GPU_Vector<double>& velocity,
     GPU_Vector<double>* channel_per_atom = nullptr);
   void notify_velocity_update();
+  bool compute_reference_mechanical_current(const Box& box, const GPU_Vector<double>& position,
+    const GPU_Vector<double>& direction, double* current, double* image = nullptr);
+  bool compute_reference_relay_current(const Box& box, const GPU_Vector<double>& position,
+    const GPU_Vector<double>& direction, double* current, double* image);
   bool compute_dynamic_charge_correction(
     const int N,
     const int N1,

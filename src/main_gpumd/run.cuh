@@ -23,6 +23,7 @@ class RunInput;
 #include "force/force.cuh"
 #include "integrate/integrate.cuh"
 #include "measure/measure.cuh"
+#include "measure/r164_rpmd.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "model/group.cuh"
@@ -97,4 +98,5 @@ private:
   Force force;
   Integrate integrate;
   Measure measure;
+  R164_RPMD r164_rpmd;
 };

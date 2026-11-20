@@ -528,6 +528,21 @@ void Run::perform_a_run(const int number_of_steps)
     }
   }
 
+  if (r164_rpmd.enabled()) {
+    box.set_is_orthogonal();
+    if (integrate.get_type() != EnsembleType::RPMD || !integrate.pimd_restart_read_this_run() ||
+        integrate.get_pimd_fix_com() || !integrate.get_pimd_use_exact_propagator() ||
+        integrate.get_fixed_group() != -1 ||
+        integrate.get_move_group() != -1 || velocity.do_velocity_correction || max_distance_per_step > 0) {
+      PRINT_INPUT_ERROR("r164_rpmd requires loaded, fixed-cell exact RPMD, fix_com off, fixed dt and no measurements or corrections.");
+    }
+    for (const auto& action : actions)
+      if (action->action_name != "dump_thermo") PRINT_INPUT_ERROR("r164_rpmd only supports dump_thermo as an additional action.");
+    for (const auto& property : measure.properties)
+      if (property->property_name != "dump_pimd_restart") PRINT_INPUT_ERROR("r164_rpmd only supports dump_pimd_restart as an additional property.");
+    r164_rpmd.begin(atom, box, integrate.get_temperature(), time_step, global_time);
+    r164_rpmd.configure_observer(force, atom);
+  }
   integrate.initialize(time_step, atom, box, group);
   measure.pre_run(number_of_steps, time_step, integrate, group, atom, box, force);
 
@@ -538,6 +553,8 @@ void Run::perform_a_run(const int number_of_steps)
 
   // setup force for the first integrate step
   compute_force();
+  if (r164_rpmd.enabled()) r164_rpmd.check_force_positions(atom);
+  if (r164_rpmd.enabled()) r164_rpmd.output(0, number_of_steps, global_time, atom);
   atom.update_unwrapped_position(box);
   measure.setup_force(time_step, integrate, group, atom, box, force);
   measure.process_dynamics(0, box, atom);
@@ -580,12 +597,14 @@ void Run::perform_a_run(const int number_of_steps)
                               .count();
     }
 
+    if (r164_rpmd.enabled()) r164_rpmd.capture_drift(atom);
     measure.post_integrate1(step, time_step, integrate, group, atom, box, force);
 
     force.advance_temperature();
 
     measure.pre_force(step, time_step, integrate, group, atom, box, force);
     compute_force();
+    if (r164_rpmd.enabled()) r164_rpmd.check_force_positions(atom);
 
     atom.update_unwrapped_position(box);
     measure.post_force(step, time_step, global_time, integrate, group, atom, box, force);
@@ -597,6 +616,7 @@ void Run::perform_a_run(const int number_of_steps)
     }
     integrate.compute2(time_step, step, number_of_steps, group, box, atom, thermo, force);
     force.notify_velocity_update();
+    if (r164_rpmd.enabled()) r164_rpmd.output(step + 1, number_of_steps, global_time, atom);
     atom.update_unwrapped_position(box);
     if (profile_pimd_bead_parallel) {
       CHECK(gpuSetDevice(0));
@@ -687,7 +707,7 @@ void Run::parse_one_keyword(
   for (int n = 0; n < num_param; ++n) param[n] = tokens[n].c_str();
 
 #ifdef GPUMD_WPE_ENABLED
-  force.wpe_process_command(tokens, atom.number_of_atoms);
+  if (tokens[0] != "r164_rpmd") force.wpe_process_command(tokens, atom.number_of_atoms);
 #endif
 
   if (tokens[0] == "potential") {
@@ -780,6 +800,8 @@ void Run::parse_one_keyword(
     measure.set_hac_current(hac_current_qnep_full_a_);
   } else if (tokens[0] == "rpmd_ja") {
     parse_rpmd_ja(tokens);
+  } else if (tokens[0] == "r164_rpmd") {
+    r164_rpmd.parse(tokens);
   } else if (tokens[0] == "run") {
     parse_run(tokens);
     hac_current_option_seen_ = false;
@@ -790,6 +812,7 @@ void Run::parse_one_keyword(
     rpmd_ja_diagnostic_ = false;
     rpmd_ja_reference_path_.clear();
     measure.set_rpmd_ja(false);
+    r164_rpmd.reset();
   } else if (!measure.parse_action(
                tokens, number_of_types, integrate, group, atom, box, force,
                first_potential_filename_)) {

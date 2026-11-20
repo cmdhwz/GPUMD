@@ -1,0 +1,9 @@
+potential qnep.txt
+kspace pppm 0.5
+time_step 0.2
+ensemble rpmd 32 300
+pimd_propagator exact
+pimd_fix_com off
+read_pimd_restart restart_beads.xyz
+r164_rpmd r164_output 1
+run 5

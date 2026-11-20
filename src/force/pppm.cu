@@ -829,6 +829,58 @@ __global__ void find_dynamic_mesh(
   }
 }
 
+// Original assignment images are retained until after the first moments are formed.
+__global__ void find_mechanical_mesh(
+  const int N, const PPPM::Para para, const Box box, const float* charge,
+  const double* position, const double* direction, gpufftComplex* Z,
+  gpufftComplex* Ax, gpufftComplex* Ay, gpufftComplex* Az,
+  gpufftComplex* Bx, gpufftComplex* By, gpufftComplex* Bz)
+{
+  const int i=blockIdx.x*blockDim.x+threadIdx.x; if (i>=N) return;
+  const double x=position[i], y=position[i+N], z=position[i+2*N];
+  const PPPMReferenceStencil stencil=make_reference_stencil(para,box,x,y,z);
+  for (int a=-2;a<=2;++a) for (int b=-2;b<=2;++b) for (int c=-2;c<=2;++c) {
+    const int ix=get_index_within_mesh(para.K[0],stencil.index[0]+a);
+    const int iy=get_index_within_mesh(para.K[1],stencil.index[1]+b);
+    const int iz=get_index_within_mesh(para.K[2],stencil.index[2]+c);
+    const int k=ix+para.K[0]*(iy+para.K[1]*iz);
+    const float W=stencil.weight[0][a+2]*stencil.weight[1][b+2]*stencil.weight[2][c+2];
+    double dw=0; for (int d=0;d<3;++d) dw+=reference_stencil_dW_dR(stencil,a,b,c,d)*direction[d*N+i];
+    const double sx=double(stencil.index[0]+a)/para.K[0];
+    const double sy=double(stencil.index[1]+b)/para.K[1];
+    const double sz=double(stencil.index[2]+c)/para.K[2];
+    const double offset[3]={box.cpu_h[0]*sx+box.cpu_h[1]*sy+box.cpu_h[2]*sz-x,
+      box.cpu_h[3]*sx+box.cpu_h[4]*sy+box.cpu_h[5]*sz-y,
+      box.cpu_h[6]*sx+box.cpu_h[7]*sy+box.cpu_h[8]*sz-z};
+    const float qw=charge[i]*W, qdw=static_cast<float>(charge[i]*dw);
+    atomicAdd(&Z[k].x,qdw);
+    gpufftComplex* A[3]={Ax,Ay,Az}; gpufftComplex* B[3]={Bx,By,Bz};
+    for (int d=0;d<3;++d) { atomicAdd(&A[d][k].x,static_cast<float>(offset[d])*qw); atomicAdd(&B[d][k].x,static_cast<float>(offset[d])*qdw); }
+  }
+}
+
+__global__ void find_absolute_moments(
+  int N, PPPM::Para para, Box box, const float* charge, const float* charge_rate,
+  const double* position, const double* direction, gpufftComplex* Ax, gpufftComplex* Ay,
+  gpufftComplex* Az, gpufftComplex* Bx, gpufftComplex* By, gpufftComplex* Bz)
+{
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if (i>=N) return;
+  const double x=position[i], y=position[i+N], z=position[i+2*N];
+  const PPPMReferenceStencil st=make_reference_stencil(para,box,x,y,z);
+  for (int a=-2;a<=2;++a) for (int b=-2;b<=2;++b) for (int c=-2;c<=2;++c) {
+    int ix=get_index_within_mesh(para.K[0],st.index[0]+a), iy=get_index_within_mesh(para.K[1],st.index[1]+b), iz=get_index_within_mesh(para.K[2],st.index[2]+c);
+    int k=ix+para.K[0]*(iy+para.K[1]*iz);
+    float W=st.weight[0][a+2]*st.weight[1][b+2]*st.weight[2][c+2];
+    double rate=charge_rate ? charge_rate[i]*W : 0;
+    if (direction) for (int d=0;d<3;++d) rate+=charge[i]*reference_stencil_dW_dR(st,a,b,c,d)*direction[d*N+i];
+    double sx=double(st.index[0]+a)/para.K[0], sy=double(st.index[1]+b)/para.K[1], sz=double(st.index[2]+c)/para.K[2];
+    double g[3]={box.cpu_h[0]*sx+box.cpu_h[1]*sy+box.cpu_h[2]*sz,
+      box.cpu_h[3]*sx+box.cpu_h[4]*sy+box.cpu_h[5]*sz,box.cpu_h[6]*sx+box.cpu_h[7]*sy+box.cpu_h[8]*sz};
+    gpufftComplex* A[3]={Ax,Ay,Az}; gpufftComplex* B[3]={Bx,By,Bz};
+    for (int d=0;d<3;++d) { atomicAdd(&A[d][k].x,static_cast<float>(g[d]*charge[i]*W)); atomicAdd(&B[d][k].x,static_cast<float>(g[d]*rate)); }
+  }
+}
+
 __global__ void dynamic_i_d_times_s(
   const PPPM::Para para,
   const float* g_d_x,
@@ -2295,6 +2347,42 @@ void PPPM::cache_dynamic_operator_on_host()
   dynamic_operator_host_cache_valid_ = true;
 }
 
+bool PPPM::compute_mechanical_current(
+  int N, const Box& box, const GPU_Vector<float>& charge,
+  const GPU_Vector<double>& position, const GPU_Vector<double>& direction,
+  double* current, unsigned long long force_evaluation_id, double* image)
+{
+  if (N<=0 || !box.is_orthogonal || charge.size()<static_cast<size_t>(N) ||
+      position.size()<static_cast<size_t>(3*N) || direction.size()<static_cast<size_t>(3*N) ||
+      !current_force_mesh_matches(N,0,N,box,charge,position,force_evaluation_id)) return false;
+  find_para(N,box); const int M=para.K0K1K2, grid=(M-1)/64+1;
+  resize_dynamic_charge_workspace(M,false); const gpufftComplex zero={0.0f,0.0f};
+  dynamic_S_.fill(zero); dynamic_Ax_.fill(zero); dynamic_Ay_.fill(zero); dynamic_Az_.fill(zero);
+  dynamic_Bx_.fill(zero); dynamic_By_.fill(zero); dynamic_Bz_.fill(zero);
+  prepare_dynamic_operator(N,box,grid);
+  find_mechanical_mesh<<<(N-1)/64+1,64>>>(N,para,box,charge.data(),position.data(),direction.data(),
+    dynamic_S_.data(),dynamic_Ax_.data(),dynamic_Ay_.data(),dynamic_Az_.data(),dynamic_Bx_.data(),dynamic_By_.data(),dynamic_Bz_.data());
+  GPU_CHECK_KERNEL
+  if (gpufftExecC2C(plan,dynamic_S_.data(),dynamic_S_.data(),GPUFFT_FORWARD)!=GPUFFT_SUCCESS) return false;
+  reduce_dynamic_mesh_current<<<3,1024>>>(M,mesh.data(),dynamic_S_.data(),dynamic_d_x_.data(),dynamic_d_y_.data(),dynamic_d_z_.data(),dynamic_current_total_.data());
+  GPU_CHECK_KERNEL
+  find_mesh_G<<<grid,64>>>(para,G.data(),dynamic_S_.data(),dynamic_S_.data()); GPU_CHECK_KERNEL
+  if (gpufftExecC2C(plan,dynamic_S_.data(),dynamic_S_.data(),GPUFFT_INVERSE)!=GPUFFT_SUCCESS) return false;
+  reduce_dynamic_assignment_current<<<3,1024>>>(M,mesh_G.data(),dynamic_S_.data(),dynamic_Ax_.data(),dynamic_Ay_.data(),dynamic_Az_.data(),dynamic_Bx_.data(),dynamic_By_.data(),dynamic_Bz_.data(),dynamic_current_total_.data());
+  GPU_CHECK_KERNEL
+  double sums[9]; dynamic_current_total_.copy_to_host(sums);
+  for (int d=0;d<3;++d) { current[d]=sums[d]+sums[3+d]+sums[6+d]; if (!std::isfinite(current[d])) return false; }
+  if (image) {
+    dynamic_Ax_.fill(zero); dynamic_Ay_.fill(zero); dynamic_Az_.fill(zero); dynamic_Bx_.fill(zero); dynamic_By_.fill(zero); dynamic_Bz_.fill(zero);
+    find_absolute_moments<<<(N-1)/64+1,64>>>(N,para,box,charge.data(),nullptr,position.data(),direction.data(),
+      dynamic_Ax_.data(),dynamic_Ay_.data(),dynamic_Az_.data(),dynamic_Bx_.data(),dynamic_By_.data(),dynamic_Bz_.data()); GPU_CHECK_KERNEL
+    reduce_dynamic_assignment_current<<<3,1024>>>(M,mesh_G.data(),dynamic_S_.data(),dynamic_Ax_.data(),dynamic_Ay_.data(),dynamic_Az_.data(),dynamic_Bx_.data(),dynamic_By_.data(),dynamic_Bz_.data(),dynamic_current_total_.data()); GPU_CHECK_KERNEL
+    double absolute[9]; dynamic_current_total_.copy_to_host(absolute);
+    for (int d=0;d<3;++d) { image[d]=sums[d]+absolute[3+d]+absolute[6+d]; if (!std::isfinite(image[d])) return false; }
+  }
+  return true;
+}
+
 bool PPPM::compute_dynamic_charge_correction(
   const int N,
   const int N1,
@@ -2304,7 +2392,8 @@ bool PPPM::compute_dynamic_charge_correction(
   const GPU_Vector<float>& charge_rate,
   const GPU_Vector<double>& position,
   double* delta_j_q_pppm,
-  const unsigned long long force_evaluation_id)
+  const unsigned long long force_evaluation_id,
+  double* image)
 {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   dynamic_q_last_compute_valid_ = false;
@@ -2421,6 +2510,14 @@ bool PPPM::compute_dynamic_charge_correction(
     const double value = host_current[d] + host_current[3 + d] + host_current[6 + d];
     valid = valid && std::isfinite(value);
     if (delta_j_q_pppm != nullptr) delta_j_q_pppm[d] = value;
+  }
+  if (valid && image) {
+    dynamic_Ax_.fill(zero); dynamic_Ay_.fill(zero); dynamic_Az_.fill(zero); dynamic_Bx_.fill(zero); dynamic_By_.fill(zero); dynamic_Bz_.fill(zero);
+    find_absolute_moments<<<(N-1)/64+1,64>>>(N,para,box,charge.data(),charge_rate.data(),position.data(),nullptr,
+      dynamic_Ax_.data(),dynamic_Ay_.data(),dynamic_Az_.data(),dynamic_Bx_.data(),dynamic_By_.data(),dynamic_Bz_.data()); GPU_CHECK_KERNEL
+    reduce_dynamic_assignment_current<<<3,1024>>>(M,reuse_current_force_mesh ? mesh_G.data() : dynamic_Q_.data(),dynamic_S_.data(),dynamic_Ax_.data(),dynamic_Ay_.data(),dynamic_Az_.data(),dynamic_Bx_.data(),dynamic_By_.data(),dynamic_Bz_.data(),dynamic_current_total_.data()); GPU_CHECK_KERNEL
+    double absolute[9]; dynamic_current_total_.copy_to_host(absolute);
+    for (int d=0;d<3;++d) { image[d]=host_current[d]+absolute[3+d]+absolute[6+d]; valid=valid && std::isfinite(image[d]); }
   }
   dynamic_q_last_compute_valid_ = valid;
   return valid;
