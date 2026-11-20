@@ -45,7 +45,7 @@ def config(capture,meta,source):
     keys=['potential','kspace','time_step','ensemble','pimd_propagator','pimd_fix_com','read_pimd_restart','r164_rpmd','run']
     if [x[0] for x in lines]!=keys: raise ValueError('requires nine-command card')
     b={x[0]:x for x in lines}; r=b['r164_rpmd']
-    if (len(b['potential'])!=2 or len(b['read_pimd_restart'])!=2 or len(b['kspace'])!=3 or b['kspace'][1]!='pppm' or float(b['kspace'][2])<=0 or len(b['time_step'])!=2 or float(b['time_step'][1])!=float(meta['dt_fs']) or len(b['ensemble'])!=4 or b['ensemble'][1]!='rpmd' or int(b['ensemble'][2])!=int(meta['P']) or float(b['ensemble'][3])!=float(meta['temperature_K']) or b['pimd_propagator']!=['pimd_propagator','exact'] or b['pimd_fix_com']!=['pimd_fix_com','off'] or len(b['run'])!=2 or int(b['run'][1])<=0): raise ValueError('unsupported run configuration')
+    if (len(b['potential'])!=2 or len(b['read_pimd_restart'])!=2 or len(b['kspace'])!=3 or b['kspace'][1]!='pppm' or float(b['kspace'][2])<=0 or len(b['time_step'])!=2 or not math.isclose(float(b['time_step'][1]),float(meta['dt_fs']),rel_tol=4.5e-16,abs_tol=0.0) or len(b['ensemble'])!=4 or b['ensemble'][1]!='rpmd' or int(b['ensemble'][2])!=int(meta['P']) or float(b['ensemble'][3])!=float(meta['temperature_K']) or b['pimd_propagator']!=['pimd_propagator','exact'] or b['pimd_fix_com']!=['pimd_fix_com','off'] or len(b['run'])!=2 or not 0<int(b['run'][1])<=2147483647): raise ValueError('unsupported run configuration')
     observer,checkpoint=r164_options(r)
     if r[1]!='r164_output' or (root/r[1]).resolve()!=capture.resolve() or checkpoint is None or checkpoint!=int(meta['checkpoint_stride']): raise ValueError('checkpoint card mismatch')
     for name,field in ((simple(b['potential'][1]),'model_sha256'),('model.xyz','model_xyz_sha256'),(simple(b['read_pimd_restart'][1]),'restart_input_sha256')):
@@ -57,6 +57,7 @@ def load(capture,step):
     capture=Path(capture).resolve(); meta=keyfile(capture/'metadata.txt'); source=keyfile(capture/'source_identity.txt')
     if meta.get('schema')!='r164_diagnostic_v1' or meta.get('time_convention')!='step_times_fixed_dt_start_zero' or meta.get('checkpoint')!='FRESH_REBUILD_ONLY': raise ValueError('unsupported metadata')
     if not meta.get('reference_id') or not HEX.fullmatch(meta.get('reference_source_sha256','')): raise ValueError('missing reference identity')
+    if not re.fullmatch('[0-9a-fA-F]{40}',source.get('build_git_commit','')) or source.get('build_git_dirty')!='no': raise ValueError('clean Git build identity required')
     lines,b=config(capture,meta,source); dt=float(meta['dt_fs']); P=int(meta['P']); N=int(meta['N']); temp=float(meta['temperature_K']); stride=int(meta['checkpoint_stride']); final=int(b['run'][1])
     if not math.isfinite(dt) or dt<=0 or not math.isfinite(temp) or temp<=0 or P<2 or N<1 or not 0<=step<=final or (step not in (0,final) and step%stride): raise ValueError('invalid checkpoint index or metadata')
     receipt=capture/f'checkpoint_{step}.txt'; data={}
@@ -77,16 +78,19 @@ def load(capture,step):
     observer_active='OBSERVER_CONV_UNVERIFIED' in rows[-1][0].decode('utf8').split()
     if not observer and (observer_present or observer_active): raise ValueError('observer-off capture contains observer output')
     if observer_active and not observer_present: raise ValueError('missing observer identity')
+    if observer_present:
+        obs=keyfile(capture/'observer.txt')
+        if obs.get('model_sha256')!=source.get('model_sha256') or obs.get('run_in_sha256')!=source.get('run_in_sha256') or float(obs.get('pppm_spacing','nan'))!=float(b['kspace'][2]): raise ValueError('observer identity mismatch')
     atoms=[x.split()[1:] for x in (capture/'metadata.txt').read_text(encoding='utf8').splitlines() if x.startswith('atom ')]
     if len(atoms)!=N or [int(x[0]) for x in atoms]!=list(range(N)): raise ValueError('atom order mismatch')
     species=np.array([x[1] for x in atoms]); mass=np.array([float(x[2])*C*C for x in atoms]); cell=np.array(meta['cell_angstrom'].split(),float)
     if cell.shape!=(3,) or not np.isfinite(cell).all() or np.any(cell<=0) or not np.isfinite(mass).all() or np.any(mass<=0): raise ValueError('invalid cell or mass')
     q,p,F,U=read_frame(capture/f'frame_{step}.txt',P,N); images=read_images(capture/f'force_images_{step}.txt',q,cell)
     validate_frame_scalars(q,p,U,mass,species,temp,rows[-1][1])
-    return locals()
+    return {'capture':capture,'step':step,'meta':meta,'source':source,'dt':dt,'P':P,'N':N,'temp':temp,'final':final,'lines':lines,'b':b,'receipt':receipt,'rows':rows,'atoms':atoms,'species':species,'mass':mass,'cell':cell,'q':q,'p':p,'F':F,'U':U,'images':images,'observer':observer,'observer_present':observer_present,'observer_active':observer_active}
 
 def prepare(parent,step,dest,steps):
-    if steps<=0: raise ValueError('steps must be positive')
+    if not 0<steps<=2147483647: raise ValueError('steps must be a positive int')
     a=load(parent,step); q=a['q']; cell=a['cell']
     if np.any(q < -cell) or np.any(q > 2*cell): raise ValueError('lift outside one-wrap range')
     potential=a['b']['potential'][1]
@@ -134,8 +138,6 @@ def verify(captures,output):
             if run['b']['read_pimd_restart'][1]!='restart_beads.xyz': raise ValueError('child restart input differs from receipt')
             expected={name:sha(capture.parent/name) for name in ('run.in','model.xyz','restart_beads.xyz',run['b']['potential'][1])}
             if manifest['child_input_sha256']!=expected: raise ValueError('child input receipt mismatch')
-            for item in (run,previous):
-                if not re.fullmatch('[0-9a-fA-F]{40}',item['source'].get('build_git_commit','')) or item['source'].get('build_git_dirty') not in ('yes','no'): raise ValueError('build identity unavailable')
             for key in ('bead_force_backend','model_sha256','build_git_commit','build_git_dirty'):
                 if run['source'].get(key)!=previous['source'].get(key): raise ValueError('source identity mismatch: '+key)
             for key in ('P','N','dt_fs','temperature_K','cell_angstrom','reference_id','reference_source_sha256','checkpoint_stride'):
@@ -149,7 +151,7 @@ def verify(captures,output):
             for name in ('b','d2','j2'):
                 x=previous['rows'][-1][1][name]; y=start['rows'][0][1][name]; diffs[name]=None if x is None or y is None else maximum(x-y)
             links.append({'q_lift_max_A':dq,'p_max_eV_fs_per_A':dp,'force_image_changed_components':images,'F_max_eV_per_A':maximum(start['F']-previous['F']),'U_bead_max_eV':maximum(start['U']-previous['U']),'observer_max_abs':diffs})
-        segments.append({'capture':str(capture),'end_step':end,'absolute_step_start':absolute,'absolute_step_end':absolute+end,'boundary_truncated':end<run['final'],'checkpoint_sha256':sha(run['receipt']),'metadata_sha256':sha(capture/'metadata.txt'),'source_identity_sha256':sha(capture/'source_identity.txt'),'source_identity':run['source'],'build_binding':'known' if run['source'].get('build_git_commit','UNAVAILABLE')!='UNAVAILABLE' else 'unavailable'})
+        segments.append({'capture':str(capture),'end_step':end,'absolute_step_start':absolute,'absolute_step_end':absolute+end,'boundary_truncated':end<run['final'],'checkpoint_sha256':sha(run['receipt']),'metadata_sha256':sha(capture/'metadata.txt'),'source_identity_sha256':sha(capture/'source_identity.txt'),'source_identity':run['source'],'build_binding':'clean_git_label_not_binary_hash','observer_state':{'requested':run['observer'],'identity_present':run['observer_present'],'active_at_endpoint':run['observer_active']}})
         for local,(raw,_) in enumerate(run['rows']):
             if index and local==0: continue
             allrows.append({'absolute_step':absolute+local,'absolute_time_fs':(absolute+local)*run['dt'],'capture':str(capture),'local_step':local,'scalar_line':raw.decode('utf8').rstrip('\n')})

@@ -39,6 +39,23 @@ class ChainTests(unittest.TestCase):
             (d/f'checkpoint_{i}.txt').write_text(''.join(k+' '+v+'\n' for k,v in data.items()))
         (d/'scalar.txt').write_bytes((''.join(rows)+'2 partial').encode()); (d/'COMPLETE').write_text('r164_diagnostic_v1 final_step 1\n')
         return d
+    def test_dirty_and_unknown_build_rejected(self):
+        source=self.capture/'source_identity.txt'; original=source.read_text()
+        for identity in ('build_git_dirty yes', 'build_git_dirty unknown'):
+            source.write_text(original.replace('build_git_dirty no',identity))
+            with self.assertRaisesRegex(ValueError,'clean Git build identity'): chain.load(self.capture,1)
+    def test_timestep_rounding_and_step_bounds(self):
+        meta=chain.keyfile(self.capture/'metadata.txt'); source=chain.keyfile(self.capture/'source_identity.txt')
+        meta['dt_fs']=format(__import__('math').nextafter(.1,1),'.17g')
+        chain.config(self.capture,meta,source)
+        with self.assertRaisesRegex(ValueError,'positive int'): chain.prepare(self.capture,1,self.root.parent/'new',2147483648)
+    def test_observer_identity_rejected_if_mismatched(self):
+        (self.capture/'observer.txt').write_text('model_sha256 wrong\nrun_in_sha256 wrong\npppm_spacing 0.5\n')
+        with self.assertRaisesRegex(ValueError,'observer-off'): chain.load(self.capture,1)
+        card=self.root/'run.in'; card.write_text(card.read_text().replace('1 checkpoint','1 observer checkpoint'))
+        src=self.capture/'source_identity.txt'; src.write_text(src.read_text().replace(chain.keyfile(src)['run_in_sha256'],chain.sha(card)))
+        receipt=self.capture/'checkpoint_1.txt'; receipt.write_text(receipt.read_text().replace(chain.keyfile(receipt)['source_identity_sha256'],chain.sha(src)))
+        with self.assertRaisesRegex(ValueError,'observer identity mismatch'): chain.load(self.capture,1)
     def test_prefix_and_missing_receipt(self):
         chain.load(self.capture,1)
         (self.capture/'checkpoint_1.txt').unlink()
