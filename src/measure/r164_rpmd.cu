@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <sstream>
 #include <limits>
+#include <cstdint>
 #include <new>
 #include <utility>
 #include <sys/stat.h>
@@ -115,7 +116,9 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
 #endif
   if (created != 0) PRINT_INPUT_ERROR("r164_rpmd output directory must not already exist and its parent must exist.");
   std::ostringstream meta;
-  meta << std::setprecision(17) << "schema r164_diagnostic_v1\nstorage binary64_text_17_digits; force_backend_precision not_certified\n"
+  meta << std::setprecision(17) << "schema r164_diagnostic_v1\nstorage "
+       << (buffered_ ? "binary64_series_text_and_binary_snapshots_v1" : "binary64_text_17_digits")
+       << "; force_backend_precision not_certified\n"
        << "layout q_p_F: bead,atom,xyz; U: bead\nreference_id R27_fixed_2OH_R157\nreference_source_sha256 1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa\nreference_atom_identity_and_environment UNVERIFIED\nunits q=angstrom p=eV_fs_per_angstrom F=eV_per_angstrom U=eV time=fs\n"
        << "flow_b UNVERIFIED_OR_UNAVAILABLE\nd2 R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT\nJ2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\n"
        << "checkpoint " << (checkpoint_stride_ ? "FRESH_REBUILD_ONLY" : "BLOCKED") << "\n"
@@ -123,7 +126,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
        << "time_convention step_times_fixed_dt_start_zero\n"
        << "number_increment " << (buffered_ ? "UNAVAILABLE_buffered_mode" : "lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment") << "\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
-  if (buffered_) meta << "buffered_sample_stride " << sample_stride_ << "\n";
+  if (buffered_) meta << "buffered_sample_stride " << sample_stride_ << "\nbuffered_frame_stride " << stride_ << "\nbuffered_snapshot_format binary_v1\n";
   if (drift_charge_requested_) meta << "drift_charge observer_frame_natural_units\n";
   if (checkpoint_stride_) meta << "checkpoint_stride " << checkpoint_stride_ << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
@@ -264,11 +267,18 @@ void R164_RPMD::write_snapshot(int step, const std::vector<double>& q, const std
 void R164_RPMD::prepare_buffered(int total) {
   if (!buffered_) return;
   buffered_total_=total;
+  if (stride_>0) {
+    const uint16_t endian=1;
+    if (*reinterpret_cast<const unsigned char*>(&endian)!=1 || sizeof(double)!=8 ||
+        !std::numeric_limits<double>::is_iec559 || sizeof(long long)!=8)
+      PRINT_INPUT_ERROR("r164_rpmd binary snapshots require little-endian IEEE binary64 and 64-bit images.");
+  }
   const size_t sample_count=static_cast<size_t>(total)/sample_stride_+1;
   const size_t frame_count=stride_>0 ? 1+static_cast<size_t>(total)/stride_+(total%stride_!=0 ? 1 : 0) : 0;
-  const double bytes=static_cast<double>(frame_count)*(static_cast<double>(p_)*n_*(9*sizeof(double)+3*sizeof(long long))+static_cast<double>(p_)*sizeof(double))
-      +static_cast<double>(sample_count)*sizeof(SeriesRow);
-  if (stride_>0) printf("r164_rpmd buffered output estimates %.3f GiB host memory for %zu snapshots and %zu samples; choose sparse frames for large runs.\n",bytes/(1024.0*1024.0*1024.0),frame_count,sample_count);
+  const double base=static_cast<double>(frame_count)*static_cast<double>(p_)*n_;
+  const double extra=static_cast<double>(frame_count)*p_*sizeof(double)+static_cast<double>(sample_count)*sizeof(SeriesRow);
+  const double unit=1024.0*1024.0*1024.0;
+  if (stride_>0) printf("r164_rpmd buffered output estimates %.3f GiB (int8 images) to %.3f GiB (int64 images) host memory for %zu snapshots and %zu samples; choose sparse frames for large runs.\n",(base*(9*sizeof(double)+3)+extra)/unit,(base*(9*sizeof(double)+3*sizeof(long long))+extra)/unit,frame_count,sample_count);
   try { series_.reserve(sample_count); snapshots_.reserve(frame_count); }
   catch (const std::bad_alloc&) { PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered output; reduce frame or sample frequency."); }
 }
@@ -280,7 +290,29 @@ void R164_RPMD::finish_buffered(Atom& atom) {
   write_text("metadata.txt",metadata_text_);
   write_text("source_identity.txt",identity_text_);
   write_text("observer.txt",observer_text_);
-  for (const auto& snapshot:snapshots_) write_snapshot(snapshot.step,snapshot.q,snapshot.v,snapshot.f,snapshot.energy,snapshot.images,atom);
+  if (!snapshots_.empty()) {
+    const std::string binary_path=directory_+"/snapshots.bin";
+    rpmd_ja_file_io::ofstream binary(binary_path+".tmp",std::ios::binary);
+    const char magic[8]={'R','1','6','4','S','N','A','P'};
+    const uint32_t header[4]={1,static_cast<uint32_t>(p_),static_cast<uint32_t>(n_),static_cast<uint32_t>(snapshots_.size())};
+    binary.write(magic,sizeof(magic)); binary.write(reinterpret_cast<const char*>(header),sizeof(header));
+    for (auto& snapshot:snapshots_) {
+      const uint32_t record[2]={static_cast<uint32_t>(snapshot.step),static_cast<uint32_t>(snapshot.image_width)};
+      binary.write(reinterpret_cast<const char*>(record),sizeof(record));
+      binary.write(reinterpret_cast<const char*>(snapshot.energy.data()),snapshot.energy.size()*sizeof(double));
+      binary.write(reinterpret_cast<const char*>(snapshot.q.data()),snapshot.q.size()*sizeof(double));
+      for (int bead=0;bead<p_;++bead) for (int d=0;d<3;++d) for (int i=0;i<n_;++i) {
+        const int j=bead*3*n_+d*n_+i;
+        snapshot.v[j]=atom.cpu_mass[i]*TIME_UNIT_CONVERSION*snapshot.v[j];
+      }
+      binary.write(reinterpret_cast<const char*>(snapshot.v.data()),snapshot.v.size()*sizeof(double));
+      binary.write(reinterpret_cast<const char*>(snapshot.f.data()),snapshot.f.size()*sizeof(double));
+      binary.write(reinterpret_cast<const char*>(snapshot.images.data()),snapshot.images.size());
+    }
+    binary.close();
+    if (!binary || rpmd_ja_file_io::atomic_commit_new_file(binary_path+".tmp",binary_path)!=0)
+      PRINT_INPUT_ERROR("r164_rpmd failed committing binary snapshots.");
+  }
   const std::string path=directory_+"/series.txt";
   rpmd_ja_file_io::ofstream out(path+".tmp"); out << std::setprecision(17);
   out << "# schema r164_buffered_series_v1\n# sample_stride " << sample_stride_
@@ -517,7 +549,16 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       std::vector<double> energy(p_,0.0);
       for (int bead=0;bead<p_;++bead) for (int i=0;i<n_;++i) energy[bead]+=u[bead*n_+i];
       if (buffered_) {
-        Snapshot frame; frame.step=step; frame.q=q_; frame.images=force_images_; frame.energy=std::move(energy);
+        Snapshot frame; frame.step=step; frame.q=q_; frame.energy=std::move(energy);
+        const auto range=std::minmax_element(force_images_.begin(),force_images_.end());
+        const long long lo=*range.first, hi=*range.second;
+        frame.image_width=(lo>=INT8_MIN && hi<=INT8_MAX) ? 1 : (lo>=INT16_MIN && hi<=INT16_MAX) ? 2 :
+                          (lo>=INT32_MIN && hi<=INT32_MAX) ? 4 : 8;
+        frame.images.resize(force_images_.size()*frame.image_width);
+        for (size_t i=0;i<force_images_.size();++i) {
+          const uint64_t bits=static_cast<uint64_t>(force_images_[i]);
+          for (int j=0;j<frame.image_width;++j) frame.images[i*frame.image_width+j]=static_cast<unsigned char>(bits>>(8*j));
+        }
         frame.v=std::move(v); frame.f=std::move(f); snapshots_.push_back(std::move(frame));
       } else write_snapshot(step,q_,v,f,energy,force_images_,atom);
     } catch (const std::bad_alloc&) {

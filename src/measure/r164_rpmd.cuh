@@ -46,7 +46,8 @@ private:
   struct Snapshot {
     int step;
     std::vector<double> q, v, f, energy;
-    std::vector<long long> images;
+    int image_width;
+    std::vector<unsigned char> images;
   };
   std::vector<Snapshot> snapshots_;
   std::string metadata_text_, identity_text_, observer_text_;
