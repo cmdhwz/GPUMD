@@ -33,7 +33,7 @@ inline Value evaluate(const Config& c, double q, double Q) {
   v.h={{2*a[2]+6*a[3]*q+12*a[4]*q*q+2*a[8]*Q,a[7]+2*a[8]*q,a[7]+2*a[8]*q,a[5]}};
   return v;
 }
-inline bool near(double a,double b) { return std::isfinite(a) && std::isfinite(b) && std::fabs(a-b)<=1e-9*std::max(1.,std::max(std::fabs(a),std::fabs(b))); }
+inline bool nearly_equal(double a,double b) { return std::isfinite(a) && std::isfinite(b) && std::fabs(a-b)<=1e-9*std::max(1.,std::max(std::fabs(a),std::fabs(b))); }
 inline void need(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
 inline void key(std::istream& in,const char* name) { std::string s; need(bool(in>>s)&&s==name,"U9 config: missing, duplicate, reordered, or unknown field"); }
 template<class T, size_t N> inline void values(std::istream& in,std::array<T,N>& a) {
@@ -86,7 +86,7 @@ inline Config read_config(std::istream& in) {
     need(c.indices[i]>=0&&c.types[i]>=0&&c.masses[i]>0&&c.pbc[i]==1,"U9 config: invalid index, type, mass or PBC");
     for(int j=0;j<i;j++) need(c.indices[i]!=c.indices[j],"U9 config: duplicate indices");
   }
-  need(near(c.axis[0]*c.axis[0]+c.axis[1]*c.axis[1]+c.axis[2]*c.axis[2],1),"U9 config: axis is not unit length");
+  need(nearly_equal(c.axis[0]*c.axis[0]+c.axis[1]*c.axis[1]+c.axis[2]*c.axis[2],1),"U9 config: axis is not unit length");
   double det=c.cell[0]*(c.cell[4]*c.cell[8]-c.cell[5]*c.cell[7])-c.cell[1]*(c.cell[3]*c.cell[8]-c.cell[5]*c.cell[6])+c.cell[2]*(c.cell[3]*c.cell[7]-c.cell[4]*c.cell[6]);
   need(std::isfinite(det)&&det>1e-12,"U9 config: invalid cell");
   double inv[9]={
@@ -100,23 +100,23 @@ inline Config read_config(std::istream& in) {
   }
   double G[4]={};
   for(int i=0;i<9;i++) for(int a=0;a<2;a++) for(int b=0;b<2;b++) G[2*a+b]+=c.masses[i/3]*c.A[2*i+a]*c.A[2*i+b];
-  for(int i=0;i<4;i++) need(near(G[i],c.G[i]),"U9 config: G does not equal A transpose M A");
+  for(int i=0;i<4;i++) need(nearly_equal(G[i],c.G[i]),"U9 config: G does not equal A transpose M A");
   double gd=G[0]*G[3]-G[1]*G[2];
   need(std::isfinite(gd) && G[0]>0&&G[3]>0&&gd>1e-12*G[0]*G[3],"U9 config: G is singular or indefinite");
   for(int a=0;a<2;a++) for(int b=0;b<2;b++) {
     double x=0; for(int j=0;j<2;j++) x+=G[2*a+j]*c.C[2*j+b];
-    need(near(x,a==b?1.:0.),"U9 config: C is not inverse G");
+    need(nearly_equal(x,a==b?1.:0.),"U9 config: C is not inverse G");
   }
   for(int a=0;a<2;a++) for(int b=0;b<2;b++) {
     double x=0; for(int d=0;d<3;d++) {
       double l=c.A[2*d+b],h=c.A[2*(3+d)+b],r=c.A[2*(6+d)+b];
       x+=c.axis[d]*(a==0 ? h-.5*(l+r) : r-l);
     }
-    need(near(x,a==b?1.:0.),"U9 config: physical coordinate Jacobian A is not identity");
+    need(nearly_equal(x,a==b?1.:0.),"U9 config: physical coordinate Jacobian A is not identity");
   }
   double z[2]={0,-c.d0};
   for(int d=0;d<3;d++) { z[0]+=c.axis[d]*(c.r0[3+d]-.5*(c.r0[d]+c.r0[6+d])); z[1]+=c.axis[d]*(c.r0[6+d]-c.r0[d]); }
-  need(near(z[0],c.z0[0])&&near(z[1],c.z0[1]),"U9 config: R0 and z0 disagree");
+  need(nearly_equal(z[0],c.z0[0])&&nearly_equal(z[1],c.z0[1]),"U9 config: R0 and z0 disagree");
   for(const auto& point:{c.left,c.right}) {
     auto v=evaluate(c,point[0],point[1]);
     need(std::isfinite(v.u)&&std::isfinite(v.g[0])&&std::isfinite(v.g[1])&&std::isfinite(v.h[0])&&std::isfinite(v.h[1])&&std::isfinite(v.h[3]),"U9 config: reference overflow");

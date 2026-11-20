@@ -26,7 +26,7 @@ __global__ void gather_oho(int n,const int* indices,const double* r,const double
 void fail(const std::string& message) { PRINT_INPUT_ERROR(message.c_str()); }
 void check_cell(const u9_oho::Config& c,const Box& box) {
   if(box.pbc_x!=1 || box.pbc_y!=1 || box.pbc_z!=1) fail("U9 diagnostic requires 3D PBC.");
-  for(int i=0;i<9;i++) if(!std::isfinite(box.cpu_h[i]) || !u9_oho::near(c.cell[i],box.cpu_h[i])) fail("U9 diagnostic cell changed or differs from reference.");
+  for(int i=0;i<9;i++) if(!std::isfinite(box.cpu_h[i]) || !u9_oho::nearly_equal(c.cell[i],box.cpu_h[i])) fail("U9 diagnostic cell changed or differs from reference.");
 }
 bool compatible_output() {
   errno=0;
@@ -70,7 +70,7 @@ void U9OHO::pre_run(int steps,double dt,Integrate& integrate,std::vector<Group>&
   if(!hac_ || !hac_->u9_compatible() || hac_->sample_interval>steps) fail("U9 diagnostic requires one immediate, unsplit centroid HAC with samples.");
   if(integrate.get_type()!=EnsembleType::RPMD && integrate.get_type()!=EnsembleType::PIMD) fail("U9 diagnostic requires RPMD or PIMD.");
   if(atom.number_of_beads<2 || atom.position_beads.size()!=static_cast<size_t>(atom.number_of_beads) || atom.velocity_beads.size()!=static_cast<size_t>(atom.number_of_beads) || integrate.get_deform_x()!=0 || integrate.get_deform_y()!=0 || integrate.get_deform_z()!=0 || integrate.get_deform_xy()!=0 || integrate.get_deform_xz()!=0 || integrate.get_deform_yz()!=0 || integrate.get_num_target_pressure_components()>0 || integrate.get_use_scr_barostat() || integrate.get_use_eco_pimd()) fail("U9 diagnostic requires fixed-cell primitive ring polymer.");
-  if(!std::isfinite(dt)||dt<=0 || !u9_oho::near(integrate.get_temperature1(),config_.temperature) || !u9_oho::near(integrate.get_temperature2(),config_.temperature)) fail("U9 diagnostic requires fixed positive time step and matching temperature.");
+  if(!std::isfinite(dt)||dt<=0 || !u9_oho::nearly_equal(integrate.get_temperature1(),config_.temperature) || !u9_oho::nearly_equal(integrate.get_temperature2(),config_.temperature)) fail("U9 diagnostic requires fixed positive time step and matching temperature.");
   std::uint64_t model_fnv=0, config_fnv=0;
   try {
     if(!hac_->u9_qnep_identity(force,atom,model_fnv,config_fnv)) fail("U9 diagnostic requires a verified charge1/2 qNEP PPPM stage without DFTD3 or Eco-PIMD.");
@@ -82,7 +82,7 @@ void U9OHO::pre_run(int steps,double dt,Integrate& integrate,std::vector<Group>&
   if(atom.cpu_atom_symbol.size()!=static_cast<size_t>(atom.number_of_atoms)) fail("U9 diagnostic requires O-H-O element metadata.");
   for(int i=0;i<3;i++) {
     int index=config_.indices[i];
-    if(index>=atom.number_of_atoms || atom.cpu_type[index]!=config_.types[i] || !u9_oho::near(atom.cpu_mass[index],config_.masses[i])) fail("U9 diagnostic atom index, type or mass mismatch.");
+    if(index>=atom.number_of_atoms || atom.cpu_type[index]!=config_.types[i] || !u9_oho::nearly_equal(atom.cpu_mass[index],config_.masses[i])) fail("U9 diagnostic atom index, type or mass mismatch.");
     if(atom.cpu_atom_symbol[index]!=(i==1 ? "H" : "O")) fail("U9 diagnostic requires O-H-O element identities; D uses symbol H with isotope mass.");
   }
   check_cell(config_,box); box.get_inverse();

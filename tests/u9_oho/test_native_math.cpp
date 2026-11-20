@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
   double next[9]; for(int i=0;i<9;i++) next[i]=displaced[i]+1e-6*velocity[i];
   auto next_projection=u9_oho::project(unequal,next,velocity);
   for(int a=0;a<2;a++) assert(std::fabs((next_projection.z[a]-unequal_projection.z[a])/1e-6-unequal_projection.velocity[a])<1e-9);
-  assert(!u9_oho::near(INFINITY, 1.));
+  assert(!u9_oho::nearly_equal(INFINITY, 1.));
   double h[18]={10,0,0,0,10,0,0,0,10,.1,0,0,0,.1,0,0,0,.1};
   double raw[9]={9,0,0,0,0,0,1,0,0},last[9]={},continuous[9]={};
   u9_oho::advance(cfg,h,raw,last,continuous,true);
