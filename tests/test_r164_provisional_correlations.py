@@ -37,6 +37,14 @@ class CorrelationTests(unittest.TestCase):
             with self.assertRaises(ValueError): corr.analyze([d,d],2)
             copy=d/'copy'; copy.mkdir(); self.fixture(copy)
             with self.assertRaises(ValueError): corr.analyze([d,copy],2)
+    def test_eh_one_interval_identity(self):
+        x=np.arange(108,dtype=float).reshape(6,18)**1.1
+        result=corr.eh_diagnostic([x],0.2,1)
+        self.assertEqual(result['origin_count'],5)
+        np.testing.assert_allclose(result['eh_covariance_over_2t'],result['triangular_correlation_integral'],rtol=1e-12,atol=1e-12)
+        self.assertLess(np.max(np.abs(result['finite_sample_residual'])),1e-12)
+        self.assertIsNone(corr.eh_diagnostic([x[:2]],0.2,1)['eh_covariance_over_2t'])
+
     def test_reject_missing_hole_and_bad_j(self):
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp); self.fixture(d); scalar=d/'scalar.txt'; original=scalar.read_text(encoding='utf8')

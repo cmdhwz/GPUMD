@@ -117,6 +117,41 @@ def integral(c, dt):
     return out
 
 
+def eh_diagnostic(traces, dt, window):
+    bins=[(trace[:-1]+trace[1:])*0.5 for trace in traces]
+    total_bins=sum(len(x) for x in bins)
+    mean=sum((x.sum(axis=0) for x in bins),np.zeros(18))/total_bins
+    origin_count=sum(max(0,len(x)-window+1) for x in bins)
+    result={'window_intervals':window, 'window_fs':window*dt, 'interval_bin_count':total_bins,
+            'origin_count':origin_count, 'interval_mean':mean.tolist(),
+            'units':'outer product of vector units multiplied by fs; no volume or temperature normalization',
+            'scope':'regular-only; no event increments, no cross-trace windows, no conductivity',
+            'centering':'EH increments centered over actual origins; triangular correlation uses common interval-bin mean',
+            'eh_covariance_over_2t':None, 'triangular_correlation_integral':None, 'finite_sample_residual':None}
+    if origin_count < 2 or any(len(x)<window for x in bins):
+        result['support']='INSUFFICIENT_CONTIGUOUS_ORIGINS'
+        return result
+    increments=[]
+    for x in bins:
+        prefix=np.vstack((np.zeros((1,18)),np.cumsum(x*dt,axis=0)))
+        increments.append(prefix[window:]-prefix[:-window])
+    increments=np.concatenate(increments,axis=0)
+    centered=increments-increments.mean(axis=0)
+    eh=centered.T@centered/(origin_count*2*window*dt)
+    numerator=np.zeros((18,18)); counts=[]
+    for lag in range(window):
+        term=np.zeros((18,18)); count=0
+        for x in bins:
+            n=len(x)-lag; z=x-mean
+            term+=z[:n].T@z[lag:lag+n]; count+=n
+        c=term/count; counts.append(count)
+        numerator += (0.5*c if lag==0 else (1-lag/window)*(c+c.T)*0.5)
+    triangular=dt*numerator
+    result.update(support='FINITE_SAMPLE_ONLY', interval_sample_counts=counts,
+                  eh_covariance_over_2t=eh.tolist(), triangular_correlation_integral=triangular.tolist(),
+                  finite_sample_residual=(eh-triangular).tolist())
+    return result
+
 def analyze(directories, max_lag):
     if max_lag <= 0:
         raise ValueError('max lag must be positive')
@@ -158,6 +193,7 @@ def analyze(directories, max_lag):
         'axes': 'C[lag,i,j] uses time-zero i and later-time j; vector order b_xyz,d2_xyz,N_O_xyz,N_H_xyz,N_Na_xyz,N_Cl_xyz',
         'units': {'b_d2':'eV angstrom/fs','species':'angstrom/fs','correlation':'outer product of vector units',
                   'integral':'correlation units multiplied by fs; no volume or temperature normalization'},
+        'eh_regular_only':eh_diagnostic(traces,loaded[0][3],max_lag),
         'dt_fs': loaded[0][3], 'temperature_K': loaded[0][4], 'cell_angstrom': loaded[0][5].tolist(),
         'max_lag': max_lag, 'sample_counts': counts, 'mean_shared_all_samples': mean.tolist(),
         'C_full_18x18': c.tolist(), 'C_bb':bb.tolist(), 'C_bd':bd.tolist(), 'C_db':db.tolist(), 'C_dd':dd.tolist(),
