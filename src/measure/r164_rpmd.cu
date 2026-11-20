@@ -63,6 +63,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
     PRINT_INPUT_ERROR("r164_rpmd requires an orthogonal periodic cell, positive temperature and dt, and a fresh run.");
   n_=atom.number_of_atoms; p_=atom.number_of_beads; temperature_=temperature; dt_=dt; box_for_observer_=box;
   previous_force_images_.clear(); force_images_.clear();
+  if (checkpoint_stride_) scalar_prefix_digest_=rpmd_ja_sha256::Digest();
   if (n_ <= 0 || p_ < 2) PRINT_INPUT_ERROR("r164_rpmd requires loaded bead arrays.");
   for (int d=0; d<3; ++d) { lengths_[d]=box.cpu_h[d*4]; if (!std::isfinite(lengths_[d]) || !(lengths_[d]>0)) PRINT_INPUT_ERROR("r164_rpmd invalid box."); }
   for (const auto& species : atom.cpu_atom_symbol)
@@ -430,6 +431,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   const std::string scalar_line=scalar.str();
   scalar_file << scalar_line;
   scalar_file.close(); if (!scalar_file) PRINT_INPUT_ERROR("r164_rpmd failed closing scalar output.");
+  if (checkpoint_stride_) scalar_prefix_digest_.update(reinterpret_cast<const unsigned char*>(scalar_line.data()),scalar_line.size());
   if (checkpoint) {
     const std::string suffix=std::to_string(step)+".txt";
     const std::string metadata_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/metadata.txt");
@@ -437,14 +439,16 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     const std::string frame_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/frame_"+suffix);
     const std::string image_hash=rpmd_ja_sample_provenance::sha256_file(directory_+"/force_images_"+suffix);
     const std::string scalar_hash=rpmd_ja_sample_provenance::sha256_text(scalar_line);
-    if (metadata_hash.size()!=64 || identity_hash.size()!=64 || frame_hash.size()!=64 || image_hash.size()!=64 || scalar_hash.size()!=64)
+    auto prefix_digest=scalar_prefix_digest_;
+    const std::string prefix_hash=prefix_digest.finish_hex();
+    if (metadata_hash.size()!=64 || identity_hash.size()!=64 || frame_hash.size()!=64 || image_hash.size()!=64 || scalar_hash.size()!=64 || prefix_hash.size()!=64)
       PRINT_INPUT_ERROR("r164_rpmd failed hashing checkpoint inputs.");
     const std::string path=directory_+"/checkpoint_"+suffix;
     rpmd_ja_file_io::ofstream receipt(path+".tmp");
     receipt << std::setprecision(17) << "schema r164_checkpoint_v1\nstep " << step << "\ntime_fs " << time_fs
             << "\nmetadata_sha256 " << metadata_hash << "\nsource_identity_sha256 " << identity_hash
             << "\nframe_sha256 " << frame_hash << "\nforce_images_sha256 " << image_hash
-            << "\nscalar_line_sha256 " << scalar_hash << "\ncache_policy fresh_rebuild_only\nphysical_event_history unavailable\n";
+            << "\nscalar_line_sha256 " << scalar_hash << "\nscalar_prefix_sha256 " << prefix_hash << "\ncache_policy fresh_rebuild_only\nphysical_event_history unavailable\n";
     receipt.close();
     if (!receipt || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
       PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.");

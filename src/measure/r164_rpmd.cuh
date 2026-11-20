@@ -1,5 +1,6 @@
 #pragma once
 #include "force/nep_charge.cuh"
+#include "rpmd_ja_sha256.h"
 #include "model/box.cuh"
 #include <memory>
 #include <string>
@@ -23,6 +24,7 @@ private:
   double temperature_ = 0, dt_ = 0, lengths_[3] = {};
   std::string directory_;
   bool observer_requested_ = false;
+  rpmd_ja_sha256::Digest scalar_prefix_digest_;
   std::unique_ptr<NEP_Charge> observer_;
   Box box_for_observer_;
   GPU_Vector<double> observer_q_, observer_u_, observer_f_, observer_virial_, observer_v_, observer_site_rate_, observer_gradient_, observer_local_, observer_local_image_;
