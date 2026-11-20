@@ -131,7 +131,7 @@ INC = -I./ -Iforce -Ilib/wpe -I"$(WPE_INTEGRATION)" -I"$(WPE_INCLUDE)"
 LDFLAGS =
 LIBS = -lcublas -lcusolver -lcufft
 LIBS += -lpthread
-GPUMD_R164_ZSTD ?= 0
+GPUMD_R164_ZSTD ?= 1
 GPUMD_R164_ZSTD_CFLAGS ?=
 GPUMD_R164_ZSTD_LDFLAGS ?=
 ifeq ($(GPUMD_R164_ZSTD),1)
