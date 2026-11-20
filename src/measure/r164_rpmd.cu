@@ -33,6 +33,7 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
   if (observer_requested_) ++next;
   drift_charge_requested_ = observer_requested_ && next<t.size() && t[next]=="drift_charge";
   if (drift_charge_requested_) ++next;
+  buffered_=false; sample_stride_=0; series_.clear();
   checkpoint_stride_=0; trace_step_=-1;
   auto decimal = [](const std::string& text, int& value) {
     if (text.empty()) return false;
@@ -43,6 +44,14 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
     }
     return true;
   };
+  if (next<t.size() && t[next]=="buffered") {
+    if (!observer_requested_ || drift_charge_requested_ || next+1>=t.size() ||
+        !decimal(t[next+1],sample_stride_) || sample_stride_<=0)
+      PRINT_INPUT_ERROR("r164_rpmd buffered requires observer and a positive decimal sample stride.");
+    buffered_=true; next+=2;
+  }
+  if (buffered_ && next<t.size())
+    PRINT_INPUT_ERROR("r164_rpmd buffered cannot be combined with checkpoint, drift_charge or pppm_trace; use legacy diagnostic mode.");
   if (next<t.size() && t[next]=="checkpoint") {
     if (next+1>=t.size() || !decimal(t[next+1],checkpoint_stride_) || checkpoint_stride_<=0)
       PRINT_INPUT_ERROR("r164_rpmd checkpoint requires a positive decimal int stride.");
@@ -110,8 +119,9 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
        << "checkpoint " << (checkpoint_stride_ ? "FRESH_REBUILD_ONLY" : "BLOCKED") << "\n"
        << "P " << p_ << "\nN " << n_ << "\ntemperature_K " << temperature_ << "\ndt_fs " << dt*TIME_UNIT_CONVERSION << "\n"
        << "time_convention step_times_fixed_dt_start_zero\n"
-       << "number_increment lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment\n"
+       << "number_increment " << (buffered_ ? "UNAVAILABLE_buffered_mode" : "lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment") << "\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
+  if (buffered_) meta << "buffered_sample_stride " << sample_stride_ << "\n";
   if (drift_charge_requested_) meta << "drift_charge observer_frame_natural_units\n";
   if (checkpoint_stride_) meta << "checkpoint_stride " << checkpoint_stride_ << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
@@ -156,25 +166,25 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
       stage.pimd_beads != p_ || stage.dftd3_enabled != 0 ||
       (stage.facts & WPE_STAGE_PIMD_ECO_CONFIGURATION) != 0 ||
       stage.qnep_kspace_method != WPE_QNEP_KSPACE_PPPM) {
-    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: incompatible WPE stage.");
+    if (drift_charge_requested_ || buffered_) PRINT_INPUT_ERROR("r164_rpmd drift_charge or buffered requires an available private observer: incompatible WPE stage.");
     printf("r164_rpmd centroid observer BLOCKED: incompatible WPE stage.\n"); return;
   }
   model=get_first_potential_filename(force.get_run_input()); spacing=stage.qnep_pppm_spacing;
 #else
   if (force.potentials.size()!=1 || force.get_run_input().contains("dftd3")) {
-    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: incompatible potential configuration.");
+    if (drift_charge_requested_ || buffered_) PRINT_INPUT_ERROR("r164_rpmd drift_charge or buffered requires an available private observer: incompatible potential configuration.");
     printf("r164_rpmd centroid observer BLOCKED: incompatible potential configuration.\n"); return;
   }
   auto* active=dynamic_cast<NEP_Charge*>(force.potentials[0].get());
   if (!active || active->get_charge_mode()!=2 || !active->uses_pppm()) {
-    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: needs charge2 PPPM.");
+    if (drift_charge_requested_ || buffered_) PRINT_INPUT_ERROR("r164_rpmd drift_charge or buffered requires an available private observer: needs charge2 PPPM.");
     printf("r164_rpmd centroid observer BLOCKED: needs charge2 PPPM.\n"); return;
   }
   model=force.primary_nep_model_path(); spacing=active->get_pppm_mesh_spacing();
 #endif
   rpmd_ja_file_io::ifstream in(model); std::string kind; in >> kind;
   if (!in || kind != "nep4_charge2" || !std::isfinite(spacing) || spacing < 0.2 || spacing > 2.0) {
-    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: unsupported model or PPPM spacing.");
+    if (drift_charge_requested_ || buffered_) PRINT_INPUT_ERROR("r164_rpmd drift_charge or buffered requires an available private observer: unsupported model or PPPM spacing.");
     printf("r164_rpmd centroid observer BLOCKED: unsupported model or PPPM spacing.\n"); return;
   }
   std::ostringstream kspace; kspace << std::setprecision(17) << "kspace pppm " << spacing;
@@ -195,7 +205,7 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
     PRINT_INPUT_ERROR("r164_rpmd failed committing observer identity.");
 }
 void R164_RPMD::capture_drift(Atom& atom) {
-  std::vector<double> current; read_positions(atom,current);
+  read_positions(atom,position_scratch_); const auto& current=position_scratch_;
   if (next_output_step_<=0 || drift_pending_) PRINT_INPUT_ERROR("r164_rpmd invalid drift capture sequence.");
   for (auto& species : number_increment_) for (double& value : species) value=0;
   for (int s=0; s<p_; ++s) for (int d=0; d<3; ++d) for (int i=0; i<n_; ++i) {
@@ -212,7 +222,7 @@ void R164_RPMD::capture_drift(Atom& atom) {
   drift_pending_=true;
 }
 void R164_RPMD::check_force_positions(Atom& atom) {
-  std::vector<double> current; read_positions(atom,current);
+  read_positions(atom,position_scratch_); const auto& current=position_scratch_;
   force_images_.resize(q_.size());
   for (int s=0; s<p_; ++s) for (int d=0; d<3; ++d) for (int i=0; i<n_; ++i) {
     int j=s*n_*3+d*n_+i;
@@ -224,18 +234,48 @@ void R164_RPMD::check_force_positions(Atom& atom) {
     force_images_[j]=static_cast<long long>(image);
   }
 }
+void R164_RPMD::finish_buffered(int step, int total) {
+  if (step!=total) return;
+  const std::string path=directory_+"/series.txt";
+  rpmd_ja_file_io::ofstream out(path+".tmp"); out << std::setprecision(17);
+  out << "# schema r164_buffered_series_v1\n# sample_stride " << sample_stride_
+      << "\n# units time=fs energy=eV momentum=eV_fs_per_angstrom number_flow=angstrom_per_fs b_d2_J2=eV_angstrom_per_fs\n"
+      << "# validity 1=UNVERIFIED 0=UNAVAILABLE; unavailable values nan\n"
+      << "# columns step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz b_valid bx by bz d2_valid d2x d2y d2z J2_valid J2x J2y J2z\n";
+  const double missing=std::numeric_limits<double>::quiet_NaN();
+  for (const auto& row:series_) {
+    out << row.step << ' ' << row.time << ' ' << row.potential << ' ' << row.kinetic << ' ' << row.spring << ' ' << row.energy;
+    for (double value:row.momentum) out << ' ' << value;
+    for (const auto& flow:row.flows) for (double value:flow) out << ' ' << value;
+    out << ' ' << row.b_valid; for (double value:row.b) out << ' ' << (row.b_valid ? value : missing);
+    out << ' ' << row.d2_valid; for (double value:row.d2) out << ' ' << (row.d2_valid ? value : missing);
+    out << ' ' << row.j2_valid; for (double value:row.j2) out << ' ' << (row.j2_valid ? value : missing);
+    out << '\n';
+  }
+  out.close();
+  if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
+    PRINT_INPUT_ERROR("r164_rpmd failed committing buffered series.");
+  series_.clear(); series_.shrink_to_fit();
+  write_complete(step);
+}
+
+void R164_RPMD::write_complete(int step) {
+  const std::string marker=directory_+"/COMPLETE";
+  rpmd_ja_file_io::ofstream done(marker+".tmp");
+  done << "r164_diagnostic_v1 final_step " << step << "\n"; done.close();
+  if (!done || rpmd_ja_file_io::atomic_commit_new_file(marker+".tmp",marker)!=0)
+    PRINT_INPUT_ERROR("r164_rpmd failed committing completion marker.");
+}
+
 void R164_RPMD::output(int step, int total, Atom& atom) {
   if (step!=next_output_step_ || (step==0 ? drift_pending_ : !drift_pending_))
     PRINT_INPUT_ERROR("r164_rpmd invalid completed-step output sequence.");
   const double time_fs=step*dt_*TIME_UNIT_CONVERSION;
-  std::vector<double> v(p_*n_*3), f(p_*n_*3), u(p_*n_), current;
-  for (int s=0; s<p_; ++s) {
-    atom.velocity_beads[s].copy_to_host(v.data()+s*n_*3);
-    atom.force_beads[s].copy_to_host(f.data()+s*n_*3);
-    atom.potential_beads[s].copy_to_host(u.data()+s*n_);
-  }
+  const bool sample=!buffered_ || step%sample_stride_==0;
+  const bool snapshot=stride_>0 && (step==0 || step==total || step%stride_==0);
+  if (buffered_ && step==0) series_.reserve(static_cast<size_t>(total)/sample_stride_+1);
   // The next drift starts after the integrator maps every bead relative to bead zero.
-  read_positions(atom,current);
+  read_positions(atom,position_scratch_); const auto& current=position_scratch_;
   for (int i=0;i<n_;++i) for (int d=0;d<3;++d) {
     int j=d*n_+i; offset_[j]=q_[j]-current[j];
     double image=std::round(offset_[j]/lengths_[d]);
@@ -249,6 +289,18 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       if (!std::isfinite(delta) || !std::isfinite(expected) || std::abs(std::abs(delta)-lengths_[d]*0.5)<1e-9 || std::abs(delta-expected)>1e-8)
         PRINT_INPUT_ERROR("r164_rpmd BLOCKED: propagation MIC branch differs from continuous lift.");
     }
+  }
+  if (buffered_ && !sample && !snapshot) {
+    drift_pending_=false; ++next_output_step_;
+    finish_buffered(step,total);
+    return;
+  }
+  const bool need_force=!buffered_ || snapshot;
+  std::vector<double> v(p_*n_*3), f(need_force ? p_*n_*3 : 0), u(p_*n_);
+  for (int s=0; s<p_; ++s) {
+    atom.velocity_beads[s].copy_to_host(v.data()+s*n_*3);
+    if (need_force) atom.force_beads[s].copy_to_host(f.data()+s*n_*3);
+    atom.potential_beads[s].copy_to_host(u.data()+s*n_);
   }
   double Q[2]={}, Pi[2]={}, d2[3]={};
   const double mass_factor=TIME_UNIT_CONVERSION*TIME_UNIT_CONVERSION;
@@ -288,13 +340,13 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   for (double value : u) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite potential before observer.");
   for (double mass : atom.cpu_mass) if (!std::isfinite(mass) || mass <= 0) PRINT_INPUT_ERROR("r164_rpmd invalid mass.");
   double observer_conv[3]={}, local_current[3]={}, local_image[3]={}, mechanical[3]={}, mechanical_image[3]={}, relay[3]={}, relay_image[3]={}, projection[3]={}, projection_image[3]={}, chart[3]={}, site_rate_sum=0, gradient_power=0, native_power=0, force_difference_max=0;
-  const bool projection_frame=step==0 || step==total || (stride_ && step%stride_==0);
+  const bool projection_frame=!buffered_ && (step==0 || step==total || (stride_ && step%stride_==0));
   bool tangent_valid=false, mechanical_valid=false, relay_valid=false, projection_valid=false;
   std::vector<double> centroid;
   std::vector<float> raw_D, raw_rate;
   const char* projection_status="charge_diagnostics_unavailable";
   int projection_guard_axis=-1, projection_guard_index=-1;
-  if (observer_) {
+  if (observer_ && sample) {
     centroid.resize(3*n_); std::vector<double> cv(3*n_);
     for (int bead=0; bead<p_; ++bead) for (int j=0; j<3*n_; ++j) {
       centroid[j]+=q_[bead*3*n_+j]/p_; cv[j]+=v[bead*3*n_+j]/p_;
@@ -394,17 +446,23 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     for (int d=0; d<3; ++d) {
       int j=s*n_*3+d*n_+i, next=((s+1)%p_)*n_*3+d*n_+i;
       double velocity=v[j], delta=q_[next]-q_[j];
-      if (!std::isfinite(velocity) || !std::isfinite(delta) || !std::isfinite(f[j]) || !std::isfinite(u[s*n_+i]) || !std::isfinite(mass) || !(mass>0))
+      if (!std::isfinite(velocity) || !std::isfinite(delta) || (need_force && !std::isfinite(f[j])) || !std::isfinite(u[s*n_+i]) || !std::isfinite(mass) || !(mass>0))
         PRINT_INPUT_ERROR("r164_rpmd non-finite or invalid state.");
       kinetic+=0.5*mass*velocity*velocity; spring+=0.5*mass*omega*omega*delta*delta;
       momentum[d]+=mass*TIME_UNIT_CONVERSION*velocity/p_;
       flows[sp][d]+=velocity/TIME_UNIT_CONVERSION/p_;
     }
   }
+  const bool b_valid=observer_ && tangent_valid && mechanical_valid && relay_valid && projection_valid;
+  double candidate[3]={};
+  if (b_valid) for (int d=0;d<3;++d) {
+    candidate[d]=observer_conv[d]+local_current[d]+mechanical[d]+relay[d]+projection[d];
+    if (!std::isfinite(candidate[d])) PRINT_INPUT_ERROR("r164_rpmd nonfinite b candidate.");
+  }
   const bool checkpoint = checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0);
   R164_PPPM_Trace trace;
   const bool trace_here=trace_for_step(step,trace);
-  if (step==0 || step==total || (stride_ && step%stride_==0) || checkpoint || trace_here) {
+  if (snapshot || (!buffered_ && (step==0 || step==total || checkpoint || trace_here))) {
     const std::string frame_path=directory_+"/frame_"+std::to_string(step)+".txt";
     rpmd_ja_file_io::ofstream frame(frame_path+".tmp"); frame << std::setprecision(17);
     for (int s=0; s<p_; ++s) { double energy=0; for (int i=0;i<n_;++i) energy+=u[s*n_+i]; frame << "bead " << s << ' ' << energy << '\n';
@@ -420,6 +478,31 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       images << bead << ' ' << i << ' ' << force_images_[bead*3*n_+i] << ' ' << force_images_[bead*3*n_+n_+i] << ' ' << force_images_[bead*3*n_+2*n_+i] << '\n';
     images.close(); if (!images || rpmd_ja_file_io::atomic_commit_new_file(image_path+".tmp",image_path)!=0)
       PRINT_INPUT_ERROR("r164_rpmd failed committing force images.");
+  }
+  if (buffered_) {
+    if (sample) {
+      SeriesRow row{};
+      row.step=step; row.time=time_fs; row.potential=potential; row.kinetic=kinetic;
+      row.spring=spring; row.energy=(potential+kinetic+spring)/(p_*n_);
+      row.b_valid=b_valid;
+      row.d2_valid=r27_candidate; row.j2_valid=row.b_valid && row.d2_valid;
+      for (int d=0;d<3;++d) {
+        row.momentum[d]=momentum[d];
+        for (int sp=0;sp<4;++sp) row.flows[sp][d]=flows[sp][d];
+        if (row.b_valid) {
+          row.b[d]=candidate[d];
+        }
+        if (row.d2_valid) row.d2[d]=d2[d];
+        if (row.j2_valid) {
+          row.j2[d]=row.b[d]+d2[d];
+          if (!std::isfinite(row.j2[d])) PRINT_INPUT_ERROR("r164_rpmd nonfinite J2 candidate.");
+        }
+      }
+      series_.push_back(row);
+    }
+    drift_pending_=false; ++next_output_step_;
+    finish_buffered(step,total);
+    return;
   }
   if (!previous_force_images_.empty()) {
     size_t changed=0; for (size_t i=0;i<force_images_.size();++i) if (force_images_[i]!=previous_force_images_[i]) ++changed;
@@ -461,11 +544,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     else scalar << " TANGENT_UNAVAILABLE";
   }
   else scalar << " OBSERVER_UNAVAILABLE";
-  if (observer_ && tangent_valid && mechanical_valid && relay_valid && projection_valid) {
-    double candidate[3];
-    for (int d=0;d<3;++d) candidate[d]=observer_conv[d]+local_current[d]+mechanical[d]+relay[d]+projection[d];
-    if (!std::isfinite(candidate[0]) || !std::isfinite(candidate[1]) || !std::isfinite(candidate[2]))
-      PRINT_INPUT_ERROR("r164_rpmd nonfinite b candidate.");
+  if (b_valid) {
     scalar << " B_UNVERIFIED " << candidate[0] << ' ' << candidate[1] << ' ' << candidate[2];
     double regular[3], residual[3];
     for (int d=0;d<3;++d) {
@@ -646,13 +725,6 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     if (!receipt || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
       PRINT_INPUT_ERROR("r164_rpmd failed committing PPPM trace receipt.");
   }
-  if (step == total) {
-    const std::string marker=directory_+"/COMPLETE";
-    rpmd_ja_file_io::ofstream done(marker+".tmp");
-    done << "r164_diagnostic_v1 final_step " << step << "\n";
-    done.close();
-    if (!done || rpmd_ja_file_io::atomic_commit_new_file(marker+".tmp", marker) != 0)
-      PRINT_INPUT_ERROR("r164_rpmd failed committing completion marker.");
-  }
+  if (step == total) write_complete(step);
 
 }

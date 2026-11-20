@@ -15,13 +15,15 @@ class CheckpointContract(unittest.TestCase):
     def test_commit_order_and_opt_in_cadence(self):
         output = SOURCE.split('void R164_RPMD::output(', 1)[1]
         for text in ('checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0)',
-                     '(stride_ && step%stride_==0) || checkpoint'):
+                     'snapshot || (!buffered_ && (step==0 || step==total || checkpoint || trace_here))'):
             self.assertIn(text, output)
         points = [output.index(x) for x in ('atomic_commit_new_file(frame_path', 'atomic_commit_new_file(image_path',
                   'crossings.close()', 'scalar_file.close()', 'sha256_text(scalar_line)',
-                  'PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.")', 'atomic_commit_new_file(marker+".tmp", marker)')]
+                  'PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.")', 'if (step == total) write_complete(step)')]
         self.assertEqual(points, sorted(points))
         self.assertIn('if (checkpoint) {', output)
+        complete=SOURCE.split('void R164_RPMD::write_complete(',1)[1].split('void R164_RPMD::output(',1)[0]
+        self.assertIn('atomic_commit_new_file(marker+".tmp",marker)',complete)
 
     def test_canonical_line_hash_and_required_fields(self):
         lf = b'12 1.2 3.4\n'
