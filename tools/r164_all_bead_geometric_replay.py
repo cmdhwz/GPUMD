@@ -163,6 +163,7 @@ def read_endpoint(info, step):
         raise ValueError('ambiguous first-bead lift branch')
     hashes = {frame_path.name: sha(frame_path), image_path.name: sha(image_path)}
     receipt_sources = []
+    assignment_captured_beads = []
     for name in (f'checkpoint_{step}.txt', f'pppm_trace_step_{step}_receipt.txt'):
         receipt_path = d / name
         if not receipt_path.exists():
@@ -177,12 +178,41 @@ def read_endpoint(info, step):
             actual = hashes[path.name] if path in (frame_path, image_path) else info['identity_hashes'][path.name]
             if receipt.get(key + '_sha256') != actual:
                 raise ValueError('frame receipt digest mismatch: ' + key)
+        if receipt.get('schema') == 'r164_pppm_trace_all_v1':
+            bead=int(receipt['bead'])
+            if not 0 <= bead < info['P']:
+                raise ValueError('invalid captured assignment bead')
+            assignment=d/f'pppm_trace_step_{step}_bead_{bead}_assignment_atom.out'
+            if sha(assignment)!=receipt.get('assignment_atom_sha256'):
+                raise ValueError('assignment receipt digest mismatch')
+            header={}
+            with assignment.open(encoding='utf8') as f:
+                for line in f:
+                    if not line.startswith('#'):
+                        break
+                    parts=line[1:].strip().split(maxsplit=1)
+                    if len(parts)==2:
+                        header[parts[0]]=parts[1]
+            if int(header.get('force_evaluation_id','0'))!=int(receipt.get('force_evaluation_id','-1')):
+                raise ValueError('assignment force identity mismatch')
+            data=np.loadtxt(assignment,comments='#',ndmin=2)
+            if data.shape!=(info['N'],29) or not np.isfinite(data).all() or not np.array_equal(data[:,0],np.arange(info['N'])):
+                raise ValueError('invalid captured assignment rows')
+            canonical=frame[0][bead]-image[bead]*info['cell']
+            scaled=(canonical*(1./info['cell'])*info['mesh']).astype(np.float32)
+            centers=np.trunc(scaled+np.float32(.5)).astype(np.int64)
+            if not np.array_equal(data[:,5:8],scaled) or not np.array_equal(data[:,8:11],centers):
+                raise ValueError('captured assignment center mismatch')
+            hashes[assignment.name]=receipt['assignment_atom_sha256']
+            assignment_captured_beads.append(bead)
         receipt_sources.append({'file': name, 'sha256': sha(receipt_path)})
     return {
         'frame': frame,
         'image': image,
         'hashes': hashes,
         'receipts': receipt_sources,
+        'assignment_captured_beads': assignment_captured_beads,
+        'assignment_other_beads_scope': 'derived_from_recorded_positions',
         'identity_scope': 'receipt_verified' if receipt_sources else 'posthoc_hash_only',
     }
 
@@ -237,7 +267,7 @@ def run_step(info, step, T, initial, final):
     checks = {}
     for kind in counted:
         bad = np.argwhere(counted[kind] != expected[kind])
-        checks[kind] = [{'bead': int(a), 'atom': int(b), 'axis': 'xyz'[c], 'recorded_net': int(expected[kind][a, b, c]), 'replayed_net': int(counted[kind][a, b, c])} for a, b, c in bad]
+        checks[kind] = [{'bead': int(a), 'atom': int(b), 'axis': 'xyz'[c], 'endpoint_expected_net': int(expected[kind][a, b, c]), 'replayed_net': int(counted[kind][a, b, c])} for a, b, c in bad]
     issue_keys = {(x['bead'], x['atom'], x['axis'], face['kind']) for x in unresolved for face in x['faces']}
     for kind, items in checks.items():
         for item in items:
@@ -284,7 +314,7 @@ def run_step(info, step, T, initial, final):
         'arithmetic_time_overlap_group_count': len(overlap_groups),
         'arithmetic_time_overlap_groups': overlap_groups,
         'unresolved': unresolved,
-        'endpoint_provenance': [{'step': step, 'identity_scope': initial['identity_scope'], 'receipts': initial['receipts']}, {'step': step + 1, 'identity_scope': final['identity_scope'], 'receipts': final['receipts']}],
+        'endpoint_provenance': [{'step': step, 'identity_scope': initial['identity_scope'], 'receipts': initial['receipts'], 'assignment_captured_beads': initial['assignment_captured_beads'], 'assignment_other_beads_scope': initial['assignment_other_beads_scope']}, {'step': step + 1, 'identity_scope': final['identity_scope'], 'receipts': final['receipts'], 'assignment_captured_beads': final['assignment_captured_beads'], 'assignment_other_beads_scope': final['assignment_other_beads_scope']}],
         'input_sha256': inputs,
         'roots': seen,
     }
@@ -311,7 +341,7 @@ def main():
     for x in info['lines']:
         if x[0] in ('potential', 'read_pimd_restart'):
             paths.append(info['runin'].parent / x[1])
-    report = {'schema': 'r164_all_bead_geometric_replay_v1', 'scope': 'bounded floating-point reconstruction of geometric assignment and periodic chart surfaces; no substep force evaluation, physical event, full MIC or neighbor cutoff coverage; not a rigorous mathematical certificate', 'source_identity': info['source'], 'dt_fs': info['dt'], 'P': info['P'], 'N': info['N'], 'capture': str(info['capture']), 'stdout_binding': 'same directory and matching printed facts, not cryptographically bound to run', 'minimum_coordinate_cushion_A': CUSHION, 'endpoint_replay_tolerance': 1e-08, 'physical_event_history': 'unavailable', 'accumulated_propagation_error': 'unknown', 'input_sha256': {str(p): info['identity_hashes'][p.name] if p.name in info['identity_hashes'] and p.parent == info['capture'] else sha(p) for p in paths}, 'steps': runs}
+    report = {'schema': 'r164_all_bead_geometric_replay_v1', 'scope': 'bounded floating-point reconstruction of geometric assignment and periodic chart surfaces; no substep force evaluation, physical event, full MIC or neighbor cutoff coverage; not a rigorous mathematical certificate', 'source_identity': info['source'], 'dt_fs': info['dt'], 'P': info['P'], 'N': info['N'], 'capture': str(info['capture']), 'stdout_binding': 'same directory and matching printed facts, not cryptographically bound to run', 'minimum_coordinate_cushion_A': CUSHION, 'endpoint_replay_tolerance': 1e-08, 'endpoint_label_source': {'periodic_chart': 'recorded_force_images', 'assignment_center': 'derived_from_recorded_positions_and_force_images_using_native_FP32_rule'}, 'physical_event_history': 'unavailable', 'accumulated_propagation_error': 'unknown', 'input_sha256': {str(p): info['identity_hashes'][p.name] if p.name in info['identity_hashes'] and p.parent == info['capture'] else sha(p) for p in paths}, 'steps': runs}
     with a.output.open('x', encoding='utf8', newline='\n') as f:
         json.dump(report, f, indent=2, allow_nan=False)
         f.write('\n')

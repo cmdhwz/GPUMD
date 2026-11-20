@@ -49,6 +49,15 @@ class GeometryTests(unittest.TestCase):
                 fields['frame_sha256']=replay.sha(d/'frame_0.txt')
                 (d/'checkpoint_0.txt').write_text(''.join(k+' '+v+'\n' for k,v in fields.items()))
                 self.assertEqual(replay.read_endpoint(info,0)['identity_scope'],'receipt_verified')
+                info['mesh']=np.array([10,10,10])
+                assignment=d/'pppm_trace_step_0_bead_0_assignment_atom.out'
+                assignment.write_text('# force_evaluation_id 1\n'+' '.join(['0']*8+['1']+['0']*20)+'\n')
+                fields.update({'schema':'r164_pppm_trace_all_v1','bead':'0','force_evaluation_id':'1',
+                               'assignment_atom_sha256':replay.sha(assignment)})
+                (d/'pppm_trace_step_0_receipt.txt').write_text(''.join(k+' '+v+'\n' for k,v in fields.items()))
+                with self.assertRaisesRegex(ValueError,'captured assignment center mismatch'):
+                    replay.read_endpoint(info,0)
+
 
     def test_mismatched_source_directory(self):
         with tempfile.TemporaryDirectory() as t:
