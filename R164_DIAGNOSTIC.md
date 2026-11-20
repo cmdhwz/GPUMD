@@ -1,6 +1,6 @@
 # R164 diagnostic readout
 
-This opt-in development readout records full-bead phase and forces and, optionally, provisional ordinary-path centroid observables. It does not establish production acceptance, a real P11 event, a complete checkpoint, or conductivity. CUDA compilation, WPE runtime, GPU propagation, same-frame CPU comparison and ordinary-flow closure have not been verified here.
+This opt-in development readout records full-bead phase and forces and, optionally, provisional ordinary-path centroid observables. It does not establish production acceptance, a real P11 event, a complete checkpoint, or conductivity. The native short-run build and comparisons described below have been performed. WPE full linking and runtime, physical event accounting, production acceptance and long-time transport remain unverified.
 
 Prepare the frozen R161 phase with the matching target model, using a fresh directory:
 
@@ -20,7 +20,7 @@ At each whole step `scalar.txt` contains the ring energy components, total centr
 
 Committed `frame_<step>.txt` files contain full-bead q, p, U, F. Corresponding `force_images_<step>.txt` records integer images in `q_lift = q_force + cell*image`. `geometric_chart_changes.txt` is written only for image changes between adjacent actual force frames; it counts changed bead-coordinate indices and does not localize a crossing or contain event energy/history. It is not a P11 event record. `COMPLETE` means only that diagnostic capture reached its last step and checked its output closes. Missing COMPLETE means capture is incomplete.
 
-Convert a committed frame to a portable archive with `python tools/r164_frame_to_npz.py r164_output STEP frame.npz`; this checks the unique scalar row, final newline, step and fixed-dt time. The archive can be supplied to the accompanying `verify_ja_frame.py`. Compare observer-off and observer-on runs on the same initial phase, backend, model, PPPM, step and frame; cache isolation and same-frame force equivalence remain unverified until measured.
+Convert a committed frame to a portable archive with `python tools/r164_frame_to_npz.py r164_output STEP frame.npz`; this checks the unique scalar row, final newline, step and fixed-dt time. The archive can be supplied to the accompanying `verify_ja_frame.py`. Compare observer-off and observer-on runs on the same initial phase, backend, model, PPPM, step and frame. The native comparison below quantifies their differences; it does not establish bitwise identity, prove cache isolation, or attribute those differences to a specific cause.
 
 For fresh-cache diagnostic reinitialization from a committed frame:
 
@@ -40,12 +40,24 @@ Optional `python tools/r164_provisional_de.py --parameters R27_固定双模参�
 
 D/E replay requires NPZ frames exported from the same R164 capture directory: the exporter binds the resolved directory and byte identities of metadata, source identity and the committed initial frame. Explicit atom-row and bead-order arrays must also match. Manually assembled archives without this provenance and frames from different captures are rejected, even if their step numbers are consecutive. This binding establishes common recorded provenance, not a guarantee that files or a physical trajectory are scientifically valid.
 
-When real short-run outputs become available, compare the two observer-enabled step sizes and a matching observer-disabled fine run with:
+To repeat the short-run comparison on recorded outputs, use the two observer-enabled step sizes and a matching observer-disabled fine run:
 
 ```
 python tools/r164_verify_short_runs.py --coarse coarse/r164_output --coarse-run-in coarse/run.in --fine fine_on/r164_output --fine-run-in fine_on/run.in --observer-off fine_off/r164_output --observer-off-run-in fine_off/run.in --phase GPUMD_r157_initial_phase.npz --cpu-forces R157_CPU_初态势力.npz --output short_review.json
 ```
 
-The verifier accepts only the provided nine-command thermostat-free cards with per-step debug output, checks their original `run.in` hashes, source model/model.xyz/restart hashes, metadata, atom order, committed frame and force-image files, and matching source configuration. It reports all-step H/(PN), each drift from the initial value and its maximum, coarse/fine common-time and observer on/off differences. Observer candidate coverage and unavailable components are explicit; geometric image comparisons are not P11 events. CPU U/F differences are calculated only when initial q(MIC) and p both agree within 1e-8; frozen phase, CPU and potential hashes are independently identified, and nonmatching references are labeled UNVERIFIED. Runtime/GPU and actual binary identity remain unverified; no unestablished threshold is called a physical pass.
+The verifier accepts only the provided nine-command thermostat-free cards with per-step debug output, checks their original `run.in` hashes, source model/model.xyz/restart hashes, metadata, atom order, committed frame and force-image files, and matching source configuration. It reports all-step H/(PN), each drift from the initial value and its maximum, coarse/fine common-time and observer on/off differences. Observer candidate coverage and unavailable components are explicit; geometric image comparisons are not P11 events. CPU U/F differences are calculated only when initial q(MIC) and p both agree within 1e-8; frozen phase, CPU and potential hashes are independently identified, and nonmatching references are labeled UNVERIFIED. The verifier alone does not establish runtime/GPU or actual binary identity; no unestablished threshold is called a physical pass.
 
 For every frame, the short-run verifier independently reconstructs U, K, ring-spring energy, H/(PN), centroid momentum and four species number flows from q, p, bead U and model masses. It rejects a frame/scalar mismatch using a fixed arithmetic-only allowance of `1e-10 + 1e-10 × sum(abs(contributions))` for each quantity and reports the signed residual, contribution sum and allowance per step. This checks synchronization and serialization arithmetic; it is not a force, trajectory or physical acceptance tolerance. Observer-off runs containing an observer identity file or candidate component are rejected.
+
+## Recorded native short-run evidence
+
+At source commit `e9a4876d`, the 150 compilation units in the CMake `gpumd` source set were compiled and linked directly with CUDA 12.2.140 and MSVC 19.29. This was a direct build of that source set; the local CMake generator probe remained unresolved. On an NVIDIA GeForce RTX 3060 Laptop GPU with driver 551.86, native R161 runs completed for 0.2 fs × 5 with the observer on and 0.1 fs × 10 with the observer on and off. The short-run verifier's frame/scalar arithmetic checks passed for all recorded frames. The machine-readable comparison is `short-run-verification.json` in the `native-r161-e9a4876d` evidence directory.
+
+At the initial phase, the maximum CPU-reference position difference under MIC was 0 Å and the maximum momentum difference was 2.8422e-14 eV fs/Å. The maximum and RMS force differences were 1.24814e-4 and 1.95078e-5 eV/Å. The mean per-bead potential-energy offset was −3.15814e-4 eV, with maximum centered difference 2.82298e-4 eV. These are measured differences, not a pass against an agreed backend accuracy threshold.
+
+The maximum full-window drift in H/(PN) was 5.3016 µeV/atom for the coarse observer-on run and 1.0060 µeV/atom for the fine observer-on run. At common times the maximum coarse/fine q difference was 5.7239e-4 Å; at 1 fs it was 5.20977e-4 Å. Across the 11 fine observer-on/off frames the maximum q, p and F differences were 2.59082e-8 Å, 6.29486e-6 eV fs/Å and 6.3993e-5 eV/Å. The first-frame F difference was 2.55927e-6 eV/Å, before the observer calculation. These comparisons neither show bitwise identity nor identify the cause of the differences.
+
+At coarse step 3, the y separation of atom pair (346, 1539) was 5.21336e-10 Å from L/2. Projection, b and J2 were unavailable at that frame under the ambiguity guard; they were available in all 11 fine observer-on frames. The fine observer-on D/E replay and provisional correlation analysis executed; the maximum D identity residual was 1.39e-17 eV Å/fs and the E endpoint residual was 5.51e-17 eV Å. These are finite-window arithmetic diagnostics, not proof of physical event treatment or converged transport.
+
+`run.cu` and `r164_rpmd.cu` also compiled individually with the WPE definition and distribution headers under CUDA. Full WPE Linux linking and runtime were not tested. No result above establishes a P11 event, a production threshold, equilibrium independence, bead or timestep convergence, or long-time conductivity.
