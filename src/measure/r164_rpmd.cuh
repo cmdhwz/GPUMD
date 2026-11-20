@@ -16,7 +16,7 @@ public:
   void configure_observer(Force&, Atom&);
   void capture_drift(Atom&);
   void check_force_positions(Atom&);
-  void output(int step, int total, double time, Atom&);
+  void output(int step, int total, Atom&);
 private:
   bool enabled_ = false;
   int stride_ = 0, n_ = 0, p_ = 0;

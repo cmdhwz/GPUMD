@@ -148,8 +148,8 @@ void R164_RPMD::check_force_positions(Atom& atom) {
     force_images_[j]=static_cast<long long>(image);
   }
 }
-void R164_RPMD::output(int step, int total, double time, Atom& atom) {
-  time=step*dt_;
+void R164_RPMD::output(int step, int total, Atom& atom) {
+  const double time_fs=step*dt_*TIME_UNIT_CONVERSION;
   std::vector<double> v(p_*n_*3), f(p_*n_*3), u(p_*n_), current;
   for (int s=0; s<p_; ++s) {
     atom.velocity_beads[s].copy_to_host(v.data()+s*n_*3);
@@ -348,7 +348,7 @@ void R164_RPMD::output(int step, int total, double time, Atom& atom) {
   const std::string scalar_path=directory_+"/scalar.txt";
   rpmd_ja_file_io::ofstream scalar(scalar_path, std::ios::app);
   if (step == 0) scalar << "# step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz observer_status [conv_xyz local_status local_xyz local_image_status local_image_xyz mechanical_image_status mechanical_image_xyz relay_image_status relay_image_xyz projection_image_status projection_image_xyz mechanical_status mechanical_xyz relay_status relay_xyz projection_status projection_xyz tangent_status site_rate_sum gradient_power native_power max_force_residual] b_status b_xyz J2_status J2_xyz R27_status [Q0 Q1 Pi0 Pi1 d2x d2y d2z]\n";
-  scalar << std::setprecision(17) << step << ' ' << time*TIME_UNIT_CONVERSION << ' ' << potential << ' ' << kinetic << ' ' << spring << ' ' << (potential+kinetic+spring)/(p_*n_);
+  scalar << std::setprecision(17) << step << ' ' << time_fs << ' ' << potential << ' ' << kinetic << ' ' << spring << ' ' << (potential+kinetic+spring)/(p_*n_);
   for (double x:momentum) scalar << ' ' << x;
   for (auto& species:flows) for (double x:species) scalar << ' ' << x;
   if (observer_) {

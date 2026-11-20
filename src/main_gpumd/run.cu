@@ -554,7 +554,7 @@ void Run::perform_a_run(const int number_of_steps)
   // setup force for the first integrate step
   compute_force();
   if (r164_rpmd.enabled()) r164_rpmd.check_force_positions(atom);
-  if (r164_rpmd.enabled()) r164_rpmd.output(0, number_of_steps, global_time, atom);
+  if (r164_rpmd.enabled()) r164_rpmd.output(0, number_of_steps, atom);
   atom.update_unwrapped_position(box);
   measure.setup_force(time_step, integrate, group, atom, box, force);
   measure.process_dynamics(0, box, atom);
@@ -616,7 +616,7 @@ void Run::perform_a_run(const int number_of_steps)
     }
     integrate.compute2(time_step, step, number_of_steps, group, box, atom, thermo, force);
     force.notify_velocity_update();
-    if (r164_rpmd.enabled()) r164_rpmd.output(step + 1, number_of_steps, global_time, atom);
+    if (r164_rpmd.enabled()) r164_rpmd.output(step + 1, number_of_steps, atom);
     atom.update_unwrapped_position(box);
     if (profile_pimd_bead_parallel) {
       CHECK(gpuSetDevice(0));
