@@ -104,6 +104,25 @@ WARN_FLAGS += -Wformat -Wformat-security -Wformat-overflow -Wformat-truncation
 
 WPE_NVCC_FLAGS ?= -Wno-deprecated-gpu-targets
 
+GPUMD_GIT_COMMIT_FULL ?= $(shell git -C .. rev-parse HEAD 2>/dev/null)
+ifeq ($(strip $(GPUMD_GIT_COMMIT_FULL)),)
+GPUMD_GIT_COMMIT_FULL := unknown
+endif
+ifndef GPUMD_GIT_DIRTY
+GPUMD_GIT_STATUS_RESULT := $(shell git -C .. status --porcelain --untracked-files=normal 2>/dev/null && echo __GPUMD_GIT_STATUS_OK__)
+ifeq ($(findstring __GPUMD_GIT_STATUS_OK__,$(GPUMD_GIT_STATUS_RESULT)),)
+GPUMD_GIT_DIRTY := unknown
+else
+GPUMD_GIT_STATUS := $(subst __GPUMD_GIT_STATUS_OK__,,$(GPUMD_GIT_STATUS_RESULT))
+ifneq ($(strip $(GPUMD_GIT_STATUS)),)
+GPUMD_GIT_DIRTY := yes
+else
+GPUMD_GIT_DIRTY := no
+endif
+endif
+endif
+GPUMD_GIT_DEFINES = -DGPUMD_GIT_COMMIT_FULL=\"$(GPUMD_GIT_COMMIT_FULL)\" -DGPUMD_GIT_DIRTY=\"$(GPUMD_GIT_DIRTY)\"
+
 CFLAGS = -std=c++14 -O3 $(CUDA_ARCH) -Xcompiler="$(WARN_FLAGS)"
 CFLAGS += -DGPUMD_WPE_ENABLED=1 $(WPE_NVCC_FLAGS)
 
@@ -214,7 +233,7 @@ gpumd-wpe: $(OBJECTS)
 
 $(OBJDIR)/%.o: %.cu $(HEADERS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(GPUMD_GIT_DEFINES) $(INC) -c $< -o $@
 
 
 ###########################################################

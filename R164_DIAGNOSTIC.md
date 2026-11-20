@@ -98,3 +98,5 @@ python tools/r164_checkpoint_chain.py verify parent/r164_output child/r164_outpu
 ```
 
 Preparation verifies the parent receipt and scalar prefix and writes a parent link only after creating the four child inputs. The link records intent; verification binds it to the actual child capture and compares its step-zero lift, momentum and force images to the parent endpoint. It reports force, bead energy and available current differences without a physical acceptance threshold. Intermediate captures may end at a committed checkpoint without `COMPLETE`; the final capture requires both its final checkpoint and `COMPLETE`. The merged report contains one copy of each seam row and is a diagnostic record, not transport-tool input. Cache and physical-event histories remain unavailable.
+
+The WPE makefile records the GPUMD source commit and worktree dirty status when Git is available. These labels are not a binary-content hash or a WPE engine version. Rebuild the GPUMD objects after changing the checkout to refresh them.
