@@ -12,7 +12,8 @@ class OptionTests(unittest.TestCase):
     def test_legacy_and_extended(self):
         for args,expected in [(['r164_rpmd','r164_output','1'],(False,None)),(['r164_rpmd','r164_output','1','observer'],(True,None)),(['r164_rpmd','r164_output','1','observer','checkpoint','2'],(True,2)),(['r164_rpmd','r164_output','1','checkpoint','2'],(False,2)),(['r164_rpmd','r164_output','1','observer','checkpoint','2','pppm_trace','0','0','5609'],(True,2)),(['r164_rpmd','r164_output','1','pppm_trace','0','0','1'],(False,None)),(['r164_rpmd','r164_output','1','pppm_trace','0','0','all'],(False,None))]:
             self.assertEqual(chain.r164_options(args),expected)
-        for rest in (['checkpoint','0'],['checkpoint','4294967297'],['checkpoint','2','observer'],['checkpoint','+2']):
+        self.assertEqual(chain.r164_options(['r164_rpmd','r164_output','1','observer','drift_charge','checkpoint','2','pppm_trace','0','0','all']),(True,2))
+        for rest in (['drift_charge'],['observer','drift_charge','drift_charge'],['observer','checkpoint','2','drift_charge'],['checkpoint','0'],['checkpoint','4294967297'],['checkpoint','2','observer'],['checkpoint','+2']):
             with self.assertRaises(ValueError): chain.r164_options(['r164_rpmd','r164_output','1']+rest)
 
 class ChainTests(unittest.TestCase):

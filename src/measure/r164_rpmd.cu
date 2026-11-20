@@ -31,6 +31,8 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
   size_t next=3;
   observer_requested_ = next<t.size() && t[next]=="observer";
   if (observer_requested_) ++next;
+  drift_charge_requested_ = observer_requested_ && next<t.size() && t[next]=="drift_charge";
+  if (drift_charge_requested_) ++next;
   checkpoint_stride_=0; trace_step_=-1;
   auto decimal = [](const std::string& text, int& value) {
     if (text.empty()) return false;
@@ -51,7 +53,7 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
       PRINT_INPUT_ERROR("r164_rpmd pppm_trace requires nonnegative decimal step and bead, and a nonnegative decimal atom or all.");
     next+=4;
   }
-  if (next!=t.size()) PRINT_INPUT_ERROR("r164_rpmd invalid options; use observer, checkpoint, pppm_trace in order.");
+  if (next!=t.size()) PRINT_INPUT_ERROR("r164_rpmd invalid options; use observer, drift_charge, checkpoint, pppm_trace in order.");
   directory_ = t[1]; enabled_ = true;
 }
 void R164_RPMD::validate_trace(const Force& force, int total, const Atom& atom) const {
@@ -110,6 +112,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
        << "time_convention step_times_fixed_dt_start_zero\n"
        << "number_increment lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
+  if (drift_charge_requested_) meta << "drift_charge observer_frame_natural_units\n";
   if (checkpoint_stride_) meta << "checkpoint_stride " << checkpoint_stride_ << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
   meta.close(); if (!meta || rpmd_ja_file_io::atomic_commit_new_file(directory_+"/metadata.txt.tmp", directory_+"/metadata.txt") != 0) PRINT_INPUT_ERROR("r164_rpmd failed committing metadata.");
@@ -153,21 +156,25 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
       stage.pimd_beads != p_ || stage.dftd3_enabled != 0 ||
       (stage.facts & WPE_STAGE_PIMD_ECO_CONFIGURATION) != 0 ||
       stage.qnep_kspace_method != WPE_QNEP_KSPACE_PPPM) {
+    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: incompatible WPE stage.");
     printf("r164_rpmd centroid observer BLOCKED: incompatible WPE stage.\n"); return;
   }
   model=get_first_potential_filename(force.get_run_input()); spacing=stage.qnep_pppm_spacing;
 #else
   if (force.potentials.size()!=1 || force.get_run_input().contains("dftd3")) {
+    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: incompatible potential configuration.");
     printf("r164_rpmd centroid observer BLOCKED: incompatible potential configuration.\n"); return;
   }
   auto* active=dynamic_cast<NEP_Charge*>(force.potentials[0].get());
   if (!active || active->get_charge_mode()!=2 || !active->uses_pppm()) {
+    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: needs charge2 PPPM.");
     printf("r164_rpmd centroid observer BLOCKED: needs charge2 PPPM.\n"); return;
   }
   model=force.primary_nep_model_path(); spacing=active->get_pppm_mesh_spacing();
 #endif
   rpmd_ja_file_io::ifstream in(model); std::string kind; in >> kind;
   if (!in || kind != "nep4_charge2" || !std::isfinite(spacing) || spacing < 0.2 || spacing > 2.0) {
+    if (drift_charge_requested_) PRINT_INPUT_ERROR("r164_rpmd drift_charge requires an available private observer: unsupported model or PPPM spacing.");
     printf("r164_rpmd centroid observer BLOCKED: unsupported model or PPPM spacing.\n"); return;
   }
   std::ostringstream kspace; kspace << std::setprecision(17) << "kspace pppm " << spacing;
@@ -176,6 +183,7 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
   observer_->N1=0; observer_->N2=n_; observer_->set_pppm_mesh_spacing(spacing);
   observer_->configure_mechanical_observer(); observer_->enable_charge_diagnostics();
   observer_q_.resize(3*n_); observer_u_.resize(n_); observer_f_.resize(3*n_); observer_virial_.resize(9*n_); observer_v_.resize(3*n_);
+  if (drift_charge_requested_) observer_drift_v_.resize(3*n_);
   const std::string model_hash=rpmd_ja_sample_provenance::sha256_file(model);
   rpmd_ja_file_io::ofstream meta(directory_+"/observer.txt.tmp");
   meta << std::setprecision(17) << "native_private_qnep_pppm_observer\nmodel " << model
@@ -513,6 +521,47 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     }
     out.close(); if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
       PRINT_INPUT_ERROR("r164_rpmd failed committing observer projection.");
+    if (drift_charge_requested_) {
+      const std::string projection_hash=rpmd_ja_sample_provenance::sha256_file(path);
+      if (projection_hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing observer projection.");
+      const bool available=observer_->has_charge_diagnostics_for_current_force_frame();
+      const char* status[2]={step>0 ? "charge_diagnostics_unavailable" : "absent_boundary",
+                             step<total ? "charge_diagnostics_unavailable" : "absent_boundary"};
+      std::vector<float> rates[2];
+      if (available) for (int side=0;side<2;++side) {
+        if ((side==0 && step==0) || (side==1 && step==total)) continue;
+        std::vector<double> velocity(3*n_,0.0);
+        const double sign=side==0 ? -1.0 : 1.0;
+        for (int bead=0;bead<p_;++bead) for (int d=0;d<3;++d) for (int i=0;i<n_;++i) {
+          const int j=d*n_+i, k=bead*3*n_+j;
+          velocity[j]+=(v[k]+sign*0.5*dt_*f[k]/atom.cpu_mass[i])/p_;
+        }
+        bool finite=true;
+        for (double value:velocity) if (!std::isfinite(value)) finite=false;
+        if (!finite) { status[side]="nonfinite"; continue; }
+        observer_->notify_velocity_update();
+        observer_drift_v_.copy_from_host(velocity.data());
+        observer_->compute_charge_rate_for_current_force_frame(box_for_observer_,atom.type,observer_q_,observer_drift_v_);
+        rates[side].resize(n_);
+        observer_->get_raw_charge_rate_reference().copy_to_host(rates[side].data());
+        for (float value:rates[side]) if (!std::isfinite(value)) finite=false;
+        if (!finite) { rates[side].clear(); status[side]="nonfinite"; }
+        else status[side]="valid";
+      }
+      observer_->notify_velocity_update();
+      const std::string drift_path=directory_+"/observer_drift_charge_"+suffix;
+      rpmd_ja_file_io::ofstream drift_out(drift_path+".tmp"); drift_out << std::setprecision(17);
+      drift_out << "# schema r164_observer_drift_charge_v1\n# step " << step << "\n# time_fs " << time_fs
+                << "\n# observer_force_call " << step+1 << "\n# N " << n_
+                << "\n# time_unit_conversion " << TIME_UNIT_CONVERSION
+                << "\n# arrival_status " << status[0] << "\n# departure_status " << status[1]
+                << "\n# columns side atom raw_charge_rate_fp32_e_per_natural_time\n# observer_projection_sha256 " << projection_hash << '\n';
+      for (int side=0;side<2;++side) for (int i=0;i<static_cast<int>(rates[side].size());++i)
+        drift_out << (side==0 ? "arrival " : "departure ") << i << ' ' << rates[side][i] << '\n';
+      drift_out.close();
+      if (!drift_out || rpmd_ja_file_io::atomic_commit_new_file(drift_path+".tmp",drift_path)!=0)
+        PRINT_INPUT_ERROR("r164_rpmd failed committing observer drift charge.");
+    }
   }
   if (checkpoint) {
     const std::string suffix=std::to_string(step)+".txt";

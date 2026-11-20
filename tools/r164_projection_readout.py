@@ -12,11 +12,16 @@ TIME_UNIT=10.18051
 GUARD=1e-9
 
 
-def replay_projection(x, raw_D, raw_rate, cell, stop_on_guard=True):
+def charge_coeff(raw_D, raw_rate):
     n=len(raw_D)
     mean_D=sum(float(v) for v in (raw_D/np.float32(n)))
     mean_rate=sum(float(v) for v in (raw_rate/np.float32(n)))
-    c=mean_D*raw_rate.astype(float)-raw_D.astype(float)*mean_rate
+    return mean_D*raw_rate.astype(float)-raw_D.astype(float)*mean_rate
+
+
+def replay_projection(x, raw_D, raw_rate, cell, stop_on_guard=True):
+    n=len(raw_D)
+    c=charge_coeff(raw_D,raw_rate)
     projection=np.zeros(3); image=np.zeros(3); first_guard=None
     for d in range(3):
         ordered=np.sort(x[:,d]); mean_x=sum(float(v)/n for v in x[:,d]); L=cell[d]
@@ -145,7 +150,7 @@ def readout(directory,step,pair=None, *, _return_data=False):
                                     'for_increasing_xj_minus_xi_eV_A_per_fs':float(cell[axis]/N*(c[i]-c[j])/TIME_UNIT),
                                     'scope':'fixed q and raw charge tangent projection branch only; not an impulse or physical event'}
     if _return_data:
-        return result, {'x':x, 'c':c/TIME_UNIT, 'q':q, 'p':p, 'F':F}
+        return result, {'x':x, 'c':c/TIME_UNIT, 'raw_D':raw[:,0].astype(np.float32), 'q':q, 'p':p, 'F':F}
     return result
 
 

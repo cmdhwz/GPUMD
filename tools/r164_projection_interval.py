@@ -1,13 +1,51 @@
 #!/usr/bin/env python3
 """Integrate the observer projection under a piecewise-linear endpoint-c model."""
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
 import numpy as np
-from r164_projection_readout import readout
+from r164_projection_readout import readout, charge_coeff, TIME_UNIT
 from r164_frame_to_npz import read_frame
 from r164_verify_short_runs import keyfile, load_run, sha
+
+
+def read_drift_charge(path, step, total, n, time_fs, projection_sha):
+    path=Path(path)
+    if not path.exists(): return None
+    raw=path.read_bytes()
+    header={}; rows={'arrival':[], 'departure':[]}
+    for line in raw.decode('utf8').splitlines():
+        if line.startswith('#'):
+            parts=line[1:].strip().split(maxsplit=1)
+            if len(parts)!=2 or parts[0] in header: raise ValueError('invalid drift charge header')
+            header[parts[0]]=parts[1]
+        elif line.strip():
+            parts=line.split()
+            if len(parts)!=3 or parts[0] not in rows: raise ValueError('invalid drift charge row')
+            rows[parts[0]].append(parts[1:])
+    if (header.get('schema')!='r164_observer_drift_charge_v1' or header.get('step')!=str(step)
+        or header.get('observer_force_call')!=str(step+1) or header.get('N')!=str(n)
+        or float(header['time_fs'])!=time_fs or float(header['time_unit_conversion'])!=TIME_UNIT
+        or header.get('observer_projection_sha256')!=projection_sha
+        or header.get('columns')!='side atom raw_charge_rate_fp32_e_per_natural_time'):
+        raise ValueError('drift charge identity mismatch')
+    result={'sha256':hashlib.sha256(raw).hexdigest(), 'status':{}, 'rates':{}}
+    for side in ('arrival','departure'):
+        status=header.get(side+'_status')
+        boundary=(side=='arrival' and step==0) or (side=='departure' and step==total)
+        if status not in ('valid','absent_boundary','nonfinite','charge_diagnostics_unavailable') or (status=='absent_boundary')!=boundary:
+            raise ValueError('drift charge side status mismatch')
+        expected=n if status=='valid' else 0
+        if len(rows[side])!=expected or any(int(row[0])!=i for i,row in enumerate(rows[side])):
+            raise ValueError('drift charge side row mismatch')
+        values=np.array([row[1] for row in rows[side]],float)
+        if not np.isfinite(values).all() or not np.array_equal(values,values.astype(np.float32).astype(float)):
+            raise ValueError('drift charge rate is not finite float32')
+        result['status'][side]=status
+        result['rates'][side]=values.astype(np.float32) if status=='valid' else None
+    return result
 
 
 def eta(x, cell):
@@ -78,7 +116,7 @@ def integrate_interval(x0, x1, r0, r1, c0, c1, cell, h, eps=1e-10):
             'linear_c_model_integral_eV_A':None if unresolved else (baseline+correction).tolist()}
 
 
-def analyze(directory, run_in):
+def analyze(directory, run_in, drift_charge=False):
     directory = Path(directory).resolve()
     run_in = Path(run_in).resolve()
     meta = keyfile(directory/'metadata.txt')
@@ -93,6 +131,8 @@ def analyze(directory, run_in):
     lines = [line.split('#',1)[0].split() for line in run_in.read_text(encoding='utf8').splitlines()]
     r164 = next(line for line in lines if line and line[0]=='r164_rpmd')
     if (run_in.parent/r164[1]).resolve()!=directory: raise ValueError('capture path differs from run card')
+    if drift_charge and (r164[3:5]!=['observer','drift_charge'] or meta.get('drift_charge')!='observer_frame_natural_units'):
+        raise ValueError('drift charge mode requires matching run card and metadata')
     src=run['source']
     for path,key in ((run_in.parent/commands['potential'][1],'model_sha256'),
                      (run_in.parent/'model.xyz','model_xyz_sha256'),
@@ -134,8 +174,15 @@ def analyze(directory, run_in):
             q,p,F=data.pop('q'),data.pop('p'),data.pop('F')
             if sha(run['frames'][step])!=bound['frame_sha256']:
                 raise ValueError('frame changed while reading endpoint')
+        if drift_charge and 'projection_file_sha256' in result:
+            attachment=read_drift_charge(directory/f'observer_drift_charge_{step}.txt',step,steps,5896,
+                                         result['time_fs'],result['projection_file_sha256'])
+            result['drift_charge']=None if attachment is None else {key:attachment[key] for key in ('sha256','status')}
+            data['drift_charge']=attachment
         data['lift']=np.mean(q,axis=0)
         data['drift']=np.mean((p+dt*F/2)/mass[None,:,None],axis=0)
+        if drift_charge:
+            data['arrival']=np.mean((p-dt*F/2)/mass[None,:,None],axis=0)
         current=(result,data)
         if previous is not None:
             before,old=previous
@@ -143,10 +190,22 @@ def analyze(directory, run_in):
             drift_error=float(np.max(np.abs(data['lift']-old['lift']-dt*old['drift'])))
             record['centroid_free_drift_max_error_A']=drift_error
             if not np.isfinite(drift_error) or drift_error>=1e-8: raise ValueError('centroid free drift mismatch')
+            if drift_charge:
+                velocity_error=float(np.max(np.abs(data['arrival']-old['drift'])))
+                record['centroid_drift_velocity_max_residual_A_per_fs']=velocity_error
+                if not np.isfinite(velocity_error) or velocity_error>1e-9:
+                    raise ValueError('centroid drift endpoint velocity mismatch')
             if before['status']!='valid' or result['status']!='valid':
                 record.update(status='unavailable',reason='missing or invalid endpoint projection')
+            elif drift_charge and (old.get('drift_charge') is None or data.get('drift_charge') is None or
+                    old['drift_charge']['rates']['departure'] is None or data['drift_charge']['rates']['arrival'] is None):
+                record.update(status='unavailable',reason='missing or unavailable drift charge side')
             else:
-                record.update(integrate_interval(old['x'],data['x'],old['lift'],data['lift'],old['c'],data['c'],cell,dt))
+                c0=old['c']; c1=data['c']
+                if drift_charge:
+                    c0=charge_coeff(old['raw_D'],old['drift_charge']['rates']['departure'])/TIME_UNIT
+                    c1=charge_coeff(data['raw_D'],data['drift_charge']['rates']['arrival'])/TIME_UNIT
+                record.update(integrate_interval(old['x'],data['x'],old['lift'],data['lift'],c0,c1,cell,dt))
                 record['native_scalar_trapezoid_eV_A']=(dt/2*(np.array(before['recorded_projection'])+np.array(result['recorded_projection']))).tolist()
             intervals.append(record)
         previous=current
@@ -157,7 +216,7 @@ def analyze(directory, run_in):
               'root_correction_eV_A','linear_c_model_integral_eV_A')
         total={key:np.sum([row[key] for row in intervals],axis=0).tolist() for key in keys}
         total['model_minus_trapezoid_eV_A']=(np.array(total[keys[3]])-np.array(total[keys[0]])).tolist()
-    return {'schema':'r164_projection_interval_v1','scope':'observer projection only; endpoint c linear model, not measured continuous c, impulse or physical event first moment',
+    report={'schema':'r164_projection_interval_v1','scope':'observer projection only; endpoint c linear model, not measured continuous c, impulse or physical event first moment',
             'capture':str(directory),'run_in':str(run_in),'input_sha256':run['inputs'],
             'potential_sha256':src['model_sha256'],'model_xyz_sha256':src['model_xyz_sha256'],
             'restart_sha256':src['restart_input_sha256'],
@@ -165,6 +224,9 @@ def analyze(directory, run_in):
             'force_image_sha256':run['image_sha256'],'dt_fs':dt,'steps':steps,'endpoints':endpoints,
             'intervals':intervals,'complete_window_totals':total,
             'summation_scope':'only supplied when every interval is valid'}
+    if drift_charge:
+        report['endpoint_coefficient_mode']='left departure and right arrival drift charge; native trapezoid remains full-step velocity baseline'
+    return report
 
 
 def main():
@@ -172,8 +234,9 @@ def main():
     parser.add_argument('capture',type=Path)
     parser.add_argument('--run-in',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--drift-charge',action='store_true')
     args=parser.parse_args()
-    result=analyze(args.capture,args.run_in)
+    result=analyze(args.capture,args.run_in,args.drift_charge)
     with args.output.open('x',encoding='utf8',newline='\n') as out:
         json.dump(result,out,indent=2,allow_nan=False)
         out.write('\n')

@@ -31,6 +31,9 @@ def r164_options(tokens):
         raise ValueError('invalid R164 options')
     rest=tokens[3:]; observer=bool(rest and rest[0]=='observer')
     if observer: rest=rest[1:]
+    if rest and rest[0]=='drift_charge':
+        if not observer: raise ValueError('drift_charge requires observer')
+        rest=rest[1:]
     checkpoint=None
     if rest and rest[0]=='checkpoint':
         if len(rest)<2 or not rest[1].isascii() or not rest[1].isdigit() or not 0<int(rest[1])<=2147483647: raise ValueError('invalid checkpoint option')
