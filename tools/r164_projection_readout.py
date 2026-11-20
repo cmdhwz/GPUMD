@@ -36,11 +36,13 @@ def replay_projection(x, raw_D, raw_rate, cell, stop_on_guard=True):
     return projection,image,c,first_guard
 
 
-def readout(directory,step,pair=None):
+def readout(directory,step,pair=None, *, _return_data=False):
     if step<0: raise ValueError('step must be nonnegative')
     d=Path(directory).resolve(); path=d/f'observer_projection_{step}.txt'
+    projection_bytes=path.read_bytes()
+    projection_sha=hashlib.sha256(projection_bytes).hexdigest()
     header={}; rows=[]
-    for line in path.read_text(encoding='utf8').splitlines():
+    for line in projection_bytes.decode('utf8').splitlines():
         if line.startswith('#'):
             parts=line[1:].strip().split(maxsplit=1)
             if len(parts)==2:
@@ -95,27 +97,27 @@ def readout(directory,step,pair=None):
     if count not in (0,N) or len(rows)!=count or (status=='charge_diagnostics_unavailable')!=(count==0):
         raise ValueError('projection row count/status mismatch')
     result={'schema':'r164_projection_readout_v1','scope':'private observer projection diagnostic only; no impulse or physical event first moment',
-            'step':step,'time_fs':float(header['time_fs']),'status':status,'projection_file_sha256':sha(path),
+            'step':step,'time_fs':float(header['time_fs']),'status':status,'projection_file_sha256':projection_sha,
             'bound_source_sha256':{key:value for key,value in header.items() if key.endswith('_sha256')},
             'rows':count,'recorded_projection':None if value is None else value.tolist(),
             'recorded_projection_image':None if image is None else image.tolist()}
     if not count:
         if pair is not None: raise ValueError('pair comparison requires raw rows')
-        return result
+        return (result,None) if _return_data else result
     if any(len(row)!=6 or int(row[0])!=i for i,row in enumerate(rows)):
         raise ValueError('invalid projection row order')
     data=np.array([row[1:] for row in rows],float)
     x=data[:,:3]; raw=data[:,3:]
     if not np.isfinite(x).all() or np.any(x<0) or np.any(x>cell):
         raise ValueError('invalid canonical centroid')
-    q,_,_,_=read_frame(d/f'frame_{step}.txt',P,N)
+    q,p,F,_=read_frame(d/f'frame_{step}.txt',P,N)
     centroid=np.zeros((N,3))
     for bead in range(P): centroid+=q[bead]/P
     centroid-=np.floor(centroid/cell)*cell
     if not np.allclose(x,centroid,rtol=0,atol=2e-12): raise ValueError('projection centroid differs from frame')
     if status=='nonfinite':
         if pair is not None: raise ValueError('pair comparison requires finite values')
-        return result
+        return (result,None) if _return_data else result
     if not np.isfinite(raw).all() or not np.array_equal(raw,raw.astype(np.float32).astype(float)):
         raise ValueError('raw values are not finite float32 source values')
     calculated,calculated_image,c,guard=replay_projection(x,raw[:,0].astype(np.float32),raw[:,1].astype(np.float32),cell)
@@ -142,6 +144,8 @@ def readout(directory,step,pair=None):
         result['frozen_pair_jump']={'i':i,'j':j,'axis':'xyz'[axis], 'raw_separation_A':float(delta),
                                     'for_increasing_xj_minus_xi_eV_A_per_fs':float(cell[axis]/N*(c[i]-c[j])/TIME_UNIT),
                                     'scope':'fixed q and raw charge tangent projection branch only; not an impulse or physical event'}
+    if _return_data:
+        return result, {'x':x, 'c':c/TIME_UNIT, 'q':q, 'p':p, 'F':F}
     return result
 
 
