@@ -205,3 +205,13 @@ python tools/r164_composition_projection.py PARENT_CAPTURE CHILD_CAPTURE --check
 The tools run the checkpoint verifier themselves; a saved report is not accepted as proof. They consume the selected authenticated prefix of each parent, including child local step zero for the child's first interval and mass-flow check. GK retains the parent endpoint once. Each interval uses its own segment's adjacent recorded heat samples and, in lift mode, the actual right-end increment. EH windows may cross a verified seam. Reports preserve segment/step/receipt provenance and seam diagnostics; the chain is one diagnostic trajectory with unknown independent sample count. Fresh-cache reconstruction does not restore cache or physical event history, and it does not release P13 or P14. The same source contracts allow WPE records; WPE runtime validation for this statistics path remains unavailable.
 
 For the recorded native checkpoint chains, independent comparison of six windows and both projection modes found a maximum element difference of 5.55e-17 across ordered C, GK, EH and triangular matrices (in the corresponding block units). The 4+6-step chain at lag 6 had five EH origins; maximum mass-flow residuals were 8.70e-12 eV fs/Å for that chain and 5.97e-12 eV fs/Å for the 1+1-step lift chain. Reversed chain order and lift mode on the legacy chain were rejected. Evidence: `checkpoint-transport-review-f260/verified-chain-transport.json`.
+
+### Diagnostic Maxwell momentum handoff
+
+`tools/r164_sample_maxwell.py` draws unconstrained bead momenta from a SHA-bound position archive, without reading its old momentum:
+
+```text
+python tools/r164_sample_maxwell.py PHASE.npz --phase-sha256 POSITION_ARCHIVE_SHA256 --temperature 300 --seed 42 --trajectory-id diagnostic-42 --destination maxwell-diagnostic
+```
+
+The tool checks bead/atom order, species, masses, an axis-aligned orthogonal cell, one-wrap position range and the existing first-bead MIC branch. It uses NumPy PCG64 and independent Cartesian standard normals with variance `m*P*k_B*T`; no center-of-mass projection or kinetic-energy rescaling is applied. The new phase, exact-mass model, four-decimal-mass restart and final receipt bind source, generator, seed, thermodynamic and kinetic details. The tool produces no run card. A new seed does not establish independent or equilibrated positions. R161 retains its original momenta for same-frame comparison; production requires separately qualified P12 positions and an approved run identity.
