@@ -193,12 +193,15 @@ def read_endpoint(info, step):
                     parts=line[1:].strip().split(maxsplit=1)
                     if len(parts)==2:
                         header[parts[0]]=parts[1]
-            if int(header.get('force_evaluation_id','0'))!=int(receipt.get('force_evaluation_id','-1')):
+            expected_id=step*info['P']+bead+1
+            if int(header.get('force_evaluation_id','0'))!=expected_id or int(receipt.get('force_evaluation_id','-1'))!=expected_id:
                 raise ValueError('assignment force identity mismatch')
             data=np.loadtxt(assignment,comments='#',ndmin=2)
             if data.shape!=(info['N'],29) or not np.isfinite(data).all() or not np.array_equal(data[:,0],np.arange(info['N'])):
                 raise ValueError('invalid captured assignment rows')
             canonical=frame[0][bead]-image[bead]*info['cell']
+            if not np.allclose(data[:,2:5],canonical,rtol=0,atol=2e-12):
+                raise ValueError('captured assignment coordinates mismatch')
             scaled=(canonical*(1./info['cell'])*info['mesh']).astype(np.float32)
             centers=np.trunc(scaled+np.float32(.5)).astype(np.int64)
             if not np.array_equal(data[:,5:8],scaled) or not np.array_equal(data[:,8:11],centers):

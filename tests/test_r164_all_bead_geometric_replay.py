@@ -57,6 +57,21 @@ class GeometryTests(unittest.TestCase):
                 (d/'pppm_trace_step_0_receipt.txt').write_text(''.join(k+' '+v+'\n' for k,v in fields.items()))
                 with self.assertRaisesRegex(ValueError,'captured assignment center mismatch'):
                     replay.read_endpoint(info,0)
+                fields['force_evaluation_id']='2'
+                assignment.write_text(assignment.read_text().replace('force_evaluation_id 1','force_evaluation_id 2'))
+                fields['assignment_atom_sha256']=replay.sha(assignment)
+                (d/'pppm_trace_step_0_receipt.txt').write_text(''.join(k+' '+v+'\n' for k,v in fields.items()))
+                with self.assertRaisesRegex(ValueError,'assignment force identity mismatch'):
+                    replay.read_endpoint(info,0)
+                fields['force_evaluation_id']='1'
+                row=['0']*29
+                row[2]='0.000000000003'
+                assignment.write_text('# force_evaluation_id 1\n'+' '.join(row)+'\n')
+                fields['assignment_atom_sha256']=replay.sha(assignment)
+                (d/'pppm_trace_step_0_receipt.txt').write_text(''.join(k+' '+v+'\n' for k,v in fields.items()))
+                with self.assertRaisesRegex(ValueError,'captured assignment coordinates mismatch'):
+                    replay.read_endpoint(info,0)
+
 
 
     def test_mismatched_source_directory(self):
