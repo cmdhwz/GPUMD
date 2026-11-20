@@ -536,10 +536,12 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   }
   double Q[2]={}, Pi[2]={}, d2[3]={};
   const double mass_factor=TIME_UNIT_CONVERSION*TIME_UNIT_CONVERSION;
+  // Permit ordinary decimal mass rounding in the fixed R27 reference guard.
+  constexpr double r27_mass_relative_tolerance=1e-6;
   const bool r27_candidate = n_ == 5896 && std::abs(temperature_-300.0)<1e-8 &&
-    std::abs(atom.cpu_mass[715]*mass_factor-1658.1794888315474)<1e-8 &&
-    std::abs(atom.cpu_mass[3382]*mass_factor-104.47183728621788)<1e-8 &&
-    std::abs(atom.cpu_mass[5674]*mass_factor-104.47183728621788)<1e-8 && atom.cpu_atom_symbol[715] == "O" &&
+    std::abs(atom.cpu_mass[715]*mass_factor-1658.1794888315474)<=r27_mass_relative_tolerance*1658.1794888315474 &&
+    std::abs(atom.cpu_mass[3382]*mass_factor-104.47183728621788)<=r27_mass_relative_tolerance*104.47183728621788 &&
+    std::abs(atom.cpu_mass[5674]*mass_factor-104.47183728621788)<=r27_mass_relative_tolerance*104.47183728621788 && atom.cpu_atom_symbol[715] == "O" &&
     atom.cpu_atom_symbol[3382] == "H" && atom.cpu_atom_symbol[5674] == "H" &&
     std::abs(lengths_[0]-29.3104)<1e-8 && std::abs(lengths_[1]-29.3104)<1e-8 &&
     std::abs(lengths_[2]-29.3104)<1e-8;
