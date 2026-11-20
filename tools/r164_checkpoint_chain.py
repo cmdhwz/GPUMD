@@ -55,7 +55,9 @@ def config(capture,meta,source):
     return lines,b
 
 def load(capture,step):
-    capture=Path(capture).resolve(); meta=keyfile(capture/'metadata.txt'); source=keyfile(capture/'source_identity.txt')
+    capture=Path(capture).resolve()
+    metadata_hash=sha(capture/'metadata.txt'); identity_hash=sha(capture/'source_identity.txt')
+    meta=keyfile(capture/'metadata.txt'); source=keyfile(capture/'source_identity.txt')
     if meta.get('schema')!='r164_diagnostic_v1' or meta.get('time_convention')!='step_times_fixed_dt_start_zero' or meta.get('checkpoint')!='FRESH_REBUILD_ONLY': raise ValueError('unsupported metadata')
     if not meta.get('reference_id') or not HEX.fullmatch(meta.get('reference_source_sha256','')): raise ValueError('missing reference identity')
     if not re.fullmatch('[0-9a-fA-F]{40}',source.get('build_git_commit','')) or source.get('build_git_dirty')!='no': raise ValueError('clean Git build identity required')
@@ -69,6 +71,8 @@ def load(capture,step):
     if set(data)!=KEYS or data['schema']!='r164_checkpoint_v1' or data['step']!=str(step) or data['cache_policy']!='fresh_rebuild_only' or data['physical_event_history']!='unavailable' or not math.isclose(float(data['time_fs']),step*dt,rel_tol=1e-12,abs_tol=1e-10): raise ValueError('invalid checkpoint receipt')
     for field,path in [('metadata_sha256',capture/'metadata.txt'),('source_identity_sha256',capture/'source_identity.txt'),('frame_sha256',capture/f'frame_{step}.txt'),('force_images_sha256',capture/f'force_images_{step}.txt')]:
         if not HEX.fullmatch(data[field]) or sha(path)!=data[field]: raise ValueError('checkpoint SHA mismatch: '+field)
+    if data['metadata_sha256']!=metadata_hash or data['source_identity_sha256']!=identity_hash:
+        raise ValueError('checkpoint metadata or identity changed during read')
     rows=scalar_prefix(capture/'scalar.txt',step,dt)
     if not HEX.fullmatch(data['scalar_line_sha256']) or hashlib.sha256(rows[-1][0]).hexdigest()!=data['scalar_line_sha256']: raise ValueError('scalar SHA mismatch')
     prefix=hashlib.sha256()
@@ -112,8 +116,9 @@ def prepare(parent,step,dest,steps):
 
 def maximum(x): return float(np.max(np.abs(x)))
 
-def verify(captures,output):
-    captures=[Path(x).resolve() for x in captures]; links=[]; segments=[]; allrows=[]; absolute=0; previous=None
+def inspect(captures):
+    captures=[Path(x).resolve() for x in captures]; links=[]; segments=[]; allrows=[]; verified=[]; absolute=0; previous=None
+    if len(captures)<2: raise ValueError('requires root and child captures')
     if len(set(captures))!=len(captures): raise ValueError('duplicate capture')
     if (captures[0].parent/'parent_receipt.json').exists(): raise ValueError('child capture cannot be used as root')
     for index,capture in enumerate(captures):
@@ -151,14 +156,19 @@ def verify(captures,output):
             diffs={}
             for name in ('b','d2','j2'):
                 x=previous['rows'][-1][1][name]; y=start['rows'][0][1][name]; diffs[name]=None if x is None or y is None else maximum(x-y)
-            links.append({'q_lift_max_A':dq,'p_max_eV_fs_per_A':dp,'force_image_changed_components':images,'F_max_eV_per_A':maximum(start['F']-previous['F']),'U_bead_max_eV':maximum(start['U']-previous['U']),'observer_max_abs':diffs})
-        segments.append({'capture':str(capture),'end_step':end,'absolute_step_start':absolute,'absolute_step_end':absolute+end,'boundary_truncated':end<run['final'],'checkpoint_sha256':sha(run['receipt']),'metadata_sha256':sha(capture/'metadata.txt'),'source_identity_sha256':sha(capture/'source_identity.txt'),'source_identity':run['source'],'build_binding':'clean_git_label_not_binary_hash','observer_state':{'requested':run['observer'],'identity_present':run['observer_present'],'active_at_endpoint':run['observer_active']}})
+            links.append({'q_lift_max_A':dq,'p_max_eV_fs_per_A':dp,'force_image_changed_components':images,'F_max_eV_per_A':maximum(start['F']-previous['F']),'U_bead_max_eV':maximum(start['U']-previous['U']),'observer_max_abs':diffs,'child_initial_scalar_line':start['rows'][0][0].decode('utf8').rstrip('\n'),'child_initial_checkpoint_sha256':sha(start['receipt'])})
+        segments.append({'capture':str(capture),'end_step':end,'absolute_step_start':absolute,'absolute_step_end':absolute+end,'boundary_truncated':end<run['final'],'checkpoint_sha256':sha(run['receipt']),'scalar_prefix_sha256':keyfile(run['receipt'])['scalar_prefix_sha256'],'observer_sha256':sha(capture/'observer.txt') if run['observer_present'] else None,'metadata_sha256':sha(capture/'metadata.txt'),'source_identity_sha256':sha(capture/'source_identity.txt'),'source_identity':run['source'],'build_binding':'clean_git_label_not_binary_hash','observer_state':{'requested':run['observer'],'identity_present':run['observer_present'],'active_at_endpoint':run['observer_active']}})
         for local,(raw,_) in enumerate(run['rows']):
             if index and local==0: continue
             allrows.append({'absolute_step':absolute+local,'absolute_time_fs':(absolute+local)*run['dt'],'capture':str(capture),'local_step':local,'scalar_line':raw.decode('utf8').rstrip('\n')})
+        verified.append({key:run[key] for key in ('capture','step','meta','source','dt','P','N','temp','rows','atoms','species','mass','cell','b','observer','observer_present','observer_active')})
         absolute+=end; previous=run
     if [x['absolute_step'] for x in allrows]!=list(range(absolute+1)): raise ValueError('noncontiguous chain')
     report={'schema':'r164_checkpoint_chain_v1','scope':'fresh_cache_diagnostic_no_transport_or_event_history','cache_history':'unavailable','physical_event_history':'unavailable','links':links,'segments':segments,'rows':allrows}
+    return report, verified
+
+def verify(captures,output):
+    report,_=inspect(captures)
     with Path(output).open('x',encoding='utf8',newline='\n') as f: f.write(json.dumps(report,indent=2,allow_nan=False)+'\n')
 
 def main():

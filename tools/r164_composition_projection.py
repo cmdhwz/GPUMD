@@ -10,10 +10,10 @@ SPECIES = ('O', 'H', 'Na', 'Cl')
 MASS_FACTOR = 10.18051**2
 
 
-def composition(directory, hashes):
+def composition(directory, hashes, verified_rows=None):
     directory = Path(directory)
     metadata, scalar = directory/'metadata.txt', directory/'scalar.txt'
-    if digest(metadata) != hashes['metadata.txt'] or digest(scalar) != hashes['scalar.txt']:
+    if digest(metadata) != hashes['metadata.txt'] or (verified_rows is None and digest(scalar) != hashes['scalar.txt']):
         raise ValueError('source hash mismatch')
     meta = fields(metadata)
     rows = [line.split() for line in metadata.read_text(encoding='utf8').splitlines() if line.startswith('atom ')]
@@ -34,7 +34,8 @@ def composition(directory, hashes):
     species_mass = np.array([masses[s] * MASS_FACTOR for s in SPECIES])
     maximum = 0.0
     count = 0
-    with scalar.open(encoding='utf8', newline='') as stream:
+    def check_rows(stream):
+        nonlocal maximum, count
         for line in stream:
             if line.startswith('#'):
                 continue
@@ -53,7 +54,12 @@ def composition(directory, hashes):
             if not np.allclose(reconstructed, p, rtol=2e-13, atol=1e-10):
                 raise ValueError('mass-flow momentum mismatch')
             count += 1
-    if digest(metadata) != hashes['metadata.txt'] or digest(scalar) != hashes['scalar.txt']:
+    if verified_rows is None:
+        with scalar.open(encoding='utf8', newline='') as stream:
+            check_rows(stream)
+    else:
+        check_rows(raw.decode('utf8') for raw,_ in verified_rows)
+    if digest(metadata) != hashes['metadata.txt'] or (verified_rows is None and digest(scalar) != hashes['scalar.txt']):
         raise ValueError('source changed during verification')
     return atoms, counts, masses, count, maximum
 
@@ -135,18 +141,33 @@ def matrix_diagnostic(raw, a, rcond, null_rtol):
     return result
 
 
-def run(directories, max_lag, rcond, null_rtol, number_intervals='trapezoid'):
+def run(directories, max_lag, rcond, null_rtol, number_intervals='trapezoid', checkpoint_chain=False):
     if not np.isfinite(rcond) or not 0 < rcond < 0.1 or not np.isfinite(null_rtol) or not 0 <= null_rtol <= 1:
         raise ValueError('invalid support rcond or null-cross tolerance')
-    names = ('metadata.txt','source_identity.txt','observer.txt','scalar.txt','COMPLETE')
-    initial_hashes = [{name:digest(Path(d)/name) for name in names} for d in directories]
-    raw = analyze(directories, max_lag, number_intervals)
-    if any(before != item['sha256'] for before,item in zip(initial_hashes,raw['inputs'])):
-        raise ValueError('source changed during correlation calculation')
-    checked = [composition(d, item['sha256']) for d,item in zip(directories,raw['inputs'])]
-    if any(x[0] != checked[0][0] for x in checked[1:]):
-        raise ValueError('capture atom identity or mass differs')
-    if sum(x[3] for x in checked) != raw['sample_counts'][0]:
+    if checkpoint_chain:
+        from r164_checkpoint_chain import inspect
+        verified = inspect(directories)
+        raw = analyze(directories, max_lag, number_intervals, True, verified)
+        checked = [composition(segment['capture'], {'metadata.txt':entry['metadata_sha256']}, segment['rows'])
+                   for segment,entry in zip(verified[1],raw['inputs'])]
+    else:
+        names = ('metadata.txt','source_identity.txt','observer.txt','scalar.txt','COMPLETE')
+        initial_hashes = [{name:digest(Path(d)/name) for name in names} for d in directories]
+        raw = analyze(directories, max_lag, number_intervals)
+        if any(before != item['sha256'] for before,item in zip(initial_hashes,raw['inputs'])):
+            raise ValueError('source changed during correlation calculation')
+        checked = [composition(d, item['sha256']) for d,item in zip(directories,raw['inputs'])]
+    for item in checked[1:]:
+        reference = checked[0][0]
+        if len(item[0]) != len(reference) or any(a[0] != b[0] for a,b in zip(item[0],reference)):
+            raise ValueError('capture atom identity differs')
+        if checkpoint_chain:
+            if not np.allclose([a[1] for a in item[0]],[a[1] for a in reference],rtol=2e-15,atol=0):
+                raise ValueError('checkpoint atom mass differs')
+        elif item[0] != reference:
+            raise ValueError('capture atom identity or mass differs')
+    expected_rows = raw['sample_counts'][0] + (len(checked)-1 if checkpoint_chain else 0)
+    if sum(x[3] for x in checked) != expected_rows:
         raise ValueError('scalar sample domain mismatch')
     atoms, counts, masses = checked[0][:3]
     a, total_mass = transform(counts,masses)
@@ -160,6 +181,8 @@ def run(directories, max_lag, rcond, null_rtol, number_intervals='trapezoid'):
             'window_scope':'GK uses point samples; EH and triangular use common interval-bin data and actual contiguous origins as recorded in raw_report', 'support_rcond':rcond, 'null_cross_rtol':null_rtol,
             'species_order':SPECIES, 'counts':counts, 'mass_amu':masses, 'total_mass_eV_fs2_per_A2':total_mass,
             'mass_flow_max_abs_eV_fs_per_A':max(x[4] for x in checked),
+            'mass_flow_verified_rows':sum(x[3] for x in checked),
+            'checkpoint_mass_max_abs_amu':max((max(abs(a[1]-b[1]) for a,b in zip(item[0],checked[0][0])) for item in checked),default=0.0),
             'mass_flow_tolerance':'rtol 2e-13, atol 1e-10 eV fs/angstrom',
             'transform_Y_from_species':a[6:,6:].tolist(),
             'matrices':{name:matrix_diagnostic(value,a,rcond,null_rtol) for name,value in matrices.items()},
@@ -173,9 +196,10 @@ def main():
     parser.add_argument('--support-rcond',required=True,type=float)
     parser.add_argument('--null-cross-rtol',required=True,type=float)
     parser.add_argument('--number-intervals',choices=('trapezoid','lift'),default='trapezoid')
+    parser.add_argument('--checkpoint-chain',action='store_true')
     parser.add_argument('--output',required=True,type=Path)
     args = parser.parse_args()
-    report = run(args.directories,args.max_lag,args.support_rcond,args.null_cross_rtol,args.number_intervals)
+    report = run(args.directories,args.max_lag,args.support_rcond,args.null_cross_rtol,args.number_intervals,args.checkpoint_chain)
     encoded = json.dumps(report,indent=2,allow_nan=False)+'\n'
     with args.output.open('x',encoding='utf8',newline='\n') as output:
         output.write(encoded)

@@ -117,8 +117,8 @@ def integral(c, dt):
     return out
 
 
-def eh_diagnostic(traces, dt, window, number_intervals=None):
-    bins=[(trace[:-1]+trace[1:])*0.5 for trace in traces]
+def eh_diagnostic(traces, dt, window, number_intervals=None, interval_bins=None):
+    bins=[(trace[:-1]+trace[1:])*0.5 for trace in traces] if interval_bins is None else [x.copy() for x in interval_bins]
     if number_intervals is not None:
         if len(number_intervals) != len(bins):
             raise ValueError('number interval trace count mismatch')
@@ -159,6 +159,21 @@ def eh_diagnostic(traces, dt, window, number_intervals=None):
                   finite_sample_residual=(eh-triangular).tolist())
     return result
 
+def lift_row(tokens, step):
+    initial = tokens.count('NUMBER_INCREMENT_INITIAL_BOUNDARY')
+    lift = tokens.count('NUMBER_INCREMENT_LIFT_A')
+    if step == 0:
+        if initial != 1 or lift != 0 or tokens[-1] != 'NUMBER_INCREMENT_INITIAL_BOUNDARY':
+            raise ValueError('invalid initial number increment boundary')
+        return None
+    if initial != 0 or lift != 1 or len(tokens) < 13 or tokens[-13] != 'NUMBER_INCREMENT_LIFT_A':
+        raise ValueError('invalid lifted number increment suffix')
+    values = np.asarray(tokens[-12:], dtype=float)
+    if values.shape != (12,) or not np.isfinite(values).all():
+        raise ValueError('invalid lifted number increment values')
+    return values
+
+
 def read_lift_intervals(directory, expected_hash, expected_metadata_hash, expected_rows):
     path = Path(directory)/'scalar.txt'
     meta_path = Path(directory)/'metadata.txt'
@@ -180,50 +195,94 @@ def read_lift_intervals(directory, expected_hash, expected_metadata_hash, expect
             step = len(rows)
             if not tokens or int(tokens[0]) != step:
                 raise ValueError('noncontiguous interval step')
-            initial = tokens.count('NUMBER_INCREMENT_INITIAL_BOUNDARY')
-            lift = tokens.count('NUMBER_INCREMENT_LIFT_A')
-            if step == 0:
-                if initial != 1 or lift != 0 or tokens[-1] != 'NUMBER_INCREMENT_INITIAL_BOUNDARY':
-                    raise ValueError('invalid initial number increment boundary')
-                rows.append(None)
-            else:
-                if initial != 0 or lift != 1 or len(tokens) < 13 or tokens[-13] != 'NUMBER_INCREMENT_LIFT_A':
-                    raise ValueError('invalid lifted number increment suffix')
-                values = np.asarray(tokens[-12:], dtype=float)
-                if values.shape != (12,) or not np.isfinite(values).all():
-                    raise ValueError('invalid lifted number increment values')
-                rows.append(values)
+            rows.append(lift_row(tokens, step))
     if len(rows) != expected_rows or digest(path) != expected_hash or digest(meta_path) != expected_metadata_hash:
         raise ValueError('number interval domain or scalar SHA mismatch')
     return np.asarray(rows[1:], dtype=float).reshape((-1,12))
 
 
-def analyze(directories, max_lag, number_intervals='trapezoid'):
+def analyze(directories, max_lag, number_intervals='trapezoid', checkpoint_chain=False, _verified=None):
     if number_intervals not in ('trapezoid','lift'):
         raise ValueError('unsupported number interval mode')
     if max_lag <= 0:
         raise ValueError('max lag must be positive')
     if len({Path(d).resolve() for d in directories}) != len(directories):
         raise ValueError('duplicate input directory')
-    initial_hashes = None
-    if number_intervals == 'lift':
-        initial_hashes = [{name:digest(Path(d)/name) for name in ('metadata.txt','scalar.txt')} for d in directories]
-    loaded = [load_trace(d) for d in directories]
-    if initial_hashes is not None and any(any(before[name] != entry[2][name] for name in before)
-                                          for before,entry in zip(initial_hashes,loaded)):
-        raise ValueError('source changed during correlation calculation')
-    scalar_hashes=[item[2]['scalar.txt'] for item in loaded]
-    if len(set(scalar_hashes)) != len(scalar_hashes):
-        raise ValueError('identical scalar inputs would be double counted')
-    if any(item[1] != loaded[0][1] for item in loaded[1:]):
-        raise ValueError('backend, source/configuration, reference or thermodynamic identity mismatch')
-    traces = [item[0] for item in loaded]
+    chain_report = None
+    chain_bins = None
+    if checkpoint_chain:
+        from r164_checkpoint_chain import inspect
+        chain_report, segments = inspect(directories) if _verified is None else _verified
+        first = segments[0]
+        if (first['meta'].get('reference_id') != 'R27_fixed_2OH_R157' or
+                first['meta'].get('reference_source_sha256') != '1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa'):
+            raise ValueError('unsupported fixed reference identity')
+        points = []
+        bins = []
+        for index,segment in enumerate(segments):
+            if not segment['observer'] or not segment['observer_present']:
+                raise ValueError('checkpoint segment lacks observer identity')
+            if number_intervals == 'lift' and segment['meta'].get('number_increment') != 'lift_angstrom O_H_Na_Cl_xyz right_closed_initial_boundary_no_increment':
+                raise ValueError('missing lifted number increment metadata')
+            segment_points = []
+            segment_lift = []
+            for step,(raw,_) in enumerate(segment['rows']):
+                tokens = raw.decode('utf8').split()
+                b = numeric(tokens,'B_UNVERIFIED',3)
+                r = numeric(tokens,'R27_UNVERIFIED',7)
+                j = numeric(tokens,'J2_UNVERIFIED',3)
+                if not np.allclose(j,b+r[4:7],rtol=2e-14,atol=2e-14):
+                    raise ValueError('J2 identity mismatch')
+                species = np.asarray(tokens[9:21],dtype=float)
+                if species.shape != (12,) or not np.isfinite(species).all():
+                    raise ValueError('invalid species flows')
+                segment_points.append(np.concatenate((b,r[4:7],species)))
+                if number_intervals == 'lift':
+                    value = lift_row(tokens,step)
+                    if step: segment_lift.append(value)
+            values = np.asarray(segment_points)
+            points.extend(values if index == 0 else values[1:])
+            segment_bins = (values[:-1]+values[1:])*0.5
+            if number_intervals == 'lift':
+                segment_bins[:,6:] = np.asarray(segment_lift).reshape((-1,12))/segment['dt']
+            bins.extend(segment_bins)
+        traces = [np.asarray(points)]
+        chain_bins = [np.asarray(bins).reshape((-1,18))]
+        if len(chain_bins[0]) != len(traces[0])-1:
+            raise ValueError('chain interval domain mismatch')
+        dt, temperature, cell = first['dt'], first['temp'], first['cell']
+        for index, record in enumerate(chain_report['segments']):
+            record['point_local_range'] = [0 if index == 0 else 1, record['end_step']]
+            record['interval_left_local_range'] = [0,record['end_step']-1]
+            record['interval_right_local_range'] = [1,record['end_step']]
+            record['seam_absolute_step'] = None if index == 0 else record['absolute_step_start']
+        chain_report['sampling'] = 'one diagnostic trajectory; independent sample count unknown; windows may cross verified seams'
+        inputs = [{'directory':str(segment['capture']), 'checkpoint_sha256':record['checkpoint_sha256'],
+                   'metadata_sha256':record['metadata_sha256'], 'source_identity_sha256':record['source_identity_sha256']}
+                  for segment,record in zip(segments,chain_report['segments'])]
+        intervals = None
+    else:
+        initial_hashes = None
+        if number_intervals == 'lift':
+            initial_hashes = [{name:digest(Path(d)/name) for name in ('metadata.txt','scalar.txt')} for d in directories]
+        loaded = [load_trace(d) for d in directories]
+        if initial_hashes is not None and any(any(before[name] != entry[2][name] for name in before)
+                                              for before,entry in zip(initial_hashes,loaded)):
+            raise ValueError('source changed during correlation calculation')
+        scalar_hashes=[item[2]['scalar.txt'] for item in loaded]
+        if len(set(scalar_hashes)) != len(scalar_hashes):
+            raise ValueError('identical scalar inputs would be double counted')
+        if any(item[1] != loaded[0][1] for item in loaded[1:]):
+            raise ValueError('backend, source/configuration, reference or thermodynamic identity mismatch')
+        traces = [item[0] for item in loaded]
+        dt, temperature, cell = loaded[0][3], loaded[0][4], loaded[0][5]
+        intervals = None
+        if number_intervals == 'lift':
+            intervals = [read_lift_intervals(d, entry[2]['scalar.txt'], entry[2]['metadata.txt'], len(entry[0]))
+                         for d,entry in zip(directories,loaded)]
+        inputs = [{'directory':str(d),'sha256':entry[2]} for d,entry in zip(directories,loaded)]
     if any(len(x) <= max_lag for x in traces):
         raise ValueError('max lag must be shorter than every trace')
-    intervals = None
-    if number_intervals == 'lift':
-        intervals = [read_lift_intervals(d, entry[2]['scalar.txt'], entry[2]['metadata.txt'], len(entry[0]))
-                     for d,entry in zip(directories,loaded)]
     mean = sum((x.sum(axis=0) for x in traces), np.zeros(18))/sum(map(len, traces))
     c, counts = correlations(traces, mean, max_lag)
     bb, bd, db, dd = c[:, :3, :3], c[:, :3, 3:6], c[:, 3:6, :3], c[:, 3:6, 3:6]
@@ -242,7 +301,7 @@ def analyze(directories, max_lag, number_intervals='trapezoid'):
             for part in (trace[:half], trace[half:2*half]):
                 cb, _ = correlations([part], mean, max_lag)
                 four = np.stack((cb[:,:3,:3],cb[:,:3,3:6],cb[:,3:6,:3],cb[:,3:6,3:6]),axis=1)
-                block_vectors.append(integral(four, loaded[0][3])[-1].reshape(36))
+                block_vectors.append(integral(four, dt)[-1].reshape(36))
     covariance = np.cov(np.asarray(block_vectors),rowvar=False,ddof=1).tolist() if len(block_vectors)>=2 else None
     return {
         'schema': 'r164_provisional_correlations_v1',
@@ -251,18 +310,18 @@ def analyze(directories, max_lag, number_intervals='trapezoid'):
         'axes': 'C[lag,i,j] uses time-zero i and later-time j; vector order b_xyz,d2_xyz,N_O_xyz,N_H_xyz,N_Na_xyz,N_Cl_xyz',
         'units': {'b_d2':'eV angstrom/fs','species':'angstrom/fs','correlation':'outer product of vector units',
                   'integral':'correlation units multiplied by fs; no volume or temperature normalization'},
-        'eh_regular_only':eh_diagnostic(traces,loaded[0][3],max_lag,intervals),
+        'eh_regular_only':eh_diagnostic(traces,dt,max_lag,intervals,chain_bins),
         'number_interval_mode':number_intervals,
-        'number_interval_scope':'GK remains pointwise; EH species bins are lifted displacement/dt' if intervals is not None else 'GK pointwise; EH species bins use endpoint trapezoids',
-        'dt_fs': loaded[0][3], 'temperature_K': loaded[0][4], 'cell_angstrom': loaded[0][5].tolist(),
+        'number_interval_scope':'GK remains pointwise; EH species bins are lifted displacement/dt' if number_intervals == 'lift' else 'GK pointwise; EH species bins use endpoint trapezoids',
+        'dt_fs': dt, 'temperature_K': temperature, 'cell_angstrom': cell.tolist(),
         'max_lag': max_lag, 'sample_counts': counts, 'mean_shared_all_samples': mean.tolist(),
         'C_full_18x18': c.tolist(), 'C_bb':bb.tolist(), 'C_bd':bd.tolist(), 'C_db':db.tolist(), 'C_dd':dd.tolist(),
         'C_J2_direct':j_direct.tolist(), 'J2_identity_max_abs':float(np.max(np.abs(j_direct-bb-bd-db-dd))),
-        'integrated_full_18x18_trapezoid':integral(c,loaded[0][3]).tolist(),
-        'integrated_four_blocks_trapezoid':integral(blocks,loaded[0][3]).tolist(),
+        'integrated_full_18x18_trapezoid':integral(c,dt).tolist(),
+        'integrated_four_blocks_trapezoid':integral(blocks,dt).tolist(),
         'paired_block_covariance_36x36':covariance, 'paired_block_count':len(block_vectors),
         'paired_block_note':'two nonoverlapping equal blocks per eligible trace, common global mean; blocks not asserted independent',
-        'inputs':[{'directory':str(d),'sha256':entry[2]} for d,entry in zip(directories,loaded)],
+        'inputs':inputs, 'checkpoint_chain':chain_report,
     }
 
 
@@ -271,9 +330,10 @@ def main():
     parser.add_argument('directories', nargs='+', type=Path)
     parser.add_argument('--max-lag',type=int,required=True)
     parser.add_argument('--number-intervals', choices=('trapezoid','lift'), default='trapezoid')
+    parser.add_argument('--checkpoint-chain', action='store_true')
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
-    result=analyze(args.directories,args.max_lag,args.number_intervals)
+    result=analyze(args.directories,args.max_lag,args.number_intervals,args.checkpoint_chain)
     with args.output.open('x',encoding='utf8') as output:
         json.dump(result,output,indent=2,allow_nan=False); output.write('\n')
 
