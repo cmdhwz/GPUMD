@@ -47,7 +47,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   if (!box.is_orthogonal || !box.pbc_x || !box.pbc_y || !box.pbc_z || start_time != 0 ||
       !std::isfinite(temperature) || temperature <= 0 || !std::isfinite(dt) || dt <= 0)
     PRINT_INPUT_ERROR("r164_rpmd requires an orthogonal periodic cell, positive temperature and dt, and a fresh run.");
-  n_=atom.number_of_atoms; p_=atom.number_of_beads; temperature_=temperature; box_for_observer_=box;
+  n_=atom.number_of_atoms; p_=atom.number_of_beads; temperature_=temperature; dt_=dt; box_for_observer_=box;
   previous_force_images_.clear(); force_images_.clear();
   if (n_ <= 0 || p_ < 2) PRINT_INPUT_ERROR("r164_rpmd requires loaded bead arrays.");
   for (int d=0; d<3; ++d) { lengths_[d]=box.cpu_h[d*4]; if (!std::isfinite(lengths_[d]) || !(lengths_[d]>0)) PRINT_INPUT_ERROR("r164_rpmd invalid box."); }
@@ -66,6 +66,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
        << "layout q_p_F: bead,atom,xyz; U: bead\nreference_id R27_fixed_2OH_R157\nreference_source_sha256 1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa\nreference_atom_identity_and_environment UNVERIFIED\nunits q=angstrom p=eV_fs_per_angstrom F=eV_per_angstrom U=eV time=fs\n"
        << "flow_b UNVERIFIED_OR_UNAVAILABLE\nd2 R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT\nJ2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\ncheckpoint BLOCKED\n"
        << "P " << p_ << "\nN " << n_ << "\ntemperature_K " << temperature_ << "\ndt_fs " << dt*TIME_UNIT_CONVERSION << "\n"
+       << "time_convention step_times_fixed_dt_start_zero\n"
        << "cell_angstrom " << lengths_[0] << ' ' << lengths_[1] << ' ' << lengths_[2] << "\n";
   for (int i=0; i<n_; ++i) meta << "atom " << i << ' ' << atom.cpu_atom_symbol[i] << ' ' << atom.cpu_mass[i] << '\n';
   meta.close(); if (!meta || rpmd_ja_file_io::atomic_commit_new_file(directory_+"/metadata.txt.tmp", directory_+"/metadata.txt") != 0) PRINT_INPUT_ERROR("r164_rpmd failed committing metadata.");
@@ -77,6 +78,12 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom) {
   const std::string source_hash=rpmd_ja_sample_provenance::sha256_file(source_model);
   const std::string input_hash=rpmd_ja_sample_provenance::sha256_file("run.in");
   rpmd_ja_file_io::ofstream identity(directory_+"/source_identity.txt.tmp");
+#ifdef GPUMD_WPE_ENABLED
+  identity << "bead_force_backend WPE\n";
+#else
+  identity << "bead_force_backend native_GPUMD\n";
+#endif
+  identity << "machine_scope GPU_and_driver_not_recorded\nlogical_bead_force_call_mapping initial_1_step_n_is_n_plus_1_backend_internal_calls_unrecorded\n";
   identity << "model_sha256 " << (source_hash.empty()?"UNAVAILABLE":source_hash)
            << "\nrun_in_sha256 " << (input_hash.empty()?"UNAVAILABLE":input_hash) << "\n";
   identity.close();
@@ -142,6 +149,7 @@ void R164_RPMD::check_force_positions(Atom& atom) {
   }
 }
 void R164_RPMD::output(int step, int total, double time, Atom& atom) {
+  time=step*dt_;
   std::vector<double> v(p_*n_*3), f(p_*n_*3), u(p_*n_), current;
   for (int s=0; s<p_; ++s) {
     atom.velocity_beads[s].copy_to_host(v.data()+s*n_*3);

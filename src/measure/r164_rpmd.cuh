@@ -20,7 +20,7 @@ public:
 private:
   bool enabled_ = false;
   int stride_ = 0, n_ = 0, p_ = 0;
-  double temperature_ = 0, lengths_[3] = {};
+  double temperature_ = 0, dt_ = 0, lengths_[3] = {};
   std::string directory_;
   bool observer_requested_ = false;
   std::unique_ptr<NEP_Charge> observer_;

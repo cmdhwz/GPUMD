@@ -32,6 +32,7 @@ def main():
     matching=[]
     with (a.directory / 'scalar.txt').open(encoding='utf-8') as scalar:
         for line in scalar:
+            if not line.endswith('\n'): raise ValueError('partial scalar row without newline')
             if line.startswith('#'): continue
             columns=line.split()
             if columns and int(columns[0]) == a.step: matching.append(columns)

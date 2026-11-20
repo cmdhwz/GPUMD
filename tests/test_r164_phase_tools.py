@@ -41,6 +41,8 @@ class PhaseToolsTest(unittest.TestCase):
             scalar.write_text('1 0.2\n',encoding='utf8')
             cmd[-1]=str(d/'bad.npz')
             self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
+            scalar.write_text('1 0.1',encoding='utf8')
+            self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
 
     def test_relaunch_receipt_and_one_wrap_guard(self):
         with tempfile.TemporaryDirectory() as td:

@@ -45,12 +45,19 @@ def main():
     model = args.destination/'model.xyz'; restart = args.destination/'restart_beads.xyz'
     subprocess.run([sys.executable, str(HERE/'r164_phase_to_restart.py'), str(phase), str(restart),
                     '--temperature', str(temperature), '--model-output', str(model)], check=True)
+    with scalar.open('rb') as source:
+        rows=[line for line in source if not line.startswith(b'#') and line.split() and int(line.split()[0]) == args.step]
+    if len(rows) != 1 or not rows[0].endswith(b'\n'):
+        raise ValueError('parent scalar row missing, duplicated or partial')
     receipt = {
         'schema': 'r164_diagnostic_phase_relaunch_v1', 'scope': 'fresh_run_reinitialization_not_seamless_restart',
         'parent_step': args.step, 'parent_time_fs': time_fs, 'parent_dt_fs': dt_fs,
         'parent_files_sha256': {path.name: digest(path) for path in (meta, frame, scalar, identity)},
         'child_files_sha256': {path.name: digest(path) for path in (phase, model, restart)},
         'parent_source_identity': identity.read_text(encoding='utf8').splitlines(),
+        'parent_scalar_row_sha256': hashlib.sha256(rows[0]).hexdigest(),
+        'parent_scalar_file_hash_scope': 'file bytes at receipt creation; file may grow',
+        'future_execution_identity': 'NOT_VERIFIED',
         'missing': ['continuing_step_time_identity', 'neighbor_and_pppm_cache_history', 'event_history', 'rng_and_thermostat_history'],
         'required_check': 'compare uninterrupted and fresh-cache trajectories before any continuity claim',
     }
