@@ -16,4 +16,14 @@ class ReplayTests(unittest.TestCase):
         np.testing.assert_allclose(result['Q_drift_residual'],0,atol=1e-14)
         np.testing.assert_allclose(result['last_kick_residual'],0,atol=1e-14)
         np.testing.assert_allclose(result['split_minus_endpoint'],0,atol=1e-14)
+    def test_reject_cross_capture_and_missing_lineage(self):
+        first={'capture_id_sha256':np.array('a'*64),'capture_source_directory':np.array('trajectory_A'),
+               'atom_row_zero_based':np.arange(3),'bead_order_zero_based':np.arange(2)}
+        lineage=de.validate_lineage(first,None,2,3)
+        same=dict(first); self.assertEqual(de.validate_lineage(same,lineage,2,3),lineage)
+        other=dict(first,capture_id_sha256=np.array('b'*64),capture_source_directory=np.array('trajectory_B'))
+        with self.assertRaises(ValueError): de.validate_lineage(other,lineage,2,3)
+        with self.assertRaises(ValueError): de.validate_lineage({},None,2,3)
+        bad=dict(first,bead_order_zero_based=np.array([1,0]))
+        with self.assertRaises(ValueError): de.validate_lineage(bad,None,2,3)
 if __name__=='__main__': unittest.main()

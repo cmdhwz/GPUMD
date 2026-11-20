@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Convert an R164 debug frame and metadata into an R161-style NPZ."""
 import argparse
+import hashlib
 from pathlib import Path
 import numpy as np
 
@@ -41,10 +42,21 @@ def main():
     if (not np.isfinite(time_fs) or not np.isfinite(dt_fs) or dt_fs <= 0
         or not np.isclose(time_fs, a.step * dt_fs, rtol=1e-12, atol=1e-10)):
         raise ValueError('invalid or aliased frame time/step')
+    lineage={}
+    source_paths=[a.directory/'metadata.txt',a.directory/'source_identity.txt',a.directory/'frame_0.txt']
+    if all(path.is_file() for path in source_paths):
+        identity=hashlib.sha256()
+        directory=str(a.directory.resolve())
+        identity.update(directory.encode('utf8'))
+        for path in source_paths:
+            identity.update(b'\0'+path.name.encode('utf8')+b'\0')
+            with path.open('rb') as source:
+                for block in iter(lambda:source.read(1024*1024),b''): identity.update(block)
+        lineage={'capture_id_sha256':identity.hexdigest(),'capture_source_directory':directory}
     with open(a.output,'xb') as target:
         np.savez_compressed(target,q_A=q,p_eV_fs_per_A=p,F_eV_per_A=f,U_eV=u,
             mass=np.array([float(x[2]) for x in atoms])*10.18051**2,
             time_fs=time_fs,dt_fs=dt_fs,step=a.step,
             species=np.array([x[1] for x in atoms]),cell=np.diag(np.array(fields['cell_angstrom'],float)),
-            atom_row_zero_based=np.arange(N),bead_order_zero_based=np.arange(P))
+            atom_row_zero_based=np.arange(N),bead_order_zero_based=np.arange(P),**lineage)
 if __name__=='__main__': main()

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 import numpy as np
 
@@ -46,6 +47,32 @@ def replay(Q,Pi,a,time,omega,q0,c):
             'last_kick_integral':np.asarray(after).tolist(),
             'split_minus_endpoint':(split-np.diff(pol,axis=0)).tolist()}
 
+def validate_lineage(z, expected, beads, atoms):
+    if 'capture_id_sha256' not in z or 'capture_source_directory' not in z:
+        raise ValueError('D/E requires R164 capture provenance in every frame')
+    capture=str(z['capture_id_sha256']); directory=str(z['capture_source_directory'])
+    if not re.fullmatch(r'[0-9a-f]{64}',capture) or not directory:
+        raise ValueError('invalid capture provenance')
+    if expected is not None and (capture,directory)!=expected:
+        raise ValueError('D/E frames belong to different captures')
+    if ('atom_row_zero_based' not in z or 'bead_order_zero_based' not in z or
+        not np.array_equal(z['atom_row_zero_based'],np.arange(atoms)) or
+        not np.array_equal(z['bead_order_zero_based'],np.arange(beads))):
+        raise ValueError('D/E requires explicit original atom and bead ordering')
+    return capture,directory
+
+def load_coefficients(par):
+    groups=par['diagnostic_delta_G_affine_centered_by_Cartesian_component']
+    c={k:np.array([r[k] for r in groups]) for k in ('c','gamma','S_Q','S_P','T','V')}
+    shapes={'c':(3,), 'gamma':(3,2), 'S_Q':(3,2,2), 'S_P':(3,2,2), 'T':(3,2,2,2), 'V':(3,2,2,2)}
+    if any(c[k].shape!=shape or not np.isfinite(c[k]).all() for k,shape in shapes.items()):
+        raise ValueError('invalid R27 polynomial coefficient shape or value')
+    if not all(np.array_equal(c[k],c[k].swapaxes(1,2)) for k in ('S_Q','S_P')):
+        raise ValueError('R27 quadratic coefficients are not symmetric')
+    if not (np.array_equal(c['T'],c['T'].swapaxes(1,2)) and np.array_equal(c['T'],c['T'].swapaxes(2,3)) and np.array_equal(c['V'],c['V'].swapaxes(2,3))):
+        raise ValueError('R27 cubic coefficients are not symmetric')
+    return c
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--parameters',required=True,type=Path)
@@ -60,12 +87,13 @@ def main():
         raise ValueError('requires fixed R27 reference and at least two contiguous frames')
     support=par['support']; indices=[r['atom_id'] for r in support]
     mass=np.array([r['mass_eV_fs2_per_A2'] for r in support]); basis=np.array([r['B_cartesian_by_mode'] for r in support]); ref=np.array([r['reference_lift_A'] for r in support])
-    qlist=[]; plist=[]; flist=[]; times=[]; steps=[]; dt0=None; inputs=[]; first_shape=None; first_species=None; first_mass=None
+    qlist=[]; plist=[]; flist=[]; times=[]; steps=[]; dt0=None; inputs=[]; first_shape=None; first_species=None; first_mass=None; lineage=None
     for path in args.frames:
         with np.load(path,allow_pickle=False) as z:
             q=z['q_A']; p=z['p_eV_fs_per_A']; f=z['F_eV_per_A']; t=float(z['time_fs']); dt=float(z['dt_fs']); step=int(z['step'])
             if q.ndim!=3 or q.shape[0]<1 or q.shape[1:]!=(5896,3) or q.shape!=p.shape or q.shape!=f.shape or not all(np.isfinite(v).all() for v in (q,p,f)) or not np.isfinite(t) or not np.isfinite(dt) or dt<=0:
                 raise ValueError('invalid full-bead frame')
+            lineage=validate_lineage(z,lineage,q.shape[0],q.shape[1])
             species=z['species']; masses=z['mass']; cell=z['cell']
             if species.shape!=(5896,) or masses.shape!=(5896,) or cell.shape!=(3,3) or not np.allclose(cell,np.eye(3)*29.3104,rtol=0,atol=1e-8):
                 raise ValueError('invalid atom metadata or cell')
@@ -80,11 +108,11 @@ def main():
         inputs.append({'path':str(path),'sha256':digest(path)})
     xc=np.array(qlist); pc=np.array(plist); fc=np.array(flist)
     Q=np.einsum('i,iaj,tia->tj',mass,basis,xc-ref); Pi=np.einsum('iaj,tia->tj',basis,pc); a=np.einsum('iaj,tia->tj',basis,fc)
-    groups=par['diagnostic_delta_G_affine_centered_by_Cartesian_component']; c={k:np.array([r[k] for r in groups]) for k in ('c','gamma','S_Q','S_P','T','V')}
+    c=load_coefficients(par)
     result={'schema':'r164_provisional_de_v1','scope':'diagnostic arithmetic on supplied whole-step frames; no event or physical release',
             'static_C':'inherited reference coefficients only; no independent C revalidation',
             'full_hessian_and_same_source_backend_residual':'UNAVAILABLE',
-            'reference_sha256':EXPECTED,'frame_inputs':inputs,'time_fs':times,
+            'reference_sha256':EXPECTED,'capture_id_sha256':lineage[0],'capture_source_directory':lineage[1],'frame_inputs':inputs,'time_fs':times,
             'units':{'Q':'sqrt(eV) fs','Pi':'sqrt(eV)','force':'sqrt(eV)/fs','polarization':'eV angstrom'},
             'replay':replay(Q,Pi,a,np.array(times),np.array(par['mode_omega_per_fs']),np.array(par['diagnostic_q0_sqrt_eV_fs']),c)}
     with args.output.open('x',encoding='utf8') as out:

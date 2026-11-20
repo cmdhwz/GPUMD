@@ -33,11 +33,13 @@ class PhaseToolsTest(unittest.TestCase):
             d=Path(td)
             (d/'metadata.txt').write_text('P 2\nN 1\ndt_fs 0.1\ncell_angstrom 10 10 10\natom 0 O 15.999\n',encoding='utf8')
             (d/'frame_1.txt').write_text('bead 0 -1\n0 1 2 3 4 5 6 7 8 9\nbead 1 -2\n0 2 3 4 5 6 7 8 9 10\n',encoding='utf8')
+            (d/'frame_0.txt').write_text('initial frame',encoding='utf8')
+            (d/'source_identity.txt').write_text('model_sha256 example\n',encoding='utf8')
             scalar=d/'scalar.txt'; scalar.write_text('# header\n1 0.1\n',encoding='utf8')
             cmd=[sys.executable,str(ROOT/'tools/r164_frame_to_npz.py'),str(d),'1',str(d/'out.npz')]
             subprocess.run(cmd,check=True)
             with np.load(d/'out.npz') as out:
-                self.assertEqual(out['q_A'].shape,(2,1,3)); self.assertEqual(out['time_fs'],0.1); self.assertEqual(out['dt_fs'],0.1)
+                self.assertEqual(out['q_A'].shape,(2,1,3)); self.assertEqual(out['time_fs'],0.1); self.assertEqual(out['dt_fs'],0.1); self.assertEqual(len(str(out['capture_id_sha256'])),64)
             scalar.write_text('1 0.2\n',encoding='utf8')
             cmd[-1]=str(d/'bad.npz')
             self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
