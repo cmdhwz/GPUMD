@@ -2,6 +2,8 @@
 #include "force/nep_charge.cuh"
 #include "rpmd_ja_sha256.h"
 #include "model/box.cuh"
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -14,7 +16,7 @@ public:
   bool enabled() const { return enabled_; }
   void parse(const std::vector<std::string>& tokens);
   void reset() {
-    compression_.reset(); compressed_ = false;
+    compression_.reset(); shadow_.reset(); compressed_ = false;
     enabled_ = false; observer_requested_ = false; drift_charge_requested_ = false; buffered_ = false;
     sample_stride_ = 0; checkpoint_stride_ = 0; trace_step_ = -1;
     series_.clear(); series_.shrink_to_fit(); snapshots_.clear(); snapshots_.shrink_to_fit();
@@ -30,6 +32,22 @@ public:
   void prepare_buffered(int total, const Atom&);
   void finish_buffered(Atom&);
 private:
+  using Clock = std::chrono::steady_clock;
+  struct TransferTiming { uint64_t calls=0, bytes=0; double seconds=0; };
+  TransferTiming d2h_, h2d_;
+  double geometry_wall_=0, output_host_wall_=0, observer_wall_=0, finalization_wall_=0;
+  template <typename T> void copy_to_host(const GPU_Vector<T>& source, T* dest) {
+    if (!buffered_) { source.copy_to_host(dest); return; }
+    const auto start=Clock::now(); source.copy_to_host(dest);
+    d2h_.seconds+=std::chrono::duration<double>(Clock::now()-start).count();
+    ++d2h_.calls; d2h_.bytes+=source.size()*sizeof(T);
+  }
+  template <typename T> void copy_from_host(GPU_Vector<T>& dest, const T* source) {
+    if (!buffered_) { dest.copy_from_host(source); return; }
+    const auto start=Clock::now(); dest.copy_from_host(source);
+    h2d_.seconds+=std::chrono::duration<double>(Clock::now()-start).count();
+    ++h2d_.calls; h2d_.bytes+=dest.size()*sizeof(T);
+  }
   bool enabled_ = false;
   int stride_ = 0, checkpoint_stride_ = 0, n_ = 0, p_ = 0;
   int trace_step_ = -1, trace_bead_ = -1, trace_atom_ = -1;
@@ -64,6 +82,16 @@ private:
   Box box_for_observer_;
   GPU_Vector<double> observer_q_, observer_u_, observer_f_, observer_virial_, observer_v_, observer_site_rate_, observer_gradient_, observer_local_, observer_local_image_;
   GPU_Vector<double> observer_drift_v_;
+  struct BufferedShadow {
+    GPU_Vector<double> q, offset;
+    GPU_Vector<long long> images;
+    GPU_Vector<int> error;
+    GPU_Vector<double*> positions;
+    std::vector<double*> positions_host;
+  };
+  std::unique_ptr<BufferedShadow> shadow_;
+  void shadow_prepare(Atom&);
+  void shadow_stage(Atom&, int phase, bool save_images=false);
   std::vector<double> q_, offset_, position_scratch_;
   std::vector<int> species_;
   double number_increment_[4][3] = {};
