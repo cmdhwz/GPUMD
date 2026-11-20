@@ -27,7 +27,7 @@ class CheckpointContract(unittest.TestCase):
         lf = b'12 1.2 3.4\n'
         self.assertEqual(hashlib.sha256(lf).digest(), hashlib.sha256(b'12 1.2 3.4\r\n'.rstrip(b'\r\n') + b'\n').digest())
         for field in ('metadata_sha256', 'source_identity_sha256', 'frame_sha256', 'force_images_sha256',
-                      'scalar_line_sha256', 'cache_policy fresh_rebuild_only', 'physical_event_history unavailable'):
+                      'scalar_line_sha256', 'scalar_prefix_sha256', 'cache_policy fresh_rebuild_only', 'physical_event_history unavailable'):
             self.assertIn(field, SOURCE)
         self.assertIn('metadata_hash.size()!=64', SOURCE)
         self.assertIn('scalar_hash.size()!=64', SOURCE)

@@ -26,6 +26,18 @@ def keyfile(path):
     return data
 
 
+def r164_options(tokens):
+    if len(tokens)<3 or tokens[0]!='r164_rpmd' or not tokens[2].isdigit() or int(tokens[2])>2147483647:
+        raise ValueError('invalid R164 options')
+    rest=tokens[3:]; observer=bool(rest and rest[0]=='observer')
+    if observer: rest=rest[1:]
+    checkpoint=None
+    if rest:
+        if len(rest)!=2 or rest[0]!='checkpoint' or not rest[1].isascii() or not rest[1].isdigit() or not 0<int(rest[1])<=2147483647: raise ValueError('invalid checkpoint option')
+        checkpoint=int(rest[1])
+    return observer,checkpoint
+
+
 def card(path,source,dt,steps,observer):
     if sha(path)!=source.get('run_in_sha256'): raise ValueError('run.in SHA mismatch')
     lines=[]
@@ -41,7 +53,8 @@ def card(path,source,dt,steps,observer):
         float(by['time_step'][1])!=dt or by['run']!=['run',str(steps)]):
         raise ValueError('card differs from required thermostat-free short-run contract')
     r=by['r164_rpmd']
-    if len(r) not in (3,4) or r[2]!='1' or (len(r)==4)!=(observer) or (observer and r[3]!='observer'):
+    actual_observer,_=r164_options(r)
+    if r[2]!='1' or actual_observer!=observer:
         raise ValueError('requires stride 1 and requested observer mode')
     return [tuple(x) for x in lines if x[0] not in ('r164_rpmd','time_step','run')]
 

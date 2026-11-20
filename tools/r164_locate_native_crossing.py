@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 import numpy as np
 from r164_frame_to_npz import read_frame
-from r164_verify_short_runs import card, keyfile, read_scalars, read_images, sha, validate_frame_scalars, check_observer_mode
+from r164_verify_short_runs import card, keyfile, read_scalars, read_images, sha, validate_frame_scalars, check_observer_mode, r164_options
 
 C=10.18051
 KB=8.617343e-5
@@ -161,7 +161,7 @@ def main():
     final=int(marker[2]); dt=float(meta['dt_fs']); temperature=float(meta['temperature_K']); P=int(meta['P']); N=int(meta['N'])
     if (P,N,temperature)!=(32,5896,300.) or (dt,final) not in ((0.1,10),(0.2,5)) or not (0<=a.step<final and 0<=a.bead<P and 0<=a.atom<N): raise ValueError('unsupported capture or indices')
     lines=[line.split('#',1)[0].split() for line in runin.read_text(encoding='utf8').splitlines()]; lines=[x for x in lines if x]
-    observer=any(x[0]=='r164_rpmd' and len(x)==4 and x[3]=='observer' for x in lines)
+    observer,_=r164_options(next(x for x in lines if x[0]=='r164_rpmd'))
     card(runin,source,dt,final,observer); records=read_scalars(directory/'scalar.txt',dt,final)
     check_observer_mode(directory,records,observer)
     validate_capture_path(lines,runin.parent,directory)
