@@ -44,17 +44,17 @@ static __device__ void apply_mic_small_box(
   float sy12 = ebox.h[12] * x12 + ebox.h[13] * y12 + ebox.h[14] * z12;
   float sz12 = ebox.h[15] * x12 + ebox.h[16] * y12 + ebox.h[17] * z12;
   if (box.pbc_x == 1) {
-    const double shift=nearbyint(sx12);
+    const auto shift=nearbyint(sx12);
     sx12 -= shift;
     if (image) image[0]=-static_cast<int>(shift);
   }
   if (box.pbc_y == 1) {
-    const double shift=nearbyint(sy12);
+    const auto shift=nearbyint(sy12);
     sy12 -= shift;
     if (image) image[1]=-static_cast<int>(shift);
   }
   if (box.pbc_z == 1) {
-    const double shift=nearbyint(sz12);
+    const auto shift=nearbyint(sz12);
     sz12 -= shift;
     if (image) image[2]=-static_cast<int>(shift);
   }

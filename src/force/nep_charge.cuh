@@ -546,7 +546,7 @@ private:
   const void* charge_heat_channel_cache_position_ = nullptr;
   const void* charge_heat_channel_cache_velocity_ = nullptr;
   GPU_Vector<R164_Neighbor_Edge> r164_radial_edges_, r164_angular_edges_;
-  void write_r164_neighbors(int N, bool small, unsigned long long before, unsigned long long after);
+  void write_r164_neighbors(int N, bool small_box_path, unsigned long long before, unsigned long long after);
   std::string r164_trace_prefix_;
   int r164_trace_step_ = -1, r164_trace_atom_ = -1, r164_trace_bead_ = -1;
   void write_r164_pre_electro_trace(int N, const GPU_Vector<double>& potential);

@@ -3070,11 +3070,11 @@ void NEP_Charge::invalidate_current_force_caches()
   invalidate_current_force_caches_();
 }
 
-void NEP_Charge::write_r164_neighbors(int N, bool small, unsigned long long before, unsigned long long after)
+void NEP_Charge::write_r164_neighbors(int N, bool small_box_path, unsigned long long before, unsigned long long after)
 {
   int counts[2]={};
-  const auto& nn_radial=small ? small_box_data.NN_radial : nep_data.NN_radial;
-  const auto& nn_angular=small ? small_box_data.NN_angular : nep_data.NN_angular;
+  const auto& nn_radial=small_box_path ? small_box_data.NN_radial : nep_data.NN_radial;
+  const auto& nn_angular=small_box_path ? small_box_data.NN_angular : nep_data.NN_angular;
   nn_radial.copy_to_host(&counts[0],1,r164_trace_atom_);
   nn_angular.copy_to_host(&counts[1],1,r164_trace_atom_);
   if (counts[0]<0 || counts[1]<0 || static_cast<size_t>(counts[0])>r164_radial_edges_.size() || static_cast<size_t>(counts[1])>r164_angular_edges_.size())
@@ -3086,8 +3086,8 @@ void NEP_Charge::write_r164_neighbors(int N, bool small, unsigned long long befo
   out << std::setprecision(17) << "# schema r164_descriptor_neighbors_v1\n# step " << r164_trace_step_
       << "\n# bead " << r164_trace_bead_ << "\n# atom " << r164_trace_atom_
       << "\n# force_evaluation_id " << force_evaluation_id_ << "\n# N " << N
-      << "\n# path " << (small ? "small_rebuild_each_call" : "large_descriptor_mic") << "\n";
-  if (small) out << "# global_generation unavailable\n";
+      << "\n# path " << (small_box_path ? "small_rebuild_each_call" : "large_descriptor_mic") << "\n";
+  if (small_box_path) out << "# global_generation unavailable\n";
   else out << "# global_generation_before " << before << "\n# global_generation_after " << after << "\n";
   out << "# r_ij = q_force[j]-q_force[i]+h*image; displacement float angstrom\n"
       << "# radial_count " << counts[0] << "\n# angular_count " << counts[1]

@@ -124,17 +124,17 @@ inline __host__ __device__ void apply_mic(const Box& box, float& x12, float& y12
     float sy12 = box.float_h[12] * x12 + box.float_h[13] * y12 + box.float_h[14] * z12;
     float sz12 = box.float_h[15] * x12 + box.float_h[16] * y12 + box.float_h[17] * z12;
     if (box.pbc_x == 1) {
-      const double shift=nearbyint(sx12);
+      const auto shift=nearbyint(sx12);
       sx12 -= shift;
       if (image) image[0]=-static_cast<int>(shift);
     }
     if (box.pbc_y == 1) {
-      const double shift=nearbyint(sy12);
+      const auto shift=nearbyint(sy12);
       sy12 -= shift;
       if (image) image[1]=-static_cast<int>(shift);
     }
     if (box.pbc_z == 1) {
-      const double shift=nearbyint(sz12);
+      const auto shift=nearbyint(sz12);
       sz12 -= shift;
       if (image) image[2]=-static_cast<int>(shift);
     }
