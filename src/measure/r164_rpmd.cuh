@@ -35,7 +35,7 @@ private:
   std::vector<double> q_, offset_;
   std::vector<int> species_;
   double number_increment_[4][3] = {};
-  int next_output_step_ = 0;
+  long long next_output_step_ = 0;
   bool drift_pending_ = false;
   std::vector<long long> force_images_, previous_force_images_;
   void read_positions(Atom&, std::vector<double>&);
