@@ -310,4 +310,3 @@ def main():
     if a.command=='prepare': prepare(a.geometry,a.geometry_sha256,a.step,a.bead,a.atom,a.axis,a.kind,a.root_index,a.destination)
     else: review(a.directory,a.manifest_sha256,a.output)
 if __name__=='__main__': main()
-
