@@ -46,6 +46,15 @@ class TraceContract(unittest.TestCase):
         self.assertIn('find_charge_gradient_angular_pair(paramb,c_type_pair,center,edge.atom,type,r,charge_fp,angular_sum,g)',large)
         self.assertIn('derivative_id_found',receipt)
         self.assertIn('local_edge_derivatives',receipt)
+    def test_assignment_join_is_single_atom_and_scratch_only(self):
+        pppm=(ROOT/'src/force/pppm.cu').read_text(encoding='utf8')
+        section=pppm.split('const std::string join_path=',1)[1].split('void PPPM::allocate_virial_memory()',1)[0]
+        self.assertIn('GPU_Vector<gpufftComplex> scratch(M)',section)
+        self.assertIn('apply_reference_G',section)
+        self.assertIn('atomic_commit_new_file',section)
+        self.assertIn('no_adjacent_face',section)
+        self.assertIn('assignment_join_sha256',(ROOT/'src/measure/r164_rpmd.cu').read_text(encoding='utf8'))
+
     def test_all_edges_are_explicit_little_endian_records(self):
         large=(ROOT/'src/force/nep_charge.cu').read_text(encoding='utf8')
         pppm=(ROOT/'src/force/pppm.cu').read_text(encoding='utf8')

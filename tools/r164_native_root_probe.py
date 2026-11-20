@@ -94,6 +94,21 @@ def prepare(geometry,expected_sha,step,bead,atom,axis,kind,root_index,destinatio
 
 
 
+def validate_assignment_join(capture, prefix, receipt, step, atom, force_id):
+    if 'assignment_join_sha256' not in receipt:
+        return None
+    from r164_audit_force_split import headers
+    path=capture / (prefix+'_assignment_join.out')
+    digest=sha(path)
+    if digest!=receipt['assignment_join_sha256']:
+        raise ValueError('trace SHA mismatch: assignment_join')
+    h=headers(path)
+    if (h.get('schema')!='r164_assignment_join_v1' or h.get('step')!=str(step)
+            or h.get('atom')!=str(atom) or h.get('force_evaluation_id')!=str(force_id)):
+        raise ValueError('assignment join source identity mismatch')
+    return digest
+
+
 def review(directory, expected_manifest_sha, output):
     import hashlib
     from r164_frame_to_npz import read_frame
@@ -145,10 +160,12 @@ def review(directory, expected_manifest_sha, output):
                              ('pre_electro','pre_electro.out'), ('descriptor_neighbors','descriptor_neighbors.out'),
                              ('local_edge_derivatives','local_edge_derivatives.out')):
             files[name] = capture / f'{prefix}_{suffix}'
+        join_hash=validate_assignment_join(capture,prefix,receipt,0,atom,bead+1)
         hashes = {name: sha(path) for name, path in files.items()}
         for name, digest in hashes.items():
             if receipt.get(name + '_sha256') != digest:
                 raise ValueError('trace SHA mismatch: ' + name)
+        if join_hash is not None: hashes['assignment_join']=join_hash
         scalar_lines = (capture/'scalar.txt').read_bytes().splitlines(keepends=True)
         scalar_rows = [line for line in scalar_lines if line and not line.startswith(b'#')]
         if len(scalar_rows) != 2 or any(not line.endswith(b'\n') for line in scalar_rows):

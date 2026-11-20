@@ -32,6 +32,7 @@ The k-space part of the PPPM method.
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sys/stat.h>
 #include <vector>
 
@@ -543,6 +544,18 @@ __global__ void convert_reference_delta_Q(
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < M) mesh[i] = {static_cast<float>(delta_Q[i]), 0.0f};
+}
+
+__global__ void r164_join_other_stencil(
+  const PPPMAssignmentAtomDebug atom, const int axis, const float delta, float* output)
+{
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= 125) return;
+  const int indices[3] = {t / 25, (t / 5) % 5, t % 5};
+  float weights[3] = {atom.Wx[indices[0]], atom.Wy[indices[1]], atom.Wz[indices[2]]};
+  weights[axis] = pppm_reference_weight(W_coeff, indices[axis], delta);
+  const float W = (weights[0] * weights[1]) * weights[2];
+  output[t] = atom.q * W;
 }
 
 __global__ void apply_reference_G(
@@ -2041,6 +2054,99 @@ void PPPM::write_debug(
   if (!mesh_file || !kspace_file || !atom_file || !assignment_atom_file || !assignment_stencil_file) {
     std::cerr << "Failed closing PPPM debug output files.\n"; exit(1);
   }
+  if (debug_atom_ >= 0) {
+    const std::string join_path=debug_prefix_+"_assignment_join.out";
+    rpmd_ja_file_io::ofstream join(join_path+".tmp"); join << std::setprecision(17);
+    join << "# schema r164_assignment_join_v1\n# step " << debug_frame_
+         << "\n# force_evaluation_id " << force_evaluation_id << "\n# atom " << debug_atom_
+         << "\n# units delta_charge=e phi=native_mesh_potential term=eV\n"
+         << "# convention delta=other_minus_captured; energy=upper_minus_lower; FP64_delta_FP32_FFT\n"
+         << "# phi_c native_mesh_G; phi_delta unnormalized_FP32_FFT_with_delta_cast_to_FP32\n"
+         << "# columns axis gx gy gz flat delta_charge phi_c phi_delta signed_energy_term_eV\n";
+    const bool supported=N1==0 && N2==N && para.K[0]>=5 && para.K[1]>=5 && para.K[2]>=5;
+    const PPPMAssignmentAtomDebug& a=h_assignment_atoms[0];
+    if (supported && a.atom_id!=debug_atom_) PRINT_INPUT_ERROR("r164 PPPM join target identity mismatch.");
+    float coordinate[3]={}; int center[3]={};
+    if (supported) {
+      coordinate[0]=a.sx; coordinate[1]=a.sy; coordinate[2]=a.sz;
+      center[0]=a.ix; center[1]=a.iy; center[2]=a.iz;
+    }
+    for (int axis=0;axis<3;++axis) {
+      int lower=-1; float lo=0,hi=0;
+      if (supported && std::isfinite(coordinate[axis])) for (int candidate=center[axis]-1;candidate<=center[axis];++candidate) {
+        if (candidate<0 || candidate>=para.K[axis]) continue;
+        float x=std::nextafter(static_cast<float>(candidate)+0.5f,-std::numeric_limits<float>::infinity());
+        for (int attempt=0;attempt<2 && static_cast<int>(x+0.5f)!=candidate;++attempt)
+          x=std::nextafter(x,-std::numeric_limits<float>::infinity());
+        if (static_cast<int>(x+0.5f)!=candidate)
+          PRINT_INPUT_ERROR("r164 PPPM join cannot resolve center transition.");
+        const float y=std::nextafter(x,std::numeric_limits<float>::infinity());
+        if (static_cast<int>(y+0.5f)!=candidate+1)
+          PRINT_INPUT_ERROR("r164 PPPM join center transition invalid.");
+        if (coordinate[axis]==x || coordinate[axis]==y) { lower=candidate; lo=x; hi=y; break; }
+      }
+      if (lower<0) {
+        join << "# axis " << axis << " status " << (supported ? "no_adjacent_face" : "unsupported_mesh_or_range") << "\n";
+        continue;
+      }
+      const bool captured_lower=coordinate[axis]==lo;
+      if (center[axis]!=(captured_lower ? lower : lower+1))
+        PRINT_INPUT_ERROR("r164 PPPM join captured center mismatch.");
+      const int other_center=captured_lower ? lower+1 : lower;
+      const float other_s=captured_lower ? hi : lo;
+      const float other_delta=other_s-static_cast<float>(other_center);
+      GPU_Vector<float> other_qW(125);
+      r164_join_other_stencil<<<1,128>>>(a,axis,other_delta,other_qW.data()); GPU_CHECK_KERNEL
+      std::vector<float> h_other(125); other_qW.copy_to_host(h_other.data());
+      std::map<int,double> delta;
+      for (int t=0;t<125;++t) {
+        const auto& old=h_assignment_stencil[t];
+        if (old.neighbor012<0 || old.neighbor012>=M || !std::isfinite(old.qW) || !std::isfinite(h_other[t]))
+          PRINT_INPUT_ERROR("r164 PPPM join invalid stencil.");
+        delta[old.neighbor012]-=static_cast<double>(old.qW);
+        const int offset[3]={t/25-2,(t/5)%5-2,t%5-2};
+        int index[3];
+        for (int d=0;d<3;++d) {
+          const int raw=(d==axis ? other_center : center[d])+offset[d];
+          index[d]=(raw%para.K[d]+para.K[d])%para.K[d];
+        }
+        delta[index[0]+para.K[0]*(index[1]+para.K[1]*index[2])]+=static_cast<double>(h_other[t]);
+      }
+      std::vector<gpufftComplex> host_delta(M);
+      for (int i=0;i<M;++i) host_delta[i]={0.0f,0.0f};
+      for (const auto& item:delta) host_delta[item.first].x=static_cast<float>(item.second);
+      GPU_Vector<gpufftComplex> scratch(M); scratch.copy_from_host(host_delta.data());
+      if (gpufftExecC2C(plan,scratch.data(),scratch.data(),GPUFFT_FORWARD)!=GPUFFT_SUCCESS)
+        PRINT_INPUT_ERROR("r164 PPPM join forward FFT failed.");
+      GPU_CHECK_KERNEL
+      apply_reference_G<<<(M-1)/256+1,256>>>(G.data(),scratch.data(),M); GPU_CHECK_KERNEL
+      if (gpufftExecC2C(plan,scratch.data(),scratch.data(),GPUFFT_INVERSE)!=GPUFFT_SUCCESS)
+        PRINT_INPUT_ERROR("r164 PPPM join inverse FFT failed.");
+      GPU_CHECK_KERNEL
+      scratch.copy_to_host(host_delta.data());
+      const double sign=captured_lower ? 1.0 : -1.0;
+      double energy=0;
+      join << "# axis " << axis << " status valid lower_center " << lower
+           << " captured_side " << (captured_lower ? "lower" : "upper")
+           << " s_lower " << lo << " s_upper " << hi << " other_delta " << other_delta << "\n";
+      for (const auto& item:delta) if (item.second!=0) {
+        const int i=item.first;
+        if (!std::isfinite(h_mesh_G[i].x) || !std::isfinite(host_delta[i].x))
+          PRINT_INPUT_ERROR("r164 PPPM join nonfinite potential.");
+        const double term=sign*static_cast<double>(K_C_SP)*item.second*(2.0*h_mesh_G[i].x+host_delta[i].x);
+        energy+=term;
+        const int gx=i%para.K[0], gy=(i/para.K[0])%para.K[1], gz=i/(para.K[0]*para.K[1]);
+        join << axis << ' ' << gx << ' ' << gy << ' ' << gz << ' ' << i << ' ' << item.second << ' '
+             << h_mesh_G[i].x << ' ' << host_delta[i].x << ' ' << term << '\n';
+      }
+      join << "# axis_energy_eV " << axis << ' ' << energy << "\n";
+    }
+    join.close();
+    if (!join || rpmd_ja_file_io::atomic_commit_new_file(join_path+".tmp",join_path)!=0)
+      PRINT_INPUT_ERROR("r164 PPPM join output commit failed.");
+  }
+
+
 }
 
 void PPPM::allocate_virial_memory()

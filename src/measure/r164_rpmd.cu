@@ -636,6 +636,11 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       const char* name=trace_atom_==-2 && i==10 ? "all_meta" : trace_atom_==-2 && i==11 ? "all_edges" : names[i];
       receipt << name << "_sha256 " << hash << "\n";
     }
+    if (trace_atom_>=0) {
+      const auto hash=rpmd_ja_sample_provenance::sha256_file(trace.prefix+"_assignment_join.out");
+      if (hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing PPPM assignment join.");
+      receipt << "assignment_join_sha256 " << hash << "\n";
+    }
     receipt << "scalar_line_sha256 " << rpmd_ja_sample_provenance::sha256_text(scalar_line) << "\n";
     receipt.close();
     if (!receipt || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
