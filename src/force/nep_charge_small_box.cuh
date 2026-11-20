@@ -111,7 +111,7 @@ static __global__ void find_neighbor_list_small_box(
             float z12 = g_z[n2] + delta[2] - z1;
 
             int shift[3];
-            apply_mic_small_box(box, ebox, x12, y12, z12, n1==trace_atom ? shift : nullptr);
+            apply_mic_small_box(box, ebox, x12, y12, z12, (trace_atom==-2 || n1==trace_atom) ? shift : nullptr);
 
             float distance_square = float(x12 * x12 + y12 * y12 + z12 * z12);
 
@@ -119,8 +119,8 @@ static __global__ void find_neighbor_list_small_box(
             float rc_angular = paramb.rc_angular;
 
             if (distance_square < rc_radial * rc_radial) {
-              if (n1==trace_atom && count_radial<trace_capacity) {
-                R164_Neighbor_Edge& edge=radial[count_radial];
+              if ((trace_atom==-2 || n1==trace_atom) && count_radial<trace_capacity) {
+                R164_Neighbor_Edge& edge=radial[trace_atom==-2 ? static_cast<size_t>(count_radial)*N+n1 : count_radial];
                 edge.slot=count_radial; edge.atom=n2; edge.native_atom=-1;
                 edge.image[0]=ia+ebox.num_cells[0]*shift[0]; edge.image[1]=ib+ebox.num_cells[1]*shift[1]; edge.image[2]=ic+ebox.num_cells[2]*shift[2];
                 edge.dx=x12; edge.dy=y12; edge.dz=z12;
@@ -132,8 +132,8 @@ static __global__ void find_neighbor_list_small_box(
               count_radial++;
             }
             if (distance_square < rc_angular * rc_angular) {
-              if (n1==trace_atom && count_angular<trace_capacity) {
-                R164_Neighbor_Edge& edge=angular[count_angular];
+              if ((trace_atom==-2 || n1==trace_atom) && count_angular<trace_capacity) {
+                R164_Neighbor_Edge& edge=angular[trace_atom==-2 ? static_cast<size_t>(count_angular)*N+n1 : count_angular];
                 edge.slot=count_angular; edge.atom=n2; edge.native_atom=-1;
                 edge.image[0]=ia+ebox.num_cells[0]*shift[0]; edge.image[1]=ib+ebox.num_cells[1]*shift[1]; edge.image[2]=ic+ebox.num_cells[2]*shift[2];
                 edge.dx=x12; edge.dy=y12; edge.dz=z12;
@@ -704,7 +704,7 @@ static __device__ void find_force_radial_small_box_impl(
           f12[d] += tmp12 * r12[d];
         }
       }
-      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
+      if ((trace_atom==-2 || n1==trace_atom) && i1<trace_capacity) r164_record_native(trace_edges,trace_atom==-2 ? static_cast<size_t>(i1)*N+n1 : i1,n2,r12,f12);
       double s_sxx = 0.0;
       double s_sxy = 0.0;
       double s_sxz = 0.0;
@@ -922,7 +922,7 @@ static __device__ void find_force_angular_small_box_impl(
           sum_fxyz,
           f12);
       }
-      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
+      if ((trace_atom==-2 || n1==trace_atom) && i1<trace_capacity) r164_record_native(trace_edges,trace_atom==-2 ? static_cast<size_t>(i1)*N+n1 : i1,n2,r12,f12);
       double s_sxx = 0.0;
       double s_sxy = 0.0;
       double s_sxz = 0.0;

@@ -47,7 +47,7 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
     next+=2;
   }
   if (next<t.size() && t[next]=="pppm_trace") {
-    if (next+4!=t.size() || !decimal(t[next+1],trace_step_) || !decimal(t[next+2],trace_bead_) || !decimal(t[next+3],trace_atom_))
+    if (next+4!=t.size() || !decimal(t[next+1],trace_step_) || !decimal(t[next+2],trace_bead_) || !(t[next+3]=="all" ? (trace_atom_=-2,true) : decimal(t[next+3],trace_atom_)))
       PRINT_INPUT_ERROR("r164_rpmd pppm_trace requires step bead atom as nonnegative decimal ints.");
     next+=4;
   }
@@ -479,7 +479,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     const std::string suffix=std::to_string(step)+".txt";
     const std::string files[]={directory_+"/metadata.txt",directory_+"/source_identity.txt",directory_+"/frame_"+suffix,directory_+"/force_images_"+suffix,
       trace.prefix+"_mesh.out",trace.prefix+"_kspace.out",trace.prefix+"_atom.out",trace.prefix+"_assignment_atom.out",
-      trace.prefix+"_assignment_stencil_atom"+std::to_string(trace_atom_)+".out",trace.prefix+"_pre_electro.out",trace.prefix+"_descriptor_neighbors.out",trace.prefix+"_local_edge_derivatives.out"};
+      trace.prefix+"_assignment_stencil_atom"+std::to_string(trace_atom_==-2?0:trace_atom_)+".out",trace.prefix+"_pre_electro.out",trace.prefix+(trace_atom_==-2?"_all_meta.out":"_descriptor_neighbors.out"),trace.prefix+(trace_atom_==-2?"_all_edges.bin":"_local_edge_derivatives.out")};
     const char* names[]={"metadata","source_identity","frame","force_images","mesh","kspace","atom","assignment_atom","assignment_stencil","pre_electro","descriptor_neighbors","local_edge_derivatives"};
     const std::string path=directory_+"/pppm_trace_step_"+std::to_string(step)+"_receipt.txt";
     rpmd_ja_file_io::ifstream debug_atom_file(trace.prefix+"_atom.out");
@@ -493,7 +493,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       }
     }
     if (!debug_atom_file.eof() || !found) PRINT_INPUT_ERROR("r164_rpmd missing trace force evaluation id.");
-    rpmd_ja_file_io::ifstream neighbors(trace.prefix+"_descriptor_neighbors.out");
+    rpmd_ja_file_io::ifstream neighbors(trace.prefix+(trace_atom_==-2?"_all_meta.out":"_descriptor_neighbors.out"));
     bool neighbor_id_found=false;
     while (std::getline(neighbors,line)) {
       const std::string key="# force_evaluation_id ";
@@ -505,7 +505,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       }
     }
     if (!neighbors.eof() || !neighbor_id_found) PRINT_INPUT_ERROR("r164_rpmd missing descriptor neighbor force id.");
-    rpmd_ja_file_io::ifstream derivatives(trace.prefix+"_local_edge_derivatives.out");
+    rpmd_ja_file_io::ifstream derivatives(trace.prefix+(trace_atom_==-2?"_all_meta.out":"_local_edge_derivatives.out"));
     bool derivative_id_found=false;
     while (std::getline(derivatives,line)) {
       const std::string key="# force_evaluation_id ";
@@ -518,7 +518,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     }
     if (!derivatives.eof() || !derivative_id_found) PRINT_INPUT_ERROR("r164_rpmd missing derivative force id.");
     rpmd_ja_file_io::ofstream receipt(path+".tmp");
-    receipt << "schema r164_pppm_trace_v3\nstep " << step << "\nbead " << trace_bead_ << "\natom " << trace_atom_ << "\nforce_evaluation_id " << evaluation_id << "\nneighbor_history partial_target_descriptor_only\nphysical_event unavailable\n";
+    receipt << (trace_atom_==-2?"schema r164_pppm_trace_all_v1\nstep ":"schema r164_pppm_trace_v3\nstep ") << step << "\nbead " << trace_bead_ << "\natom " << (trace_atom_==-2?"all":std::to_string(trace_atom_)) << "\nforce_evaluation_id " << evaluation_id << "\nneighbor_history partial_target_descriptor_only\nphysical_event unavailable\n";
     for (int i=0;i<12;++i) {
       const auto hash=rpmd_ja_sample_provenance::sha256_file(files[i]);
       if (hash.size()!=64) PRINT_INPUT_ERROR("r164_rpmd failed hashing PPPM trace.");

@@ -36,6 +36,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -778,9 +779,9 @@ static __global__ void find_descriptor(
       float y12 = g_y[n2] - y1;
       float z12 = g_z[n2] - z1;
       int image[3];
-      apply_mic(box, x12, y12, z12, (n1==trace_atom) ? image : nullptr);
-      if (n1==trace_atom && i1<radial_capacity) {
-        R164_Neighbor_Edge& edge=radial[i1]; edge.slot=i1; edge.atom=n2; edge.native_atom=-1;
+      apply_mic(box, x12, y12, z12, (trace_atom==-2 || n1==trace_atom) ? image : nullptr);
+      if ((trace_atom==-2 || n1==trace_atom) && i1<radial_capacity) {
+        R164_Neighbor_Edge& edge=radial[trace_atom==-2 ? static_cast<size_t>(i1)*N+n1 : i1]; edge.slot=i1; edge.atom=n2; edge.native_atom=-1;
         edge.image[0]=image[0]; edge.image[1]=image[1]; edge.image[2]=image[2];
         edge.dx=x12; edge.dy=y12; edge.dz=z12;
       }
@@ -813,9 +814,9 @@ static __global__ void find_descriptor(
         float y12 = g_y[n2] - y1;
         float z12 = g_z[n2] - z1;
         int image[3];
-        apply_mic(box, x12, y12, z12, (n1==trace_atom && n==0) ? image : nullptr);
-        if (n1==trace_atom && n==0 && i1<angular_capacity) {
-          R164_Neighbor_Edge& edge=angular[i1]; edge.slot=i1; edge.atom=n2; edge.native_atom=-1;
+        apply_mic(box, x12, y12, z12, ((trace_atom==-2 || n1==trace_atom) && n==0) ? image : nullptr);
+        if ((trace_atom==-2 || n1==trace_atom) && n==0 && i1<angular_capacity) {
+          R164_Neighbor_Edge& edge=angular[trace_atom==-2 ? static_cast<size_t>(i1)*N+n1 : i1]; edge.slot=i1; edge.atom=n2; edge.native_atom=-1;
           edge.image[0]=image[0]; edge.image[1]=image[1]; edge.image[2]=image[2];
           edge.dx=x12; edge.dy=y12; edge.dz=z12;
         }
@@ -1498,7 +1499,7 @@ static __global__ void find_force_radial(
           f21[d] -= tmp21 * r12[d];
         }
       }
-      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
+      if ((trace_atom==-2 || n1==trace_atom) && i1<trace_capacity) r164_record_native(trace_edges,trace_atom==-2 ? static_cast<size_t>(i1)*N+n1 : i1,n2,r12,f12);
       s_fx += f12[0] - f21[0];
       s_fy += f12[1] - f21[1];
       s_fz += f12[2] - f21[2];
@@ -1748,7 +1749,7 @@ static __global__ void find_partial_force_angular(
           sum_fxyz,
           f12);
       }
-      if (n1==trace_atom && i1<trace_capacity) r164_record_native(trace_edges,i1,n2,r12,f12);
+      if ((trace_atom==-2 || n1==trace_atom) && i1<trace_capacity) r164_record_native(trace_edges,trace_atom==-2 ? static_cast<size_t>(i1)*N+n1 : i1,n2,r12,f12);
       g_f12x[index] = f12[0];
       g_f12y[index] = f12[1];
       g_f12z[index] = f12[2];
@@ -2422,12 +2423,14 @@ void NEP_Charge::compute_large_box(
 
   const bool trace_neighbors=r164_trace_step_>=0;
   const auto generation_before=neighbor_manager.get_generation();
-  if (trace_neighbors) { r164_radial_edges_.resize(paramb.MN_radial); r164_angular_edges_.resize(paramb.MN_angular); }
+  if (trace_neighbors && r164_trace_atom_==-2 && (paramb.MN_radial<0 || paramb.MN_angular<0 || static_cast<size_t>(N)*std::max(paramb.MN_radial,paramb.MN_angular)>static_cast<size_t>(std::numeric_limits<int>::max()))) PRINT_INPUT_ERROR("r164_rpmd all-edge capacity overflow.");
+  if (trace_neighbors) { r164_radial_edges_.resize(static_cast<size_t>(paramb.MN_radial)*(r164_trace_atom_==-2?N:1)); r164_angular_edges_.resize(static_cast<size_t>(paramb.MN_angular)*(r164_trace_atom_==-2?N:1)); }
   neighbor_manager.update(
     box, 
     type, 
     position_per_atom);
 
+  if (trace_neighbors && r164_trace_atom_==-2) { r164_generation_before_=generation_before; r164_generation_after_=neighbor_manager.get_generation(); }
   find_neighbor_list_large_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
     N,
@@ -2492,7 +2495,7 @@ void NEP_Charge::compute_large_box(
     trace_neighbors ? r164_trace_atom_ : -1, trace_neighbors ? r164_radial_edges_.data() : nullptr,
     trace_neighbors ? r164_angular_edges_.data() : nullptr, paramb.MN_radial, paramb.MN_angular);
   GPU_CHECK_KERNEL
-  if (trace_neighbors) write_r164_neighbors(N, false, generation_before, neighbor_manager.get_generation());
+  if (trace_neighbors && r164_trace_atom_!=-2) write_r164_neighbors(N, false, generation_before, neighbor_manager.get_generation());
 
   if (capture_charge_diagnostics) {
     nep_data.charge_raw.copy_from_device(nep_data.charge.data());
@@ -2721,7 +2724,8 @@ void NEP_Charge::compute_small_box(
   const int big_neighbor_size = 2000;
   const int size_x12 = type.size() * big_neighbor_size;
   const bool trace_neighbors=r164_trace_step_>=0;
-  if (trace_neighbors) { r164_radial_edges_.resize(big_neighbor_size); r164_angular_edges_.resize(big_neighbor_size); }
+  if (trace_neighbors && r164_trace_atom_==-2 && static_cast<size_t>(N)*big_neighbor_size>static_cast<size_t>(std::numeric_limits<int>::max())) PRINT_INPUT_ERROR("r164_rpmd all-edge capacity overflow.");
+  if (trace_neighbors) { r164_radial_edges_.resize(static_cast<size_t>(big_neighbor_size)*(r164_trace_atom_==-2?N:1)); r164_angular_edges_.resize(static_cast<size_t>(big_neighbor_size)*(r164_trace_atom_==-2?N:1)); }
 
   find_neighbor_list_small_box<<<grid_size, BLOCK_SIZE>>>(
     paramb,
@@ -2747,7 +2751,7 @@ void NEP_Charge::compute_small_box(
     trace_neighbors ? r164_trace_atom_ : -1, trace_neighbors ? r164_radial_edges_.data() : nullptr,
     trace_neighbors ? r164_angular_edges_.data() : nullptr, big_neighbor_size);
   GPU_CHECK_KERNEL
-  if (trace_neighbors) write_r164_neighbors(N, true, 0, 0);
+  if (trace_neighbors && r164_trace_atom_!=-2) write_r164_neighbors(N, true, 0, 0);
 
   long long& num_calls = neighbor_small_box_calls_;
   if (neighbor_diagnostics_enabled_ && num_calls++ % 1000 == 0) {
@@ -3115,7 +3119,7 @@ void NEP_Charge::write_r164_pre_electro_trace(int N, const GPU_Vector<double>& p
   potential.copy_to_host(local.data(), N);
   rpmd_ja_file_io::ofstream out(r164_trace_prefix_+"_pre_electro.out");
   out << std::setprecision(17) << "# schema r164_pre_electro_v1\n# step " << r164_trace_step_
-      << "\n# atom " << r164_trace_atom_ << "\n# force_evaluation_id " << force_evaluation_id_
+      << "\n# atom " << (r164_trace_atom_==-2?"all":std::to_string(r164_trace_atom_)) << "\n# force_evaluation_id " << force_evaluation_id_
       << "\n# N " << N << "\n# columns atom raw_charge potential_before_electro_eV\n";
   for (int i=0;i<N;++i) {
     if (!std::isfinite(raw[i]) || !std::isfinite(local[i]))
@@ -3304,8 +3308,83 @@ static __global__ void r164_independent_gradients(
   for (int d=0;d<3;++d) { edge.energy_gradient[d]=e[d]; edge.charge_gradient[d]=g[d]; }
 }
 
+static __global__ void r164_all_gradients(
+  NEP_Charge::ParaMB paramb, const float* c_type_pair, int N, const int* type,
+  const int* nr, const int* na, const float* Fp, const float* charge_derivative,
+  const float* sums, R164_Neighbor_Edge* radial, R164_Neighbor_Edge* angular)
+{
+  const int center=blockIdx.x*blockDim.x+threadIdx.x;
+  if (center>=N) return;
+  float energy_fp[MAX_DIM_ANGULAR]={}, charge_fp[MAX_DIM_ANGULAR]={};
+  float angular_sum[NUM_OF_ABC*MAX_NUM_N]={};
+  for (int d=0;d<paramb.dim_angular;++d) {
+    const int k=(paramb.n_max_radial+1+d)*N+center;
+    energy_fp[d]=Fp[k]; charge_fp[d]=charge_derivative[k];
+  }
+  const int count_abc=(paramb.L_max+1)*(paramb.L_max+1)-1;
+  for (int n=0;n<=paramb.n_max_angular;++n) for (int a=0;a<count_abc;++a)
+    angular_sum[n*NUM_OF_ABC+a]=sums[(n*count_abc+a)*N+center];
+  for (int kind=0;kind<2;++kind) for (int slot=0;slot<(kind?na[center]:nr[center]);++slot) {
+    R164_Neighbor_Edge& edge=(kind?angular:radial)[static_cast<size_t>(slot)*N+center];
+    float r[3]={edge.dx,edge.dy,edge.dz}, e[3]={}, g[3]={};
+    if (kind) {
+      find_charge_gradient_angular_pair(paramb,c_type_pair,center,edge.atom,type,r,energy_fp,angular_sum,e);
+      find_charge_gradient_angular_pair(paramb,c_type_pair,center,edge.atom,type,r,charge_fp,angular_sum,g);
+    } else {
+      find_charge_gradient_radial_pair(paramb,c_type_pair,N,center,edge.atom,type,r,Fp,e);
+      find_charge_gradient_radial_pair(paramb,c_type_pair,N,center,edge.atom,type,r,charge_derivative,g);
+    }
+    for (int d=0;d<3;++d) { edge.energy_gradient[d]=e[d]; edge.charge_gradient[d]=g[d]; }
+  }
+}
+
 void NEP_Charge::write_r164_derivatives(int N, bool small_box_path, const GPU_Vector<int>& type)
 {
+  if (r164_trace_atom_==-2) {
+    const auto& nr=small_box_path ? small_box_data.NN_radial : nep_data.NN_radial;
+    const auto& na=small_box_path ? small_box_data.NN_angular : nep_data.NN_angular;
+    const int cap[2]={small_box_path?2000:paramb.MN_radial,small_box_path?2000:paramb.MN_angular};
+    std::vector<int> counts[2]={std::vector<int>(N),std::vector<int>(N)};
+    std::vector<float> G(N);
+    nr.copy_to_host(counts[0].data(),N); na.copy_to_host(counts[1].data(),N); nep_data.D_real.copy_to_host(G.data(),N);
+    for (int i=0;i<N;++i) if (!std::isfinite(G[i]) || counts[0][i]<0 || counts[0][i]>cap[0] || counts[1][i]<0 || counts[1][i]>cap[1])
+      PRINT_INPUT_ERROR("r164_rpmd all-edge count or G invalid.");
+    r164_all_gradients<<<(N+63)/64,64>>>(paramb,annmb.c_type_pair,N,type.data(),nr.data(),na.data(),nep_data.Fp.data(),
+      nep_data.charge_derivative.data(),nep_data.sum_fxyz.data(),r164_radial_edges_.data(),r164_angular_edges_.data());
+    GPU_CHECK_KERNEL
+    rpmd_ja_file_io::ofstream meta(r164_trace_prefix_+"_all_meta.out");
+    meta << std::setprecision(17) << "# schema r164_all_edges_v1\n# force_evaluation_id " << force_evaluation_id_
+      << "\n# step " << r164_trace_step_ << "\n# bead " << r164_trace_bead_ << "\n# N " << N
+      << "\n# path " << (small_box_path?"small_rebuild_each_call":"large_descriptor_mic") << "\n";
+    if (small_box_path) meta << "# global_generation unavailable\n";
+    else meta << "# global_generation_before " << r164_generation_before_ << "\n# global_generation_after " << r164_generation_after_ << "\n";
+    meta << "# binary little_endian record_bytes 76 order kind_slot_center\n# columns int32:kind,center,slot,atom,ix,iy,iz float32:r_xyz,B_xyz,e_xyz,g_xyz\n"
+         << "# units r=angstrom B,e=eV_per_angstrom g=e_per_angstrom G=eV_per_e; ANN_only_ZBL_excluded\n# center radial_count angular_count G\n";
+    for (int i=0;i<N;++i) meta << i << ' ' << counts[0][i] << ' ' << counts[1][i] << ' ' << G[i] << '\n';
+    meta.close(); if (!meta) PRINT_INPUT_ERROR("r164_rpmd failed closing all-edge metadata.");
+    rpmd_ja_file_io::ofstream out(r164_trace_prefix_+"_all_edges.bin",std::ios::binary);
+    static_assert(sizeof(float)==4 && std::numeric_limits<float>::is_iec559, "all-edge output requires IEEE binary32");
+    auto write32=[&](uint32_t value) { char bytes[4]; for (int b=0;b<4;++b) bytes[b]=static_cast<char>((value>>(8*b))&255); out.write(bytes,4); };
+    for (int kind=0;kind<2;++kind) {
+      int max_count=0; for (int count:counts[kind]) max_count=std::max(max_count,count);
+      auto& dev=kind?r164_angular_edges_:r164_radial_edges_;
+      for (int base=0;base<max_count;base+=8) {
+        const int slots=std::min(8,max_count-base); std::vector<R164_Neighbor_Edge> host(static_cast<size_t>(slots)*N);
+        dev.copy_to_host(host.data(),host.size(),base*N);
+        for (int slot=base;slot<base+slots;++slot) for (int center=0;center<N;++center) if (slot<counts[kind][center]) {
+          const auto& edge=host[static_cast<size_t>(slot-base)*N+center];
+          if (edge.slot!=slot || edge.atom<0 || edge.atom>=N || edge.atom!=edge.native_atom || edge.dx!=edge.native_r[0] || edge.dy!=edge.native_r[1] || edge.dz!=edge.native_r[2])
+            PRINT_INPUT_ERROR("r164_rpmd all-edge descriptor/native mismatch.");
+          const int32_t ints[7]={kind,center,slot,edge.atom,edge.image[0],edge.image[1],edge.image[2]};
+          for (int32_t v:ints) write32(static_cast<uint32_t>(v));
+          const float floats[12]={edge.dx,edge.dy,edge.dz,edge.B[0],edge.B[1],edge.B[2],edge.energy_gradient[0],edge.energy_gradient[1],edge.energy_gradient[2],edge.charge_gradient[0],edge.charge_gradient[1],edge.charge_gradient[2]};
+          for (float value:floats) { if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite all-edge value."); uint32_t bits; std::memcpy(&bits,&value,4); write32(bits); }
+        }
+      }
+    }
+    out.close(); if (!out) PRINT_INPUT_ERROR("r164_rpmd failed closing all-edge binary.");
+    return;
+  }
   int counts[2]={};
   const auto& nr=small_box_path ? small_box_data.NN_radial : nep_data.NN_radial;
   const auto& na=small_box_path ? small_box_data.NN_angular : nep_data.NN_angular;

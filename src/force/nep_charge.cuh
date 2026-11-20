@@ -86,9 +86,9 @@ struct R164_Neighbor_Edge {
   float native_r[3], B[3], energy_gradient[3], charge_gradient[3];
 };
 
-inline __device__ void r164_record_native(R164_Neighbor_Edge* edges, int slot, int atom, const float* r, const float* f)
+inline __device__ void r164_record_native(R164_Neighbor_Edge* edges, size_t index, int atom, const float* r, const float* f)
 {
-  R164_Neighbor_Edge& edge=edges[slot]; edge.native_atom=atom;
+  R164_Neighbor_Edge& edge=edges[index]; edge.native_atom=atom;
   for (int d=0;d<3;++d) { edge.native_r[d]=r[d]; edge.B[d]=f[d]; }
 }
 
@@ -250,7 +250,7 @@ public:
   void request_pppm_debug_for_next_force(const char* prefix, const int frame, const int atom = -1, const int bead = -1)
   {
     pppm.request_debug_for_next_force(prefix, frame, atom);
-    if (atom >= 0) { r164_trace_prefix_=prefix; r164_trace_step_=frame; r164_trace_atom_=atom; r164_trace_bead_=bead; }
+    if (atom != -1) { r164_trace_prefix_=prefix; r164_trace_step_=frame; r164_trace_atom_=atom; r164_trace_bead_=bead; }
   }
   void reset_dynamic_charge_cache();
   void request_dynamic_charge_debug(const int step) { pppm.request_dynamic_charge_debug(step); }
@@ -554,6 +554,7 @@ private:
   const void* charge_heat_channel_cache_position_ = nullptr;
   const void* charge_heat_channel_cache_velocity_ = nullptr;
   GPU_Vector<R164_Neighbor_Edge> r164_radial_edges_, r164_angular_edges_;
+  unsigned long long r164_generation_before_=0, r164_generation_after_=0;
   void write_r164_neighbors(int N, bool small_box_path, unsigned long long before, unsigned long long after);
   void write_r164_derivatives(int N, bool small_box_path, const GPU_Vector<int>& type);
   std::string r164_trace_prefix_;

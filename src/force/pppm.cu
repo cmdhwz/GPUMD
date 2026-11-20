@@ -445,8 +445,8 @@ __global__ void find_mesh(
       Wy[d] = (((W_coeff[d][4] * dy + W_coeff[d][3]) * dy + W_coeff[d][2]) * dy + W_coeff[d][1]) * dy + W_coeff[d][0];
       Wz[d] = (((W_coeff[d][4] * dz + W_coeff[d][3]) * dz + W_coeff[d][2]) * dz + W_coeff[d][1]) * dz + W_coeff[d][0];
     }
-    const int debug_slot = debug_atom >= 0 ? (n == debug_atom ? 0 : 8) : n - N1;
-    if (g_debug_atoms != nullptr && debug_slot < 8) {
+    const int debug_slot = debug_atom == -2 ? n-N1 : (debug_atom >= 0 ? (n == debug_atom ? 0 : 8) : n-N1);
+    if (g_debug_atoms != nullptr && (debug_atom == -2 || debug_slot < 8)) {
       PPPMAssignmentAtomDebug& d = g_debug_atoms[debug_slot];
       d.atom_id = n;
       d.q = q;
@@ -1892,7 +1892,7 @@ void PPPM::write_debug(
   std::vector<float> h_kx(M), h_ky(M), h_kz(M), h_G(M);
   std::vector<float> h_charge(N), h_D_real(N);
   std::vector<double> h_position(3 * N);
-  std::vector<PPPMAssignmentAtomDebug> h_assignment_atoms(8);
+  std::vector<PPPMAssignmentAtomDebug> h_assignment_atoms(debug_atom_ == -2 ? N2-N1 : 8);
   std::vector<PPPMAssignmentStencilDebug> h_assignment_stencil(125);
 
   debug_mesh_charge_.copy_to_host(h_mesh_charge.data());
@@ -1906,7 +1906,7 @@ void PPPM::write_debug(
   charge.copy_to_host(h_charge.data(), N);
   position.copy_to_host(h_position.data(), 3 * N);
   D_real.copy_to_host(h_D_real.data(), N);
-  debug_assignment_atoms_.copy_to_host(h_assignment_atoms.data(), 8);
+  debug_assignment_atoms_.copy_to_host(h_assignment_atoms.data(), h_assignment_atoms.size());
   debug_assignment_stencil_.copy_to_host(h_assignment_stencil.data(), 125);
   double sum_charge_N1_N2 = 0.0;
   for (int n = N1; n < N2; ++n) {
@@ -1932,11 +1932,12 @@ void PPPM::write_debug(
 
   auto write_header = [&](std::ofstream& file) {
     file << "# pppm_frame " << debug_frame_ << "\n";
-    if (debug_atom_ >= 0) {
+    if (debug_atom_ != -1) {
       file << "# force_evaluation_id " << force_evaluation_id << "\n";
       file << "# reciprocal_energy_branch " << (calculate_peratom_virial ? "per_atom" : "global_uniform") << "\n";
     }
     file << "# source_signature " << PPPM_DEBUG_SOURCE_SIGNATURE << "\n";
+    if (debug_atom_ == -2) file << "# pppm_alpha_factor " << para.alpha_factor << "\n# pppm_alpha " << para.alpha << "\n";
     file << "# pppm_N " << N << "\n";
     file << "# pppm_N1 " << N1 << "\n";
     file << "# pppm_N2 " << N2 << "\n";
@@ -2013,7 +2014,7 @@ void PPPM::write_debug(
   write_header(assignment_atom_file);
   assignment_atom_file << "# columns atom_id q x y z sx sy sz ix iy iz dx dy dz"
                           " Wx0 Wx1 Wx2 Wx3 Wx4 Wy0 Wy1 Wy2 Wy3 Wy4 Wz0 Wz1 Wz2 Wz3 Wz4\n";
-  const int debug_atom_count = debug_atom_ >= 0 ? 1 : (N2 - N1 < 8 ? N2 - N1 : 8);
+  const int debug_atom_count = debug_atom_ == -2 ? N2-N1 : (debug_atom_ >= 0 ? 1 : (N2 - N1 < 8 ? N2 - N1 : 8));
   for (int i = 0; i < debug_atom_count; ++i) {
     const PPPMAssignmentAtomDebug& d = h_assignment_atoms[i];
     assignment_atom_file << d.atom_id << " " << d.q << " " << d.x << " " << d.y << " " << d.z
@@ -2613,8 +2614,9 @@ void PPPM::find_force(
       debug_mesh_charge_.resize(para.K0K1K2);
       debug_mesh_fourier_.resize(para.K0K1K2);
     }
-    if (debug_assignment_atoms_.size() != 8) {
-      debug_assignment_atoms_.resize(8);
+    const size_t debug_atom_count=debug_atom_ == -2 ? static_cast<size_t>(N2-N1) : 8;
+    if (debug_assignment_atoms_.size() != debug_atom_count) {
+      debug_assignment_atoms_.resize(debug_atom_count);
     }
     if (debug_assignment_stencil_.size() != 125) {
       debug_assignment_stencil_.resize(125);
