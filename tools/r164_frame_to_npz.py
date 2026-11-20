@@ -5,6 +5,23 @@ import hashlib
 from pathlib import Path
 import numpy as np
 
+
+def read_frame(path, P, N):
+    q = np.empty((P, N, 3)); p = np.empty_like(q); f = np.empty_like(q); u = np.empty(P)
+    with (path).open(encoding='utf-8') as source:
+        for s in range(P):
+            header=source.readline().split()
+            if len(header)!=3 or header[:2] != ['bead',str(s)]: raise ValueError('invalid bead header')
+            u[s]=float(header[2])
+            for i in range(N):
+                row=source.readline().split()
+                if len(row)!=10 or int(row[0])!=i: raise ValueError('invalid atom row')
+                values=np.array(row[1:],dtype=float)
+                q[s,i],p[s,i],f[s,i]=values[:3],values[3:6],values[6:]
+        if source.read().strip(): raise ValueError('trailing frame data')
+    if not all(np.isfinite(x).all() for x in (q,p,f,u)): raise ValueError('nonfinite frame')
+    return q,p,f,u
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('directory', type=Path)
@@ -17,19 +34,7 @@ def main():
     P, N = int(fields['P'][0]), int(fields['N'][0])
     if len(atoms) != N or [int(x[0]) for x in atoms] != list(range(N)):
         raise ValueError('atom metadata ordering mismatch')
-    q = np.empty((P, N, 3)); p = np.empty_like(q); f = np.empty_like(q); u = np.empty(P)
-    with (a.directory / f'frame_{a.step}.txt').open(encoding='utf-8') as source:
-        for s in range(P):
-            header=source.readline().split()
-            if len(header)!=3 or header[:2] != ['bead',str(s)]: raise ValueError('invalid bead header')
-            u[s]=float(header[2])
-            for i in range(N):
-                row=source.readline().split()
-                if len(row)!=10 or int(row[0])!=i: raise ValueError('invalid atom row')
-                values=np.array(row[1:],dtype=float)
-                q[s,i],p[s,i],f[s,i]=values[:3],values[3:6],values[6:]
-        if source.read().strip(): raise ValueError('trailing frame data')
-    if not all(np.isfinite(x).all() for x in (q,p,f,u)): raise ValueError('nonfinite frame')
+    q,p,f,u = read_frame(a.directory / f'frame_{a.step}.txt',P,N)
     matching=[]
     with (a.directory / 'scalar.txt').open(encoding='utf-8') as scalar:
         for line in scalar:

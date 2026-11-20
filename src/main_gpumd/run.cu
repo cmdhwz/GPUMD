@@ -70,6 +70,7 @@ Run simulation according to the inputs in the run.in file.
 #include "measure/property.cuh"
 #include "measure/proton_tunneling.cuh"
 #include "measure/rpmd_ja_reference.cuh"
+#include "measure/rpmd_ja_sample_provenance.h"
 #include "measure/rpmd_ja_fit.cuh"
 #include "measure/rpmd_ja_native_fit.cuh"
 #include "measure/rpmd_ja_qnep_prepare.cuh"
@@ -199,6 +200,7 @@ Run::Run(const RunInput& run_input)
   fflush(stdout);
   print_line_2();
 
+  r164_identity_enabled_ = run_input.contains("r164_rpmd");
   has_replicate_ = parse_initial_replicate(run_input, replicate_size_);
 
   initialize_position(
@@ -208,6 +210,7 @@ Run::Run(const RunInput& run_input)
     box,
     group,
     atom);
+  if (r164_identity_enabled_) r164_model_xyz_sha256_ = rpmd_ja_sample_provenance::sha256_file("model.xyz");
   first_potential_filename_ = get_first_potential_filename(run_input);
 
   if (has_replicate_) {
@@ -541,7 +544,7 @@ void Run::perform_a_run(const int number_of_steps)
     for (const auto& property : measure.properties)
       if (property->property_name != "dump_pimd_restart") PRINT_INPUT_ERROR("r164_rpmd only supports dump_pimd_restart as an additional property.");
     r164_rpmd.begin(atom, box, integrate.get_temperature(), time_step, global_time);
-    r164_rpmd.configure_observer(force, atom);
+    r164_rpmd.configure_observer(force, atom, r164_model_xyz_sha256_, r164_restart_sha256_);
   }
   integrate.initialize(time_step, atom, box, group);
   measure.pre_run(number_of_steps, time_step, integrate, group, atom, box, force);
@@ -1302,6 +1305,7 @@ void Run::parse_read_pimd_restart(const char** param, int num_param)
 
   PIMD_Restart_Metadata restart_metadata;
   read_pimd_restart(param[1], integrate.get_number_of_beads(), box, atom, &restart_metadata);
+  if (r164_identity_enabled_) r164_restart_sha256_ = rpmd_ja_sample_provenance::sha256_file(param[1]);
   integrate.mark_pimd_restart_read();
   if (restart_metadata.has_temperature) {
     if (integrate.ring_polymer_temperature_is_explicit()) {

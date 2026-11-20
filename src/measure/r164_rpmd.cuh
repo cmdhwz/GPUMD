@@ -13,7 +13,7 @@ public:
   void parse(const std::vector<std::string>& tokens);
   void reset() { enabled_ = false; observer_requested_ = false; observer_.reset(); }
   void begin(Atom&, const Box&, double temperature, double dt, double start_time);
-  void configure_observer(Force&, Atom&);
+  void configure_observer(Force&, Atom&, const std::string& model_xyz_sha256, const std::string& restart_sha256);
   void capture_drift(Atom&);
   void check_force_positions(Atom&);
   void output(int step, int total, Atom&);

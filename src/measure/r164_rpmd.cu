@@ -72,7 +72,7 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   meta.close(); if (!meta || rpmd_ja_file_io::atomic_commit_new_file(directory_+"/metadata.txt.tmp", directory_+"/metadata.txt") != 0) PRINT_INPUT_ERROR("r164_rpmd failed committing metadata.");
   offset_.resize(n_*3);
 }
-void R164_RPMD::configure_observer(Force& force, Atom& atom) {
+void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& model_xyz_sha256, const std::string& restart_sha256) {
   observer_.reset();
   const std::string source_model=get_first_potential_filename(force.get_run_input());
   const std::string source_hash=rpmd_ja_sample_provenance::sha256_file(source_model);
@@ -84,6 +84,19 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom) {
   identity << "bead_force_backend native_GPUMD\n";
 #endif
   identity << "machine_scope GPU_and_driver_not_recorded\nlogical_bead_force_call_mapping initial_1_step_n_is_n_plus_1_backend_internal_calls_unrecorded\n";
+#ifdef GPUMD_GIT_COMMIT_FULL
+  identity << "build_git_commit " << GPUMD_GIT_COMMIT_FULL << "\n";
+#else
+  identity << "build_git_commit UNAVAILABLE\n";
+#endif
+#ifdef GPUMD_GIT_DIRTY
+  identity << "build_git_dirty " << GPUMD_GIT_DIRTY << "\n";
+#else
+  identity << "build_git_dirty UNAVAILABLE\n";
+#endif
+  identity << "model_xyz_sha256 " << (model_xyz_sha256.empty()?"UNAVAILABLE":model_xyz_sha256)
+           << "\nrestart_input_sha256 " << (restart_sha256.empty()?"UNAVAILABLE":restart_sha256)
+           << "\ninput_hash_scope after_successful_read_unverified_against_concurrent_changes\n";
   identity << "model_sha256 " << (source_hash.empty()?"UNAVAILABLE":source_hash)
            << "\nrun_in_sha256 " << (input_hash.empty()?"UNAVAILABLE":input_hash) << "\n";
   identity.close();

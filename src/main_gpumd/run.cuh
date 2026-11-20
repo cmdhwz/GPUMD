@@ -79,6 +79,9 @@ private:
   bool has_replicate_ = false;
   int replicate_size_[3] = {1, 1, 1};
   std::string first_potential_filename_;
+  bool r164_identity_enabled_ = false;
+  std::string r164_model_xyz_sha256_;
+  std::string r164_restart_sha256_;
   double global_time = 0.0; // run time of entire simulation (fs)
   unsigned run_ordinal_ = 0;
   double time_step = 1.0 / TIME_UNIT_CONVERSION;
