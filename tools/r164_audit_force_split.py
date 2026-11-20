@@ -56,7 +56,7 @@ def project_raw_charge(raw):
     mean = np.float32(lanes[0] / np.float32(len(raw)))
     return (raw - mean).astype(np.float32)
 
-def audit(directory, step):
+def audit(directory, step, *, _return_data=False):
     d = Path(directory).resolve()
     rec = {}
     for line in (d / f'pppm_trace_step_{step}_receipt.txt').read_text(encoding='utf8').splitlines():
@@ -364,7 +364,7 @@ def audit(directory, step):
     maxcoord = np.unravel_index(np.argmax(np.abs(fw64 - ik)), fw64.shape)
     fd_coordinate = finite_difference(int(maxcoord[0]), int(maxcoord[1]))
     fd_translation = {axis: finite_difference(None, i) for i, axis in enumerate('xyz')}
-    return {
+    report = {
         'schema': 'r164_force_split_audit_v1',
         'scope': 'fixed_descriptor_edges_assignment_branch_ANN_only_native_no_event_or_transport_claim',
         'capture': str(d),
@@ -391,6 +391,11 @@ def audit(directory, step):
         'total_F_regular_minus_native': metrics(stages[-1] - stages[0], velocity),
         'chain_closure': metrics(stages[0] - stages[-1] - sum((stages[i] - stages[i + 1] for i in range(4)), np.zeros_like(stages[0])), velocity),
     }
+    if _return_data:
+        return report, {'A': A, 'edge': edge, 'K': K, 'cell': cell, 'kc': kc,
+                        'G': G, 'wavevectors': k[:, 6:9], 'velocity': velocity}
+    return report
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
