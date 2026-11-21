@@ -83,7 +83,10 @@ private:
   GPU_Vector<double> observer_q_, observer_u_, observer_f_, observer_virial_, observer_v_, observer_site_rate_, observer_gradient_, observer_local_, observer_local_image_;
   GPU_Vector<double> observer_drift_v_;
   struct BufferedShadow {
-    GPU_Vector<double> q, offset;
+    GPU_Vector<double> q, offset, staging;
+    GPU_Vector<double*> sample_pointers;
+    std::vector<double*> sample_pointers_host;
+    std::vector<double> staging_host;
     GPU_Vector<long long> images;
     GPU_Vector<int> error;
     GPU_Vector<double*> positions;

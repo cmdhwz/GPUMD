@@ -17,7 +17,7 @@ class CheckpointContract(unittest.TestCase):
         for text in ('checkpoint_stride_ && (step==0 || step==total || step%checkpoint_stride_==0)',
                      'snapshot || (!buffered_ && (step==0 || step==total || checkpoint || trace_here))'):
             self.assertIn(text, output)
-        points = [output.index(x) for x in ('write_snapshot(step,q_,v,f,energy,force_images_,atom)',
+        points = [output.index(x) for x in ('write_snapshot(step,q_,v_storage,f_storage,energy,force_images_,atom)',
                   'crossings.close()', 'scalar_file.close()', 'sha256_text(scalar_line)',
                   'PRINT_INPUT_ERROR("r164_rpmd failed committing checkpoint.")', 'if (step == total) write_complete(step)')]
         self.assertEqual(points, sorted(points))

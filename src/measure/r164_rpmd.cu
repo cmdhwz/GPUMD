@@ -113,12 +113,12 @@ __global__ void r164_shadow_stage(int n, int p, double lx, double ly, double lz,
       int k=bead*3*n+j;
       const double next=positions[bead][j]+offset[j];
       const double diff=next-q[k];
-      if (!isfinite(next) || !isfinite(diff)) atomicExch(error,1);
+      if (!isfinite(next) || !isfinite(diff)) atomicOr(error,1<<1);
       q[k]=next;
     }
     for (int bead=1;bead<p;++bead) {
       const double diff=q[bead*3*n+j]-q[j];
-      if (!isfinite(diff) || fabs(diff)>=L*0.5-1e-9) atomicExch(error,2);
+      if (!isfinite(diff) || fabs(diff)>=L*0.5-1e-9) atomicOr(error,1<<2);
     }
   } else if (phase==SHADOW_FORCE) {
     for (int bead=0;bead<p;++bead) {
@@ -128,7 +128,7 @@ __global__ void r164_shadow_stage(int n, int p, double lx, double ly, double lz,
       volatile double image_length=image*L;
       if (!isfinite(q[k]) || !isfinite(current) || !isfinite(image) || fabs(image)>9.0e15 ||
           current < -1e-9 || current > L+1e-9 || fabs((q[k]-current)-image_length)>1e-8)
-        atomicExch(error,3);
+        atomicOr(error,1<<3);
       else if (save_images) images[k]=static_cast<long long>(image);
     }
   } else {
@@ -136,7 +136,7 @@ __global__ void r164_shadow_stage(int n, int p, double lx, double ly, double lz,
     const double shift=q[j]-current;
     const double image=round(shift/L);
     volatile double image_length=image*L;
-    if (!isfinite(shift) || !isfinite(image) || fabs(shift-image_length)>1e-8) atomicExch(error,4);
+    if (!isfinite(shift) || !isfinite(image) || fabs(shift-image_length)>1e-8) atomicOr(error,1<<4);
     offset[j]=shift;
     for (int bead=1;bead<p;++bead) {
       double diff=positions[bead][j]-current;
@@ -144,9 +144,20 @@ __global__ void r164_shadow_stage(int n, int p, double lx, double ly, double lz,
       else if (diff > L*0.5) diff-=L;
       const double expected=q[bead*3*n+j]-q[j];
       if (!isfinite(diff) || !isfinite(expected) || fabs(fabs(diff)-L*0.5)<1e-9 || fabs(diff-expected)>1e-8)
-        atomicExch(error,5);
+        atomicOr(error,1<<5);
     }
   }
+}
+
+__global__ void r164_gather_sample(int n, int p, bool force, double* const* pointers, double* out) {
+  const int bead=blockIdx.y;
+  const int j=blockIdx.x*blockDim.x+threadIdx.x;
+  const size_t count=static_cast<size_t>(p)*n;
+  if (j<3*n) {
+    out[static_cast<size_t>(bead)*3*n+j]=pointers[bead][j];
+    if (force) out[count*4+static_cast<size_t>(bead)*3*n+j]=pointers[2*p+bead][j];
+  }
+  if (j<n) out[count*3+static_cast<size_t>(bead)*n+j]=pointers[p+bead][j];
 }
 
 void R164_RPMD::shadow_prepare(Atom& atom) {
@@ -155,7 +166,7 @@ void R164_RPMD::shadow_prepare(Atom& atom) {
     shadow_->q.resize(q_.size());
     shadow_->offset.resize(offset_.size());
     if (stride_>0) shadow_->images.resize(q_.size());
-    shadow_->error.resize(1);
+    shadow_->error.resize(1); shadow_->error.fill(0);
     copy_from_host(shadow_->q,q_.data());
     shadow_->positions_host.clear();
   }
@@ -172,17 +183,18 @@ void R164_RPMD::shadow_prepare(Atom& atom) {
 
 void R164_RPMD::shadow_stage(Atom& atom, int phase, bool save_images) {
   shadow_prepare(atom);
-  shadow_->error.fill(0);
+  if (phase==SHADOW_DRIFT) shadow_->error.fill(0);
   r164_shadow_stage<<<(3*n_+127)/128,128>>>(n_,p_,lengths_[0],lengths_[1],lengths_[2],
     shadow_->positions.data(),shadow_->q.data(),shadow_->offset.data(),
     stride_>0 ? shadow_->images.data() : nullptr,shadow_->error.data(),phase,save_images);
   GPU_CHECK_KERNEL
+  if (phase==SHADOW_FORCE) return;
   int error=0; copy_to_host(shadow_->error,&error);
-  if (error==1) PRINT_INPUT_ERROR("r164_rpmd non-finite drift increment.");
-  if (error==2) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: first-bead MIC branch is ambiguous or differs from the loaded lift.");
-  if (error==3) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: force position is not a canonical image of the lifted state.");
-  if (error==4) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: bead zero has no verified integer image.");
-  if (error==5) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: propagation MIC branch differs from continuous lift.");
+  if (error & (1<<1)) PRINT_INPUT_ERROR("r164_rpmd non-finite drift increment.");
+  if (error & (1<<2)) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: first-bead MIC branch is ambiguous or differs from the loaded lift.");
+  if (error & (1<<3)) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: force position is not a canonical image of the lifted state.");
+  if (error & (1<<4)) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: bead zero has no verified integer image.");
+  if (error & (1<<5)) PRINT_INPUT_ERROR("r164_rpmd BLOCKED: propagation MIC branch differs from continuous lift.");
 }
 
 void R164_RPMD::read_positions(Atom& atom, std::vector<double>& q) {
@@ -642,16 +654,44 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     return;
   }
   const bool need_force=!buffered_ || snapshot;
-  std::vector<double> v, f, u;
-  try { v.resize(p_*n_*3); if (need_force) f.resize(p_*n_*3); u.resize(p_*n_); }
-  catch (const std::bad_alloc&) {
+  const size_t count=static_cast<size_t>(p_)*n_;
+  std::vector<double> v_storage, f_storage, u_storage;
+  const double *v=nullptr, *f=nullptr, *u=nullptr;
+  try {
+    if (buffered_) {
+      const size_t size=count*(need_force ? 7 : 4);
+      auto& sh=*shadow_;
+      const size_t capacity=count*(stride_>0 ? 7 : 4);
+      if (sh.staging.size()!=capacity) { sh.staging.resize(capacity); sh.staging_host.resize(capacity); }
+      std::vector<double*> pointers(3*p_);
+      for (int bead=0;bead<p_;++bead) {
+        pointers[bead]=atom.velocity_beads[bead].data(); pointers[p_+bead]=atom.potential_beads[bead].data();
+        pointers[2*p_+bead]=atom.force_beads[bead].data();
+      }
+      if (pointers!=sh.sample_pointers_host) {
+        sh.sample_pointers_host=pointers;
+        if (sh.sample_pointers.size()!=pointers.size()) sh.sample_pointers.resize(pointers.size());
+        copy_from_host(sh.sample_pointers,sh.sample_pointers_host.data());
+      }
+      r164_gather_sample<<<dim3((3*n_+255)/256,p_),256>>>(n_,p_,need_force,sh.sample_pointers.data(),sh.staging.data());
+      GPU_CHECK_KERNEL
+      const auto copy_start=Clock::now();
+      sh.staging.copy_to_host(sh.staging_host.data(),size);
+      d2h_.seconds+=std::chrono::duration<double>(Clock::now()-copy_start).count();
+      ++d2h_.calls; d2h_.bytes+=size*sizeof(double);
+      v=sh.staging_host.data(); u=v+count*3; if (need_force) f=u+count;
+    } else {
+      v_storage.resize(count*3); f_storage.resize(count*3); u_storage.resize(count);
+      for (int bead=0;bead<p_;++bead) {
+        copy_to_host(atom.velocity_beads[bead],v_storage.data()+bead*n_*3);
+        copy_to_host(atom.force_beads[bead],f_storage.data()+bead*n_*3);
+        copy_to_host(atom.potential_beads[bead],u_storage.data()+bead*n_);
+      }
+      v=v_storage.data(); f=f_storage.data(); u=u_storage.data();
+    }
+  } catch (const std::bad_alloc&) {
     if (!buffered_) throw;
     PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered frame workspace; reduce frame or sample frequency.");
-  }
-  for (int s=0; s<p_; ++s) {
-    copy_to_host(atom.velocity_beads[s],v.data()+s*n_*3);
-    if (need_force) copy_to_host(atom.force_beads[s],f.data()+s*n_*3);
-    copy_to_host(atom.potential_beads[s],u.data()+s*n_);
   }
   double Q[2]={}, Pi[2]={}, d2[3]={};
   const double mass_factor=TIME_UNIT_CONVERSION*TIME_UNIT_CONVERSION;
@@ -688,9 +728,9 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     for (double value:d2) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite R27 correction.");
   }
   for (double value : q_) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite q before observer.");
-  for (double value : v) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite velocity before observer.");
-  for (double value : f) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite force before observer.");
-  for (double value : u) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite potential before observer.");
+  for (size_t j=0;j<count*3;++j) if (!std::isfinite(v[j])) PRINT_INPUT_ERROR("r164_rpmd non-finite velocity before observer.");
+  for (size_t j=0;j<(need_force ? count*3 : 0);++j) if (!std::isfinite(f[j])) PRINT_INPUT_ERROR("r164_rpmd non-finite force before observer.");
+  for (size_t j=0;j<count;++j) if (!std::isfinite(u[j])) PRINT_INPUT_ERROR("r164_rpmd non-finite potential before observer.");
   for (double mass : atom.cpu_mass) if (!std::isfinite(mass) || mass <= 0) PRINT_INPUT_ERROR("r164_rpmd invalid mass.");
   double observer_conv[3]={}, local_current[3]={}, local_image[3]={}, mechanical[3]={}, mechanical_image[3]={}, relay[3]={}, relay_image[3]={}, projection[3]={}, projection_image[3]={}, chart[3]={}, site_rate_sum=0, gradient_power=0, native_power=0, force_difference_max=0;
   const bool projection_frame=!buffered_ && (step==0 || step==total || (stride_ && step%stride_==0));
@@ -753,19 +793,33 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       double mean_D=0, mean_rate=0;
       projection_valid=true; projection_status="valid";
       for (int i=0;i<n_;++i) { if (!std::isfinite(raw_D[i]) || !std::isfinite(raw_rate[i])) { projection_valid=false; projection_status="nonfinite"; } mean_D+=raw_D[i]/n_; mean_rate+=raw_rate[i]/n_; }
+      std::vector<std::pair<double,int>> ordered(n_);
+      std::vector<int> left_counts(n_), right_counts(n_);
+      std::vector<bool> guarded(n_);
       for (int d=0;d<3 && projection_valid;++d) {
-        std::vector<double> ordered(n_); double mean_x=0, L=lengths_[d];
-        for (int i=0;i<n_;++i) { ordered[i]=centroid[d*n_+i]; mean_x+=ordered[i]/n_; }
-        std::sort(ordered.begin(),ordered.end());
+        double mean_x=0, L=lengths_[d];
         for (int i=0;i<n_;++i) {
-          double x=centroid[d*n_+i], left=x-L/2, right=x+L/2;
-          auto li=std::lower_bound(ordered.begin(),ordered.end(),left);
-          auto ri=std::upper_bound(ordered.begin(),ordered.end(),right);
-          auto left_near=std::lower_bound(ordered.begin(),ordered.end(),left-1e-9);
-          auto right_near=std::lower_bound(ordered.begin(),ordered.end(),right-1e-9);
-          if ((left_near!=ordered.end() && *left_near<=left+1e-9) ||
-              (right_near!=ordered.end() && *right_near<=right+1e-9)) { projection_valid=false; projection_status="half_box_guard"; projection_guard_axis=d; projection_guard_index=i; break; }
-          double left_count=li-ordered.begin(), right_count=ordered.end()-ri;
+          const double x=centroid[d*n_+i];
+          if (!std::isfinite(x)) { projection_valid=false; projection_status="nonfinite"; }
+          ordered[i]={x,i}; mean_x+=x/n_;
+        }
+        if (!projection_valid) break;
+        std::sort(ordered.begin(),ordered.end(),[](const std::pair<double,int>& a,const std::pair<double,int>& b){ return a.first<b.first; });
+        size_t li=0, ri=0, ln=0, rn=0;
+        for (const auto& query:ordered) {
+          const int i=query.second;
+          double x=query.first, left=x-L/2, right=x+L/2;
+          while (li<ordered.size() && ordered[li].first<left) ++li;
+          while (ri<ordered.size() && !(right<ordered[ri].first)) ++ri;
+          while (ln<ordered.size() && ordered[ln].first<left-1e-9) ++ln;
+          while (rn<ordered.size() && ordered[rn].first<right-1e-9) ++rn;
+          left_counts[i]=li; right_counts[i]=ordered.size()-ri;
+          guarded[i]=(ln<ordered.size() && ordered[ln].first<=left+1e-9) || (rn<ordered.size() && ordered[rn].first<=right+1e-9);
+        }
+        for (int i=0;i<n_;++i) {
+          double x=centroid[d*n_+i];
+          if (guarded[i]) { projection_valid=false; projection_status="half_box_guard"; projection_guard_axis=d; projection_guard_index=i; break; }
+          double left_count=left_counts[i], right_count=right_counts[i];
           double eta=x-mean_x+L*(right_count-left_count)/n_;
           double c=mean_D*raw_rate[i]-raw_D[i]*mean_rate;
           projection[d]+=eta*c/TIME_UNIT_CONVERSION;
@@ -834,13 +888,13 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
           const uint64_t bits=static_cast<uint64_t>(force_images_[i]);
           for (int j=0;j<frame.image_width;++j) frame.images[i*frame.image_width+j]=static_cast<unsigned char>(bits>>(8*j));
         }
-        frame.v=std::move(v); frame.f=std::move(f);
+        frame.v.assign(v,v+count*3); frame.f.assign(f,f+count*3);
 #ifdef GPUMD_R164_ZSTD
         if (compressed_) compression_->submit(std::move(frame));
         else
 #endif
           snapshots_.push_back(std::move(frame));
-      } else write_snapshot(step,q_,v,f,energy,force_images_,atom);
+      } else write_snapshot(step,q_,v_storage,f_storage,energy,force_images_,atom);
     } catch (const std::bad_alloc&) {
       if (!buffered_) throw;
       PRINT_INPUT_ERROR("r164_rpmd cannot allocate buffered snapshot; reduce frame frequency.");
