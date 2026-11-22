@@ -59,10 +59,7 @@ inline void write(const std::string& dir, const std::vector<double>& v,
   for (int kind=0;kind<components/3;++kind) {
     std::vector<std::vector<Complex>> spectra(3,std::vector<Complex>(size));
     for (int d=0;d<3;++d) {
-      double mean=0;
-      for (size_t i=0;i<n;++i) if (mask[i]) mean+=v[i*components+3*kind+d];
-      if (count) mean/=count;
-      for (size_t i=0;i<n;++i) if (mask[i]) spectra[d][i]=v[i*components+3*kind+d]-mean;
+      for (size_t i=0;i<n;++i) if (mask[i]) spectra[d][i]=v[i*components+3*kind+d];
       fft(spectra[d],false);
     }
     std::vector<double> corr(static_cast<size_t>(nc)*9,nan);
@@ -75,7 +72,7 @@ inline void write(const std::string& dir, const std::vector<double>& v,
     rpmd_ja_file_io::ofstream out(path+".tmp"); out<<std::setprecision(17);
     out<<"# sample_stride "<<stride<<" samples "<<n<<" valid_samples "<<count<<" Nc "<<nc<<" output_interval "<<interval<<"\n";
     out<<"# lag_ps pairs C_xx C_xy C_xz C_yx C_yy C_yz C_zx C_zy C_zz K_xx K_xy K_xz K_yx K_yy K_yz K_zx K_zy K_zz\n"
-       <<"# C uses J_a(t) J_b(t+lag), (eV Angstrom/fs)^2; K W/(m K); common mask, valid-point mean, trapezoid all lags; complete bins, pairs is the mean valid pair count in each bin; UNVERIFIED\n";
+       <<"# C uses J_a(t) J_b(t+lag), (eV Angstrom/fs)^2; K W/(m K); common mask, mean_subtraction none, trapezoid all lags; complete bins, pairs is the mean valid pair count in each bin; UNVERIFIED\n";
     double integral[9]={}, corr_sum[9]={}, integral_sum[9]={}, pair_sum=0;
     bool supported=pairs[0]>0;
     for (int l=0;l<nc;++l) {

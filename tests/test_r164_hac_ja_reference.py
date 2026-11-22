@@ -18,7 +18,6 @@ def main():
             i = np.arange(n)
             mask = (i % 7 != 1) & (i % 11 != 3)
             values = np.stack([np.sin(i * (j + 1) * .031) + i * .0001 * (j + 1) for j in range(9)], axis=1)
-            values[mask] -= values[mask].mean(axis=0)
             values[~mask] = 0
             for kind, name in enumerate(("ja", "hardy", "centroid")):
                 data = np.loadtxt(case / ("hac_" + name + ".out"), ndmin=2, converters=lambda x: float("nan") if "nan" in str(x).lower() else float(x))
