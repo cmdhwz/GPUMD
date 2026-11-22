@@ -1,6 +1,7 @@
 #pragma once
 #include "force/nep_charge.cuh"
 #include "rpmd_ja_sha256.h"
+#include "r164_ja_reference.h"
 #include "model/box.cuh"
 #include <chrono>
 #include <cstdint>
@@ -23,7 +24,7 @@ public:
     enabled_ = false; observer_requested_ = false; drift_charge_requested_ = false; buffered_ = false; centroid_requested_ = false;
     sample_stride_ = 0; checkpoint_stride_ = 0; trace_step_ = -1;
     series_.clear(); series_.shrink_to_fit(); snapshots_.clear(); snapshots_.shrink_to_fit();
-    metadata_text_.clear(); identity_text_.clear(); observer_text_.clear(); observer_.reset();
+    ja_reference_path_.clear(); metadata_text_.clear(); identity_text_.clear(); observer_text_.clear(); observer_.reset();
   }
   void begin(Atom&, const Box&, double temperature, double dt, double start_time);
   void configure_observer(Force&, Atom&, const std::string& model_xyz_sha256, const std::string& restart_sha256);
@@ -55,7 +56,8 @@ private:
   int stride_ = 0, checkpoint_stride_ = 0, n_ = 0, p_ = 0;
   int trace_step_ = -1, trace_bead_ = -1, trace_atom_ = -1;
   double temperature_ = 0, dt_ = 0, lengths_[3] = {};
-  std::string directory_;
+  std::string directory_, ja_reference_path_;
+  R164JAReference ja_reference_;
   bool observer_requested_ = false, drift_charge_requested_ = false, buffered_ = false, compressed_ = false, centroid_requested_ = false;
   int sample_stride_ = 0, hac_sample_stride_ = 0, hac_nc_ = 0, hac_interval_ = 0;
   bool hac_correlation_only_ = false;

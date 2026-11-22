@@ -94,7 +94,7 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
     if (!observer_requested_ || drift_charge_requested_)
       PRINT_INPUT_ERROR("r164_rpmd buffered requires observer.");
     buffered_=true; ++next;
-    if (next<t.size() && t[next]!="compressed" && t[next]!="centroid") {
+    if (next<t.size() && t[next]!="compressed" && t[next]!="centroid" && t[next]!="ja_reference") {
       if (!decimal(t[next],sample_stride_) || sample_stride_<=0)
         PRINT_INPUT_ERROR("r164_rpmd buffered sample stride must be a positive decimal integer.");
       ++next;
@@ -109,8 +109,12 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
     }
   }
   if (buffered_ && next<t.size() && t[next]=="centroid") { centroid_requested_=true; ++next; }
+  if (buffered_ && next<t.size() && t[next]=="ja_reference") {
+    if (next+2!=t.size() || t[next+1].empty()) PRINT_INPUT_ERROR("r164_rpmd ja_reference requires one file path.");
+    ja_reference_path_=t[next+1]; next+=2;
+  }
   if (buffered_ && next<t.size())
-    PRINT_INPUT_ERROR("r164_rpmd buffered syntax: observer buffered [SAMPLE_STRIDE] [compressed] [centroid]; incompatible with other options.");
+    PRINT_INPUT_ERROR("r164_rpmd buffered syntax: observer buffered [SAMPLE_STRIDE] [compressed] [centroid] [ja_reference FILE].");
   if (next<t.size() && t[next]=="checkpoint") {
     if (next+1>=t.size() || !decimal(t[next+1],checkpoint_stride_) || checkpoint_stride_<=0)
       PRINT_INPUT_ERROR("r164_rpmd checkpoint requires a positive decimal int stride.");
@@ -264,6 +268,22 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
       PRINT_INPUT_ERROR("r164_rpmd supports only O, H, Na and Cl.");
     species_[i]=symbol=="O"?0:symbol=="H"?1:symbol=="Na"?2:3;
   }
+  if (!ja_reference_path_.empty()) {
+    try { ja_reference_=read_r164_ja_reference(ja_reference_path_); }
+    catch (const std::exception& e) { fprintf(stderr,"r164_rpmd JA reference: %s\n",e.what()); PRINT_INPUT_ERROR("invalid JA reference file."); }
+    const auto& r=ja_reference_;
+    if (r.atoms!=n_ || std::abs(r.temperature-temperature_)>=1e-8)
+      PRINT_INPUT_ERROR("r164_rpmd JA reference atom count or temperature mismatch.");
+    for (int d=0;d<3;++d) if (std::abs(r.cell[d]-lengths_[d])>=1e-8)
+      PRINT_INPUT_ERROR("r164_rpmd JA reference cell mismatch.");
+    for (int a=0;a<3;++a) {
+      const int i=r.row[a];
+      if (atom.cpu_atom_symbol[i]!=(a==0 ? "O" : "H") ||
+          !std::isfinite(atom.cpu_mass[i]) ||
+          std::abs(atom.cpu_mass[i]*TIME_UNIT_CONVERSION*TIME_UNIT_CONVERSION-r.mass[a])>1e-6*r.mass[a])
+        PRINT_INPUT_ERROR("r164_rpmd JA reference selected species or mass mismatch.");
+    }
+  }
   next_output_step_=0; drift_pending_=false; shadow_.reset();
   read_positions(atom, q_); check_branch(q_);
 #ifdef _WIN32
@@ -276,8 +296,22 @@ void R164_RPMD::begin(Atom& atom, const Box& box, double temperature, double dt,
   meta << std::setprecision(17) << "schema r164_diagnostic_v1\nstorage "
        << (buffered_ ? (compressed_ ? "binary64_series_text_and_zstd_snapshots_v2" : "binary64_series_text_and_binary_snapshots_v1") : "binary64_text_17_digits")
        << "; force_backend_precision not_certified\n"
-       << "layout q_p_F: bead,atom,xyz; U: bead\nreference_id R27_fixed_2OH_R157\nreference_source_sha256 1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa\nreference_atom_identity_and_environment UNVERIFIED\nunits q=angstrom p=eV_fs_per_angstrom F=eV_per_angstrom U=eV time=fs\n"
-       << "flow_b UNVERIFIED_OR_UNAVAILABLE\nd2 R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT\nJ2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\n"
+       << "layout q_p_F: bead,atom,xyz; U: bead\n";
+  if (ja_reference_path_.empty()) {
+    meta << "reference_id R27_fixed_2OH_R157\n"
+         << "reference_source_sha256 1d46365935f48e390d08e69e8564a3adc692d439b9472b4250914b22144a2eaa\n";
+  } else {
+    meta << "reference_id " << ja_reference_.id << "\n"
+         << "reference_file " << std::quoted(ja_reference_path_) << "\n"
+         << "reference_potential_sha256 " << ja_reference_.potential_sha256 << "\n"
+         << "reference_file_sha256 " << ja_reference_.file_sha256 << "\n"
+         << "reference_rows " << ja_reference_.row[0] << ' ' << ja_reference_.row[1] << ' ' << ja_reference_.row[2] << "\n";
+  }
+  meta << "reference_atom_identity_and_environment UNVERIFIED\n"
+       << "units q=angstrom p=eV_fs_per_angstrom F=eV_per_angstrom U=eV time=fs\n"
+       << "flow_b UNVERIFIED_OR_UNAVAILABLE\n"
+       << "d2 " << (ja_reference_path_.empty() ? "R27_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT" : "FILE_CANDIDATE_UNVERIFIED_ROW_ID_AND_ENVIRONMENT") << "\n";
+  meta << "J2 UNVERIFIED_OR_UNAVAILABLE\nevents BLOCKED\n"
        << "checkpoint " << (checkpoint_stride_ ? "FRESH_REBUILD_ONLY" : "BLOCKED") << "\n"
        << "P " << p_ << "\nN " << n_ << "\ntemperature_K " << temperature_ << "\ndt_fs " << dt*TIME_UNIT_CONVERSION << "\n"
        << "time_convention step_times_fixed_dt_start_zero\n"
@@ -295,6 +329,8 @@ void R164_RPMD::configure_observer(Force& force, Atom& atom, const std::string& 
   const std::string source_model=get_first_potential_filename(force.get_run_input());
   const std::string source_hash=rpmd_ja_sample_provenance::sha256_file(source_model);
   const std::string input_hash=rpmd_ja_sample_provenance::sha256_file("run.in");
+  if (!ja_reference_path_.empty() && source_hash!=ja_reference_.potential_sha256)
+    PRINT_INPUT_ERROR("r164_rpmd JA reference potential SHA256 mismatch or unavailable.");
   std::ostringstream identity;
 #ifdef GPUMD_WPE_ENABLED
   identity << "bead_force_backend WPE\n";
@@ -807,16 +843,22 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
   const double mass_factor=TIME_UNIT_CONVERSION*TIME_UNIT_CONVERSION;
   // Permit ordinary decimal mass rounding in the fixed R27 reference guard.
   constexpr double r27_mass_relative_tolerance=1e-6;
-  const bool r27_candidate = n_ == 5896 && std::abs(temperature_-300.0)<1e-8 &&
+  const bool r27_candidate = ja_reference_path_.empty() && n_ == 5896 && std::abs(temperature_-300.0)<1e-8 &&
     std::abs(atom.cpu_mass[715]*mass_factor-1658.1794888315474)<=r27_mass_relative_tolerance*1658.1794888315474 &&
     std::abs(atom.cpu_mass[3382]*mass_factor-104.47183728621788)<=r27_mass_relative_tolerance*104.47183728621788 &&
     std::abs(atom.cpu_mass[5674]*mass_factor-104.47183728621788)<=r27_mass_relative_tolerance*104.47183728621788 && atom.cpu_atom_symbol[715] == "O" &&
     atom.cpu_atom_symbol[3382] == "H" && atom.cpu_atom_symbol[5674] == "H" &&
     std::abs(lengths_[0]-29.3104)<1e-8 && std::abs(lengths_[1]-29.3104)<1e-8 &&
     std::abs(lengths_[2]-29.3104)<1e-8;
-  if (r27_candidate) {
+  const bool reference_candidate = !ja_reference_path_.empty() || r27_candidate;
+  if (reference_candidate) {
+    const bool builtin=ja_reference_path_.empty();
+    const auto& rows=builtin ? r164_r27::row : ja_reference_.row;
+    const auto& reference=builtin ? r164_r27::reference : ja_reference_.reference;
+    const auto& basis=builtin ? r164_r27::basis : ja_reference_.basis;
+    const auto& D=builtin ? r164_r27::D : ja_reference_.D;
     for (int a=0; a<3; ++a) {
-      int i=r164_r27::row[a];
+      int i=rows[a];
       for (int d=0; d<3; ++d) {
         double qc=0, pc=0;
         for (int bead=0; bead<p_; ++bead) {
@@ -826,16 +868,16 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
         }
         for (int k=0; k<2; ++k) {
           Q[k]+=atom.cpu_mass[i]*TIME_UNIT_CONVERSION*TIME_UNIT_CONVERSION *
-            r164_r27::basis[a][d][k]*(qc-r164_r27::reference[a][d]);
-          Pi[k]+=r164_r27::basis[a][d][k]*pc;
+            basis[a][d][k]*(qc-reference[a][d]);
+          Pi[k]+=basis[a][d][k]*pc;
         }
       }
     }
     for (int d=0;d<3;++d) for (int r=0;r<2;++r) for (int j=0;j<2;++j)
-      d2[d]+=Pi[r]*r164_r27::D[d][r][j]*Q[j];
-    for (double value:Q) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite R27 Q.");
-    for (double value:Pi) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite R27 Pi.");
-    for (double value:d2) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite R27 correction.");
+      d2[d]+=Pi[r]*D[d][r][j]*Q[j];
+    for (double value:Q) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite JA Q.");
+    for (double value:Pi) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite JA Pi.");
+    for (double value:d2) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd nonfinite JA correction.");
   }
   for (double value : q_) if (!std::isfinite(value)) PRINT_INPUT_ERROR("r164_rpmd non-finite q before observer.");
   for (size_t j=0;j<count*3;++j) if (!std::isfinite(v[j])) PRINT_INPUT_ERROR("r164_rpmd non-finite velocity before observer.");
@@ -1024,7 +1066,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
       row.step=step; row.time=time_fs; row.potential=potential; row.kinetic=kinetic;
       row.spring=spring; row.energy=(potential+kinetic+spring)/(p_*n_);
       row.b_valid=b_valid;
-      row.d2_valid=r27_candidate; row.j2_valid=row.b_valid && row.d2_valid;
+      row.d2_valid=reference_candidate; row.j2_valid=row.b_valid && row.d2_valid;
       for (int d=0;d<3;++d) {
         row.momentum[d]=momentum[d];
         for (int sp=0;sp<4;++sp) row.flows[sp][d]=flows[sp][d];
