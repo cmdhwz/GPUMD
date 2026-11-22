@@ -1,5 +1,6 @@
 #include "r164_rpmd.cuh"
 #include "r164_r27.h"
+#include "r164_hac_ja.h"
 #include "model/atom.cuh"
 #include "force/force.cuh"
 #include "utilities/compact_nep.cuh"
@@ -37,6 +38,39 @@
 #include <direct.h>
 #endif
 
+void R164_RPMD::parse_hac(const std::vector<std::string>& t) {
+  auto decimal=[](const std::string& text, int& value) {
+    if (text.empty()) return false;
+    value=0;
+    for (char c:text) {
+      if (c<'0' || c>'9' || value>(std::numeric_limits<int>::max()-(c-'0'))/10) return false;
+      value=value*10+(c-'0');
+    }
+    return value>0;
+  };
+  const bool mode=t.size()>1 && (t.back()=="full" || t.back()=="corr");
+  const size_t count=t.size()-(mode ? 1 : 0);
+  if (hac_nc_ || (count!=3 && count!=4) ||
+      (count==4 && !decimal(t[1],hac_sample_stride_)) ||
+      !decimal(t[count-2],hac_nc_) || !decimal(t[count-1],hac_interval_))
+    PRINT_INPUT_ERROR("compute_hac_ja requires sample_interval Nc output_interval [full|corr] (legacy: Nc output_interval [full|corr]).");
+  hac_correlation_only_=mode && t.back()=="corr";
+}
+void R164_RPMD::validate_hac(int total) {
+  if (!enabled_ && !hac_nc_) return;
+  if (hac_nc_ && (!enabled_ || !buffered_ || !observer_requested_))
+    PRINT_INPUT_ERROR("compute_hac_ja requires r164_rpmd observer buffered in the same run.");
+  if (buffered_) {
+    if (sample_stride_ && hac_sample_stride_ && sample_stride_!=hac_sample_stride_)
+      PRINT_INPUT_ERROR("r164_rpmd and compute_hac_ja sample strides must match.");
+    if (!sample_stride_) sample_stride_=hac_sample_stride_;
+    if (!sample_stride_)
+      PRINT_INPUT_ERROR("r164_rpmd buffered requires a sample stride or the new compute_hac_ja syntax.");
+  }
+  if (hac_nc_ && static_cast<size_t>(hac_nc_)>static_cast<size_t>(total)/sample_stride_+1)
+    PRINT_INPUT_ERROR("compute_hac_ja Nc exceeds the number of samples including step zero.");
+}
+
 void R164_RPMD::parse(const std::vector<std::string>& t) {
   if (enabled_ || t.size() < 3 || !is_valid_int(t[2], &stride_) || stride_ < 0 || t[1].empty())
     PRINT_INPUT_ERROR("r164_rpmd requires a fresh output directory and nonnegative debug stride.");
@@ -45,7 +79,7 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
   if (observer_requested_) ++next;
   drift_charge_requested_ = observer_requested_ && next<t.size() && t[next]=="drift_charge";
   if (drift_charge_requested_) ++next;
-  buffered_=false; compressed_=false; sample_stride_=0; series_.clear();
+  buffered_=false; compressed_=false; centroid_requested_=false; sample_stride_=0; series_.clear(); centroid_conv_.clear();
   checkpoint_stride_=0; trace_step_=-1;
   auto decimal = [](const std::string& text, int& value) {
     if (text.empty()) return false;
@@ -57,10 +91,14 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
     return true;
   };
   if (next<t.size() && t[next]=="buffered") {
-    if (!observer_requested_ || drift_charge_requested_ || next+1>=t.size() ||
-        !decimal(t[next+1],sample_stride_) || sample_stride_<=0)
-      PRINT_INPUT_ERROR("r164_rpmd buffered requires observer and a positive decimal sample stride.");
-    buffered_=true; next+=2;
+    if (!observer_requested_ || drift_charge_requested_)
+      PRINT_INPUT_ERROR("r164_rpmd buffered requires observer.");
+    buffered_=true; ++next;
+    if (next<t.size() && t[next]!="compressed" && t[next]!="centroid") {
+      if (!decimal(t[next],sample_stride_) || sample_stride_<=0)
+        PRINT_INPUT_ERROR("r164_rpmd buffered sample stride must be a positive decimal integer.");
+      ++next;
+    }
     if (next<t.size() && t[next]=="compressed") {
 #ifndef GPUMD_R164_ZSTD
       PRINT_INPUT_ERROR("r164_rpmd compressed requires a Zstd-enabled build.");
@@ -70,8 +108,9 @@ void R164_RPMD::parse(const std::vector<std::string>& t) {
 #endif
     }
   }
+  if (buffered_ && next<t.size() && t[next]=="centroid") { centroid_requested_=true; ++next; }
   if (buffered_ && next<t.size())
-    PRINT_INPUT_ERROR("r164_rpmd buffered cannot be combined with checkpoint, drift_charge or pppm_trace; use legacy diagnostic mode.");
+    PRINT_INPUT_ERROR("r164_rpmd buffered syntax: observer buffered [SAMPLE_STRIDE] [compressed] [centroid]; incompatible with other options.");
   if (next<t.size() && t[next]=="checkpoint") {
     if (next+1>=t.size() || !decimal(t[next+1],checkpoint_stride_) || checkpoint_stride_<=0)
       PRINT_INPUT_ERROR("r164_rpmd checkpoint requires a positive decimal int stride.");
@@ -491,6 +530,22 @@ struct R164_RPMD::CompressionWorker {
 };
 #endif
 
+static __global__ void centroid_virial_sum(int n, const double* virial, const double* velocity, double* output, size_t sample) {
+  const int d=blockIdx.x;
+  const int offsets[9]={0,3,4,6,1,5,7,8,2};
+  __shared__ double partial[128];
+  double sum=0;
+  for (int i=threadIdx.x; i<n; i+=blockDim.x)
+    for (int k=0; k<3; ++k) sum+=virial[offsets[3*d+k]*n+i]*velocity[k*n+i];
+  partial[threadIdx.x]=sum;
+  __syncthreads();
+  for (int width=64; width>0; width/=2) {
+    if (threadIdx.x<width) partial[threadIdx.x]+=partial[threadIdx.x+width];
+    __syncthreads();
+  }
+  if (threadIdx.x==0) output[3*sample+d]=partial[0];
+}
+
 void R164_RPMD::prepare_buffered(int total, const Atom& atom) {
   if (!buffered_) return;
   buffered_total_=total;
@@ -508,6 +563,7 @@ void R164_RPMD::prepare_buffered(int total, const Atom& atom) {
   if (stride_>0) printf("r164_rpmd uncompressed output reference %.3f GiB (int8 images) to %.3f GiB (int64 images) for %zu snapshots and %zu samples%s.\n",(base*(9*sizeof(double)+3)+extra)/unit,(base*(9*sizeof(double)+3*sizeof(long long))+extra)/unit,frame_count,sample_count,compressed_ ? "; compression peak also includes queue and worker buffers" : "; choose sparse frames for large runs");
   try {
     series_.reserve(sample_count);
+    if (centroid_requested_) { centroid_virial_current_.reset(new GPU_Vector<double>(3*sample_count)); centroid_conv_.reserve(3*sample_count); }
 #ifdef GPUMD_R164_ZSTD
     if (compressed_) compression_=std::make_shared<CompressionWorker>(atom.cpu_mass,p_,n_);
     else
@@ -580,25 +636,79 @@ void R164_RPMD::finish_buffered(Atom& atom) {
     if (!binary || rpmd_ja_file_io::atomic_commit_new_file(binary_path+".tmp",binary_path)!=0)
       PRINT_INPUT_ERROR("r164_rpmd failed committing binary snapshots.");
   }
-  const std::string path=directory_+"/series.txt";
-  rpmd_ja_file_io::ofstream out(path+".tmp"); out << std::setprecision(17);
-  out << "# schema r164_buffered_series_v1\n# sample_stride " << sample_stride_
-      << "\n# units time=fs energy=eV momentum=eV_fs_per_angstrom number_flow=angstrom_per_fs b_d2_J2=eV_angstrom_per_fs\n"
-      << "# validity 1=UNVERIFIED 0=UNAVAILABLE; unavailable values nan\n"
-      << "# columns step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz b_valid bx by bz d2_valid d2x d2y d2z J2_valid J2x J2y J2z\n";
   const double missing=std::numeric_limits<double>::quiet_NaN();
-  for (const auto& row:series_) {
-    out << row.step << ' ' << row.time << ' ' << row.potential << ' ' << row.kinetic << ' ' << row.spring << ' ' << row.energy;
-    for (double value:row.momentum) out << ' ' << value;
-    for (const auto& flow:row.flows) for (double value:flow) out << ' ' << value;
-    out << ' ' << row.b_valid; for (double value:row.b) out << ' ' << (row.b_valid ? value : missing);
-    out << ' ' << row.d2_valid; for (double value:row.d2) out << ' ' << (row.d2_valid ? value : missing);
-    out << ' ' << row.j2_valid; for (double value:row.j2) out << ' ' << (row.j2_valid ? value : missing);
-    out << '\n';
+  if (!hac_correlation_only_) {
+    const std::string path=directory_+"/series.txt";
+    rpmd_ja_file_io::ofstream out(path+".tmp"); out << std::setprecision(17);
+    out << "# schema r164_buffered_series_v1\n# sample_stride " << sample_stride_
+        << "\n# units time=fs energy=eV momentum=eV_fs_per_angstrom number_flow=angstrom_per_fs b_d2_J2=eV_angstrom_per_fs\n"
+        << "# validity 1=UNVERIFIED 0=UNAVAILABLE; unavailable values nan\n"
+        << "# columns step time_fs U_eV K_eV spring_eV H_per_PN_eV Px Py Pz NOx NOy NOz NHx NHy NHz NNax NNay NNaz NClx NCly NClz b_valid bx by bz d2_valid d2x d2y d2z J2_valid J2x J2y J2z\n";
+    for (const auto& row:series_) {
+      out << row.step << ' ' << row.time << ' ' << row.potential << ' ' << row.kinetic << ' ' << row.spring << ' ' << row.energy;
+      for (double value:row.momentum) out << ' ' << value;
+      for (const auto& flow:row.flows) for (double value:flow) out << ' ' << value;
+      out << ' ' << row.b_valid; for (double value:row.b) out << ' ' << (row.b_valid ? value : missing);
+      out << ' ' << row.d2_valid; for (double value:row.d2) out << ' ' << (row.d2_valid ? value : missing);
+      out << ' ' << row.j2_valid; for (double value:row.j2) out << ' ' << (row.j2_valid ? value : missing);
+      out << '\n';
+    }
+    out.close();
+    if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
+      PRINT_INPUT_ERROR("r164_rpmd failed committing buffered series.");
   }
-  out.close();
-  if (!out || rpmd_ja_file_io::atomic_commit_new_file(path+".tmp",path)!=0)
-    PRINT_INPUT_ERROR("r164_rpmd failed committing buffered series.");
+  std::vector<double> hac_centroid;
+  if (hac_nc_ && centroid_requested_) hac_centroid.reserve(3*series_.size());
+  if (centroid_requested_) {
+    if (!observer_ || !centroid_virial_current_ || centroid_conv_.size()!=3*series_.size() ||
+        centroid_virial_current_->size()!=3*series_.size())
+      PRINT_INPUT_ERROR("r164_rpmd inconsistent centroid current samples.");
+    std::vector<double> virial(centroid_virial_current_->size());
+    copy_to_host(*centroid_virial_current_,virial.data());
+    const std::string current_path=directory_+"/centroid_current.txt";
+    rpmd_ja_file_io::ofstream current;
+    if (!hac_correlation_only_) {
+      current.open(current_path+".tmp"); current << std::setprecision(17);
+      current << "# schema r164_centroid_current_v1\n# native observer per-atom virial contracted with centroid velocity plus site energy and kinetic convection\n"
+              << "# provenance metadata.txt source_identity.txt observer.txt; sample_stride " << sample_stride_
+              << "\n# units time=fs current=eV_angstrom_per_fs; validity 1=finite_unverified 0=unavailable\n"
+              << "# columns step time_fs JC_valid JCx JCy JCz\n";
+    }
+    for (size_t i=0; i<series_.size(); ++i) {
+      double value[3]; bool valid=true;
+      for (int d=0; d<3; ++d) { value[d]=centroid_conv_[3*i+d]+virial[3*i+d]/TIME_UNIT_CONVERSION; valid=valid && std::isfinite(value[d]); }
+      if (hac_nc_) for (double x:value) hac_centroid.push_back(valid ? x : missing);
+      if (!hac_correlation_only_) {
+        current << series_[i].step << ' ' << series_[i].time << ' ' << valid;
+        for (double x:value) current << ' ' << (valid ? x : missing);
+        current << '\n';
+      }
+    }
+    if (!hac_correlation_only_) {
+      current.close();
+      if (!current || rpmd_ja_file_io::atomic_commit_new_file(current_path+".tmp",current_path)!=0)
+        PRINT_INPUT_ERROR("r164_rpmd failed committing centroid current.");
+    }
+    centroid_conv_.clear(); centroid_conv_.shrink_to_fit(); centroid_virial_current_.reset();
+  }
+  if (hac_nc_) {
+    std::vector<double> values(series_.size()* (centroid_requested_ ? 9 : 6));
+    std::vector<unsigned char> mask(series_.size());
+    const int components=centroid_requested_ ? 9 : 6;
+    for (size_t i=0;i<series_.size();++i) {
+      const auto& row=series_[i]; bool valid=row.b_valid && row.j2_valid;
+      for (int d=0;d<3;++d) {
+        values[i*components+d]=row.j2[d]; values[i*components+3+d]=row.b[d];
+        valid=valid && std::isfinite(row.j2[d]) && std::isfinite(row.b[d]);
+        if (centroid_requested_) { values[i*components+6+d]=hac_centroid[3*i+d]; valid=valid && std::isfinite(hac_centroid[3*i+d]); }
+      }
+      mask[i]=valid;
+    }
+    const double dt_fs=dt_*TIME_UNIT_CONVERSION*sample_stride_;
+    const double factor=1.602176634e-19/1e-25/(lengths_[0]*lengths_[1]*lengths_[2]*(1.380649e-23/1.602176634e-19)*temperature_*temperature_);
+    try { r164_hac_ja::write(directory_, values, mask, components, hac_nc_, hac_interval_, dt_fs, factor, sample_stride_); }
+    catch (const std::exception& e) { fprintf(stderr,"compute_hac_ja: %s\n",e.what()); PRINT_INPUT_ERROR("compute_hac_ja finalization failed."); }
+  }
   series_.clear(); series_.shrink_to_fit();
   snapshots_.clear(); snapshots_.shrink_to_fit(); compression_.reset(); shadow_.reset();
   write_complete(buffered_total_);
@@ -757,6 +867,10 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
     for (double x:site) if (!std::isfinite(x)) PRINT_INPUT_ERROR("r164_rpmd observer nonfinite energy.");
     for (double x:native_f) if (!std::isfinite(x)) PRINT_INPUT_ERROR("r164_rpmd observer nonfinite force.");
     copy_from_host(observer_v_,cv.data());
+    if (centroid_requested_) {
+      centroid_virial_sum<<<3,128>>>(n_,observer_virial_.data(),observer_v_.data(),centroid_virial_current_->data(),series_.size());
+      GPU_CHECK_KERNEL
+    }
     tangent_valid=observer_->compute_reference_site_energy_derivative(box_for_observer_, atom.type,
       observer_q_, observer_f_, &observer_v_, &observer_site_rate_, observer_gradient_, nullptr, &observer_local_, &observer_local_image_);
     if (tangent_valid) {
@@ -923,6 +1037,7 @@ void R164_RPMD::output(int step, int total, Atom& atom) {
           if (!std::isfinite(row.j2[d])) PRINT_INPUT_ERROR("r164_rpmd nonfinite J2 candidate.");
         }
       }
+      if (centroid_requested_) for (double value:observer_conv) centroid_conv_.push_back(value);
       series_.push_back(row);
     }
     output_host_wall_+=std::chrono::duration<double>(Clock::now()-output_start).count()-(d2h_.seconds+h2d_.seconds-output_copies_start)-(observer_wall_-output_observer_start);

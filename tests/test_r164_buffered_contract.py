@@ -68,10 +68,25 @@ class BufferedContract(unittest.TestCase):
         self.assertIn('} else write_snapshot(step,q_,v_storage,f_storage,energy,force_images_,atom)',output)
         self.assertNotIn('finish_buffered(',output)
         self.assertIn('frame.v.assign(v,v+count*3); frame.f.assign(f,f+count*3)',output)
+    def test_centroid_native_layout_and_sampling(self):
+        import re
+        source=(ROOT/'src/measure/r164_rpmd.cu').read_text(encoding='utf8')
+        hac=(ROOT/'src/measure/hac.cu').read_text(encoding='utf8')
+        kernel=source.split('static __global__ void centroid_virial_sum',1)[1].split('void R164_RPMD::prepare_buffered',1)[0]
+        offsets=[int(x) for x in re.search(r'offsets\[9\]=\{([^}]+)\}',kernel).group(1).split(',')]
+        call=hac.split('static void compute_full_heat_per_atom(',1)[1].split('velocity_per_atom.data(),',1)[0]
+        hac_offsets=[0]+[int(x) for x in re.findall(r'virial_per_atom.data\(\) \+ N \* (\d+)',call)]
+        self.assertEqual(offsets,hac_offsets)
+        matrix=[2,3,5,7,11,13,17,19,23]; velocity=[-2,3,5]
+        self.assertEqual([sum(matrix[offsets[3*d+k]]*velocity[k] for k in range(3)) for d in range(3)], [72,40,56])
+        self.assertIn('output[3*sample+d]',kernel)
+        self.assertIn('centroid_virial_current_->data(),series_.size()',source)
+        self.assertLess(source.index('atomic_commit_new_file(current_path+".tmp",current_path)'),source.index('write_complete(buffered_total_)'))
+
     def test_option_excludes_other_diagnostics(self):
         text=(ROOT/'src/measure/r164_rpmd.cu').read_text(encoding='utf8')
         self.assertIn('buffered_ && next<t.size()',text)
-        self.assertIn('!decimal(t[next+1],sample_stride_)',text)
+        self.assertIn('!decimal(t[next],sample_stride_)',text)
         self.assertIn('sample_stride_<=0',text)
 
 if __name__=='__main__': unittest.main()

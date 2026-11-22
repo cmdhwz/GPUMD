@@ -35,6 +35,7 @@ def r164_options(tokens):
         if not observer: raise ValueError('drift_charge requires observer')
         rest=rest[1:]
     if rest and rest[0]=='buffered':
+        if rest[-1:] == ['centroid']: rest=rest[:-1]
         if (not observer or len(rest) not in (2,3) or not rest[1].isascii() or not rest[1].isdigit()
                 or not 0<int(rest[1])<=2147483647 or 'drift_charge' in tokens[3:]
                 or (len(rest)==3 and (rest[2]!='compressed' or int(tokens[2])<=0))):

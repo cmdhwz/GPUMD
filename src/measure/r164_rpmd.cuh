@@ -15,9 +15,12 @@ class R164_RPMD {
 public:
   bool enabled() const { return enabled_; }
   void parse(const std::vector<std::string>& tokens);
+  void parse_hac(const std::vector<std::string>& tokens);
+  void validate_hac(int total);
   void reset() {
-    compression_.reset(); shadow_.reset(); compressed_ = false;
-    enabled_ = false; observer_requested_ = false; drift_charge_requested_ = false; buffered_ = false;
+    hac_nc_=0; hac_interval_=0; hac_sample_stride_=0; hac_correlation_only_=false;
+    compression_.reset(); shadow_.reset(); centroid_virial_current_.reset(); centroid_conv_.clear(); compressed_ = false;
+    enabled_ = false; observer_requested_ = false; drift_charge_requested_ = false; buffered_ = false; centroid_requested_ = false;
     sample_stride_ = 0; checkpoint_stride_ = 0; trace_step_ = -1;
     series_.clear(); series_.shrink_to_fit(); snapshots_.clear(); snapshots_.shrink_to_fit();
     metadata_text_.clear(); identity_text_.clear(); observer_text_.clear(); observer_.reset();
@@ -53,8 +56,9 @@ private:
   int trace_step_ = -1, trace_bead_ = -1, trace_atom_ = -1;
   double temperature_ = 0, dt_ = 0, lengths_[3] = {};
   std::string directory_;
-  bool observer_requested_ = false, drift_charge_requested_ = false, buffered_ = false, compressed_ = false;
-  int sample_stride_ = 0;
+  bool observer_requested_ = false, drift_charge_requested_ = false, buffered_ = false, compressed_ = false, centroid_requested_ = false;
+  int sample_stride_ = 0, hac_sample_stride_ = 0, hac_nc_ = 0, hac_interval_ = 0;
+  bool hac_correlation_only_ = false;
   struct SeriesRow {
     int step;
     double time, potential, kinetic, spring, energy, momentum[3], flows[4][3];
@@ -62,6 +66,8 @@ private:
     double b[3], d2[3], j2[3];
   };
   std::vector<SeriesRow> series_;
+  std::unique_ptr<GPU_Vector<double>> centroid_virial_current_;
+  std::vector<double> centroid_conv_;
   struct Snapshot {
     int step;
     std::vector<double> q, v, f, energy;

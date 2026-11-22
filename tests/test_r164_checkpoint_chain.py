@@ -16,6 +16,8 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(chain.r164_options(['r164_rpmd','r164_output','0','observer','buffered','3']),(True,None))
         self.assertEqual(chain.r164_options(['r164_rpmd','drift_charge','0','observer','buffered','3']),(True,None))
         self.assertEqual(chain.r164_options(['r164_rpmd','r164_output','1','observer','buffered','3','compressed']),(True,None))
+        self.assertEqual(chain.r164_options(['r164_rpmd','r164_output','0','observer','buffered','3','centroid']),(True,None))
+        self.assertEqual(chain.r164_options(['r164_rpmd','r164_output','1','observer','buffered','3','compressed','centroid']),(True,None))
         for rest in (['observer','buffered','3','compressed','extra'],['buffered','1'],['observer','buffered','0'],['observer','buffered','4294967297'],['observer','buffered','1','checkpoint','2'],['observer','drift_charge','buffered','2'],['drift_charge'],['observer','drift_charge','drift_charge'],['observer','checkpoint','2','drift_charge'],['checkpoint','0'],['checkpoint','4294967297'],['checkpoint','2','observer'],['checkpoint','+2']):
             with self.assertRaises(ValueError): chain.r164_options(['r164_rpmd','r164_output','1']+rest)
 

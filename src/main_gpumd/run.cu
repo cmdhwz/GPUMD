@@ -533,6 +533,7 @@ void Run::perform_a_run(const int number_of_steps)
     }
   }
 
+  r164_rpmd.validate_hac(number_of_steps);
   if (r164_rpmd.enabled()) {
     box.set_is_orthogonal();
     if (integrate.get_type() != EnsembleType::RPMD || !integrate.pimd_restart_read_this_run() ||
@@ -715,7 +716,7 @@ void Run::parse_one_keyword(
   for (int n = 0; n < num_param; ++n) param[n] = tokens[n].c_str();
 
 #ifdef GPUMD_WPE_ENABLED
-  if (tokens[0] != "r164_rpmd") force.wpe_process_command(tokens, atom.number_of_atoms);
+  if (tokens[0] != "r164_rpmd" && tokens[0] != "compute_hac_ja") force.wpe_process_command(tokens, atom.number_of_atoms);
 #endif
 
   if (tokens[0] == "potential") {
@@ -810,6 +811,8 @@ void Run::parse_one_keyword(
     parse_rpmd_ja(tokens);
   } else if (tokens[0] == "r164_rpmd") {
     r164_rpmd.parse(tokens);
+  } else if (tokens[0] == "compute_hac_ja") {
+    r164_rpmd.parse_hac(tokens);
   } else if (tokens[0] == "run") {
     parse_run(tokens);
     hac_current_option_seen_ = false;
