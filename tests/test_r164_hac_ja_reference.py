@@ -11,8 +11,8 @@ import numpy as np
 def main():
     exe = pathlib.Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory() as tmp:
-        for n, nc, interval in [(31, 31, 3), (2, 2, 1)]:
-            case = pathlib.Path(tmp) / str(n)
+        for n, nc, interval in [(31, 31, 3), (31, 31, 1), (2, 2, 1)]:
+            case = pathlib.Path(tmp) / f"{n}_{interval}"
             case.mkdir()
             subprocess.run([str(exe), str(n), str(nc), str(interval)], cwd=case, check=True)
             i = np.arange(n)
@@ -21,9 +21,9 @@ def main():
             values[mask] -= values[mask].mean(axis=0)
             values[~mask] = 0
             for kind, name in enumerate(("ja", "hardy", "centroid")):
-                data = np.loadtxt(case / ("hac_" + name + ".out"), ndmin=2)
-                lags = np.arange(0, nc, interval)
-                np.testing.assert_allclose(data[:, 0], lags / 1000)
+                data = np.loadtxt(case / ("hac_" + name + ".out"), ndmin=2, converters=lambda x: float("nan") if "nan" in str(x).lower() else float(x))
+                lags = np.arange(nc // interval) * interval
+                np.testing.assert_allclose(data[:, 0], (lags + (interval - 1) / 2) / 1000)
                 corr, pairs = [], []
                 for lag in range(nc):
                     both = mask[:n-lag] & mask[lag:]
@@ -36,9 +36,9 @@ def main():
                 if not pairs[0]:
                     integ[0] = np.nan
                 integ[1:] = np.cumsum(corr[:-1] + corr[1:], axis=0)
-                np.testing.assert_array_equal(data[:, 1], np.array(pairs)[lags])
-                np.testing.assert_allclose(data[:, 2:11], corr[lags], rtol=1e-8, atol=1e-8, equal_nan=True)
-                np.testing.assert_allclose(data[:, 11:], integ[lags], rtol=1e-8, atol=1e-8, equal_nan=True)
+                np.testing.assert_allclose(data[:, 1], np.array(pairs)[:len(lags)*interval].reshape(-1, interval).mean(axis=1))
+                np.testing.assert_allclose(data[:, 2:11], corr[:len(lags)*interval].reshape(-1, interval, 9).mean(axis=1), rtol=1e-8, atol=1e-8, equal_nan=True)
+                np.testing.assert_allclose(data[:, 11:], integ[:len(lags)*interval].reshape(-1, interval, 9).mean(axis=1), rtol=1e-8, atol=1e-8, equal_nan=True)
     print("R164 HAC reference checks passed")
 
 

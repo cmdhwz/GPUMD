@@ -75,17 +75,25 @@ inline void write(const std::string& dir, const std::vector<double>& v,
     rpmd_ja_file_io::ofstream out(path+".tmp"); out<<std::setprecision(17);
     out<<"# sample_stride "<<stride<<" samples "<<n<<" valid_samples "<<count<<" Nc "<<nc<<" output_interval "<<interval<<"\n";
     out<<"# lag_ps pairs C_xx C_xy C_xz C_yx C_yy C_yz C_zx C_zy C_zz K_xx K_xy K_xz K_yx K_yy K_yz K_zx K_zy K_zz\n"
-       <<"# C uses J_a(t) J_b(t+lag), (eV Angstrom/fs)^2; K W/(m K); common mask, valid-point mean, trapezoid all lags; UNVERIFIED\n";
-    double integral[9]={}; bool supported=pairs[0]>0;
+       <<"# C uses J_a(t) J_b(t+lag), (eV Angstrom/fs)^2; K W/(m K); common mask, valid-point mean, trapezoid all lags; complete bins, pairs is the mean valid pair count in each bin; UNVERIFIED\n";
+    double integral[9]={}, corr_sum[9]={}, integral_sum[9]={}, pair_sum=0;
+    bool supported=pairs[0]>0;
     for (int l=0;l<nc;++l) {
       if (!pairs[l]) supported=false;
       if (l && supported) for (int j=0;j<9;++j)
         integral[j]+=0.5*dt_fs*factor*(corr[static_cast<size_t>(l-1)*9+j]+corr[static_cast<size_t>(l)*9+j]);
-      if (l%interval==0) {
-        out<<l*dt_fs/1000<<' '<<pairs[l];
-        for (int j=0;j<9;++j) out<<' '<<corr[static_cast<size_t>(l)*9+j];
-        for (int j=0;j<9;++j) out<<' '<<(supported ? integral[j] : nan);
+      pair_sum+=pairs[l];
+      for (int j=0;j<9;++j) {
+        corr_sum[j]+=corr[static_cast<size_t>(l)*9+j];
+        integral_sum[j]+=supported ? integral[j] : nan;
+      }
+      if ((l+1)%interval==0) {
+        out<<(l-0.5*(interval-1))*dt_fs/1000<<' '<<pair_sum/interval;
+        for (int j=0;j<9;++j) out<<' '<<corr_sum[j]/interval;
+        for (int j=0;j<9;++j) out<<' '<<integral_sum[j]/interval;
         out<<'\n';
+        pair_sum=0;
+        for (int j=0;j<9;++j) corr_sum[j]=integral_sum[j]=0;
       }
     }
     commit(out,path);
